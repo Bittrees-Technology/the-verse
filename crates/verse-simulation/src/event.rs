@@ -36,6 +36,13 @@ pub enum EventPayload {
         grid_id: String,
         block: Block,
     },
+    BlockWelded {
+        grid_id: String,
+        block_id: String,
+        previous_health: u16,
+        new_health: u16,
+        max_health: u16,
+    },
     GridMotionSet {
         grid_id: String,
         linear_velocity: Vec3,
@@ -62,7 +69,18 @@ impl EventPayload {
             Self::OreRefined { batches, .. } => batches * 12,
             Self::ComponentCrafted { quantity, .. } => quantity * 18,
             Self::InventoryTransferred { .. } => 2,
-            Self::BlockBuilt { .. } => 25,
+            Self::BlockBuilt { .. } => 5,
+            Self::BlockWelded {
+                new_health,
+                max_health,
+                ..
+            } => {
+                if new_health == max_health {
+                    20
+                } else {
+                    6
+                }
+            }
             Self::GridAnchorSet { anchored: true, .. } => 40,
             Self::BlockDamaged { .. } => 3,
             Self::PlayerMoved { .. }
@@ -92,8 +110,20 @@ impl EventPayload {
                 "inventory_transferred",
                 format!("Transferred {quantity} {resource:?}"),
             ),
-            Self::BlockBuilt { block, .. } => {
-                ("block_built", format!("Built {:?} block", block.kind))
+            Self::BlockBuilt { block, .. } => (
+                "block_frame_placed",
+                format!("Placed {:?} frame", block.kind),
+            ),
+            Self::BlockWelded {
+                new_health,
+                max_health,
+                ..
+            } => {
+                let percent = u32::from(*new_health) * 100 / u32::from(*max_health);
+                (
+                    "block_welded",
+                    format!("Welded block to {percent}% integrity"),
+                )
             }
             Self::GridMotionSet { .. } => ("grid_motion_set", "Grid motion accepted".into()),
             Self::GridAnchorSet { anchored, .. } => (
@@ -224,7 +254,7 @@ mod tests {
     fn event_hash_detects_payload_tampering() {
         let mut event = CanonicalEvent::new(
             1,
-            "p0.3.0",
+            "p0.4.0",
             "universe",
             "cell",
             9,

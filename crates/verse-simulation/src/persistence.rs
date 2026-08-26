@@ -358,7 +358,7 @@ mod tests {
     use std::io::Write as _;
 
     use tempfile::tempdir;
-    use verse_protocol::{ClientMessage, IVec3};
+    use verse_protocol::{BlockKind, ClientMessage, IVec3, Vec3};
 
     use super::*;
     use crate::Runtime;
@@ -409,6 +409,63 @@ mod tests {
         let recovered = Runtime::open(directory.path(), 19, 100).expect("runtime recovers");
         assert_eq!(recovered.state().state_hash(), expected_hash);
         assert!(!recovered.state().voxels.occupied.contains(&target));
+    }
+
+    #[test]
+    fn construction_integrity_and_orientation_recover_exactly() {
+        let directory = tempdir().expect("tempdir");
+        let expected_hash;
+        {
+            let mut runtime = Runtime::open(directory.path(), 29, 100).expect("runtime starts");
+            for (index, position) in [
+                Vec3::new(11.0, 3.5, 7.5),
+                Vec3::new(10.5, 2.5, 5.0),
+                Vec3::new(10.0, 1.0, 3.0),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                runtime
+                    .execute(&ClientMessage::MovePlayer {
+                        operation_id: format!("recovery-move-{index}"),
+                        position,
+                    })
+                    .expect("player approaches construction range");
+            }
+            runtime
+                .execute(&ClientMessage::BuildBlock {
+                    operation_id: "recovery-frame".into(),
+                    grid_id: "grid-starter".into(),
+                    coordinate: IVec3::new(0, 1, 0),
+                    kind: BlockKind::Structural,
+                    orientation: 2,
+                })
+                .expect("construction frame placed");
+            let block_id = runtime.state().grids["grid-starter"]
+                .block_at(IVec3::new(0, 1, 0))
+                .expect("frame exists")
+                .block_id
+                .clone();
+            runtime
+                .execute(&ClientMessage::WeldBlock {
+                    operation_id: "recovery-weld".into(),
+                    grid_id: "grid-starter".into(),
+                    block_id,
+                })
+                .expect("one weld stage accepted");
+            runtime.persist_snapshot().expect("snapshot persists");
+            expected_hash = runtime.state().state_hash();
+        }
+
+        let recovered = Runtime::open(directory.path(), 29, 100).expect("runtime recovers");
+        let block = recovered.state().grids["grid-starter"]
+            .block_at(IVec3::new(0, 1, 0))
+            .expect("construction frame recovers");
+        assert_eq!(block.orientation, 2);
+        assert_eq!(block.health, 50);
+        assert_eq!(block.max_health(), 100);
+        assert_eq!(recovered.state().state_hash(), expected_hash);
+        assert!(recovered.state().conservation().valid);
     }
 
     #[test]

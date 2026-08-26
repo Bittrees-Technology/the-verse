@@ -11,7 +11,7 @@ use verse_protocol::{
 
 use crate::content;
 
-pub const WORLD_SCHEMA_VERSION: u32 = 3;
+pub const WORLD_SCHEMA_VERSION: u32 = 4;
 pub const PLAYER_INVENTORY_ID: &str = "inventory-player-local";
 pub const STARTER_GRID_ID: &str = "grid-starter";
 
@@ -179,6 +179,7 @@ pub struct Block {
     pub block_id: String,
     pub coordinate: IVec3,
     pub kind: BlockKind,
+    pub orientation: u8,
     pub health: u16,
     pub component_cost: u64,
     pub inventory_id: Option<String>,
@@ -191,10 +192,19 @@ impl Block {
             block_id: block_id.into(),
             coordinate,
             kind,
+            orientation: 0,
             health: definition.max_health,
             component_cost: definition.component_cost,
             inventory_id: None,
         }
+    }
+
+    pub fn max_health(&self) -> u16 {
+        content::block(self.kind).max_health
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.health == self.max_health()
     }
 }
 
@@ -220,11 +230,13 @@ impl Grid {
         let produced = self
             .blocks
             .values()
+            .filter(|block| block.is_complete())
             .map(|block| content::block(block.kind).power_production)
             .sum::<f64>();
         let required = self
             .blocks
             .values()
+            .filter(|block| block.is_complete())
             .map(|block| {
                 if block.kind == BlockKind::Anchor && !self.anchored {
                     0.0
@@ -236,6 +248,7 @@ impl Grid {
         let stored = self
             .blocks
             .values()
+            .filter(|block| block.is_complete())
             .map(|block| content::block(block.kind).stored_power)
             .sum::<f64>();
 
@@ -261,7 +274,7 @@ impl Grid {
 
     pub fn anchor_touches(&self, voxels: &VoxelField) -> bool {
         self.blocks.values().any(|block| {
-            if block.kind != BlockKind::Anchor {
+            if block.kind != BlockKind::Anchor || !block.is_complete() {
                 return false;
             }
             let world = self.world_coordinate(block.coordinate);
@@ -493,7 +506,9 @@ impl WorldState {
                         block_id: block.block_id.clone(),
                         coordinate: block.coordinate,
                         kind: block.kind,
+                        orientation: block.orientation,
                         health: block.health,
+                        max_health: block.max_health(),
                         inventory_id: block.inventory_id.clone(),
                     })
                     .collect(),

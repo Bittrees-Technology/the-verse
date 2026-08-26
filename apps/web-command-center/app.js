@@ -23,8 +23,8 @@ function connect() {
     elements.connection.className = "connection online";
     socket.send(JSON.stringify({
       type: "hello",
-      protocol_version: 2,
-      client_name: "browser-command-center-p0.2",
+      protocol_version: 3,
+      client_name: "browser-command-center-p0.4",
     }));
   });
   socket.addEventListener("close", () => {
@@ -112,16 +112,22 @@ function render() {
   const grid = selectedGrid();
   if (grid) {
     selectedGridId = grid.grid_id;
+    const unfinished = grid.blocks.filter(
+      (block) => block.health < block.max_health,
+    ).length;
     elements["selected-grid"].textContent = grid.grid_id.toUpperCase();
     elements["grid-details"].textContent =
       grid.blocks.length + " blocks • " +
+      unfinished + " unfinished • " +
       (grid.anchored ? "ANCHORED" : "DYNAMIC") + "\n" +
       "Power " + grid.power.produced.toFixed(1) + " / " +
       grid.power.required.toFixed(1) + " • " +
       (grid.power.online ? "ONLINE" : "OFFLINE") + "\n" +
       "Position " + grid.position.x.toFixed(1) + ", " +
       grid.position.y.toFixed(1) + ", " + grid.position.z.toFixed(1);
-    const hasAnchor = grid.blocks.some((block) => block.kind === "anchor");
+    const hasAnchor = grid.blocks.some(
+      (block) => block.kind === "anchor" && block.health === block.max_health,
+    );
     elements.anchor.disabled = !grid.anchored && (!hasAnchor || !grid.power.online);
     elements.stop.disabled = grid.anchored || (
       grid.linear_velocity.x === 0 &&

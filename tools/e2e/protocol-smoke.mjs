@@ -121,6 +121,41 @@ function blockAt(world, coordinate, kind) {
   return undefined;
 }
 
+async function movePlayerTo(world, target) {
+  while (distanceSquared(world.player.position, target) > 0.0001) {
+    const current = world.player.position;
+    const delta = {
+      x: target.x - current.x,
+      y: target.y - current.y,
+      z: target.z - current.z,
+    };
+    const magnitude = Math.sqrt(distanceSquared(delta, { x: 0, y: 0, z: 0 }));
+    const scale = Math.min(1, 2.8 / magnitude);
+    world = await intent("move_player", {
+      position: {
+        x: current.x + delta.x * scale,
+        y: current.y + delta.y * scale,
+        z: current.z + delta.z * scale,
+      },
+    });
+  }
+  return world;
+}
+
+async function completeBlock(world, coordinate, kind) {
+  let target = blockAt(world, coordinate, kind);
+  assert.ok(target, "construction frame exists");
+  while (target.block.health < target.block.max_health) {
+    world = await intent("weld_block", {
+      grid_id: target.grid.grid_id,
+      block_id: target.block.block_id,
+    });
+    target = blockAt(world, coordinate, kind);
+    assert.ok(target, "welded block remains on its grid");
+  }
+  return world;
+}
+
 async function run() {
   socket.addEventListener("message", (event) => {
     dispatch(JSON.parse(event.data));
@@ -140,11 +175,11 @@ async function run() {
   ).snapshot;
   send({
     type: "hello",
-    protocol_version: 2,
+    protocol_version: 3,
     client_name: "node-authoritative-e2e",
   });
   assert.equal(world.conservation.valid, true);
-  assert.equal(world.content_manifest_version, "p0.3.0");
+  assert.equal(world.content_manifest_version, "p0.4.0");
   assert.equal(world.grids.length, 1);
   assert.ok(world.voxels.length > 1_000);
 
@@ -153,7 +188,18 @@ async function run() {
     const voxel = reachableVoxel(world, mined);
     assert.ok(voxel, "a reachable unmined voxel is available");
     mined.add(coordinateKey(voxel.coordinate));
+    const voxelCount = world.voxels.length;
+    const previousHash = world.world_hash;
     world = await intent("mine_voxel", { coordinate: voxel.coordinate });
+    assert.equal(world.voxels.length, voxelCount - 1);
+    assert.notEqual(world.world_hash, previousHash);
+    assert.ok(
+      !world.voxels.some(
+        (remaining) =>
+          coordinateKey(remaining.coordinate) === coordinateKey(voxel.coordinate),
+      ),
+      "the exact mined coordinate becomes authoritative empty volume",
+    );
   }
 
   world = await intent("refine_ore", {
@@ -175,11 +221,18 @@ async function run() {
     quantity: 1,
   });
 
+  world = await movePlayerTo(world, { x: 10.0, y: 1.0, z: 3.0 });
   world = await intent("build_block", {
     grid_id: "grid-starter",
     coordinate: { x: -2, y: 0, z: 0 },
     kind: "anchor",
+    orientation: 3,
   });
+  let anchor = blockAt(world, { x: -2, y: 0, z: 0 }, "anchor");
+  assert.ok(anchor, "anchor construction frame was placed");
+  assert.equal(anchor.block.orientation, 3);
+  assert.ok(anchor.block.health < anchor.block.max_health);
+  world = await completeBlock(world, { x: -2, y: 0, z: 0 }, "anchor");
   world = await intent("toggle_grid_anchor", { grid_id: "grid-starter" });
   assert.equal(world.grids[0].anchored, true);
   world = await intent("toggle_grid_anchor", { grid_id: "grid-starter" });
@@ -210,12 +263,16 @@ async function run() {
     grid_id: "grid-starter",
     coordinate: { x: 0, y: 1, z: 0 },
     kind: "damage_test",
+    orientation: 1,
   });
+  world = await completeBlock(world, { x: 0, y: 1, z: 0 }, "damage_test");
   world = await intent("build_block", {
     grid_id: "grid-starter",
     coordinate: { x: 0, y: 2, z: 0 },
     kind: "structural",
+    orientation: 2,
   });
+  world = await completeBlock(world, { x: 0, y: 2, z: 0 }, "structural");
   const bridge = blockAt(world, { x: 0, y: 1, z: 0 }, "damage_test");
   assert.ok(bridge, "damage bridge was created");
   world = await intent("damage_block", {

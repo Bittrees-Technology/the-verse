@@ -2,7 +2,7 @@
 
 The Verse is an open-source persistent voxel space universe, work-and-economy simulator, and Web3 marketplace.
 
-The repository now contains **P0.3: the visual engineering checkpoint**, built on the first-person Salvage Frontier loop. It is still a single-player proof of the authoritative loop—not yet the public multiplayer universe or real-value economy—but its asteroid, materials, machinery, work light, and tool effects now aim at a grounded space-engineering presentation.
+The repository now contains **P0.4: Engineering Hands**, built on the first-person Salvage Frontier loop. It is still a single-player proof of the authoritative loop—not yet the public multiplayer universe or real-value economy—but mining now proves visible persistent excavation and construction uses oriented frames, staged welding, and functional-integrity rules.
 
 ## Play it on macOS
 
@@ -26,6 +26,7 @@ Native controls are shown in the client:
 | Toggle helmet work light | `L` |
 | Mine highlighted voxel | Hold left mouse |
 | Enter construction / choose block | `B` / `1`–`5` |
+| Rotate construction hologram | `Q` / `E` |
 | Weld construction hologram | Hold left mouse |
 | Cut and salvage a block | Hold right mouse |
 | Refine / fabricate / transfer cargo | `R` / `T` / `V` (`Shift+V` reverses transfer) |
@@ -72,7 +73,7 @@ Start with [the documentation map](docs/README.md), then read:
 
 ## Current status
 
-P0.3 replaces primitive asteroid clusters with a continuous density-filtered surface, adds deterministic shape variation and ore deposits, introduces original physically shaded armor and rock materials, and strengthens lighting and tool feedback. It retains the P0.2 first-person work loop and P0.1 authoritative foundation. Multiplayer, character-body and rigid-grid collision physics, landable planets, safe zones, accounts, AMMs, and blockchain settlement are not in this slice. Those systems remain sequenced in the [delivery roadmap](docs/roadmap/roadmap.md).
+P0.4 adds server-range-checked frame placement, persistent quarter-turn orientation, three staged weld operations, nonfunctional unfinished blocks, authoritative construction completion, mined-coordinate regression proofs, construction-frame visuals, rotating holograms, integrity telemetry, and mining fragments. It retains the P0.3 continuous asteroid and physically shaded presentation. Multiplayer, character-body and rigid-grid collision physics, landable planets, safe zones, accounts, AMMs, and blockchain settlement are not in this slice. Those systems remain sequenced in the [delivery roadmap](docs/roadmap/roadmap.md).
 
 ## Licensing
 

@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 
 /// The only protocol version accepted by this P0 build.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// A stable integer voxel or block coordinate.
 #[derive(
@@ -200,7 +200,9 @@ pub struct BlockSnapshot {
     pub block_id: String,
     pub coordinate: IVec3,
     pub kind: BlockKind,
+    pub orientation: u8,
     pub health: u16,
+    pub max_health: u16,
     pub inventory_id: Option<String>,
 }
 
@@ -295,6 +297,12 @@ pub enum ClientMessage {
         grid_id: String,
         coordinate: IVec3,
         kind: BlockKind,
+        orientation: u8,
+    },
+    WeldBlock {
+        operation_id: String,
+        grid_id: String,
+        block_id: String,
     },
     SetGridMotion {
         operation_id: String,
@@ -323,6 +331,7 @@ impl ClientMessage {
             | Self::CraftComponent { operation_id, .. }
             | Self::TransferInventory { operation_id, .. }
             | Self::BuildBlock { operation_id, .. }
+            | Self::WeldBlock { operation_id, .. }
             | Self::SetGridMotion { operation_id, .. }
             | Self::ToggleGridAnchor { operation_id, .. }
             | Self::DamageBlock { operation_id, .. } => Some(operation_id),
@@ -382,5 +391,28 @@ mod tests {
         let vector = Vec3::new(6.0, 0.0, 8.0).clamped(5.0);
         assert!((vector.x - 3.0).abs() < f64::EPSILON);
         assert!((vector.z - 4.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn construction_messages_preserve_orientation_and_weld_identity() {
+        let frame = serde_json::to_value(ClientMessage::BuildBlock {
+            operation_id: "frame-1".into(),
+            grid_id: "grid".into(),
+            coordinate: IVec3::new(4, 5, 6),
+            kind: BlockKind::Drill,
+            orientation: 3,
+        })
+        .expect("frame intent serializes");
+        assert_eq!(frame["type"], "build_block");
+        assert_eq!(frame["orientation"], 3);
+
+        let weld = serde_json::to_value(ClientMessage::WeldBlock {
+            operation_id: "weld-1".into(),
+            grid_id: "grid".into(),
+            block_id: "block-9".into(),
+        })
+        .expect("weld intent serializes");
+        assert_eq!(weld["type"], "weld_block");
+        assert_eq!(weld["block_id"], "block-9");
     }
 }
