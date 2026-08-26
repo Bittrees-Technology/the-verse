@@ -37,15 +37,13 @@ A cell may be drained and replaced without losing canonical state.
 
 A structure is powered for cleanup purposes when an eligible control core or beacon receives the required continuous power heartbeat. The required power may scale with registered construct mass or complexity.
 
-### Proposed timeline
+### Canonical timeline
 
 - 0 hours: unpowered timer begins.
 - 24 hours: public salvage eligibility begins.
 - 30 hours: urgent derelict warning.
 - 35 hours: final warning.
 - 36 hours: remaining eligible object is destroyed and removed.
-
-The 24-hour salvage start requires final confirmation.
 
 ### Exclusions
 
@@ -90,13 +88,13 @@ A future policy must decide whether very large registrations require size-based 
 ## Death drops
 
 - Inventory leaves the character atomically at death.
+- Owner/team-only recovery lasts 15 minutes.
+- Public salvage begins at 15 minutes.
 - Dropped container remains six hours.
 - Expiration uses a durable scheduler.
 - Verified outages pause expiration.
 - Recovery and salvage actions are server-authoritative.
 - Final cleanup records a tombstone and settlement leaf.
-
-Owner/team recovery priority before public access remains unresolved.
 
 ## Background travel and production
 

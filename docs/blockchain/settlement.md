@@ -85,6 +85,8 @@ Potential contracts:
 
 The system should prefer audited protocols and minimal adapters over inventing a new AMM.
 
+The Verse DAO deploys canonical AMM contracts and supplies the capital market's initial BIT and commodity liquidity. Pool parameters and seed transactions must be published as governance records. This work begins only after gameplay, voxel mining, and the internal economic proof validate the underlying asset lifecycle.
+
 ## Deposits and reconciliation
 
 A deposit spans game and chain state. It uses a saga with compensating transitions, never a distributed lock held across chain confirmation.

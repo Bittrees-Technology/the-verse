@@ -82,22 +82,20 @@ On death:
 
 - Carried inventory moves into a dropped container at the death coordinate.
 - The player respawns without that inventory.
+- The drop is owner/team-only for the first 15 minutes.
+- At 15 minutes, the drop becomes publicly salvageable.
 - The container receives a durable six-hour expiration.
 - Recovery, transfer, salvage, and final cleanup are explicit events.
 - Cleanup is paused during verified universe outages.
 
-The owner/team exclusivity period before public salvage remains unresolved.
-
 ## Derelict lifecycle
 
-Proposed timing:
+Canonical timing:
 
 - At loss of qualifying power: timer begins.
 - Before 24 hours: owner/company recovery period.
 - At 24 hours: public salvage begins.
 - At 36 hours: remaining eligible structure is destroyed and cleaned up.
-
-The salvage start is proposed and requires confirmation.
 
 Qualifying insurance/registration suspends ordinary cleanup but not combat damage.
 

@@ -4,6 +4,10 @@
 
 The project will reconcile and specify systems before building them one by one.
 
+## Blockchain dependency sequencing
+
+The bNOTE acquisition interface and Base BIT/bridge deployment manifest are intentionally deferred. They do not block P0 gameplay, P1 multiplayer, or P2's internal test-credit economy. They become required inputs before P3 testnet Web3 integration, after voxel mining and the economic lifecycle have been validated.
+
 ## Phase S0 — Canonical specification
 
 Deliverables:

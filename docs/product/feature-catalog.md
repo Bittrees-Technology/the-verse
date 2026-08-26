@@ -31,21 +31,21 @@ Priorities:
 | F-017 | Browser journey and asset status | P1 | Public API |
 | F-018 | Capital hard safe zone | P1 | Policy volumes |
 | F-019 | Offline structures and powered turrets | P1 | Cell wake-up |
-| F-020 | Death drop and six-hour cleanup | P1 | Lifecycle scheduler |
-| F-021 | Unpowered derelict and 36-hour cleanup | P1 | Power, scheduler |
+| F-020 | Death drop, 15-minute recovery grace, and six-hour cleanup | P1 | Lifecycle scheduler |
+| F-021 | Unpowered derelict, 24-hour public salvage, and 36-hour cleanup | P1 | Power, scheduler |
 | F-022 | Registered-station cleanup exception | P2 | BIT contract |
 | F-023 | Mining/refining/manufacturing graph | P1 | Inventory ledger |
 | F-024 | Work and delivery contracts | P2 | Escrow |
 | F-025 | Company roles and assets | P2 | Identity |
 | F-026 | Company DAO registry | P2 | Chain adapter |
-| F-027 | Capital commodity AMM | P2 | Market custody |
+| F-027 | DAO-deployed capital commodity AMM and seed liquidity | P2 | Market custody |
 | F-028 | Regional commodity AMMs | P2 | Location receipts |
 | F-029 | Unique-item listings and auctions | P2 | Escrow |
 | F-030 | Passkey profile | P1 | Identity service |
 | F-031 | ERC-4337 smart account | P2 | Wallet provider |
 | F-032 | Sponsored routine transactions | P2 | Paymaster policy |
 | F-033 | BIT, BTREE, WBTC chain adapters | P2 | Chain registry |
-| F-034 | bNOTE purchase integration | P2 | Missing ABI/audit |
+| F-034 | bNOTE purchase integration | P3 | Gameplay/economy proof, ABI/audit |
 | F-035 | Asset deposit and withdrawal | P2 | Marketplace contracts |
 | F-036 | Lifecycle Merkle batches | P2 | Event log |
 | F-037 | Public proof API | P2 | F-036 |

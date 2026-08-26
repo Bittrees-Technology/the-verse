@@ -16,12 +16,19 @@ Equivalent-address Safe deployments are planned for Sepolia, Base, and Base Sepo
 The Safe may control:
 
 - Treasury.
+- Official AMM deployment and initial capital-market liquidity.
 - Approved contract upgrades.
 - Chain registry.
 - Official content manifests.
 - Security Council delegation.
 - Emergency pause and unpause.
 - Protocol configuration within published bounds.
+
+## Open Metaverse governing framework
+
+The Verse adopts the Open Metaverse as its contractual governing framework using the meaning in Section 13 of the Bittrees Bounties Terms of Use effective 2026-08-12. The canonical project interpretation is documented in [Open Metaverse governing framework](open-metaverse-framework.md).
+
+The framework guides consent, property, voluntary contracts, transparent rules, code-backed evidence, interoperability, decentralization, portable reputation, and nonaggression. It is not represented as a sovereign or territorial jurisdiction and does not displace applicable nonwaivable rights or law.
 
 ## Governance process
 

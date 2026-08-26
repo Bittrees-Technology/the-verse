@@ -21,10 +21,10 @@ This register reconciles the planning conversations into explicit project decisi
 | D-013 | Offline ships and structures may be destroyed | Accepted | LIFE-001/002 |
 | D-014 | Powered automated defenses operate offline | Accepted | LIFE-002 |
 | D-015 | Unpowered eligible objects are deleted at 36 hours | Accepted | LIFE-008 |
-| D-016 | Derelicts become publicly salvageable before deletion | Accepted; proposed start at 24 hours awaits confirmation | LIFE-009, OQ-007 |
+| D-016 | Derelicts become publicly salvageable at 24 hours and are deleted at 36 hours | Accepted | LIFE-008/009 |
 | D-017 | Valuable claimed stations may buy a BIT cleanup exception | Accepted | LIFE-010/011 |
 | D-018 | Character death has no currency/experience charge | Accepted | LIFE-003 |
-| D-019 | Carried inventory drops and expires after six hours | Accepted; access grace unresolved | LIFE-006/007, OQ-006 |
+| D-019 | Carried inventory drops, is owner/team-only for 15 minutes, becomes public, and expires after six hours | Accepted | LIFE-006/007/013 |
 | D-020 | Capital empty-state respawn always available | Accepted | LIFE-005 |
 | D-021 | Universe expands through new asteroid fields and frontier sectors | Accepted | WORLD-005 |
 | D-022 | No reachable practical boundary in any direction | Qualified through hierarchical 128-bit procedural space | Universe simulation |
@@ -33,13 +33,13 @@ This register reconciles the planning conversations into explicit project decisi
 | D-025 | Consumption/destruction are represented on-chain | Accepted through batched Merkle commitments | CHAIN-003, ADR-0003 |
 | D-026 | Hide routine chain transactions | Accepted through passkeys, smart accounts, sessions, relayers, and paymasters | ID-001/003, CHAIN-004/005 |
 | D-027 | BIT can bridge to approved chains | Accepted in principle; canonical Base bridge unresolved | OQ-003 |
-| D-028 | bNOTE is the existing BIT source application | Accepted; proxy verified, integration ABI unresolved | Chain registry, OQ-002 |
+| D-028 | bNOTE is the existing BIT source application | Accepted; proxy verified and integration details deferred until after gameplay and internal economic validation | Chain registry, OQ-002 |
 | D-029 | Verse market purchase/swap contracts do not yet exist | Accepted | OQ-002/004 |
 | D-030 | Each standardized commodity market uses an AMM | Accepted; exact protocol/curve unresolved | MKT-005, ADR-0005 |
 | D-031 | Market prices are entirely algorithmic | Accepted | Economy and markets |
 | D-032 | Users may create additional markets | Accepted | MKT-003 |
 | D-033 | Unique/heterogeneous goods use listings, auctions, or specialized mechanisms | Qualified because ordinary AMMs require fungibility | MKT-006 |
-| D-034 | Any participant may play and use markets | Accepted product goal; real-world legal operation remains blocked | ID-004/005, MKT-009, OQ-001 |
+| D-034 | Any participant may play and use markets | Accepted under published protocol rules, the Open Metaverse framework, and applicable nonwaivable law | ID-004/005, MKT-009 |
 | D-035 | Bots, NPCs, and AI agents are permitted | Accepted | ID-005/006 |
 | D-036 | Companies are configurable DAOs with contracts and ranks | Accepted | IND-003/005 and governance spec |
 | D-037 | Verse DAO executor is the Ethereum two-of-three Safe | Accepted and live-state verified | GOV-001 and chain registry |
@@ -59,7 +59,9 @@ This register reconciles the planning conversations into explicit project decisi
 | D-051 | Visual mood blends industrial space horror, monumental portals, and expeditionary military science fiction | Qualified into an original visual language | Visual direction |
 | D-052 | Founder and AI tools begin the build | Accepted for specification/prototype; production still requires human-controlled legal, signing, security, and operations duties | Roadmap |
 | D-053 | Funding and launch date are deferred | Accepted | Open questions |
-| D-054 | “Open metaverse” is the desired governance domain | Accepted as philosophy, not as a substitute for real-world legal jurisdiction | OQ-001 |
+| D-054 | The Open Metaverse is the governing framework | Accepted with the meaning and mandatory-rights boundary in Section 13 of the Bittrees Bounties Terms effective 2026-08-12 | GOV-006/007, governance framework |
+| D-055 | The Verse DAO deploys official AMMs and provides initial capital-market liquidity | Accepted; exact pools, curves, fees, and reserve sizes require simulation and public governance parameters | MKT-010, OQ-004 |
+| D-056 | bNOTE and Base BIT/bridge details wait until gameplay, voxel mining, and the internal economy are validated | Accepted sequencing decision; required before P3 testnet integration | CHAIN-008, OQ-002/003 |
 
 ## Amendment rule
 

@@ -45,7 +45,8 @@ All addresses must be checksum-normalized and keyed by chain ID. Configuration m
 - Type: upgradeable application proxy; it is not an ERC-20 token.
 - Implementation observed 2026-08-26: `0x0358631d5b844a06f001946ceb88112530046cbf`.
 - Role: existing Bittrees mechanism from which BIT may be sourced.
-- Required before integration: verified ABI, supported purchase routes, quote behavior, slippage rules, events, failure modes, upgrade authority, and audit status.
+- Required before P3 testnet integration: verified ABI, supported purchase routes, quote behavior, slippage rules, events, failure modes, upgrade authority, and audit status.
+- Sequencing: deferred until gameplay, voxel mining, and the internal economic proof have passed; it does not block P0, P1, or internal P2 work.
 
 ### Verse DAO Safe
 
@@ -79,6 +80,7 @@ All addresses must be checksum-normalized and keyed by chain ID. Configuration m
 - Canonical bridge: not yet specified.
 - Verse DAO Safe intended address: `0x4E7cf530B84DAE10c4500737C3408761a9385051`, pending deployment.
 - AMM and market contracts: not deployed.
+- Deployment authority: Verse DAO after pool design and economic simulation are accepted.
 
 ## Base Sepolia
 

@@ -30,6 +30,7 @@ These documents form the initial specification baseline.
 ## Governance, security, and operations
 
 - [Governance and modding](governance/governance-and-modding.md)
+- [Open Metaverse governing framework](governance/open-metaverse-framework.md)
 - [Threat model](security/threat-model.md)
 - [Operations and cleanup](operations/operations-and-cleanup.md)
 

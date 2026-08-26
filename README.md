@@ -13,6 +13,7 @@ The project is currently in its **specification-first phase**. The repository is
 - Passkey accounts that hide routine blockchain operations.
 - DAO companies, formal work contracts, first-class bots and AI agents, and approved user-created content.
 - Official servers using only Verse DAO-approved mods; economically isolated private servers may run anything.
+- The Open Metaverse contractual governing framework, with nonwaivable rights and laws preserved.
 - Open development and community contribution.
 
 ## Specification index

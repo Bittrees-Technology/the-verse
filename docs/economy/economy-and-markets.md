@@ -54,6 +54,7 @@ The capital market is:
 - Inside the absolute safe zone.
 - The default onboarding venue.
 - Operated under Verse DAO policy.
+- Deployed by the Verse DAO when implemented onchain.
 - Designed for the simplest possible “deposit and sell” flow.
 - Expected to have the most visible liquidity.
 - Open to humans and agents.
@@ -114,6 +115,8 @@ Liquidity may be supplied by:
 - Independent market operators.
 - Automated strategies.
 
+The Verse DAO supplies the initial BIT and commodity reserves for the capital market. Its deployment and seed-liquidity transaction parameters are public governance records. Additional participants may add liquidity under the pool rules.
+
 Liquidity providers must see:
 
 - Pool reserves.
@@ -124,7 +127,7 @@ Liquidity providers must see:
 - Withdrawal constraints.
 - Relevant risks.
 
-The source and mandate of initial capital-market liquidity remain unresolved.
+Exact initial reserve sizes, curves, fee tiers, position ownership, and rebalancing authority require economic simulation and a separate accepted ADR before deployment.
 
 ## Unique and heterogeneous goods
 

@@ -55,10 +55,11 @@ Requirement IDs are stable references for issues, pull requests, tests, and rele
 - **LIFE-006 — Inventory drop:** Carried inventory shall drop at the death location.
 - **LIFE-007 — Drop expiry:** Dropped carried inventory shall be removed six hours after death if not recovered.
 - **LIFE-008 — Derelict deadline:** An eligible object continuously without qualifying power shall be deleted at 36 hours.
-- **LIFE-009 — Salvage:** An unpowered object shall become publicly salvageable before the 36-hour deletion.
+- **LIFE-009 — Salvage:** An eligible unpowered object shall become publicly salvageable at 24 hours and remain salvageable until its 36-hour deletion.
 - **LIFE-010 — Registered exception:** A claimed station may purchase a BIT-denominated registration or insurance contract that exempts it from ordinary unpowered cleanup while valid.
 - **LIFE-011 — No raid immunity:** Registration shall not prevent attack, destruction, capture, or salvage through ordinary gameplay.
 - **LIFE-012 — Outage safety:** Verified service outages shall not advance destructive cleanup timers.
+- **LIFE-013 — Drop recovery grace:** A death drop shall be accessible only to its owner or team for the first 15 minutes, then publicly salvageable until its six-hour expiry.
 
 ## Capital, combat, and administration
 
@@ -87,7 +88,8 @@ Requirement IDs are stable references for issues, pull requests, tests, and rele
 - **MKT-006 — Unique goods:** Unique ships, blueprints, skins, and non-fungible goods shall use listings, auctions, or specialized pools rather than forced fungibility.
 - **MKT-007 — Funded liquidity:** Market purchases shall be limited by deposited liquidity; no market promises unlimited fixed-price BIT redemption.
 - **MKT-008 — Ordinary volatility:** Governance shall not pause or alter markets merely because of legitimate price movements, deposits, or sales.
-- **MKT-009 — Permissionless participation:** Any eligible profile may access markets, subject to applicable protocol and unavoidable legal constraints.
+- **MKT-009 — Permissionless participation:** Any eligible profile may access markets, subject to the Open Metaverse governing framework, published protocol rules, and applicable nonwaivable law.
+- **MKT-010 — Canonical AMM authority:** The Verse DAO shall deploy official AMMs and provide the capital market's initial BIT and commodity liquidity under publicly recorded parameters.
 
 ## Blockchain
 
@@ -98,7 +100,7 @@ Requirement IDs are stable references for issues, pull requests, tests, and rele
 - **CHAIN-005 — Explicit custody:** High-value withdrawal, recovery, and authority changes shall require explicit confirmation.
 - **CHAIN-006 — Multi-chain registry:** Every supported token, Safe, bridge, and market contract shall be registered by chain ID.
 - **CHAIN-007 — Upgrade monitoring:** Upgradeable dependencies shall be monitored and automatically quarantined after unexpected implementation changes.
-- **CHAIN-008 — BIT sourcing:** BIT acquisition may integrate Bittrees bNOTE and approved WBTC/BTREE routes after ABI, audit, and slippage behavior are specified. **Blocked:** purchase contract interface is not yet supplied.
+- **CHAIN-008 — BIT sourcing:** BIT acquisition may integrate Bittrees bNOTE and approved WBTC/BTREE routes after ABI, audit, and slippage behavior are specified. **Deferred:** this interface is not required for gameplay, voxel mining, or the internal economic proof, but is required before P3 testnet integration.
 
 ## Governance and modding
 
@@ -107,6 +109,8 @@ Requirement IDs are stable references for issues, pull requests, tests, and rele
 - **GOV-003 — Persistent pause:** A pause remains active until the Verse DAO or authorized Security Council unpauses it.
 - **GOV-004 — Narrow reasons:** Emergency intervention is limited to safety failures such as duplication, unlimited resource creation, insolvency, bridge compromise, or malicious code.
 - **GOV-005 — Public record:** Emergency actions shall include public scope, reason, signer, affected systems, and remediation state.
+- **GOV-006 — Open Metaverse framework:** The Verse shall adopt the Open Metaverse contractual governing framework defined by Section 13 of the Bittrees Bounties Terms of Use effective 2026-08-12.
+- **GOV-007 — Mandatory-rights boundary:** The Verse shall not represent that framework as a nation, sovereign, court, territorial jurisdiction, or immunity from law; applicable nonwaivable rights and laws prevail to the extent of conflict.
 - **MOD-001 — Official approval:** Official servers shall load only Verse DAO-approved signed mod manifests.
 - **MOD-002 — Private freedom:** Private servers may load unrestricted mods.
 - **MOD-003 — Economic isolation:** Private-server items and resources shall never enter the canonical universe or its markets.

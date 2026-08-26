@@ -1,22 +1,34 @@
-# Open questions and blockers
+# Open questions, blockers, and resolved gates
 
-This register contains decisions that remain unresolved after the initial planning reconciliation.
+This register preserves resolved gates for traceability and lists the decisions that still remain after the initial planning reconciliation.
 
-## Critical before economic implementation
+## Resolved in S0 approval
 
-### OQ-001 — Real-world operator and jurisdiction
+### OQ-001 — Open Metaverse governing framework
 
-“The open metaverse” describes protocol governance but is not a real-world legal jurisdiction or legal entity. Before operating a real-value market, the project must identify:
+The Verse adopts the Open Metaverse contractual governing framework defined by Section 13 of the Bittrees Bounties Terms of Use effective 2026-08-12. The framework is not a nation, sovereign, court, territorial jurisdiction, or immunity from law; applicable nonwaivable rights and law remain controlling to the extent of conflict.
 
-- Contracting entity.
-- Place of incorporation or recognized organization.
-- Governing law and dispute venue.
-- Tax and accounting responsibility.
-- Consumer and data-protection obligations.
-- Treatment of minors and restricted regions.
-- Custody and financial-regulation analysis.
+**Status:** Resolved for the product baseline. Deployment-specific operator disclosures, policies, consent, and mandatory obligations remain a production release check under the accepted framework.
 
-**Status:** Blocked; qualified legal counsel required.
+### OQ-005 — Capital-market liquidity
+
+The Verse DAO deploys the official AMMs and deposits the capital market's initial BIT and commodity liquidity. Exact pool parameters, reserve sizes, fees, and position ownership remain part of OQ-004 and the economic simulation.
+
+**Status:** Resolved as to authority and source.
+
+### OQ-006 — Death-drop access
+
+Death drops are owner/team-only for 15 minutes, then publicly salvageable until their six-hour expiry.
+
+**Status:** Resolved.
+
+### OQ-007 — Derelict salvage start
+
+Eligible unpowered structures become publicly salvageable at 24 hours and are deleted at 36 hours.
+
+**Status:** Resolved.
+
+## Critical before Web3 implementation
 
 ### OQ-002 — BIT acquisition interface
 
@@ -31,7 +43,7 @@ The existing bNOTE proxy is known, but the Verse-specific purchase/swap contract
 - Upgrade administrator.
 - Audit status.
 
-**Status:** Blocked on Bittrees contract specification.
+**Status:** Deferred until gameplay, voxel mining, and the internal economic proof pass; required before P3 testnet integration.
 
 ### OQ-003 — Base BIT and bridge
 
@@ -44,7 +56,7 @@ Confirm:
 - Supply reconciliation.
 - Rate limits and pause authority.
 
-**Status:** Blocked on deployment manifest.
+**Status:** Deferred until gameplay, voxel mining, and the internal economic proof pass; required before P3 testnet integration.
 
 ### OQ-004 — Market contracts and curves
 
@@ -60,27 +72,7 @@ Choose:
 
 **Status:** Requires economic simulation and ADR.
 
-### OQ-005 — Capital-market liquidity
-
-Identify who deposits the initial BIT and commodities and what mandate governs that liquidity. An AMM cannot guarantee useful buy quotes without funded reserves.
-
-**Status:** Governance/economic decision.
-
 ## Critical before gameplay implementation
-
-### OQ-006 — Death-drop access
-
-Should a death container be:
-
-- Immediately public.
-- Owner/team-only for a grace period, then public.
-- Private until expiry unless the death occurred in PvP.
-
-Expiration is fixed at six hours.
-
-### OQ-007 — Derelict salvage start
-
-The specification proposes public salvage at 24 hours and deletion at 36 hours. Confirm or replace the 24-hour threshold.
 
 ### OQ-008 — Registration pricing
 
