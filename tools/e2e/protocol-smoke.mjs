@@ -140,7 +140,7 @@ async function run() {
   ).snapshot;
   send({
     type: "hello",
-    protocol_version: 1,
+    protocol_version: 2,
     client_name: "node-authoritative-e2e",
   });
   assert.equal(world.conservation.valid, true);
@@ -149,7 +149,7 @@ async function run() {
   assert.ok(world.voxels.length > 1_000);
 
   const mined = new Set();
-  while (playerInventory(world).contents.ore < 4) {
+  while (playerInventory(world).contents.ore < 4 || mined.size < 3) {
     const voxel = reachableVoxel(world, mined);
     assert.ok(voxel, "a reachable unmined voxel is available");
     mined.add(coordinateKey(voxel.coordinate));
@@ -229,6 +229,12 @@ async function run() {
 
   assert.equal(world.grids.length, 2);
   assert.equal(world.conservation.valid, true);
+  assert.ok(world.player.level >= 2, "career experience advances clearance level");
+  assert.ok(world.player.career.voxels_mined >= 3);
+  assert.equal(world.player.career.refining_batches, 1);
+  assert.equal(world.player.career.components_crafted, 1);
+  assert.equal(world.player.career.blocks_built, 3);
+  assert.equal(world.player.career.anchors_engaged, 1);
   assert.ok(
     world.inventories.some(
       (inventory) =>
@@ -242,6 +248,8 @@ async function run() {
       event_sequence: world.event_sequence,
       simulation_tick: world.simulation_tick,
       grids: world.grids.length,
+      player_level: world.player.level,
+      experience: world.player.experience,
       voxels_remaining: world.voxels.length,
       world_hash: world.world_hash,
       conservation: world.conservation.valid,

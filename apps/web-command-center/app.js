@@ -5,7 +5,8 @@ const elements = Object.fromEntries(
     "connection", "universe", "cell", "event-sequence", "world-hash",
     "conservation", "fence", "world-counts", "grid-count", "ore", "refined",
     "components", "selected-grid", "grid-details", "activity", "universe-map",
-    "resync", "refine", "craft", "anchor", "stop",
+    "resync", "refine", "craft", "anchor", "stop", "profile-rank",
+    "career-progress",
   ].map((id) => [id, document.getElementById(id)]),
 );
 
@@ -22,8 +23,8 @@ function connect() {
     elements.connection.className = "connection online";
     socket.send(JSON.stringify({
       type: "hello",
-      protocol_version: 1,
-      client_name: "browser-command-center-p0",
+      protocol_version: 2,
+      client_name: "browser-command-center-p0.2",
     }));
   });
   socket.addEventListener("close", () => {
@@ -97,6 +98,14 @@ function render() {
     (inventory.refined_material ?? 0).toLocaleString();
   elements.components.textContent =
     (inventory.components ?? 0).toLocaleString();
+  const career = world.player.career ?? {};
+  elements["profile-rank"].textContent =
+    "SALVAGER // LEVEL " + (world.player.level ?? 1);
+  elements["career-progress"].textContent =
+    (world.player.experience ?? 0).toLocaleString() + " / " +
+    (world.player.next_level_experience ?? 100).toLocaleString() + " XP • " +
+    (career.voxels_mined ?? 0).toLocaleString() + " VOXELS • " +
+    (career.blocks_built ?? 0).toLocaleString() + " BLOCKS";
   elements.refine.disabled = ore < 2;
   elements.craft.disabled = refined < 1;
 

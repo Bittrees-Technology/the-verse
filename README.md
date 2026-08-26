@@ -2,7 +2,7 @@
 
 The Verse is an open-source persistent voxel space universe, work-and-economy simulator, and Web3 marketplace.
 
-The repository now contains the first **playable P0 vertical slice**. It is a local, single-player engineering proof of the authoritative gameplay loop, not yet the public multiplayer universe or real-value economy.
+The repository now contains **P0.2: Salvage Frontier**, a first-person local gameplay slice. It is still a single-player proof of the authoritative loop—not yet the public multiplayer universe or real-value economy—but it now presents that proof as a game rather than a simulation console.
 
 ## Play it on macOS
 
@@ -15,7 +15,20 @@ tools/dev/run-local.sh
 
 The bootstrap downloads the pinned Godot 4.7.2 editor from the official release and verifies its checksum. The launcher starts the authoritative server and native client. While the server is running, the browser command center is available at <http://127.0.0.1:7777>.
 
-Native controls are shown in the client. The main loop supports flying, voxel mining, ore refining, component crafting, cargo transfers, block construction, anchoring, grid motion, block damage, and grid splitting.
+You begin outside a powered 25-block salvage skiff beside an asteroid. The guided contract asks you to extract three voxels, refine ore, fabricate a component, extend the rig, and anchor it into the rock. Actions earn persistent career experience and clearance levels.
+
+Native controls are shown in the client:
+
+| Action | Control |
+| --- | --- |
+| EVA thrust / ascend / descend | `WASD` / `Space` / `C` |
+| Boost / toggle dampeners | `Shift` / `Z` |
+| Mine highlighted voxel | Hold left mouse |
+| Enter construction / choose block | `B` / `1`–`5` |
+| Weld construction hologram | Hold left mouse |
+| Cut and salvage a block | Hold right mouse |
+| Refine / fabricate / transfer cargo | `R` / `T` / `V` (`Shift+V` reverses transfer) |
+| Anchor / move / stop targeted grid | `F` / `M` / `X` |
 
 To run only the Linux-compatible headless server:
 
@@ -31,7 +44,7 @@ Linux native client packaging and signed direct downloads remain scheduled work.
 tools/ci/check.sh
 ```
 
-This runs the Rust tests and lints, browser syntax checks, Godot validation, and an end-to-end scenario that restarts the server and proves exact state recovery. See the [P0 implementation guide](docs/architecture/p0-implementation.md) for scope and limitations.
+This runs the Rust tests and lints, browser syntax checks, Godot validation, and an end-to-end scenario that restarts the server and proves exact state recovery. See the [Salvage Frontier gameplay specification](docs/gameplay/salvage-frontier.md) and [P0 implementation guide](docs/architecture/p0-implementation.md) for scope and limitations.
 
 ## Product pillars
 
@@ -58,7 +71,7 @@ Start with [the documentation map](docs/README.md), then read:
 
 ## Current status
 
-P0.1 validates the server-authoritative resource loop, deterministic rules, hash-chained persistence, idempotent operations, grid connectivity, and native/browser client integration. Multiplayer, collision physics, planets, safe zones, accounts, AMMs, and blockchain settlement are not in this slice. Those systems remain sequenced in the [delivery roadmap](docs/roadmap/roadmap.md).
+P0.2 adds a first-person EVA presentation, an industrial multi-tool, hold-to-work interactions, differentiated machinery, a larger starter construct, a guided salvage contract, and persistent career progression to the P0.1 authoritative foundation. Multiplayer, collision physics, planets, safe zones, accounts, AMMs, and blockchain settlement are not in this slice. Those systems remain sequenced in the [delivery roadmap](docs/roadmap/roadmap.md).
 
 ## Licensing
 

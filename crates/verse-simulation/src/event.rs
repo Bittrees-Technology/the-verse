@@ -56,6 +56,24 @@ pub enum EventPayload {
 }
 
 impl EventPayload {
+    pub fn experience_reward(&self) -> u64 {
+        match self {
+            Self::VoxelMined { ore_yield, .. } => ore_yield * 5,
+            Self::OreRefined { batches, .. } => batches * 12,
+            Self::ComponentCrafted { quantity, .. } => quantity * 18,
+            Self::InventoryTransferred { .. } => 2,
+            Self::BlockBuilt { .. } => 25,
+            Self::GridAnchorSet { anchored: true, .. } => 40,
+            Self::BlockDamaged { .. } => 3,
+            Self::PlayerMoved { .. }
+            | Self::GridMotionSet { .. }
+            | Self::GridAnchorSet {
+                anchored: false, ..
+            }
+            | Self::SimulationAdvanced { .. } => 0,
+        }
+    }
+
     pub fn receipt(&self) -> (&'static str, String) {
         match self {
             Self::PlayerMoved { .. } => ("player_moved", "Position accepted".into()),

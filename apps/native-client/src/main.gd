@@ -1,15 +1,24 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 extends Node3D
 
-const PROTOCOL_VERSION := 1
+const PROTOCOL_VERSION := 2
 const DEFAULT_SERVER := "ws://127.0.0.1:7777/ws"
 const PLAYER_INVENTORY := "inventory-player-local"
 const STARTER_GRID := "grid-starter"
-const MOVE_SPEED := 6.0
-const BOOST_MULTIPLIER := 3.0
+const MOVE_SPEED := 7.0
+const BOOST_MULTIPLIER := 2.1
+const MOVE_ACCELERATION := 18.0
+const MOVE_DAMPING := 7.5
 const MOUSE_SENSITIVITY := 0.0022
 const MOVE_SEND_INTERVAL := 0.10
 const TARGET_RANGE := 9.0
+const MINE_DURATION := 0.72
+const DAMAGE_DURATION := 0.46
+const SURFACE_NEIGHBORS := [
+	Vector3i(1, 0, 0), Vector3i(-1, 0, 0),
+	Vector3i(0, 1, 0), Vector3i(0, -1, 0),
+	Vector3i(0, 0, 1), Vector3i(0, 0, -1),
+]
 
 var socket := WebSocketPeer.new()
 var server_url := DEFAULT_SERVER
@@ -31,6 +40,15 @@ var smoke_test := false
 var smoke_operation := ""
 var last_socket_state := -1
 var closed_reported := false
+var player_velocity := Vector3.ZERO
+var dampeners_enabled := true
+var action_charge := 0.0
+var action_target_key := ""
+var action_cooldown := 0.0
+var tool_kick := 0.0
+var elapsed_time := 0.0
+var build_mode := false
+var last_level := 1
 
 var camera: Camera3D
 var asteroid_root: Node3D
@@ -43,16 +61,31 @@ var target_label: Label
 var message_label: Label
 var connection_label: Label
 var selected_label: Label
+var mission_label: Label
+var level_label: Label
+var telemetry_label: Label
+var interaction_label: Label
+var action_progress: ProgressBar
+var hotbar_label: Label
+var mode_label: Label
+var tool_root: Node3D
+var tool_tip: Node3D
+var tool_light: OmniLight3D
+var build_preview: MeshInstance3D
+var action_beam: MeshInstance3D
+var action_flare: MeshInstance3D
 
 var rock_material: StandardMaterial3D
 var ore_material: StandardMaterial3D
 var block_materials: Dictionary = {}
+var detail_materials: Dictionary = {}
 
 
 func _ready() -> void:
 	_parse_command_line()
 	_register_inputs()
 	_build_environment()
+	_build_viewmodel()
 	_build_interface()
 	Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
 	_connect_to_server()
@@ -63,9 +96,12 @@ func _exit_tree() -> void:
 
 
 func _process(delta: float) -> void:
+	elapsed_time += delta
 	_poll_socket()
 	_update_movement(delta)
 	_update_target()
+	_update_tool_action(delta)
+	_update_viewmodel(delta)
 	_update_interface()
 
 
@@ -89,16 +125,22 @@ func _unhandled_input(event: InputEvent) -> void:
 				)
 			KEY_1:
 				selected_block_kind = "structural"
+				build_mode = true
 			KEY_2:
 				selected_block_kind = "anchor"
+				build_mode = true
 			KEY_3:
 				selected_block_kind = "cargo"
+				build_mode = true
 			KEY_4:
 				selected_block_kind = "power_source"
+				build_mode = true
 			KEY_5:
 				selected_block_kind = "damage_test"
+				build_mode = true
 			KEY_B:
-				_build_selected_block()
+				build_mode = not build_mode
+				action_charge = 0.0
 			KEY_F:
 				_toggle_anchor()
 			KEY_M:
@@ -113,6 +155,11 @@ func _unhandled_input(event: InputEvent) -> void:
 				_transfer_to_or_from_cargo(event.shift_pressed)
 			KEY_P:
 				_send({"type": "request_snapshot"})
+			KEY_Z:
+				dampeners_enabled = not dampeners_enabled
+				_set_message(
+					"Inertial dampeners %s" % ("online" if dampeners_enabled else "offline")
+				)
 			KEY_F5:
 				_connect_to_server()
 
@@ -120,10 +167,9 @@ func _unhandled_input(event: InputEvent) -> void:
 		if Input.mouse_mode != Input.MOUSE_MODE_CAPTURED:
 			Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
 			return
-		if event.button_index == MOUSE_BUTTON_LEFT:
-			_mine_target_voxel()
-		elif event.button_index == MOUSE_BUTTON_RIGHT:
-			_damage_target_block()
+		if event.button_index == MOUSE_BUTTON_RIGHT:
+			build_mode = false
+			action_charge = 0.0
 
 
 func _parse_command_line() -> void:
@@ -159,8 +205,13 @@ func _build_environment() -> void:
 	environment.background_color = Color(0.004, 0.007, 0.015)
 	environment.ambient_light_source = Environment.AMBIENT_SOURCE_COLOR
 	environment.ambient_light_color = Color(0.20, 0.28, 0.42)
-	environment.ambient_light_energy = 0.52
+	environment.ambient_light_energy = 0.38
 	environment.tonemap_mode = Environment.TONE_MAPPER_FILMIC
+	environment.fog_enabled = true
+	environment.fog_light_color = Color(0.035, 0.07, 0.12)
+	environment.fog_light_energy = 0.34
+	environment.fog_density = 0.0018
+	environment.fog_sky_affect = 0.18
 	world_environment.environment = environment
 	add_child(world_environment)
 
@@ -179,10 +230,10 @@ func _build_environment() -> void:
 
 	camera = Camera3D.new()
 	camera.current = true
-	camera.fov = 76.0
+	camera.fov = 74.0
 	camera.near = 0.05
 	camera.far = 1500.0
-	camera.position = Vector3(10.0, 2.0, 4.0)
+	camera.position = Vector3(10.0, 3.0, 8.0)
 	add_child(camera)
 	camera.look_at(Vector3.ZERO, Vector3.UP)
 
@@ -196,20 +247,34 @@ func _build_environment() -> void:
 	stars_root.name = "Starfield"
 	add_child(stars_root)
 
-	rock_material = _material(Color(0.18, 0.23, 0.29), 0.92, 0.04)
-	ore_material = _material(Color(0.66, 0.26, 0.12), 0.72, 0.36)
+	rock_material = _material(Color(0.14, 0.18, 0.21), 0.96, 0.02)
+	rock_material.vertex_color_use_as_albedo = true
+	ore_material = _material(Color(0.58, 0.21, 0.08), 0.78, 0.32)
+	ore_material.vertex_color_use_as_albedo = true
 	block_materials = {
-		"structural": _material(Color(0.33, 0.40, 0.47), 0.58, 0.48),
-		"control_core": _material(Color(0.12, 0.58, 0.75), 0.42, 0.44),
-		"power_source": _material(Color(0.93, 0.50, 0.10), 0.36, 0.36),
-		"battery": _material(Color(0.83, 0.70, 0.18), 0.42, 0.32),
-		"cargo": _material(Color(0.22, 0.48, 0.31), 0.65, 0.18),
-		"drill": _material(Color(0.72, 0.22, 0.16), 0.48, 0.55),
-		"anchor": _material(Color(0.55, 0.30, 0.75), 0.50, 0.45),
-		"damage_test": _material(Color(0.72, 0.12, 0.16), 0.64, 0.22),
+		"structural": _material(Color(0.22, 0.27, 0.30), 0.72, 0.62),
+		"control_core": _material(Color(0.08, 0.24, 0.31), 0.46, 0.55),
+		"power_source": _material(Color(0.35, 0.19, 0.055), 0.40, 0.48),
+		"battery": _material(Color(0.31, 0.28, 0.07), 0.48, 0.38),
+		"cargo": _material(Color(0.11, 0.27, 0.20), 0.70, 0.28),
+		"drill": _material(Color(0.28, 0.11, 0.07), 0.50, 0.60),
+		"anchor": _material(Color(0.24, 0.12, 0.31), 0.54, 0.48),
+		"damage_test": _material(Color(0.36, 0.055, 0.04), 0.64, 0.32),
+	}
+	detail_materials = {
+		"steel": _material(Color(0.50, 0.58, 0.61), 0.38, 0.82),
+		"dark": _material(Color(0.025, 0.035, 0.045), 0.50, 0.68),
+		"cyan": _emissive_material(Color(0.10, 0.72, 1.0), 2.8),
+		"amber": _emissive_material(Color(1.0, 0.37, 0.055), 3.0),
+		"green": _emissive_material(Color(0.12, 0.95, 0.53), 2.2),
+		"red": _emissive_material(Color(1.0, 0.10, 0.045), 2.8),
+		"hologram": _hologram_material(),
 	}
 	_build_starfield()
+	_build_distant_world()
+	_build_orbital_dust()
 	_build_target_highlight()
+	_build_action_feedback()
 
 
 func _material(color: Color, roughness: float, metallic: float) -> StandardMaterial3D:
@@ -218,6 +283,101 @@ func _material(color: Color, roughness: float, metallic: float) -> StandardMater
 	material.roughness = roughness
 	material.metallic = metallic
 	return material
+
+
+func _emissive_material(color: Color, energy: float) -> StandardMaterial3D:
+	var material := _material(color * 0.28, 0.28, 0.36)
+	material.emission_enabled = true
+	material.emission = color
+	material.emission_energy_multiplier = energy
+	return material
+
+
+func _hologram_material() -> StandardMaterial3D:
+	var material := StandardMaterial3D.new()
+	material.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	material.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	material.albedo_color = Color(0.12, 0.78, 1.0, 0.22)
+	material.emission_enabled = true
+	material.emission = Color(0.08, 0.56, 1.0)
+	material.emission_energy_multiplier = 1.8
+	return material
+
+
+func _build_distant_world() -> void:
+	var planet := MeshInstance3D.new()
+	planet.name = "KhepriDistantWorld"
+	var planet_mesh := SphereMesh.new()
+	planet_mesh.radius = 22.0
+	planet_mesh.height = 44.0
+	planet_mesh.radial_segments = 48
+	planet_mesh.rings = 24
+	planet_mesh.material = _material(Color(0.055, 0.13, 0.18), 0.92, 0.02)
+	planet.mesh = planet_mesh
+	planet.position = Vector3(-86.0, -30.0, -180.0)
+	add_child(planet)
+
+	var moon := MeshInstance3D.new()
+	var moon_mesh := SphereMesh.new()
+	moon_mesh.radius = 3.8
+	moon_mesh.height = 7.6
+	moon_mesh.radial_segments = 16
+	moon_mesh.rings = 8
+	moon_mesh.material = _material(Color(0.22, 0.18, 0.16), 0.98, 0.01)
+	moon.mesh = moon_mesh
+	moon.position = Vector3(64.0, 28.0, -130.0)
+	add_child(moon)
+
+
+func _build_orbital_dust() -> void:
+	var mesh := SphereMesh.new()
+	mesh.radius = 0.025
+	mesh.height = 0.05
+	mesh.radial_segments = 4
+	mesh.rings = 2
+	mesh.material = _emissive_material(Color(0.40, 0.61, 0.72), 0.55)
+	var dust := MultiMesh.new()
+	dust.transform_format = MultiMesh.TRANSFORM_3D
+	dust.mesh = mesh
+	dust.instance_count = 180
+	var random := RandomNumberGenerator.new()
+	random.seed = 918_220
+	for index in dust.instance_count:
+		var point := Vector3(
+			random.randf_range(-42.0, 42.0),
+			random.randf_range(-24.0, 24.0),
+			random.randf_range(-42.0, 42.0)
+		)
+		dust.set_instance_transform(index, Transform3D(Basis(), point))
+	var instance := MultiMeshInstance3D.new()
+	instance.multimesh = dust
+	add_child(instance)
+
+
+func _build_action_feedback() -> void:
+	var beam_mesh := CylinderMesh.new()
+	beam_mesh.top_radius = 0.018
+	beam_mesh.bottom_radius = 0.035
+	beam_mesh.height = 1.0
+	beam_mesh.radial_segments = 8
+	beam_mesh.material = _emissive_material(Color(0.08, 0.78, 1.0), 5.0)
+	action_beam = MeshInstance3D.new()
+	action_beam.name = "ToolBeam"
+	action_beam.mesh = beam_mesh
+	action_beam.visible = false
+	add_child(action_beam)
+
+	var flare_mesh := SphereMesh.new()
+	flare_mesh.radius = 0.11
+	flare_mesh.height = 0.22
+	flare_mesh.radial_segments = 10
+	flare_mesh.rings = 5
+	flare_mesh.material = _emissive_material(Color(1.0, 0.29, 0.055), 7.0)
+	action_flare = MeshInstance3D.new()
+	action_flare.name = "ToolImpact"
+	action_flare.mesh = flare_mesh
+	action_flare.visible = false
+	add_child(action_flare)
 
 
 func _build_starfield() -> void:
@@ -269,6 +429,72 @@ func _build_target_highlight() -> void:
 	target_highlight.mesh = mesh
 	target_highlight.visible = false
 	add_child(target_highlight)
+	build_preview = MeshInstance3D.new()
+	var preview_mesh := BoxMesh.new()
+	preview_mesh.size = Vector3.ONE * 0.96
+	preview_mesh.material = detail_materials["hologram"]
+	build_preview.mesh = preview_mesh
+	build_preview.visible = false
+	add_child(build_preview)
+
+
+func _build_viewmodel() -> void:
+	tool_root = Node3D.new()
+	tool_root.name = "SalvageToolViewmodel"
+	tool_root.position = Vector3(0.42, -0.34, -0.74)
+	tool_root.rotation_degrees = Vector3(-7.0, -10.0, 2.0)
+	camera.add_child(tool_root)
+
+	var body := _box_visual(Vector3(0.24, 0.22, 0.54), detail_materials["dark"])
+	body.position = Vector3(0.0, 0.0, -0.02)
+	tool_root.add_child(body)
+	var housing := _box_visual(Vector3(0.29, 0.16, 0.28), detail_materials["steel"])
+	housing.position = Vector3(0.0, 0.035, -0.27)
+	tool_root.add_child(housing)
+	var grip := _box_visual(Vector3(0.12, 0.29, 0.13), detail_materials["dark"])
+	grip.position = Vector3(0.0, -0.21, 0.08)
+	grip.rotation_degrees.x = -12.0
+	tool_root.add_child(grip)
+
+	tool_tip = Node3D.new()
+	tool_tip.position = Vector3(0.0, 0.035, -0.50)
+	tool_root.add_child(tool_tip)
+	for offset in [-0.095, 0.095]:
+		var rail := _cylinder_visual(0.034, 0.26, detail_materials["steel"])
+		rail.rotation_degrees.x = 90.0
+		rail.position = Vector3(offset, 0.0, -0.08)
+		tool_tip.add_child(rail)
+	var emitter := _cylinder_visual(0.074, 0.12, detail_materials["cyan"])
+	emitter.rotation_degrees.x = 90.0
+	emitter.position.z = -0.19
+	tool_tip.add_child(emitter)
+	tool_light = OmniLight3D.new()
+	tool_light.light_color = Color(0.14, 0.72, 1.0)
+	tool_light.light_energy = 0.0
+	tool_light.omni_range = 4.0
+	tool_light.position.z = -0.28
+	tool_tip.add_child(tool_light)
+
+
+func _box_visual(size: Vector3, material: Material) -> MeshInstance3D:
+	var instance := MeshInstance3D.new()
+	var mesh := BoxMesh.new()
+	mesh.size = size
+	mesh.material = material
+	instance.mesh = mesh
+	return instance
+
+
+func _cylinder_visual(radius: float, height: float, material: Material) -> MeshInstance3D:
+	var instance := MeshInstance3D.new()
+	var mesh := CylinderMesh.new()
+	mesh.top_radius = radius
+	mesh.bottom_radius = radius
+	mesh.height = height
+	mesh.radial_segments = 12
+	mesh.material = material
+	instance.mesh = mesh
+	return instance
 
 
 func _build_interface() -> void:
@@ -276,100 +502,165 @@ func _build_interface() -> void:
 	add_child(canvas)
 
 	var top_bar := ColorRect.new()
-	top_bar.color = Color(0.025, 0.042, 0.065, 0.94)
+	top_bar.color = Color(0.012, 0.022, 0.034, 0.94)
 	top_bar.set_anchors_and_offsets_preset(Control.PRESET_TOP_WIDE)
-	top_bar.custom_minimum_size.y = 54.0
+	top_bar.custom_minimum_size.y = 52.0
 	canvas.add_child(top_bar)
+	var accent := ColorRect.new()
+	accent.color = Color(0.10, 0.67, 0.94, 0.9)
+	accent.position = Vector2(0.0, 50.0)
+	accent.size = Vector2(430.0, 2.0)
+	top_bar.add_child(accent)
 
 	var title := Label.new()
-	title.text = "THE VERSE  //  P0 INDUSTRIAL PROOF"
-	title.position = Vector2(22.0, 15.0)
-	title.add_theme_font_size_override("font_size", 20)
-	title.add_theme_color_override("font_color", Color(0.72, 0.90, 1.0))
+	title.text = "THE VERSE  //  SALVAGE FRONTIER"
+	title.position = Vector2(24.0, 13.0)
+	title.add_theme_font_size_override("font_size", 19)
+	title.add_theme_color_override("font_color", Color(0.78, 0.91, 0.98))
 	top_bar.add_child(title)
 
 	connection_label = Label.new()
 	connection_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
-	connection_label.position = Vector2(980.0, 17.0)
-	connection_label.size = Vector2(430.0, 28.0)
+	connection_label.set_anchors_preset(Control.PRESET_TOP_RIGHT)
+	connection_label.position = Vector2(-455.0, 16.0)
+	connection_label.size = Vector2(430.0, 24.0)
+	connection_label.add_theme_font_size_override("font_size", 12)
 	top_bar.add_child(connection_label)
 
-	var left_panel := ColorRect.new()
-	left_panel.color = Color(0.018, 0.029, 0.045, 0.86)
-	left_panel.position = Vector2(18.0, 72.0)
-	left_panel.size = Vector2(350.0, 228.0)
+	var left_panel := _hud_panel(Vector2(20.0, 74.0), Vector2(354.0, 252.0))
 	canvas.add_child(left_panel)
+	var suit_heading := _hud_label("EVA SUIT // ORPHEUS-7", Vector2(16.0, 13.0), 12)
+	suit_heading.add_theme_color_override("font_color", Color(0.42, 0.78, 0.96))
+	left_panel.add_child(suit_heading)
+	level_label = _hud_label("SALVAGER // LEVEL 1", Vector2(16.0, 39.0), 18)
+	level_label.add_theme_color_override("font_color", Color(0.94, 0.72, 0.28))
+	left_panel.add_child(level_label)
+	telemetry_label = _hud_label("SUIT 100  O₂ 100  POWER 100", Vector2(16.0, 70.0), 13)
+	telemetry_label.add_theme_color_override("font_color", Color(0.64, 0.90, 0.94))
+	left_panel.add_child(telemetry_label)
 
 	status_label = Label.new()
-	status_label.position = Vector2(16.0, 14.0)
-	status_label.size = Vector2(320.0, 78.0)
-	status_label.add_theme_font_size_override("font_size", 14)
+	status_label.position = Vector2(16.0, 170.0)
+	status_label.size = Vector2(322.0, 65.0)
+	status_label.add_theme_font_size_override("font_size", 11)
+	status_label.add_theme_color_override("font_color", Color(0.42, 0.52, 0.59))
 	left_panel.add_child(status_label)
 
 	inventory_label = Label.new()
-	inventory_label.position = Vector2(16.0, 92.0)
-	inventory_label.size = Vector2(320.0, 62.0)
-	inventory_label.add_theme_color_override("font_color", Color(0.95, 0.71, 0.27))
+	inventory_label.position = Vector2(16.0, 102.0)
+	inventory_label.size = Vector2(322.0, 58.0)
+	inventory_label.add_theme_font_size_override("font_size", 14)
+	inventory_label.add_theme_color_override("font_color", Color(0.92, 0.72, 0.32))
 	left_panel.add_child(inventory_label)
 
-	selected_label = Label.new()
-	selected_label.position = Vector2(16.0, 160.0)
-	selected_label.size = Vector2(320.0, 24.0)
-	left_panel.add_child(selected_label)
-
-	target_label = Label.new()
-	target_label.position = Vector2(16.0, 188.0)
-	target_label.size = Vector2(320.0, 28.0)
-	target_label.add_theme_color_override("font_color", Color(0.48, 0.86, 1.0))
-	left_panel.add_child(target_label)
-
-	var help_panel := ColorRect.new()
-	help_panel.color = Color(0.018, 0.029, 0.045, 0.82)
-	help_panel.set_anchors_preset(Control.PRESET_TOP_RIGHT)
-	help_panel.position = Vector2(-390.0, 72.0)
-	help_panel.size = Vector2(370.0, 360.0)
-	canvas.add_child(help_panel)
-	var help := Label.new()
-	help.position = Vector2(16.0, 14.0)
-	help.size = Vector2(340.0, 340.0)
-	help.text = (
-		"FLIGHT\n"
-		+ "WASD move  •  Space/C vertical  •  Shift boost\n"
-		+ "Mouse look  •  Esc release cursor\n\n"
-		+ "INDUSTRY\n"
-		+ "Left click mine voxel  •  R refine 2 ore\n"
-		+ "T craft component  •  V move 1 ore to cargo\n"
-		+ "Shift+V move 1 ore back\n\n"
-		+ "CONSTRUCTION\n"
-		+ "1 structure  2 anchor  3 cargo  4 power  5 test\n"
-		+ "Aim at grid + B build  •  Right click damage\n"
-		+ "F anchor/release  •  M move grid  •  X stop\n\n"
-		+ "SYSTEM\n"
-		+ "P resync  •  F5 reconnect"
-	)
-	help.add_theme_font_size_override("font_size", 14)
-	help.add_theme_color_override("font_color", Color(0.74, 0.81, 0.88))
-	help_panel.add_child(help)
+	var mission_panel := _hud_panel(Vector2(-404.0, 74.0), Vector2(384.0, 238.0))
+	mission_panel.set_anchors_preset(Control.PRESET_TOP_RIGHT)
+	canvas.add_child(mission_panel)
+	var mission_heading := _hud_label("ACTIVE CONTRACT // PRIORITY", Vector2(17.0, 14.0), 11)
+	mission_heading.add_theme_color_override("font_color", Color(1.0, 0.35, 0.12))
+	mission_panel.add_child(mission_heading)
+	var contract_name := _hud_label("WAKE THE KHEPRI RELAY", Vector2(17.0, 39.0), 18)
+	contract_name.add_theme_color_override("font_color", Color(0.90, 0.94, 0.96))
+	mission_panel.add_child(contract_name)
+	mission_label = _hud_label("Awaiting authoritative career record…", Vector2(17.0, 76.0), 14)
+	mission_label.size = Vector2(350.0, 145.0)
+	mission_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	mission_label.add_theme_color_override("font_color", Color(0.69, 0.78, 0.83))
+	mission_panel.add_child(mission_label)
 
 	var crosshair := Label.new()
-	crosshair.text = "+"
+	crosshair.text = "◇"
 	crosshair.set_anchors_and_offsets_preset(Control.PRESET_CENTER)
-	crosshair.position -= Vector2(9.0, 18.0)
-	crosshair.add_theme_font_size_override("font_size", 28)
-	crosshair.add_theme_color_override("font_color", Color(0.65, 0.92, 1.0))
+	crosshair.position -= Vector2(11.0, 19.0)
+	crosshair.add_theme_font_size_override("font_size", 26)
+	crosshair.add_theme_color_override("font_color", Color(0.54, 0.91, 1.0, 0.86))
 	canvas.add_child(crosshair)
 
+	interaction_label = Label.new()
+	interaction_label.set_anchors_preset(Control.PRESET_CENTER)
+	interaction_label.position = Vector2(-210.0, 42.0)
+	interaction_label.size = Vector2(420.0, 56.0)
+	interaction_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	interaction_label.add_theme_font_size_override("font_size", 14)
+	interaction_label.add_theme_color_override("font_color", Color(0.68, 0.91, 1.0))
+	canvas.add_child(interaction_label)
+	target_label = interaction_label
+
+	action_progress = ProgressBar.new()
+	action_progress.set_anchors_preset(Control.PRESET_CENTER)
+	action_progress.position = Vector2(-122.0, 94.0)
+	action_progress.size = Vector2(244.0, 7.0)
+	action_progress.min_value = 0.0
+	action_progress.max_value = 1.0
+	action_progress.show_percentage = false
+	action_progress.add_theme_stylebox_override("background", _bar_style(Color(0.02, 0.05, 0.07, 0.92)))
+	action_progress.add_theme_stylebox_override("fill", _bar_style(Color(0.10, 0.73, 1.0, 0.94)))
+	canvas.add_child(action_progress)
+
+	mode_label = Label.new()
+	mode_label.set_anchors_preset(Control.PRESET_BOTTOM_WIDE)
+	mode_label.offset_top = -142.0
+	mode_label.offset_bottom = -117.0
+	mode_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	mode_label.add_theme_font_size_override("font_size", 12)
+	mode_label.add_theme_color_override("font_color", Color(0.46, 0.73, 0.86))
+	canvas.add_child(mode_label)
+
+	var hotbar := _hud_panel(Vector2(-380.0, -112.0), Vector2(760.0, 62.0))
+	hotbar.set_anchors_preset(Control.PRESET_CENTER_BOTTOM)
+	canvas.add_child(hotbar)
+	hotbar_label = _hud_label("", Vector2(14.0, 12.0), 13)
+	hotbar_label.size = Vector2(732.0, 38.0)
+	hotbar_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	hotbar.add_child(hotbar_label)
+	selected_label = hotbar_label
+
+	var controls := _hud_label(
+		"WASD / SPACE / C  EVA THRUST    SHIFT  BOOST    Z  DAMPENERS    B  BUILD MODE    HOLD LMB  USE TOOL    RMB  CUT / EXIT BUILD",
+		Vector2(20.0, -40.0),
+		11
+	)
+	controls.set_anchors_preset(Control.PRESET_BOTTOM_LEFT)
+	controls.add_theme_color_override("font_color", Color(0.43, 0.53, 0.60))
+	canvas.add_child(controls)
+
 	var bottom_bar := ColorRect.new()
-	bottom_bar.color = Color(0.025, 0.042, 0.065, 0.92)
+	bottom_bar.color = Color(0.012, 0.022, 0.034, 0.94)
 	bottom_bar.set_anchors_and_offsets_preset(Control.PRESET_BOTTOM_WIDE)
-	bottom_bar.position.y -= 56.0
-	bottom_bar.custom_minimum_size.y = 56.0
+	bottom_bar.position.y -= 34.0
+	bottom_bar.custom_minimum_size.y = 34.0
 	canvas.add_child(bottom_bar)
 	message_label = Label.new()
-	message_label.position = Vector2(22.0, 17.0)
+	message_label.position = Vector2(22.0, 8.0)
 	message_label.size = Vector2(1350.0, 28.0)
-	message_label.add_theme_font_size_override("font_size", 15)
+	message_label.add_theme_font_size_override("font_size", 12)
 	bottom_bar.add_child(message_label)
+
+
+func _hud_panel(position: Vector2, size: Vector2) -> ColorRect:
+	var panel := ColorRect.new()
+	panel.color = Color(0.012, 0.025, 0.037, 0.88)
+	panel.position = position
+	panel.size = size
+	return panel
+
+
+func _hud_label(text: String, position: Vector2, font_size: int) -> Label:
+	var label := Label.new()
+	label.text = text
+	label.position = position
+	label.add_theme_font_size_override("font_size", font_size)
+	return label
+
+
+func _bar_style(color: Color) -> StyleBoxFlat:
+	var style := StyleBoxFlat.new()
+	style.bg_color = color
+	style.corner_radius_top_left = 2
+	style.corner_radius_top_right = 2
+	style.corner_radius_bottom_left = 2
+	style.corner_radius_bottom_right = 2
+	return style
 
 
 func _connect_to_server() -> void:
@@ -460,8 +751,17 @@ func _apply_snapshot(authoritative: Dictionary) -> void:
 	if first_snapshot or camera.position.distance_to(position) > 2.8:
 		camera.position = position
 		if first_snapshot:
-			camera.look_at(Vector3.ZERO, Vector3.UP)
+			var grids: Array = snapshot.get("grids", [])
+			var focus := Vector3.ZERO
+			if not grids.is_empty():
+				focus = _vec3(grids[0].get("position", {}))
+			camera.look_at(focus, Vector3.UP)
 	first_snapshot = false
+	var level := int(player.get("level", 1))
+	if level > last_level:
+		_set_message("CLEARANCE ADVANCED // SALVAGER LEVEL %d" % level)
+		tool_kick = 1.0
+	last_level = level
 
 	var voxels: Array = snapshot.get("voxels", [])
 	if voxels.size() != rendered_voxel_count:
@@ -481,8 +781,6 @@ func _rebuild_voxels(voxels: Array) -> void:
 	for child in asteroid_root.get_children():
 		child.queue_free()
 	voxel_lookup.clear()
-	var rock_positions: Array[Vector3] = []
-	var ore_positions: Array[Vector3] = []
 	for voxel in voxels:
 		var coordinate: Dictionary = voxel.get("coordinate", {})
 		var grid_position := Vector3i(
@@ -491,12 +789,25 @@ func _rebuild_voxels(voxels: Array) -> void:
 			int(coordinate.get("z", 0))
 		)
 		voxel_lookup[_coord_key(grid_position)] = voxel
+	var rock_positions: Array[Vector3] = []
+	var ore_positions: Array[Vector3] = []
+	for voxel in voxels:
+		var grid_position := _coord_i(voxel.get("coordinate", {}))
+		if not _is_surface_voxel(grid_position):
+			continue
 		if voxel.get("material", "rock") == "ferrite_ore":
 			ore_positions.append(Vector3(grid_position))
 		else:
 			rock_positions.append(Vector3(grid_position))
 	_add_voxel_multimesh(rock_positions, rock_material, "RockVoxels")
 	_add_voxel_multimesh(ore_positions, ore_material, "FerriteVoxels")
+
+
+func _is_surface_voxel(coordinate: Vector3i) -> bool:
+	for offset in SURFACE_NEIGHBORS:
+		if not voxel_lookup.has(_coord_key(coordinate + offset)):
+			return true
+	return false
 
 
 func _add_voxel_multimesh(
@@ -506,19 +817,49 @@ func _add_voxel_multimesh(
 ) -> void:
 	if positions.is_empty():
 		return
-	var mesh := BoxMesh.new()
-	mesh.size = Vector3.ONE * 0.96
+	var mesh := SphereMesh.new()
+	mesh.radius = 0.66
+	mesh.height = 1.28
+	mesh.radial_segments = 7
+	mesh.rings = 4
 	mesh.material = material
 	var multimesh := MultiMesh.new()
 	multimesh.transform_format = MultiMesh.TRANSFORM_3D
+	multimesh.use_colors = true
 	multimesh.mesh = mesh
 	multimesh.instance_count = positions.size()
 	for index in positions.size():
-		multimesh.set_instance_transform(index, Transform3D(Basis(), positions[index]))
+		var position := positions[index]
+		var variation := _position_variation(position)
+		var secondary := _position_variation(position + Vector3(17.0, -9.0, 23.0))
+		var scale := 0.87 + variation * 0.15
+		var basis := Basis.from_euler(Vector3(
+			variation * 2.1,
+			secondary * 3.4,
+			(variation + secondary) * 1.7
+		))
+		basis = basis.scaled(Vector3(
+			scale * (0.91 + secondary * 0.16),
+			scale * (0.94 + variation * 0.12),
+			scale * (0.90 + (1.0 - secondary) * 0.18)
+		))
+		multimesh.set_instance_transform(
+			index,
+			Transform3D(basis, position)
+		)
+		var tint := 0.72 + variation * 0.34
+		multimesh.set_instance_color(index, Color(tint, tint * 0.97, tint * 0.92, 1.0))
 	var instance := MultiMeshInstance3D.new()
 	instance.name = node_name
 	instance.multimesh = multimesh
 	asteroid_root.add_child(instance)
+
+
+func _position_variation(position: Vector3) -> float:
+	return fposmod(
+		abs(sin(position.dot(Vector3(12.9898, 78.233, 37.719))) * 43758.5453),
+		1.0
+	)
 
 
 func _rebuild_grids(grids: Array) -> void:
@@ -533,39 +874,143 @@ func _rebuild_grids(grids: Array) -> void:
 		grid_node.position = _vec3(grid.get("position", {}))
 		grid_node.rotation.y = float(grid.get("yaw_radians", 0.0))
 		for block in grid.get("blocks", []):
-			var mesh_instance := MeshInstance3D.new()
-			mesh_instance.name = block.get("block_id", "block")
-			var mesh := BoxMesh.new()
-			mesh.size = Vector3.ONE * 0.94
-			mesh.material = block_materials.get(
-				block.get("kind", "structural"),
-				block_materials["structural"]
-			)
-			mesh_instance.mesh = mesh
+			var block_visual := _build_block_visual(block)
 			var coordinate: Dictionary = block.get("coordinate", {})
-			mesh_instance.position = Vector3(
+			block_visual.position = Vector3(
 				float(coordinate.get("x", 0)),
 				float(coordinate.get("y", 0)),
 				float(coordinate.get("z", 0))
 			)
-			grid_node.add_child(mesh_instance)
+			grid_node.add_child(block_visual)
+		if grid.get("power", {}).get("online", false):
+			var work_light := OmniLight3D.new()
+			work_light.light_color = Color(0.24, 0.72, 1.0)
+			work_light.light_energy = 1.35
+			work_light.omni_range = 10.0
+			work_light.shadow_enabled = true
+			work_light.position = Vector3(0.0, 2.2, 0.0)
+			grid_node.add_child(work_light)
 		grids_root.add_child(grid_node)
+
+
+func _build_block_visual(block: Dictionary) -> Node3D:
+	var root := Node3D.new()
+	root.name = block.get("block_id", "block")
+	var kind: String = block.get("kind", "structural")
+	var base := _box_visual(
+		Vector3.ONE * 0.92,
+		block_materials.get(kind, block_materials["structural"])
+	)
+	root.add_child(base)
+	var front_panel := _box_visual(Vector3(0.64, 0.60, 0.035), detail_materials["dark"])
+	front_panel.position.z = -0.475
+	root.add_child(front_panel)
+
+	match kind:
+		"structural":
+			for x in [-0.34, 0.34]:
+				for y in [-0.31, 0.31]:
+					var fastener := _cylinder_visual(0.035, 0.025, detail_materials["steel"])
+					fastener.rotation_degrees.x = 90.0
+					fastener.position = Vector3(x, y, -0.50)
+					root.add_child(fastener)
+		"control_core":
+			var display := _box_visual(Vector3(0.44, 0.30, 0.045), detail_materials["cyan"])
+			display.position = Vector3(0.0, 0.05, -0.505)
+			root.add_child(display)
+			var mast := _cylinder_visual(0.035, 0.72, detail_materials["steel"])
+			mast.position = Vector3(0.0, 0.76, 0.0)
+			root.add_child(mast)
+			var beacon := _cylinder_visual(0.075, 0.11, detail_materials["cyan"])
+			beacon.position = Vector3(0.0, 1.14, 0.0)
+			root.add_child(beacon)
+		"power_source":
+			for y in [-0.25, 0.0, 0.25]:
+				var vent := _box_visual(Vector3(0.62, 0.07, 0.055), detail_materials["amber"])
+				vent.position = Vector3(0.0, y, -0.505)
+				root.add_child(vent)
+		"battery":
+			for x in [-0.22, 0.0, 0.22]:
+				var cell := _cylinder_visual(0.09, 0.62, detail_materials["amber"])
+				cell.position = Vector3(x, 0.0, -0.33)
+				root.add_child(cell)
+		"cargo":
+			var door := _box_visual(Vector3(0.56, 0.52, 0.055), detail_materials["steel"])
+			door.position.z = -0.50
+			root.add_child(door)
+			var cargo_light := _box_visual(Vector3(0.33, 0.055, 0.065), detail_materials["green"])
+			cargo_light.position = Vector3(0.0, 0.32, -0.53)
+			root.add_child(cargo_light)
+		"drill":
+			var shaft := _cylinder_visual(0.16, 0.82, detail_materials["steel"])
+			shaft.rotation_degrees.x = 90.0
+			shaft.position.z = -0.68
+			root.add_child(shaft)
+			var bit := MeshInstance3D.new()
+			var cone := CylinderMesh.new()
+			cone.top_radius = 0.0
+			cone.bottom_radius = 0.25
+			cone.height = 0.52
+			cone.radial_segments = 8
+			cone.material = detail_materials["steel"]
+			bit.mesh = cone
+			bit.rotation_degrees.x = 90.0
+			bit.position.z = -1.30
+			root.add_child(bit)
+		"anchor":
+			for x in [-0.22, 0.22]:
+				var prong := _box_visual(Vector3(0.13, 0.18, 0.65), detail_materials["steel"])
+				prong.position = Vector3(x, 0.0, -0.65)
+				root.add_child(prong)
+			var anchor_light := _box_visual(Vector3(0.36, 0.07, 0.05), detail_materials["cyan"])
+			anchor_light.position = Vector3(0.0, 0.30, -0.51)
+			root.add_child(anchor_light)
+		"damage_test":
+			for offset in [-0.22, 0.22]:
+				var warning := _box_visual(Vector3(0.11, 0.62, 0.055), detail_materials["red"])
+				warning.position = Vector3(offset, 0.0, -0.51)
+				warning.rotation_degrees.z = 22.0
+				root.add_child(warning)
+	return root
 
 
 func _update_movement(delta: float) -> void:
 	if Input.mouse_mode != Input.MOUSE_MODE_CAPTURED:
 		return
-	var input := Vector3(
+	var movement_input := Vector3(
 		Input.get_action_strength("move_right") - Input.get_action_strength("move_left"),
 		Input.get_action_strength("move_up") - Input.get_action_strength("move_down"),
 		Input.get_action_strength("move_backward") - Input.get_action_strength("move_forward")
 	)
-	if input.length_squared() > 0.0:
-		input = input.normalized()
+	var desired_velocity := player_velocity
+	if movement_input.length_squared() > 0.0:
+		movement_input = movement_input.normalized()
 		var speed := MOVE_SPEED
 		if Input.is_action_pressed("move_boost"):
 			speed *= BOOST_MULTIPLIER
-		camera.position += camera.basis * input * speed * delta
+		desired_velocity = camera.basis * movement_input * speed
+		player_velocity = player_velocity.move_toward(desired_velocity, MOVE_ACCELERATION * delta)
+	elif dampeners_enabled:
+		player_velocity = player_velocity.move_toward(Vector3.ZERO, MOVE_DAMPING * delta)
+
+	var proposed_position := camera.position + player_velocity * delta
+	if _position_is_clear(proposed_position):
+		camera.position = proposed_position
+	else:
+		player_velocity *= 0.18
+		tool_kick = max(tool_kick, 0.22)
+
+	var boost_amount: float = clampf(
+		player_velocity.length() / (MOVE_SPEED * BOOST_MULTIPLIER),
+		0.0,
+		1.0
+	)
+	camera.fov = lerpf(camera.fov, 74.0 + boost_amount * 8.0, minf(delta * 5.0, 1.0))
+	camera.rotation.z = lerpf(
+		camera.rotation.z,
+		-movement_input.x * 0.028,
+		minf(delta * 4.0, 1.0)
+	)
 
 	move_send_elapsed += delta
 	if connected and move_send_elapsed >= MOVE_SEND_INTERVAL:
@@ -577,9 +1022,25 @@ func _update_movement(delta: float) -> void:
 		})
 
 
+func _position_is_clear(position: Vector3) -> bool:
+	var collision_offsets: Array[Vector3] = [
+		Vector3.ZERO,
+		Vector3(0.32, 0.0, 0.0), Vector3(-0.32, 0.0, 0.0),
+		Vector3(0.0, 0.32, 0.0), Vector3(0.0, -0.32, 0.0),
+		Vector3(0.0, 0.0, 0.32), Vector3(0.0, 0.0, -0.32),
+	]
+	for offset in collision_offsets:
+		var sample: Vector3 = position + offset
+		var coordinate := Vector3i(roundi(sample.x), roundi(sample.y), roundi(sample.z))
+		if voxel_lookup.has(_coord_key(coordinate)):
+			return false
+	return true
+
+
 func _update_target() -> void:
 	target_voxel = _raymarch_voxel()
 	target_block = _ray_target_block()
+	build_preview.visible = false
 	if target_voxel != null:
 		target_highlight.visible = true
 		target_highlight.global_position = Vector3(target_voxel)
@@ -588,6 +1049,13 @@ func _update_target() -> void:
 		target_highlight.global_position = target_block.get("world_position", Vector3.ZERO)
 	else:
 		target_highlight.visible = false
+	if build_mode and not target_block.is_empty():
+		var grid: Dictionary = target_block["grid"]
+		var grid_position := _vec3(grid.get("position", {}))
+		var grid_basis := Basis(Vector3.UP, float(grid.get("yaw_radians", 0.0)))
+		build_preview.global_position = grid_position + grid_basis * Vector3(_build_coordinate())
+		build_preview.global_rotation = Vector3(0.0, float(grid.get("yaw_radians", 0.0)), 0.0)
+		build_preview.visible = true
 
 
 func _raymarch_voxel() -> Variant:
@@ -637,6 +1105,108 @@ func _ray_target_block() -> Dictionary:
 	return best
 
 
+func _update_tool_action(delta: float) -> void:
+	action_cooldown = maxf(0.0, action_cooldown - delta)
+	var holding_primary := Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT)
+	var holding_secondary := Input.is_mouse_button_pressed(MOUSE_BUTTON_RIGHT)
+	var action_key := ""
+	var duration := MINE_DURATION
+	var action_name := ""
+
+	if holding_secondary and not target_block.is_empty():
+		action_key = "damage:%s" % target_block["block"].get("block_id", "")
+		duration = DAMAGE_DURATION
+		action_name = "CUTTING ARMOR"
+	elif holding_primary and build_mode and not target_block.is_empty():
+		action_key = "build:%s:%s" % [target_block.get("grid_id", ""), str(_build_coordinate())]
+		duration = DAMAGE_DURATION
+		action_name = "WELDING %s" % selected_block_kind.to_upper()
+	elif holding_primary and not build_mode and target_voxel != null:
+		action_key = "mine:%s" % _coord_key(target_voxel)
+		duration = MINE_DURATION
+		action_name = "EXTRACTING ORE"
+
+	if action_key.is_empty() or action_cooldown > 0.0:
+		action_charge = maxf(0.0, action_charge - delta * 3.5)
+		action_target_key = ""
+		action_progress.value = action_charge
+		return
+	if action_key != action_target_key:
+		action_target_key = action_key
+		action_charge = 0.0
+	action_charge += delta / duration
+	action_progress.value = clampf(action_charge, 0.0, 1.0)
+	mode_label.text = action_name
+	tool_kick = maxf(tool_kick, minf(action_charge, 0.62))
+	if action_charge < 1.0:
+		return
+
+	action_charge = 0.0
+	action_target_key = ""
+	action_cooldown = 0.42
+	tool_kick = 1.0
+	if holding_secondary:
+		_damage_target_block()
+	elif build_mode:
+		_build_selected_block()
+	else:
+		_mine_target_voxel()
+
+
+func _update_viewmodel(delta: float) -> void:
+	tool_kick = move_toward(tool_kick, 0.0, delta * 4.2)
+	var motion := clampf(player_velocity.length() / MOVE_SPEED, 0.0, 1.5)
+	var bob := Vector3(
+		sin(elapsed_time * 3.7) * 0.008 * motion,
+		cos(elapsed_time * 6.2) * 0.007 * motion,
+		tool_kick * 0.055
+	)
+	tool_root.position = Vector3(0.42, -0.34, -0.74) + bob
+	tool_root.rotation_degrees = Vector3(
+		-7.0 - tool_kick * 4.0,
+		-10.0,
+		2.0 + sin(elapsed_time * 3.2) * motion
+	)
+	tool_tip.rotation.z += delta * (18.0 if action_charge > 0.0 else 1.2)
+	tool_light.light_energy = lerpf(
+		tool_light.light_energy,
+		5.0 if action_charge > 0.0 else 0.0,
+		minf(delta * 14.0, 1.0)
+	)
+	_update_action_feedback()
+
+
+func _update_action_feedback() -> void:
+	var active := action_charge > 0.0 and not action_target_key.is_empty()
+	action_beam.visible = active
+	action_flare.visible = active
+	if not active:
+		return
+	var target_position := _active_action_position()
+	var beam_origin := tool_tip.global_position
+	var beam_vector := target_position - beam_origin
+	if beam_vector.length_squared() < 0.001:
+		action_beam.visible = false
+		return
+	action_beam.global_position = (beam_origin + target_position) * 0.5
+	action_beam.global_basis = Basis(Quaternion(Vector3.UP, beam_vector.normalized())).scaled(
+		Vector3(1.0, beam_vector.length(), 1.0)
+	)
+	action_flare.global_position = target_position
+	var pulse := 0.72 + sin(elapsed_time * 38.0) * 0.22 + action_charge * 0.42
+	action_flare.scale = Vector3.ONE * pulse
+
+
+func _active_action_position() -> Vector3:
+	if action_target_key.begins_with("mine:") and target_voxel != null:
+		return Vector3(target_voxel)
+	if action_target_key.begins_with("build:"):
+		return build_preview.global_position
+	if not target_block.is_empty():
+		return target_block.get("world_position", camera.global_position - camera.basis.z * 2.0)
+	return camera.global_position - camera.basis.z * 2.0
+
+
 func _mine_target_voxel() -> void:
 	if target_voxel == null:
 		_set_message("Aim at an asteroid voxel within mining range", true)
@@ -665,6 +1235,19 @@ func _build_selected_block() -> void:
 	if target_block.is_empty():
 		_set_message("Aim at a grid block before building", true)
 		return
+	var coordinate := _build_coordinate()
+	_send({
+		"type": "build_block",
+		"operation_id": _operation_id("build"),
+		"grid_id": target_block["grid_id"],
+		"coordinate": _protocol_ivec3(coordinate),
+		"kind": selected_block_kind,
+	})
+
+
+func _build_coordinate() -> Vector3i:
+	if target_block.is_empty():
+		return Vector3i.ZERO
 	var grid: Dictionary = target_block["grid"]
 	var block: Dictionary = target_block["block"]
 	var current := _coord_i(block.get("coordinate", {}))
@@ -680,14 +1263,7 @@ func _build_selected_block() -> void:
 			camera.global_position - target_block.get("world_position", Vector3.ZERO)
 		)
 		offset = _dominant_axis(toward_camera)
-	var coordinate := current + offset
-	_send({
-		"type": "build_block",
-		"operation_id": _operation_id("build"),
-		"grid_id": target_block["grid_id"],
-		"coordinate": _protocol_ivec3(coordinate),
-		"kind": selected_block_kind,
-	})
+	return current + offset
 
 
 func _toggle_anchor() -> void:
@@ -788,36 +1364,41 @@ func _operation_id(prefix: String) -> String:
 
 func _update_interface() -> void:
 	connection_label.text = (
-		"● CONNECTED  %s" % server_url
+		"● LINKED // ORIGIN CELL"
 		if connected
-		else "○ OFFLINE  %s" % server_url
+		else "○ RELAY OFFLINE // F5 TO RETRY"
 	)
 	connection_label.add_theme_color_override(
 		"font_color",
 		Color(0.35, 0.95, 0.62) if connected else Color(1.0, 0.38, 0.25)
 	)
+	var player: Dictionary = snapshot.get("player", {})
+	var level := int(player.get("level", 1))
+	var experience := int(player.get("experience", 0))
+	var next_level := int(player.get("next_level_experience", 100))
+	level_label.text = "SALVAGER // LEVEL %d     REP %d / %d" % [level, experience, next_level]
+	var suit_power := clampi(100 - roundi(player_velocity.length() * 1.4), 72, 100)
+	telemetry_label.text = "INTEGRITY 100     O₂ 100     SUIT POWER %d" % suit_power
 	status_label.text = (
-		"Universe  %s\nCell  %s\nEvent  %d  •  Tick  %d\nFence  %d  •  Hash  %s"
+		"%s  //  %s\nAUTH EVENT %d    TICK %d\nLEDGER %s    HASH %s"
 		% [
-			snapshot.get("universe_id", "awaiting state"),
-			snapshot.get("cell_id", "—"),
+			String(snapshot.get("universe_id", "AWAITING")).to_upper(),
+			String(snapshot.get("cell_id", "—")).to_upper(),
 			int(snapshot.get("event_sequence", 0)),
 			int(snapshot.get("simulation_tick", 0)),
-			int(snapshot.get("fencing_token", 0)),
-			String(snapshot.get("world_hash", "—")).left(12),
+			"CONSERVED" if snapshot.get("conservation", {}).get("valid", false) else "FAULT",
+			String(snapshot.get("world_hash", "—")).left(8),
 		]
 	)
 	var player_inventory := _inventory(PLAYER_INVENTORY)
 	var contents: Dictionary = player_inventory.get("contents", {})
 	var conserved: Dictionary = snapshot.get("conservation", {})
 	inventory_label.text = (
-		"ORE  %d     REFINED  %d     COMPONENTS  %d\n"
-		+ "CONSERVATION  %s"
+		"CARGO HARNESS\nORE  %03d     ALLOY  %03d     PARTS  %03d"
 	) % [
 		int(contents.get("ore", 0)),
 		int(contents.get("refined_material", 0)),
 		int(contents.get("components", 0)),
-		"VALID" if conserved.get("valid", false) else "INVALID",
 	]
 	inventory_label.add_theme_color_override(
 		"font_color",
@@ -825,24 +1406,109 @@ func _update_interface() -> void:
 		if conserved.get("valid", false)
 		else Color(1.0, 0.18, 0.18)
 	)
-	selected_label.text = "BUILD SELECTION  %s" % selected_block_kind.to_upper()
+	var career: Dictionary = player.get("career", {})
+	mission_label.text = _mission_text(career)
+	if build_mode:
+		var choices := [
+			["1", "FRAME", "structural"],
+			["2", "ANCHOR", "anchor"],
+			["3", "CARGO", "cargo"],
+			["4", "POWER", "power_source"],
+			["5", "BREACH", "damage_test"],
+		]
+		var hotbar_parts: Array[String] = []
+		for choice in choices:
+			var text := "[%s] %s" % [choice[0], choice[1]]
+			if choice[2] == selected_block_kind:
+				text = "▶ " + text + " ◀"
+			hotbar_parts.append(text)
+		hotbar_label.text = "     ".join(hotbar_parts)
+	else:
+		hotbar_label.text = "HAND DRILL ACTIVE     [B] CONSTRUCTION     [R] REFINE     [T] FABRICATE     [V] CARGO TRANSFER"
 	if target_voxel != null:
 		var voxel: Dictionary = voxel_lookup.get(_coord_key(target_voxel), {})
-		target_label.text = "TARGET  %s voxel  %s" % [
-			voxel.get("material", "rock").to_upper(),
-			str(target_voxel),
-		]
+		var deposit := (
+			"FERRITE DEPOSIT // HIGH YIELD"
+			if voxel.get("material", "rock") == "ferrite_ore"
+			else "CARBONACEOUS ROCK // LOW YIELD"
+		)
+		target_label.text = "%s\nHOLD LMB  //  EXTRACT" % deposit
 	elif not target_block.is_empty():
 		var block: Dictionary = target_block["block"]
-		target_label.text = "TARGET  %s  HP %d  [%s]" % [
-			String(block.get("kind", "block")).to_upper(),
-			int(block.get("health", 0)),
-			target_block.get("grid_id", ""),
-		]
+		if build_mode:
+			target_label.text = "%s // HP %d\nHOLD LMB  //  WELD %s" % [
+				String(block.get("kind", "block")).to_upper(),
+				int(block.get("health", 0)),
+				selected_block_kind.to_upper(),
+			]
+		else:
+			target_label.text = "%s // HP %d\nHOLD RMB  //  CUT AND SALVAGE" % [
+				String(block.get("kind", "block")).to_upper(),
+				int(block.get("health", 0)),
+			]
 	else:
-		target_label.text = "TARGET  none"
+		target_label.text = (
+			"CONSTRUCTION MODE // AIM AT A GRID BLOCK"
+			if build_mode
+			else "EVA NAVIGATION // AIM AT ROCK OR MACHINERY"
+		)
+	if action_charge <= 0.0:
+		mode_label.text = (
+			"CONSTRUCTION HOLOGRAM // %s" % selected_block_kind.to_upper()
+			if build_mode
+			else "INDUSTRIAL HAND DRILL // READY"
+		)
+	action_progress.visible = action_charge > 0.0
 	message_label.text = recent_message
 	message_label.add_theme_color_override("font_color", recent_message_color)
+
+
+func _mission_text(career: Dictionary) -> String:
+	var mined := int(career.get("voxels_mined", 0))
+	var refined := int(career.get("refining_batches", 0))
+	var crafted := int(career.get("components_crafted", 0))
+	var built := int(career.get("blocks_built", 0))
+	var anchored := int(career.get("anchors_engaged", 0))
+	if mined < 3:
+		return (
+			"01 // CUT A PATH\n"
+			+ "The relay rig is awake, but its stores are dry.\n\n"
+			+ "Extract asteroid voxels  %d / 3\n"
+			+ "Hold LMB on highlighted rock."
+		) % mined
+	if refined < 1:
+		return (
+			"02 // SMELT FEEDSTOCK\n"
+			+ "Turn raw ore into registered alloy.\n\n"
+			+ "Refining batches  0 / 1\n"
+			+ "Press R when carrying at least 2 ore."
+		)
+	if crafted < 1:
+		return (
+			"03 // FABRICATE A PART\n"
+			+ "Prove the production chain can sustain the rig.\n\n"
+			+ "Components fabricated  0 / 1\n"
+			+ "Press T with refined alloy."
+		)
+	if built < 2:
+		return (
+			"04 // EXPAND THE RELAY\n"
+			+ "Add a frame, then an anchor toward the rock.\n\n"
+			+ "Blocks constructed  %d / 2\n"
+			+ "Press B, select 1 or 2, aim, then hold LMB."
+		) % built
+	if anchored < 1:
+		return (
+			"05 // LOCK THE RIG\n"
+			+ "Seat an anchor against the asteroid and energize it.\n\n"
+			+ "Anchor engagements  0 / 1\n"
+			+ "Press F while targeting the rig."
+		)
+	return (
+		"CONTRACT COMPLETE // RELAY ONLINE\n"
+		+ "Khepri Station recognizes your salvage license.\n\n"
+		+ "Continue mining, design a larger grid, or cut the test frame apart."
+	)
 
 
 func _inventory(inventory_id: String) -> Dictionary:

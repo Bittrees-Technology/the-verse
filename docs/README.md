@@ -12,10 +12,14 @@ These documents form the initial specification baseline.
 - [Feature catalog](product/feature-catalog.md)
 - [Visual direction](product/visual-direction.md)
 
+## Gameplay
+
+- [P0.2 Salvage Frontier](gameplay/salvage-frontier.md)
+
 ## Architecture
 
 - [System overview](architecture/system-overview.md)
-- [P0.1 implementation guide](architecture/p0-implementation.md)
+- [P0.2 implementation guide](architecture/p0-implementation.md)
 - [Universe simulation](architecture/universe-simulation.md)
 - [Data and events](architecture/data-and-events.md)
 - [Clients and public APIs](architecture/clients-and-apis.md)
