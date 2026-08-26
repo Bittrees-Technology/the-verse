@@ -1,0 +1,31 @@
+# Godot
+.godot/
+*.tmp
+
+# Rust
+target/
+
+# JavaScript
+node_modules/
+.next/
+dist/
+coverage/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Logs and local data
+*.log
+data/
+artifacts/
