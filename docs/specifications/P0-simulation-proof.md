@@ -1,6 +1,6 @@
 # P0 specification: simulation proof
 
-**Status:** Draft ready for engineering design
+**Status:** In implementation; P0.1 playable vertical slice available
 
 ## Purpose
 
@@ -126,6 +126,28 @@ The proof must publish results for:
 - Server recovery time.
 
 Targets are set only after the first reproducible baseline to avoid inventing unsupported performance promises.
+
+The first Apple Silicon kernel baseline is published in [P0.1 benchmark results](../benchmarks/P0.1-apple-silicon.md). Ubuntu, rendering/remesh, multi-body physics, network-bandwidth, and large-grid baselines remain required before the P0 exit decision.
+
+## P0.1 implementation checkpoint
+
+Implemented and continuously verified:
+
+- Deterministic procedural asteroid and authoritative voxel removal.
+- Versioned content definitions for yields, recipes, block health, and power.
+- Inventory-domain transfers and conservation checks after every event.
+- Powered movable grids, voxel-contact anchors, block damage, and deterministic splits.
+- Operation idempotency, hash-chained journals, snapshots, recovery, and writer fencing.
+- Godot macOS client, browser command center, JSON WebSocket protocol, and public read endpoints.
+- End-to-end mining-to-construction scenario with server restart and native-client reconnect.
+
+Still required for the P0 exit gate:
+
+- Collision/contact physics and production-scale Jolt integration.
+- Sparse chunk meshing and edit/remesh latency measurements.
+- Ubuntu server benchmark and native Linux client package.
+- Network bandwidth measurements and larger body/block-count scaling.
+- Crash injection at each persistence boundary, beyond the current corruption and restart suite.
 
 ## Exit decision
 

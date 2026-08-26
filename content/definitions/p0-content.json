@@ -1,0 +1,92 @@
+{
+  "schema_version": 1,
+  "manifest_version": "p0.1.0",
+  "license": "AGPL-3.0-or-later",
+  "voxel_materials": [
+    {
+      "material": "rock",
+      "ore_yield": 1
+    },
+    {
+      "material": "ferrite_ore",
+      "ore_yield": 3
+    }
+  ],
+  "blocks": [
+    {
+      "kind": "structural",
+      "max_health": 100,
+      "power_production": 0.0,
+      "power_requirement": 0.0,
+      "stored_power": 0.0,
+      "component_cost": 1
+    },
+    {
+      "kind": "control_core",
+      "max_health": 180,
+      "power_production": 0.0,
+      "power_requirement": 2.0,
+      "stored_power": 0.0,
+      "component_cost": 1
+    },
+    {
+      "kind": "power_source",
+      "max_health": 140,
+      "power_production": 12.0,
+      "power_requirement": 0.0,
+      "stored_power": 0.0,
+      "component_cost": 1
+    },
+    {
+      "kind": "battery",
+      "max_health": 120,
+      "power_production": 2.0,
+      "power_requirement": 0.0,
+      "stored_power": 20.0,
+      "component_cost": 1
+    },
+    {
+      "kind": "cargo",
+      "max_health": 110,
+      "power_production": 0.0,
+      "power_requirement": 0.25,
+      "stored_power": 0.0,
+      "component_cost": 1
+    },
+    {
+      "kind": "drill",
+      "max_health": 100,
+      "power_production": 0.0,
+      "power_requirement": 4.0,
+      "stored_power": 0.0,
+      "component_cost": 1
+    },
+    {
+      "kind": "anchor",
+      "max_health": 160,
+      "power_production": 0.0,
+      "power_requirement": 1.0,
+      "stored_power": 0.0,
+      "component_cost": 1
+    },
+    {
+      "kind": "damage_test",
+      "max_health": 60,
+      "power_production": 0.0,
+      "power_requirement": 0.0,
+      "stored_power": 0.0,
+      "component_cost": 1
+    }
+  ],
+  "recipes": {
+    "refining": {
+      "ore_input": 2,
+      "refined_output": 1,
+      "defined_loss": 1
+    },
+    "component_crafting": {
+      "refined_input": 1,
+      "component_output": 1
+    }
+  }
+}

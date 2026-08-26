@@ -14,3 +14,5 @@ This repository uses licenses by component.
 The root [LICENSE](../LICENSE) contains the GNU Affero General Public License v3. Apache-licensed SDK directories must include the Apache license and a clear SPDX identifier. Asset directories must include authorship, source, and license metadata.
 
 Third-party dependencies and assets must be added to a software or content bill of materials before release.
+
+The current P0 dependency record is in [THIRD_PARTY.md](THIRD_PARTY.md). `Cargo.lock` is the canonical version lock for the Rust dependency graph.

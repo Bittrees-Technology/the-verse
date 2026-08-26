@@ -1,0 +1,106 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="description"
+      content="Local browser command center for The Verse authoritative P0 universe."
+    />
+    <title>The Verse — Command Center</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header>
+      <div>
+        <p class="eyebrow">AUTHORITATIVE UNIVERSE CONTROL</p>
+        <h1>THE VERSE <span>// COMMAND CENTER</span></h1>
+      </div>
+      <div id="connection" class="connection offline">OFFLINE</div>
+    </header>
+
+    <main>
+      <section class="notice">
+        P0 local proof. This screen observes and submits intents to the same
+        server as the native client; it never mutates canonical state directly.
+      </section>
+
+      <section class="metrics" aria-label="Universe metrics">
+        <article>
+          <label>UNIVERSE</label>
+          <strong id="universe">Awaiting state</strong>
+          <small id="cell">—</small>
+        </article>
+        <article>
+          <label>EVENT / TICK</label>
+          <strong id="event-sequence">0 / 0</strong>
+          <small id="world-hash">hash —</small>
+        </article>
+        <article>
+          <label>CONSERVATION</label>
+          <strong id="conservation">UNKNOWN</strong>
+          <small id="fence">fence —</small>
+        </article>
+        <article>
+          <label>WORLD STATE</label>
+          <strong id="world-counts">0 voxels</strong>
+          <small id="grid-count">0 grids</small>
+        </article>
+      </section>
+
+      <section class="workspace">
+        <article class="map-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">PUBLIC SPECTATOR FEED</p>
+              <h2>ORIGIN CELL // TOP-DOWN</h2>
+            </div>
+            <button id="resync">RESYNC</button>
+          </div>
+          <canvas id="universe-map" width="900" height="560"></canvas>
+          <div class="legend">
+            <span><i class="rock"></i>Rock</span>
+            <span><i class="ore"></i>Ferrite</span>
+            <span><i class="grid"></i>Grid</span>
+            <span><i class="player"></i>Player</span>
+          </div>
+        </article>
+
+        <aside>
+          <article class="panel">
+            <p class="eyebrow">LOCAL PROFILE</p>
+            <h2>INVENTORY</h2>
+            <dl>
+              <div><dt>Ore</dt><dd id="ore">0</dd></div>
+              <div><dt>Refined</dt><dd id="refined">0</dd></div>
+              <div><dt>Components</dt><dd id="components">0</dd></div>
+            </dl>
+            <div class="button-grid">
+              <button id="refine">REFINE 2 ORE</button>
+              <button id="craft">CRAFT COMPONENT</button>
+            </div>
+          </article>
+
+          <article class="panel">
+            <p class="eyebrow">SELECTED CONSTRUCT</p>
+            <h2 id="selected-grid">NO GRID</h2>
+            <div id="grid-details" class="details">Awaiting replication.</div>
+            <div class="button-grid">
+              <button id="anchor">ANCHOR / RELEASE</button>
+              <button id="stop">STOP MOTION</button>
+            </div>
+          </article>
+
+          <article class="panel activity-panel">
+            <p class="eyebrow">AUTHORITATIVE RECEIPTS</p>
+            <h2>ACTIVITY</h2>
+            <ol id="activity" aria-live="polite"></ol>
+          </article>
+        </aside>
+      </section>
+    </main>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
