@@ -1,0 +1,28 @@
+# Glossary
+
+- **Agent:** A human-controlled bot, autonomous AI, NPC, or system participant that submits actions.
+- **Asset:** Any canonical object, stack, right, blueprint, receipt, or construct with identity or ownership.
+- **Authoritative:** The component whose accepted state is final within its scope.
+- **BIT:** The 18-decimal token used as the default market base pair.
+- **Block:** A placed construction unit that may contain structural or functional behavior.
+- **Capital:** The protected primary settlement and default market on the main planet.
+- **Canonical universe:** The official shared universe whose assets may enter official markets.
+- **Cell:** A bounded unit of active or background simulation assigned to one authoritative writer.
+- **Commodity:** A standardized fungible resource, refined material, or component grade.
+- **Component:** A manufactured input used to construct or repair blocks and other goods.
+- **Content manifest:** A signed versioned list of approved blocks, recipes, scripts, and assets.
+- **Creative asset:** An administratively created non-economic object that cannot enter canonical markets.
+- **Derelict:** An eligible unpowered object in the cleanup lifecycle.
+- **Dynamic grid:** A constructed grid that may move because it is not voxel-anchored.
+- **Grid:** A connected set of constructed blocks.
+- **Lifecycle proof:** A Merkle proof that a canonical event was included in an on-chain batch.
+- **Location receipt:** An on-chain representation of standardized goods held at a specific market.
+- **Market custody:** Authoritative locked inventory backing on-chain receipts or listings.
+- **Private server:** A non-canonical universe that may use unrestricted mods but cannot export official assets.
+- **Region/sector:** Hierarchical generated spatial addresses used to locate celestial bodies and cells.
+- **Registration:** A BIT-denominated contract that exempts an eligible claimed station from ordinary unpowered cleanup while valid.
+- **Settlement:** Confirmed on-chain custody, trade, governance, or lifecycle-root state.
+- **Static grid:** A voxel-anchored or foundation-anchored structure eligible for partitioned simulation.
+- **Structure:** A grid or connected collection of grids functioning as a ship, station, facility, or installation.
+- **Verse DAO:** The protocol authority initially executed by the two-of-three Safe.
+- **Voxel:** A volume element in deformable planetary or asteroid terrain.
