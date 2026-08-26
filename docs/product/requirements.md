@@ -87,7 +87,7 @@ Requirement IDs are stable references for issues, pull requests, tests, and rele
 - **MKT-006 — Unique goods:** Unique ships, blueprints, skins, and non-fungible goods shall use listings, auctions, or specialized pools rather than forced fungibility.
 - **MKT-007 — Funded liquidity:** Market purchases shall be limited by deposited liquidity; no market promises unlimited fixed-price BIT redemption.
 - **MKT-008 — Ordinary volatility:** Governance shall not pause or alter markets merely because of legitimate price movements, deposits, or sales.
-- **MKT-009 — Permissionless participation:** Any eligible profile may access markets, subject to applicable protocol and unavoidable legal constraints. **Blocked:** real-world operating jurisdiction is unresolved.
+- **MKT-009 — Permissionless participation:** Any eligible profile may access markets, subject to applicable protocol and unavoidable legal constraints.
 
 ## Blockchain
 
