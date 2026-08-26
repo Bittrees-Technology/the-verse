@@ -15,6 +15,7 @@ These documents form the initial specification baseline.
 ## Architecture
 
 - [System overview](architecture/system-overview.md)
+- [P0.1 implementation guide](architecture/p0-implementation.md)
 - [Universe simulation](architecture/universe-simulation.md)
 - [Data and events](architecture/data-and-events.md)
 - [Clients and public APIs](architecture/clients-and-apis.md)
@@ -39,6 +40,7 @@ These documents form the initial specification baseline.
 - [Roadmap](roadmap/roadmap.md)
 - [Core protocol invariants](specifications/core-invariants.md)
 - [P0 simulation proof](specifications/P0-simulation-proof.md)
+- [P0.1 Apple Silicon benchmark](benchmarks/P0.1-apple-silicon.md)
 - [Architecture decision records](decisions/README.md)
 - [Open questions](open-questions.md)
 

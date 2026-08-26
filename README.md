@@ -2,7 +2,36 @@
 
 The Verse is an open-source persistent voxel space universe, work-and-economy simulator, and Web3 marketplace.
 
-The project is currently in its **specification-first phase**. The repository is defining its product requirements, architecture, economic invariants, governance boundaries, security model, and delivery sequence before gameplay implementation begins.
+The repository now contains the first **playable P0 vertical slice**. It is a local, single-player engineering proof of the authoritative gameplay loop, not yet the public multiplayer universe or real-value economy.
+
+## Play it on macOS
+
+Requirements: Apple Silicon or Intel macOS, Rust, Node.js, `curl`, and `jq`.
+
+```bash
+tools/dev/bootstrap-macos.sh
+tools/dev/run-local.sh
+```
+
+The bootstrap downloads the pinned Godot 4.7.2 editor from the official release and verifies its checksum. The launcher starts the authoritative server and native client. While the server is running, the browser command center is available at <http://127.0.0.1:7777>.
+
+Native controls are shown in the client. The main loop supports flying, voxel mining, ore refining, component crafting, cargo transfers, block construction, anchoring, grid motion, block damage, and grid splitting.
+
+To run only the Linux-compatible headless server:
+
+```bash
+tools/dev/run-server.sh
+```
+
+Linux native client packaging and signed direct downloads remain scheduled work. Godot 4.7.2 can already open `apps/native-client` on Linux for development.
+
+## Verify the build
+
+```bash
+tools/ci/check.sh
+```
+
+This runs the Rust tests and lints, browser syntax checks, Godot validation, and an end-to-end scenario that restarts the server and proves exact state recovery. See the [P0 implementation guide](docs/architecture/p0-implementation.md) for scope and limitations.
 
 ## Product pillars
 
@@ -29,7 +58,7 @@ Start with [the documentation map](docs/README.md), then read:
 
 ## Current status
 
-No gameplay implementation has been selected as production-ready. The first engineering milestone is a macOS client and Ubuntu server proof that validates voxel editing, movable grids, authoritative physics, persistence, and inventory conservation.
+P0.1 validates the server-authoritative resource loop, deterministic rules, hash-chained persistence, idempotent operations, grid connectivity, and native/browser client integration. Multiplayer, collision physics, planets, safe zones, accounts, AMMs, and blockchain settlement are not in this slice. Those systems remain sequenced in the [delivery roadmap](docs/roadmap/roadmap.md).
 
 ## Licensing
 

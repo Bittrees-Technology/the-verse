@@ -1,0 +1,32 @@
+[package]
+name = "verse-simulation-worker"
+description = "Authoritative WebSocket and HTTP simulation worker for The Verse"
+license = "AGPL-3.0-or-later"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+clap.workspace = true
+futures-util.workspace = true
+http.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+verse-protocol = { path = "../../crates/verse-protocol" }
+verse-simulation = { path = "../../crates/verse-simulation" }
+
+[dev-dependencies]
+tempfile.workspace = true
+tower.workspace = true
+
+[lints]
+workspace = true
