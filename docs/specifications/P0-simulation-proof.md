@@ -1,6 +1,6 @@
 # P0 specification: simulation proof
 
-**Status:** In implementation; P0.2 first-person gameplay slice available
+**Status:** In implementation; P0.3 visual engineering checkpoint available
 
 ## Purpose
 
@@ -160,6 +160,17 @@ Implemented and continuously verified:
 - A five-stage salvage contract spanning extraction, refining, fabrication, construction, and anchoring.
 - Event-derived career counters, experience rewards, and clearance levels in the authoritative snapshot.
 - Protocol and save-schema rejection for incompatible pre-career clients and worlds.
+
+## P0.3 visual engineering checkpoint
+
+Implemented and continuously verified:
+
+- A continuous marching-tetrahedra asteroid surface derived from authoritative integer occupancy.
+- Deterministic fixed-point asteroid silhouette variation and clustered ferrite deposits.
+- An original procedural rock shader and CC BY-SA modular spacecraft armor material.
+- Helmet work lighting, glass and emissive details, framed machinery, and impact sparks.
+- Explicit schema rejection for worlds produced by the previous deterministic generator.
+- Clean-room reference boundaries and an independently specified engineering-parity sequence.
 
 ## Exit decision
 

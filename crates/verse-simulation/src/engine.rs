@@ -1017,7 +1017,7 @@ mod tests {
 
         let result = runtime.execute(&ClientMessage::MovePlayer {
             operation_id: "stale-writer-move".into(),
-            position: Vec3::new(10.5, 3.0, 8.0),
+            position: Vec3::new(12.5, 4.5, 10.0),
         });
         assert!(matches!(
             result,
@@ -1026,11 +1026,11 @@ mod tests {
             ))
         ));
         assert_eq!(runtime.state().event_sequence, 0);
-        assert_eq!(runtime.state().player.position, Vec3::new(10.0, 3.0, 8.0));
+        assert_eq!(runtime.state().player.position, Vec3::new(12.0, 4.5, 10.0));
         assert!(matches!(
             runtime.execute(&ClientMessage::MovePlayer {
                 operation_id: "halted-move".into(),
-                position: Vec3::new(10.5, 3.0, 8.0),
+                position: Vec3::new(12.5, 4.5, 10.0),
             }),
             Err(RuntimeError::Halted)
         ));

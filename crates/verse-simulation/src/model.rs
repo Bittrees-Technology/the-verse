@@ -11,7 +11,7 @@ use verse_protocol::{
 
 use crate::content;
 
-pub const WORLD_SCHEMA_VERSION: u32 = 2;
+pub const WORLD_SCHEMA_VERSION: u32 = 3;
 pub const PLAYER_INVENTORY_ID: &str = "inventory-player-local";
 pub const STARTER_GRID_ID: &str = "grid-starter";
 
@@ -26,16 +26,23 @@ impl VoxelField {
         let mut occupied = BTreeSet::new();
         let mut ferrite_ore = BTreeSet::new();
         let radius_squared = i64::from(radius) * i64::from(radius);
+        let extent = radius + 2;
 
-        for x in -radius..=radius {
-            for y in -radius..=radius {
-                for z in -radius..=radius {
+        for x in -extent..=extent {
+            for y in -extent..=extent {
+                for z in -extent..=extent {
                     let coordinate = IVec3::new(x, y, z);
-                    if coordinate.squared_distance(IVec3::ZERO) > radius_squared {
+                    let distance_squared = coordinate.squared_distance(IVec3::ZERO);
+                    let shape_noise =
+                        fixed_value_noise(seed ^ 0x6A09_E667_F3BC_C909, coordinate) + 512;
+                    let surface_radius_fixed = i64::from(radius) * 256 + shape_noise * 3 / 8;
+                    let outside_irregular_surface =
+                        distance_squared * 65_536 > surface_radius_fixed * surface_radius_fixed;
+                    if distance_squared > radius_squared && outside_irregular_surface {
                         continue;
                     }
                     occupied.insert(coordinate);
-                    if deterministic_material_hash(seed, coordinate).is_multiple_of(7) {
+                    if fixed_value_noise(seed ^ 0xBB67_AE85_84CA_A73B, coordinate) > 280 {
                         ferrite_ore.insert(coordinate);
                     }
                 }
@@ -89,6 +96,50 @@ fn deterministic_material_hash(seed: u64, coordinate: IVec3) -> u64 {
         value = value.rotate_left(27).wrapping_mul(0x94D0_49BB_1331_11EB);
     }
     value ^ (value >> 31)
+}
+
+fn fixed_value_noise(seed: u64, coordinate: IVec3) -> i64 {
+    const CELL_SIZE: i32 = 4;
+    let cell = IVec3::new(
+        coordinate.x.div_euclid(CELL_SIZE),
+        coordinate.y.div_euclid(CELL_SIZE),
+        coordinate.z.div_euclid(CELL_SIZE),
+    );
+    let fraction = IVec3::new(
+        coordinate.x.rem_euclid(CELL_SIZE),
+        coordinate.y.rem_euclid(CELL_SIZE),
+        coordinate.z.rem_euclid(CELL_SIZE),
+    );
+    let sample = |offset: IVec3| {
+        let lattice = IVec3::new(cell.x + offset.x, cell.y + offset.y, cell.z + offset.z);
+        i64::try_from(deterministic_material_hash(seed, lattice) & 1_023)
+            .expect("ten-bit shape noise always fits i64")
+            - 512
+    };
+    let lower_front = fixed_lerp(sample(IVec3::ZERO), sample(IVec3::new(1, 0, 0)), fraction.x);
+    let upper_front = fixed_lerp(
+        sample(IVec3::new(0, 1, 0)),
+        sample(IVec3::new(1, 1, 0)),
+        fraction.x,
+    );
+    let lower_back = fixed_lerp(
+        sample(IVec3::new(0, 0, 1)),
+        sample(IVec3::new(1, 0, 1)),
+        fraction.x,
+    );
+    let upper_back = fixed_lerp(
+        sample(IVec3::new(0, 1, 1)),
+        sample(IVec3::new(1, 1, 1)),
+        fraction.x,
+    );
+    let front = fixed_lerp(lower_front, upper_front, fraction.y);
+    let back = fixed_lerp(lower_back, upper_back, fraction.y);
+    fixed_lerp(front, back, fraction.z)
+}
+
+fn fixed_lerp(left: i64, right: i64, fraction: i32) -> i64 {
+    const CELL_SIZE: i64 = 4;
+    (left * (CELL_SIZE - i64::from(fraction)) + right * i64::from(fraction)) / CELL_SIZE
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -348,7 +399,7 @@ impl WorldState {
             last_event_hash: String::new(),
             player: Player {
                 player_id: "player-local".into(),
-                position: Vec3::new(10.0, 3.0, 8.0),
+                position: Vec3::new(12.0, 4.5, 10.0),
                 inventory_id: PLAYER_INVENTORY_ID.into(),
                 experience: 0,
                 career: CareerSnapshot::default(),
@@ -490,13 +541,36 @@ mod tests {
 
     #[test]
     fn procedural_asteroid_is_deterministic() {
-        assert_eq!(
-            VoxelField::procedural_asteroid(42, 8),
-            VoxelField::procedural_asteroid(42, 8)
-        );
+        let asteroid = VoxelField::procedural_asteroid(42, 8);
+        assert_eq!(asteroid, VoxelField::procedural_asteroid(42, 8));
         assert_ne!(
-            VoxelField::procedural_asteroid(42, 8).ferrite_ore,
+            asteroid.ferrite_ore,
             VoxelField::procedural_asteroid(43, 8).ferrite_ore
+        );
+        assert!(
+            asteroid
+                .occupied
+                .iter()
+                .any(|coordinate| coordinate.squared_distance(IVec3::ZERO) > 64),
+            "the visual-realism generator must produce material outside the base sphere"
+        );
+        assert!(
+            asteroid.ferrite_ore.iter().any(|coordinate| {
+                [
+                    IVec3::new(1, 0, 0),
+                    IVec3::new(0, 1, 0),
+                    IVec3::new(0, 0, 1),
+                ]
+                .iter()
+                .any(|offset| {
+                    asteroid.ferrite_ore.contains(&IVec3::new(
+                        coordinate.x + offset.x,
+                        coordinate.y + offset.y,
+                        coordinate.z + offset.z,
+                    ))
+                })
+            }),
+            "ferrite should form readable deposits rather than salt-and-pepper noise"
         );
     }
 
@@ -507,5 +581,6 @@ mod tests {
         assert_eq!(world.grids[STARTER_GRID_ID].blocks.len(), 25);
         assert!(world.grids[STARTER_GRID_ID].power().online);
         assert!(world.voxels.occupied.len() > 1_000);
+        assert!(world.voxels.occupied.contains(&IVec3::new(8, 0, 0)));
     }
 }

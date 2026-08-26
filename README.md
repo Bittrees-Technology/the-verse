@@ -2,7 +2,7 @@
 
 The Verse is an open-source persistent voxel space universe, work-and-economy simulator, and Web3 marketplace.
 
-The repository now contains **P0.2: Salvage Frontier**, a first-person local gameplay slice. It is still a single-player proof of the authoritative loop—not yet the public multiplayer universe or real-value economy—but it now presents that proof as a game rather than a simulation console.
+The repository now contains **P0.3: the visual engineering checkpoint**, built on the first-person Salvage Frontier loop. It is still a single-player proof of the authoritative loop—not yet the public multiplayer universe or real-value economy—but its asteroid, materials, machinery, work light, and tool effects now aim at a grounded space-engineering presentation.
 
 ## Play it on macOS
 
@@ -23,6 +23,7 @@ Native controls are shown in the client:
 | --- | --- |
 | EVA thrust / ascend / descend | `WASD` / `Space` / `C` |
 | Boost / toggle dampeners | `Shift` / `Z` |
+| Toggle helmet work light | `L` |
 | Mine highlighted voxel | Hold left mouse |
 | Enter construction / choose block | `B` / `1`–`5` |
 | Weld construction hologram | Hold left mouse |
@@ -44,7 +45,7 @@ Linux native client packaging and signed direct downloads remain scheduled work.
 tools/ci/check.sh
 ```
 
-This runs the Rust tests and lints, browser syntax checks, Godot validation, and an end-to-end scenario that restarts the server and proves exact state recovery. See the [Salvage Frontier gameplay specification](docs/gameplay/salvage-frontier.md) and [P0 implementation guide](docs/architecture/p0-implementation.md) for scope and limitations.
+This runs the Rust tests and lints, browser syntax checks, Godot validation, and an end-to-end scenario that restarts the server and proves exact state recovery. See the [visual engineering checkpoint](docs/gameplay/engineering-realism.md), [Salvage Frontier gameplay specification](docs/gameplay/salvage-frontier.md), and [P0 implementation guide](docs/architecture/p0-implementation.md) for scope and limitations.
 
 ## Product pillars
 
@@ -71,7 +72,7 @@ Start with [the documentation map](docs/README.md), then read:
 
 ## Current status
 
-P0.2 adds a first-person EVA presentation, an industrial multi-tool, hold-to-work interactions, differentiated machinery, a larger starter construct, a guided salvage contract, and persistent career progression to the P0.1 authoritative foundation. Multiplayer, collision physics, planets, safe zones, accounts, AMMs, and blockchain settlement are not in this slice. Those systems remain sequenced in the [delivery roadmap](docs/roadmap/roadmap.md).
+P0.3 replaces primitive asteroid clusters with a continuous density-filtered surface, adds deterministic shape variation and ore deposits, introduces original physically shaded armor and rock materials, and strengthens lighting and tool feedback. It retains the P0.2 first-person work loop and P0.1 authoritative foundation. Multiplayer, character-body and rigid-grid collision physics, landable planets, safe zones, accounts, AMMs, and blockchain settlement are not in this slice. Those systems remain sequenced in the [delivery roadmap](docs/roadmap/roadmap.md).
 
 ## Licensing
 
