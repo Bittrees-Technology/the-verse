@@ -3,7 +3,7 @@ extends Node3D
 
 const ARMOR_TEXTURE: Texture2D = preload("res://assets/materials/verse_armor_albedo.png")
 const ASTEROID_SHADER: Shader = preload("res://shaders/asteroid_surface.gdshader")
-const PROTOCOL_VERSION := 2
+const PROTOCOL_VERSION := 3
 const DEFAULT_SERVER := "ws://127.0.0.1:7777/ws"
 const PLAYER_INVENTORY := "inventory-player-local"
 const STARTER_GRID := "grid-starter"
@@ -15,6 +15,7 @@ const MOUSE_SENSITIVITY := 0.0022
 const MOVE_SEND_INTERVAL := 0.10
 const TARGET_RANGE := 9.0
 const MINE_DURATION := 0.72
+const WELD_DURATION := 0.52
 const DAMAGE_DURATION := 0.46
 const ISO_LEVEL := 0.5
 const MARCHING_CORNERS: Array[Vector3i] = [
@@ -40,6 +41,7 @@ var connected := false
 var handshake_sent := false
 var operation_counter := 0
 var move_send_elapsed := 0.0
+var last_sent_position := Vector3.ZERO
 var first_snapshot := true
 var snapshot: Dictionary = {}
 var voxel_lookup: Dictionary = {}
@@ -63,7 +65,9 @@ var action_cooldown := 0.0
 var tool_kick := 0.0
 var elapsed_time := 0.0
 var build_mode := false
+var build_rotation_quarters := 0
 var last_level := 1
+var pending_mine_position: Variant = null
 
 var camera: Camera3D
 var asteroid_root: Node3D
@@ -86,10 +90,11 @@ var mode_label: Label
 var tool_root: Node3D
 var tool_tip: Node3D
 var tool_light: OmniLight3D
-var build_preview: MeshInstance3D
+var build_preview: Node3D
 var action_beam: MeshInstance3D
 var action_flare: MeshInstance3D
 var action_sparks: GPUParticles3D
+var mining_fragments: GPUParticles3D
 var suit_light: SpotLight3D
 
 var rock_material: Material
@@ -157,6 +162,14 @@ func _unhandled_input(event: InputEvent) -> void:
 			KEY_B:
 				build_mode = not build_mode
 				action_charge = 0.0
+			KEY_Q:
+				if build_mode:
+					build_rotation_quarters = posmod(build_rotation_quarters - 1, 4)
+					_set_message("Block orientation %d°" % (build_rotation_quarters * 90))
+			KEY_E:
+				if build_mode:
+					build_rotation_quarters = posmod(build_rotation_quarters + 1, 4)
+					_set_message("Block orientation %d°" % (build_rotation_quarters * 90))
 			KEY_F:
 				_toggle_anchor()
 			KEY_M:
@@ -292,6 +305,7 @@ func _build_environment() -> void:
 	detail_materials = {
 		"steel": _material(Color(0.50, 0.58, 0.61), 0.38, 0.82),
 		"dark": _material(Color(0.025, 0.035, 0.045), 0.50, 0.68),
+		"construction": _material(Color(0.20, 0.25, 0.27), 0.58, 0.84),
 		"cyan": _emissive_material(Color(0.10, 0.72, 1.0), 2.8),
 		"amber": _emissive_material(Color(1.0, 0.37, 0.055), 3.0),
 		"green": _emissive_material(Color(0.12, 0.95, 0.53), 2.2),
@@ -458,6 +472,33 @@ func _build_action_feedback() -> void:
 	action_sparks.emitting = false
 	add_child(action_sparks)
 
+	var fragment_process := ParticleProcessMaterial.new()
+	fragment_process.emission_shape = ParticleProcessMaterial.EMISSION_SHAPE_SPHERE
+	fragment_process.emission_sphere_radius = 0.28
+	fragment_process.direction = Vector3(0.0, 0.0, 1.0)
+	fragment_process.spread = 180.0
+	fragment_process.initial_velocity_min = 0.9
+	fragment_process.initial_velocity_max = 3.6
+	fragment_process.damping_min = 0.10
+	fragment_process.damping_max = 0.42
+	fragment_process.scale_min = 0.45
+	fragment_process.scale_max = 1.35
+	var fragment_mesh := BoxMesh.new()
+	fragment_mesh.size = Vector3(0.065, 0.045, 0.085)
+	fragment_mesh.material = _material(Color(0.16, 0.19, 0.20), 0.97, 0.04)
+	mining_fragments = GPUParticles3D.new()
+	mining_fragments.name = "MiningFragments"
+	mining_fragments.amount = 74
+	mining_fragments.lifetime = 1.15
+	mining_fragments.randomness = 0.78
+	mining_fragments.explosiveness = 0.94
+	mining_fragments.one_shot = true
+	mining_fragments.local_coords = false
+	mining_fragments.process_material = fragment_process
+	mining_fragments.draw_pass_1 = fragment_mesh
+	mining_fragments.emitting = false
+	add_child(mining_fragments)
+
 
 func _build_starfield() -> void:
 	var mesh := SphereMesh.new()
@@ -508,11 +549,23 @@ func _build_target_highlight() -> void:
 	target_highlight.mesh = mesh
 	target_highlight.visible = false
 	add_child(target_highlight)
-	build_preview = MeshInstance3D.new()
+	build_preview = Node3D.new()
+	build_preview.name = "ConstructionHologram"
 	var preview_mesh := BoxMesh.new()
 	preview_mesh.size = Vector3.ONE * 0.96
 	preview_mesh.material = detail_materials["hologram"]
-	build_preview.mesh = preview_mesh
+	var preview_body := MeshInstance3D.new()
+	preview_body.mesh = preview_mesh
+	build_preview.add_child(preview_body)
+	var preview_front := _box_visual(Vector3(0.46, 0.10, 0.12), detail_materials["hologram"])
+	preview_front.position = Vector3(0.0, 0.0, -0.54)
+	build_preview.add_child(preview_front)
+	for x in [-0.34, 0.34]:
+		var preview_rail := _box_visual(
+			Vector3(0.045, 0.72, 0.045), detail_materials["hologram"]
+		)
+		preview_rail.position = Vector3(x, 0.0, -0.50)
+		build_preview.add_child(preview_rail)
 	build_preview.visible = false
 	add_child(build_preview)
 
@@ -695,7 +748,7 @@ func _build_interface() -> void:
 	selected_label = hotbar_label
 
 	var controls := _hud_label(
-		"WASD / SPACE / C  EVA THRUST    SHIFT  BOOST    Z  DAMPENERS    L  HELMET LIGHT    B  BUILD    HOLD LMB  USE TOOL    RMB  CUT",
+		"WASD / SPACE / C  EVA THRUST    SHIFT  BOOST    Z  DAMPENERS    L  LIGHT    B  BUILD    Q / E  ROTATE    HOLD LMB  WORK    RMB  CUT",
 		Vector2(20.0, -40.0),
 		11
 	)
@@ -810,6 +863,7 @@ func _handle_server_message(message: Dictionary) -> void:
 				print("VERSE_SMOKE_OK event=%d" % int(receipt.get("event_sequence", 0)))
 				get_tree().quit(0)
 		"intent_rejected":
+			pending_mine_position = null
 			_set_message(
 				"%s — %s" % [message.get("code", "rejected"), message.get("message", "")],
 				true
@@ -835,6 +889,7 @@ func _apply_snapshot(authoritative: Dictionary) -> void:
 			if not grids.is_empty():
 				focus = _vec3(grids[0].get("position", {}))
 			camera.look_at(focus, Vector3.UP)
+	last_sent_position = position
 	first_snapshot = false
 	var level := int(player.get("level", 1))
 	if level > last_level:
@@ -846,13 +901,18 @@ func _apply_snapshot(authoritative: Dictionary) -> void:
 	if voxels.size() != rendered_voxel_count:
 		rendered_voxel_count = voxels.size()
 		_rebuild_voxels(voxels)
+		if pending_mine_position != null:
+			var mined_coordinate: Vector3i = pending_mine_position
+			if not voxel_lookup.has(_coord_key(mined_coordinate)):
+				_emit_mining_fragments(Vector3(mined_coordinate))
+				pending_mine_position = null
 	_rebuild_grids(snapshot.get("grids", []))
 	if smoke_test and smoke_operation.is_empty():
 		smoke_operation = _operation_id("godot-smoke")
 		_send({
 			"type": "move_player",
 			"operation_id": smoke_operation,
-			"position": _protocol_vec3(position),
+			"position": _protocol_vec3(position + Vector3(0.01, 0.0, 0.0)),
 		})
 
 
@@ -875,6 +935,12 @@ func _rebuild_voxels(voxels: Array) -> void:
 		minimum = minimum.min(grid_position)
 		maximum = maximum.max(grid_position)
 	_build_voxel_isosurface(minimum, maximum)
+
+
+func _emit_mining_fragments(position: Vector3) -> void:
+	mining_fragments.global_position = position
+	mining_fragments.restart()
+	mining_fragments.emitting = true
 
 
 func _build_voxel_isosurface(minimum: Vector3i, maximum: Vector3i) -> void:
@@ -1061,6 +1127,7 @@ func _rebuild_grids(grids: Array) -> void:
 				float(coordinate.get("y", 0)),
 				float(coordinate.get("z", 0))
 			)
+			block_visual.rotation.y = deg_to_rad(float(int(block.get("orientation", 0)) * 90))
 			grid_node.add_child(block_visual)
 		if grid.get("power", {}).get("online", false):
 			var work_light := OmniLight3D.new()
@@ -1077,6 +1144,16 @@ func _build_block_visual(block: Dictionary) -> Node3D:
 	var root := Node3D.new()
 	root.name = block.get("block_id", "block")
 	var kind: String = block.get("kind", "structural")
+	var health := int(block.get("health", 1))
+	var max_health := maxi(int(block.get("max_health", health)), 1)
+	var integrity := clampf(float(health) / float(max_health), 0.0, 1.0)
+	if integrity < 1.0:
+		var frame_core := _box_visual(
+			Vector3.ONE * lerpf(0.38, 0.72, integrity), detail_materials["construction"]
+		)
+		root.add_child(frame_core)
+		_add_construction_frame(root, integrity)
+		return root
 	var base := _box_visual(
 		Vector3.ONE * 0.92,
 		block_materials.get(kind, block_materials["structural"])
@@ -1175,6 +1252,30 @@ func _build_block_visual(block: Dictionary) -> Node3D:
 	return root
 
 
+func _add_construction_frame(root: Node3D, integrity: float) -> void:
+	var frame_material: Material = detail_materials["construction"]
+	for x in [-0.44, 0.44]:
+		for y in [-0.44, 0.44]:
+			var z_rail := _box_visual(Vector3(0.055, 0.055, 0.90), frame_material)
+			z_rail.position = Vector3(x, y, 0.0)
+			root.add_child(z_rail)
+	for x in [-0.44, 0.44]:
+		for z in [-0.44, 0.44]:
+			var y_rail := _box_visual(Vector3(0.055, 0.90, 0.055), frame_material)
+			y_rail.position = Vector3(x, 0.0, z)
+			root.add_child(y_rail)
+	for y in [-0.44, 0.44]:
+		for z in [-0.44, 0.44]:
+			var x_rail := _box_visual(Vector3(0.90, 0.055, 0.055), frame_material)
+			x_rail.position = Vector3(0.0, y, z)
+			root.add_child(x_rail)
+	var completed_quarters := clampi(ceili(integrity * 4.0), 1, 3)
+	for index in completed_quarters:
+		var plate := _box_visual(Vector3(0.22, 0.22, 0.035), detail_materials["amber"])
+		plate.position = Vector3(-0.27 + float(index) * 0.27, -0.25, -0.49)
+		root.add_child(plate)
+
+
 func _update_movement(delta: float) -> void:
 	if Input.mouse_mode != Input.MOUSE_MODE_CAPTURED:
 		return
@@ -1214,8 +1315,13 @@ func _update_movement(delta: float) -> void:
 	)
 
 	move_send_elapsed += delta
-	if connected and move_send_elapsed >= MOVE_SEND_INTERVAL:
+	if (
+		connected
+		and move_send_elapsed >= MOVE_SEND_INTERVAL
+		and camera.position.distance_squared_to(last_sent_position) > 0.0001
+	):
 		move_send_elapsed = 0.0
+		last_sent_position = camera.position
 		_send({
 			"type": "move_player",
 			"operation_id": _operation_id("move"),
@@ -1250,13 +1356,23 @@ func _update_target() -> void:
 		target_highlight.global_position = target_block.get("world_position", Vector3.ZERO)
 	else:
 		target_highlight.visible = false
-	if build_mode and not target_block.is_empty():
+	if build_mode and not target_block.is_empty() and not _block_needs_weld(target_block["block"]):
 		var grid: Dictionary = target_block["grid"]
 		var grid_position := _vec3(grid.get("position", {}))
 		var grid_basis := Basis(Vector3.UP, float(grid.get("yaw_radians", 0.0)))
 		build_preview.global_position = grid_position + grid_basis * Vector3(_build_coordinate())
-		build_preview.global_rotation = Vector3(0.0, float(grid.get("yaw_radians", 0.0)), 0.0)
+		build_preview.global_rotation = Vector3(
+			0.0,
+			float(grid.get("yaw_radians", 0.0)) + deg_to_rad(float(build_rotation_quarters * 90)),
+			0.0
+		)
 		build_preview.visible = true
+
+
+func _block_needs_weld(block: Dictionary) -> bool:
+	var health := int(block.get("health", 0))
+	var max_health := maxi(int(block.get("max_health", health)), 1)
+	return health < max_health
 
 
 func _raymarch_voxel() -> Variant:
@@ -1319,9 +1435,23 @@ func _update_tool_action(delta: float) -> void:
 		duration = DAMAGE_DURATION
 		action_name = "CUTTING ARMOR"
 	elif holding_primary and build_mode and not target_block.is_empty():
-		action_key = "build:%s:%s" % [target_block.get("grid_id", ""), str(_build_coordinate())]
-		duration = DAMAGE_DURATION
-		action_name = "WELDING %s" % selected_block_kind.to_upper()
+		var construction_target: Dictionary = target_block["block"]
+		if _block_needs_weld(construction_target):
+			action_key = "weld:%s" % construction_target.get("block_id", "")
+			duration = WELD_DURATION
+			var integrity := (
+				int(construction_target.get("health", 0)) * 100
+				/ maxi(int(construction_target.get("max_health", 1)), 1)
+			)
+			action_name = "WELDING FRAME // %d%%" % integrity
+		else:
+			action_key = "build:%s:%s:%d" % [
+				target_block.get("grid_id", ""),
+				str(_build_coordinate()),
+				build_rotation_quarters,
+			]
+			duration = WELD_DURATION
+			action_name = "PLACING %s FRAME" % selected_block_kind.to_upper()
 	elif holding_primary and not build_mode and target_voxel != null:
 		action_key = "mine:%s" % _coord_key(target_voxel)
 		duration = MINE_DURATION
@@ -1342,12 +1472,15 @@ func _update_tool_action(delta: float) -> void:
 	if action_charge < 1.0:
 		return
 
+	var completed_action := action_target_key
 	action_charge = 0.0
 	action_target_key = ""
 	action_cooldown = 0.42
 	tool_kick = 1.0
 	if holding_secondary:
 		_damage_target_block()
+	elif completed_action.begins_with("weld:"):
+		_weld_target_block()
 	elif build_mode:
 		_build_selected_block()
 	else:
@@ -1374,6 +1507,8 @@ func _update_viewmodel(delta: float) -> void:
 		5.0 if action_charge > 0.0 else 0.0,
 		minf(delta * 14.0, 1.0)
 	)
+	if build_preview.visible:
+		build_preview.scale = Vector3.ONE * (1.0 + sin(elapsed_time * 4.5) * 0.012)
 	_update_action_feedback()
 
 
@@ -1403,6 +1538,8 @@ func _update_action_feedback() -> void:
 func _active_action_position() -> Vector3:
 	if action_target_key.begins_with("mine:") and target_voxel != null:
 		return Vector3(target_voxel)
+	if action_target_key.begins_with("weld:") and not target_block.is_empty():
+		return target_block.get("world_position", camera.global_position - camera.basis.z * 2.0)
 	if action_target_key.begins_with("build:"):
 		return build_preview.global_position
 	if not target_block.is_empty():
@@ -1414,6 +1551,7 @@ func _mine_target_voxel() -> void:
 	if target_voxel == null:
 		_set_message("Aim at an asteroid voxel within mining range", true)
 		return
+	pending_mine_position = target_voxel
 	_send({
 		"type": "mine_voxel",
 		"operation_id": _operation_id("mine"),
@@ -1445,6 +1583,23 @@ func _build_selected_block() -> void:
 		"grid_id": target_block["grid_id"],
 		"coordinate": _protocol_ivec3(coordinate),
 		"kind": selected_block_kind,
+		"orientation": build_rotation_quarters,
+	})
+
+
+func _weld_target_block() -> void:
+	if target_block.is_empty():
+		_set_message("Aim at an unfinished construction frame", true)
+		return
+	var block: Dictionary = target_block["block"]
+	if not _block_needs_weld(block):
+		_set_message("Target block is already at full integrity", true)
+		return
+	_send({
+		"type": "weld_block",
+		"operation_id": _operation_id("weld"),
+		"grid_id": target_block["grid_id"],
+		"block_id": block.get("block_id", ""),
 	})
 
 
@@ -1625,7 +1780,9 @@ func _update_interface() -> void:
 			if choice[2] == selected_block_kind:
 				text = "▶ " + text + " ◀"
 			hotbar_parts.append(text)
-		hotbar_label.text = "     ".join(hotbar_parts)
+		hotbar_label.text = "%s     ROT %03d°" % [
+			"     ".join(hotbar_parts), build_rotation_quarters * 90
+		]
 	else:
 		hotbar_label.text = "HAND DRILL ACTIVE     [B] CONSTRUCTION     [R] REFINE     [T] FABRICATE     [V] CARGO TRANSFER"
 	if target_voxel != null:
@@ -1638,16 +1795,23 @@ func _update_interface() -> void:
 		target_label.text = "%s\nHOLD LMB  //  EXTRACT" % deposit
 	elif not target_block.is_empty():
 		var block: Dictionary = target_block["block"]
+		var health := int(block.get("health", 0))
+		var max_health := maxi(int(block.get("max_health", health)), 1)
+		var integrity := health * 100 / max_health
 		if build_mode:
-			target_label.text = "%s // HP %d\nHOLD LMB  //  WELD %s" % [
-				String(block.get("kind", "block")).to_upper(),
-				int(block.get("health", 0)),
-				selected_block_kind.to_upper(),
-			]
+			if health < max_health:
+				target_label.text = "%s FRAME // INTEGRITY %d%%\nHOLD LMB  //  CONTINUE WELD" % [
+					String(block.get("kind", "block")).to_upper(), integrity
+				]
+			else:
+				target_label.text = "%s // INTEGRITY 100%%\nHOLD LMB  //  PLACE %s  //  Q/E ROTATE" % [
+					String(block.get("kind", "block")).to_upper(),
+					selected_block_kind.to_upper(),
+				]
 		else:
-			target_label.text = "%s // HP %d\nHOLD RMB  //  CUT AND SALVAGE" % [
+			target_label.text = "%s // INTEGRITY %d%%\nHOLD RMB  //  CUT AND SALVAGE" % [
 				String(block.get("kind", "block")).to_upper(),
-				int(block.get("health", 0)),
+				integrity,
 			]
 	else:
 		target_label.text = (
@@ -1657,7 +1821,9 @@ func _update_interface() -> void:
 		)
 	if action_charge <= 0.0:
 		mode_label.text = (
-			"CONSTRUCTION HOLOGRAM // %s" % selected_block_kind.to_upper()
+			"CONSTRUCTION HOLOGRAM // %s // ROT %03d°" % [
+				selected_block_kind.to_upper(), build_rotation_quarters * 90
+			]
 			if build_mode
 			else "INDUSTRIAL HAND DRILL // READY"
 		)
@@ -1698,7 +1864,7 @@ func _mission_text(career: Dictionary) -> String:
 			"04 // EXPAND THE RELAY\n"
 			+ "Add a frame, then an anchor toward the rock.\n\n"
 			+ "Blocks constructed  %d / 2\n"
-			+ "Press B, select 1 or 2, aim, then hold LMB."
+			+ "Press B, select 1 or 2, rotate with Q/E, then hold LMB to place and weld."
 		) % built
 	if anchored < 1:
 		return (

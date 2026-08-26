@@ -1,6 +1,6 @@
 # P0 specification: simulation proof
 
-**Status:** In implementation; P0.3 visual engineering checkpoint available
+**Status:** In implementation; P0.4 Engineering Hands checkpoint available
 
 ## Purpose
 
@@ -171,6 +171,18 @@ Implemented and continuously verified:
 - Helmet work lighting, glass and emissive details, framed machinery, and impact sparks.
 - Explicit schema rejection for worlds produced by the previous deterministic generator.
 - Clean-room reference boundaries and an independently specified engineering-parity sequence.
+
+## P0.4 engineering hands checkpoint
+
+Implemented and continuously verified:
+
+- Server-range-checked construction placement and welding.
+- Persistent 90-degree block orientations transmitted in protocol snapshots.
+- Frames that consume components once, begin at 25 percent integrity, and require three accepted weld stages.
+- Power and anchor rules that ignore unfinished construction.
+- Completion-derived career progress and idempotent welding receipts.
+- Exact mined-coordinate removal assertions in the cross-process scenario.
+- Client-side frame skeletons, rotating directional holograms, integrity telemetry, and confirmed-edit rock fragments.
 
 ## Exit decision
 

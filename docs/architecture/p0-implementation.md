@@ -1,10 +1,10 @@
-# P0.3 implementation guide
+# P0.4 implementation guide
 
 **Status:** Playable local vertical slice
 
 ## What this milestone proves
 
-P0.3 connects a first-person Godot client and a browser command center to one Rust authoritative simulation. A player begins beside a powered salvage skiff, follows a five-stage industrial contract, mines a deterministic irregular asteroid rendered as a continuous surface, manufactures and moves resources, extends the grid, anchors it to voxels, moves it when released, and splits it through damage. Accepted work grants authoritative career experience. The server persists each accepted event before acknowledging it and reconstructs the same world after restart.
+P0.4 connects a first-person Godot client and a browser command center to one Rust authoritative simulation. A player begins beside a powered salvage skiff, excavates a deterministic irregular asteroid rendered as a continuous surface, then places oriented construction frames and welds them through three persistent integrity stages before they become functional. The five-stage industrial contract continues through manufacturing, anchoring, motion, damage, and splitting. The server persists each accepted event before acknowledging it and reconstructs the same world after restart.
 
 ```mermaid
 flowchart LR
@@ -22,9 +22,9 @@ flowchart LR
 
 Clients choose targets and request actions; they never choose yields, damage, health, power, production outputs, or final transforms. The simulation checks distance, adjacency, inventory, power, motion budgets, and anchor contact. A conservation proof runs after every accepted event. If ore, refined material, components, installed blocks, or destroyed blocks do not reconcile, the event is rejected.
 
-The content manifest `p0.3.0` defines voxel yields, recipes, block health, component costs, and power behavior. Its version is stored in the universe manifest and snapshots and included in every canonical event hash. Opening a universe under a different rule version fails explicitly.
+The content manifest `p0.4.0` defines voxel yields, recipes, block health, component costs, construction integrity, and power behavior. Its version is stored in the universe manifest and snapshots and included in every canonical event hash. Opening a universe under a different rule version fails explicitly.
 
-The save schema is version 3 and the client protocol is version 2. Save version 3 identifies the changed deterministic world generator; protocol version 2 retains the career aggregate and derived level fields because the wire shape is unchanged. A version mismatch fails explicitly; the runtime never guesses how to reinterpret an older save.
+The save schema is version 4 and the client protocol is version 3. Save version 4 adds persistent block orientation. Protocol version 3 adds orientation and maximum integrity to snapshots plus the weld-block intent. A version mismatch fails explicitly; the runtime never guesses how to reinterpret an older save.
 
 ## Local operation
 
@@ -66,10 +66,10 @@ The scenario proves:
 
 ## Deliberate limits
 
-This slice has one local player, one small asteroid, one 25-block salvage skiff, and one five-stage contract. Grid motion is deterministic kinematic integration, not collision physics. It sends complete JSON snapshots and is not intended for production bandwidth. Its distant planet is visual context, not a landable voxel body. It has no accounts, safe zones, offline cleanup, multiplayer partitioning, real markets, token custody, or smart contracts. These are roadmap work, not implied capabilities of P0.3.
+This slice has one local player, one small asteroid, one 25-block salvage skiff, and one five-stage contract. Orientation is currently limited to four yaw rotations, and one registered component is consumed entirely when its frame is placed. Grid motion is deterministic kinematic integration, not collision physics. It sends complete JSON snapshots and is not intended for production bandwidth. Its distant planet is visual context, not a landable voxel body. It has no accounts, safe zones, offline cleanup, multiplayer partitioning, real markets, token custody, or smart contracts. These are roadmap work, not implied capabilities of P0.4.
 
 ## Migration and rollback
 
-P0.3 has no deployed predecessor to migrate. It rejects save schemas 1 and 2 because the career and deterministic generator contracts differ. A universe also records content manifest `p0.3.0` and refuses to open under another rule set. Local testers can use `tools/dev/reset-local-world.sh` to move an incompatible world into a recoverable backup before creating a new one.
+P0.4 has no deployed predecessor to migrate. It rejects save schemas 1 through 3 because their player, generator, or block-orientation contracts differ. A universe also records content manifest `p0.4.0` and refuses to open under another rule set. Local testers can use `tools/dev/reset-local-world.sh` to move an incompatible world into a recoverable backup before creating a new one.
 
-Rollback is operational only: stop the worker, preserve its data directory, and return to the prior repository revision. No P0.3 action reaches a blockchain or changes external custody. A future content migration must be explicit, versioned, tested against a copy, and documented before the runtime will accept it.
+Rollback is operational only: stop the worker, preserve its data directory, and return to the prior repository revision. No P0.4 action reaches a blockchain or changes external custody. A future content migration must be explicit, versioned, tested against a copy, and documented before the runtime will accept it.

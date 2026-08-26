@@ -16,6 +16,7 @@ use crate::persistence::{PersistenceError, Store};
 
 const MAX_PLAYER_MOVE_STEP: f64 = 3.0;
 const MINING_RANGE: f64 = 8.5;
+const HAND_TOOL_RANGE: f64 = 9.0;
 const MAX_GRID_SPEED: f64 = 8.0;
 const MAX_GRID_ANGULAR_SPEED: f64 = 1.5;
 const MAX_GRID_BLOCKS_P0: usize = 2_048;
@@ -215,9 +216,14 @@ impl WorldState {
         let payload = match message {
             ClientMessage::MovePlayer { position, .. } => {
                 ensure_finite(*position, "player position")?;
-                if self.player.position.squared_distance(*position)
-                    > MAX_PLAYER_MOVE_STEP * MAX_PLAYER_MOVE_STEP
-                {
+                let distance_squared = self.player.position.squared_distance(*position);
+                if distance_squared <= 0.000_001 {
+                    return Err(IntentError::rejected(
+                        "movement_no_change",
+                        "stationary movement intents are not journaled",
+                    ));
+                }
+                if distance_squared > MAX_PLAYER_MOVE_STEP * MAX_PLAYER_MOVE_STEP {
                     return Err(IntentError::rejected(
                         "movement_too_large",
                         "authoritative player movement exceeded the per-intent limit",
@@ -345,9 +351,16 @@ impl WorldState {
                 grid_id,
                 coordinate,
                 kind,
+                orientation,
                 ..
             } => {
                 let grid = self.grid(grid_id)?;
+                if *orientation > 3 {
+                    return Err(IntentError::rejected(
+                        "invalid_block_orientation",
+                        "block orientation must be a quarter turn from 0 through 3",
+                    ));
+                }
                 if grid.blocks.len() >= MAX_GRID_BLOCKS_P0 {
                     return Err(IntentError::rejected(
                         "p0_grid_budget_reached",
@@ -371,6 +384,7 @@ impl WorldState {
                         "new blocks must share a face with the target grid",
                     ));
                 }
+                self.ensure_hand_tool_range(grid, *coordinate, "block_out_of_range")?;
                 let player_inventory = self.inventory(PLAYER_INVENTORY_ID)?;
                 let component_cost = content::block(*kind).component_cost;
                 if player_inventory.contents.components < component_cost {
@@ -382,12 +396,40 @@ impl WorldState {
 
                 let block_id = format!("block-{}", self.event_sequence + 1);
                 let mut block = Block::new(block_id.clone(), *coordinate, *kind);
+                block.orientation = *orientation;
+                block.health = block.max_health().div_ceil(4);
                 if *kind == BlockKind::Cargo {
                     block.inventory_id = Some(format!("inventory-{block_id}"));
                 }
                 EventPayload::BlockBuilt {
                     grid_id: grid_id.clone(),
                     block,
+                }
+            }
+            ClientMessage::WeldBlock {
+                grid_id, block_id, ..
+            } => {
+                let grid = self.grid(grid_id)?;
+                let block = grid.blocks.get(block_id).ok_or_else(|| {
+                    IntentError::rejected("block_missing", "weld target does not exist")
+                })?;
+                self.ensure_hand_tool_range(grid, block.coordinate, "block_out_of_range")?;
+                let max_health = block.max_health();
+                if block.health >= max_health {
+                    return Err(IntentError::rejected(
+                        "block_already_complete",
+                        "the targeted block is already at full integrity",
+                    ));
+                }
+                EventPayload::BlockWelded {
+                    grid_id: grid_id.clone(),
+                    block_id: block_id.clone(),
+                    previous_health: block.health,
+                    new_health: block
+                        .health
+                        .saturating_add(max_health.div_ceil(4))
+                        .min(max_health),
+                    max_health,
                 }
             }
             ClientMessage::SetGridMotion {
@@ -456,12 +498,13 @@ impl WorldState {
                 grid_id, block_id, ..
             } => {
                 let grid = self.grid(grid_id)?;
-                if !grid.blocks.contains_key(block_id) {
-                    return Err(IntentError::rejected(
+                let block = grid.blocks.get(block_id).ok_or_else(|| {
+                    IntentError::rejected(
                         "block_missing",
                         "target block does not exist on the grid",
-                    ));
-                }
+                    )
+                })?;
+                self.ensure_hand_tool_range(grid, block.coordinate, "block_out_of_range")?;
                 EventPayload::BlockDamaged {
                     grid_id: grid_id.clone(),
                     block_id: block_id.clone(),
@@ -589,6 +632,12 @@ impl WorldState {
                 );
             }
             EventPayload::BlockBuilt { grid_id, block } => {
+                if block.orientation > 3 || block.health != block.max_health().div_ceil(4) {
+                    return Err(IntentError::rejected(
+                        "replay_construction_frame_invalid",
+                        "placed frame does not match canonical orientation or integrity",
+                    ));
+                }
                 self.inventory_mut(PLAYER_INVENTORY_ID)?.contents.components -=
                     block.component_cost;
                 if let Some(inventory_id) = &block.inventory_id {
@@ -607,6 +656,37 @@ impl WorldState {
                     .blocks
                     .insert(block.block_id.clone(), block.clone());
                 self.ledger.built_blocks += 1;
+            }
+            EventPayload::BlockWelded {
+                grid_id,
+                block_id,
+                previous_health,
+                new_health,
+                max_health,
+            } => {
+                let block = self
+                    .grid_mut(grid_id)?
+                    .blocks
+                    .get_mut(block_id)
+                    .ok_or_else(|| {
+                        IntentError::rejected("replay_block_missing", "weld target is missing")
+                    })?;
+                if block.health != *previous_health || block.max_health() != *max_health {
+                    return Err(IntentError::rejected(
+                        "replay_integrity_mismatch",
+                        "weld event does not match the block integrity state",
+                    ));
+                }
+                let expected_health = previous_health
+                    .saturating_add(max_health.div_ceil(4))
+                    .min(*max_health);
+                if *new_health != expected_health {
+                    return Err(IntentError::rejected(
+                        "replay_weld_increment_invalid",
+                        "weld event does not match the canonical integrity increment",
+                    ));
+                }
+                block.health = *new_health;
             }
             EventPayload::GridMotionSet {
                 grid_id,
@@ -653,12 +733,18 @@ impl WorldState {
             EventPayload::ComponentCrafted { quantity, .. } => {
                 self.player.career.components_crafted += quantity;
             }
-            EventPayload::BlockBuilt { .. } => self.player.career.blocks_built += 1,
+            EventPayload::BlockWelded {
+                new_health,
+                max_health,
+                ..
+            } if new_health == max_health => self.player.career.blocks_built += 1,
             EventPayload::GridAnchorSet { anchored: true, .. } => {
                 self.player.career.anchors_engaged += 1;
             }
             EventPayload::PlayerMoved { .. }
             | EventPayload::InventoryTransferred { .. }
+            | EventPayload::BlockBuilt { .. }
+            | EventPayload::BlockWelded { .. }
             | EventPayload::GridMotionSet { .. }
             | EventPayload::GridAnchorSet {
                 anchored: false, ..
@@ -829,6 +915,23 @@ impl WorldState {
             IntentError::rejected("grid_missing", format!("grid {grid_id} does not exist"))
         })
     }
+
+    fn ensure_hand_tool_range(
+        &self,
+        grid: &Grid,
+        coordinate: verse_protocol::IVec3,
+        code: &str,
+    ) -> Result<(), IntentError> {
+        let world = grid.world_coordinate(coordinate);
+        let position = Vec3::new(f64::from(world.x), f64::from(world.y), f64::from(world.z));
+        if self.player.position.squared_distance(position) > HAND_TOOL_RANGE * HAND_TOOL_RANGE {
+            return Err(IntentError::rejected(
+                code,
+                "the targeted block coordinate is beyond the hand-tool range",
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn ensure_finite(value: Vec3, label: &str) -> Result<(), IntentError> {
@@ -867,6 +970,43 @@ mod tests {
 
     fn runtime() -> Runtime {
         Runtime::open(tempdir().expect("tempdir").keep(), 42, 5).expect("runtime opens")
+    }
+
+    fn move_player_near_grid(runtime: &mut Runtime) {
+        for (index, position) in [
+            Vec3::new(11.0, 3.5, 7.5),
+            Vec3::new(10.5, 2.5, 5.0),
+            Vec3::new(10.0, 1.0, 3.0),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            runtime
+                .execute(&ClientMessage::MovePlayer {
+                    operation_id: format!("approach-grid-{index}"),
+                    position,
+                })
+                .expect("bounded movement approaches the grid");
+        }
+    }
+
+    fn weld_to_completion(runtime: &mut Runtime, coordinate: IVec3, prefix: &str) {
+        loop {
+            let block = runtime.state().grids[STARTER_GRID_ID]
+                .block_at(coordinate)
+                .expect("weld target exists")
+                .clone();
+            if block.is_complete() {
+                break;
+            }
+            runtime
+                .execute(&ClientMessage::WeldBlock {
+                    operation_id: format!("{prefix}-{}", block.health),
+                    grid_id: STARTER_GRID_ID.into(),
+                    block_id: block.block_id,
+                })
+                .expect("weld stage accepted");
+        }
     }
 
     #[test]
@@ -979,13 +1119,31 @@ mod tests {
     }
 
     #[test]
+    fn stationary_movement_does_not_create_an_event() {
+        let mut runtime = runtime();
+        let result = runtime.execute(&ClientMessage::MovePlayer {
+            operation_id: "stationary-spam".into(),
+            position: runtime.state().player.position,
+        });
+        assert!(matches!(
+            result,
+            Err(RuntimeError::Intent(IntentError::Rejected { ref code, .. }))
+                if code == "movement_no_change"
+        ));
+        assert_eq!(runtime.state().event_sequence, 0);
+        assert!(runtime.state().processed_operations.is_empty());
+    }
+
+    #[test]
     fn build_retry_does_not_consume_a_second_component() {
         let mut runtime = runtime();
+        move_player_near_grid(&mut runtime);
         let intent = ClientMessage::BuildBlock {
             operation_id: "idempotent-build".into(),
             grid_id: STARTER_GRID_ID.into(),
             coordinate: IVec3::new(0, 1, 0),
             kind: BlockKind::Structural,
+            orientation: 2,
         };
         let first = runtime.execute(&intent).expect("build accepted");
         let second = runtime.execute(&intent).expect("retry accepted");
@@ -997,6 +1155,151 @@ mod tests {
             23
         );
         assert_eq!(runtime.state().grids[STARTER_GRID_ID].blocks.len(), 26);
+        let frame = runtime.state().grids[STARTER_GRID_ID]
+            .block_at(IVec3::new(0, 1, 0))
+            .expect("construction frame exists");
+        assert_eq!(frame.health, 25);
+        assert_eq!(frame.orientation, 2);
+        assert_eq!(runtime.state().player.career.blocks_built, 0);
+        assert!(runtime.state().conservation().valid);
+    }
+
+    #[test]
+    fn welding_is_staged_idempotent_and_counts_completion_once() {
+        let mut runtime = runtime();
+        move_player_near_grid(&mut runtime);
+        runtime
+            .execute(&ClientMessage::BuildBlock {
+                operation_id: "place-frame".into(),
+                grid_id: STARTER_GRID_ID.into(),
+                coordinate: IVec3::new(0, 1, 0),
+                kind: BlockKind::Structural,
+                orientation: 1,
+            })
+            .expect("frame placement accepted");
+        let block_id = runtime.state().grids[STARTER_GRID_ID]
+            .block_at(IVec3::new(0, 1, 0))
+            .expect("frame exists")
+            .block_id
+            .clone();
+        let first_weld = ClientMessage::WeldBlock {
+            operation_id: "weld-once".into(),
+            grid_id: STARTER_GRID_ID.into(),
+            block_id: block_id.clone(),
+        };
+        let first_receipt = runtime.execute(&first_weld).expect("first weld accepted");
+        let retry_receipt = runtime.execute(&first_weld).expect("weld retry accepted");
+        assert_eq!(first_receipt, retry_receipt);
+        assert_eq!(
+            runtime.state().grids[STARTER_GRID_ID].blocks[&block_id].health,
+            50
+        );
+        weld_to_completion(&mut runtime, IVec3::new(0, 1, 0), "finish-frame");
+        assert_eq!(runtime.state().player.career.blocks_built, 1);
+        let sequence = runtime.state().event_sequence;
+        let completed = runtime.execute(&ClientMessage::WeldBlock {
+            operation_id: "over-weld".into(),
+            grid_id: STARTER_GRID_ID.into(),
+            block_id,
+        });
+        assert!(matches!(
+            completed,
+            Err(RuntimeError::Intent(IntentError::Rejected { ref code, .. }))
+                if code == "block_already_complete"
+        ));
+        assert_eq!(runtime.state().event_sequence, sequence);
+        assert!(runtime.state().conservation().valid);
+    }
+
+    #[test]
+    fn construction_rejects_remote_and_invalid_frames() {
+        let mut runtime = runtime();
+        let remote = runtime.execute(&ClientMessage::BuildBlock {
+            operation_id: "remote-frame".into(),
+            grid_id: STARTER_GRID_ID.into(),
+            coordinate: IVec3::new(0, 1, 0),
+            kind: BlockKind::Structural,
+            orientation: 0,
+        });
+        assert!(matches!(
+            remote,
+            Err(RuntimeError::Intent(IntentError::Rejected { ref code, .. }))
+                if code == "block_out_of_range"
+        ));
+        move_player_near_grid(&mut runtime);
+        let invalid = runtime.execute(&ClientMessage::BuildBlock {
+            operation_id: "invalid-orientation".into(),
+            grid_id: STARTER_GRID_ID.into(),
+            coordinate: IVec3::new(0, 1, 0),
+            kind: BlockKind::Structural,
+            orientation: 4,
+        });
+        assert!(matches!(
+            invalid,
+            Err(RuntimeError::Intent(IntentError::Rejected { ref code, .. }))
+                if code == "invalid_block_orientation"
+        ));
+        assert_eq!(runtime.state().grids[STARTER_GRID_ID].blocks.len(), 25);
+        assert!(runtime.state().conservation().valid);
+    }
+
+    #[test]
+    fn unfinished_anchor_cannot_lock_the_grid() {
+        let mut runtime = runtime();
+        move_player_near_grid(&mut runtime);
+        runtime
+            .execute(&ClientMessage::BuildBlock {
+                operation_id: "place-anchor-frame".into(),
+                grid_id: STARTER_GRID_ID.into(),
+                coordinate: IVec3::new(-2, 0, 0),
+                kind: BlockKind::Anchor,
+                orientation: 3,
+            })
+            .expect("anchor frame placement accepted");
+        let unfinished = runtime.execute(&ClientMessage::ToggleGridAnchor {
+            operation_id: "engage-unfinished-anchor".into(),
+            grid_id: STARTER_GRID_ID.into(),
+        });
+        assert!(matches!(
+            unfinished,
+            Err(RuntimeError::Intent(IntentError::Rejected { ref code, .. }))
+                if code == "anchor_not_touching_voxel"
+        ));
+        weld_to_completion(&mut runtime, IVec3::new(-2, 0, 0), "weld-anchor");
+        runtime
+            .execute(&ClientMessage::ToggleGridAnchor {
+                operation_id: "engage-complete-anchor".into(),
+                grid_id: STARTER_GRID_ID.into(),
+            })
+            .expect("complete anchor engages");
+        assert!(runtime.state().grids[STARTER_GRID_ID].anchored);
+        assert!(runtime.state().conservation().valid);
+    }
+
+    #[test]
+    fn unfinished_power_block_does_not_join_the_network() {
+        let mut runtime = runtime();
+        move_player_near_grid(&mut runtime);
+        let baseline = runtime.state().grids[STARTER_GRID_ID].power().produced;
+        runtime
+            .execute(&ClientMessage::BuildBlock {
+                operation_id: "place-power-frame".into(),
+                grid_id: STARTER_GRID_ID.into(),
+                coordinate: IVec3::new(0, 1, 0),
+                kind: BlockKind::PowerSource,
+                orientation: 1,
+            })
+            .expect("power frame placement accepted");
+        assert!(
+            (runtime.state().grids[STARTER_GRID_ID].power().produced - baseline).abs()
+                < f64::EPSILON
+        );
+        weld_to_completion(&mut runtime, IVec3::new(0, 1, 0), "weld-power");
+        let expected = baseline + content::block(BlockKind::PowerSource).power_production;
+        assert!(
+            (runtime.state().grids[STARTER_GRID_ID].power().produced - expected).abs()
+                < f64::EPSILON
+        );
         assert!(runtime.state().conservation().valid);
     }
 
@@ -1044,11 +1347,13 @@ mod tests {
     #[test]
     fn disconnected_damage_splits_grid_without_duplicating_blocks() {
         let mut runtime = runtime();
+        move_player_near_grid(&mut runtime);
         let build = ClientMessage::BuildBlock {
             operation_id: "build-bridge".into(),
             grid_id: STARTER_GRID_ID.into(),
             coordinate: IVec3::new(0, 1, 0),
             kind: BlockKind::DamageTest,
+            orientation: 0,
         };
         runtime.execute(&build).expect("bridge block built");
         let build_top = ClientMessage::BuildBlock {
@@ -1056,8 +1361,11 @@ mod tests {
             grid_id: STARTER_GRID_ID.into(),
             coordinate: IVec3::new(0, 2, 0),
             kind: BlockKind::Structural,
+            orientation: 0,
         };
         runtime.execute(&build_top).expect("top block built");
+        weld_to_completion(&mut runtime, IVec3::new(0, 1, 0), "weld-bridge");
+        weld_to_completion(&mut runtime, IVec3::new(0, 2, 0), "weld-top");
         let bridge_id = runtime.state().grids[STARTER_GRID_ID]
             .block_at(IVec3::new(0, 1, 0))
             .expect("bridge block")

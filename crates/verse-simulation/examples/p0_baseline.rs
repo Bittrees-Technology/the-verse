@@ -53,6 +53,30 @@ fn summarize(mut samples: Vec<Duration>) -> LatencySummary {
     }
 }
 
+fn move_player(
+    runtime: &mut Runtime,
+    target: Vec3,
+    sequence: &mut u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    loop {
+        let current = runtime.state().player.position;
+        let delta = Vec3::new(
+            target.x - current.x,
+            target.y - current.y,
+            target.z - current.z,
+        );
+        if delta.magnitude() <= 0.01 {
+            return Ok(());
+        }
+        let next = current + delta.clamped(2.8);
+        runtime.execute(&ClientMessage::MovePlayer {
+            operation_id: format!("benchmark-move-{sequence}"),
+            position: next,
+        })?;
+        *sequence += 1;
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempdir()?;
     let startup_started = Instant::now();
@@ -61,6 +85,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let initial_voxels = runtime.state().voxels.occupied.len();
     let snapshot_json_bytes = serde_json::to_vec(&runtime.snapshot())?.len();
 
+    let mut mining_move_sequence = 0;
+    move_player(
+        &mut runtime,
+        Vec3::new(10.0, 0.0, 3.0),
+        &mut mining_move_sequence,
+    )?;
     let mut mining_samples = Vec::new();
     for index in 0..100_u64 {
         let target = runtime
@@ -98,7 +128,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let split_directory = tempdir()?;
     let mut split_runtime = Runtime::open(split_directory.path(), 84, 10_000)?;
+    let mut move_sequence = 0;
     for y in 1..=20 {
+        move_player(
+            &mut split_runtime,
+            Vec3::new(10.0, f64::from(y), 3.0),
+            &mut move_sequence,
+        )?;
         split_runtime.execute(&ClientMessage::BuildBlock {
             operation_id: format!("benchmark-build-{y}"),
             grid_id: "grid-starter".into(),
@@ -108,13 +144,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 BlockKind::Structural
             },
+            orientation: 0,
         })?;
+        let block_id = split_runtime.state().grids["grid-starter"]
+            .block_at(IVec3::new(0, y, 0))
+            .expect("construction frame exists")
+            .block_id
+            .clone();
+        for stage in 0..3 {
+            split_runtime.execute(&ClientMessage::WeldBlock {
+                operation_id: format!("benchmark-weld-{y}-{stage}"),
+                grid_id: "grid-starter".into(),
+                block_id: block_id.clone(),
+            })?;
+        }
     }
     let bridge_id = split_runtime.state().grids["grid-starter"]
         .block_at(IVec3::new(0, 10, 0))
         .expect("bridge exists")
         .block_id
         .clone();
+    move_player(
+        &mut split_runtime,
+        Vec3::new(10.0, 10.0, 3.0),
+        &mut move_sequence,
+    )?;
     split_runtime.execute(&ClientMessage::DamageBlock {
         operation_id: "benchmark-damage-1".into(),
         grid_id: "grid-starter".into(),
