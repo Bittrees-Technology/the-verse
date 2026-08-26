@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 extends Node3D
 
+const ARMOR_TEXTURE: Texture2D = preload("res://assets/materials/verse_armor_albedo.png")
+const ASTEROID_SHADER: Shader = preload("res://shaders/asteroid_surface.gdshader")
 const PROTOCOL_VERSION := 2
 const DEFAULT_SERVER := "ws://127.0.0.1:7777/ws"
 const PLAYER_INVENTORY := "inventory-player-local"
@@ -14,7 +16,19 @@ const MOVE_SEND_INTERVAL := 0.10
 const TARGET_RANGE := 9.0
 const MINE_DURATION := 0.72
 const DAMAGE_DURATION := 0.46
-const SURFACE_NEIGHBORS := [
+const ISO_LEVEL := 0.5
+const MARCHING_CORNERS: Array[Vector3i] = [
+	Vector3i(0, 0, 0), Vector3i(1, 0, 0),
+	Vector3i(1, 1, 0), Vector3i(0, 1, 0),
+	Vector3i(0, 0, 1), Vector3i(1, 0, 1),
+	Vector3i(1, 1, 1), Vector3i(0, 1, 1),
+]
+const MARCHING_TETRAHEDRA: Array[Vector4i] = [
+	Vector4i(0, 5, 1, 6), Vector4i(0, 1, 2, 6),
+	Vector4i(0, 2, 3, 6), Vector4i(0, 3, 7, 6),
+	Vector4i(0, 7, 4, 6), Vector4i(0, 4, 5, 6),
+]
+const DENSITY_NEIGHBORS: Array[Vector3i] = [
 	Vector3i(1, 0, 0), Vector3i(-1, 0, 0),
 	Vector3i(0, 1, 0), Vector3i(0, -1, 0),
 	Vector3i(0, 0, 1), Vector3i(0, 0, -1),
@@ -42,6 +56,7 @@ var last_socket_state := -1
 var closed_reported := false
 var player_velocity := Vector3.ZERO
 var dampeners_enabled := true
+var suit_light_enabled := true
 var action_charge := 0.0
 var action_target_key := ""
 var action_cooldown := 0.0
@@ -74,9 +89,10 @@ var tool_light: OmniLight3D
 var build_preview: MeshInstance3D
 var action_beam: MeshInstance3D
 var action_flare: MeshInstance3D
+var action_sparks: GPUParticles3D
+var suit_light: SpotLight3D
 
-var rock_material: StandardMaterial3D
-var ore_material: StandardMaterial3D
+var rock_material: Material
 var block_materials: Dictionary = {}
 var detail_materials: Dictionary = {}
 
@@ -160,6 +176,10 @@ func _unhandled_input(event: InputEvent) -> void:
 				_set_message(
 					"Inertial dampeners %s" % ("online" if dampeners_enabled else "offline")
 				)
+			KEY_L:
+				suit_light_enabled = not suit_light_enabled
+				suit_light.visible = suit_light_enabled
+				_set_message("Helmet light %s" % ("online" if suit_light_enabled else "offline"))
 			KEY_F5:
 				_connect_to_server()
 
@@ -217,15 +237,15 @@ func _build_environment() -> void:
 
 	var key_light := DirectionalLight3D.new()
 	key_light.rotation_degrees = Vector3(-38.0, -52.0, 0.0)
-	key_light.light_color = Color(0.72, 0.84, 1.0)
-	key_light.light_energy = 1.35
+	key_light.light_color = Color(0.82, 0.89, 1.0)
+	key_light.light_energy = 1.20
 	key_light.shadow_enabled = true
 	add_child(key_light)
 
 	var rim_light := DirectionalLight3D.new()
 	rim_light.rotation_degrees = Vector3(28.0, 132.0, 0.0)
-	rim_light.light_color = Color(1.0, 0.36, 0.16)
-	rim_light.light_energy = 0.55
+	rim_light.light_color = Color(1.0, 0.58, 0.36)
+	rim_light.light_energy = 0.32
 	add_child(rim_light)
 
 	camera = Camera3D.new()
@@ -233,9 +253,18 @@ func _build_environment() -> void:
 	camera.fov = 74.0
 	camera.near = 0.05
 	camera.far = 1500.0
-	camera.position = Vector3(10.0, 3.0, 8.0)
+	camera.position = Vector3(12.0, 4.5, 10.0)
 	add_child(camera)
 	camera.look_at(Vector3.ZERO, Vector3.UP)
+	suit_light = SpotLight3D.new()
+	suit_light.name = "HelmetWorkLight"
+	suit_light.light_color = Color(0.86, 0.92, 1.0)
+	suit_light.light_energy = 3.2
+	suit_light.spot_range = 18.0
+	suit_light.spot_angle = 33.0
+	suit_light.spot_angle_attenuation = 1.35
+	suit_light.shadow_enabled = true
+	camera.add_child(suit_light)
 
 	asteroid_root = Node3D.new()
 	asteroid_root.name = "AuthoritativeAsteroid"
@@ -247,19 +276,18 @@ func _build_environment() -> void:
 	stars_root.name = "Starfield"
 	add_child(stars_root)
 
-	rock_material = _material(Color(0.14, 0.18, 0.21), 0.96, 0.02)
-	rock_material.vertex_color_use_as_albedo = true
-	ore_material = _material(Color(0.58, 0.21, 0.08), 0.78, 0.32)
-	ore_material.vertex_color_use_as_albedo = true
+	var asteroid_material := ShaderMaterial.new()
+	asteroid_material.shader = ASTEROID_SHADER
+	rock_material = asteroid_material
 	block_materials = {
-		"structural": _material(Color(0.22, 0.27, 0.30), 0.72, 0.62),
-		"control_core": _material(Color(0.08, 0.24, 0.31), 0.46, 0.55),
-		"power_source": _material(Color(0.35, 0.19, 0.055), 0.40, 0.48),
-		"battery": _material(Color(0.31, 0.28, 0.07), 0.48, 0.38),
-		"cargo": _material(Color(0.11, 0.27, 0.20), 0.70, 0.28),
-		"drill": _material(Color(0.28, 0.11, 0.07), 0.50, 0.60),
-		"anchor": _material(Color(0.24, 0.12, 0.31), 0.54, 0.48),
-		"damage_test": _material(Color(0.36, 0.055, 0.04), 0.64, 0.32),
+		"structural": _armored_material(Color(0.72, 0.78, 0.80), 0.72, 0.62),
+		"control_core": _armored_material(Color(0.34, 0.72, 0.79), 0.46, 0.55),
+		"power_source": _armored_material(Color(0.93, 0.57, 0.20), 0.40, 0.48),
+		"battery": _armored_material(Color(0.86, 0.78, 0.24), 0.48, 0.38),
+		"cargo": _armored_material(Color(0.36, 0.75, 0.56), 0.70, 0.28),
+		"drill": _armored_material(Color(0.82, 0.38, 0.23), 0.50, 0.60),
+		"anchor": _armored_material(Color(0.65, 0.37, 0.77), 0.54, 0.48),
+		"damage_test": _armored_material(Color(0.92, 0.22, 0.16), 0.64, 0.32),
 	}
 	detail_materials = {
 		"steel": _material(Color(0.50, 0.58, 0.61), 0.38, 0.82),
@@ -268,6 +296,7 @@ func _build_environment() -> void:
 		"amber": _emissive_material(Color(1.0, 0.37, 0.055), 3.0),
 		"green": _emissive_material(Color(0.12, 0.95, 0.53), 2.2),
 		"red": _emissive_material(Color(1.0, 0.10, 0.045), 2.8),
+		"glass": _glass_material(),
 		"hologram": _hologram_material(),
 	}
 	_build_starfield()
@@ -282,6 +311,17 @@ func _material(color: Color, roughness: float, metallic: float) -> StandardMater
 	material.albedo_color = color
 	material.roughness = roughness
 	material.metallic = metallic
+	return material
+
+
+func _armored_material(color: Color, roughness: float, metallic: float) -> StandardMaterial3D:
+	var material := _material(color, roughness, metallic)
+	material.albedo_texture = ARMOR_TEXTURE
+	material.texture_filter = BaseMaterial3D.TEXTURE_FILTER_LINEAR_WITH_MIPMAPS_ANISOTROPIC
+	material.texture_repeat = true
+	material.uv1_triplanar = true
+	material.uv1_world_triplanar = false
+	material.uv1_scale = Vector3.ONE * 0.72
 	return material
 
 
@@ -301,6 +341,16 @@ func _hologram_material() -> StandardMaterial3D:
 	material.emission_enabled = true
 	material.emission = Color(0.08, 0.56, 1.0)
 	material.emission_energy_multiplier = 1.8
+	return material
+
+
+func _glass_material() -> StandardMaterial3D:
+	var material := StandardMaterial3D.new()
+	material.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	material.albedo_color = Color(0.025, 0.16, 0.22, 0.58)
+	material.metallic = 0.72
+	material.roughness = 0.12
+	material.cull_mode = BaseMaterial3D.CULL_DISABLED
 	return material
 
 
@@ -378,6 +428,35 @@ func _build_action_feedback() -> void:
 	action_flare.mesh = flare_mesh
 	action_flare.visible = false
 	add_child(action_flare)
+
+	var spark_process := ParticleProcessMaterial.new()
+	spark_process.emission_shape = ParticleProcessMaterial.EMISSION_SHAPE_SPHERE
+	spark_process.emission_sphere_radius = 0.10
+	spark_process.direction = Vector3(0.0, 1.0, 0.0)
+	spark_process.spread = 180.0
+	spark_process.initial_velocity_min = 0.8
+	spark_process.initial_velocity_max = 3.4
+	spark_process.damping_min = 1.2
+	spark_process.damping_max = 2.4
+	spark_process.scale_min = 0.45
+	spark_process.scale_max = 1.15
+	var spark_mesh := SphereMesh.new()
+	spark_mesh.radius = 0.018
+	spark_mesh.height = 0.036
+	spark_mesh.radial_segments = 5
+	spark_mesh.rings = 3
+	spark_mesh.material = detail_materials["amber"]
+	action_sparks = GPUParticles3D.new()
+	action_sparks.name = "ToolSparks"
+	action_sparks.amount = 46
+	action_sparks.lifetime = 0.42
+	action_sparks.randomness = 0.72
+	action_sparks.explosiveness = 0.18
+	action_sparks.local_coords = false
+	action_sparks.process_material = spark_process
+	action_sparks.draw_pass_1 = spark_mesh
+	action_sparks.emitting = false
+	add_child(action_sparks)
 
 
 func _build_starfield() -> void:
@@ -616,7 +695,7 @@ func _build_interface() -> void:
 	selected_label = hotbar_label
 
 	var controls := _hud_label(
-		"WASD / SPACE / C  EVA THRUST    SHIFT  BOOST    Z  DAMPENERS    B  BUILD MODE    HOLD LMB  USE TOOL    RMB  CUT / EXIT BUILD",
+		"WASD / SPACE / C  EVA THRUST    SHIFT  BOOST    Z  DAMPENERS    L  HELMET LIGHT    B  BUILD    HOLD LMB  USE TOOL    RMB  CUT",
 		Vector2(20.0, -40.0),
 		11
 	)
@@ -781,6 +860,10 @@ func _rebuild_voxels(voxels: Array) -> void:
 	for child in asteroid_root.get_children():
 		child.queue_free()
 	voxel_lookup.clear()
+	if voxels.is_empty():
+		return
+	var minimum := Vector3i(1_000_000, 1_000_000, 1_000_000)
+	var maximum := Vector3i(-1_000_000, -1_000_000, -1_000_000)
 	for voxel in voxels:
 		var coordinate: Dictionary = voxel.get("coordinate", {})
 		var grid_position := Vector3i(
@@ -789,70 +872,167 @@ func _rebuild_voxels(voxels: Array) -> void:
 			int(coordinate.get("z", 0))
 		)
 		voxel_lookup[_coord_key(grid_position)] = voxel
-	var rock_positions: Array[Vector3] = []
-	var ore_positions: Array[Vector3] = []
-	for voxel in voxels:
-		var grid_position := _coord_i(voxel.get("coordinate", {}))
-		if not _is_surface_voxel(grid_position):
-			continue
-		if voxel.get("material", "rock") == "ferrite_ore":
-			ore_positions.append(Vector3(grid_position))
-		else:
-			rock_positions.append(Vector3(grid_position))
-	_add_voxel_multimesh(rock_positions, rock_material, "RockVoxels")
-	_add_voxel_multimesh(ore_positions, ore_material, "FerriteVoxels")
+		minimum = minimum.min(grid_position)
+		maximum = maximum.max(grid_position)
+	_build_voxel_isosurface(minimum, maximum)
 
 
-func _is_surface_voxel(coordinate: Vector3i) -> bool:
-	for offset in SURFACE_NEIGHBORS:
-		if not voxel_lookup.has(_coord_key(coordinate + offset)):
-			return true
-	return false
-
-
-func _add_voxel_multimesh(
-	positions: Array[Vector3],
-	material: Material,
-	node_name: String
-) -> void:
-	if positions.is_empty():
-		return
-	var mesh := SphereMesh.new()
-	mesh.radius = 0.66
-	mesh.height = 1.28
-	mesh.radial_segments = 7
-	mesh.rings = 4
-	mesh.material = material
-	var multimesh := MultiMesh.new()
-	multimesh.transform_format = MultiMesh.TRANSFORM_3D
-	multimesh.use_colors = true
-	multimesh.mesh = mesh
-	multimesh.instance_count = positions.size()
-	for index in positions.size():
-		var position := positions[index]
-		var variation := _position_variation(position)
-		var secondary := _position_variation(position + Vector3(17.0, -9.0, 23.0))
-		var scale := 0.87 + variation * 0.15
-		var basis := Basis.from_euler(Vector3(
-			variation * 2.1,
-			secondary * 3.4,
-			(variation + secondary) * 1.7
-		))
-		basis = basis.scaled(Vector3(
-			scale * (0.91 + secondary * 0.16),
-			scale * (0.94 + variation * 0.12),
-			scale * (0.90 + (1.0 - secondary) * 0.18)
-		))
-		multimesh.set_instance_transform(
-			index,
-			Transform3D(basis, position)
-		)
-		var tint := 0.72 + variation * 0.34
-		multimesh.set_instance_color(index, Color(tint, tint * 0.97, tint * 0.92, 1.0))
-	var instance := MultiMeshInstance3D.new()
-	instance.name = node_name
-	instance.multimesh = multimesh
+func _build_voxel_isosurface(minimum: Vector3i, maximum: Vector3i) -> void:
+	var surface := SurfaceTool.new()
+	surface.begin(Mesh.PRIMITIVE_TRIANGLES)
+	for x in range(minimum.x - 1, maximum.x + 1):
+		for y in range(minimum.y - 1, maximum.y + 1):
+			for z in range(minimum.z - 1, maximum.z + 1):
+				var origin := Vector3i(x, y, z)
+				var corner_points: Array[Vector3] = []
+				var corner_values: Array[float] = []
+				var filled_count := 0
+				for offset in MARCHING_CORNERS:
+					var coordinate := origin + offset
+					var density := _voxel_density(coordinate)
+					corner_points.append(Vector3(coordinate))
+					corner_values.append(density)
+					if density >= ISO_LEVEL:
+						filled_count += 1
+				if filled_count == 0 or filled_count == MARCHING_CORNERS.size():
+					continue
+				for tetrahedron in MARCHING_TETRAHEDRA:
+					var indices: Array[int] = [
+						tetrahedron.x, tetrahedron.y, tetrahedron.z, tetrahedron.w,
+					]
+					var tetra_points: Array[Vector3] = []
+					var tetra_values: Array[float] = []
+					for index in indices:
+						tetra_points.append(corner_points[index])
+						tetra_values.append(corner_values[index])
+					_polygonize_tetrahedron(surface, tetra_points, tetra_values)
+	surface.index()
+	surface.generate_normals()
+	var mesh := surface.commit()
+	var instance := MeshInstance3D.new()
+	instance.name = "SmoothVoxelAsteroid"
+	instance.mesh = mesh
+	instance.material_override = rock_material
 	asteroid_root.add_child(instance)
+
+
+func _voxel_density(coordinate: Vector3i) -> float:
+	var density := 0.46 if voxel_lookup.has(_coord_key(coordinate)) else 0.0
+	for offset in DENSITY_NEIGHBORS:
+		if voxel_lookup.has(_coord_key(coordinate + offset)):
+			density += 0.09
+	return density
+
+
+func _polygonize_tetrahedron(
+	surface: SurfaceTool,
+	points: Array[Vector3],
+	values: Array[float]
+) -> void:
+	var inside: Array[int] = []
+	var outside: Array[int] = []
+	for index in 4:
+		if values[index] >= ISO_LEVEL:
+			inside.append(index)
+		else:
+			outside.append(index)
+	if inside.is_empty() or outside.is_empty():
+		return
+	var material_samples: Array[Vector3] = []
+	for index in inside:
+		material_samples.append(points[index])
+	if inside.size() == 1:
+		_add_surface_triangle(
+			surface,
+			_iso_intersection(
+				points[inside[0]], values[inside[0]], points[outside[0]], values[outside[0]]
+			),
+			_iso_intersection(
+				points[inside[0]], values[inside[0]], points[outside[1]], values[outside[1]]
+			),
+			_iso_intersection(
+				points[inside[0]], values[inside[0]], points[outside[2]], values[outside[2]]
+			),
+			material_samples
+		)
+	elif inside.size() == 3:
+		_add_surface_triangle(
+			surface,
+			_iso_intersection(
+				points[outside[0]], values[outside[0]], points[inside[0]], values[inside[0]]
+			),
+			_iso_intersection(
+				points[outside[0]], values[outside[0]], points[inside[1]], values[inside[1]]
+			),
+			_iso_intersection(
+				points[outside[0]], values[outside[0]], points[inside[2]], values[inside[2]]
+			),
+			material_samples
+		)
+	else:
+		var edge_a := _iso_intersection(
+			points[inside[0]], values[inside[0]], points[outside[0]], values[outside[0]]
+		)
+		var edge_b := _iso_intersection(
+			points[inside[0]], values[inside[0]], points[outside[1]], values[outside[1]]
+		)
+		var edge_c := _iso_intersection(
+			points[inside[1]], values[inside[1]], points[outside[0]], values[outside[0]]
+		)
+		var edge_d := _iso_intersection(
+			points[inside[1]], values[inside[1]], points[outside[1]], values[outside[1]]
+		)
+		_add_surface_triangle(surface, edge_a, edge_b, edge_d, material_samples)
+		_add_surface_triangle(surface, edge_a, edge_d, edge_c, material_samples)
+
+
+func _iso_intersection(
+	first_point: Vector3,
+	first_value: float,
+	second_point: Vector3,
+	second_value: float
+) -> Vector3:
+	var difference := second_value - first_value
+	if absf(difference) < 0.0001:
+		return first_point.lerp(second_point, 0.5)
+	var fraction := clampf((ISO_LEVEL - first_value) / difference, 0.0, 1.0)
+	return first_point.lerp(second_point, fraction)
+
+
+func _add_surface_triangle(
+	surface: SurfaceTool,
+	first: Vector3,
+	second: Vector3,
+	third: Vector3,
+	material_samples: Array[Vector3]
+) -> void:
+	var centroid := (first + second + third) / 3.0
+	var face_normal := (second - first).cross(third - first).normalized()
+	if face_normal.dot(centroid) < 0.0:
+		var swap := second
+		second = third
+		third = swap
+		face_normal = -face_normal
+	var triangle_points: Array[Vector3] = [first, second, third]
+	for point in triangle_points:
+		var radial_normal: Vector3 = point.normalized()
+		surface.set_normal(radial_normal)
+		surface.set_color(_voxel_surface_color(point, material_samples))
+		surface.add_vertex(point)
+
+
+func _voxel_surface_color(point: Vector3, material_samples: Array[Vector3]) -> Color:
+	var variation := _position_variation(point * 1.37)
+	var ferrite := false
+	for sample in material_samples:
+		var coordinate := Vector3i(roundi(sample.x), roundi(sample.y), roundi(sample.z))
+		var voxel: Dictionary = voxel_lookup.get(_coord_key(coordinate), {})
+		if voxel.get("material", "rock") == "ferrite_ore":
+			ferrite = true
+	if ferrite:
+		return Color(0.68 + variation * 0.14, 0.19, 0.055, 1.0)
+	var shade := 0.27 + variation * 0.11
+	return Color(shade * 0.84, shade * 0.94, shade, 1.0)
 
 
 func _position_variation(position: Vector3) -> float:
@@ -908,6 +1088,18 @@ func _build_block_visual(block: Dictionary) -> Node3D:
 
 	match kind:
 		"structural":
+			for z in [-0.43, 0.43]:
+				var horizontal_rail := _box_visual(
+					Vector3(0.78, 0.045, 0.04), detail_materials["steel"]
+				)
+				horizontal_rail.position = Vector3(0.0, 0.47, z)
+				root.add_child(horizontal_rail)
+			for x in [-0.43, 0.43]:
+				var vertical_rail := _box_visual(
+					Vector3(0.04, 0.045, 0.78), detail_materials["steel"]
+				)
+				vertical_rail.position = Vector3(x, 0.47, 0.0)
+				root.add_child(vertical_rail)
 			for x in [-0.34, 0.34]:
 				for y in [-0.31, 0.31]:
 					var fastener := _cylinder_visual(0.035, 0.025, detail_materials["steel"])
@@ -915,6 +1107,15 @@ func _build_block_visual(block: Dictionary) -> Node3D:
 					fastener.position = Vector3(x, y, -0.50)
 					root.add_child(fastener)
 		"control_core":
+			var canopy := _box_visual(Vector3(0.70, 0.34, 0.58), detail_materials["glass"])
+			canopy.position = Vector3(0.0, 0.52, 0.03)
+			root.add_child(canopy)
+			for x in [-0.37, 0.37]:
+				var canopy_frame := _box_visual(
+					Vector3(0.045, 0.42, 0.64), detail_materials["steel"]
+				)
+				canopy_frame.position = Vector3(x, 0.50, 0.03)
+				root.add_child(canopy_frame)
 			var display := _box_visual(Vector3(0.44, 0.30, 0.045), detail_materials["cyan"])
 			display.position = Vector3(0.0, 0.05, -0.505)
 			root.add_child(display)
@@ -1180,6 +1381,7 @@ func _update_action_feedback() -> void:
 	var active := action_charge > 0.0 and not action_target_key.is_empty()
 	action_beam.visible = active
 	action_flare.visible = active
+	action_sparks.emitting = active
 	if not active:
 		return
 	var target_position := _active_action_position()
@@ -1193,6 +1395,7 @@ func _update_action_feedback() -> void:
 		Vector3(1.0, beam_vector.length(), 1.0)
 	)
 	action_flare.global_position = target_position
+	action_sparks.global_position = target_position
 	var pulse := 0.72 + sin(elapsed_time * 38.0) * 0.22 + action_charge * 0.42
 	action_flare.scale = Vector3.ONE * pulse
 

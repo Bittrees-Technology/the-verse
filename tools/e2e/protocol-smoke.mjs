@@ -144,7 +144,7 @@ async function run() {
     client_name: "node-authoritative-e2e",
   });
   assert.equal(world.conservation.valid, true);
-  assert.equal(world.content_manifest_version, "p0.1.0");
+  assert.equal(world.content_manifest_version, "p0.3.0");
   assert.equal(world.grids.length, 1);
   assert.ok(world.voxels.length > 1_000);
 

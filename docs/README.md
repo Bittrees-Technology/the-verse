@@ -15,11 +15,16 @@ These documents form the initial specification baseline.
 ## Gameplay
 
 - [P0.2 Salvage Frontier](gameplay/salvage-frontier.md)
+- [P0.3 visual engineering checkpoint](gameplay/engineering-realism.md)
+
+## Research
+
+- [Space-engineering reference study](research/space-engineering-reference.md)
 
 ## Architecture
 
 - [System overview](architecture/system-overview.md)
-- [P0.2 implementation guide](architecture/p0-implementation.md)
+- [P0.3 implementation guide](architecture/p0-implementation.md)
 - [Universe simulation](architecture/universe-simulation.md)
 - [Data and events](architecture/data-and-events.md)
 - [Clients and public APIs](architecture/clients-and-apis.md)
