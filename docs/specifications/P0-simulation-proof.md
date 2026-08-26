@@ -1,6 +1,6 @@
 # P0 specification: simulation proof
 
-**Status:** In implementation; P0.1 playable vertical slice available
+**Status:** In implementation; P0.2 first-person gameplay slice available
 
 ## Purpose
 
@@ -148,6 +148,18 @@ Still required for the P0 exit gate:
 - Ubuntu server benchmark and native Linux client package.
 - Network bandwidth measurements and larger body/block-count scaling.
 - Crash injection at each persistence boundary, beyond the current corruption and restart suite.
+
+## P0.2 gameplay checkpoint
+
+Implemented and continuously verified:
+
+- First-person six-axis EVA movement with boost and toggleable inertial dampeners.
+- A physical industrial multi-tool with hold-to-mine, weld, and cut interactions.
+- Surface-only irregular asteroid rendering while integer voxels remain canonical.
+- A differentiated 25-block starter skiff with control, power, battery, cargo, drill, and work-light silhouettes.
+- A five-stage salvage contract spanning extraction, refining, fabrication, construction, and anchoring.
+- Event-derived career counters, experience rewards, and clearance levels in the authoritative snapshot.
+- Protocol and save-schema rejection for incompatible pre-career clients and worlds.
 
 ## Exit decision
 

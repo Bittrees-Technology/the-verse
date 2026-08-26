@@ -130,6 +130,7 @@ canvas {
 
 aside { display: flex; flex-direction: column; gap: 12px; }
 .panel { padding: 17px; }
+.career-progress { margin-top: 7px; color: var(--cyan); font-size: 0.7rem; letter-spacing: 0.05em; }
 dl { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin: 16px 0; }
 dl div { padding: 10px; border: 1px solid #1d384d; background: rgba(5, 13, 21, 0.6); }
 dt { color: var(--muted); font-size: 0.7rem; }

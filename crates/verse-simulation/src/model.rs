@@ -4,14 +4,14 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use verse_protocol::{
-    BlockKind, BlockSnapshot, ConservationSnapshot, GridSnapshot, IVec3, InventoryContents,
-    InventoryDomain, InventorySnapshot, PlayerSnapshot, PowerSnapshot, Vec3, VoxelMaterial,
-    VoxelSnapshot, WorldSnapshot,
+    BlockKind, BlockSnapshot, CareerSnapshot, ConservationSnapshot, GridSnapshot, IVec3,
+    InventoryContents, InventoryDomain, InventorySnapshot, PlayerSnapshot, PowerSnapshot, Vec3,
+    VoxelMaterial, VoxelSnapshot, WorldSnapshot,
 };
 
 use crate::content;
 
-pub const WORLD_SCHEMA_VERSION: u32 = 1;
+pub const WORLD_SCHEMA_VERSION: u32 = 2;
 pub const PLAYER_INVENTORY_ID: &str = "inventory-player-local";
 pub const STARTER_GRID_ID: &str = "grid-starter";
 
@@ -96,6 +96,24 @@ pub struct Player {
     pub player_id: String,
     pub position: Vec3,
     pub inventory_id: String,
+    pub experience: u64,
+    pub career: CareerSnapshot,
+}
+
+impl Player {
+    pub fn level(&self) -> u32 {
+        let mut level = 1_u32;
+        let mut threshold = 100_u64;
+        while self.experience >= threshold && level < 100 {
+            level += 1;
+            threshold += u64::from(level) * 100;
+        }
+        level
+    }
+
+    pub fn next_level_experience(&self) -> u64 {
+        (1..=self.level()).map(|level| u64::from(level) * 100).sum()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -272,6 +290,41 @@ impl WorldState {
         let mut cargo_block = Block::new("block-cargo", IVec3::new(-1, 0, 0), BlockKind::Cargo);
         cargo_block.inventory_id = Some(cargo_inventory_id.clone());
         blocks.insert(cargo_block.block_id.clone(), cargo_block);
+        for (block_id, coordinate) in [
+            ("block-deck-a", IVec3::new(-1, 0, -1)),
+            ("block-deck-b", IVec3::new(0, 0, -1)),
+            ("block-deck-c", IVec3::new(1, 0, -1)),
+            ("block-deck-d", IVec3::new(-1, 0, 1)),
+            ("block-deck-e", IVec3::new(0, 0, 1)),
+            ("block-deck-f", IVec3::new(1, 0, 1)),
+            ("block-bow-a", IVec3::new(-2, 0, -2)),
+            ("block-bow-b", IVec3::new(-1, 0, -2)),
+            ("block-bow-c", IVec3::new(0, 0, -2)),
+            ("block-bow-d", IVec3::new(1, 0, -2)),
+            ("block-bow-e", IVec3::new(2, 0, -2)),
+            ("block-stern-a", IVec3::new(-2, 0, 2)),
+            ("block-stern-b", IVec3::new(-1, 0, 2)),
+            ("block-stern-c", IVec3::new(0, 0, 2)),
+            ("block-stern-d", IVec3::new(1, 0, 2)),
+            ("block-stern-e", IVec3::new(2, 0, 2)),
+            ("block-port-a", IVec3::new(-2, 0, -1)),
+            ("block-port-b", IVec3::new(-2, 0, 1)),
+            ("block-starboard-a", IVec3::new(2, 0, -1)),
+            ("block-starboard-b", IVec3::new(2, 0, 1)),
+        ] {
+            blocks.insert(
+                block_id.into(),
+                Block::new(block_id, coordinate, BlockKind::Structural),
+            );
+        }
+        blocks.insert(
+            "block-battery".into(),
+            Block::new("block-battery", IVec3::new(1, 1, 0), BlockKind::Battery),
+        );
+        blocks.insert(
+            "block-drill".into(),
+            Block::new("block-drill", IVec3::new(2, 0, 0), BlockKind::Drill),
+        );
 
         let grid = Grid {
             grid_id: STARTER_GRID_ID.into(),
@@ -295,8 +348,10 @@ impl WorldState {
             last_event_hash: String::new(),
             player: Player {
                 player_id: "player-local".into(),
-                position: Vec3::new(10.0, 2.0, 4.0),
+                position: Vec3::new(10.0, 3.0, 8.0),
                 inventory_id: PLAYER_INVENTORY_ID.into(),
+                experience: 0,
+                career: CareerSnapshot::default(),
             },
             voxels: VoxelField::procedural_asteroid(seed, 8),
             grids: BTreeMap::from([(STARTER_GRID_ID.into(), grid)]),
@@ -306,7 +361,7 @@ impl WorldState {
             ]),
             ledger: Ledger {
                 genesis_components: 24,
-                genesis_installed_components: 3,
+                genesis_installed_components: 25,
                 ..Ledger::default()
             },
             processed_operations: BTreeMap::new(),
@@ -408,6 +463,10 @@ impl WorldState {
                 player_id: self.player.player_id.clone(),
                 position: self.player.position,
                 inventory_id: self.player.inventory_id.clone(),
+                experience: self.player.experience,
+                level: self.player.level(),
+                next_level_experience: self.player.next_level_experience(),
+                career: self.player.career.clone(),
             },
             voxels: self.voxels.snapshot(),
             grids,
@@ -445,7 +504,7 @@ mod tests {
     fn genesis_is_conserved_and_playable() {
         let world = WorldState::genesis(7);
         assert!(world.conservation().valid);
-        assert_eq!(world.grids[STARTER_GRID_ID].blocks.len(), 3);
+        assert_eq!(world.grids[STARTER_GRID_ID].blocks.len(), 25);
         assert!(world.grids[STARTER_GRID_ID].power().online);
         assert!(world.voxels.occupied.len() > 1_000);
     }

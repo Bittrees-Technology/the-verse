@@ -641,6 +641,32 @@ impl WorldState {
             }
         }
 
+        self.player.experience = self
+            .player
+            .experience
+            .saturating_add(event.payload.experience_reward());
+        match &event.payload {
+            EventPayload::VoxelMined { .. } => self.player.career.voxels_mined += 1,
+            EventPayload::OreRefined { batches, .. } => {
+                self.player.career.refining_batches += batches;
+            }
+            EventPayload::ComponentCrafted { quantity, .. } => {
+                self.player.career.components_crafted += quantity;
+            }
+            EventPayload::BlockBuilt { .. } => self.player.career.blocks_built += 1,
+            EventPayload::GridAnchorSet { anchored: true, .. } => {
+                self.player.career.anchors_engaged += 1;
+            }
+            EventPayload::PlayerMoved { .. }
+            | EventPayload::InventoryTransferred { .. }
+            | EventPayload::GridMotionSet { .. }
+            | EventPayload::GridAnchorSet {
+                anchored: false, ..
+            }
+            | EventPayload::BlockDamaged { .. }
+            | EventPayload::SimulationAdvanced { .. } => {}
+        }
+
         self.event_sequence = event.event_sequence;
         self.last_event_hash.clone_from(&event.event_hash);
         if let Some(operation_id) = &event.operation_id {
@@ -970,7 +996,7 @@ mod tests {
                 .components,
             23
         );
-        assert_eq!(runtime.state().grids[STARTER_GRID_ID].blocks.len(), 4);
+        assert_eq!(runtime.state().grids[STARTER_GRID_ID].blocks.len(), 26);
         assert!(runtime.state().conservation().valid);
     }
 
@@ -991,7 +1017,7 @@ mod tests {
 
         let result = runtime.execute(&ClientMessage::MovePlayer {
             operation_id: "stale-writer-move".into(),
-            position: Vec3::new(10.5, 2.0, 4.0),
+            position: Vec3::new(10.5, 3.0, 8.0),
         });
         assert!(matches!(
             result,
@@ -1000,11 +1026,11 @@ mod tests {
             ))
         ));
         assert_eq!(runtime.state().event_sequence, 0);
-        assert_eq!(runtime.state().player.position, Vec3::new(10.0, 2.0, 4.0));
+        assert_eq!(runtime.state().player.position, Vec3::new(10.0, 3.0, 8.0));
         assert!(matches!(
             runtime.execute(&ClientMessage::MovePlayer {
                 operation_id: "halted-move".into(),
-                position: Vec3::new(10.5, 2.0, 4.0),
+                position: Vec3::new(10.5, 3.0, 8.0),
             }),
             Err(RuntimeError::Halted)
         ));

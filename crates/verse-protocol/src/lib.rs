@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 
 /// The only protocol version accepted by this P0 build.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// A stable integer voxel or block coordinate.
 #[derive(
@@ -180,6 +180,19 @@ pub struct PlayerSnapshot {
     pub player_id: String,
     pub position: Vec3,
     pub inventory_id: String,
+    pub experience: u64,
+    pub level: u32,
+    pub next_level_experience: u64,
+    pub career: CareerSnapshot,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CareerSnapshot {
+    pub voxels_mined: u64,
+    pub refining_batches: u64,
+    pub components_crafted: u64,
+    pub blocks_built: u64,
+    pub anchors_engaged: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
