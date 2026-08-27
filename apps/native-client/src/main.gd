@@ -14,7 +14,6 @@ const BLOCK_DAMAGE_SHADER: Shader = preload("res://shaders/block_damage.gdshader
 const PROTOCOL_VERSION := 11
 const DEFAULT_SERVER := "ws://127.0.0.1:7777/ws"
 const DEFAULT_PLAYER_ID := "player-local"
-const DEFAULT_PLAYER_INVENTORY := "inventory-player-local"
 const STARTER_GRID := "grid-starter"
 # Clean-room prediction mirrors the protocol-fenced p0.10.0 character content.
 # The server remains authoritative for elapsed time, contacts, and final motion.
@@ -388,13 +387,13 @@ func _player_from_roster(players: Array, player_id: String) -> Dictionary:
 func _local_player() -> Dictionary:
 	var players: Array = snapshot.get("players", [])
 	var selected := _player_from_roster(players, _controlled_player_id())
-	if not selected.is_empty():
+	if not players.is_empty():
 		return selected
 	return snapshot.get("player", {})
 
 
 func _local_inventory_id() -> String:
-	return String(_local_player().get("inventory_id", DEFAULT_PLAYER_INVENTORY))
+	return String(_local_player().get("inventory_id", ""))
 
 
 func _life_support_display_state(player: Dictionary) -> String:
@@ -408,7 +407,7 @@ func _life_support_display_state(player: Dictionary) -> String:
 
 
 func _player_controls_enabled(player: Dictionary) -> bool:
-	return not _player_is_incapacitated(player)
+	return not player.is_empty() and not _player_is_incapacitated(player)
 
 
 func _parse_command_line() -> void:
@@ -1557,11 +1556,19 @@ func _apply_snapshot(authoritative: Dictionary) -> void:
 	snapshot = authoritative.duplicate(true)
 	var players: Array = snapshot.get("players", [])
 	var player := _player_from_roster(players, _controlled_player_id())
-	if player.is_empty():
+	if player.is_empty() and players.is_empty():
 		player = snapshot.get("player", {})
 	snapshot["player"] = player
-	_capture_prediction_gravity(snapshot)
 	_sync_remote_players(players)
+	if player.is_empty():
+		authoritative_player_ready = false
+		_set_message(
+			"Authoritative roster is missing bound pilot %s"
+			% _controlled_player_id(),
+			true
+		)
+		return
+	_capture_prediction_gravity(snapshot)
 	var level := int(player.get("level", 1))
 	if level > last_level:
 		_set_message("CLEARANCE ADVANCED // SALVAGER LEVEL %d" % level)
@@ -1655,8 +1662,15 @@ func _apply_motion_state(motion: Dictionary) -> void:
 			existing_players.append(player_motion.duplicate(true))
 	snapshot["players"] = existing_players
 	var merged_player := _player_from_roster(existing_players, _controlled_player_id())
-	if merged_player.is_empty():
+	if merged_player.is_empty() and existing_players.is_empty():
 		merged_player = snapshot.get("player", {}).duplicate(true)
+	if merged_player.is_empty():
+		authoritative_player_ready = false
+		_set_message(
+			"Motion roster lost bound pilot %s" % _controlled_player_id(),
+			true
+		)
+		return
 	snapshot["player"] = merged_player
 	snapshot["event_sequence"] = event_sequence
 	snapshot["simulation_tick"] = int(motion.get("simulation_tick", 0))
