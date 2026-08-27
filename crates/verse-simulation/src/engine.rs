@@ -24,7 +24,6 @@ use crate::model::{
 };
 use crate::persistence::{PersistenceError, Store};
 
-const PLAYER_COLLISION_RADIUS: f64 = 0.32;
 const PLAYER_BODY_ID: &str = "player-body-player-local";
 const PLAYER_COLLIDER_ID: &str = "player-collider-player-local";
 const PLANET_BODY_ID: &str = "planet-body-khepri-prime";
@@ -34,6 +33,14 @@ const HAND_TOOL_RANGE: f64 = 9.0;
 const MAX_GRID_CONTROL_INPUT: f64 = 1.0;
 const CONTROL_INPUT_EPSILON: f64 = 1.0e-9;
 const MAX_GRID_BLOCKS_P0: usize = 2_048;
+const PLAYER_POSITION_CORRECTION_BUDGET_M_PER_STEP: f64 = 0.25;
+const PLAYER_ROTATION_SLOP_RADIANS_PER_STEP: f64 = 0.000_1;
+const REPLAY_QUANTIZATION_SLOP: f64 = 0.000_004;
+#[cfg(test)]
+const REPLAY_CONTACT_SLOP_M: f64 = 0.15;
+const PHYSICS_SPECULATIVE_DISTANCE_M: f64 = 0.02;
+const PLAYER_PLANET_PENETRATION_LIMIT_M: f64 = 0.28;
+const PLAYER_BOX_PENETRATION_LIMIT_M: f64 = 0.85;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum IntentError {
@@ -237,8 +244,17 @@ impl Runtime {
                     || grid.control_linear_input.magnitude() > f64::EPSILON
                     || grid.control_angular_input.magnitude() > f64::EPSILON)
         });
-        let physics_active =
-            moving_grid || matches!(self.state.player.life_state, PlayerLifeState::Alive);
+        let player_physics_active = matches!(self.state.player.life_state, PlayerLifeState::Alive)
+            && (self.state.player.linear_velocity.magnitude() > f64::EPSILON
+                || self.state.player.angular_velocity.magnitude() > f64::EPSILON
+                || self.state.player.control_linear_input.magnitude() > f64::EPSILON
+                || self.state.player.control_angular_input.magnitude() > f64::EPSILON
+                || self.state.player.boost
+                || self.state.simulation_tick
+                    < self.state.player.control_expires_at_simulation_tick
+                || !self.state.player.dampeners
+                || !self.state.player.jetpack_enabled);
+        let physics_active = moving_grid || player_physics_active;
         let delta_millis = delta_millis.clamp(1, 250);
         let mut changed = false;
         if physics_active {
@@ -272,6 +288,38 @@ impl Runtime {
                             return Err(source.into());
                         }
                     };
+                    if let (Some(prior), Some(result)) = (
+                        body_states
+                            .iter()
+                            .find(|body| body.body_id == PLAYER_BODY_ID),
+                        step.bodies
+                            .iter()
+                            .find(|body| body.body_id == PLAYER_BODY_ID),
+                    ) && let Err(source) = ensure_player_fixed_step_envelope(
+                        from_physics_vec3(prior.pose.position),
+                        from_physics_quat(prior.pose.rotation),
+                        from_physics_vec3(result.pose.position),
+                        from_physics_quat(result.pose.rotation),
+                        &physics_scene_config(),
+                    ) {
+                        self.halted = true;
+                        return Err(source.into());
+                    }
+                    for grid in self.state.grids.values().filter(|grid| !grid.anchored) {
+                        if let (Some(prior), Some(result)) = (
+                            body_states.iter().find(|body| body.body_id == grid.grid_id),
+                            step.bodies.iter().find(|body| body.body_id == grid.grid_id),
+                        ) && let Err(source) = ensure_dynamic_body_fixed_step_envelope(
+                            from_physics_vec3(prior.pose.position),
+                            from_physics_quat(prior.pose.rotation),
+                            from_physics_vec3(result.pose.position),
+                            from_physics_quat(result.pose.rotation),
+                            &physics_scene_config(),
+                        ) {
+                            self.halted = true;
+                            return Err(source.into());
+                        }
+                    }
                     let substep_index =
                         u8::try_from(substep_index).expect("bounded physics substep index fits u8");
                     let current_contacts = step
@@ -559,7 +607,8 @@ impl WorldState {
             position.z - PLANET_CENTER.z,
         )
         .magnitude();
-        planet_distance >= PLANET_SURFACE_RADIUS_M + 0.45
+        planet_distance
+            >= PLANET_SURFACE_RADIUS_M + content::manifest().character.collision_radius_m + 0.001
             && !self.player_movement_hits_voxel(position, position)
             && !self.player_movement_hits_grid(position, position)
     }
@@ -846,6 +895,12 @@ impl WorldState {
                     ));
                 }
                 self.ensure_hand_tool_range(grid, *coordinate, "block_out_of_range")?;
+                if self.player_intersects_grid_coordinate(grid, *coordinate) {
+                    return Err(IntentError::rejected(
+                        "block_intersects_player",
+                        "a block frame cannot be created around the living player collider",
+                    ));
+                }
                 let player_inventory = self.inventory(PLAYER_INVENTORY_ID)?;
                 let component_cost = content::block(*kind).component_cost;
                 if player_inventory.contents.components < component_cost {
@@ -1402,6 +1457,12 @@ impl WorldState {
                     block.coordinate,
                     "replay_construction_out_of_range",
                 )?;
+                if self.player_intersects_grid_coordinate(grid, block.coordinate) {
+                    return Err(IntentError::rejected(
+                        "replay_construction_intersects_player",
+                        "placed frame intersects the authoritative player collider",
+                    ));
+                }
                 if self.inventory(PLAYER_INVENTORY_ID)?.contents.components < block.component_cost {
                     return Err(IntentError::rejected(
                         "replay_construction_components_invalid",
@@ -1573,6 +1634,12 @@ impl WorldState {
                             "player physics velocity exceeds the authoritative solver limit",
                         ));
                     }
+                    ensure_player_motion_continuity(
+                        &self.player,
+                        player,
+                        *step_count,
+                        &physics_limits,
+                    )?;
                     let resulting_tick =
                         self.simulation_tick.saturating_add(u64::from(*step_count));
                     let lease_active =
@@ -1661,6 +1728,16 @@ impl WorldState {
                             "anchored grid pose must remain unchanged and its velocity must remain zero",
                         ));
                     }
+                    if !grid.anchored {
+                        ensure_dynamic_body_motion_continuity(
+                            grid.position,
+                            grid.orientation,
+                            body.position,
+                            body.orientation,
+                            *step_count,
+                            &physics_limits,
+                        )?;
+                    }
                 }
                 let mut contacts_by_substep = vec![Vec::new(); usize::from(*step_count)];
                 for contact in contacts {
@@ -1713,6 +1790,23 @@ impl WorldState {
                             "replay_physics_contact_mass_invalid",
                             "physics contact reduced translational mass does not match canonical content",
                         ));
+                    }
+                    if contact_key_involves_player(&key) {
+                        let player = player
+                            .as_ref()
+                            .expect("validated living player outcome exists for a player contact");
+                        if !self.player_contact_is_spatially_plausible(
+                            contact,
+                            player,
+                            bodies,
+                            *step_count,
+                            &physics_limits,
+                        ) {
+                            return Err(IntentError::rejected(
+                                "replay_player_contact_spatially_invalid",
+                                "player contact must lie on the plausible swept player and counterpart geometry",
+                            ));
+                        }
                     }
                     contacts_by_substep[usize::from(contact.substep_index)].push((key, contact));
                 }
@@ -2054,7 +2148,7 @@ impl WorldState {
     }
 
     fn player_intersects_voxel(&self, position: Vec3) -> bool {
-        let extent = PLAYER_COLLISION_RADIUS + 0.5;
+        let extent = content::manifest().character.collision_radius_m + 0.5;
         let minimum = IVec3::new(
             (position.x - extent).floor() as i32,
             (position.y - extent).floor() as i32,
@@ -2100,11 +2194,258 @@ impl WorldState {
         })
     }
 
+    fn player_intersects_grid_coordinate(&self, grid: &Grid, coordinate: IVec3) -> bool {
+        let relative = self.player.position - grid.position;
+        let local_player = grid.orientation.conjugate().rotate(relative);
+        sphere_intersects_unit_cube(local_player, coordinate)
+    }
+
     fn player_movement_hits_grid(&self, start: Vec3, end: Vec3) -> bool {
         movement_samples(start, end)
             .into_iter()
             .any(|position| self.player_intersects_grid(position))
     }
+
+    fn player_contact_is_spatially_plausible(
+        &self,
+        contact: &PhysicsContactOutcome,
+        player: &PlayerPhysicsOutcome,
+        bodies: &[PhysicsBodyOutcome],
+        step_count: u8,
+        limits: &SceneConfig,
+    ) -> bool {
+        let radius = content::manifest().character.collision_radius_m;
+        let fixed_delta_seconds = f64::from(content::manifest().physics.fixed_delta_seconds);
+        let completed_steps = f64::from(contact.substep_index) + 1.0;
+        let per_step_reach = f64::from(limits.max_linear_velocity_mps) * fixed_delta_seconds
+            + PLAYER_POSITION_CORRECTION_BUDGET_M_PER_STEP
+            + REPLAY_QUANTIZATION_SLOP;
+        let surface_slack = 0.5 * contact.penetration_m.max(PHYSICS_SPECULATIVE_DISTANCE_M)
+            + REPLAY_QUANTIZATION_SLOP;
+        if contact.point.squared_distance(self.player.position).sqrt()
+            > completed_steps * per_step_reach + radius + surface_slack
+        {
+            return false;
+        }
+        if contact.substep_index + 1 == step_count
+            && contact.point.squared_distance(player.position).sqrt()
+                > radius + per_step_reach + surface_slack
+        {
+            return false;
+        }
+
+        let (other_body, other_collider) = if contact.body_a_id == PLAYER_BODY_ID {
+            (&contact.body_b_id, &contact.collider_b_id)
+        } else if contact.body_b_id == PLAYER_BODY_ID {
+            (&contact.body_a_id, &contact.collider_a_id)
+        } else {
+            return false;
+        };
+        if other_body == PLAYER_BODY_ID {
+            return false;
+        }
+        if other_body == PLANET_BODY_ID {
+            return other_collider == PLANET_COLLIDER_ID
+                && contact.penetration_m <= PLAYER_PLANET_PENETRATION_LIMIT_M
+                && ((contact.point - PLANET_CENTER).magnitude() - PLANET_SURFACE_RADIUS_M).abs()
+                    <= surface_slack;
+        }
+        if let Some(grid) = self.grids.get(other_body) {
+            let Some(block) = grid.blocks.get(other_collider) else {
+                return false;
+            };
+            if contact.penetration_m > PLAYER_BOX_PENETRATION_LIMIT_M {
+                return false;
+            }
+            let local_center = Vec3::new(
+                f64::from(block.coordinate.x),
+                f64::from(block.coordinate.y),
+                f64::from(block.coordinate.z),
+            );
+            if grid.anchored {
+                let local_point = grid
+                    .orientation
+                    .conjugate()
+                    .rotate(contact.point - grid.position);
+                return point_unit_cube_distance(local_point, block.coordinate) <= surface_slack;
+            }
+            if !bodies.iter().any(|body| body.grid_id == *other_body) {
+                return false;
+            }
+            let prior_center = grid.position + grid.orientation.rotate(local_center);
+            let half_diagonal = 3.0_f64.sqrt() * 0.5;
+            let angular_reach = (completed_steps
+                * (f64::from(limits.max_angular_velocity_radians_per_second)
+                    * fixed_delta_seconds
+                    + PLAYER_ROTATION_SLOP_RADIANS_PER_STEP))
+                .min(std::f64::consts::PI);
+            let orbit_radius = local_center.magnitude() + half_diagonal;
+            let grid_point_reach = completed_steps * per_step_reach
+                + half_diagonal
+                + 2.0 * orbit_radius * (angular_reach * 0.5).sin();
+            return contact.point.squared_distance(prior_center).sqrt()
+                <= grid_point_reach + surface_slack;
+        }
+        let Some(coordinate) = self.voxels.occupied.iter().find(|coordinate| {
+            voxel_collision_chunk_body_id(voxel_collision_chunk_coordinate(**coordinate))
+                == *other_body
+                && voxel_collision_collider_id(**coordinate) == *other_collider
+        }) else {
+            return false;
+        };
+        contact.penetration_m <= PLAYER_BOX_PENETRATION_LIMIT_M
+            && point_unit_cube_distance(contact.point, *coordinate) <= surface_slack
+    }
+}
+
+fn ensure_player_motion_continuity(
+    prior: &crate::model::Player,
+    outcome: &PlayerPhysicsOutcome,
+    step_count: u8,
+    limits: &SceneConfig,
+) -> Result<(), IntentError> {
+    let fixed_delta_seconds = f64::from(content::manifest().physics.fixed_delta_seconds);
+    let maximum_translation = f64::from(step_count)
+        * (f64::from(limits.max_linear_velocity_mps) * fixed_delta_seconds
+            + PLAYER_POSITION_CORRECTION_BUDGET_M_PER_STEP)
+        + REPLAY_QUANTIZATION_SLOP;
+    if prior.position.squared_distance(outcome.position) > maximum_translation * maximum_translation
+    {
+        return Err(IntentError::rejected(
+            "replay_player_physics_translation_invalid",
+            "player physics translation exceeds the conservative fixed-step envelope",
+        ));
+    }
+    let angular_displacement =
+        quaternion_angular_displacement(prior.orientation, outcome.orientation);
+    let maximum_rotation = f64::from(step_count)
+        * (f64::from(limits.max_angular_velocity_radians_per_second) * fixed_delta_seconds
+            + PLAYER_ROTATION_SLOP_RADIANS_PER_STEP)
+        + REPLAY_QUANTIZATION_SLOP;
+    if angular_displacement > maximum_rotation {
+        return Err(IntentError::rejected(
+            "replay_player_physics_rotation_continuity_invalid",
+            "player physics rotation exceeds the conservative fixed-step envelope",
+        ));
+    }
+    let radius = content::manifest().character.collision_radius_m;
+    let planet_distance = (outcome.position - PLANET_CENTER).magnitude();
+    if planet_distance < PLANET_SURFACE_RADIUS_M + radius - 0.05 {
+        return Err(IntentError::rejected(
+            "replay_player_planet_penetration_invalid",
+            "player physics outcome penetrates beyond the planet contact tolerance",
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_player_fixed_step_envelope(
+    prior_position: Vec3,
+    prior_orientation: Quat,
+    outcome_position: Vec3,
+    outcome_orientation: Quat,
+    limits: &SceneConfig,
+) -> Result<(), IntentError> {
+    let fixed_delta_seconds = f64::from(content::manifest().physics.fixed_delta_seconds);
+    let maximum_translation = f64::from(limits.max_linear_velocity_mps) * fixed_delta_seconds
+        + PLAYER_POSITION_CORRECTION_BUDGET_M_PER_STEP
+        + REPLAY_QUANTIZATION_SLOP;
+    if prior_position.squared_distance(outcome_position) > maximum_translation * maximum_translation
+    {
+        return Err(IntentError::rejected(
+            "physics_player_translation_envelope_invalid",
+            "native player result exceeds the per-step movement safety envelope",
+        ));
+    }
+    let maximum_rotation = f64::from(limits.max_angular_velocity_radians_per_second)
+        * fixed_delta_seconds
+        + PLAYER_ROTATION_SLOP_RADIANS_PER_STEP
+        + REPLAY_QUANTIZATION_SLOP;
+    if quaternion_angular_displacement(prior_orientation, outcome_orientation) > maximum_rotation {
+        return Err(IntentError::rejected(
+            "physics_player_rotation_envelope_invalid",
+            "native player result exceeds the per-step rotation safety envelope",
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_dynamic_body_motion_continuity(
+    prior_position: Vec3,
+    prior_orientation: Quat,
+    outcome_position: Vec3,
+    outcome_orientation: Quat,
+    step_count: u8,
+    limits: &SceneConfig,
+) -> Result<(), IntentError> {
+    let fixed_delta_seconds = f64::from(content::manifest().physics.fixed_delta_seconds);
+    let maximum_translation = f64::from(step_count)
+        * (f64::from(limits.max_linear_velocity_mps) * fixed_delta_seconds
+            + PLAYER_POSITION_CORRECTION_BUDGET_M_PER_STEP
+            + REPLAY_QUANTIZATION_SLOP);
+    if prior_position.squared_distance(outcome_position) > maximum_translation * maximum_translation
+    {
+        return Err(IntentError::rejected(
+            "replay_physics_body_translation_invalid",
+            "dynamic body translation exceeds the server-enforced fixed-step envelope",
+        ));
+    }
+    let maximum_rotation = f64::from(step_count)
+        * (f64::from(limits.max_angular_velocity_radians_per_second) * fixed_delta_seconds
+            + PLAYER_ROTATION_SLOP_RADIANS_PER_STEP);
+    if quaternion_angular_displacement(prior_orientation, outcome_orientation) > maximum_rotation {
+        return Err(IntentError::rejected(
+            "replay_physics_body_rotation_continuity_invalid",
+            "dynamic body rotation exceeds the server-enforced fixed-step envelope",
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_dynamic_body_fixed_step_envelope(
+    prior_position: Vec3,
+    prior_orientation: Quat,
+    outcome_position: Vec3,
+    outcome_orientation: Quat,
+    limits: &SceneConfig,
+) -> Result<(), IntentError> {
+    ensure_dynamic_body_motion_continuity(
+        prior_position,
+        prior_orientation,
+        outcome_position,
+        outcome_orientation,
+        1,
+        limits,
+    )
+    .map_err(|_| {
+        IntentError::rejected(
+            "physics_dynamic_body_envelope_invalid",
+            "native dynamic-body result exceeds the per-step safety envelope",
+        )
+    })
+}
+
+fn quaternion_angular_displacement(left: Quat, right: Quat) -> f64 {
+    let dot = f64::from(left.x) * f64::from(right.x)
+        + f64::from(left.y) * f64::from(right.y)
+        + f64::from(left.z) * f64::from(right.z)
+        + f64::from(left.w) * f64::from(right.w);
+    2.0 * dot.abs().clamp(0.0, 1.0).acos()
+}
+
+fn point_unit_cube_distance(point: Vec3, coordinate: IVec3) -> f64 {
+    let closest = Vec3::new(
+        point
+            .x
+            .clamp(f64::from(coordinate.x) - 0.5, f64::from(coordinate.x) + 0.5),
+        point
+            .y
+            .clamp(f64::from(coordinate.y) - 0.5, f64::from(coordinate.y) + 0.5),
+        point
+            .z
+            .clamp(f64::from(coordinate.z) - 0.5, f64::from(coordinate.z) + 0.5),
+    );
+    point.squared_distance(closest).sqrt()
 }
 
 fn movement_samples(start: Vec3, end: Vec3) -> Vec<Vec3> {
@@ -2454,7 +2795,16 @@ fn physics_controls(
                 } else {
                     character.thrust_acceleration_m_s2
                 };
-                acceleration = acceleration + world_input * thrust;
+                let delta_seconds = f64::from(physics.fixed_delta_seconds);
+                let maximum_speed = if boost {
+                    character.boost_maximum_speed_m_s
+                } else {
+                    character.maximum_speed_m_s
+                };
+                let requested = acceleration + world_input * thrust;
+                let bounded_velocity =
+                    (linear_velocity + requested * delta_seconds).clamped(maximum_speed);
+                acceleration = (bounded_velocity - linear_velocity) * (1.0 / delta_seconds);
             }
         }
         let world_angular_input = orientation.rotate(angular_input);
@@ -2468,7 +2818,12 @@ fn physics_controls(
                 },
             )
         } else {
-            world_angular_input * character.angular_acceleration_radians_per_second_squared
+            let delta_seconds = f64::from(physics.fixed_delta_seconds);
+            let requested =
+                world_angular_input * character.angular_acceleration_radians_per_second_squared;
+            let bounded_velocity = (angular_velocity + requested * delta_seconds)
+                .clamped(character.maximum_angular_speed_radians_per_second);
+            (bounded_velocity - angular_velocity) * (1.0 / delta_seconds)
         };
         let sphere_inertia =
             0.4 * character.mass_kg * character.collision_radius_m * character.collision_radius_m;
@@ -2482,12 +2837,15 @@ fn physics_controls(
 }
 
 fn physics_body_outcome(body: &verse_physics::BodyState) -> PhysicsBodyOutcome {
+    let limits = physics_scene_config();
     PhysicsBodyOutcome {
         grid_id: body.body_id.clone(),
         position: from_physics_vec3(body.pose.position),
         orientation: from_physics_quat(body.pose.rotation),
-        linear_velocity: from_physics_vec3(body.linear_velocity),
-        angular_velocity: from_physics_vec3(body.angular_velocity),
+        linear_velocity: from_physics_vec3(body.linear_velocity)
+            .clamped(f64::from(limits.max_linear_velocity_mps)),
+        angular_velocity: from_physics_vec3(body.angular_velocity)
+            .clamped(f64::from(limits.max_angular_velocity_radians_per_second)),
     }
 }
 
@@ -2497,13 +2855,16 @@ fn player_physics_outcome(
     surface_contact: bool,
     resulting_simulation_tick: u64,
 ) -> PlayerPhysicsOutcome {
+    let limits = physics_scene_config();
     let lease_active = resulting_simulation_tick < state.player.control_expires_at_simulation_tick;
     PlayerPhysicsOutcome {
         player_id: state.player.player_id.clone(),
         position: from_physics_vec3(body.pose.position),
         orientation: from_physics_quat(body.pose.rotation),
-        linear_velocity: from_physics_vec3(body.linear_velocity),
-        angular_velocity: from_physics_vec3(body.angular_velocity),
+        linear_velocity: from_physics_vec3(body.linear_velocity)
+            .clamped(f64::from(limits.max_linear_velocity_mps)),
+        angular_velocity: from_physics_vec3(body.angular_velocity)
+            .clamped(f64::from(limits.max_angular_velocity_radians_per_second)),
         surface_contact,
         control_linear_input: if lease_active {
             state.player.control_linear_input
@@ -2665,8 +3026,8 @@ fn sphere_intersects_unit_cube(center: Vec3, cube: IVec3) -> bool {
     let closest_z = center
         .z
         .clamp(f64::from(cube.z) - 0.5, f64::from(cube.z) + 0.5);
-    center.squared_distance(Vec3::new(closest_x, closest_y, closest_z))
-        <= PLAYER_COLLISION_RADIUS * PLAYER_COLLISION_RADIUS
+    let radius = content::manifest().character.collision_radius_m;
+    center.squared_distance(Vec3::new(closest_x, closest_y, closest_z)) <= radius * radius + 1.0e-9
 }
 
 fn ensure_finite(value: Vec3, label: &str) -> Result<(), IntentError> {
@@ -3029,7 +3390,7 @@ mod tests {
 
         let mut over_speed = state.prepare_system_event(payload.clone());
         if let EventPayload::PhysicsStepCommitted { bodies, .. } = &mut over_speed.payload {
-            bodies[0].linear_velocity = Vec3::new(32.000_001, 0.0, 0.0);
+            bodies[0].linear_velocity = Vec3::new(32.001, 0.0, 0.0);
         }
         over_speed.event_hash = over_speed.calculate_hash();
         let mut replay = state.clone();
@@ -3139,8 +3500,156 @@ mod tests {
         else {
             unreachable!();
         };
-        player.linear_velocity = Vec3::new(32.000_001, 0.0, 0.0);
+        player.linear_velocity = Vec3::new(32.001, 0.0, 0.0);
         reject(over_speed, "replay_player_physics_velocity_invalid");
+
+        let mut teleported = canonical.clone();
+        let EventPayload::PhysicsStepCommitted {
+            player: Some(player),
+            ..
+        } = &mut teleported
+        else {
+            unreachable!();
+        };
+        player.position.x += 10.0;
+        reject(teleported, "replay_player_physics_translation_invalid");
+
+        let mut spun = canonical.clone();
+        let EventPayload::PhysicsStepCommitted {
+            player: Some(player),
+            ..
+        } = &mut spun
+        else {
+            unreachable!();
+        };
+        player.orientation = Quat::new(0.0, 0.0, 1.0, 0.0);
+        reject(spun, "replay_player_physics_rotation_continuity_invalid");
+
+        let mut impossible_contact = canonical.clone();
+        let EventPayload::PhysicsStepCommitted {
+            player: Some(player),
+            contacts,
+            active_contacts_after,
+            ..
+        } = &mut impossible_contact
+        else {
+            unreachable!();
+        };
+        let key = ContactPairKey {
+            body_a: PLANET_BODY_ID.into(),
+            collider_a: PLANET_COLLIDER_ID.into(),
+            body_b: PLAYER_BODY_ID.into(),
+            collider_b: PLAYER_COLLIDER_ID.into(),
+        };
+        player.surface_contact = true;
+        contacts.push(PhysicsContactOutcome {
+            substep_index: 0,
+            body_a_id: key.body_a.clone(),
+            collider_a_id: key.collider_a.clone(),
+            body_b_id: key.body_b.clone(),
+            collider_b_id: key.collider_b.clone(),
+            point: Vec3::ZERO,
+            normal: Vec3::new(1.0, 0.0, 0.0),
+            penetration_m: 0.0,
+            closing_speed_mm_per_second: 0,
+            estimated_normal_impulse_millinewton_seconds: 0,
+            reduced_translational_mass_grams: reduced_translational_contact_mass_grams(
+                state,
+                PLANET_BODY_ID,
+                PLAYER_BODY_ID,
+            ),
+            phase: PhysicsContactPhase::Began,
+        });
+        active_contacts_after.push(key);
+        reject(
+            impossible_contact,
+            "replay_player_contact_spatially_invalid",
+        );
+
+        let voxel = *state.voxels.occupied.iter().next().expect("voxel exists");
+        let voxel_body = voxel_collision_chunk_body_id(voxel_collision_chunk_coordinate(voxel));
+        let voxel_collider = voxel_collision_collider_id(voxel);
+        let mut wrong_voxel_geometry = canonical.clone();
+        let EventPayload::PhysicsStepCommitted {
+            player: Some(player),
+            contacts,
+            active_contacts_after,
+            ..
+        } = &mut wrong_voxel_geometry
+        else {
+            unreachable!();
+        };
+        let key = ContactPairKey {
+            body_a: PLAYER_BODY_ID.into(),
+            collider_a: PLAYER_COLLIDER_ID.into(),
+            body_b: voxel_body,
+            collider_b: voxel_collider,
+        };
+        player.surface_contact = true;
+        contacts.push(PhysicsContactOutcome {
+            substep_index: 0,
+            body_a_id: key.body_a.clone(),
+            collider_a_id: key.collider_a.clone(),
+            body_b_id: key.body_b.clone(),
+            collider_b_id: key.collider_b.clone(),
+            point: state.player.position,
+            normal: Vec3::new(1.0, 0.0, 0.0),
+            penetration_m: 0.0,
+            closing_speed_mm_per_second: 0,
+            estimated_normal_impulse_millinewton_seconds: 0,
+            reduced_translational_mass_grams: reduced_translational_contact_mass_grams(
+                state,
+                PLAYER_BODY_ID,
+                &key.body_b,
+            ),
+            phase: PhysicsContactPhase::Began,
+        });
+        active_contacts_after.push(key);
+        reject(
+            wrong_voxel_geometry,
+            "replay_player_contact_spatially_invalid",
+        );
+
+        let mut wrong_grid_geometry = canonical.clone();
+        let EventPayload::PhysicsStepCommitted {
+            player: Some(player),
+            contacts,
+            active_contacts_after,
+            ..
+        } = &mut wrong_grid_geometry
+        else {
+            unreachable!();
+        };
+        let key = ContactPairKey {
+            body_a: STARTER_GRID_ID.into(),
+            collider_a: "block-core".into(),
+            body_b: PLAYER_BODY_ID.into(),
+            collider_b: PLAYER_COLLIDER_ID.into(),
+        };
+        player.surface_contact = true;
+        contacts.push(PhysicsContactOutcome {
+            substep_index: 0,
+            body_a_id: key.body_a.clone(),
+            collider_a_id: key.collider_a.clone(),
+            body_b_id: key.body_b.clone(),
+            collider_b_id: key.collider_b.clone(),
+            point: state.player.position,
+            normal: Vec3::new(1.0, 0.0, 0.0),
+            penetration_m: 0.0,
+            closing_speed_mm_per_second: 0,
+            estimated_normal_impulse_millinewton_seconds: 0,
+            reduced_translational_mass_grams: reduced_translational_contact_mass_grams(
+                state,
+                STARTER_GRID_ID,
+                PLAYER_BODY_ID,
+            ),
+            phase: PhysicsContactPhase::Began,
+        });
+        active_contacts_after.push(key);
+        reject(
+            wrong_grid_geometry,
+            "replay_player_contact_spatially_invalid",
+        );
 
         let mut wrong_control = canonical.clone();
         let EventPayload::PhysicsStepCommitted {
@@ -3163,6 +3672,45 @@ mod tests {
         };
         player.surface_contact = true;
         reject(wrong_contact, "replay_player_surface_contact_invalid");
+    }
+
+    #[test]
+    fn replay_rejects_dynamic_grid_teleport_before_mutation() {
+        let runtime = runtime();
+        let state = runtime.state();
+        let before_hash = state.state_hash();
+        let mut bodies = state
+            .grids
+            .values()
+            .map(|grid| PhysicsBodyOutcome {
+                grid_id: grid.grid_id.clone(),
+                position: grid.position,
+                orientation: grid.orientation,
+                linear_velocity: grid.linear_velocity,
+                angular_velocity: grid.angular_velocity,
+            })
+            .collect::<Vec<_>>();
+        bodies
+            .iter_mut()
+            .find(|body| body.grid_id == STARTER_GRID_ID)
+            .expect("starter grid outcome exists")
+            .position
+            .x += 10.0;
+        let event = state.prepare_system_event(EventPayload::PhysicsStepCommitted {
+            fixed_step_hz: content::manifest().physics.fixed_step_hz,
+            step_count: 1,
+            remaining_step_phase: 0,
+            bodies,
+            player: stationary_player_outcome(state, 1),
+            contacts: Vec::new(),
+            active_contacts_after: Vec::new(),
+        });
+        let mut replay = state.clone();
+        let error = replay
+            .apply_event(&event)
+            .expect_err("dynamic-grid teleport rejects");
+        assert_eq!(error.code(), "replay_physics_body_translation_invalid");
+        assert_eq!(replay.state_hash(), before_hash);
     }
 
     #[test]
@@ -3648,6 +4196,35 @@ mod tests {
         ));
         assert_eq!(runtime.state().event_sequence, 0);
 
+        for (operation_id, linear_input, angular_input) in [
+            (
+                "nonfinite-linear",
+                Vec3::new(f64::NAN, 0.0, 0.0),
+                Vec3::ZERO,
+            ),
+            (
+                "nonfinite-angular",
+                Vec3::ZERO,
+                Vec3::new(0.0, f64::INFINITY, 0.0),
+            ),
+        ] {
+            let result = runtime.execute(&ClientMessage::SetPlayerControl {
+                operation_id: operation_id.into(),
+                movement_epoch: 1,
+                input_sequence: 1,
+                linear_input,
+                angular_input,
+                boost: false,
+                dampeners: true,
+            });
+            assert!(matches!(
+                result,
+                Err(RuntimeError::Intent(IntentError::Rejected { ref code, .. }))
+                    if code == "invalid_vector"
+            ));
+            assert_eq!(runtime.state().event_sequence, 0);
+        }
+
         let result = runtime.execute(&ClientMessage::SetPlayerControl {
             operation_id: "unbounded-control".into(),
             movement_epoch: 1,
@@ -3664,17 +4241,23 @@ mod tests {
         ));
         assert_eq!(runtime.state().event_sequence, 0);
 
-        runtime
-            .execute(&ClientMessage::SetPlayerControl {
-                operation_id: "control-1".into(),
-                movement_epoch: 1,
-                input_sequence: 1,
-                linear_input: Vec3::new(0.0, 0.0, -1.0),
-                angular_input: Vec3::new(0.0, 0.0, 0.5),
-                boost: true,
-                dampeners: false,
-            })
+        let accepted_control = ClientMessage::SetPlayerControl {
+            operation_id: "control-1".into(),
+            movement_epoch: 1,
+            input_sequence: 1,
+            linear_input: Vec3::new(0.0, 0.0, -1.0),
+            angular_input: Vec3::new(0.0, 0.0, 0.5),
+            boost: true,
+            dampeners: false,
+        };
+        let first_receipt = runtime
+            .execute(&accepted_control)
             .expect("bounded in-order control is accepted");
+        let retry_receipt = runtime
+            .execute(&accepted_control)
+            .expect("same operation retry returns its durable receipt");
+        assert_eq!(retry_receipt, first_receipt);
+        assert_eq!(runtime.state().event_sequence, 1);
         let result = runtime.execute(&ClientMessage::SetPlayerControl {
             operation_id: "control-reordered".into(),
             movement_epoch: 1,
@@ -3698,6 +4281,45 @@ mod tests {
         assert!(runtime.state().player.boost);
         assert!(!runtime.state().player.dampeners);
         assert!(runtime.state().conservation().valid);
+    }
+
+    #[test]
+    fn disconnected_control_lease_expires_safely_across_restart() {
+        let directory = tempdir().expect("tempdir");
+        {
+            let mut runtime = Runtime::open(directory.path(), 131, 1).expect("runtime opens");
+            runtime
+                .execute(&ClientMessage::SetPlayerControl {
+                    operation_id: "disconnect-held-control".into(),
+                    movement_epoch: 1,
+                    input_sequence: 1,
+                    linear_input: Vec3::new(1.0, 0.0, 0.0),
+                    angular_input: Vec3::new(0.0, 0.0, 1.0),
+                    boost: true,
+                    dampeners: false,
+                })
+                .expect("control is durable before disconnect");
+            runtime
+                .advance(100)
+                .expect("control advances before disconnect");
+            assert_eq!(runtime.state().simulation_tick, 6);
+            assert_eq!(
+                runtime.state().player.control_expires_at_simulation_tick,
+                18
+            );
+        }
+
+        let mut recovered = Runtime::open(directory.path(), 131, 1).expect("runtime restarts");
+        assert_eq!(recovered.state().simulation_tick, 6);
+        assert_ne!(recovered.state().player.control_linear_input, Vec3::ZERO);
+        recovered
+            .advance(200)
+            .expect("unrefreshed disconnected lease reaches its durable boundary");
+        assert_eq!(recovered.state().simulation_tick, 18);
+        assert_eq!(recovered.state().player.control_linear_input, Vec3::ZERO);
+        assert_eq!(recovered.state().player.control_angular_input, Vec3::ZERO);
+        assert!(!recovered.state().player.boost);
+        assert!(recovered.state().player.dampeners);
     }
 
     #[test]
@@ -3743,6 +4365,94 @@ mod tests {
     }
 
     #[test]
+    fn refreshed_character_controls_respect_content_speed_caps_with_both_dampener_modes() {
+        let character = &content::manifest().character;
+        for dampeners in [true, false] {
+            for boost in [false, true] {
+                let mut runtime = runtime();
+                for input_sequence in 1_u64..=24 {
+                    runtime
+                        .execute(&ClientMessage::SetPlayerControl {
+                            operation_id: format!("held-{dampeners}-{boost}-{input_sequence}"),
+                            movement_epoch: runtime.state().player.movement_epoch,
+                            input_sequence,
+                            linear_input: Vec3::new(1.0, 0.0, 0.0),
+                            angular_input: Vec3::new(0.0, 0.0, 1.0),
+                            boost,
+                            dampeners,
+                        })
+                        .expect("refreshed held control is accepted");
+                    runtime.advance(100).expect("held control advances");
+                }
+                let expected_linear = if boost {
+                    character.boost_maximum_speed_m_s
+                } else {
+                    character.maximum_speed_m_s
+                };
+                assert!(
+                    runtime.state().player.linear_velocity.magnitude() <= expected_linear + 0.001,
+                    "dampeners={dampeners} boost={boost}: {:?}",
+                    runtime.state().player.linear_velocity
+                );
+                assert!(
+                    runtime.state().player.angular_velocity.magnitude()
+                        <= character.maximum_angular_speed_radians_per_second + 0.001,
+                    "dampeners={dampeners} boost={boost}: {:?}",
+                    runtime.state().player.angular_velocity
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn quantized_eva_motion_matches_the_cross_platform_golden_fixture() {
+        let mut runtime = runtime();
+        runtime
+            .execute(&ClientMessage::SetPlayerControl {
+                operation_id: "cross-platform-motion-golden".into(),
+                movement_epoch: 1,
+                input_sequence: 1,
+                linear_input: Vec3::new(0.25, -0.5, 0.75),
+                angular_input: Vec3::new(0.3, -0.2, 0.4),
+                boost: true,
+                dampeners: true,
+            })
+            .expect("golden control is accepted");
+        runtime
+            .advance(250)
+            .expect("fifteen golden substeps commit");
+        let player = &runtime.state().player;
+        let tolerance = 0.000_05;
+        assert!(
+            player
+                .position
+                .squared_distance(Vec3::new(12.173_76, 4.152_002, 10.511_92))
+                .sqrt()
+                <= tolerance
+        );
+        assert!(
+            player
+                .linear_velocity
+                .squared_distance(Vec3::new(1.358_501, -2.721_636, 3.926_716))
+                .sqrt()
+                <= tolerance
+        );
+        assert!(
+            player
+                .angular_velocity
+                .squared_distance(Vec3::new(0.691_878, -0.461_252, 0.922_504))
+                .sqrt()
+                <= tolerance
+        );
+        let expected_orientation = Quat::new(0.044_726, -0.029_817, 0.059_634, 0.996_772);
+        assert!((player.orientation.x - expected_orientation.x).abs() <= tolerance as f32);
+        assert!((player.orientation.y - expected_orientation.y).abs() <= tolerance as f32);
+        assert!((player.orientation.z - expected_orientation.z).abs() <= tolerance as f32);
+        assert!((player.orientation.w - expected_orientation.w).abs() <= tolerance as f32);
+        assert_eq!(runtime.state().simulation_tick, 15);
+    }
+
+    #[test]
     fn character_force_uses_radial_gravity_from_the_current_authoritative_position() {
         let character_mass = content::manifest().character.mass_kg;
         for position in [
@@ -3783,9 +4493,9 @@ mod tests {
                 jetpack_enabled: true,
             })
             .expect("helmet opens in breathable atmosphere");
-        assert!(runtime.advance(250).expect("life support and physics tick"));
-        assert!(runtime.advance(250).expect("life support and physics tick"));
-        assert!(runtime.advance(250).expect("life support and physics tick"));
+        assert!(!runtime.advance(250).expect("partial life support tick"));
+        assert!(!runtime.advance(250).expect("partial life support tick"));
+        assert!(!runtime.advance(250).expect("partial life support tick"));
         assert!(runtime.advance(250).expect("life support tick"));
         assert_eq!(runtime.state().player.suit_oxygen_milli, 925);
 
@@ -3909,11 +4619,7 @@ mod tests {
             .clone();
 
         for _ in 0..3 {
-            assert!(
-                runtime
-                    .advance(250)
-                    .expect("partial oxygen second advances physics")
-            );
+            assert!(!runtime.advance(250).expect("partial oxygen second"));
         }
         assert!(runtime.advance(250).expect("terminal oxygen second"));
         let death_sequence = runtime.state().event_sequence;
@@ -4157,6 +4863,55 @@ mod tests {
         assert!(runtime.state().death_drops.is_empty());
         assert_eq!(runtime.state().inventories.len(), 2);
         assert!(runtime.state().conservation().valid);
+    }
+
+    #[test]
+    fn oxygen_death_mid_motion_clears_player_kinematics_controls_and_contacts() {
+        let mut runtime = runtime();
+        runtime.state.player.suit_oxygen_milli = 5;
+        runtime.state.player.linear_velocity = Vec3::new(3.0, -2.0, 1.0);
+        runtime.state.player.angular_velocity = Vec3::new(0.5, 0.25, -0.75);
+        runtime.state.player.control_linear_input = Vec3::new(1.0, 0.0, 0.0);
+        runtime.state.player.control_angular_input = Vec3::new(0.0, 0.0, 1.0);
+        runtime.state.player.boost = true;
+        runtime.state.player.dampeners = false;
+        runtime.state.player.surface_contact = true;
+        runtime.state.player.control_expires_at_simulation_tick =
+            content::manifest().character.control_lease_ticks;
+        runtime.state.active_contact_pairs.insert(ContactPairKey {
+            body_a: PLAYER_BODY_ID.into(),
+            collider_a: PLAYER_COLLIDER_ID.into(),
+            body_b: STARTER_GRID_ID.into(),
+            collider_b: "block-core".into(),
+        });
+        runtime.life_support_elapsed_millis = 999;
+
+        runtime
+            .advance(1)
+            .expect("terminal life-support millisecond incapacitates the moving player");
+
+        assert!(matches!(
+            runtime.state().player.life_state,
+            PlayerLifeState::Incapacitated { .. }
+        ));
+        assert_eq!(runtime.state().player.linear_velocity, Vec3::ZERO);
+        assert_eq!(runtime.state().player.angular_velocity, Vec3::ZERO);
+        assert_eq!(runtime.state().player.control_linear_input, Vec3::ZERO);
+        assert_eq!(runtime.state().player.control_angular_input, Vec3::ZERO);
+        assert!(!runtime.state().player.boost);
+        assert!(runtime.state().player.dampeners);
+        assert!(!runtime.state().player.surface_contact);
+        assert_eq!(
+            runtime.state().player.control_expires_at_simulation_tick,
+            runtime.state().simulation_tick
+        );
+        assert!(
+            runtime
+                .state()
+                .active_contact_pairs
+                .iter()
+                .all(|pair| !contact_key_involves_player(pair))
+        );
     }
 
     #[test]
@@ -4510,6 +5265,44 @@ mod tests {
         state.apply_event(&event).expect("fallback respawn applies");
         assert_eq!(state.player.position, position);
         assert_eq!(state.player.life_state, PlayerLifeState::Alive);
+    }
+
+    #[test]
+    fn respawn_clearance_uses_the_content_radius_at_voxel_and_grid_edges() {
+        let radius = content::manifest().character.collision_radius_m;
+
+        let mut voxel_state = runtime().state().clone();
+        voxel_state.grids.clear();
+        let voxel = *voxel_state
+            .voxels
+            .occupied
+            .iter()
+            .max_by_key(|coordinate| coordinate.x)
+            .expect("asteroid boundary voxel exists");
+        let voxel_touch = Vec3::new(
+            f64::from(voxel.x) + 0.5 + radius,
+            f64::from(voxel.y),
+            f64::from(voxel.z),
+        );
+        assert!(!voxel_state.proof_recovery_position_is_clear(voxel_touch));
+        assert!(
+            voxel_state.proof_recovery_position_is_clear(voxel_touch + Vec3::new(0.001, 0.0, 0.0))
+        );
+
+        let mut grid_state = runtime().state().clone();
+        grid_state.voxels.occupied.clear();
+        grid_state.voxels.ferrite_ore.clear();
+        let grid = grid_state
+            .grids
+            .get_mut(STARTER_GRID_ID)
+            .expect("starter grid exists");
+        grid.position = Vec3::new(100.0, 100.0, 100.0);
+        grid.orientation = Quat::IDENTITY;
+        let grid_touch = grid.position + Vec3::new(2.5 + radius, 0.0, 0.0);
+        assert!(!grid_state.proof_recovery_position_is_clear(grid_touch));
+        assert!(
+            grid_state.proof_recovery_position_is_clear(grid_touch + Vec3::new(0.001, 0.0, 0.0))
+        );
     }
 
     #[test]
@@ -4898,6 +5691,21 @@ mod tests {
                 if code == "block_out_of_range"
         ));
         move_player_near_grid(&mut runtime);
+        let candidate = IVec3::new(0, 1, 0);
+        runtime.state.player.position =
+            runtime.state().grids[STARTER_GRID_ID].world_position(candidate);
+        let overlap = runtime.execute(&ClientMessage::BuildBlock {
+            operation_id: "overlapping-frame".into(),
+            grid_id: STARTER_GRID_ID.into(),
+            coordinate: candidate,
+            kind: BlockKind::Structural,
+            orientation: 0,
+        });
+        assert!(matches!(
+            overlap,
+            Err(RuntimeError::Intent(IntentError::Rejected { ref code, .. }))
+                if code == "block_intersects_player"
+        ));
         let invalid = runtime.execute(&ClientMessage::BuildBlock {
             operation_id: "invalid-orientation".into(),
             grid_id: STARTER_GRID_ID.into(),
@@ -4912,6 +5720,29 @@ mod tests {
         ));
         assert_eq!(runtime.state().grids[STARTER_GRID_ID].blocks.len(), 25);
         assert!(runtime.state().conservation().valid);
+    }
+
+    #[test]
+    fn construction_replay_rejects_a_frame_around_the_player_before_mutation() {
+        let mut state = runtime().state().clone();
+        state.player.position = Vec3::new(10.0, 1.0, 3.0);
+        let coordinate = IVec3::new(0, 1, 0);
+        let canonical = state
+            .prepare_client_event(&ClientMessage::BuildBlock {
+                operation_id: "prepared-clear-frame".into(),
+                grid_id: STARTER_GRID_ID.into(),
+                coordinate,
+                kind: BlockKind::Structural,
+                orientation: 0,
+            })
+            .expect("clear construction event prepares");
+        state.player.position = state.grids[STARTER_GRID_ID].world_position(coordinate);
+        let before = state.state_hash();
+        let error = state
+            .apply_event(&canonical)
+            .expect_err("replay cannot create a collider around the player");
+        assert_eq!(error.code(), "replay_construction_intersects_player");
+        assert_eq!(state.state_hash(), before);
     }
 
     #[test]
@@ -5047,12 +5878,172 @@ mod tests {
             .rebuild(&physics_body_specs(&runtime.state))
             .expect("test setup rebuilds the rotated grid scene");
 
-        runtime
-            .advance(250)
-            .expect("authoritative player step commits");
+        let mut contacted = false;
+        for _ in 0..30 {
+            runtime
+                .advance(17)
+                .expect("authoritative player step commits");
+            contacted |= runtime.state().player.surface_contact;
+            if contacted {
+                break;
+            }
+        }
 
         assert!(runtime.state().player.position.y > drill_position.y + 0.6);
         assert!(runtime.state().player.linear_velocity.y > -24.0);
+        assert!(contacted);
+        assert!(runtime.state().active_contact_pairs.iter().any(|pair| {
+            contact_key_involves_player(pair)
+                && (pair.body_a == STARTER_GRID_ID || pair.body_b == STARTER_GRID_ID)
+        }));
+    }
+
+    #[test]
+    fn authoritative_player_lands_on_planet_with_stable_canonical_contact() {
+        let mut runtime = runtime();
+        let radius = content::manifest().character.collision_radius_m;
+        runtime.state.player.position =
+            PLANET_CENTER + Vec3::new(0.0, PLANET_SURFACE_RADIUS_M + radius + 2.0, 0.0);
+        runtime.state.player.linear_velocity = Vec3::new(0.0, -24.0, 0.0);
+        runtime.state.player.jetpack_enabled = false;
+        runtime
+            .physics
+            .rebuild(&physics_body_specs(&runtime.state))
+            .expect("planet landing fixture rebuilds");
+
+        let mut contacted = false;
+        for _ in 0..60 {
+            runtime.advance(17).expect("planet landing commits");
+            contacted |= runtime.state().player.surface_contact;
+        }
+        assert!(contacted);
+        assert!(runtime.state().active_contact_pairs.iter().any(|pair| {
+            contact_key_involves_player(pair)
+                && (pair.body_a == PLANET_BODY_ID || pair.body_b == PLANET_BODY_ID)
+        }));
+
+        let mut minimum_gap = f64::MAX;
+        let mut maximum_gap = f64::MIN;
+        for _ in 0..30 {
+            runtime
+                .advance(17)
+                .expect("landed player remains simulated");
+            let distance = (runtime.state().player.position - PLANET_CENTER).magnitude();
+            let gap = distance - PLANET_SURFACE_RADIUS_M - radius;
+            minimum_gap = minimum_gap.min(gap);
+            maximum_gap = maximum_gap.max(gap);
+        }
+        assert!(minimum_gap > -REPLAY_CONTACT_SLOP_M);
+        assert!(maximum_gap - minimum_gap < 0.05);
+        assert!(runtime.state().player.linear_velocity.magnitude() < 0.25);
+        assert!(runtime.state().player.surface_contact);
+    }
+
+    #[test]
+    fn authoritative_player_ccd_contacts_voxel_while_nearby_clear_motion_passes() {
+        let mut runtime = runtime();
+        let surface = *runtime
+            .state()
+            .voxels
+            .occupied
+            .iter()
+            .max_by_key(|coordinate| coordinate.y)
+            .expect("asteroid surface voxel exists");
+        let radius = content::manifest().character.collision_radius_m;
+        runtime.state.player.position = Vec3::new(
+            f64::from(surface.x),
+            f64::from(surface.y) + 0.5 + radius + 2.0,
+            f64::from(surface.z),
+        );
+        runtime.state.player.linear_velocity = Vec3::new(0.0, -24.0, 0.0);
+        runtime.state.player.jetpack_enabled = false;
+        runtime
+            .physics
+            .rebuild(&physics_body_specs(&runtime.state))
+            .expect("voxel collision fixture rebuilds");
+
+        let mut contacted = false;
+        for _ in 0..30 {
+            runtime.advance(17).expect("voxel collision commits");
+            contacted |= runtime.state().player.surface_contact;
+            if contacted {
+                break;
+            }
+        }
+        assert!(contacted);
+        assert!(runtime.state().active_contact_pairs.iter().any(|pair| {
+            contact_key_involves_player(pair)
+                && (pair.collider_a == voxel_collision_collider_id(surface)
+                    || pair.collider_b == voxel_collision_collider_id(surface))
+        }));
+        assert!(
+            runtime.state().player.position.y
+                >= f64::from(surface.y) + 0.5 + radius - REPLAY_CONTACT_SLOP_M
+        );
+
+        let clear_start = Vec3::new(
+            f64::from(surface.x),
+            f64::from(surface.y) + 0.5 + radius + 0.25,
+            f64::from(surface.z),
+        );
+        runtime.state.player.position = clear_start;
+        runtime.state.player.linear_velocity = Vec3::new(4.0, 0.0, 0.0);
+        runtime.state.player.surface_contact = false;
+        runtime.state.active_contact_pairs.clear();
+        runtime
+            .physics
+            .rebuild(&physics_body_specs(&runtime.state))
+            .expect("nearby clear voxel fixture rebuilds");
+        runtime.advance(100).expect("nearby clear motion commits");
+        assert!(runtime.state().player.position.x > clear_start.x + 0.2);
+    }
+
+    #[test]
+    fn authoritative_player_ccd_contacts_axis_aligned_grid_while_clear_motion_passes() {
+        let mut runtime = runtime();
+        let radius = content::manifest().character.collision_radius_m;
+        let grid = runtime
+            .state
+            .grids
+            .get_mut(STARTER_GRID_ID)
+            .expect("starter grid exists");
+        grid.anchored = true;
+        let block_position = grid.world_position(IVec3::ZERO);
+        runtime.state.player.position = block_position + Vec3::new(0.0, 0.5 + radius + 2.0, 0.0);
+        runtime.state.player.linear_velocity = Vec3::new(0.0, -24.0, 0.0);
+        runtime.state.player.jetpack_enabled = false;
+        runtime
+            .physics
+            .rebuild(&physics_body_specs(&runtime.state))
+            .expect("axis-aligned grid fixture rebuilds");
+
+        let mut contacted = false;
+        for _ in 0..30 {
+            runtime.advance(17).expect("grid collision commits");
+            contacted |= runtime.state().player.surface_contact;
+            if contacted {
+                break;
+            }
+        }
+        assert!(contacted);
+        assert!(runtime.state().active_contact_pairs.iter().any(|pair| {
+            contact_key_involves_player(pair)
+                && (pair.body_a == STARTER_GRID_ID || pair.body_b == STARTER_GRID_ID)
+        }));
+
+        let clear_start = block_position + Vec3::new(0.0, 0.5 + radius + 0.25, 3.0);
+        runtime.state.player.position = clear_start;
+        runtime.state.player.linear_velocity = Vec3::new(4.0, 0.0, 0.0);
+        runtime.state.player.surface_contact = false;
+        runtime.state.active_contact_pairs.clear();
+        runtime
+            .physics
+            .rebuild(&physics_body_specs(&runtime.state))
+            .expect("nearby clear grid fixture rebuilds");
+        runtime
+            .advance(100)
+            .expect("nearby clear grid motion commits");
+        assert!(runtime.state().player.position.x > clear_start.x + 0.2);
     }
 
     #[test]

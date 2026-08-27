@@ -80,11 +80,18 @@ fn move_player(
             return Ok(());
         }
         let direction = delta * (1.0 / delta.magnitude());
+        let local_direction = runtime
+            .state()
+            .player
+            .orientation
+            .conjugate()
+            .rotate(direction)
+            .clamped(1.0);
         runtime.execute(&ClientMessage::SetPlayerControl {
             operation_id: format!("benchmark-control-{sequence}"),
             movement_epoch: runtime.state().player.movement_epoch,
             input_sequence: *sequence + 1,
-            linear_input: direction,
+            linear_input: local_direction,
             angular_input: Vec3::ZERO,
             boost: true,
             dampeners: true,
