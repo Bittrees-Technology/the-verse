@@ -2371,18 +2371,29 @@ func _send_player_control(control: Dictionary, force: bool) -> bool:
 	current_prediction_input_sequence = sequence
 	last_sent_control = bounded_control.duplicate(true)
 	control_send_elapsed = 0.0
-	pending_controls.append({
-		"movement_epoch": movement_epoch,
-		"input_sequence": sequence,
-		"control": bounded_control.duplicate(true),
-	})
-	while _prediction_buffer_exceeds_limit(pending_controls.size()):
-		prediction_history_invalid = true
-		pending_controls.pop_front()
+	_record_pending_control(movement_epoch, sequence, bounded_control)
 	if smoke_test and smoke_visual_ready and smoke_operation.is_empty():
 		smoke_operation = operation_id
 		smoke_input_sequence = sequence
 	return true
+
+
+func _record_pending_control(epoch: int, sequence: int, control: Dictionary) -> void:
+	_append_bounded_prediction_entry(pending_controls, {
+		"movement_epoch": epoch,
+		"input_sequence": sequence,
+		"control": control.duplicate(true),
+	})
+
+
+func _append_bounded_prediction_entry(
+	buffer: Array[Dictionary],
+	entry: Dictionary
+) -> void:
+	buffer.append(entry)
+	while _prediction_buffer_exceeds_limit(buffer.size()):
+		prediction_history_invalid = true
+		buffer.pop_front()
 
 
 func _player_control_message(
@@ -2427,15 +2438,12 @@ func _predict_player_step(control: Dictionary, delta: float, record_history: boo
 		tool_kick = max(tool_kick, 0.22)
 	predicted_simulation_tick += 1
 	if record_history:
-		prediction_history.append({
+		_append_bounded_prediction_entry(prediction_history, {
 			"movement_epoch": movement_epoch,
 			"input_sequence": current_prediction_input_sequence,
 			"simulation_tick": predicted_simulation_tick,
 			"control": control.duplicate(true),
 		})
-		while _prediction_buffer_exceeds_limit(prediction_history.size()):
-			prediction_history_invalid = true
-			prediction_history.pop_front()
 
 
 func _integrate_player_motion(
