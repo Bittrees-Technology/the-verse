@@ -25,10 +25,11 @@ use joltc_sys::{
     JPC_ContactListener_delete, JPC_ContactListener_new, JPC_ContactListenerFns,
     JPC_ContactManifold, JPC_ContactSettings, JPC_EstimateCollisionResponse,
     JPC_JobSystemThreadPool, JPC_JobSystemThreadPool_delete, JPC_JobSystemThreadPool_new3,
-    JPC_MOTION_QUALITY_DISCRETE, JPC_MOTION_TYPE_DYNAMIC, JPC_MOTION_TYPE_STATIC,
-    JPC_PHYSICS_UPDATE_ERROR_NONE, JPC_PhysicsSystem_GetBodyInterface,
+    JPC_MOTION_QUALITY_DISCRETE, JPC_MOTION_QUALITY_LINEAR_CAST, JPC_MOTION_TYPE_DYNAMIC,
+    JPC_MOTION_TYPE_STATIC, JPC_PHYSICS_UPDATE_ERROR_NONE, JPC_PhysicsSystem_GetBodyInterface,
     JPC_PhysicsSystem_SetContactListener, JPC_PhysicsSystem_Update, JPC_Quat, JPC_RVec3, JPC_Shape,
-    JPC_Shape_GetSubShapeUserData, JPC_Shape_Release, JPC_StaticCompoundShapeSettings,
+    JPC_Shape_GetSubShapeUserData, JPC_Shape_Release, JPC_SphereShapeSettings,
+    JPC_SphereShapeSettings_Create, JPC_StaticCompoundShapeSettings,
     JPC_StaticCompoundShapeSettings_Create, JPC_String, JPC_String_c_str, JPC_String_delete,
     JPC_SubShapeIDPair, JPC_SubShapeSettings, JPC_TempAllocatorImpl, JPC_TempAllocatorImpl_delete,
     JPC_TempAllocatorImpl_new, JPC_VALIDATE_RESULT_ACCEPT_ALL_CONTACTS, JPC_ValidateResult,
@@ -41,7 +42,8 @@ use rolt::{
 
 use crate::{
     BodyControl, BodyMotion, BodySpec, BodyState, BoxColliderSpec, ContactInvariant, ContactPhase,
-    ContactRecord, ContactSource, PhysicsError, Pose, Quat, SceneConfig, Vec3,
+    ContactRecord, ContactSource, MotionQuality, PhysicsError, Pose, Quat, SceneConfig,
+    SphereColliderSpec, Vec3,
 };
 
 const OBJECT_LAYER_STATIC: u16 = 0;
@@ -605,14 +607,19 @@ impl NativeScene {
         config: &SceneConfig,
         spec: &BodySpec,
     ) -> Result<StagedNativeBody, PhysicsError> {
-        let mut child_shapes = Vec::with_capacity(spec.colliders.len());
-        let mut sub_shapes = Vec::with_capacity(spec.colliders.len());
-        for (index, collider) in spec.colliders.iter().enumerate() {
-            let shape = create_box(spec, collider, index)?;
+        let ordered_colliders = ordered_colliders(spec);
+        let mut child_shapes = Vec::with_capacity(ordered_colliders.len());
+        let mut sub_shapes = Vec::with_capacity(ordered_colliders.len());
+        for (index, collider) in ordered_colliders.iter().enumerate() {
+            let shape = match collider {
+                ColliderRef::Box(collider) => create_box(spec, collider, index)?,
+                ColliderRef::Sphere(collider) => create_sphere(spec, collider, index)?,
+            };
+            let local_pose = collider.local_pose();
             sub_shapes.push(JPC_SubShapeSettings {
                 Shape: shape.0,
-                Position: local_vec3(collider.local_pose.position),
-                Rotation: quat(collider.local_pose.rotation),
+                Position: local_vec3(local_pose.position),
+                Rotation: quat(local_pose.rotation),
                 UserData: u32::try_from(index + 1).unwrap_or(u32::MAX),
                 ..JPC_SubShapeSettings::default()
             });
@@ -645,7 +652,10 @@ impl NativeScene {
                 BodyMotion::Static => JPC_MOTION_TYPE_STATIC,
                 BodyMotion::Dynamic => JPC_MOTION_TYPE_DYNAMIC,
             },
-            MotionQuality: JPC_MOTION_QUALITY_DISCRETE,
+            MotionQuality: match spec.motion_quality {
+                MotionQuality::Discrete => JPC_MOTION_QUALITY_DISCRETE,
+                MotionQuality::LinearCast => JPC_MOTION_QUALITY_LINEAR_CAST,
+            },
             AllowSleeping: spec.allow_sleeping,
             Friction: spec.friction,
             Restitution: spec.restitution,
@@ -716,10 +726,9 @@ impl NativeScene {
             })?;
         let replacement = BodyContactCatalog {
             body_id: spec.body_id.clone(),
-            collider_ids: spec
-                .colliders
-                .iter()
-                .map(|collider| collider.collider_id.clone())
+            collider_ids: ordered_colliders(spec)
+                .into_iter()
+                .map(|collider| collider.id().to_owned())
                 .collect(),
         };
         let previous = if existing_index.is_some() {
@@ -1008,6 +1017,39 @@ impl Drop for ShapeRef {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum ColliderRef<'a> {
+    Box(&'a BoxColliderSpec),
+    Sphere(&'a SphereColliderSpec),
+}
+
+impl<'a> ColliderRef<'a> {
+    fn id(self) -> &'a str {
+        match self {
+            Self::Box(collider) => &collider.collider_id,
+            Self::Sphere(collider) => &collider.collider_id,
+        }
+    }
+
+    fn local_pose(self) -> Pose {
+        match self {
+            Self::Box(collider) => collider.local_pose,
+            Self::Sphere(collider) => collider.local_pose,
+        }
+    }
+}
+
+fn ordered_colliders(spec: &BodySpec) -> Vec<ColliderRef<'_>> {
+    let mut colliders = spec
+        .colliders
+        .iter()
+        .map(ColliderRef::Box)
+        .chain(spec.sphere_colliders.iter().map(ColliderRef::Sphere))
+        .collect::<Vec<_>>();
+    colliders.sort_by(|left, right| left.id().cmp(right.id()));
+    colliders
+}
+
 fn create_box(
     body: &BodySpec,
     collider: &BoxColliderSpec,
@@ -1026,6 +1068,37 @@ fn create_box(
     // settings contains no borrowed pointers. Success returns one owned ref.
     let created = unsafe {
         JPC_BoxShapeSettings_Create(
+            ptr::from_ref(&settings),
+            ptr::from_mut(&mut shape),
+            ptr::from_mut(&mut error),
+        )
+    };
+    if created && !shape.is_null() {
+        Ok(ShapeRef(shape))
+    } else {
+        Err(PhysicsError::ShapeCreation {
+            body_id: body.body_id.clone(),
+            message: take_error(error),
+        })
+    }
+}
+
+fn create_sphere(
+    body: &BodySpec,
+    collider: &SphereColliderSpec,
+    index: usize,
+) -> Result<ShapeRef, PhysicsError> {
+    let settings = JPC_SphereShapeSettings {
+        UserData: u64::try_from(index + 1).unwrap_or(u64::MAX),
+        Density: collider.density_kg_per_m3,
+        Radius: collider.radius,
+    };
+    let mut shape = ptr::null_mut();
+    let mut error = ptr::null_mut();
+    // SAFETY: Output pointers refer to local variables valid for the call;
+    // settings contains no borrowed pointers. Success returns one owned ref.
+    let created = unsafe {
+        JPC_SphereShapeSettings_Create(
             ptr::from_ref(&settings),
             ptr::from_mut(&mut shape),
             ptr::from_mut(&mut error),
