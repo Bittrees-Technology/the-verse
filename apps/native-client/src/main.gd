@@ -21,6 +21,7 @@ const CHARACTER_FIXED_DELTA := 1.0 / 60.0
 const CONTROL_SEND_INTERVAL := 0.10
 const PREDICTION_HISTORY_LIMIT := 180
 const POSITION_SNAP_DISTANCE := 2.0
+const ORIENTATION_SNAP_ANGLE := PI / 3.0
 const CHARACTER_COLLISION_RADIUS := 0.34
 const CHARACTER_THRUST_ACCELERATION := 10.0
 const CHARACTER_BOOST_ACCELERATION := 20.0
@@ -82,6 +83,7 @@ var last_sent_control: Dictionary = {}
 var current_prediction_input_sequence := 0
 var prediction_history: Array[Dictionary] = []
 var pending_controls: Array[Dictionary] = []
+var prediction_history_invalid := false
 var mouse_delta_accumulator := Vector2.ZERO
 var presentation_position_offset := Vector3.ZERO
 var presentation_orientation_offset := Quaternion.IDENTITY
@@ -213,13 +215,15 @@ func _physics_process(delta: float) -> void:
 
 
 func _input(event: InputEvent) -> void:
+	if event is InputEventKey and _reconnect_shortcut(event):
+		_connect_to_server()
+		get_viewport().set_input_as_handled()
+		return
+
 	if _local_player_incapacitated():
 		if event is InputEventKey and event.pressed and not event.echo:
 			if event.keycode in [KEY_ENTER, KEY_KP_ENTER]:
 				_request_recovery()
-				get_viewport().set_input_as_handled()
-			elif event.keycode == KEY_F5:
-				_connect_to_server()
 				get_viewport().set_input_as_handled()
 		return
 
@@ -309,9 +313,6 @@ func _input(event: InputEvent) -> void:
 				suit_light_enabled = not suit_light_enabled
 				suit_light.visible = suit_light_enabled
 				_set_message("Helmet light %s" % ("online" if suit_light_enabled else "offline"))
-			KEY_F5:
-				_connect_to_server()
-
 	if event is InputEventMouseButton and event.pressed:
 		if Input.mouse_mode != Input.MOUSE_MODE_CAPTURED:
 			Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
@@ -325,6 +326,10 @@ func _inventory_close_shortcut(event: InputEventKey, text_entry_focused: bool) -
 	if not event.pressed or event.echo:
 		return false
 	return event.keycode == KEY_ESCAPE or (event.keycode == KEY_I and not text_entry_focused)
+
+
+func _reconnect_shortcut(event: InputEventKey) -> bool:
+	return event.pressed and not event.echo and event.keycode == KEY_F5
 
 
 func _player_life_state(player: Dictionary) -> String:
@@ -1480,6 +1485,11 @@ func _handle_server_message(message: Dictionary) -> void:
 func _apply_snapshot(authoritative: Dictionary) -> void:
 	if authoritative.is_empty():
 		return
+	var event_sequence := int(authoritative.get("event_sequence", 0))
+	if not _full_snapshot_event_is_current(
+		event_sequence, last_authoritative_event_sequence
+	):
+		return
 	snapshot = authoritative
 	var player: Dictionary = snapshot.get("player", {})
 	var level := int(player.get("level", 1))
@@ -1501,7 +1511,7 @@ func _apply_snapshot(authoritative: Dictionary) -> void:
 	_apply_authoritative_player(
 		player,
 		int(snapshot.get("simulation_tick", 0)),
-		int(snapshot.get("event_sequence", 0)),
+		event_sequence,
 		String(snapshot.get("world_hash", "")),
 		"snapshot"
 	)
@@ -1510,6 +1520,12 @@ func _apply_snapshot(authoritative: Dictionary) -> void:
 			get_tree().quit(1)
 			return
 		smoke_visual_ready = true
+
+
+func _full_snapshot_event_is_current(incoming_sequence: int, current_sequence: int) -> bool:
+	# An equal-sequence snapshot is an intentional complete refresh of the same
+	# canonical event. Older snapshots must not roll structural state backward.
+	return incoming_sequence >= current_sequence
 
 
 func _apply_motion_state(motion: Dictionary) -> void:
@@ -1575,6 +1591,17 @@ func _apply_authoritative_player(
 	var old_present_position := camera.position
 	var old_present_orientation := camera.quaternion
 	var old_history := prediction_history.duplicate(true)
+	var old_predicted_simulation_tick := predicted_simulation_tick
+	var history_reset := (
+		not lifecycle_reset
+		and _prediction_history_requires_reset(
+			prediction_history_invalid,
+			old_history,
+			incoming_epoch,
+			simulation_tick,
+			old_predicted_simulation_tick
+		)
+	)
 
 	predicted_position = _vec3(player.get("position", {}))
 	predicted_orientation = _quat(player.get("orientation", {}))
@@ -1596,7 +1623,21 @@ func _apply_authoritative_player(
 	if lifecycle_reset:
 		prediction_history.clear()
 		pending_controls.clear()
+		prediction_history_invalid = false
 		next_input_sequence = incoming_ack + 1
+		current_prediction_input_sequence = incoming_ack
+		desired_dampeners = bool(player.get("dampeners", true))
+		last_sent_control = {}
+		control_send_elapsed = CONTROL_SEND_INTERVAL
+		mouse_delta_accumulator = Vector2.ZERO
+		require_neutral_baseline = incoming_life_state == "alive"
+	elif history_reset:
+		# The missing local timeline cannot be replayed safely. Preserve sequence
+		# monotonicity, snap to this canonical state, and supersede any in-flight
+		# control with a fresh neutral baseline on the next physics frame.
+		prediction_history.clear()
+		pending_controls.clear()
+		prediction_history_invalid = false
 		current_prediction_input_sequence = incoming_ack
 		desired_dampeners = bool(player.get("dampeners", true))
 		last_sent_control = {}
@@ -1624,7 +1665,12 @@ func _apply_authoritative_player(
 			desired_dampeners = bool(player.get("dampeners", true))
 
 	var correction_distance := old_present_position.distance_to(predicted_position)
-	if lifecycle_reset or correction_distance > POSITION_SNAP_DISTANCE:
+	var correction_angle := _quaternion_angular_distance(
+		old_present_orientation, predicted_orientation
+	)
+	if _correction_requires_snap(
+		lifecycle_reset or history_reset, correction_distance, correction_angle
+	):
 		presentation_position_offset = Vector3.ZERO
 		presentation_orientation_offset = Quaternion.IDENTITY
 		camera.position = predicted_position
@@ -1651,11 +1697,71 @@ func _apply_authoritative_player(
 	_check_smoke_control_ack(player)
 
 
+func _prediction_history_requires_reset(
+	invalidated: bool,
+	history: Array[Dictionary],
+	epoch: int,
+	authoritative_tick: int,
+	local_predicted_tick: int
+) -> bool:
+	return invalidated or _prediction_history_has_gap(
+		history,
+		epoch,
+		authoritative_tick,
+		local_predicted_tick
+	)
+
+
+func _prediction_buffer_exceeds_limit(size: int) -> bool:
+	return size > PREDICTION_HISTORY_LIMIT
+
+
+func _prediction_history_has_gap(
+	history: Array[Dictionary],
+	epoch: int,
+	authoritative_tick: int,
+	local_predicted_tick: int
+) -> bool:
+	if local_predicted_tick <= authoritative_tick:
+		return false
+	var expected_tick := authoritative_tick + 1
+	for frame in history:
+		if int(frame.get("movement_epoch", -1)) != epoch:
+			continue
+		var frame_tick := int(frame.get("simulation_tick", 0))
+		if frame_tick <= authoritative_tick:
+			continue
+		if frame_tick != expected_tick:
+			return true
+		expected_tick += 1
+	return expected_tick - 1 != local_predicted_tick
+
+
+func _quaternion_angular_distance(first: Quaternion, second: Quaternion) -> float:
+	var normalized_first := first.normalized()
+	var normalized_second := second.normalized()
+	var magnitude := clampf(absf(normalized_first.dot(normalized_second)), 0.0, 1.0)
+	return 2.0 * acos(magnitude)
+
+
+func _correction_requires_snap(
+	lifecycle_or_history_reset: bool,
+	position_distance: float,
+	orientation_angle: float
+) -> bool:
+	return (
+		lifecycle_or_history_reset
+		or position_distance > POSITION_SNAP_DISTANCE
+		or orientation_angle > ORIENTATION_SNAP_ANGLE
+	)
+
+
 func _begin_player_resync() -> void:
 	authoritative_player_ready = false
 	awaiting_reconnect_baseline = true
 	prediction_history.clear()
 	pending_controls.clear()
+	prediction_history_invalid = false
 	last_sent_control = {}
 	control_send_elapsed = 0.0
 	mouse_delta_accumulator = Vector2.ZERO
@@ -2231,7 +2337,8 @@ func _send_player_control(control: Dictionary, force: bool) -> bool:
 		"input_sequence": sequence,
 		"control": bounded_control.duplicate(true),
 	})
-	while pending_controls.size() > PREDICTION_HISTORY_LIMIT:
+	while _prediction_buffer_exceeds_limit(pending_controls.size()):
+		prediction_history_invalid = true
 		pending_controls.pop_front()
 	if smoke_test and smoke_visual_ready and smoke_operation.is_empty():
 		smoke_operation = operation_id
@@ -2287,7 +2394,8 @@ func _predict_player_step(control: Dictionary, delta: float, record_history: boo
 			"simulation_tick": predicted_simulation_tick,
 			"control": control.duplicate(true),
 		})
-		while prediction_history.size() > PREDICTION_HISTORY_LIMIT:
+		while _prediction_buffer_exceeds_limit(prediction_history.size()):
+			prediction_history_invalid = true
 			prediction_history.pop_front()
 
 
@@ -2514,6 +2622,24 @@ func _run_visual_smoke_assertions() -> bool:
 	var escape_key := InputEventKey.new()
 	escape_key.keycode = KEY_ESCAPE
 	escape_key.pressed = true
+	var reconnect_key := InputEventKey.new()
+	reconnect_key.keycode = KEY_F5
+	reconnect_key.pressed = true
+	var reconnect_echo := InputEventKey.new()
+	reconnect_echo.keycode = KEY_F5
+	reconnect_echo.pressed = true
+	reconnect_echo.echo = true
+	var contiguous_history: Array[Dictionary] = [
+		{"movement_epoch": 7, "simulation_tick": 101},
+		{"movement_epoch": 7, "simulation_tick": 102},
+	]
+	var gapped_history: Array[Dictionary] = [
+		{"movement_epoch": 7, "simulation_tick": 101},
+		{"movement_epoch": 7, "simulation_tick": 103},
+	]
+	var small_orientation := Quaternion(Vector3.UP, ORIENTATION_SNAP_ANGLE * 0.5)
+	var large_orientation := Quaternion(Vector3.UP, ORIENTATION_SNAP_ANGLE + 0.1)
+	var equivalent_identity := Quaternion(0.0, 0.0, 0.0, -1.0)
 	var frame := {
 		"block_id": "smoke-frame",
 		"kind": "structural",
@@ -2562,6 +2688,31 @@ func _run_visual_smoke_assertions() -> bool:
 		and not _inventory_close_shortcut(inventory_key, true)
 		and _inventory_close_shortcut(inventory_key, false)
 		and _inventory_close_shortcut(escape_key, true)
+		and _reconnect_shortcut(reconnect_key)
+		and not _reconnect_shortcut(reconnect_echo)
+		and _full_snapshot_event_is_current(42, 42)
+		and _full_snapshot_event_is_current(43, 42)
+		and not _full_snapshot_event_is_current(41, 42)
+		and not _prediction_history_requires_reset(
+			false, contiguous_history, 7, 100, 102
+		)
+		and _prediction_history_requires_reset(false, gapped_history, 7, 100, 103)
+		and _prediction_history_requires_reset(true, contiguous_history, 7, 100, 102)
+		and not _prediction_buffer_exceeds_limit(PREDICTION_HISTORY_LIMIT)
+		and _prediction_buffer_exceeds_limit(PREDICTION_HISTORY_LIMIT + 1)
+		and not _correction_requires_snap(
+			false,
+			POSITION_SNAP_DISTANCE * 0.5,
+			_quaternion_angular_distance(Quaternion.IDENTITY, small_orientation)
+		)
+		and _correction_requires_snap(
+			false,
+			0.0,
+			_quaternion_angular_distance(Quaternion.IDENTITY, large_orientation)
+		)
+		and _quaternion_angular_distance(
+			Quaternion.IDENTITY, equivalent_identity
+		) < 0.00001
 		and life_support_valid
 		and motion_prediction_valid
 	)
@@ -2572,7 +2723,7 @@ func _run_visual_smoke_assertions() -> bool:
 		printerr("VERSE_VISUAL_STATE_FAILED")
 		return false
 	print(
-		"VERSE_VISUAL_STATE_OK frame=frame damaged=armor_damaged repaired=armor_complete inventory_focus=owned"
+		"VERSE_VISUAL_STATE_OK frame=frame damaged=armor_damaged repaired=armor_complete inventory_focus=owned reconnect=global reconciliation=bounded"
 	)
 	print("VERSE_EVA_GRAVITY_OK drift=gravity dampeners=compensating")
 	return true
