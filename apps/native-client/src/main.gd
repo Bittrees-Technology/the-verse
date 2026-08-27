@@ -32,6 +32,7 @@ const CHARACTER_MAXIMUM_SPEED := 12.0
 const CHARACTER_BOOST_MAXIMUM_SPEED := 24.0
 const CHARACTER_MAXIMUM_ANGULAR_SPEED := 2.5
 const PHYSICS_MAXIMUM_LINEAR_SPEED := 32.0
+const PHYSICS_MAXIMUM_ANGULAR_SPEED := 8.0
 const MOUSE_ANGULAR_INPUT_PER_PIXEL := 0.12
 const TARGET_RANGE := 9.0
 const MINE_DURATION := 0.72
@@ -78,6 +79,11 @@ var predicted_orientation := Quaternion.IDENTITY
 var predicted_linear_velocity := Vector3.ZERO
 var predicted_angular_velocity := Vector3.ZERO
 var predicted_surface_contact := false
+var prediction_planet_center := Vector3.ZERO
+var prediction_surface_radius := 0.0
+var prediction_gravitational_parameter := 0.0
+var prediction_gravity_fallback := Vector3.ZERO
+var prediction_gravity_model_ready := false
 var desired_dampeners := true
 var last_sent_control: Dictionary = {}
 var current_prediction_input_sequence := 0
@@ -1490,6 +1496,7 @@ func _apply_snapshot(authoritative: Dictionary) -> void:
 		event_sequence, last_authoritative_event_sequence
 	):
 		return
+	_capture_prediction_gravity(authoritative)
 	snapshot = authoritative
 	var player: Dictionary = snapshot.get("player", {})
 	var level := int(player.get("level", 1))
@@ -1526,6 +1533,35 @@ func _full_snapshot_event_is_current(incoming_sequence: int, current_sequence: i
 	# An equal-sequence snapshot is an intentional complete refresh of the same
 	# canonical event. Older snapshots must not roll structural state backward.
 	return incoming_sequence >= current_sequence
+
+
+func _capture_prediction_gravity(authoritative: Dictionary) -> void:
+	var environment: Dictionary = authoritative.get("environment", {})
+	var player: Dictionary = authoritative.get("player", {})
+	var center := _vec3(environment.get("planet_center", {}))
+	var surface_radius := float(environment.get("surface_radius_m", 0.0))
+	var gravity_sample := _vec3(environment.get("gravity", {}))
+	prediction_gravity_fallback = gravity_sample
+	prediction_gravity_model_ready = false
+	if player.is_empty() or surface_radius <= 0.0 or gravity_sample.length_squared() <= 0.0:
+		return
+	var sample_position := _vec3(player.get("position", {}))
+	var gravitational_parameter := _gravitational_parameter_from_sample(
+		gravity_sample, sample_position, center
+	)
+	if gravitational_parameter <= 0.0:
+		return
+	prediction_planet_center = center
+	prediction_surface_radius = surface_radius
+	prediction_gravitational_parameter = gravitational_parameter
+	prediction_gravity_model_ready = true
+
+
+func _gravitational_parameter_from_sample(
+	gravity_sample: Vector3, sample_position: Vector3, center: Vector3
+) -> float:
+	var sample_distance := maxf(sample_position.distance_to(center), 1.0)
+	return gravity_sample.length() * sample_distance * sample_distance
 
 
 func _apply_motion_state(motion: Dictionary) -> void:
@@ -1762,6 +1798,8 @@ func _begin_player_resync() -> void:
 	prediction_history.clear()
 	pending_controls.clear()
 	prediction_history_invalid = false
+	prediction_gravity_model_ready = false
+	prediction_gravity_fallback = Vector3.ZERO
 	last_sent_control = {}
 	control_send_elapsed = 0.0
 	mouse_delta_accumulator = Vector2.ZERO
@@ -2416,28 +2454,38 @@ func _integrate_player_motion(
 	var body_basis := Basis(orientation)
 	var world_input := body_basis * linear_input
 	var acceleration := gravity
-	if jetpack_enabled:
-		if dampeners:
-			var maximum_speed := (
-				CHARACTER_BOOST_MAXIMUM_SPEED if boost else CHARACTER_MAXIMUM_SPEED
-			)
-			var target_velocity := world_input * maximum_speed
-			var maximum_acceleration := (
-				CHARACTER_BOOST_ACCELERATION
-				if world_input.length() > 0.00001 and boost
-				else CHARACTER_THRUST_ACCELERATION
-				if world_input.length() > 0.00001
-				else CHARACTER_LINEAR_DAMPENER_ACCELERATION
-			)
-			acceleration = ((target_velocity - linear_velocity) / delta).limit_length(
-				maximum_acceleration
-			)
+	if jetpack_enabled and not dampeners:
+		var thrust := CHARACTER_BOOST_ACCELERATION if boost else CHARACTER_THRUST_ACCELERATION
+		var selected_maximum_speed := (
+			CHARACTER_BOOST_MAXIMUM_SPEED if boost else CHARACTER_MAXIMUM_SPEED
+		)
+		var gravity_velocity := linear_velocity + gravity * delta
+		if world_input.length() > 0.00001:
+			var speed_ceiling := maxf(gravity_velocity.length(), selected_maximum_speed)
+			linear_velocity = (
+				gravity_velocity + world_input * thrust * delta
+			).limit_length(speed_ceiling)
 		else:
-			var thrust := CHARACTER_BOOST_ACCELERATION if boost else CHARACTER_THRUST_ACCELERATION
-			acceleration += world_input * thrust
-	linear_velocity = (linear_velocity + acceleration * delta).limit_length(
-		PHYSICS_MAXIMUM_LINEAR_SPEED
-	)
+			linear_velocity = gravity_velocity
+	elif jetpack_enabled:
+		var maximum_speed := (
+			CHARACTER_BOOST_MAXIMUM_SPEED if boost else CHARACTER_MAXIMUM_SPEED
+		)
+		var target_velocity := world_input * maximum_speed
+		var maximum_acceleration := (
+			CHARACTER_BOOST_ACCELERATION
+			if world_input.length() > 0.00001 and boost
+			else CHARACTER_THRUST_ACCELERATION
+			if world_input.length() > 0.00001
+			else CHARACTER_LINEAR_DAMPENER_ACCELERATION
+		)
+		acceleration = ((target_velocity - linear_velocity) / delta).limit_length(
+			maximum_acceleration
+		)
+		linear_velocity += acceleration * delta
+	else:
+		linear_velocity += gravity * delta
+	linear_velocity = linear_velocity.limit_length(PHYSICS_MAXIMUM_LINEAR_SPEED)
 
 	var world_angular_input := body_basis * angular_input
 	if dampeners:
@@ -2450,9 +2498,14 @@ func _integrate_player_motion(
 		angular_velocity = angular_velocity.move_toward(
 			target_angular_velocity, angular_acceleration * delta
 		)
-	else:
-		angular_velocity += world_angular_input * CHARACTER_ANGULAR_ACCELERATION * delta
-	angular_velocity = angular_velocity.limit_length(CHARACTER_MAXIMUM_ANGULAR_SPEED)
+	elif world_angular_input.length() > 0.00001:
+		var angular_speed_ceiling := maxf(
+			angular_velocity.length(), CHARACTER_MAXIMUM_ANGULAR_SPEED
+		)
+		angular_velocity = (
+			angular_velocity + world_angular_input * CHARACTER_ANGULAR_ACCELERATION * delta
+		).limit_length(angular_speed_ceiling)
+	angular_velocity = angular_velocity.limit_length(PHYSICS_MAXIMUM_ANGULAR_SPEED)
 	if angular_velocity.length_squared() > 0.00000001:
 		var delta_rotation := Quaternion(
 			angular_velocity.normalized(), angular_velocity.length() * delta
@@ -2469,12 +2522,40 @@ func _integrate_player_motion(
 
 func _prediction_gravity(position: Vector3) -> Vector3:
 	var environment: Dictionary = snapshot.get("environment", {})
-	var canonical_gravity := _vec3(environment.get("gravity", {}))
-	var planet_center := _vec3(environment.get("planet_center", {}))
-	var radial := position - planet_center
-	if canonical_gravity.length_squared() <= 0.00000001 or radial.length_squared() <= 0.0001:
-		return canonical_gravity
-	return -radial.normalized() * canonical_gravity.length()
+	var fallback := prediction_gravity_fallback
+	if fallback.length_squared() <= 0.0:
+		fallback = _vec3(environment.get("gravity", {}))
+	if not prediction_gravity_model_ready:
+		return fallback
+	return _inverse_square_gravity(
+		position,
+		prediction_planet_center,
+		prediction_surface_radius,
+		prediction_gravitational_parameter,
+		fallback
+	)
+
+
+func _inverse_square_gravity(
+	position: Vector3,
+	center: Vector3,
+	surface_radius: float,
+	gravitational_parameter: float,
+	fallback: Vector3
+) -> Vector3:
+	var radial := position - center
+	if (
+		surface_radius <= 0.0
+		or gravitational_parameter <= 0.0
+		or radial.length_squared() <= 0.0001
+	):
+		return fallback
+	var distance := maxf(radial.length(), 1.0)
+	var surface_gravity := gravitational_parameter / (surface_radius * surface_radius)
+	var gravity_magnitude := minf(
+		gravitational_parameter / (distance * distance), surface_gravity * 1.25
+	)
+	return -radial.normalized() * gravity_magnitude
 
 
 func _sweep_player_position(start: Vector3, finish: Vector3) -> Dictionary:
@@ -2742,7 +2823,42 @@ func _run_motion_prediction_smoke_assertions() -> bool:
 	thrust_control["linear_input"] = Vector3(0.0, 0.0, -1.0)
 	var roll_control := dampened_control.duplicate(true)
 	roll_control["angular_input"] = Vector3(0.0, 0.0, -1.0)
+	var drift_thrust_control := drift_control.duplicate(true)
+	drift_thrust_control["linear_input"] = Vector3.RIGHT
+	var drift_roll_control := drift_control.duplicate(true)
+	drift_roll_control["angular_input"] = Vector3(0.0, 0.0, 1.0)
 	var gravity_probe := Vector3(0.0, -0.5, 0.0)
+	var gravity_surface_radius := 1200.0
+	var gravity_surface_strength := 6.2
+	var gravity_parameter := gravity_surface_strength * gravity_surface_radius * gravity_surface_radius
+	var gravity_reference := _inverse_square_gravity(
+		Vector3(gravity_surface_radius * 2.0, 0.0, 0.0),
+		Vector3.ZERO,
+		gravity_surface_radius,
+		gravity_parameter,
+		gravity_probe
+	)
+	var gravity_inward := _inverse_square_gravity(
+		Vector3(gravity_surface_radius * 1.5, 0.0, 0.0),
+		Vector3.ZERO,
+		gravity_surface_radius,
+		gravity_parameter,
+		gravity_probe
+	)
+	var gravity_outward := _inverse_square_gravity(
+		Vector3(gravity_surface_radius * 3.0, 0.0, 0.0),
+		Vector3.ZERO,
+		gravity_surface_radius,
+		gravity_parameter,
+		gravity_probe
+	)
+	var gravity_capped := _inverse_square_gravity(
+		Vector3(gravity_surface_radius * 0.5, 0.0, 0.0),
+		Vector3.ZERO,
+		gravity_surface_radius,
+		gravity_parameter,
+		gravity_probe
+	)
 	var drift := _integrate_player_motion(
 		Vector3.ZERO,
 		Quaternion.IDENTITY,
@@ -2769,6 +2885,57 @@ func _run_motion_prediction_smoke_assertions() -> bool:
 		Vector3.ZERO,
 		Vector3.ZERO,
 		roll_control,
+		Vector3.ZERO,
+		true,
+		CHARACTER_FIXED_DELTA
+	)
+	var inertial_velocity := Vector3(18.0, 0.0, 0.0)
+	var inertial_drift := _integrate_player_motion(
+		Vector3.ZERO,
+		Quaternion.IDENTITY,
+		inertial_velocity,
+		Vector3.ZERO,
+		drift_control,
+		gravity_probe,
+		true,
+		CHARACTER_FIXED_DELTA
+	)
+	var normal_cap := _integrate_player_motion(
+		Vector3.ZERO,
+		Quaternion.IDENTITY,
+		Vector3.RIGHT * CHARACTER_MAXIMUM_SPEED,
+		Vector3.ZERO,
+		drift_thrust_control,
+		Vector3.ZERO,
+		true,
+		CHARACTER_FIXED_DELTA
+	)
+	var boost_release := _integrate_player_motion(
+		Vector3.ZERO,
+		Quaternion.IDENTITY,
+		Vector3.RIGHT * CHARACTER_BOOST_MAXIMUM_SPEED,
+		Vector3.ZERO,
+		drift_thrust_control,
+		Vector3.ZERO,
+		true,
+		CHARACTER_FIXED_DELTA
+	)
+	var angular_inertia := _integrate_player_motion(
+		Vector3.ZERO,
+		Quaternion.IDENTITY,
+		Vector3.ZERO,
+		Vector3(0.0, 0.0, 4.0),
+		drift_control,
+		Vector3.ZERO,
+		true,
+		CHARACTER_FIXED_DELTA
+	)
+	var angular_ceiling := _integrate_player_motion(
+		Vector3.ZERO,
+		Quaternion.IDENTITY,
+		Vector3.ZERO,
+		Vector3(0.0, 0.0, 4.0),
+		drift_roll_control,
 		Vector3.ZERO,
 		true,
 		CHARACTER_FIXED_DELTA
@@ -2800,6 +2967,44 @@ func _run_motion_prediction_smoke_assertions() -> bool:
 			gravity_probe * CHARACTER_FIXED_DELTA
 		)
 		and (dampened.get("linear_velocity", Vector3.ZERO) as Vector3).is_zero_approx()
+		and gravity_inward.length() > gravity_reference.length()
+		and gravity_outward.length() < gravity_reference.length()
+		and gravity_inward.x < 0.0
+		and gravity_outward.x < 0.0
+		and is_equal_approx(gravity_capped.length(), gravity_surface_strength * 1.25)
+		and _inverse_square_gravity(
+			Vector3.ZERO,
+			Vector3.ZERO,
+			gravity_surface_radius,
+			gravity_parameter,
+			gravity_probe
+		).is_equal_approx(gravity_probe)
+		and is_equal_approx(
+			_gravitational_parameter_from_sample(
+				gravity_reference,
+				Vector3(gravity_surface_radius * 2.0, 0.0, 0.0),
+				Vector3.ZERO
+			),
+			gravity_parameter
+		)
+		and (inertial_drift.get("linear_velocity", Vector3.ZERO) as Vector3).is_equal_approx(
+			inertial_velocity + gravity_probe * CHARACTER_FIXED_DELTA
+		)
+		and is_equal_approx(
+			(normal_cap.get("linear_velocity", Vector3.ZERO) as Vector3).length(),
+			CHARACTER_MAXIMUM_SPEED
+		)
+		and is_equal_approx(
+			(boost_release.get("linear_velocity", Vector3.ZERO) as Vector3).length(),
+			CHARACTER_BOOST_MAXIMUM_SPEED
+		)
+		and (angular_inertia.get("angular_velocity", Vector3.ZERO) as Vector3).is_equal_approx(
+			Vector3(0.0, 0.0, 4.0)
+		)
+		and is_equal_approx(
+			(angular_ceiling.get("angular_velocity", Vector3.ZERO) as Vector3).length(),
+			4.0
+		)
 		and float(rolled_orientation.length_squared()) > 0.999
 		and (rolled.get("angular_velocity", Vector3.ZERO) as Vector3).z < 0.0
 		and _controls_equal(dampened_control, dampened_control.duplicate(true))
@@ -2812,7 +3017,9 @@ func _run_motion_prediction_smoke_assertions() -> bool:
 	if not valid:
 		printerr("VERSE_CHARACTER_PREDICTION_FAILED")
 		return false
-	print("VERSE_CHARACTER_PREDICTION_OK input_only=true roll=single_path fixed_step=60hz")
+	print(
+		"VERSE_CHARACTER_PREDICTION_OK input_only=true roll=single_path fixed_step=60hz drift=inertial caps=preserved"
+	)
 	return true
 
 
