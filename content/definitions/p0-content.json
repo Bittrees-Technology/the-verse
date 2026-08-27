@@ -1,6 +1,6 @@
 {
-  "schema_version": 7,
-  "manifest_version": "p0.9.0",
+  "schema_version": 8,
+  "manifest_version": "p0.10.0",
   "license": "AGPL-3.0-or-later",
   "physics": {
     "fixed_step_hz": 60,
@@ -17,6 +17,8 @@
   "character": {
     "mass_kg": 90.0,
     "collision_radius_m": 0.34,
+    "standing_height_m": 1.8,
+    "eye_height_m": 1.62,
     "control_lease_ticks": 18,
     "thrust_acceleration_m_s2": 10.0,
     "boost_acceleration_m_s2": 20.0,
@@ -25,7 +27,24 @@
     "angular_dampener_acceleration_radians_per_second_squared": 7.0,
     "maximum_speed_m_s": 12.0,
     "boost_maximum_speed_m_s": 24.0,
-    "maximum_angular_speed_radians_per_second": 2.5
+    "maximum_angular_speed_radians_per_second": 2.5,
+    "maximum_view_pitch_degrees": 85.0,
+    "walk_speed_m_s": 4.5,
+    "sprint_speed_m_s": 7.5,
+    "ground_acceleration_m_s2": 18.0,
+    "ground_braking_m_s2": 24.0,
+    "jump_speed_m_s": 5.0,
+    "walkable_slope_degrees": 50.0,
+    "slope_exit_hysteresis_degrees": 2.0,
+    "step_height_m": 0.45,
+    "ground_snap_m": 0.18,
+    "support_probe_distance_m": 0.22,
+    "jump_buffer_ticks": 6,
+    "coyote_ticks": 6,
+    "magnetic_probe_distance_m": 0.2,
+    "magnetic_catch_speed_m_s": 2.0,
+    "magnetic_adhesion_acceleration_m_s2": 24.0,
+    "magnetic_reattach_lockout_ticks": 12
   },
   "survival": {
     "suit_oxygen_capacity_milli": 1000,

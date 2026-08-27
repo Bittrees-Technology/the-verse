@@ -585,6 +585,7 @@ mod tests {
                 linear_input: verse_protocol::Vec3::ZERO,
                 angular_input: verse_protocol::Vec3::ZERO,
                 boost: false,
+                jump: false,
                 dampeners: true,
             },
         )
@@ -676,6 +677,7 @@ mod tests {
                 linear_input: verse_protocol::Vec3::new(0.0, 0.0, -1.0),
                 angular_input: verse_protocol::Vec3::new(0.0, 0.0, 0.5),
                 boost: false,
+                jump: false,
                 dampeners: true,
             },
         )

@@ -2,12 +2,14 @@
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use verse_protocol::{IVec3, PlayerDeathCause, Quat, ResourceKind, Vec3, VoxelMaterial};
+use verse_protocol::{
+    IVec3, PlayerDeathCause, PlayerLocomotionSnapshot, Quat, ResourceKind, Vec3, VoxelMaterial,
+};
 
 use crate::model::{Block, ContactPairKey, DeathDrop, InventoryRecord};
 
 pub const EVENT_SCHEMA_NAME: &str = "verse.world_event";
-pub const EVENT_SCHEMA_VERSION: u32 = 7;
+pub const EVENT_SCHEMA_VERSION: u32 = 8;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event_type", rename_all = "snake_case")]
@@ -19,11 +21,13 @@ pub enum EventPayload {
         angular_input: Vec3,
         boost: bool,
         dampeners: bool,
+        jump: bool,
         expires_at_simulation_tick: u64,
     },
     SuitModeChanged {
         helmet_closed: bool,
         jetpack_enabled: bool,
+        magnetic_boots_enabled: bool,
     },
     SuitOxygenChanged {
         previous_oxygen_milli: u16,
@@ -43,6 +47,7 @@ pub enum EventPayload {
         suit_oxygen_milli: u16,
         helmet_closed: bool,
         jetpack_enabled: bool,
+        magnetic_boots_enabled: bool,
     },
     VoxelMined {
         coordinate: IVec3,
@@ -110,10 +115,12 @@ pub struct PlayerPhysicsOutcome {
     pub linear_velocity: Vec3,
     pub angular_velocity: Vec3,
     pub surface_contact: bool,
+    pub locomotion: PlayerLocomotionSnapshot,
     pub control_linear_input: Vec3,
     pub control_angular_input: Vec3,
     pub boost: bool,
     pub dampeners: bool,
+    pub jump: bool,
     pub control_expires_at_simulation_tick: u64,
 }
 
@@ -191,16 +198,22 @@ impl EventPayload {
             Self::SuitModeChanged {
                 helmet_closed,
                 jetpack_enabled,
+                magnetic_boots_enabled,
             } => (
                 "suit_mode_changed",
                 format!(
-                    "Helmet {} — jetpack {}",
+                    "Helmet {} — jetpack {} — magnetic boots {}",
                     if *helmet_closed { "sealed" } else { "open" },
                     if *jetpack_enabled {
                         "online"
                     } else {
                         "offline"
-                    }
+                    },
+                    if *magnetic_boots_enabled {
+                        "armed"
+                    } else {
+                        "off"
+                    },
                 ),
             ),
             Self::SuitOxygenChanged {
@@ -376,7 +389,7 @@ mod tests {
     fn event_hash_detects_payload_tampering() {
         let mut event = CanonicalEvent::new(
             1,
-            "p0.9.0",
+            "p0.10.0",
             "universe",
             "cell",
             9,
@@ -390,6 +403,7 @@ mod tests {
                 linear_input: Vec3::new(1.0, 0.0, 0.0),
                 angular_input: Vec3::ZERO,
                 boost: false,
+                jump: false,
                 dampeners: true,
                 expires_at_simulation_tick: 18,
             },
@@ -401,6 +415,7 @@ mod tests {
             linear_input: Vec3::new(0.0, 1.0, 0.0),
             angular_input: Vec3::ZERO,
             boost: false,
+            jump: false,
             dampeners: true,
             expires_at_simulation_tick: 18,
         };

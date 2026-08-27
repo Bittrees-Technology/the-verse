@@ -10,7 +10,8 @@ use verse_physics::{
 };
 use verse_protocol::{
     BlockKind, ClientMessage, IVec3, IntentReceipt, InventoryContents, InventoryDomain,
-    MotionSnapshot, PlayerDeathCause, PlayerLifeState, Quat, ResourceKind, Vec3, WorldSnapshot,
+    LocomotionKind, MotionSnapshot, PlayerDeathCause, PlayerLifeState, PlayerLocomotionSnapshot,
+    Quat, ResourceKind, Vec3, WorldSnapshot,
 };
 
 use crate::content;
@@ -21,7 +22,7 @@ use crate::event::{
 use crate::model::{
     Block, CARGO_INVENTORY_CAPACITY_LITERS, ContactPairKey, DeathDrop, Grid, InventoryRecord,
     PLANET_CENTER, PLANET_SURFACE_RADIUS_M, PLAYER_INVENTORY_ID, Player, PlayerControlFrame,
-    WorldState,
+    WorldState, radial_up,
 };
 use crate::persistence::{PersistenceError, Store};
 
@@ -609,6 +610,7 @@ impl WorldState {
             suit_oxygen_milli: survival.respawn_oxygen_milli,
             helmet_closed: survival.respawn_helmet_closed,
             jetpack_enabled: survival.respawn_jetpack_enabled,
+            magnetic_boots_enabled: false,
         })
     }
 
@@ -655,6 +657,7 @@ impl WorldState {
                 angular_input,
                 boost,
                 dampeners,
+                jump,
                 ..
             } => {
                 ensure_bounded_control(*linear_input, "character linear control")?;
@@ -688,6 +691,7 @@ impl WorldState {
                     angular_input: *angular_input,
                     boost: *boost,
                     dampeners: *dampeners,
+                    jump: *jump,
                     expires_at_simulation_tick: self
                         .simulation_tick
                         .saturating_add(content::manifest().character.control_lease_ticks),
@@ -696,10 +700,12 @@ impl WorldState {
             ClientMessage::SetSuitMode {
                 helmet_closed,
                 jetpack_enabled,
+                magnetic_boots_enabled,
                 ..
             } => {
                 if self.player.helmet_closed == *helmet_closed
                     && self.player.jetpack_enabled == *jetpack_enabled
+                    && self.player.locomotion.magnetic_boots_enabled == *magnetic_boots_enabled
                 {
                     return Err(IntentError::rejected(
                         "suit_mode_no_change",
@@ -709,6 +715,7 @@ impl WorldState {
                 EventPayload::SuitModeChanged {
                     helmet_closed: *helmet_closed,
                     jetpack_enabled: *jetpack_enabled,
+                    magnetic_boots_enabled: *magnetic_boots_enabled,
                 }
             }
             ClientMessage::RespawnPlayer { .. } => self.player_respawn_payload()?,
@@ -1188,6 +1195,7 @@ impl WorldState {
                 angular_input,
                 boost,
                 dampeners,
+                jump,
                 expires_at_simulation_tick,
             } => {
                 ensure_bounded_control(*linear_input, "replayed character linear control")?;
@@ -1222,6 +1230,7 @@ impl WorldState {
                         angular_input: *angular_input,
                         boost: *boost,
                         dampeners: *dampeners,
+                        jump: *jump,
                         expires_at_simulation_tick: *expires_at_simulation_tick,
                     });
                 self.player.last_received_input_sequence = *input_sequence;
@@ -1229,9 +1238,17 @@ impl WorldState {
             EventPayload::SuitModeChanged {
                 helmet_closed,
                 jetpack_enabled,
+                magnetic_boots_enabled,
             } => {
                 self.player.helmet_closed = *helmet_closed;
                 self.player.jetpack_enabled = *jetpack_enabled;
+                self.player.locomotion.magnetic_boots_enabled = *magnetic_boots_enabled;
+                if *jetpack_enabled {
+                    self.player.locomotion.kind = LocomotionKind::Eva;
+                    self.player.locomotion.support = None;
+                } else if matches!(self.player.locomotion.kind, LocomotionKind::Eva) {
+                    self.player.locomotion.kind = LocomotionKind::Airborne;
+                }
             }
             EventPayload::SuitOxygenChanged {
                 new_oxygen_milli, ..
@@ -1275,10 +1292,17 @@ impl WorldState {
                 self.player.linear_velocity = Vec3::ZERO;
                 self.player.angular_velocity = Vec3::ZERO;
                 self.player.surface_contact = false;
+                self.player.locomotion = reset_locomotion(
+                    self.player.position,
+                    LocomotionKind::Airborne,
+                    false,
+                    self.simulation_tick,
+                );
                 self.player.control_linear_input = Vec3::ZERO;
                 self.player.control_angular_input = Vec3::ZERO;
                 self.player.boost = false;
                 self.player.dampeners = true;
+                self.player.jump = false;
                 self.player.control_expires_at_simulation_tick = self.simulation_tick;
                 self.player.pending_control_frames.clear();
                 self.player.life_state = PlayerLifeState::Incapacitated { death_id, cause };
@@ -1295,6 +1319,7 @@ impl WorldState {
                 suit_oxygen_milli,
                 helmet_closed,
                 jetpack_enabled,
+                magnetic_boots_enabled,
                 ..
             } => {
                 let expected = self.player_respawn_payload()?;
@@ -1309,6 +1334,16 @@ impl WorldState {
                 self.player.linear_velocity = Vec3::ZERO;
                 self.player.angular_velocity = Vec3::ZERO;
                 self.player.surface_contact = false;
+                self.player.locomotion = reset_locomotion(
+                    *position,
+                    if *jetpack_enabled {
+                        LocomotionKind::Eva
+                    } else {
+                        LocomotionKind::Airborne
+                    },
+                    *magnetic_boots_enabled,
+                    self.simulation_tick,
+                );
                 self.player.movement_epoch = self.player.movement_epoch.saturating_add(1);
                 self.player.last_received_input_sequence = 0;
                 self.player.last_processed_input_sequence = 0;
@@ -1317,6 +1352,7 @@ impl WorldState {
                 self.player.control_angular_input = Vec3::ZERO;
                 self.player.boost = false;
                 self.player.dampeners = true;
+                self.player.jump = false;
                 self.player.control_expires_at_simulation_tick = self.simulation_tick;
                 self.player.suit_oxygen_milli = *suit_oxygen_milli;
                 self.player.helmet_closed = *helmet_closed;
@@ -1706,7 +1742,9 @@ impl WorldState {
                     if player.control_linear_input != expected_linear
                         || player.control_angular_input != expected_angular
                         || player.boost != (scheduled_player.boost && lease_active)
+                        || player.jump != (scheduled_player.jump && lease_active)
                         || player.dampeners != (scheduled_player.dampeners || !lease_active)
+                        || player.locomotion != scheduled_player.locomotion
                         || player.control_expires_at_simulation_tick
                             != scheduled_player.control_expires_at_simulation_tick
                     {
@@ -1917,6 +1955,7 @@ impl WorldState {
                     self.player.linear_velocity = player.linear_velocity;
                     self.player.angular_velocity = player.angular_velocity;
                     self.player.surface_contact = player.surface_contact;
+                    self.player.locomotion = player.locomotion.clone();
                     self.player.last_processed_input_sequence =
                         scheduled_player.last_processed_input_sequence;
                     self.player.pending_control_frames = scheduled_player.pending_control_frames;
@@ -1924,6 +1963,7 @@ impl WorldState {
                     self.player.control_angular_input = player.control_angular_input;
                     self.player.boost = player.boost;
                     self.player.dampeners = player.dampeners;
+                    self.player.jump = player.jump;
                     self.player.control_expires_at_simulation_tick =
                         player.control_expires_at_simulation_tick;
                 }
@@ -2791,11 +2831,18 @@ fn advance_player_control_for_substep(player: &mut Player, simulation_tick: u64)
     }
 
     if let Some(frame) = player.pending_control_frames.pop_front() {
+        let jump_pressed = frame.jump && !player.locomotion.jump_held;
         player.last_processed_input_sequence = frame.input_sequence;
         player.control_linear_input = frame.linear_input;
         player.control_angular_input = frame.angular_input;
         player.boost = frame.boost;
         player.dampeners = frame.dampeners;
+        player.jump = frame.jump;
+        player.locomotion.jump_held = frame.jump;
+        if jump_pressed {
+            player.locomotion.jump_buffer_expires_at_simulation_tick =
+                simulation_tick.saturating_add(content::manifest().character.jump_buffer_ticks);
+        }
         player.control_expires_at_simulation_tick = frame.expires_at_simulation_tick;
     }
 
@@ -2804,6 +2851,27 @@ fn advance_player_control_for_substep(player: &mut Player, simulation_tick: u64)
         player.control_angular_input = Vec3::ZERO;
         player.boost = false;
         player.dampeners = true;
+        player.jump = false;
+        player.locomotion.jump_held = false;
+    }
+}
+
+fn reset_locomotion(
+    position: Vec3,
+    kind: LocomotionKind,
+    magnetic_boots_enabled: bool,
+    simulation_tick: u64,
+) -> PlayerLocomotionSnapshot {
+    PlayerLocomotionSnapshot {
+        kind,
+        up: radial_up(position),
+        view_pitch_radians: 0.0,
+        support: None,
+        jump_held: false,
+        jump_buffer_expires_at_simulation_tick: simulation_tick,
+        support_grace_expires_at_simulation_tick: simulation_tick,
+        magnetic_boots_enabled,
+        magnetic_reattach_after_simulation_tick: simulation_tick,
     }
 }
 
@@ -2998,6 +3066,7 @@ fn player_physics_outcome(
         angular_velocity: from_physics_vec3(body.angular_velocity)
             .clamped(f64::from(limits.max_angular_velocity_radians_per_second)),
         surface_contact,
+        locomotion: player.locomotion.clone(),
         control_linear_input: if lease_active {
             player.control_linear_input
         } else {
@@ -3010,6 +3079,7 @@ fn player_physics_outcome(
         },
         boost: player.boost && lease_active,
         dampeners: player.dampeners || !lease_active,
+        jump: player.jump && lease_active,
         control_expires_at_simulation_tick: player.control_expires_at_simulation_tick,
     }
 }
@@ -3235,6 +3305,7 @@ mod tests {
                 orientation: state.player.orientation,
                 linear_velocity: state.player.linear_velocity,
                 angular_velocity: state.player.angular_velocity,
+                locomotion: state.player.locomotion.clone(),
                 surface_contact: false,
                 control_linear_input: if lease_active {
                     state.player.control_linear_input
@@ -3247,6 +3318,7 @@ mod tests {
                     Vec3::ZERO
                 },
                 boost: state.player.boost && lease_active,
+                jump: state.player.jump && lease_active,
                 dampeners: state.player.dampeners || !lease_active,
                 control_expires_at_simulation_tick: state.player.control_expires_at_simulation_tick,
             }
@@ -3799,6 +3871,28 @@ mod tests {
         player.boost = true;
         reject(wrong_control, "replay_player_physics_control_invalid");
 
+        let mut wrong_locomotion = canonical.clone();
+        let EventPayload::PhysicsStepCommitted {
+            player: Some(player),
+            ..
+        } = &mut wrong_locomotion
+        else {
+            unreachable!();
+        };
+        player.locomotion.kind = LocomotionKind::Grounded;
+        reject(wrong_locomotion, "replay_player_physics_control_invalid");
+
+        let mut wrong_jump = canonical.clone();
+        let EventPayload::PhysicsStepCommitted {
+            player: Some(player),
+            ..
+        } = &mut wrong_jump
+        else {
+            unreachable!();
+        };
+        player.jump = true;
+        reject(wrong_jump, "replay_player_physics_control_invalid");
+
         let mut wrong_contact = canonical;
         let EventPayload::PhysicsStepCommitted {
             player: Some(player),
@@ -4324,6 +4418,7 @@ mod tests {
             linear_input: Vec3::ZERO,
             angular_input: Vec3::ZERO,
             boost: false,
+            jump: false,
             dampeners: true,
         });
         assert!(matches!(
@@ -4352,6 +4447,7 @@ mod tests {
                 linear_input,
                 angular_input,
                 boost: false,
+                jump: false,
                 dampeners: true,
             });
             assert!(matches!(
@@ -4369,6 +4465,7 @@ mod tests {
             linear_input: Vec3::new(1.01, 0.0, 0.0),
             angular_input: Vec3::ZERO,
             boost: false,
+            jump: false,
             dampeners: true,
         });
         assert!(matches!(
@@ -4385,6 +4482,7 @@ mod tests {
             linear_input: Vec3::new(0.0, 0.0, -1.0),
             angular_input: Vec3::new(0.0, 0.0, 0.5),
             boost: true,
+            jump: false,
             dampeners: false,
         };
         let first_receipt = runtime
@@ -4402,6 +4500,7 @@ mod tests {
             linear_input: Vec3::ZERO,
             angular_input: Vec3::ZERO,
             boost: false,
+            jump: false,
             dampeners: true,
         });
         assert!(matches!(
@@ -4430,6 +4529,7 @@ mod tests {
                     linear_input: Vec3::ZERO,
                     angular_input,
                     boost: false,
+                    jump: false,
                     dampeners: true,
                 })
                 .expect("tap transition is durably accepted");
@@ -4476,6 +4576,7 @@ mod tests {
                             linear_input: Vec3::ZERO,
                             angular_input,
                             boost: false,
+                            jump: false,
                             dampeners: true,
                         })
                         .expect("queued transition commits");
@@ -4514,6 +4615,7 @@ mod tests {
                         linear_input: Vec3::ZERO,
                         angular_input: Vec3::new(0.0, 0.0, 1.0),
                         boost: false,
+                        jump: false,
                         dampeners: true,
                     }),
                     Err(RuntimeError::Persistence(
@@ -4555,6 +4657,7 @@ mod tests {
                     linear_input: Vec3::ZERO,
                     angular_input: Vec3::new(0.0, 0.0, 1.0),
                     boost: false,
+                    jump: false,
                     dampeners: true,
                 })
                 .expect("bounded queue entry commits");
@@ -4568,6 +4671,7 @@ mod tests {
             linear_input: Vec3::ZERO,
             angular_input: Vec3::ZERO,
             boost: false,
+            jump: false,
             dampeners: true,
         });
         assert!(matches!(
@@ -4593,6 +4697,7 @@ mod tests {
                 linear_input: Vec3::new(1.0, 0.0, 0.0),
                 angular_input: Vec3::new(0.0, 0.0, 1.0),
                 boost: true,
+                jump: false,
                 dampeners: false,
             })
             .expect("stale fixture control commits");
@@ -4619,6 +4724,7 @@ mod tests {
                     linear_input: Vec3::new(1.0, 0.0, 0.0),
                     angular_input: Vec3::new(0.0, 0.0, 1.0),
                     boost: true,
+                    jump: false,
                     dampeners: false,
                 })
                 .expect("control is durable before disconnect");
@@ -4656,6 +4762,7 @@ mod tests {
                 linear_input: Vec3::new(1.0, 0.0, 0.0),
                 angular_input: Vec3::new(0.0, 0.0, 1.0),
                 boost: false,
+                jump: false,
                 dampeners: false,
             })
             .expect("bounded EVA control is accepted");
@@ -4702,6 +4809,7 @@ mod tests {
                             linear_input: Vec3::new(1.0, 0.0, 0.0),
                             angular_input: Vec3::new(0.0, 0.0, 1.0),
                             boost,
+                            jump: false,
                             dampeners,
                         })
                         .expect("refreshed held control is accepted");
@@ -4744,6 +4852,7 @@ mod tests {
                 linear_input: Vec3::ZERO,
                 angular_input: Vec3::ZERO,
                 boost: false,
+                jump: false,
                 dampeners: false,
             })
             .expect("neutral inertial control is accepted");
@@ -4759,6 +4868,7 @@ mod tests {
                 linear_input: Vec3::new(1.0, 0.0, 0.0),
                 angular_input: Vec3::new(0.0, 0.0, 1.0),
                 boost: false,
+                jump: false,
                 dampeners: false,
             })
             .expect("held control above the normal tier is accepted");
@@ -4782,6 +4892,7 @@ mod tests {
                 linear_input: Vec3::new(0.25, -0.5, 0.75),
                 angular_input: Vec3::new(0.3, -0.2, 0.4),
                 boost: true,
+                jump: false,
                 dampeners: true,
             })
             .expect("golden control is accepted");
@@ -4858,6 +4969,7 @@ mod tests {
                 operation_id: "open-helmet".into(),
                 helmet_closed: false,
                 jetpack_enabled: true,
+                magnetic_boots_enabled: false,
             })
             .expect("helmet opens in breathable atmosphere");
         assert!(!runtime.advance(250).expect("partial life support tick"));
@@ -5035,12 +5147,14 @@ mod tests {
                 linear_input: Vec3::new(1.0, 0.0, 0.0),
                 angular_input: Vec3::ZERO,
                 boost: false,
+                jump: false,
                 dampeners: true,
             },
             ClientMessage::SetSuitMode {
                 operation_id: "dead-suit".into(),
                 helmet_closed: false,
                 jetpack_enabled: false,
+                magnetic_boots_enabled: false,
             },
             ClientMessage::MineVoxel {
                 operation_id: "dead-mine".into(),
@@ -5296,6 +5410,7 @@ mod tests {
                 linear_input: Vec3::new(1.0, 0.0, 0.0),
                 angular_input: Vec3::new(0.0, 0.0, 1.0),
                 boost: true,
+                jump: false,
                 dampeners: false,
                 expires_at_simulation_tick: 18,
             });
@@ -5734,6 +5849,7 @@ mod tests {
                 linear_input: Vec3::ZERO,
                 angular_input: Vec3::ZERO,
                 boost: false,
+                jump: false,
                 dampeners: true,
                 expires_at_simulation_tick: state.simulation_tick
                     + content::manifest().character.control_lease_ticks,
@@ -6209,6 +6325,7 @@ mod tests {
             linear_input: Vec3::new(1.0, 0.0, 0.0),
             angular_input: Vec3::ZERO,
             boost: false,
+            jump: false,
             dampeners: true,
         });
         assert!(matches!(
@@ -6227,6 +6344,7 @@ mod tests {
                 linear_input: Vec3::ZERO,
                 angular_input: Vec3::ZERO,
                 boost: false,
+                jump: false,
                 dampeners: true,
             }),
             Err(RuntimeError::Halted)

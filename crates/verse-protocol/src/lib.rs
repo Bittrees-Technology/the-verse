@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 
 /// The only protocol version accepted by this P0 build.
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 10;
 
 /// A stable integer voxel or block coordinate.
 #[derive(
@@ -255,6 +255,36 @@ pub enum PlayerLifeState {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocomotionKind {
+    Eva,
+    Airborne,
+    Grounded,
+    Magnetic,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LocomotionSupportSnapshot {
+    pub body_id: String,
+    pub collider_id: String,
+    pub local_anchor: Vec3,
+    pub local_normal: Vec3,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlayerLocomotionSnapshot {
+    pub kind: LocomotionKind,
+    pub up: Vec3,
+    pub view_pitch_radians: f64,
+    pub support: Option<LocomotionSupportSnapshot>,
+    pub jump_held: bool,
+    pub jump_buffer_expires_at_simulation_tick: u64,
+    pub support_grace_expires_at_simulation_tick: u64,
+    pub magnetic_boots_enabled: bool,
+    pub magnetic_reattach_after_simulation_tick: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DeathDropSnapshot {
     pub drop_id: String,
@@ -275,6 +305,7 @@ pub struct PlayerSnapshot {
     pub linear_velocity: Vec3,
     pub angular_velocity: Vec3,
     pub surface_contact: bool,
+    pub locomotion: PlayerLocomotionSnapshot,
     pub movement_epoch: u64,
     pub last_received_input_sequence: u64,
     pub last_processed_input_sequence: u64,
@@ -282,6 +313,7 @@ pub struct PlayerSnapshot {
     pub control_angular_input: Vec3,
     pub boost: bool,
     pub dampeners: bool,
+    pub jump: bool,
     pub control_expires_at_simulation_tick: u64,
     pub inventory_id: String,
     pub experience: u64,
@@ -360,6 +392,7 @@ pub struct PlayerMotionSnapshot {
     pub linear_velocity: Vec3,
     pub angular_velocity: Vec3,
     pub surface_contact: bool,
+    pub locomotion: PlayerLocomotionSnapshot,
     pub movement_epoch: u64,
     pub last_received_input_sequence: u64,
     pub last_processed_input_sequence: u64,
@@ -367,6 +400,7 @@ pub struct PlayerMotionSnapshot {
     pub control_angular_input: Vec3,
     pub boost: bool,
     pub dampeners: bool,
+    pub jump: bool,
     pub control_expires_at_simulation_tick: u64,
     pub jetpack_enabled: bool,
     pub life_state: PlayerLifeState,
@@ -441,11 +475,13 @@ pub enum ClientMessage {
         angular_input: Vec3,
         boost: bool,
         dampeners: bool,
+        jump: bool,
     },
     SetSuitMode {
         operation_id: String,
         helmet_closed: bool,
         jetpack_enabled: bool,
+        magnetic_boots_enabled: bool,
     },
     RespawnPlayer {
         operation_id: String,
@@ -628,15 +664,17 @@ mod tests {
             operation_id: "suit-1".into(),
             helmet_closed: false,
             jetpack_enabled: true,
+            magnetic_boots_enabled: true,
         })
         .expect("suit mode intent serializes");
         assert_eq!(value["type"], "set_suit_mode");
         assert_eq!(value["helmet_closed"], false);
         assert_eq!(value["jetpack_enabled"], true);
+        assert_eq!(value["magnetic_boots_enabled"], true);
     }
 
     #[test]
-    fn protocol_v9_character_control_contains_inputs_but_no_transform_or_time() {
+    fn protocol_v10_character_control_contains_jump_but_no_transform_or_time() {
         let message = ClientMessage::SetPlayerControl {
             operation_id: "player-control-3-41".into(),
             movement_epoch: 3,
@@ -645,6 +683,7 @@ mod tests {
             angular_input: Vec3::new(0.0, 0.0, 0.5),
             boost: true,
             dampeners: false,
+            jump: true,
         };
         let value = serde_json::to_value(&message).expect("control serializes");
         assert_eq!(value["type"], "set_player_control");
@@ -652,6 +691,7 @@ mod tests {
         assert_eq!(value["input_sequence"], 41);
         assert_eq!(value["linear_input"]["z"], -1.0);
         assert_eq!(value["angular_input"]["z"], 0.5);
+        assert_eq!(value["jump"], true);
         for forbidden in [
             "position",
             "orientation",
@@ -673,8 +713,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v9_exposes_tagged_life_state_and_death_cause() {
-        assert_eq!(PROTOCOL_VERSION, 9);
+    fn protocol_v10_exposes_tagged_life_state_and_death_cause() {
+        assert_eq!(PROTOCOL_VERSION, 10);
         let life_state = PlayerLifeState::Incapacitated {
             death_id: "death-player-local-42".into(),
             cause: PlayerDeathCause::OxygenDepleted,
@@ -693,7 +733,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v9_snapshot_exposes_motion_input_oxygen_and_death_drops() {
+    fn protocol_v10_snapshot_exposes_locomotion_input_oxygen_and_death_drops() {
         let death_drop = DeathDropSnapshot {
             drop_id: "drop-player-local-42".into(),
             death_id: "death-player-local-42".into(),
@@ -710,6 +750,17 @@ mod tests {
             linear_velocity: Vec3::ZERO,
             angular_velocity: Vec3::ZERO,
             surface_contact: false,
+            locomotion: PlayerLocomotionSnapshot {
+                kind: LocomotionKind::Airborne,
+                up: Vec3::new(0.0, 1.0, 0.0),
+                view_pitch_radians: 0.0,
+                support: None,
+                jump_held: false,
+                jump_buffer_expires_at_simulation_tick: 0,
+                support_grace_expires_at_simulation_tick: 0,
+                magnetic_boots_enabled: true,
+                magnetic_reattach_after_simulation_tick: 0,
+            },
             movement_epoch: 1,
             last_received_input_sequence: 0,
             last_processed_input_sequence: 0,
@@ -717,6 +768,7 @@ mod tests {
             control_angular_input: Vec3::ZERO,
             boost: false,
             dampeners: true,
+            jump: false,
             control_expires_at_simulation_tick: 0,
             inventory_id: "inventory-player-local".into(),
             experience: 0,
@@ -733,8 +785,8 @@ mod tests {
             jetpack_enabled: false,
         };
         let world = WorldSnapshot {
-            schema_version: 11,
-            content_manifest_version: "p0.9.0".into(),
+            schema_version: 13,
+            content_manifest_version: "p0.10.0".into(),
             universe_id: "the-verse-local".into(),
             cell_id: "cell-origin".into(),
             event_sequence: 42,

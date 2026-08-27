@@ -55,6 +55,8 @@ pub struct PhysicsDefinition {
 pub struct CharacterDefinition {
     pub mass_kg: f64,
     pub collision_radius_m: f64,
+    pub standing_height_m: f64,
+    pub eye_height_m: f64,
     pub control_lease_ticks: u64,
     pub thrust_acceleration_m_s2: f64,
     pub boost_acceleration_m_s2: f64,
@@ -64,6 +66,23 @@ pub struct CharacterDefinition {
     pub maximum_speed_m_s: f64,
     pub boost_maximum_speed_m_s: f64,
     pub maximum_angular_speed_radians_per_second: f64,
+    pub maximum_view_pitch_degrees: f64,
+    pub walk_speed_m_s: f64,
+    pub sprint_speed_m_s: f64,
+    pub ground_acceleration_m_s2: f64,
+    pub ground_braking_m_s2: f64,
+    pub jump_speed_m_s: f64,
+    pub walkable_slope_degrees: f64,
+    pub slope_exit_hysteresis_degrees: f64,
+    pub step_height_m: f64,
+    pub ground_snap_m: f64,
+    pub support_probe_distance_m: f64,
+    pub jump_buffer_ticks: u64,
+    pub coyote_ticks: u64,
+    pub magnetic_probe_distance_m: f64,
+    pub magnetic_catch_speed_m_s: f64,
+    pub magnetic_adhesion_acceleration_m_s2: f64,
+    pub magnetic_reattach_lockout_ticks: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -114,6 +133,14 @@ fn validate_character(definition: &CharacterDefinition) -> Result<(), &'static s
     if !definition.collision_radius_m.is_finite() || definition.collision_radius_m <= 0.0 {
         return Err("character collision radius must be finite and positive");
     }
+    if !definition.standing_height_m.is_finite()
+        || definition.standing_height_m <= 2.0 * definition.collision_radius_m
+        || !definition.eye_height_m.is_finite()
+        || definition.eye_height_m <= definition.collision_radius_m
+        || definition.eye_height_m >= definition.standing_height_m
+    {
+        return Err("character standing and eye heights must fit the capsule");
+    }
     if definition.control_lease_ticks == 0 {
         return Err("character control lease must be positive");
     }
@@ -160,6 +187,62 @@ fn validate_character(definition: &CharacterDefinition) -> Result<(), &'static s
         || definition.maximum_angular_speed_radians_per_second <= 0.0
     {
         return Err("character maximum angular speed must be finite and positive");
+    }
+    if !definition.maximum_view_pitch_degrees.is_finite()
+        || !(1.0..89.0).contains(&definition.maximum_view_pitch_degrees)
+    {
+        return Err("character view pitch limit must be finite and between 1 and 89 degrees");
+    }
+    if !definition.walk_speed_m_s.is_finite()
+        || definition.walk_speed_m_s <= 0.0
+        || !definition.sprint_speed_m_s.is_finite()
+        || definition.sprint_speed_m_s <= definition.walk_speed_m_s
+    {
+        return Err("character walk and sprint speeds must be finite, positive, and ordered");
+    }
+    for value in [
+        definition.ground_acceleration_m_s2,
+        definition.ground_braking_m_s2,
+        definition.jump_speed_m_s,
+        definition.magnetic_catch_speed_m_s,
+        definition.magnetic_adhesion_acceleration_m_s2,
+    ] {
+        if !value.is_finite() || value <= 0.0 {
+            return Err(
+                "character locomotion accelerations and speeds must be finite and positive",
+            );
+        }
+    }
+    if !definition.walkable_slope_degrees.is_finite()
+        || !(1.0..89.0).contains(&definition.walkable_slope_degrees)
+        || !definition.slope_exit_hysteresis_degrees.is_finite()
+        || definition.slope_exit_hysteresis_degrees <= 0.0
+        || definition.slope_exit_hysteresis_degrees >= definition.walkable_slope_degrees
+    {
+        return Err("character slope and hysteresis angles must be finite and ordered");
+    }
+    if !definition.step_height_m.is_finite()
+        || definition.step_height_m <= 0.0
+        || definition.step_height_m >= definition.standing_height_m
+        || !definition.ground_snap_m.is_finite()
+        || definition.ground_snap_m <= 0.0
+        || definition.ground_snap_m > definition.step_height_m
+        || !definition.support_probe_distance_m.is_finite()
+        || definition.support_probe_distance_m < definition.ground_snap_m
+        || definition.support_probe_distance_m > definition.step_height_m
+        || !definition.magnetic_probe_distance_m.is_finite()
+        || definition.magnetic_probe_distance_m <= 0.0
+        || definition.magnetic_probe_distance_m > definition.step_height_m
+    {
+        return Err("character step, snap, and support probes must be finite and ordered");
+    }
+    if definition.jump_buffer_ticks == 0
+        || definition.jump_buffer_ticks > definition.control_lease_ticks
+        || definition.coyote_ticks == 0
+        || definition.coyote_ticks > definition.control_lease_ticks
+        || definition.magnetic_reattach_lockout_ticks == 0
+    {
+        return Err("character locomotion tick windows must be positive and bounded");
     }
     Ok(())
 }
@@ -212,7 +295,7 @@ pub fn manifest() -> &'static ContentManifest {
     MANIFEST.get_or_init(|| {
         let parsed: ContentManifest =
             serde_json::from_str(P0_CONTENT).expect("embedded P0 content must be valid JSON");
-        assert_eq!(parsed.schema_version, 7, "unsupported P0 content schema");
+        assert_eq!(parsed.schema_version, 8, "unsupported P0 content schema");
         assert_eq!(
             parsed.license, "AGPL-3.0-or-later",
             "content definition license must be explicit"
@@ -278,8 +361,8 @@ mod tests {
             .map(|definition| format!("{:?}", definition.kind))
             .collect::<BTreeSet<_>>();
         assert_eq!(block_kinds.len(), content.blocks.len());
-        assert_eq!(content.schema_version, 7);
-        assert_eq!(content.manifest_version, "p0.9.0");
+        assert_eq!(content.schema_version, 8);
+        assert_eq!(content.manifest_version, "p0.10.0");
         assert_eq!(content.physics.voxel_collision_chunk_edge_cells, 8);
         assert_eq!(content.survival.suit_oxygen_capacity_milli, 1_000);
         assert_eq!(content.survival.critical_oxygen_milli, 200);
