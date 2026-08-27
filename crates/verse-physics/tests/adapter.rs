@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use verse_physics::{
-    BodyControl, BodySpec, BodyState, BoxColliderSpec, CapsuleCast, CapsuleColliderSpec,
-    ContactPhase, ContactSource, MotionQuality, PhysicsError, Pose, Quat, Scene, SceneConfig,
-    SphereColliderSpec, StepOutput, Vec3,
+    BodyCollisionClass, BodyControl, BodySpec, BodyState, BoxColliderSpec, CapsuleCast,
+    CapsuleColliderSpec, ContactPhase, ContactSource, MotionQuality, PhysicsError, Pose, Quat,
+    Scene, SceneConfig, SphereColliderSpec, StepOutput, Vec3,
 };
 
 const P0_TOTAL_MOMENTUM_ERROR_KG_MPS: f64 = 1.0;
@@ -163,6 +163,68 @@ fn standing_capsule_contacts_floor_with_stable_identity() {
 }
 
 #[test]
+fn character_collision_class_passes_other_characters_but_still_contacts_world() {
+    let mut scene = Scene::new(SceneConfig::default()).expect("scene initializes");
+    let floor = BodySpec::static_body(
+        "floor",
+        pose(0.0, -0.5, 0.0),
+        vec![BoxColliderSpec {
+            collider_id: "floor-panel".into(),
+            half_extents: Vec3::new(10.0, 0.5, 10.0),
+            ..BoxColliderSpec::unit_cube("ignored")
+        }],
+    );
+    let make_character = |body_id: &str, collider_id: &str, x: f64, velocity_x: f64| {
+        let mut character = BodySpec::dynamic(body_id, pose(x, 2.0, 0.0), Vec::new());
+        character
+            .capsule_colliders
+            .push(CapsuleColliderSpec::new(collider_id, 0.34, 0.56));
+        character.collision_class = BodyCollisionClass::Character;
+        character.linear_velocity = Vec3::new(velocity_x, 0.0, 0.0);
+        character.gravity_factor = 1.0;
+        character.allow_sleeping = false;
+        character.motion_quality = MotionQuality::LinearCast;
+        character
+    };
+    scene
+        .rebuild(&[
+            make_character("character-a", "capsule-a", -1.0, 2.0),
+            make_character("character-b", "capsule-b", 1.0, -2.0),
+            floor,
+        ])
+        .expect("characters and floor build");
+
+    let mut saw_floor_a = false;
+    let mut saw_floor_b = false;
+    for _ in 0..120 {
+        let output = scene.step(&[]).expect("fixed step succeeds");
+        for contact in output.contacts {
+            let pair = [contact.body_a_id.as_str(), contact.body_b_id.as_str()];
+            assert_ne!(
+                pair,
+                ["character-a", "character-b"],
+                "character bodies must not push one another in P1.0"
+            );
+            assert_ne!(pair, ["character-b", "character-a"]);
+            saw_floor_a |= pair.contains(&"character-a") && pair.contains(&"floor");
+            saw_floor_b |= pair.contains(&"character-b") && pair.contains(&"floor");
+        }
+    }
+
+    let states = scene.body_states().expect("body states read");
+    let character_a = states
+        .iter()
+        .find(|body| body.body_id == "character-a")
+        .expect("character A remains");
+    let character_b = states
+        .iter()
+        .find(|body| body.body_id == "character-b")
+        .expect("character B remains");
+    assert!(character_a.pose.position.x > character_b.pose.position.x);
+    assert!(saw_floor_a && saw_floor_b);
+}
+
+#[test]
 fn invalid_capsule_dimensions_reject_without_replacing_the_scene() {
     let mut scene = Scene::new(SceneConfig::default()).expect("scene initializes");
     scene
@@ -205,6 +267,7 @@ fn capsule_cast_finds_floor_with_stable_identity_and_up_normal() {
             radius: 0.34,
             half_height_of_cylinder: 0.56,
             displacement: Vec3::new(0.0, -0.5, 0.0),
+            collision_class: BodyCollisionClass::Default,
             ignore_body_id: None,
         })
         .expect("query succeeds")
@@ -244,10 +307,54 @@ fn capsule_cast_can_ignore_the_live_character_body() {
             radius: 0.34,
             half_height_of_cylinder: 0.56,
             displacement: Vec3::new(0.0, -0.5, 0.0),
+            collision_class: BodyCollisionClass::Default,
             ignore_body_id: Some("character".into()),
         })
         .expect("query succeeds")
         .expect("floor remains visible after self filtering");
+
+    assert_eq!(hit.body_id, "floor");
+    assert_eq!(hit.collider_id, "floor-panel");
+}
+
+#[test]
+fn character_capsule_cast_skips_every_character_and_finds_world_support() {
+    let mut scene = Scene::new(SceneConfig::default()).expect("scene initializes");
+    let floor = BodySpec::static_body(
+        "floor",
+        pose(0.0, -0.5, 0.0),
+        vec![BoxColliderSpec {
+            collider_id: "floor-panel".into(),
+            half_extents: Vec3::new(10.0, 0.5, 10.0),
+            ..BoxColliderSpec::unit_cube("ignored")
+        }],
+    );
+    let character = |body_id: &str, collider_id: &str, height: f64| {
+        let mut body = BodySpec::dynamic(body_id, pose(0.0, height, 0.0), Vec::new());
+        body.collision_class = BodyCollisionClass::Character;
+        body.capsule_colliders
+            .push(CapsuleColliderSpec::new(collider_id, 0.34, 0.56));
+        body
+    };
+    scene
+        .rebuild(&[
+            floor,
+            character("character-lower", "capsule-lower", 1.2),
+            character("character-query", "capsule-query", 3.0),
+        ])
+        .expect("characters and floor build");
+
+    let hit = scene
+        .cast_capsule(&CapsuleCast {
+            pose: pose(0.0, 3.0, 0.0),
+            radius: 0.34,
+            half_height_of_cylinder: 0.56,
+            displacement: Vec3::new(0.0, -2.5, 0.0),
+            collision_class: BodyCollisionClass::Character,
+            ignore_body_id: Some("character-query".into()),
+        })
+        .expect("query succeeds")
+        .expect("world support remains visible through another character");
 
     assert_eq!(hit.body_id, "floor");
     assert_eq!(hit.collider_id, "floor-panel");
@@ -270,6 +377,7 @@ fn invalid_capsule_cast_rejects_without_advancing_scene() {
             radius: 0.34,
             half_height_of_cylinder: 0.56,
             displacement: Vec3::ZERO,
+            collision_class: BodyCollisionClass::Default,
             ignore_body_id: None,
         })
         .expect_err("zero displacement rejects");

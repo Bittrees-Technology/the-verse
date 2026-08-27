@@ -5,9 +5,9 @@ use std::path::Path;
 
 use thiserror::Error;
 use verse_physics::{
-    BodyControl, BodySpec, BoxColliderSpec, CapsuleCast, CapsuleColliderSpec, MotionQuality,
-    PhysicsError, Pose as PhysicsPose, Quat as PhysicsQuat, Scene, SceneConfig, SphereColliderSpec,
-    Vec3 as PhysicsVec3,
+    BodyCollisionClass, BodyControl, BodySpec, BoxColliderSpec, CapsuleCast, CapsuleColliderSpec,
+    MotionQuality, PhysicsError, Pose as PhysicsPose, Quat as PhysicsQuat, Scene, SceneConfig,
+    SphereColliderSpec, Vec3 as PhysicsVec3,
 };
 use verse_protocol::{
     BlockKind, ClientMessage, IVec3, IntentReceipt, InventoryContents, InventoryDomain,
@@ -28,6 +28,7 @@ use crate::model::{
 use crate::persistence::{PersistenceError, Store};
 
 const PLAYER_BODY_ID: &str = "player-body-player-local";
+#[cfg(test)]
 const PLAYER_COLLIDER_ID: &str = "player-collider-player-local";
 const PLANET_BODY_ID: &str = "planet-body-khepri-prime";
 const PLANET_COLLIDER_ID: &str = "planet-collider-khepri-prime";
@@ -47,6 +48,14 @@ const PHYSICS_CONTACT_POINT_SLOP_M: f64 = 0.001;
 const PLAYER_PLANET_PENETRATION_LIMIT_M: f64 = 0.28;
 const PLAYER_BOX_PENETRATION_LIMIT_M: f64 = 0.85;
 const CHARACTER_INERTIA_MULTIPLIER: f64 = 12.0;
+
+fn player_body_id(player_id: &str) -> String {
+    format!("player-body-{player_id}")
+}
+
+fn player_collider_id(player_id: &str) -> String {
+    format!("player-collider-{player_id}")
+}
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum IntentError {
@@ -271,17 +280,18 @@ impl Runtime {
                     || grid.control_linear_input.magnitude() > f64::EPSILON
                     || grid.control_angular_input.magnitude() > f64::EPSILON)
         });
-        let player_physics_active = matches!(self.state.player.life_state, PlayerLifeState::Alive)
-            && (self.state.player.linear_velocity.magnitude() > f64::EPSILON
-                || self.state.player.angular_velocity.magnitude() > f64::EPSILON
-                || self.state.player.control_linear_input.magnitude() > f64::EPSILON
-                || self.state.player.control_angular_input.magnitude() > f64::EPSILON
-                || !self.state.player.pending_control_frames.is_empty()
-                || self.state.player.boost
-                || self.state.simulation_tick
-                    < self.state.player.control_expires_at_simulation_tick
-                || !self.state.player.dampeners
-                || !self.state.player.jetpack_enabled);
+        let player_physics_active = self.state.player.iter().any(|(_, player)| {
+            matches!(player.life_state, PlayerLifeState::Alive)
+                && (player.linear_velocity.magnitude() > f64::EPSILON
+                    || player.angular_velocity.magnitude() > f64::EPSILON
+                    || player.control_linear_input.magnitude() > f64::EPSILON
+                    || player.control_angular_input.magnitude() > f64::EPSILON
+                    || !player.pending_control_frames.is_empty()
+                    || player.boost
+                    || self.state.simulation_tick < player.control_expires_at_simulation_tick
+                    || !player.dampeners
+                    || !player.jetpack_enabled)
+        });
         let physics_active = moving_grid || player_physics_active;
         let delta_millis = delta_millis.clamp(1, 250);
         let mut changed = false;
@@ -303,35 +313,45 @@ impl Runtime {
                 let mut output = None;
                 let mut contacts = Vec::new();
                 let mut active_contacts = self.state.active_contact_pairs.clone();
-                let mut scheduled_player = self.state.player.clone();
+                let mut scheduled_players = self.state.player.by_id.clone();
                 for substep_index in 0..step_count {
                     let substep_simulation_tick =
                         self.state.simulation_tick.saturating_add(substep_index);
-                    advance_player_control_for_substep(
-                        &mut scheduled_player,
-                        substep_simulation_tick,
-                    );
-                    adjust_grounded_capsule_for_substep(
-                        &self.state,
-                        &mut self.physics,
-                        &scheduled_player,
-                        &mut body_states,
-                        substep_simulation_tick,
-                    )?;
-                    let player_jump = classify_player_locomotion_for_substep(
-                        &self.state,
-                        &self.physics,
-                        &mut scheduled_player,
-                        &body_states,
-                        substep_simulation_tick,
-                    )?;
-                    let controls = physics_controls(
-                        &self.state,
-                        &scheduled_player,
-                        &body_states,
-                        substep_simulation_tick,
-                        player_jump,
-                    );
+                    let mut player_jumps = BTreeMap::new();
+                    for (player_id, scheduled_player) in &mut scheduled_players {
+                        advance_player_control_for_substep(
+                            scheduled_player,
+                            substep_simulation_tick,
+                        );
+                        adjust_grounded_capsule_for_substep(
+                            &self.state,
+                            &mut self.physics,
+                            scheduled_player,
+                            &mut body_states,
+                            substep_simulation_tick,
+                        )?;
+                        let jump = classify_player_locomotion_for_substep(
+                            &self.state,
+                            &self.physics,
+                            scheduled_player,
+                            &body_states,
+                            substep_simulation_tick,
+                        )?;
+                        player_jumps.insert(player_id.clone(), jump);
+                    }
+                    let mut controls = Vec::new();
+                    for (index, (player_id, scheduled_player)) in
+                        scheduled_players.iter().enumerate()
+                    {
+                        controls.extend(physics_controls(
+                            &self.state,
+                            scheduled_player,
+                            &body_states,
+                            substep_simulation_tick,
+                            player_jumps.get(player_id).copied().flatten(),
+                            index == 0,
+                        ));
+                    }
                     let step = match self.physics.step(&controls) {
                         Ok(step) => step,
                         Err(source) => {
@@ -339,22 +359,25 @@ impl Runtime {
                             return Err(source.into());
                         }
                     };
-                    if let (Some(prior), Some(result)) = (
-                        body_states
-                            .iter()
-                            .find(|body| body.body_id == PLAYER_BODY_ID),
-                        step.bodies
-                            .iter()
-                            .find(|body| body.body_id == PLAYER_BODY_ID),
-                    ) && let Err(source) = ensure_player_fixed_step_envelope(
-                        from_physics_vec3(prior.pose.position),
-                        from_physics_quat(prior.pose.rotation),
-                        from_physics_vec3(result.pose.position),
-                        from_physics_quat(result.pose.rotation),
-                        &physics_scene_config(),
-                    ) {
-                        self.halted = true;
-                        return Err(source.into());
+                    for scheduled_player in scheduled_players.values() {
+                        let player_body_id = player_body_id(&scheduled_player.player_id);
+                        if let (Some(prior), Some(result)) = (
+                            body_states
+                                .iter()
+                                .find(|body| body.body_id == player_body_id),
+                            step.bodies
+                                .iter()
+                                .find(|body| body.body_id == player_body_id),
+                        ) && let Err(source) = ensure_player_fixed_step_envelope(
+                            from_physics_vec3(prior.pose.position),
+                            from_physics_quat(prior.pose.rotation),
+                            from_physics_vec3(result.pose.position),
+                            from_physics_quat(result.pose.rotation),
+                            &physics_scene_config(),
+                        ) {
+                            self.halted = true;
+                            return Err(source.into());
+                        }
                     }
                     for grid in self.state.grids.values().filter(|grid| !grid.anchored) {
                         if let (Some(prior), Some(result)) = (
@@ -405,18 +428,29 @@ impl Runtime {
                         .filter(|body| self.state.grids.contains_key(&body.body_id))
                         .map(physics_body_outcome)
                         .collect(),
-                    player: output
-                        .bodies
-                        .iter()
-                        .find(|body| body.body_id == PLAYER_BODY_ID)
-                        .map(|body| {
-                            player_physics_outcome(
-                                &scheduled_player,
-                                body,
-                                active_contacts.iter().any(contact_key_involves_player),
-                                self.state.simulation_tick.saturating_add(step_count),
-                            )
-                        }),
+                    players: scheduled_players
+                        .values()
+                        .filter_map(|scheduled_player| {
+                            let player_body_id = player_body_id(&scheduled_player.player_id);
+                            output
+                                .bodies
+                                .iter()
+                                .find(|body| body.body_id == player_body_id)
+                                .map(|body| {
+                                    player_physics_outcome(
+                                        scheduled_player,
+                                        body,
+                                        active_contacts.iter().any(|contact| {
+                                            contact_key_involves_player_id(
+                                                contact,
+                                                &scheduled_player.player_id,
+                                            )
+                                        }),
+                                        self.state.simulation_tick.saturating_add(step_count),
+                                    )
+                                })
+                        })
+                        .collect(),
                     contacts,
                     active_contacts_after: active_contacts.into_iter().collect(),
                 };
@@ -1697,7 +1731,7 @@ impl WorldState {
                 step_count,
                 remaining_step_phase,
                 bodies,
-                player,
+                players,
                 contacts,
                 active_contacts_after,
             } => {
@@ -1719,29 +1753,52 @@ impl WorldState {
                     ));
                 }
                 let physics_limits = physics_scene_config();
-                let player_alive = matches!(self.player.life_state, PlayerLifeState::Alive);
-                if player.is_some() != player_alive {
+                let living_player_count = self
+                    .player
+                    .iter()
+                    .filter(|(_, player)| matches!(player.life_state, PlayerLifeState::Alive))
+                    .count();
+                if players.len() != living_player_count {
                     return Err(IntentError::rejected(
                         "replay_player_physics_presence_invalid",
-                        "physics outcome must contain the player exactly while alive",
+                        "physics outcome must contain every living player exactly once",
                     ));
                 }
-                let mut scheduled_player = self.player.clone();
-                if player_alive {
+                let mut scheduled_players = self.player.by_id.clone();
+                for scheduled_player in scheduled_players
+                    .values_mut()
+                    .filter(|player| matches!(player.life_state, PlayerLifeState::Alive))
+                {
                     for substep_index in 0..u64::from(*step_count) {
                         advance_player_control_for_substep(
-                            &mut scheduled_player,
+                            scheduled_player,
                             self.simulation_tick.saturating_add(substep_index),
                         );
                     }
                 }
-                if let Some(player) = player {
-                    if player.player_id != self.player.player_id {
+                let mut seen_players = BTreeSet::new();
+                for player in players {
+                    if !seen_players.insert(player.player_id.as_str()) {
                         return Err(IntentError::rejected(
-                            "replay_player_physics_identity_invalid",
-                            "physics outcome identifies the wrong player",
+                            "replay_player_physics_duplicate",
+                            "physics outcome contains a duplicate player",
                         ));
                     }
+                    let Some(prior_player) = self.player.get(&player.player_id) else {
+                        return Err(IntentError::rejected(
+                            "replay_player_physics_identity_invalid",
+                            "physics outcome identifies a player outside this cell",
+                        ));
+                    };
+                    if !matches!(prior_player.life_state, PlayerLifeState::Alive) {
+                        return Err(IntentError::rejected(
+                            "replay_player_physics_presence_invalid",
+                            "physics outcome cannot contain an incapacitated player",
+                        ));
+                    }
+                    let scheduled_player = scheduled_players
+                        .get(&player.player_id)
+                        .expect("validated player is present in the scheduled roster");
                     ensure_finite(player.position, "replayed player position")?;
                     ensure_finite(player.linear_velocity, "replayed player velocity")?;
                     ensure_finite(player.angular_velocity, "replayed player angular velocity")?;
@@ -1774,7 +1831,7 @@ impl WorldState {
                         ));
                     }
                     ensure_player_motion_continuity(
-                        &self.player,
+                        prior_player,
                         player,
                         *step_count,
                         &physics_limits,
@@ -1783,7 +1840,7 @@ impl WorldState {
                         self.simulation_tick.saturating_add(u64::from(*step_count));
                     validate_player_locomotion_outcome(
                         self,
-                        &scheduled_player,
+                        scheduled_player,
                         player,
                         resulting_tick,
                     )?;
@@ -1812,6 +1869,21 @@ impl WorldState {
                             "player physics control and lease outcome is not canonical",
                         ));
                     }
+                }
+                let canonical_player_ids = self
+                    .player
+                    .iter()
+                    .filter(|(_, player)| matches!(player.life_state, PlayerLifeState::Alive))
+                    .map(|(player_id, _)| player_id.as_str());
+                if !players
+                    .iter()
+                    .map(|player| player.player_id.as_str())
+                    .eq(canonical_player_ids)
+                {
+                    return Err(IntentError::rejected(
+                        "replay_player_physics_order_invalid",
+                        "physics player outcomes must use canonical player-ID order",
+                    ));
                 }
                 let mut seen = BTreeSet::new();
                 for body in bodies {
@@ -1886,6 +1958,15 @@ impl WorldState {
                         )?;
                     }
                 }
+                if bodies
+                    .windows(2)
+                    .any(|pair| pair[0].grid_id.as_str() >= pair[1].grid_id.as_str())
+                {
+                    return Err(IntentError::rejected(
+                        "replay_physics_body_order_invalid",
+                        "physics grid outcomes must use canonical grid-ID order",
+                    ));
+                }
                 let mut contacts_by_substep = vec![Vec::new(); usize::from(*step_count)];
                 for contact in contacts {
                     if contact.substep_index >= *step_count {
@@ -1938,12 +2019,26 @@ impl WorldState {
                             "physics contact reduced translational mass does not match canonical content",
                         ));
                     }
-                    if contact_key_involves_player(&key) {
-                        let player = player
-                            .as_ref()
+                    let left_player = player_for_body_id(self, &key.body_a);
+                    let right_player = player_for_body_id(self, &key.body_b);
+                    if left_player.is_some() && right_player.is_some() {
+                        return Err(IntentError::rejected(
+                            "replay_character_contact_forbidden",
+                            "character collision layers do not produce character-to-character contacts",
+                        ));
+                    }
+                    if let Some(contact_player_id) = player_id_for_contact(self, &key) {
+                        let player = players
+                            .iter()
+                            .find(|player| player.player_id == contact_player_id)
                             .expect("validated living player outcome exists for a player contact");
+                        let prior_player = self
+                            .player
+                            .get(contact_player_id)
+                            .expect("contact player is present in the canonical roster");
                         if !self.player_contact_is_spatially_plausible(
                             contact,
+                            prior_player,
                             player,
                             bodies,
                             *step_count,
@@ -1956,6 +2051,26 @@ impl WorldState {
                         }
                     }
                     contacts_by_substep[usize::from(contact.substep_index)].push((key, contact));
+                }
+                if contacts.windows(2).any(|pair| {
+                    (
+                        pair[0].substep_index,
+                        pair[0].body_a_id.as_str(),
+                        pair[0].collider_a_id.as_str(),
+                        pair[0].body_b_id.as_str(),
+                        pair[0].collider_b_id.as_str(),
+                    ) >= (
+                        pair[1].substep_index,
+                        pair[1].body_a_id.as_str(),
+                        pair[1].collider_a_id.as_str(),
+                        pair[1].body_b_id.as_str(),
+                        pair[1].collider_b_id.as_str(),
+                    )
+                }) {
+                    return Err(IntentError::rejected(
+                        "replay_physics_contact_order_invalid",
+                        "physics contacts must use canonical substep and collider-pair order",
+                    ));
                 }
                 let mut active = self.active_contact_pairs.clone();
                 for substep in contacts_by_substep {
@@ -1989,8 +2104,10 @@ impl WorldState {
                         "physics active-contact outcome does not match the final substep",
                     ));
                 }
-                if let Some(player) = player {
-                    let expected_surface_contact = active.iter().any(contact_key_involves_player)
+                for player in players {
+                    let expected_surface_contact = active
+                        .iter()
+                        .any(|contact| contact_key_involves_player_id(contact, &player.player_id))
                         || player.locomotion.support.is_some();
                     if player.surface_contact != expected_surface_contact {
                         return Err(IntentError::rejected(
@@ -2009,22 +2126,30 @@ impl WorldState {
                     grid.linear_velocity = body.linear_velocity;
                     grid.angular_velocity = body.angular_velocity;
                 }
-                if let Some(player) = player {
-                    self.player.position = player.position;
-                    self.player.orientation = player.orientation;
-                    self.player.linear_velocity = player.linear_velocity;
-                    self.player.angular_velocity = player.angular_velocity;
-                    self.player.surface_contact = player.surface_contact;
-                    self.player.locomotion = player.locomotion.clone();
-                    self.player.last_processed_input_sequence =
+                for player in players {
+                    let scheduled_player = scheduled_players
+                        .remove(&player.player_id)
+                        .expect("validated physics outcome has scheduled state");
+                    let canonical_player = self
+                        .player
+                        .get_mut(&player.player_id)
+                        .expect("validated physics outcome has canonical state");
+                    canonical_player.position = player.position;
+                    canonical_player.orientation = player.orientation;
+                    canonical_player.linear_velocity = player.linear_velocity;
+                    canonical_player.angular_velocity = player.angular_velocity;
+                    canonical_player.surface_contact = player.surface_contact;
+                    canonical_player.locomotion = player.locomotion.clone();
+                    canonical_player.last_processed_input_sequence =
                         scheduled_player.last_processed_input_sequence;
-                    self.player.pending_control_frames = scheduled_player.pending_control_frames;
-                    self.player.control_linear_input = player.control_linear_input;
-                    self.player.control_angular_input = player.control_angular_input;
-                    self.player.boost = player.boost;
-                    self.player.dampeners = player.dampeners;
-                    self.player.jump = player.jump;
-                    self.player.control_expires_at_simulation_tick =
+                    canonical_player.pending_control_frames =
+                        scheduled_player.pending_control_frames;
+                    canonical_player.control_linear_input = player.control_linear_input;
+                    canonical_player.control_angular_input = player.control_angular_input;
+                    canonical_player.boost = player.boost;
+                    canonical_player.dampeners = player.dampeners;
+                    canonical_player.jump = player.jump;
+                    canonical_player.control_expires_at_simulation_tick =
                         player.control_expires_at_simulation_tick;
                 }
                 self.active_contact_pairs = active;
@@ -2205,9 +2330,9 @@ impl WorldState {
     }
 
     fn physics_collider_exists(&self, body_id: &str, collider_id: &str) -> bool {
-        if body_id == PLAYER_BODY_ID {
-            return matches!(self.player.life_state, PlayerLifeState::Alive)
-                && collider_id == PLAYER_COLLIDER_ID;
+        if let Some(player) = player_for_body_id(self, body_id) {
+            return matches!(player.life_state, PlayerLifeState::Alive)
+                && collider_id == player_collider_id(&player.player_id);
         }
         if body_id == PLANET_BODY_ID {
             return collider_id == PLANET_COLLIDER_ID;
@@ -2351,11 +2476,16 @@ impl WorldState {
     }
 
     fn player_intersects_grid_coordinate(&self, grid: &Grid, coordinate: IVec3) -> bool {
-        let relative = self.player.position - grid.position;
-        let local_player = grid.orientation.conjugate().rotate(relative);
-        let world_axis = self.player.orientation.rotate(Vec3::new(0.0, 1.0, 0.0));
-        let local_axis = grid.orientation.conjugate().rotate(world_axis);
-        capsule_axis_intersects_unit_cube(local_player, local_axis, coordinate)
+        self.player.iter().any(|(_, player)| {
+            if !matches!(player.life_state, PlayerLifeState::Alive) {
+                return false;
+            }
+            let relative = player.position - grid.position;
+            let local_player = grid.orientation.conjugate().rotate(relative);
+            let world_axis = player.orientation.rotate(Vec3::new(0.0, 1.0, 0.0));
+            let local_axis = grid.orientation.conjugate().rotate(world_axis);
+            capsule_axis_intersects_unit_cube(local_player, local_axis, coordinate)
+        })
     }
 
     fn player_movement_hits_grid(&self, start: Vec3, end: Vec3, orientation: Quat) -> bool {
@@ -2367,6 +2497,7 @@ impl WorldState {
     fn player_contact_is_spatially_plausible(
         &self,
         contact: &PhysicsContactOutcome,
+        prior_player: &Player,
         player: &PlayerPhysicsOutcome,
         bodies: &[PhysicsBodyOutcome],
         step_count: u8,
@@ -2384,8 +2515,8 @@ impl WorldState {
         let capsule_half_height = character_capsule_half_height();
         if point_capsule_axis_distance(
             contact.point,
-            self.player.position,
-            self.player.orientation,
+            prior_player.position,
+            prior_player.orientation,
             capsule_half_height,
         ) > completed_steps * per_step_reach + radius + surface_slack
         {
@@ -2402,14 +2533,15 @@ impl WorldState {
             return false;
         }
 
-        let (other_body, other_collider) = if contact.body_a_id == PLAYER_BODY_ID {
+        let player_body_id = player_body_id(&prior_player.player_id);
+        let (other_body, other_collider) = if contact.body_a_id == player_body_id {
             (&contact.body_b_id, &contact.collider_b_id)
-        } else if contact.body_b_id == PLAYER_BODY_ID {
+        } else if contact.body_b_id == player_body_id {
             (&contact.body_a_id, &contact.collider_a_id)
         } else {
             return false;
         };
-        if other_body == PLAYER_BODY_ID {
+        if player_for_body_id(self, other_body).is_some() {
             return false;
         }
         if other_body == PLANET_BODY_ID {
@@ -2592,7 +2724,7 @@ fn validate_player_locomotion_outcome(
     if let Some(support) = &locomotion.support {
         ensure_finite(support.local_anchor, "replayed support anchor")?;
         ensure_finite(support.local_normal, "replayed support normal")?;
-        if support.body_id == PLAYER_BODY_ID
+        if player_for_body_id(state, &support.body_id).is_some()
             || !state.physics_collider_exists(&support.body_id, &support.collider_id)
             || (support.local_normal.magnitude() - 1.0).abs() > 1.0e-5
             || support.local_anchor.magnitude() > 1.0e7
@@ -3000,32 +3132,37 @@ fn physics_body_specs(state: &WorldState) -> Vec<BodySpec> {
     planet.friction = physics.friction;
     planet.restitution = physics.restitution;
     bodies.push(planet);
-    if matches!(state.player.life_state, PlayerLifeState::Alive) {
+    for (_, canonical_player) in state
+        .player
+        .iter()
+        .filter(|(_, player)| matches!(player.life_state, PlayerLifeState::Alive))
+    {
         let character = &content::manifest().character;
         let radius = character.collision_radius_m;
         let half_height_of_cylinder = (character.standing_height_m - 2.0 * radius) * 0.5;
         let volume = std::f64::consts::PI * radius.powi(2) * (2.0 * half_height_of_cylinder)
             + 4.0 / 3.0 * std::f64::consts::PI * radius.powi(3);
         let mut player = BodySpec::dynamic(
-            PLAYER_BODY_ID,
+            player_body_id(&canonical_player.player_id),
             PhysicsPose::new(
-                to_physics_vec3(state.player.position),
-                to_physics_quat(state.player.orientation),
+                to_physics_vec3(canonical_player.position),
+                to_physics_quat(canonical_player.orientation),
             ),
             Vec::new(),
         );
         player.capsule_colliders.push(CapsuleColliderSpec {
-            collider_id: PLAYER_COLLIDER_ID.into(),
+            collider_id: player_collider_id(&canonical_player.player_id),
             local_pose: PhysicsPose::IDENTITY,
             radius: radius as f32,
             half_height_of_cylinder: half_height_of_cylinder as f32,
             density_kg_per_m3: (character.mass_kg / volume) as f32,
         });
-        player.linear_velocity = to_physics_vec3(state.player.linear_velocity);
-        player.angular_velocity = to_physics_vec3(state.player.angular_velocity);
+        player.linear_velocity = to_physics_vec3(canonical_player.linear_velocity);
+        player.angular_velocity = to_physics_vec3(canonical_player.angular_velocity);
         player.friction = physics.friction;
         player.restitution = physics.restitution;
         player.allow_sleeping = false;
+        player.collision_class = BodyCollisionClass::Character;
         player.inertia_multiplier = CHARACTER_INERTIA_MULTIPLIER as f32;
         player.motion_quality = MotionQuality::LinearCast;
         bodies.push(player);
@@ -3153,9 +3290,10 @@ fn classify_player_locomotion_for_substep(
     if !matches!(player.life_state, PlayerLifeState::Alive) {
         return Ok(None);
     }
+    let player_body_id = player_body_id(&player.player_id);
     let Some(body) = body_states
         .iter()
-        .find(|body| body.body_id == PLAYER_BODY_ID)
+        .find(|body| body.body_id == player_body_id)
     else {
         return Ok(None);
     };
@@ -3202,7 +3340,8 @@ fn classify_player_locomotion_for_substep(
         radius: character.collision_radius_m as f32,
         half_height_of_cylinder: character_capsule_half_height() as f32,
         displacement: to_physics_vec3(probe_up * -probe_distance),
-        ignore_body_id: Some(PLAYER_BODY_ID.into()),
+        collision_class: BodyCollisionClass::Character,
+        ignore_body_id: Some(player_body_id),
     })?;
     let prior_had_support = player.locomotion.support.is_some();
     let mut accepted_support = None;
@@ -3314,9 +3453,10 @@ fn adjust_grounded_capsule_for_substep(
     {
         return Ok(());
     }
+    let player_body_id = player_body_id(&player.player_id);
     let Some(body_index) = body_states
         .iter()
-        .position(|body| body.body_id == PLAYER_BODY_ID)
+        .position(|body| body.body_id == player_body_id)
     else {
         return Ok(());
     };
@@ -3351,11 +3491,15 @@ fn adjust_grounded_capsule_for_substep(
                 * local_walk_input.magnitude().min(1.0)
                 * selected_speed
                 * f64::from(content::manifest().physics.fixed_delta_seconds);
-            if let Some(step_translation) =
-                grounded_step_translation(physics_scene, body_pose, up, forward_displacement)?
-            {
+            if let Some(step_translation) = grounded_step_translation(
+                physics_scene,
+                &player_body_id,
+                body_pose,
+                up,
+                forward_displacement,
+            )? {
                 physics_scene
-                    .translate_dynamic_body(PLAYER_BODY_ID, to_physics_vec3(step_translation))?;
+                    .translate_dynamic_body(&player_body_id, to_physics_vec3(step_translation))?;
                 body_states[body_index].pose.position =
                     body_states[body_index].pose.position + to_physics_vec3(step_translation);
             }
@@ -3369,7 +3513,8 @@ fn adjust_grounded_capsule_for_substep(
         radius: character.collision_radius_m as f32,
         half_height_of_cylinder: character_capsule_half_height() as f32,
         displacement: to_physics_vec3(snap_displacement),
-        ignore_body_id: Some(PLAYER_BODY_ID.into()),
+        collision_class: BodyCollisionClass::Character,
+        ignore_body_id: Some(player_body_id.clone()),
     })? {
         let surface_normal = normalized_or(from_physics_vec3(hit.surface_normal), up);
         let same_support = player.locomotion.support.as_ref().is_some_and(|support| {
@@ -3398,7 +3543,7 @@ fn adjust_grounded_capsule_for_substep(
             if snap_distance > f64::EPSILON {
                 let translation = up * -snap_distance;
                 physics_scene
-                    .translate_dynamic_body(PLAYER_BODY_ID, to_physics_vec3(translation))?;
+                    .translate_dynamic_body(&player_body_id, to_physics_vec3(translation))?;
                 body_states[body_index].pose.position =
                     body_states[body_index].pose.position + to_physics_vec3(translation);
             }
@@ -3409,6 +3554,7 @@ fn adjust_grounded_capsule_for_substep(
 
 fn grounded_step_translation(
     physics_scene: &Scene,
+    player_body_id: &str,
     body_pose: PhysicsPose,
     up: Vec3,
     forward_displacement: Vec3,
@@ -3420,7 +3566,8 @@ fn grounded_step_translation(
         radius: character.collision_radius_m as f32,
         half_height_of_cylinder: character_capsule_half_height() as f32,
         displacement: to_physics_vec3(displacement),
-        ignore_body_id: Some(PLAYER_BODY_ID.into()),
+        collision_class: BodyCollisionClass::Character,
+        ignore_body_id: Some(player_body_id.into()),
     };
     let obstruction_pose = PhysicsPose::new(
         body_pose.position + to_physics_vec3(up * STEP_SKIN_M),
@@ -3600,55 +3747,62 @@ fn physics_controls(
     body_states: &[verse_physics::BodyState],
     simulation_tick: u64,
     player_jump: Option<PlayerJumpLaunch>,
+    include_grid_controls: bool,
 ) -> Vec<BodyControl> {
     let physics = &content::manifest().physics;
-    let mut controls = state
-        .grids
-        .values()
-        .filter(|grid| !grid.anchored)
-        .map(|grid| {
-            let body_state = body_states.iter().find(|body| body.body_id == grid.grid_id);
-            let linear_velocity = body_state.map_or(grid.linear_velocity, |body| {
-                from_physics_vec3(body.linear_velocity)
-            });
-            let angular_velocity = body_state.map_or(grid.angular_velocity, |body| {
-                from_physics_vec3(body.angular_velocity)
-            });
-            let online = grid.power().online;
-            let user_force = if online {
-                grid.orientation.rotate(grid.control_linear_input) * physics.control_force_newtons
-            } else {
-                Vec3::ZERO
-            };
-            let user_torque = if online {
-                grid.orientation.rotate(grid.control_angular_input)
-                    * physics.control_torque_newton_meters
-            } else {
-                Vec3::ZERO
-            };
-            let dampener_force = if online && grid.dampeners {
-                linear_velocity * -physics.linear_dampener_newtons_per_mps
-            } else {
-                Vec3::ZERO
-            };
-            let dampener_torque = if online && grid.dampeners {
-                angular_velocity * -physics.angular_dampener_newton_meters_per_radian
-            } else {
-                Vec3::ZERO
-            };
-            BodyControl {
-                body_id: grid.grid_id.clone(),
-                force_newtons: to_physics_vec3(user_force + dampener_force),
-                torque_newton_meters: to_physics_vec3(user_torque + dampener_torque),
-            }
-        })
-        .collect::<Vec<_>>();
+    let mut controls = if include_grid_controls {
+        state
+            .grids
+            .values()
+            .filter(|grid| !grid.anchored)
+            .map(|grid| {
+                let body_state = body_states.iter().find(|body| body.body_id == grid.grid_id);
+                let linear_velocity = body_state.map_or(grid.linear_velocity, |body| {
+                    from_physics_vec3(body.linear_velocity)
+                });
+                let angular_velocity = body_state.map_or(grid.angular_velocity, |body| {
+                    from_physics_vec3(body.angular_velocity)
+                });
+                let online = grid.power().online;
+                let user_force = if online {
+                    grid.orientation.rotate(grid.control_linear_input)
+                        * physics.control_force_newtons
+                } else {
+                    Vec3::ZERO
+                };
+                let user_torque = if online {
+                    grid.orientation.rotate(grid.control_angular_input)
+                        * physics.control_torque_newton_meters
+                } else {
+                    Vec3::ZERO
+                };
+                let dampener_force = if online && grid.dampeners {
+                    linear_velocity * -physics.linear_dampener_newtons_per_mps
+                } else {
+                    Vec3::ZERO
+                };
+                let dampener_torque = if online && grid.dampeners {
+                    angular_velocity * -physics.angular_dampener_newton_meters_per_radian
+                } else {
+                    Vec3::ZERO
+                };
+                BodyControl {
+                    body_id: grid.grid_id.clone(),
+                    force_newtons: to_physics_vec3(user_force + dampener_force),
+                    torque_newton_meters: to_physics_vec3(user_torque + dampener_torque),
+                }
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
 
     if matches!(player.life_state, PlayerLifeState::Alive) {
         let character = &content::manifest().character;
+        let player_body_id = player_body_id(&player.player_id);
         let body_state = body_states
             .iter()
-            .find(|body| body.body_id == PLAYER_BODY_ID);
+            .find(|body| body.body_id == player_body_id);
         let position = body_state.map_or(player.position, |body| {
             from_physics_vec3(body.pose.position)
         });
@@ -3834,7 +3988,7 @@ fn physics_controls(
             local_angular_acceleration.z * capsule_perpendicular_inertia,
         ) * CHARACTER_INERTIA_MULTIPLIER;
         controls.push(BodyControl {
-            body_id: PLAYER_BODY_ID.into(),
+            body_id: player_body_id,
             force_newtons: to_physics_vec3(acceleration * character.mass_kg),
             torque_newton_meters: to_physics_vec3(orientation.rotate(local_torque)),
         });
@@ -3932,13 +4086,36 @@ fn contact_key_involves_player(contact: &ContactPairKey) -> bool {
     contact.body_a == PLAYER_BODY_ID || contact.body_b == PLAYER_BODY_ID
 }
 
+fn contact_key_involves_player_id(contact: &ContactPairKey, player_id: &str) -> bool {
+    let body_id = player_body_id(player_id);
+    contact.body_a == body_id || contact.body_b == body_id
+}
+
+fn player_for_body_id<'a>(state: &'a WorldState, body_id: &str) -> Option<&'a Player> {
+    state
+        .player
+        .iter()
+        .find_map(|(player_id, player)| (player_body_id(player_id) == body_id).then_some(player))
+}
+
+fn player_id_for_contact<'a>(state: &'a WorldState, contact: &ContactPairKey) -> Option<&'a str> {
+    let left = player_for_body_id(state, &contact.body_a).map(|player| player.player_id.as_str());
+    let right = player_for_body_id(state, &contact.body_b).map(|player| player.player_id.as_str());
+    match (left, right) {
+        (Some(player_id), None) | (None, Some(player_id)) => Some(player_id),
+        _ => None,
+    }
+}
+
 fn reduced_translational_contact_mass_grams(
     state: &WorldState,
     left_body: &str,
     right_body: &str,
 ) -> u64 {
     fn mass(state: &WorldState, body_id: &str) -> Option<u64> {
-        if body_id == PLAYER_BODY_ID && matches!(state.player.life_state, PlayerLifeState::Alive) {
+        if player_for_body_id(state, body_id)
+            .is_some_and(|player| matches!(player.life_state, PlayerLifeState::Alive))
+        {
             #[allow(clippy::cast_sign_loss)]
             return Some((content::manifest().character.mass_kg * 1_000.0).round() as u64);
         }
@@ -4213,37 +4390,39 @@ mod tests {
             .expect("test setup rebuilds player near the grid");
     }
 
-    fn stationary_player_outcome(
-        state: &WorldState,
-        step_count: u8,
-    ) -> Option<PlayerPhysicsOutcome> {
-        matches!(state.player.life_state, PlayerLifeState::Alive).then(|| {
-            let resulting_tick = state.simulation_tick + u64::from(step_count);
-            let lease_active = resulting_tick < state.player.control_expires_at_simulation_tick;
-            PlayerPhysicsOutcome {
-                player_id: state.player.player_id.clone(),
-                position: state.player.position,
-                orientation: state.player.orientation,
-                linear_velocity: state.player.linear_velocity,
-                angular_velocity: state.player.angular_velocity,
-                locomotion: state.player.locomotion.clone(),
-                surface_contact: false,
-                control_linear_input: if lease_active {
-                    state.player.control_linear_input
-                } else {
-                    Vec3::ZERO
-                },
-                control_angular_input: if lease_active {
-                    state.player.control_angular_input
-                } else {
-                    Vec3::ZERO
-                },
-                boost: state.player.boost && lease_active,
-                jump: state.player.jump && lease_active,
-                dampeners: state.player.dampeners || !lease_active,
-                control_expires_at_simulation_tick: state.player.control_expires_at_simulation_tick,
-            }
-        })
+    fn stationary_player_outcomes(state: &WorldState, step_count: u8) -> Vec<PlayerPhysicsOutcome> {
+        state
+            .player
+            .iter()
+            .filter(|(_, player)| matches!(player.life_state, PlayerLifeState::Alive))
+            .map(|(_, player)| {
+                let resulting_tick = state.simulation_tick + u64::from(step_count);
+                let lease_active = resulting_tick < player.control_expires_at_simulation_tick;
+                PlayerPhysicsOutcome {
+                    player_id: player.player_id.clone(),
+                    position: player.position,
+                    orientation: player.orientation,
+                    linear_velocity: player.linear_velocity,
+                    angular_velocity: player.angular_velocity,
+                    locomotion: player.locomotion.clone(),
+                    surface_contact: false,
+                    control_linear_input: if lease_active {
+                        player.control_linear_input
+                    } else {
+                        Vec3::ZERO
+                    },
+                    control_angular_input: if lease_active {
+                        player.control_angular_input
+                    } else {
+                        Vec3::ZERO
+                    },
+                    boost: player.boost && lease_active,
+                    jump: player.jump && lease_active,
+                    dampeners: player.dampeners || !lease_active,
+                    control_expires_at_simulation_tick: player.control_expires_at_simulation_tick,
+                }
+            })
+            .collect()
     }
 
     fn reachable_voxel(runtime: &Runtime) -> IVec3 {
@@ -4418,7 +4597,7 @@ mod tests {
             step_count: 1,
             remaining_step_phase: 0,
             bodies,
-            player: stationary_player_outcome(state, 1),
+            players: stationary_player_outcomes(state, 1),
             contacts: vec![PhysicsContactOutcome {
                 substep_index: 0,
                 body_a_id: STARTER_GRID_ID.into(),
@@ -4500,7 +4679,7 @@ mod tests {
             step_count: 1,
             remaining_step_phase: 0,
             bodies,
-            player: stationary_player_outcome(&state, 1),
+            players: stationary_player_outcomes(&state, 1),
             contacts: Vec::new(),
             active_contacts_after: Vec::new(),
         };
@@ -4567,7 +4746,7 @@ mod tests {
             step_count: 1,
             remaining_step_phase: 0,
             bodies,
-            player: stationary_player_outcome(state, 1),
+            players: stationary_player_outcomes(state, 1),
             contacts: Vec::new(),
             active_contacts_after: Vec::new(),
         };
@@ -4583,81 +4762,63 @@ mod tests {
         };
 
         let mut missing = canonical.clone();
-        let EventPayload::PhysicsStepCommitted { player, .. } = &mut missing else {
+        let EventPayload::PhysicsStepCommitted { players, .. } = &mut missing else {
             unreachable!();
         };
-        *player = None;
+        players.clear();
         reject(missing, "replay_player_physics_presence_invalid");
 
         let mut wrong_id = canonical.clone();
-        let EventPayload::PhysicsStepCommitted {
-            player: Some(player),
-            ..
-        } = &mut wrong_id
-        else {
+        let EventPayload::PhysicsStepCommitted { players, .. } = &mut wrong_id else {
             unreachable!();
         };
+        let player = &mut players[0];
         player.player_id.push_str("-forged");
         reject(wrong_id, "replay_player_physics_identity_invalid");
 
         let mut non_finite = canonical.clone();
-        let EventPayload::PhysicsStepCommitted {
-            player: Some(player),
-            ..
-        } = &mut non_finite
-        else {
+        let EventPayload::PhysicsStepCommitted { players, .. } = &mut non_finite else {
             unreachable!();
         };
+        let player = &mut players[0];
         player.position.x = f64::NAN;
         reject(non_finite, "invalid_vector");
 
         let mut zero_rotation = canonical.clone();
-        let EventPayload::PhysicsStepCommitted {
-            player: Some(player),
-            ..
-        } = &mut zero_rotation
-        else {
+        let EventPayload::PhysicsStepCommitted { players, .. } = &mut zero_rotation else {
             unreachable!();
         };
+        let player = &mut players[0];
         player.orientation = Quat::new(0.0, 0.0, 0.0, 0.0);
         reject(zero_rotation, "replay_player_physics_rotation_invalid");
 
         let mut over_speed = canonical.clone();
-        let EventPayload::PhysicsStepCommitted {
-            player: Some(player),
-            ..
-        } = &mut over_speed
-        else {
+        let EventPayload::PhysicsStepCommitted { players, .. } = &mut over_speed else {
             unreachable!();
         };
+        let player = &mut players[0];
         player.linear_velocity = Vec3::new(32.001, 0.0, 0.0);
         reject(over_speed, "replay_player_physics_velocity_invalid");
 
         let mut teleported = canonical.clone();
-        let EventPayload::PhysicsStepCommitted {
-            player: Some(player),
-            ..
-        } = &mut teleported
-        else {
+        let EventPayload::PhysicsStepCommitted { players, .. } = &mut teleported else {
             unreachable!();
         };
+        let player = &mut players[0];
         player.position.x += 10.0;
         reject(teleported, "replay_player_physics_translation_invalid");
 
         let mut spun = canonical.clone();
-        let EventPayload::PhysicsStepCommitted {
-            player: Some(player),
-            ..
-        } = &mut spun
-        else {
+        let EventPayload::PhysicsStepCommitted { players, .. } = &mut spun else {
             unreachable!();
         };
+        let player = &mut players[0];
         player.orientation = Quat::new(0.0, 0.0, 1.0, 0.0);
         reject(spun, "replay_player_physics_rotation_continuity_invalid");
 
         let mut impossible_contact = canonical.clone();
         let EventPayload::PhysicsStepCommitted {
-            player: Some(player),
+            players,
             contacts,
             active_contacts_after,
             ..
@@ -4665,6 +4826,7 @@ mod tests {
         else {
             unreachable!();
         };
+        let player = &mut players[0];
         let key = ContactPairKey {
             body_a: PLANET_BODY_ID.into(),
             collider_a: PLANET_COLLIDER_ID.into(),
@@ -4701,7 +4863,7 @@ mod tests {
         let voxel_collider = voxel_collision_collider_id(voxel);
         let mut wrong_voxel_geometry = canonical.clone();
         let EventPayload::PhysicsStepCommitted {
-            player: Some(player),
+            players,
             contacts,
             active_contacts_after,
             ..
@@ -4709,6 +4871,7 @@ mod tests {
         else {
             unreachable!();
         };
+        let player = &mut players[0];
         let key = ContactPairKey {
             body_a: PLAYER_BODY_ID.into(),
             collider_a: PLAYER_COLLIDER_ID.into(),
@@ -4742,7 +4905,7 @@ mod tests {
 
         let mut wrong_grid_geometry = canonical.clone();
         let EventPayload::PhysicsStepCommitted {
-            player: Some(player),
+            players,
             contacts,
             active_contacts_after,
             ..
@@ -4750,6 +4913,7 @@ mod tests {
         else {
             unreachable!();
         };
+        let player = &mut players[0];
         let key = ContactPairKey {
             body_a: STARTER_GRID_ID.into(),
             collider_a: "block-core".into(),
@@ -4782,48 +4946,181 @@ mod tests {
         );
 
         let mut wrong_control = canonical.clone();
-        let EventPayload::PhysicsStepCommitted {
-            player: Some(player),
-            ..
-        } = &mut wrong_control
-        else {
+        let EventPayload::PhysicsStepCommitted { players, .. } = &mut wrong_control else {
             unreachable!();
         };
+        let player = &mut players[0];
         player.boost = true;
         reject(wrong_control, "replay_player_physics_control_invalid");
 
         let mut wrong_locomotion = canonical.clone();
-        let EventPayload::PhysicsStepCommitted {
-            player: Some(player),
-            ..
-        } = &mut wrong_locomotion
-        else {
+        let EventPayload::PhysicsStepCommitted { players, .. } = &mut wrong_locomotion else {
             unreachable!();
         };
+        let player = &mut players[0];
         player.locomotion.kind = LocomotionKind::Grounded;
         reject(wrong_locomotion, "replay_player_locomotion_invalid");
 
         let mut wrong_jump = canonical.clone();
-        let EventPayload::PhysicsStepCommitted {
-            player: Some(player),
-            ..
-        } = &mut wrong_jump
-        else {
+        let EventPayload::PhysicsStepCommitted { players, .. } = &mut wrong_jump else {
             unreachable!();
         };
+        let player = &mut players[0];
         player.jump = true;
         reject(wrong_jump, "replay_player_physics_control_invalid");
 
         let mut wrong_contact = canonical;
-        let EventPayload::PhysicsStepCommitted {
-            player: Some(player),
-            ..
-        } = &mut wrong_contact
-        else {
+        let EventPayload::PhysicsStepCommitted { players, .. } = &mut wrong_contact else {
             unreachable!();
         };
+        let player = &mut players[0];
         player.surface_contact = true;
         reject(wrong_contact, "replay_player_surface_contact_invalid");
+    }
+
+    #[test]
+    fn replay_rejects_character_to_character_contacts_before_mutation() {
+        let runtime = runtime();
+        let mut state = runtime.state().clone();
+        let mut second_player = state.player.primary().clone();
+        second_player.player_id = "player-remote".into();
+        second_player.inventory_id = "inventory-player-remote".into();
+        second_player.position.x += 4.0;
+        state
+            .player
+            .by_id
+            .insert(second_player.player_id.clone(), second_player);
+        let before_hash = state.state_hash();
+        let local_body = player_body_id("player-local");
+        let local_collider = player_collider_id("player-local");
+        let remote_body = player_body_id("player-remote");
+        let remote_collider = player_collider_id("player-remote");
+        let contact_key = ContactPairKey {
+            body_a: local_body.clone(),
+            collider_a: local_collider.clone(),
+            body_b: remote_body.clone(),
+            collider_b: remote_collider.clone(),
+        };
+        let event = state.prepare_system_event(EventPayload::PhysicsStepCommitted {
+            fixed_step_hz: content::manifest().physics.fixed_step_hz,
+            step_count: 1,
+            remaining_step_phase: 0,
+            bodies: state
+                .grids
+                .values()
+                .map(|grid| PhysicsBodyOutcome {
+                    grid_id: grid.grid_id.clone(),
+                    position: grid.position,
+                    orientation: grid.orientation,
+                    linear_velocity: grid.linear_velocity,
+                    angular_velocity: grid.angular_velocity,
+                })
+                .collect(),
+            players: stationary_player_outcomes(&state, 1),
+            contacts: vec![PhysicsContactOutcome {
+                substep_index: 0,
+                body_a_id: local_body.clone(),
+                collider_a_id: local_collider,
+                body_b_id: remote_body.clone(),
+                collider_b_id: remote_collider,
+                point: state.player.position,
+                normal: Vec3::new(1.0, 0.0, 0.0),
+                penetration_m: 0.0,
+                closing_speed_mm_per_second: 0,
+                estimated_normal_impulse_millinewton_seconds: 0,
+                reduced_translational_mass_grams: reduced_translational_contact_mass_grams(
+                    &state,
+                    &local_body,
+                    &remote_body,
+                ),
+                phase: PhysicsContactPhase::Began,
+            }],
+            active_contacts_after: vec![contact_key],
+        });
+        let mut replay = state.clone();
+
+        let error = replay
+            .apply_event(&event)
+            .expect_err("character-to-character contacts must not enter canonical replay");
+
+        assert_eq!(error.code(), "replay_character_contact_forbidden");
+        assert_eq!(replay.state_hash(), before_hash);
+    }
+
+    #[test]
+    fn two_player_physics_commits_in_order_and_recovers_exactly() {
+        let directory = tempdir().expect("tempdir");
+        let mut runtime = Runtime::open(directory.path(), 67, 1_000).expect("runtime opens");
+        let mut remote = runtime.state.player.primary().clone();
+        remote.player_id = "player-remote".into();
+        remote.inventory_id = "inventory-player-remote".into();
+        remote.position.x += 4.0;
+        remote.linear_velocity = Vec3::new(0.25, 0.0, 0.0);
+        runtime
+            .state
+            .player
+            .by_id
+            .insert(remote.player_id.clone(), remote);
+        runtime.state.inventories.insert(
+            "inventory-player-remote".into(),
+            InventoryRecord {
+                inventory_id: "inventory-player-remote".into(),
+                domain: InventoryDomain::Player {
+                    player_id: "player-remote".into(),
+                },
+                contents: InventoryContents::default(),
+                capacity_liters: crate::model::PLAYER_INVENTORY_CAPACITY_LITERS,
+            },
+        );
+        runtime
+            .physics
+            .rebuild(&physics_body_specs(&runtime.state))
+            .expect("two-player physics scene builds");
+        runtime
+            .persist_snapshot()
+            .expect("two-player baseline persists");
+        let prior_state = runtime.state.clone();
+
+        assert!(runtime.advance(17).expect("shared physics step commits"));
+        assert!(!runtime.is_halted());
+        let committed_hash = runtime.state().state_hash();
+        let journal = fs::read_to_string(directory.path().join("events.ndjson"))
+            .expect("shared physics journal reads");
+        let event: CanonicalEvent = serde_json::from_str(
+            journal
+                .lines()
+                .last()
+                .expect("shared physics event is durable"),
+        )
+        .expect("shared physics event decodes");
+        let EventPayload::PhysicsStepCommitted { players, .. } = &event.payload else {
+            panic!("shared step must commit a physics outcome");
+        };
+        assert_eq!(
+            players
+                .iter()
+                .map(|player| player.player_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["player-local", "player-remote"]
+        );
+
+        let mut reversed = event.clone();
+        let EventPayload::PhysicsStepCommitted { players, .. } = &mut reversed.payload else {
+            unreachable!();
+        };
+        players.reverse();
+        reversed.event_hash = reversed.calculate_hash();
+        let mut replay = prior_state.clone();
+        let error = replay
+            .apply_event(&reversed)
+            .expect_err("noncanonical player outcome order rejects");
+        assert_eq!(error.code(), "replay_player_physics_order_invalid");
+        assert_eq!(replay.state_hash(), prior_state.state_hash());
+
+        drop(runtime);
+        let recovered = Runtime::open(directory.path(), 67, 1_000).expect("runtime recovers");
+        assert_eq!(recovered.state().state_hash(), committed_hash);
+        assert_eq!(recovered.snapshot().players.len(), 2);
     }
 
     #[test]
@@ -4853,7 +5150,7 @@ mod tests {
             step_count: 1,
             remaining_step_phase: 0,
             bodies,
-            player: stationary_player_outcome(state, 1),
+            players: stationary_player_outcomes(state, 1),
             contacts: Vec::new(),
             active_contacts_after: Vec::new(),
         });
@@ -5864,7 +6161,7 @@ mod tests {
             state.player.jetpack_enabled = true;
             state.player.dampeners = false;
             state.player.control_expires_at_simulation_tick = 1;
-            let controls = physics_controls(&state, &state.player, &[], 0, None);
+            let controls = physics_controls(&state, &state.player, &[], 0, None, true);
             let player = controls
                 .iter()
                 .find(|control| control.body_id == PLAYER_BODY_ID)
@@ -7529,6 +7826,7 @@ mod tests {
 
         let translation = grounded_step_translation(
             &scene,
+            PLAYER_BODY_ID,
             PhysicsPose::new(PhysicsVec3::new(0.0, 0.9, 0.0), PhysicsQuat::IDENTITY),
             Vec3::new(0.0, 1.0, 0.0),
             Vec3::new(0.125, 0.0, 0.0),
@@ -7560,6 +7858,7 @@ mod tests {
         assert!(
             grounded_step_translation(
                 &scene,
+                PLAYER_BODY_ID,
                 PhysicsPose::new(PhysicsVec3::new(0.0, 0.9, 0.0), PhysicsQuat::IDENTITY),
                 Vec3::new(0.0, 1.0, 0.0),
                 Vec3::new(0.125, 0.0, 0.0),

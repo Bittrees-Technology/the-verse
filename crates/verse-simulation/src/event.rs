@@ -9,7 +9,7 @@ use verse_protocol::{
 use crate::model::{Block, ContactPairKey, DeathDrop, InventoryRecord};
 
 pub const EVENT_SCHEMA_NAME: &str = "verse.world_event";
-pub const EVENT_SCHEMA_VERSION: u32 = 8;
+pub const EVENT_SCHEMA_VERSION: u32 = 9;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event_type", rename_all = "snake_case")]
@@ -101,7 +101,7 @@ pub enum EventPayload {
         step_count: u8,
         remaining_step_phase: u32,
         bodies: Vec<PhysicsBodyOutcome>,
-        player: Option<PlayerPhysicsOutcome>,
+        players: Vec<PlayerPhysicsOutcome>,
         contacts: Vec<PhysicsContactOutcome>,
         active_contacts_after: Vec<ContactPairKey>,
     },

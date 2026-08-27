@@ -421,6 +421,10 @@ pub struct MotionSnapshot {
     pub simulation_tick: u64,
     pub world_hash: String,
     pub player: PlayerMotionSnapshot,
+    /// Deterministic canonical roster. `player` remains the primary-player
+    /// compatibility view during the P1.0 client migration.
+    #[serde(default)]
+    pub players: Vec<PlayerMotionSnapshot>,
     pub grids: Vec<GridMotionSnapshot>,
 }
 
@@ -449,6 +453,10 @@ pub struct WorldSnapshot {
     pub fencing_token: u64,
     pub world_hash: String,
     pub player: PlayerSnapshot,
+    /// Deterministic canonical roster. `player` remains the primary-player
+    /// compatibility view during the P1.0 client migration.
+    #[serde(default)]
+    pub players: Vec<PlayerSnapshot>,
     pub environment: EnvironmentSnapshot,
     pub voxels: Vec<VoxelSnapshot>,
     pub grids: Vec<GridSnapshot>,
@@ -805,7 +813,7 @@ mod tests {
             jetpack_enabled: false,
         };
         let world = WorldSnapshot {
-            schema_version: 13,
+            schema_version: 14,
             content_manifest_version: "p0.10.0".into(),
             universe_id: "the-verse-local".into(),
             cell_id: "cell-origin".into(),
@@ -813,6 +821,7 @@ mod tests {
             simulation_tick: 0,
             fencing_token: 1,
             world_hash: "hash".into(),
+            players: vec![player.clone()],
             player,
             environment: EnvironmentSnapshot {
                 celestial_body_id: "khepri-prime".into(),
@@ -834,6 +843,7 @@ mod tests {
         };
         let value = serde_json::to_value(&world).expect("world snapshot serializes");
         assert_eq!(value["player"]["critical_oxygen_milli"], 100);
+        assert_eq!(value["players"][0]["player_id"], "player-local");
         assert_eq!(value["death_drops"][0]["drop_id"], death_drop.drop_id);
         assert_eq!(value["death_drops"][0]["cause"]["kind"], "oxygen_depleted");
         assert_eq!(
