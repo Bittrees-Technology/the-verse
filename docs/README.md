@@ -20,6 +20,7 @@ These documents form the initial specification baseline.
 - [P0.5 Planetary Logistics](gameplay/planetary-logistics.md)
 - [P0.6 Orbital Operations](gameplay/orbital-operations.md)
 - [P0.7 Server-Authoritative Contact Physics](gameplay/contact-physics.md)
+- [P0.8 Survival Death Foundation](gameplay/survival-death.md)
 
 ## Research
 
