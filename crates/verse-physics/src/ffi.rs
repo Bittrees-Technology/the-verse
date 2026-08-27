@@ -19,8 +19,9 @@ use joltc_sys::{
     JPC_BodyInterface_AddBody, JPC_BodyInterface_AddForceAndTorque, JPC_BodyInterface_CreateBody,
     JPC_BodyInterface_DestroyBody, JPC_BodyInterface_GetAngularVelocity,
     JPC_BodyInterface_GetLinearVelocity, JPC_BodyInterface_GetPosition,
-    JPC_BodyInterface_GetRotation, JPC_BodyInterface_IsActive, JPC_BodyInterface_RemoveBody,
-    JPC_BoxShapeSettings, JPC_BoxShapeSettings_Create, JPC_CollideShapeResult,
+    JPC_BodyInterface_GetRotation, JPC_BodyInterface_GetShape, JPC_BodyInterface_IsActive,
+    JPC_BodyInterface_RemoveBody, JPC_BoxShapeSettings, JPC_BoxShapeSettings_Create,
+    JPC_CapsuleShapeSettings, JPC_CapsuleShapeSettings_Create, JPC_CollideShapeResult,
     JPC_CollisionEstimationResult, JPC_ContactListener as JpcContactListener,
     JPC_ContactListener_delete, JPC_ContactListener_new, JPC_ContactListenerFns,
     JPC_ContactManifold, JPC_ContactSettings, JPC_EstimateCollisionResponse,
@@ -33,17 +34,19 @@ use joltc_sys::{
     JPC_StaticCompoundShapeSettings_Create, JPC_String, JPC_String_c_str, JPC_String_delete,
     JPC_SubShapeIDPair, JPC_SubShapeSettings, JPC_TempAllocatorImpl, JPC_TempAllocatorImpl_delete,
     JPC_TempAllocatorImpl_new, JPC_VALIDATE_RESULT_ACCEPT_ALL_CONTACTS, JPC_ValidateResult,
-    JPC_Vec3,
+    JPC_Vec3, JPC_Vec4,
 };
 use rolt::{
-    BroadPhaseLayer, BroadPhaseLayerInterface, ObjectLayer, ObjectLayerPairFilter,
-    ObjectVsBroadPhaseLayerFilter, PhysicsSystem,
+    Body as RoltBody, BodyFilter, BodyFilterImpl, BodyId as RoltBodyId, BroadPhaseLayer,
+    BroadPhaseLayerInterface, CastShapeArgs, CastShapeCollectorImpl, ClosestHitCastShapeCollector,
+    ObjectLayer, ObjectLayerPairFilter, ObjectVsBroadPhaseLayerFilter, PhysicsSystem, RShapeCast,
+    RVec3 as RoltRVec3, Vec3 as RoltVec3,
 };
 
 use crate::{
-    BodyControl, BodyMotion, BodySpec, BodyState, BoxColliderSpec, ContactInvariant, ContactPhase,
-    ContactRecord, ContactSource, MotionQuality, PhysicsError, Pose, Quat, SceneConfig,
-    SphereColliderSpec, Vec3,
+    BodyControl, BodyMotion, BodySpec, BodyState, BoxColliderSpec, CapsuleCast, CapsuleCastHit,
+    CapsuleColliderSpec, ContactInvariant, ContactPhase, ContactRecord, ContactSource,
+    MotionQuality, PhysicsError, Pose, Quat, SceneConfig, SphereColliderSpec, Vec3,
 };
 
 const OBJECT_LAYER_STATIC: u16 = 0;
@@ -98,6 +101,21 @@ impl ObjectLayerPairFilter for ObjectPairs {
 #[derive(Debug, Clone, Copy)]
 struct NativeBody {
     id: JPC_BodyID,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct IgnoreNativeBody {
+    id: JPC_BodyID,
+}
+
+impl BodyFilter for IgnoreNativeBody {
+    fn should_collide(&self, body_id: RoltBodyId) -> bool {
+        body_id.raw() != self.id
+    }
+
+    fn should_collide_locked(&self, body: &mut RoltBody<'_>) -> bool {
+        body.id().raw() != self.id
+    }
 }
 
 #[derive(Debug)]
@@ -614,6 +632,7 @@ impl NativeScene {
             let shape = match collider {
                 ColliderRef::Box(collider) => create_box(spec, collider, index)?,
                 ColliderRef::Sphere(collider) => create_sphere(spec, collider, index)?,
+                ColliderRef::Capsule(collider) => create_capsule(spec, collider, index)?,
             };
             let local_pose = collider.local_pose();
             sub_shapes.push(JPC_SubShapeSettings {
@@ -915,6 +934,125 @@ impl NativeScene {
             .collect()
     }
 
+    pub(crate) fn cast_capsule(
+        &self,
+        specs: &BTreeMap<String, BodySpec>,
+        query: &CapsuleCast,
+    ) -> Result<Option<CapsuleCastHit>, PhysicsError> {
+        let shape = create_query_capsule(query)?;
+        let ignored = query
+            .ignore_body_id
+            .as_ref()
+            .map(|body_id| IgnoreNativeBody {
+                id: self.bodies[body_id].id,
+            })
+            .map(BodyFilterImpl::new);
+        let base_offset = query.pose.position;
+        let mut collector = ClosestHitCastShapeCollector::new();
+        let physics = self
+            .physics
+            .as_ref()
+            .expect("live native scene owns physics system");
+        let narrow_phase = physics.narrow_phase_query();
+        let mut settings = joltc_sys::JPC_ShapeCastSettings::default();
+        settings.ReturnDeepestPoint = true;
+        // SAFETY: The temporary shape, collector bridge, filter bridge, and
+        // physics query all remain live for this synchronous read-only cast.
+        // Query validation bounds every scalar before the f32 conversion.
+        unsafe {
+            narrow_phase.cast_shape(CastShapeArgs {
+                shapecast: RShapeCast {
+                    shape: shape.0,
+                    scale: RoltVec3::ONE,
+                    center_of_mass_start: world_transform(query.pose),
+                    direction: RoltVec3::new(
+                        query.displacement.x as f32,
+                        query.displacement.y as f32,
+                        query.displacement.z as f32,
+                    ),
+                },
+                base_offset: RoltRVec3::new(base_offset.x, base_offset.y, base_offset.z),
+                settings,
+                collector: Some(CastShapeCollectorImpl::new_borrowed(&mut collector)),
+                broad_phase_layer_filter: None,
+                object_layer_filter: None,
+                body_filter: ignored,
+                shape_filter: None,
+            });
+        }
+
+        let Some(result) = collector.result else {
+            return Ok(None);
+        };
+        let Some((body_id, native_body)) = self
+            .bodies
+            .iter()
+            .find(|(_, body)| body.id == result.BodyID2)
+        else {
+            return Err(PhysicsError::CapsuleCastFailed(
+                "hit body has no stable Verse identity".into(),
+            ));
+        };
+        let interface = self.body_interface();
+        // SAFETY: The hit ID belongs to this live body interface and its shape
+        // remains owned by that body throughout this synchronous query.
+        let body_shape = unsafe { JPC_BodyInterface_GetShape(interface, native_body.id) };
+        if body_shape.is_null() {
+            return Err(PhysicsError::CapsuleCastFailed(
+                "hit body has no live collision shape".into(),
+            ));
+        }
+        // SAFETY: `body_shape` is live and `SubShapeID2` was returned for it by
+        // the same query. User data was assigned from the stable collider list.
+        let collider_user_data =
+            unsafe { JPC_Shape_GetSubShapeUserData(body_shape, result.SubShapeID2) };
+        let Some(collider_index) = collider_user_data
+            .checked_sub(1)
+            .and_then(|index| usize::try_from(index).ok())
+        else {
+            return Err(PhysicsError::CapsuleCastFailed(
+                "hit collider has no stable Verse identity".into(),
+            ));
+        };
+        let collider_id = ordered_colliders(&specs[body_id])
+            .get(collider_index)
+            .map(|collider| collider.id().to_owned())
+            .ok_or_else(|| {
+                PhysicsError::CapsuleCastFailed(
+                    "hit collider identity is outside the stable catalog".into(),
+                )
+            })?;
+        let point_on_capsule = base_offset + from_local_vec3(result.ContactPointOn1);
+        let point_on_body = base_offset + from_local_vec3(result.ContactPointOn2);
+        let surface_normal = (-from_local_vec3(result.PenetrationAxis))
+            .normalized()
+            .ok_or_else(|| {
+                PhysicsError::CapsuleCastFailed("hit returned an invalid surface normal".into())
+            })?;
+        let fraction = f64::from(result.Fraction);
+        let penetration_depth_m = f64::from(result.PenetrationDepth);
+        if !point_on_capsule.is_finite()
+            || !point_on_body.is_finite()
+            || !fraction.is_finite()
+            || !(-1.0e-6..=1.0 + 1.0e-6).contains(&fraction)
+            || !penetration_depth_m.is_finite()
+            || penetration_depth_m < 0.0
+        {
+            return Err(PhysicsError::CapsuleCastFailed(
+                "hit returned non-finite or out-of-range geometry".into(),
+            ));
+        }
+        Ok(Some(CapsuleCastHit {
+            body_id: body_id.clone(),
+            collider_id,
+            fraction: fraction.clamp(0.0, 1.0),
+            point_on_capsule,
+            point_on_body,
+            surface_normal,
+            penetration_depth_m,
+        }))
+    }
+
     fn body_interface(&self) -> *mut joltc_sys::JPC_BodyInterface {
         let physics = self
             .physics
@@ -1021,6 +1159,7 @@ impl Drop for ShapeRef {
 enum ColliderRef<'a> {
     Box(&'a BoxColliderSpec),
     Sphere(&'a SphereColliderSpec),
+    Capsule(&'a CapsuleColliderSpec),
 }
 
 impl<'a> ColliderRef<'a> {
@@ -1028,6 +1167,7 @@ impl<'a> ColliderRef<'a> {
         match self {
             Self::Box(collider) => &collider.collider_id,
             Self::Sphere(collider) => &collider.collider_id,
+            Self::Capsule(collider) => &collider.collider_id,
         }
     }
 
@@ -1035,6 +1175,7 @@ impl<'a> ColliderRef<'a> {
         match self {
             Self::Box(collider) => collider.local_pose,
             Self::Sphere(collider) => collider.local_pose,
+            Self::Capsule(collider) => collider.local_pose,
         }
     }
 }
@@ -1045,6 +1186,7 @@ fn ordered_colliders(spec: &BodySpec) -> Vec<ColliderRef<'_>> {
         .iter()
         .map(ColliderRef::Box)
         .chain(spec.sphere_colliders.iter().map(ColliderRef::Sphere))
+        .chain(spec.capsule_colliders.iter().map(ColliderRef::Capsule))
         .collect::<Vec<_>>();
     colliders.sort_by(|left, right| left.id().cmp(right.id()));
     colliders
@@ -1114,6 +1256,63 @@ fn create_sphere(
     }
 }
 
+fn create_capsule(
+    body: &BodySpec,
+    collider: &CapsuleColliderSpec,
+    index: usize,
+) -> Result<ShapeRef, PhysicsError> {
+    let settings = JPC_CapsuleShapeSettings {
+        UserData: u64::try_from(index + 1).unwrap_or(u64::MAX),
+        Density: collider.density_kg_per_m3,
+        Radius: collider.radius,
+        HalfHeightOfCylinder: collider.half_height_of_cylinder,
+    };
+    let mut shape = ptr::null_mut();
+    let mut error = ptr::null_mut();
+    // SAFETY: Output pointers refer to local variables valid for the call;
+    // settings contains no borrowed pointers. Success returns one owned ref.
+    let created = unsafe {
+        JPC_CapsuleShapeSettings_Create(
+            ptr::from_ref(&settings),
+            ptr::from_mut(&mut shape),
+            ptr::from_mut(&mut error),
+        )
+    };
+    if created && !shape.is_null() {
+        Ok(ShapeRef(shape))
+    } else {
+        Err(PhysicsError::ShapeCreation {
+            body_id: body.body_id.clone(),
+            message: take_error(error),
+        })
+    }
+}
+
+fn create_query_capsule(query: &CapsuleCast) -> Result<ShapeRef, PhysicsError> {
+    let settings = JPC_CapsuleShapeSettings {
+        UserData: 0,
+        Density: 1_000.0,
+        Radius: query.radius,
+        HalfHeightOfCylinder: query.half_height_of_cylinder,
+    };
+    let mut shape = ptr::null_mut();
+    let mut error = ptr::null_mut();
+    // SAFETY: Output pointers refer to live locals and successful creation
+    // returns one owned shape reference released by `ShapeRef`.
+    let created = unsafe {
+        JPC_CapsuleShapeSettings_Create(
+            ptr::from_ref(&settings),
+            ptr::from_mut(&mut shape),
+            ptr::from_mut(&mut error),
+        )
+    };
+    if created && !shape.is_null() {
+        Ok(ShapeRef(shape))
+    } else {
+        Err(PhysicsError::CapsuleCastFailed(take_error(error)))
+    }
+}
+
 fn create_compound(settings: &JPC_StaticCompoundShapeSettings) -> Result<ShapeRef, String> {
     let mut shape = ptr::null_mut();
     let mut error = ptr::null_mut();
@@ -1157,6 +1356,33 @@ fn local_vec3(value: Vec3) -> JPC_Vec3 {
         y: value.y as f32,
         z: value.z as f32,
         _w: value.z as f32,
+    }
+}
+
+fn local_vec4(value: Vec3, w: f32) -> JPC_Vec4 {
+    JPC_Vec4 {
+        x: value.x as f32,
+        y: value.y as f32,
+        z: value.z as f32,
+        w,
+    }
+}
+
+#[allow(clippy::needless_update)]
+fn world_transform(pose: Pose) -> joltc_sys::JPC_RMat44 {
+    // SAFETY: JPC_RMat44 contains only scalar columns plus target-specific
+    // padding. Zeroing the padding is the representation used by JoltC's own
+    // Rust examples before the initialized columns are assigned.
+    unsafe {
+        joltc_sys::JPC_RMat44 {
+            col: [
+                local_vec4(pose.rotation.rotate(Vec3::new(1.0, 0.0, 0.0)), 0.0),
+                local_vec4(pose.rotation.rotate(Vec3::new(0.0, 1.0, 0.0)), 0.0),
+                local_vec4(pose.rotation.rotate(Vec3::new(0.0, 0.0, 1.0)), 0.0),
+            ],
+            col3: world_vec3(pose.position),
+            ..std::mem::zeroed()
+        }
     }
 }
 

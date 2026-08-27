@@ -3285,6 +3285,11 @@ mod tests {
                             .into_iter()
                             .map(|collider| collider.collider_id),
                     )
+                    .chain(
+                        spec.capsule_colliders
+                            .into_iter()
+                            .map(|collider| collider.collider_id),
+                    )
                     .collect::<Vec<_>>();
                 colliders.sort();
                 (spec.body_id, colliders)
