@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-use std::time::Instant;
+use std::{sync::Mutex, time::Instant};
 
 use verse_physics::{
     BodySpec, BoxColliderSpec, CapsuleCast, CapsuleColliderSpec, Pose, Quat, Scene, SceneConfig,
     Vec3,
 };
 
+static BENCHMARK_LOCK: Mutex<()> = Mutex::new(());
+
 #[test]
 #[ignore = "focused performance probe; run with --ignored --nocapture"]
 fn steps_against_two_thousand_voxel_static_compound() {
+    let _benchmark_guard = BENCHMARK_LOCK.lock().expect("benchmark lock is healthy");
     let mut floor_colliders = Vec::with_capacity(2_048);
     for z in 0..32 {
         for x in 0..64 {
@@ -58,6 +61,7 @@ fn steps_against_two_thousand_voxel_static_compound() {
 #[test]
 #[ignore = "focused performance probe; run with --ignored --nocapture"]
 fn starter_grid_against_proof_asteroid_budget() {
+    let _benchmark_guard = BENCHMARK_LOCK.lock().expect("benchmark lock is healthy");
     let mut asteroid_colliders = Vec::with_capacity(2_816);
     for z in 0..44 {
         for x in 0..64 {
@@ -124,6 +128,7 @@ fn starter_grid_against_proof_asteroid_budget() {
 #[test]
 #[ignore = "focused performance probe; run with --ignored --nocapture"]
 fn dirty_collision_chunk_replacement_distribution() {
+    let _benchmark_guard = BENCHMARK_LOCK.lock().expect("benchmark lock is healthy");
     let mut chunks = Vec::with_capacity(32);
     for chunk in 0..32 {
         let mut colliders = Vec::with_capacity(88);
@@ -179,6 +184,7 @@ fn dirty_collision_chunk_replacement_distribution() {
 #[test]
 #[ignore = "focused performance probe; run with --ignored --nocapture"]
 fn grounded_capsule_query_set_against_proof_asteroid_budget() {
+    let _benchmark_guard = BENCHMARK_LOCK.lock().expect("benchmark lock is healthy");
     let mut asteroid_colliders = Vec::with_capacity(2_816);
     for z in 0..44 {
         for x in 0..64 {
