@@ -2,8 +2,9 @@
 
 **Feature IDs:** F-003, F-012, F-014, F-038
 
-**Status:** Local proof implemented and cross-process validated; production-scale
-release evidence and independent client hash verification remain open
+**Status:** Local proof and independent official-client verification implemented
+and cross-process validated; production-scale and current hosted evidence remain
+open
 
 **Owner:** Universe, simulation-worker, protocol, native-client, and browser
 maintainers
@@ -86,12 +87,19 @@ selected view membership.
 The full local playable scenario passes two-player mining and control,
 refining, manufacturing, inventory transfer, construction, welding, damage,
 grid splitting, death-drop, oxygen, respawn, exact recovery, and both native
-client identities. [Hosted CI run 33112815767](https://github.com/Bittrees-Technology/the-verse/actions/runs/33112815767)
-replays the complete Linux verification suite and packages Linux and Apple
-Silicon clients for implementation revision `bb4ab4e`. Still open are
-independent client-side view-hash verification, active-player rather than
-spectator load distributions, WAN/failure/soak testing, partitioned thousand-
-participant evidence, and the production binary codec.
+client identities. The native and browser clients now run the same independent
+verifier over the raw typed message, require pinned universe/content/registry/
+manifest roots, recompute the complete authorized view commitment, stage
+presentation before commit, and emit only verifier-owned acknowledgements. A
+real shipped browser-page test proves an in-flight tamper produces no applied
+state and no acknowledgement, while native tests cover exact unsigned values
+beyond Godot's signed integer range and missing-extension failure. [Hosted CI
+run 33112815767](https://github.com/Bittrees-Technology/the-verse/actions/runs/33112815767)
+is the published Linux replay and Linux/Apple Silicon package result for
+implementation revision `bb4ab4e`; hosted evidence for the verifier revision
+is pending. Still open are active-player rather than spectator load
+distributions, WAN/failure/soak testing, partitioned thousand-participant
+evidence, and the production binary codec.
 
 ## Scope
 

@@ -1,7 +1,8 @@
 # P1 replication and backpressure
 
-**Status:** P1.5 local and hosted proof transport verified; production active-
-player load and independent client hash evidence pending
+**Status:** P1.5 transport and independent official-client view verification
+locally verified; production active-player load and current hosted evidence
+pending
 
 ## Failure being prevented
 
@@ -63,10 +64,14 @@ audience-authorized projection. Subset clients use the view hash to converge
 their representation and never interpret the global commitment as a listing or
 hash of visible entities.
 
-The client applies a delta only when session epoch, interest epoch, baseline
-ID, sequence, and previous view hash all match. A mismatch discards the delta
-and requests a current baseline. A client acknowledgement is flow-control
-evidence only and cannot attest to or mutate canonical gameplay.
+The shared independent verifier applies a delta only when session epoch,
+interest epoch, baseline ID, sequence, previous view hash, trusted registry and
+manifest roots, and the recomputed resulting view hash all match. It stages a
+sanitized typed frame before presentation and emits the exact acknowledgement
+only after presentation commit. A mismatch discards the stage and requests a
+current baseline or closes the stream according to its error class. A client
+acknowledgement is flow-control evidence only and cannot attest to or mutate
+canonical gameplay.
 
 ## Per-session retention
 
@@ -163,11 +168,14 @@ schema `1`.
 Existing tests cover 4,096-motion coalescing, structural ordering,
 fresh-snapshot recovery, bounded bursts, a 60 Hz send ceiling, actor-private
 projection, exact spatial membership, irrelevant-far-entity query independence,
-and a local `2`/`8`/`16`/`32`/`64` public-spectator distribution. P1.5 release
-acceptance additionally requires:
+and a local `2`/`8`/`16`/`32`/`64` public-spectator distribution. Portable raw
+vectors, the browser WASM adapter, the native Godot adapter, live official
+clients, and a real shipped browser page also prove exact typed-integer/hash
+parity, pinned-root enforcement, stage/discard/commit atomicity, and tamper
+rejection with no state apply or acknowledgement. Remaining production gates
+include:
 
 - exact enter/exit/hysteresis and negative-coordinate membership vectors;
-- delay, loss, duplicate, reorder, stale epoch, and hash mismatch recovery;
 - no hidden IDs, counts, projected hashes, tombstones, or private overlays
   across two players and one spectator, apart from the documented global
   commitment side channel;
@@ -179,8 +187,9 @@ acceptance additionally requires:
 
 [Hosted CI run 33112815767](https://github.com/Bittrees-Technology/the-verse/actions/runs/33112815767)
 passes the complete Linux replay and packages Linux and Apple Silicon clients
-for implementation revision `bb4ab4e`; it does not widen the spectator harness
-into an active-player or production-capacity claim.
+for implementation revision `bb4ab4e`; current verifier-revision hosted
+evidence is pending, and neither result widens the spectator harness into an
+active-player or production-capacity claim.
 
 This is still a local-cell scale slice. A final binary codec, multi-process
 cell scheduler, cross-cell handoff, and thousand-participant production result

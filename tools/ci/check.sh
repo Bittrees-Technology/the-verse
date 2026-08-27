@@ -8,18 +8,21 @@ cd "${verse_root}"
 cargo fmt --all -- --check
 cargo test --workspace --locked --no-fail-fast
 cargo clippy --workspace --all-targets --locked -- -D warnings
-node --check apps/web-command-center/app.js
-node --test apps/web-command-center/app.test.mjs
+tools/ci/test-browser-verifier.sh
 node --check tools/e2e/protocol-smoke.mjs
+node --check tools/e2e/browser-verifier-smoke.mjs
+node --check tools/e2e/browser-command-center-smoke.mjs
 node --check tools/e2e/two-player-control-smoke.mjs
 node --check tools/e2e/p15-scale-evidence.mjs
-npx --yes markdownlint-cli2 '**/*.md'
+npm ci --ignore-scripts --prefix tools/markdownlint
+npm exec --prefix tools/markdownlint --no -- markdownlint-cli2 '**/*.md'
 
 godot_binary="${GODOT_BIN:-}"
 if [[ -z "${godot_binary}" ]] && [[ -x "artifacts/toolchains/godot-4.7.2/Godot.app/Contents/MacOS/Godot" ]]; then
   godot_binary="artifacts/toolchains/godot-4.7.2/Godot.app/Contents/MacOS/Godot"
 fi
 if [[ -n "${godot_binary}" ]]; then
+  GODOT_BIN="${godot_binary}" tools/ci/verify-native-verifier.sh
   "${godot_binary}" --headless --editor --path apps/native-client --quit
   "${godot_binary}" \
     --headless \

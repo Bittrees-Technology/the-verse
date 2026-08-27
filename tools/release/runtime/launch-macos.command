@@ -4,6 +4,7 @@ set -euo pipefail
 
 package_directory="$(cd "$(dirname "$0")" && pwd)"
 universe_directory="${VERSE_DATA_DIR:-${HOME}/Library/Application Support/The Verse/universe}"
+export VERSE_BROWSER_VERIFIER_ASSET_DIR="${package_directory}/browser-verifier"
 server_pid=""
 
 cleanup() {

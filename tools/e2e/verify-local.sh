@@ -108,6 +108,28 @@ if ! node tools/e2e/protocol-smoke.mjs "ws://127.0.0.1:${verse_port}/ws"; then
 fi
 stop_server
 
+# Exercise the generated browser WASM verifier against untouched frames from a
+# separate spectator-only universe. The smoke also opens an isolated tamper
+# connection and proves altered hash material cannot be committed or ACKed.
+start_server live "${verse_test_dir}/browser-verifier"
+if ! node tools/e2e/browser-verifier-smoke.mjs \
+  "ws://127.0.0.1:${verse_port}/ws"; then
+  sed -n '1,240p' "${verse_test_dir}/server.log" >&2
+  exit 1
+fi
+
+# Exercise the shipped command-center HTML and JavaScript in a real headless
+# browser. A transparent local proxy records the exact verifier-owned ACK sent
+# to this authoritative server and injects one isolated hash tamper to prove
+# the page, module Worker, generated WASM, and presentation handshake fail
+# closed together. Set VERSE_BROWSER_BIN when Chrome/Chromium is not discoverable.
+if ! node tools/e2e/browser-command-center-smoke.mjs \
+  "http://127.0.0.1:${verse_port}/"; then
+  sed -n '1,240p' "${verse_test_dir}/server.log" >&2
+  exit 1
+fi
+stop_server
+
 start_server paused
 before_restart="$(
   curl --fail --silent "http://127.0.0.1:${verse_port}/api/v1/status"
