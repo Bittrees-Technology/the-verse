@@ -28,6 +28,15 @@ pub enum BodyMotion {
     Dynamic,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MotionQuality {
+    #[default]
+    Discrete,
+    /// Sweeps a dynamic body's shape along its linear motion to reduce
+    /// tunneling through thin geometry at high speed.
+    LinearCast,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct BoxColliderSpec {
     pub collider_id: String,
@@ -48,6 +57,25 @@ impl BoxColliderSpec {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct SphereColliderSpec {
+    pub collider_id: String,
+    pub local_pose: Pose,
+    pub radius: f32,
+    pub density_kg_per_m3: f32,
+}
+
+impl SphereColliderSpec {
+    pub fn new(collider_id: impl Into<String>, radius: f32) -> Self {
+        Self {
+            collider_id: collider_id.into(),
+            local_pose: Pose::IDENTITY,
+            radius,
+            density_kg_per_m3: 1_000.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct BodySpec {
     pub body_id: String,
     pub motion: BodyMotion,
@@ -58,7 +86,11 @@ pub struct BodySpec {
     pub restitution: f32,
     pub gravity_factor: f32,
     pub allow_sleeping: bool,
+    pub motion_quality: MotionQuality,
+    /// Box colliders are retained under the original field name so existing
+    /// grid and voxel callers remain source-compatible.
     pub colliders: Vec<BoxColliderSpec>,
+    pub sphere_colliders: Vec<SphereColliderSpec>,
 }
 
 impl BodySpec {
@@ -77,7 +109,9 @@ impl BodySpec {
             restitution: 0.0,
             gravity_factor: 0.0,
             allow_sleeping: true,
+            motion_quality: MotionQuality::Discrete,
             colliders,
+            sphere_colliders: Vec::new(),
         }
     }
 
@@ -96,7 +130,9 @@ impl BodySpec {
             restitution: 0.0,
             gravity_factor: 0.0,
             allow_sleeping: true,
+            motion_quality: MotionQuality::Discrete,
             colliders,
+            sphere_colliders: Vec::new(),
         }
     }
 }
@@ -423,7 +459,13 @@ impl Scene {
         self.specs.get(body_id).is_some_and(|spec| {
             spec.colliders
                 .iter()
-                .any(|collider| collider.collider_id == collider_id)
+                .map(|collider| collider.collider_id.as_str())
+                .chain(
+                    spec.sphere_colliders
+                        .iter()
+                        .map(|collider| collider.collider_id.as_str()),
+                )
+                .any(|candidate| candidate == collider_id)
         })
     }
 
@@ -431,13 +473,18 @@ impl Scene {
         self.specs
             .iter()
             .map(|(body_id, spec)| {
-                (
-                    body_id.clone(),
-                    spec.colliders
-                        .iter()
-                        .map(|collider| collider.collider_id.clone())
-                        .collect(),
-                )
+                let mut collider_ids = spec
+                    .colliders
+                    .iter()
+                    .map(|collider| collider.collider_id.clone())
+                    .chain(
+                        spec.sphere_colliders
+                            .iter()
+                            .map(|collider| collider.collider_id.clone()),
+                    )
+                    .collect::<Vec<_>>();
+                collider_ids.sort();
+                (body_id.clone(), collider_ids)
             })
             .collect()
     }
@@ -619,7 +666,21 @@ fn validated_specs(
                     .into(),
             });
         }
-        if body.colliders.is_empty() || body.colliders.len() > config.max_colliders_per_body {
+        if body.motion == BodyMotion::Static && body.motion_quality != MotionQuality::Discrete {
+            return Err(PhysicsError::InvalidBody {
+                body_id: body.body_id.clone(),
+                message: "linear-cast motion quality is valid only for dynamic bodies".into(),
+            });
+        }
+        let collider_count = body
+            .colliders
+            .len()
+            .checked_add(body.sphere_colliders.len())
+            .ok_or_else(|| PhysicsError::InvalidBody {
+                body_id: body.body_id.clone(),
+                message: "collider count overflowed".into(),
+            })?;
+        if collider_count == 0 || collider_count > config.max_colliders_per_body {
             return Err(PhysicsError::InvalidBody {
                 body_id: body.body_id.clone(),
                 message: format!(
@@ -670,8 +731,46 @@ fn validated_specs(
                     message: "rotation must be finite and normalized".into(),
                 })?;
         }
+        for collider in &mut validated.sphere_colliders {
+            validate_id(&collider.collider_id).map_err(|message| {
+                PhysicsError::InvalidCollider {
+                    body_id: body.body_id.clone(),
+                    collider_id: collider.collider_id.clone(),
+                    message,
+                }
+            })?;
+            if !collider_ids.insert(collider.collider_id.clone()) {
+                return Err(PhysicsError::InvalidCollider {
+                    body_id: body.body_id.clone(),
+                    collider_id: collider.collider_id.clone(),
+                    message: "collider ID is duplicated within its body".into(),
+                });
+            }
+            if !collider.local_pose.position.is_finite()
+                || !collider.radius.is_finite()
+                || collider.radius <= 0.0
+                || collider.radius > 1_000_000.0
+                || !collider.density_kg_per_m3.is_finite()
+                || collider.density_kg_per_m3 <= 0.0
+            {
+                return Err(PhysicsError::InvalidCollider {
+                    body_id: body.body_id.clone(),
+                    collider_id: collider.collider_id.clone(),
+                    message: "pose, radius, and density must be finite and positive".into(),
+                });
+            }
+            collider.local_pose.rotation = validated_rotation(collider.local_pose.rotation)
+                .ok_or_else(|| PhysicsError::InvalidCollider {
+                    body_id: body.body_id.clone(),
+                    collider_id: collider.collider_id.clone(),
+                    message: "rotation must be finite and normalized".into(),
+                })?;
+        }
         validated
             .colliders
+            .sort_by(|left, right| left.collider_id.cmp(&right.collider_id));
+        validated
+            .sphere_colliders
             .sort_by(|left, right| left.collider_id.cmp(&right.collider_id));
         result.insert(validated.body_id.clone(), validated);
     }

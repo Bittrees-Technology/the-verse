@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use verse_physics::{
-    BodyControl, BodySpec, BodyState, BoxColliderSpec, ContactPhase, ContactSource, PhysicsError,
-    Pose, Quat, Scene, SceneConfig, StepOutput, Vec3,
+    BodyControl, BodySpec, BodyState, BoxColliderSpec, ContactPhase, ContactSource, MotionQuality,
+    PhysicsError, Pose, Quat, Scene, SceneConfig, SphereColliderSpec, StepOutput, Vec3,
 };
 
 const P0_TOTAL_MOMENTUM_ERROR_KG_MPS: f64 = 1.0;
@@ -349,6 +349,120 @@ fn compound_colliders_keep_sorted_stable_identity() {
         );
     }
     assert!(collider_ids.iter().any(|id| id == "right-block"));
+}
+
+#[test]
+fn sphere_and_box_colliders_share_one_sorted_stable_identity_catalog() {
+    let mut mixed = BodySpec::dynamic(
+        "mixed-body",
+        pose(-3.0, 0.0, 0.0),
+        vec![BoxColliderSpec::unit_cube("zeta-box")],
+    );
+    mixed
+        .sphere_colliders
+        .push(SphereColliderSpec::new("alpha-sphere", 0.35));
+    let wall = BodySpec::static_body(
+        "wall",
+        Pose::IDENTITY,
+        vec![BoxColliderSpec::unit_cube("wall-box")],
+    );
+    mixed.linear_velocity = Vec3::new(4.0, 0.0, 0.0);
+
+    let mut scene = Scene::new(SceneConfig::default()).expect("scene initializes");
+    scene.rebuild(&[wall, mixed]).expect("mixed shapes build");
+    assert!(scene.contains_collider("mixed-body", "alpha-sphere"));
+    assert!(scene.contains_collider("mixed-body", "zeta-box"));
+    assert_eq!(
+        scene.body_collider_fingerprint(),
+        vec![
+            (
+                "mixed-body".into(),
+                vec!["alpha-sphere".into(), "zeta-box".into()]
+            ),
+            ("wall".into(), vec!["wall-box".into()]),
+        ]
+    );
+}
+
+#[test]
+fn sphere_validation_rejects_invalid_geometry_and_cross_shape_duplicate_ids() {
+    let mut invalid_radius = BodySpec::dynamic("sphere", Pose::IDENTITY, vec![]);
+    invalid_radius
+        .sphere_colliders
+        .push(SphereColliderSpec::new("player", f32::NAN));
+    let mut scene = Scene::new(SceneConfig::default()).expect("scene initializes");
+    assert!(matches!(
+        scene.rebuild(&[invalid_radius]),
+        Err(PhysicsError::InvalidCollider { .. })
+    ));
+
+    let mut duplicate = BodySpec::dynamic(
+        "duplicate",
+        Pose::IDENTITY,
+        vec![BoxColliderSpec::unit_cube("same-id")],
+    );
+    duplicate
+        .sphere_colliders
+        .push(SphereColliderSpec::new("same-id", 0.5));
+    assert!(matches!(
+        scene.rebuild(&[duplicate]),
+        Err(PhysicsError::InvalidCollider { .. })
+    ));
+
+    let mut static_linear_cast = BodySpec::static_body(
+        "static-linear-cast",
+        Pose::IDENTITY,
+        vec![BoxColliderSpec::unit_cube("block")],
+    );
+    static_linear_cast.motion_quality = MotionQuality::LinearCast;
+    assert!(matches!(
+        scene.rebuild(&[static_linear_cast]),
+        Err(PhysicsError::InvalidBody { .. })
+    ));
+}
+
+#[test]
+fn linear_cast_sphere_does_not_tunnel_through_a_thin_wall() {
+    let config = SceneConfig {
+        fixed_delta_seconds: 1.0 / 60.0,
+        collision_substeps: 1,
+        ..SceneConfig::default()
+    };
+    let wall = BodySpec::static_body(
+        "thin-wall",
+        Pose::IDENTITY,
+        vec![BoxColliderSpec {
+            collider_id: "wall-panel".into(),
+            local_pose: Pose::IDENTITY,
+            half_extents: Vec3::new(0.05, 5.0, 5.0),
+            density_kg_per_m3: 1_000.0,
+        }],
+    );
+    let mut sphere = BodySpec::dynamic("player-body", pose(-5.0, 0.0, 0.0), vec![]);
+    sphere
+        .sphere_colliders
+        .push(SphereColliderSpec::new("player-sphere", 0.25));
+    sphere.motion_quality = MotionQuality::LinearCast;
+    sphere.linear_velocity = Vec3::new(600.0, 0.0, 0.0);
+    sphere.allow_sleeping = false;
+    sphere.friction = 0.0;
+    sphere.restitution = 0.0;
+
+    let mut scene = Scene::new(config).expect("scene initializes");
+    scene.rebuild(&[sphere, wall]).expect("CCD scene builds");
+    let output = scene.step(&[]).expect("high-speed step succeeds");
+    let player = output_body(&output, "player-body");
+    assert!(
+        player.pose.position.x < 0.0,
+        "linear cast must keep the sphere center on the approach side of the wall: {}",
+        player.pose.position.x
+    );
+    assert!(
+        output.contacts.iter().any(|contact| {
+            contact.collider_a_id == "player-sphere" && contact.collider_b_id == "wall-panel"
+        }),
+        "CCD impact must preserve stable sphere and wall collider IDs"
+    );
 }
 
 #[test]
