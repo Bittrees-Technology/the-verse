@@ -66,14 +66,14 @@ Generic knowledge of an inventory or grid ID is never authority.
 
 ## Replication and budgets
 
-Protocol 13 sends public deterministic rosters and topology to every audience, then adds only the bound pilot's exact player, owned inventory, protected-drop, and owned-grid-mass records as an atomic private overlay. The shared replication feed retains canonical dirty markers rather than session-specific bytes. HTTP and spectator reads cannot select an actor, and dynamic HTTP responses are not cacheable. Spatial interest sets and binary deltas remain later scale work and must not change canonical state.
+Protocol 14 preserves protocol 13's public deterministic rosters and topology, then adds only the bound pilot's exact player, owned inventory, protected-drop, owned-grid-mass, and committed-operation-frontier records as an atomic private overlay. Retained receipts, operation IDs, fingerprints, compaction commitments, and every other actor's frontier remain server-private. The shared replication feed retains canonical dirty markers rather than session-specific bytes. HTTP and spectator reads cannot select an actor, and dynamic HTTP responses are not cacheable. Spatial interest sets and binary deltas remain later scale work and must not change canonical state.
 
 The serialized P0.10 Linux baseline measured a 0.0298 ms median three-cast grounded query set but a 29.8 ms worst-path naive loop for 1,000 characters. Therefore P1.0 must publish 2, 8, 16, 32, and 64 active-player distributions and set a conservative cell budget; thousands of universe participants require multiple cells and reduced-frequency/background modes.
 
 ## Acceptance
 
 - Two clients walk independently and observe both authoritative poses.
-- The same operation ID can succeed once for each player but duplicate only within that player's namespace.
+- The same sequence and exact message return one actor's original receipt; a changed message conflicts, while another actor has an independent frontier.
 - Cross-player control and inventory attempts fail without changing event sequence or world hash.
 - Shared mining removes one voxel once and credits only the accepted actor.
 - Non-owner production, transfer, construction, welding, grid control, and anchoring fail closed.
