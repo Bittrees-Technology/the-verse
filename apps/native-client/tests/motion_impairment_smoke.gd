@@ -22,13 +22,14 @@ func _run() -> void:
 	_test_exact_tool_targeting()
 	_test_private_projection_lifecycle()
 	_test_actor_owned_industry_selection()
+	_test_mutation_frontier_reconciliation()
 	if not failures.is_empty():
 		for failure in failures:
 			printerr("VERSE_NATIVE_IMPAIRMENT_FAILED %s" % failure)
 		quit(1)
 		return
 	print(
-		"VERSE_NATIVE_IMPAIRMENT_OK queued_ack=ordered motion=monotonic corrections=bounded menu=neutral_prediction lifecycle=reset buffers=bounded roll_tap=durable idle=silent rebuild=none targeting=closest_hit ownership=filtered privacy=projected"
+		"VERSE_NATIVE_IMPAIRMENT_OK queued_ack=ordered motion=monotonic corrections=bounded menu=neutral_prediction lifecycle=reset buffers=bounded roll_tap=durable idle=silent rebuild=none targeting=closest_hit ownership=filtered privacy=projected operations=serialized"
 	)
 	quit(0)
 
@@ -66,6 +67,10 @@ func _new_client(add_to_tree := false) -> Node3D:
 	client.set("bound_player_id", "impairment-player")
 	client.set("session_role_kind", "player")
 	client.set("actor_private_snapshot", _private_snapshot(player))
+	client.set("committed_operation_sequence", 0)
+	client.set("committed_operation_actor_id", "impairment-player")
+	client.set("operation_frontier_observed", true)
+	client.set("operation_frontier_ready", true)
 	client.set("authoritative_player_ready", true)
 	client.set("awaiting_reconnect_baseline", false)
 	client.set("last_player_id", "impairment-player")
@@ -133,6 +138,7 @@ func _private_snapshot(
 		]
 	return {
 		"player": player,
+		"committed_operation_sequence": 0,
 		"inventories": private_inventories,
 		"death_drops": death_drops,
 		"owned_grid_masses": [],
@@ -717,6 +723,167 @@ func _test_private_projection_lifecycle() -> void:
 	_check(
 		not bool(client.get("authoritative_player_ready")),
 		"wrong-schema motion fails closed pending resnapshot"
+	)
+	client.free()
+
+
+func _test_mutation_frontier_reconciliation() -> void:
+	var client := _new_client()
+	client.set("committed_operation_sequence", 4)
+	client.set("committed_operation_actor_id", "impairment-player")
+	client.set("operation_frontier_observed", true)
+	client.set("operation_frontier_ready", true)
+	client.set("mutation_queue_actor_id", "impairment-player")
+	client.set("in_flight_mutation_actor_id", "impairment-player")
+	var exact_message := {
+		"type": "mine_voxel",
+		"operation_sequence": 5,
+		"operation_id": "frontier-five",
+		"coordinate": {"x": 1, "y": 2, "z": 3},
+	}
+	var exact_text := JSON.stringify(exact_message)
+	client.set("in_flight_mutation", exact_message.duplicate(true))
+	client.set("in_flight_mutation_text", exact_text)
+	client.set("mutation_resync_required", true)
+	_check(
+		bool(client.call("_reconcile_operation_frontier", 4)),
+		"uncommitted reconnect frontier permits exact retry"
+	)
+	_check(
+		String(client.get("in_flight_mutation_text")) == exact_text
+		and int(client.get("committed_operation_sequence")) == 4
+		and not bool(client.get("mutation_resync_required")),
+		"reconnect retains byte-exact pending payload and reusable sequence"
+	)
+
+	_check(
+		bool(client.call("_reconcile_operation_frontier", 5)),
+		"committed reconnect frontier completes pending command"
+	)
+	_check(
+		(client.get("in_flight_mutation") as Dictionary).is_empty()
+		and int(client.get("committed_operation_sequence")) == 5,
+		"frontier completion clears only the committed command"
+	)
+	client.call("_clear_actor_private_state")
+	_check(
+		not bool(client.call("_reconcile_operation_frontier", 4))
+		and bool(client.get("mutation_resync_required")),
+		"private overlay clearing cannot make an observed frontier regress"
+	)
+	client.set("mutation_resync_required", false)
+	client.set("operation_frontier_ready", true)
+
+	client.set("mutation_queue_actor_id", "impairment-player")
+	client.set("in_flight_mutation_actor_id", "impairment-player")
+	client.set("in_flight_mutation", {
+		"type": "craft_component",
+		"operation_sequence": 6,
+		"operation_id": "rejected-six",
+	})
+	client.set("in_flight_mutation_text", "exact-rejected-six")
+	client.call("_handle_intent_rejected", {
+		"type": "intent_rejected",
+		"operation_sequence": 6,
+		"operation_id": "rejected-six",
+		"code": "insufficient_refined_material",
+		"message": "not enough material",
+	})
+	_check(
+		(client.get("in_flight_mutation") as Dictionary).is_empty()
+		and int(client.get("committed_operation_sequence")) == 5,
+		"gameplay rejection leaves the operation sequence reusable"
+	)
+
+	client.set("in_flight_mutation_actor_id", "impairment-player")
+	client.set("in_flight_mutation", {
+		"type": "set_player_control",
+		"operation_sequence": 6,
+		"operation_id": "rejected-control-six",
+		"input_sequence": 7,
+	})
+	client.set("in_flight_mutation_text", "exact-rejected-control-six")
+	(client.get("mutation_queue") as Array).append({
+		"type": "craft_component",
+		"operation_id": "deferred-after-control",
+	})
+	client.set("authoritative_player_ready", true)
+	client.call("_handle_intent_rejected", {
+		"type": "intent_rejected",
+		"operation_sequence": 6,
+		"operation_id": "rejected-control-six",
+		"code": "input_sequence_stale",
+		"message": "control input is stale",
+	})
+	_check(
+		not bool(client.get("authoritative_player_ready"))
+		and (client.get("in_flight_mutation") as Dictionary).is_empty()
+		and (client.get("mutation_queue") as Array).size() == 1,
+		"rejected control defers later commands until a fresh prediction snapshot"
+	)
+
+	client.set("in_flight_mutation_actor_id", "impairment-player")
+	client.set("in_flight_mutation", {
+		"type": "craft_component",
+		"operation_sequence": 6,
+		"operation_id": "conflicted-six",
+	})
+	client.set("in_flight_mutation_text", "exact-conflicted-six")
+	(client.get("mutation_queue") as Array).clear()
+	client.call("_handle_intent_rejected", {
+		"type": "intent_rejected",
+		"operation_sequence": 6,
+		"operation_id": "conflicted-six",
+		"code": "operation_conflict",
+		"message": "sequence already bound",
+	})
+	_check(
+		bool(client.get("mutation_resync_required"))
+		and not bool(client.get("operation_frontier_ready"))
+		and not (client.get("in_flight_mutation") as Dictionary).is_empty(),
+		"operation conflict pauses authority while preserving exact pending payload"
+	)
+
+	client.set("mutation_resync_required", false)
+	client.set("operation_frontier_ready", true)
+	client.set("authoritative_player_ready", true)
+	client.set("connected", true)
+	client.set("in_flight_mutation", {
+		"type": "mine_voxel",
+		"operation_sequence": 6,
+		"operation_id": "blocking-six",
+	})
+	client.set("in_flight_mutation_actor_id", "impairment-player")
+	var first_control := {
+		"type": "set_player_control",
+		"operation_id": "queued-control-one",
+		"movement_epoch": 1,
+		"input_sequence": 7,
+	}
+	var latest_control := first_control.duplicate(true)
+	latest_control["operation_id"] = "queued-control-two"
+	latest_control["input_sequence"] = 8
+	_check(bool(client.call("_queue_mutation", first_control)), "first queued control accepted")
+	_check(bool(client.call("_queue_mutation", latest_control)), "latest queued control coalesced")
+	var queued: Array = client.get("mutation_queue")
+	_check(
+		queued.size() == 1
+		and int((queued[0] as Dictionary).get("input_sequence", 0)) == 8
+		and not (queued[0] as Dictionary).has("operation_sequence"),
+		"queued controls stay bounded and receive no sequence before dispatch"
+	)
+	for index in range(1, 32):
+		_check(bool(client.call("_queue_mutation", {
+			"type": "craft_component",
+			"operation_id": "bounded-command-%d" % index,
+		})), "bounded command %d queued" % index)
+	_check(
+		not bool(client.call("_queue_mutation", {
+			"type": "craft_component",
+			"operation_id": "overflow-command",
+		}))
+		and (client.get("mutation_queue") as Array).size() == 32,
+		"mutation queue rejects work beyond its deterministic bound"
 	)
 	client.free()
 
