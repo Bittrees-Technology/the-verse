@@ -172,7 +172,9 @@ func _input(event: InputEvent) -> void:
 	if inventory_open and event is InputEventKey:
 		if event.keycode == KEY_M and not event.pressed and grid_control_active:
 			_stop_target_grid()
-		if event.pressed and not event.echo and event.keycode in [KEY_ESCAPE, KEY_I]:
+		var focus_owner := get_viewport().gui_get_focus_owner()
+		var text_entry_focused := focus_owner is LineEdit or focus_owner is TextEdit
+		if _inventory_close_shortcut(event, text_entry_focused):
 			_set_inventory_open(false)
 		return
 
@@ -265,6 +267,12 @@ func _input(event: InputEvent) -> void:
 		if event.button_index == MOUSE_BUTTON_RIGHT:
 			build_mode = false
 			action_charge = 0.0
+
+
+func _inventory_close_shortcut(event: InputEventKey, text_entry_focused: bool) -> bool:
+	if not event.pressed or event.echo:
+		return false
+	return event.keycode == KEY_ESCAPE or (event.keycode == KEY_I and not text_entry_focused)
 
 
 func _parse_command_line() -> void:
@@ -1830,17 +1838,21 @@ func _update_movement(delta: float) -> void:
 	)
 	if jetpack_enabled:
 		var desired_velocity := player_velocity
-		if movement_input.length_squared() > 0.0:
+		var has_movement_input := movement_input.length_squared() > 0.0
+		if has_movement_input:
 			movement_input = movement_input.normalized()
 			var speed := MOVE_SPEED
 			if Input.is_action_pressed("move_boost"):
 				speed *= BOOST_MULTIPLIER
 			desired_velocity = camera.basis * movement_input * speed
-			player_velocity = player_velocity.move_toward(
-				desired_velocity, MOVE_ACCELERATION * delta
-			)
-		elif dampeners_enabled:
-			player_velocity = player_velocity.move_toward(Vector3.ZERO, MOVE_DAMPING * delta)
+		player_velocity = _integrate_jetpack_velocity(
+			player_velocity,
+			desired_velocity,
+			gravity,
+			delta,
+			has_movement_input,
+			dampeners_enabled
+		)
 	else:
 		var tangent_input := Vector3(movement_input.x, 0.0, movement_input.z)
 		var tangent_velocity := camera.basis * tangent_input
@@ -1895,6 +1907,24 @@ func _update_movement(delta: float) -> void:
 			"operation_id": _operation_id("move"),
 			"position": _protocol_vec3(camera.position),
 		})
+
+
+func _integrate_jetpack_velocity(
+	current_velocity: Vector3,
+	desired_velocity: Vector3,
+	gravity: Vector3,
+	delta: float,
+	has_movement_input: bool,
+	dampeners: bool
+) -> Vector3:
+	var integrated := current_velocity + gravity * delta
+	if has_movement_input:
+		return integrated.move_toward(desired_velocity, MOVE_ACCELERATION * delta)
+	if dampeners:
+		return integrated.move_toward(
+			Vector3.ZERO, (MOVE_DAMPING + gravity.length()) * delta
+		)
+	return integrated
 
 
 func _position_is_clear(position: Vector3) -> bool:
@@ -1972,6 +2002,12 @@ func _damage_material(root: Node3D) -> ShaderMaterial:
 
 
 func _run_visual_smoke_assertions() -> bool:
+	var inventory_key := InputEventKey.new()
+	inventory_key.keycode = KEY_I
+	inventory_key.pressed = true
+	var escape_key := InputEventKey.new()
+	escape_key.keycode = KEY_ESCAPE
+	escape_key.pressed = true
 	var frame := {
 		"block_id": "smoke-frame",
 		"kind": "structural",
@@ -1998,6 +2034,16 @@ func _run_visual_smoke_assertions() -> bool:
 	var repaired_visual := _build_block_visual(repaired)
 	var damage_material: ShaderMaterial = _damage_material(damaged_visual)
 	var expected_seed := _stable_unit_seed("smoke-damaged")
+	var gravity_probe := Vector3(0.0, -0.5, 0.0)
+	var drift_velocity := _integrate_jetpack_velocity(
+		Vector3.ZERO, Vector3.ZERO, gravity_probe, 0.25, false, false
+	)
+	var dampened_velocity := _integrate_jetpack_velocity(
+		Vector3.ZERO, Vector3.ZERO, gravity_probe, 0.25, false, true
+	)
+	var zero_gravity_velocity := _integrate_jetpack_velocity(
+		Vector3.ZERO, Vector3.ZERO, Vector3.ZERO, 0.25, false, false
+	)
 	var valid: bool = (
 		frame_visual.get_meta("verse_visual_state", "") == "frame"
 		and frame_visual.get_node_or_null("DamageOverlay") == null
@@ -2015,6 +2061,12 @@ func _run_visual_smoke_assertions() -> bool:
 		and _block_condition_label(damaged) == "DAMAGED"
 		and _weld_action_name(frame).begins_with("WELDING FRAME")
 		and _weld_action_name(damaged).begins_with("REPAIRING ARMOR")
+		and not _inventory_close_shortcut(inventory_key, true)
+		and _inventory_close_shortcut(inventory_key, false)
+		and _inventory_close_shortcut(escape_key, true)
+		and drift_velocity.is_equal_approx(gravity_probe * 0.25)
+		and dampened_velocity.is_zero_approx()
+		and zero_gravity_velocity.is_zero_approx()
 	)
 	frame_visual.free()
 	damaged_visual.free()
@@ -2022,7 +2074,10 @@ func _run_visual_smoke_assertions() -> bool:
 	if not valid:
 		printerr("VERSE_VISUAL_STATE_FAILED")
 		return false
-	print("VERSE_VISUAL_STATE_OK frame=frame damaged=armor_damaged repaired=armor_complete")
+	print(
+		"VERSE_VISUAL_STATE_OK frame=frame damaged=armor_damaged repaired=armor_complete inventory_focus=owned"
+	)
+	print("VERSE_EVA_GRAVITY_OK drift=gravity dampeners=compensating")
 	return true
 
 
@@ -2462,8 +2517,9 @@ func _update_interface() -> void:
 	var oxygen_percent := int(player.get("suit_oxygen_milli", 1000)) / 10
 	var helmet_state := "SEALED" if player.get("helmet_closed", true) else "OPEN"
 	var jetpack_state := "JET" if player.get("jetpack_enabled", true) else "WALK"
-	telemetry_label.text = "O₂ %03d%%   PWR %03d%%   %s   %s" % [
-		oxygen_percent, suit_power, helmet_state, jetpack_state
+	var dampener_state := "DAMP" if dampeners_enabled else "DRIFT"
+	telemetry_label.text = "O₂ %03d%%   PWR %03d%%   %s   %s   %s" % [
+		oxygen_percent, suit_power, helmet_state, jetpack_state, dampener_state
 	]
 	telemetry_label.add_theme_color_override(
 		"font_color", Color(1.0, 0.32, 0.18) if oxygen_percent < 20 else Color(0.64, 0.90, 0.94)
