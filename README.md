@@ -15,6 +15,18 @@ tools/dev/run-local.sh
 
 The bootstrap downloads the pinned Godot 4.7.2 editor from the official release and verifies its checksum. The launcher starts the authoritative server and native client. While the server is running, the read-only browser command center is available at <http://127.0.0.1:7777>.
 
+To test the second pilot, leave the first client and server running, open a
+second terminal, and launch:
+
+```bash
+tools/dev/run-client.sh player-remote
+```
+
+Each window controls only the pilot named in its connection binding and renders
+the other pilot as a remote engineering suit. A previous single-pilot test
+world cannot be silently rewritten; if startup reports an incompatible world,
+archive it with `tools/dev/reset-local-world.sh` and launch again.
+
 To create the portable Apple Silicon development package used by release testing:
 
 ```bash
