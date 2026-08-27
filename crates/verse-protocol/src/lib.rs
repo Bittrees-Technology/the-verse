@@ -9,7 +9,10 @@
 use serde::{Deserialize, Serialize};
 
 /// The only protocol version accepted by this build.
-pub const PROTOCOL_VERSION: u32 = 12;
+pub const PROTOCOL_VERSION: u32 = 13;
+
+/// The actor-aware public/private projection contract carried by protocol 13.
+pub const PROJECTION_SCHEMA_VERSION: u32 = 1;
 
 /// A stable integer voxel or block coordinate.
 #[derive(
@@ -477,6 +480,142 @@ pub struct WorldSnapshot {
     pub conservation: ConservationSnapshot,
 }
 
+/// Public life-state information needed to render another player without
+/// exposing the protected death identity or cause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicPlayerLifeState {
+    Alive,
+    Incapacitated,
+}
+
+/// The player state visible to every authenticated player and spectator.
+/// Control values, input frontiers, inventories, progression, oxygen, and
+/// private suit state intentionally exist only in the actor-private view.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PublicPlayerSnapshot {
+    pub player_id: String,
+    pub position: Vec3,
+    pub orientation: Quat,
+    pub linear_velocity: Vec3,
+    pub angular_velocity: Vec3,
+    pub surface_contact: bool,
+    pub locomotion_kind: LocomotionKind,
+    pub life_state: PublicPlayerLifeState,
+    pub helmet_closed: bool,
+    pub jetpack_enabled: bool,
+}
+
+/// A public block view. Cargo inventory identity is an authority edge and is
+/// therefore absent even when the block itself is visible.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PublicBlockSnapshot {
+    pub block_id: String,
+    pub coordinate: IVec3,
+    pub kind: BlockKind,
+    pub orientation: u8,
+    pub health: u16,
+    pub max_health: u16,
+    pub construction_complete: bool,
+}
+
+/// A public grid view. Cargo-inclusive mass is owner-private because it leaks
+/// protected inventory contents through deterministic mass differences.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PublicGridSnapshot {
+    pub grid_id: String,
+    pub owner_player_id: String,
+    pub position: Vec3,
+    pub orientation: Quat,
+    pub linear_velocity: Vec3,
+    pub angular_velocity: Vec3,
+    pub anchored: bool,
+    pub power: PowerSnapshot,
+    pub blocks: Vec<PublicBlockSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OwnedGridMassSnapshot {
+    pub grid_id: String,
+    pub mass_kg: f64,
+}
+
+/// The exact canonical data bound to one authenticated player. Inventory and
+/// death-drop vectors contain only records whose strict durable owner resolves
+/// to the same actor.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ActorPrivateSnapshot {
+    pub player: PlayerSnapshot,
+    pub inventories: Vec<InventorySnapshot>,
+    pub death_drops: Vec<DeathDropSnapshot>,
+    pub owned_grid_masses: Vec<OwnedGridMassSnapshot>,
+}
+
+/// Actor-aware wire projection of a canonical [`WorldSnapshot`].
+///
+/// The canonical `event_sequence`, `simulation_tick`, and `world_hash` remain
+/// exact so clients can reconcile authoritative state. Consequently traffic
+/// timing and hash changes can still reveal that hidden state changed; this
+/// schema protects field values, not timing or aggregate-hash side channels.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectedWorldSnapshot {
+    pub projection_schema_version: u32,
+    pub schema_version: u32,
+    pub content_manifest_version: String,
+    pub universe_id: String,
+    pub cell_id: String,
+    pub event_sequence: u64,
+    pub simulation_tick: u64,
+    pub fencing_token: u64,
+    pub world_hash: String,
+    pub players: Vec<PublicPlayerSnapshot>,
+    pub environment: EnvironmentSnapshot,
+    pub voxels: Vec<VoxelSnapshot>,
+    pub grids: Vec<PublicGridSnapshot>,
+    pub conservation_valid: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_private: Option<ActorPrivateSnapshot>,
+}
+
+/// Public high-rate motion for a player. Exact locomotion, input frontiers,
+/// controls, and suit state are confined to the bound actor's private motion.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PublicPlayerMotionSnapshot {
+    pub player_id: String,
+    pub position: Vec3,
+    pub orientation: Quat,
+    pub linear_velocity: Vec3,
+    pub angular_velocity: Vec3,
+    pub surface_contact: bool,
+    pub locomotion_kind: LocomotionKind,
+    pub life_state: PublicPlayerLifeState,
+    pub jetpack_enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PublicGridMotionSnapshot {
+    pub grid_id: String,
+    pub position: Vec3,
+    pub orientation: Quat,
+    pub linear_velocity: Vec3,
+    pub angular_velocity: Vec3,
+}
+
+/// Actor-aware wire projection of canonical high-rate motion. It preserves the
+/// canonical hash and timing, with the same residual side-channel documented
+/// for [`ProjectedWorldSnapshot`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectedMotionSnapshot {
+    pub projection_schema_version: u32,
+    pub event_sequence: u64,
+    pub simulation_tick: u64,
+    pub world_hash: String,
+    pub players: Vec<PublicPlayerMotionSnapshot>,
+    pub grids: Vec<PublicGridMotionSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_private: Option<PlayerMotionSnapshot>,
+}
+
 /// Authentication material is interpreted only by the connection boundary and
 /// never becomes canonical simulation state. The local-development mode is
 /// permitted only on a loopback-bound worker; production profiles will use a
@@ -613,10 +752,10 @@ pub enum ServerMessage {
         session_role: SessionRole,
     },
     Snapshot {
-        snapshot: Box<WorldSnapshot>,
+        snapshot: Box<ProjectedWorldSnapshot>,
     },
     MotionState {
-        motion: Box<MotionSnapshot>,
+        motion: Box<ProjectedMotionSnapshot>,
     },
     IntentAccepted {
         receipt: IntentReceipt,
@@ -753,8 +892,9 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v12_exposes_tagged_life_state_and_death_cause() {
-        assert_eq!(PROTOCOL_VERSION, 12);
+    fn protocol_v13_preserves_tagged_life_state_and_death_cause() {
+        assert_eq!(PROTOCOL_VERSION, 13);
+        assert_eq!(PROJECTION_SCHEMA_VERSION, 1);
         let life_state = PlayerLifeState::Incapacitated {
             death_id: "death-player-local-42".into(),
             cause: PlayerDeathCause::OxygenDepleted,
@@ -950,6 +1090,62 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<InventoryDomain>(value).expect("drop domain deserializes"),
             dropped
+        );
+    }
+
+    #[test]
+    fn protocol_v13_spectator_projection_omits_actor_private_sections() {
+        let snapshot = ProjectedWorldSnapshot {
+            projection_schema_version: PROJECTION_SCHEMA_VERSION,
+            schema_version: 15,
+            content_manifest_version: "p1.1.0".into(),
+            universe_id: "the-verse-local".into(),
+            cell_id: "cell-origin".into(),
+            event_sequence: 8,
+            simulation_tick: 13,
+            fencing_token: 2,
+            world_hash: "canonical-hash".into(),
+            players: vec![PublicPlayerSnapshot {
+                player_id: "player-local".into(),
+                position: Vec3::ZERO,
+                orientation: Quat::IDENTITY,
+                linear_velocity: Vec3::ZERO,
+                angular_velocity: Vec3::ZERO,
+                surface_contact: false,
+                locomotion_kind: LocomotionKind::Eva,
+                life_state: PublicPlayerLifeState::Alive,
+                helmet_closed: true,
+                jetpack_enabled: true,
+            }],
+            environment: EnvironmentSnapshot {
+                celestial_body_id: "khepri-prime".into(),
+                celestial_body_name: "Khepri Prime".into(),
+                planet_center: Vec3::ZERO,
+                surface_radius_m: 1_200.0,
+                altitude_m: 0.0,
+                gravity: Vec3::new(0.0, -6.2, 0.0),
+                gravity_m_s2: 6.2,
+                atmosphere_density: 1.0,
+                oxygen_fraction: 0.21,
+                breathable: true,
+            },
+            voxels: Vec::new(),
+            grids: Vec::new(),
+            conservation_valid: true,
+            actor_private: None,
+        };
+        let message = ServerMessage::Snapshot {
+            snapshot: Box::new(snapshot.clone()),
+        };
+        let value = serde_json::to_value(&message).expect("projected message serializes");
+        assert_eq!(value["type"], "snapshot");
+        assert_eq!(value["snapshot"]["world_hash"], "canonical-hash");
+        assert!(value["snapshot"].get("actor_private").is_none());
+        assert!(value["snapshot"].get("inventories").is_none());
+        assert!(value["snapshot"].get("death_drops").is_none());
+        assert_eq!(
+            serde_json::from_value::<ServerMessage>(value).expect("message deserializes"),
+            message
         );
     }
 
