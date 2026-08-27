@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import assert from "node:assert/strict";
+import { COMPATIBILITY, Protocol16InterestStream } from "./interest-stream.mjs";
 
 const url = process.argv[2] ?? "ws://127.0.0.1:17777/ws";
 const socket = new WebSocket(url);
@@ -9,13 +10,18 @@ const waiters = [];
 let operationSequence = 0;
 let committedOperationSequence = 0;
 let authoritativeWorld;
-const PROTOCOL_VERSION = 15;
+const PROTOCOL_VERSION = COMPATIBILITY.protocol_version;
+const interestStream = new Protocol16InterestStream({
+  expectedPlayerId: "player-local",
+  send: (message) => socket.send(JSON.stringify(message)),
+});
 const CHARACTER_EYE_OFFSET = 1.62 - 1.8 / 2;
 const CHARACTER_MAXIMUM_ANGULAR_SPEED = 2.5;
 const TOOL_RANGE = 9.0;
 const TARGET_ALIGNMENT_RADIANS = 0.006;
 
-function dispatch(message) {
+function dispatch(rawMessage) {
+  const message = interestStream.receive(rawMessage);
   const index = waiters.findIndex((waiter) => waiter.predicate(message));
   if (index >= 0) {
     const [waiter] = waiters.splice(index, 1);
@@ -53,7 +59,10 @@ function send(message) {
 
 function hydrateActorSnapshot(snapshot) {
   const privateState = snapshot.actor_private;
-  assert.ok(privateState, "an authenticated pilot receives an actor-private overlay");
+  assert.ok(
+    privateState,
+    "an authenticated pilot receives an actor-private overlay",
+  );
   assert.equal(privateState.player.player_id, "player-local");
   assert.ok(
     Number.isSafeInteger(privateState.committed_operation_sequence) &&
@@ -65,28 +74,7 @@ function hydrateActorSnapshot(snapshot) {
     "a full snapshot cannot regress the actor-local operation frontier",
   );
   committedOperationSequence = privateState.committed_operation_sequence;
-  const privateMasses = new Map(
-    privateState.owned_grid_masses.map((entry) => [entry.grid_id, entry.mass_kg]),
-  );
-  return {
-    ...snapshot,
-    player: privateState.player,
-    players: snapshot.players.map((player) =>
-      player.player_id === privateState.player.player_id
-        ? privateState.player
-        : player,
-    ),
-    grids: snapshot.grids.map((grid) => ({
-      ...grid,
-      ...(privateMasses.has(grid.grid_id)
-        ? { mass_kg: privateMasses.get(grid.grid_id) }
-        : {}),
-    })),
-    inventories: privateState.inventories,
-    death_drops: privateState.death_drops,
-    production_queues: privateState.production_queues ?? [],
-    conservation: { valid: snapshot.conservation_valid },
-  };
+  return snapshot;
 }
 
 async function waitForWorld(predicate, description, timeoutMillis = 12_000) {
@@ -94,15 +82,15 @@ async function waitForWorld(predicate, description, timeoutMillis = 12_000) {
   while (Date.now() < deadline) {
     const state = await waitFor(
       (message) =>
-        message.type === "snapshot" &&
-        message.snapshot.event_sequence >=
+        message.type === "interest_state" &&
+        message.state.event_sequence >=
           (authoritativeWorld?.event_sequence ?? 0) &&
-        message.snapshot.actor_private?.committed_operation_sequence >=
+        message.state.actor_private?.committed_operation_sequence >=
           committedOperationSequence,
       description,
       Math.max(1, deadline - Date.now()),
     );
-    authoritativeWorld = hydrateActorSnapshot(state.snapshot);
+    authoritativeWorld = hydrateActorSnapshot(state.state);
     if (predicate(authoritativeWorld)) return authoritativeWorld;
   }
   throw new Error("timed out waiting for " + description);
@@ -128,69 +116,31 @@ async function intent(type, payload) {
   assert.equal(result.receipt.operation_sequence, operation_sequence);
   committedOperationSequence = operation_sequence;
   const eventSequence = result.receipt.event_sequence;
-  const acceptsMotionState = type === "set_player_control";
   const minimumStateSequence = Math.max(
     eventSequence,
     authoritativeWorld?.event_sequence ?? 0,
   );
   const state = await waitFor(
     (message) =>
-      (message.type === "snapshot" &&
-        message.snapshot.event_sequence >= minimumStateSequence) ||
-      (acceptsMotionState &&
-        message.type === "motion_state" &&
-        message.motion.event_sequence >= minimumStateSequence),
+      message.type === "interest_state" &&
+      message.state.event_sequence >= minimumStateSequence,
     type + " authoritative state",
   );
-  authoritativeWorld =
-    state.type === "snapshot"
-      ? hydrateActorSnapshot(state.snapshot)
-      : applyMotion(authoritativeWorld, state.motion);
+  authoritativeWorld = hydrateActorSnapshot(state.state);
   assert.equal(authoritativeWorld.conservation.valid, true);
   return authoritativeWorld;
-}
-
-function applyMotion(world, motion) {
-  assert.ok(world, "a full snapshot precedes motion deltas");
-  assert.ok(motion.actor_private, "pilot motion includes its exact private frontier");
-  assert.equal(motion.actor_private.player_id, "player-local");
-  assert.equal(
-    motion.actor_private.committed_operation_sequence,
-    undefined,
-    "motion deltas do not disclose durable operation history",
-  );
-  const movingGrids = new Map(motion.grids.map((grid) => [grid.grid_id, grid]));
-  const movingPlayers = new Map(
-    motion.players.map((player) => [player.player_id, player]),
-  );
-  movingPlayers.set(motion.actor_private.player_id, motion.actor_private);
-  return {
-    ...world,
-    event_sequence: motion.event_sequence,
-    simulation_tick: motion.simulation_tick,
-    world_hash: motion.world_hash,
-    player: { ...world.player, ...motion.actor_private },
-    players: world.players.map((player) => ({
-      ...player,
-      ...(movingPlayers.get(player.player_id) ?? {}),
-    })),
-    grids: world.grids.map((grid) => ({
-      ...grid,
-      ...(movingGrids.get(grid.grid_id) ?? {}),
-    })),
-  };
 }
 
 async function waitForMotionAfter(simulationTick, description) {
   const minimumEventSequence = authoritativeWorld?.event_sequence ?? 0;
   const state = await waitFor(
     (message) =>
-      message.type === "motion_state" &&
-      message.motion.simulation_tick > simulationTick &&
-      message.motion.event_sequence >= minimumEventSequence,
+      message.type === "interest_state" &&
+      message.state.simulation_tick > simulationTick &&
+      message.state.event_sequence >= minimumEventSequence,
     description,
   );
-  authoritativeWorld = applyMotion(authoritativeWorld, state.motion);
+  authoritativeWorld = hydrateActorSnapshot(state.state);
   return authoritativeWorld;
 }
 
@@ -222,16 +172,16 @@ async function waitForCanonicalIncapacitation(world) {
     const remaining = wallDeadline - Date.now();
     const state = await waitFor(
       (message) =>
-        message.type === "snapshot" &&
-        message.snapshot.event_sequence > observedEventSequence &&
-        (message.snapshot.actor_private?.player.life_state.kind ===
+        message.type === "interest_state" &&
+        message.state.event_sequence > observedEventSequence &&
+        (message.state.actor_private?.player.life_state.kind ===
           "incapacitated" ||
-          message.snapshot.actor_private?.player.suit_oxygen_milli <
+          message.state.actor_private?.player.suit_oxygen_milli <
             observedOxygen),
       "canonical oxygen depletion progress",
       Math.min(8_000, remaining),
     );
-    world = hydrateActorSnapshot(state.snapshot);
+    world = hydrateActorSnapshot(state.state);
     authoritativeWorld = world;
     const depleted = observedOxygen - world.player.suit_oxygen_milli;
     assert.ok(depleted > 0, "each observed oxygen snapshot makes progress");
@@ -766,15 +716,24 @@ async function run() {
     kind: "player",
     player_id: "player-local",
   });
-  let world = hydrateActorSnapshot((
-    await waitFor(
-      (message) => message.type === "snapshot",
-      "post-handshake genesis snapshot",
-    )
-  ).snapshot);
+  const registryMessage = await waitFor(
+    (message) => message.type === "registry",
+    "immutable celestial registry",
+  );
+  assert.equal(
+    registryMessage.universe_manifest.celestial_registry_hash,
+    registryMessage.registry.registry_hash,
+  );
+  let initialState = await waitFor(
+    (message) =>
+      message.type === "interest_state" && message.frame_kind === "baseline",
+    "post-handshake interest baseline",
+  );
+  const firstFrontier = structuredClone(initialState.interest);
+  let world = hydrateActorSnapshot(initialState.state);
   authoritativeWorld = world;
   assert.equal(world.conservation.valid, true);
-  assert.equal(world.content_manifest_version, "p1.4.0");
+  assert.equal(world.content_manifest_version, "p1.5.0");
   assert.equal(world.grids.length, 2);
   assert.deepEqual(
     world.players.map((player) => player.player_id),
@@ -805,7 +764,11 @@ async function run() {
     world.environment,
     "the compatibility environment remains the primary pilot environment",
   );
-  assert.equal(world.player.suit_oxygen_milli, 1_000);
+  assert.ok(
+    world.player.suit_oxygen_milli > 0 &&
+      world.player.suit_oxygen_milli <= 1_000,
+    "the live initial baseline contains a valid non-empty suit oxygen reserve",
+  );
   assert.equal(world.player.critical_oxygen_milli, 200);
   assert.deepEqual(world.player.life_state, { kind: "alive" });
   assert.equal(world.player.helmet_closed, true);
@@ -816,6 +779,34 @@ async function run() {
   assert.ok(playerInventory(world).capacity_liters > 0);
   assert.ok(playerInventory(world).used_liters > 0);
   assert.ok(playerInventory(world).mass_grams > 0);
+
+  // A stale/wrong acknowledgement must not advance a session cursor. The
+  // server fails closed by issuing a new complete baseline, which this client
+  // validates and acknowledges before accepting any more deltas.
+  send({
+    type: "acknowledge_interest",
+    session_epoch: firstFrontier.session_epoch,
+    interest_epoch: firstFrontier.interest_epoch,
+    baseline_id: firstFrontier.baseline_id,
+    delta_sequence: firstFrontier.delta_sequence,
+    view_hash: `${firstFrontier.view_hash}-wrong`,
+  });
+  initialState = await waitFor(
+    (message) =>
+      message.type === "interest_state" && message.frame_kind === "baseline",
+    "wrong-frontier baseline recovery",
+  );
+  assert.equal(
+    initialState.interest.session_epoch,
+    firstFrontier.session_epoch,
+  );
+  assert.equal(
+    initialState.interest.interest_epoch,
+    firstFrontier.interest_epoch + 1,
+  );
+  assert.notEqual(initialState.interest.baseline_id, firstFrontier.baseline_id);
+  world = hydrateActorSnapshot(initialState.state);
+  authoritativeWorld = world;
 
   for (const [operation_sequence, expectedCode] of [
     [0, "operation_sequence_invalid"],
@@ -915,12 +906,12 @@ async function run() {
   assert.equal(conflict.code, "operation_conflict");
   const pulseState = await waitFor(
     (message) =>
-      message.type === "motion_state" &&
-      message.motion.actor_private?.last_processed_input_sequence >=
+      message.type === "interest_state" &&
+      message.state.actor_private?.player.last_processed_input_sequence >=
         pulseSequence + 1,
     "successive authoritative pulse consumption",
   );
-  world = applyMotion(world, pulseState.motion);
+  world = hydrateActorSnapshot(pulseState.state);
   authoritativeWorld = world;
   assert.equal(world.player.last_received_input_sequence, pulseSequence + 1);
   assert.equal(world.player.last_processed_input_sequence, pulseSequence + 1);
@@ -944,6 +935,15 @@ async function run() {
     const voxelCount = world.voxels.length;
     const previousHash = world.world_hash;
     world = await intent("mine_voxel", { coordinate: voxel.coordinate });
+    world = await waitForWorld(
+      (state) =>
+        !state.voxels.some(
+          (remaining) =>
+            coordinateKey(remaining.coordinate) ===
+            coordinateKey(voxel.coordinate),
+        ),
+      "voxel-chunk replacement after mining",
+    );
     assert.equal(world.voxels.length, voxelCount - 1);
     assert.notEqual(world.world_hash, previousHash);
     assert.ok(
@@ -1021,12 +1021,11 @@ async function run() {
     quantity: 1,
   });
 
-  const cargoBeforeAnchorView = blockAt(
-    world,
-    { x: -1, y: 0, z: 0 },
-    "cargo",
+  const cargoBeforeAnchorView = blockAt(world, { x: -1, y: 0, z: 0 }, "cargo");
+  assert.ok(
+    cargoBeforeAnchorView,
+    "starter cargo remains available for anchor work",
   );
-  assert.ok(cargoBeforeAnchorView, "starter cargo remains available for anchor work");
   const anchorViewEye = addVector(
     gridBlockWorldPosition(
       cargoBeforeAnchorView.grid,

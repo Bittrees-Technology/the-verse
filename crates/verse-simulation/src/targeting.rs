@@ -416,11 +416,17 @@ mod tests {
     };
 
     use super::*;
+    use crate::celestial;
     use crate::model::{Block, Grid};
 
     fn actor(position: Vec3, orientation: Quat) -> Player {
         Player {
             player_id: "targeting-pilot".into(),
+            address: celestial::address_from_local_position(
+                &celestial::cell_origin_address(),
+                position,
+            )
+            .expect("fixture position has an exact universe address"),
             position,
             orientation,
             linear_velocity: Vec3::ZERO,
@@ -469,6 +475,11 @@ mod tests {
             grid_id: grid_id.into(),
             owner_player_id: "player-local".into(),
             anchor_reward_eligible: true,
+            address: celestial::address_from_local_position(
+                &celestial::cell_origin_address(),
+                position,
+            )
+            .expect("fixture position has an exact universe address"),
             position,
             orientation,
             linear_velocity: Vec3::ZERO,

@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+use std::collections::BTreeSet;
 use std::sync::OnceLock;
 
 use serde::Deserialize;
-use verse_protocol::{BlockKind, ProductionRecipeKind, Vec3, VoxelMaterial};
+use verse_protocol::{
+    BlockKind, I64Vec3, InterestEntityKind, ProductionRecipeKind, Vec3, VoxelMaterial,
+};
 
 const P0_CONTENT: &str = include_str!("../../../content/definitions/p0-content.json");
 
@@ -19,6 +22,8 @@ pub struct ContentManifest {
     pub physics: PhysicsDefinition,
     pub character: CharacterDefinition,
     pub survival: SurvivalDefinition,
+    pub celestial: CelestialDefinition,
+    pub interest: InterestDefinition,
     pub experience_rewards: ExperienceRewards,
 }
 
@@ -101,6 +106,73 @@ pub struct SurvivalDefinition {
     pub respawn_helmet_closed: bool,
     pub respawn_jetpack_enabled: bool,
     pub proof_recovery_position: Vec3,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct InterestDefinition {
+    pub spatial_bucket_edge_m: u32,
+    pub enter_radius_m: u32,
+    pub exit_radius_m: u32,
+    pub exit_consecutive_ticks: u16,
+    pub maximum_visible_entities: usize,
+    pub selected_context_margin_m: u32,
+    pub maximum_selected_context_entities: usize,
+    pub public_spectator_anchor_um: I64Vec3,
+    pub entity_bands: Vec<InterestBandDefinition>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct InterestBandDefinition {
+    pub kind: InterestEntityKind,
+    pub enter_radius_m: u32,
+    pub exit_radius_m: u32,
+    pub update_interval_ticks: u16,
+    pub maximum_entities: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CelestialDefinition {
+    pub minimum_fixed_body_surface_gap_um: u64,
+    pub geometry_definition_ids: Vec<String>,
+    pub voxel_definition_ids: Vec<String>,
+    pub material_definition_ids: Vec<String>,
+    pub gravity_definition_ids: Vec<String>,
+    pub atmosphere_definition_ids: Vec<String>,
+    pub resource_definition_ids: Vec<String>,
+}
+
+impl CelestialDefinition {
+    pub fn contains_geometry(&self, value: &str) -> bool {
+        self.geometry_definition_ids
+            .iter()
+            .any(|item| item == value)
+    }
+
+    pub fn contains_voxel(&self, value: &str) -> bool {
+        self.voxel_definition_ids.iter().any(|item| item == value)
+    }
+
+    pub fn contains_material(&self, value: &str) -> bool {
+        self.material_definition_ids
+            .iter()
+            .any(|item| item == value)
+    }
+
+    pub fn contains_gravity(&self, value: &str) -> bool {
+        self.gravity_definition_ids.iter().any(|item| item == value)
+    }
+
+    pub fn contains_atmosphere(&self, value: &str) -> bool {
+        self.atmosphere_definition_ids
+            .iter()
+            .any(|item| item == value)
+    }
+
+    pub fn contains_resource(&self, value: &str) -> bool {
+        self.resource_definition_ids
+            .iter()
+            .any(|item| item == value)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -404,12 +476,91 @@ fn validate_survival(definition: &SurvivalDefinition) -> Result<(), &'static str
     Ok(())
 }
 
+fn validate_interest(definition: &InterestDefinition) -> Result<(), &'static str> {
+    if definition.spatial_bucket_edge_m != 256 {
+        return Err("P1.5 spatial buckets must have a 256 metre edge");
+    }
+    if definition.enter_radius_m != 2_000 || definition.exit_radius_m != 2_250 {
+        return Err("P1.5 interest radii must be the versioned 2,000/2,250 metre proof policy");
+    }
+    if definition.exit_consecutive_ticks != 2 {
+        return Err("P1.5 interest exit hysteresis must require two committed evaluations");
+    }
+    if definition.maximum_visible_entities != 4_096 {
+        return Err("P1.5 interest views must contain at most 4,096 entities");
+    }
+    if definition.selected_context_margin_m != 250
+        || definition.maximum_selected_context_entities != 64
+        || definition.public_spectator_anchor_um != I64Vec3::ZERO
+    {
+        return Err("P1.5 selected-context and spectator-anchor policy must remain pinned");
+    }
+    let expected_kinds = [
+        InterestEntityKind::Player,
+        InterestEntityKind::Grid,
+        InterestEntityKind::VoxelChunk,
+        InterestEntityKind::DeathDrop,
+    ];
+    if definition.entity_bands.len() != expected_kinds.len()
+        || !definition
+            .entity_bands
+            .iter()
+            .map(|band| band.kind)
+            .eq(expected_kinds)
+        || definition
+            .entity_bands
+            .iter()
+            .map(|band| band.kind)
+            .collect::<BTreeSet<_>>()
+            != expected_kinds.into_iter().collect::<BTreeSet<_>>()
+        || definition.entity_bands.iter().any(|band| {
+            band.enter_radius_m == 0
+                || band.exit_radius_m <= band.enter_radius_m
+                || band.update_interval_ticks == 0
+                || band.maximum_entities == 0
+        })
+        || definition
+            .entity_bands
+            .iter()
+            .map(|band| band.maximum_entities)
+            .sum::<usize>()
+            > definition.maximum_visible_entities
+    {
+        return Err("P1.5 interest entity bands must be unique, bounded, and ordered");
+    }
+    Ok(())
+}
+
+fn validate_celestial(definition: &CelestialDefinition) -> Result<(), &'static str> {
+    if definition.minimum_fixed_body_surface_gap_um != 3_000_000_000 {
+        return Err("P1.5 fixed celestial bodies must keep the pinned 3,000 metre surface gap");
+    }
+    for values in [
+        &definition.geometry_definition_ids,
+        &definition.voxel_definition_ids,
+        &definition.material_definition_ids,
+        &definition.gravity_definition_ids,
+        &definition.atmosphere_definition_ids,
+        &definition.resource_definition_ids,
+    ] {
+        if values.is_empty()
+            || values.iter().any(|value| value.trim().is_empty())
+            || values.iter().collect::<BTreeSet<_>>().len() != values.len()
+            || !values.windows(2).all(|pair| pair[0] < pair[1])
+        {
+            return Err("celestial definition IDs must be nonempty, unique, and sorted");
+        }
+    }
+    Ok(())
+}
+
 pub fn manifest() -> &'static ContentManifest {
     static MANIFEST: OnceLock<ContentManifest> = OnceLock::new();
     MANIFEST.get_or_init(|| {
         let parsed: ContentManifest =
             serde_json::from_str(P0_CONTENT).expect("embedded P0 content must be valid JSON");
-        assert_eq!(parsed.schema_version, 10, "unsupported P1.4 content schema");
+        assert_eq!(parsed.schema_version, 11, "unsupported P1.5 content schema");
+        assert_eq!(parsed.manifest_version, "p1.5.0");
         assert_eq!(
             parsed.license, "AGPL-3.0-or-later",
             "content definition license must be explicit"
@@ -420,6 +571,8 @@ pub fn manifest() -> &'static ContentManifest {
         validate_voxel_collision_chunk_edge_cells(parsed.physics.voxel_collision_chunk_edge_cells)
             .unwrap_or_else(|message| panic!("{message}"));
         validate_survival(&parsed.survival).unwrap_or_else(|message| panic!("{message}"));
+        validate_celestial(&parsed.celestial).unwrap_or_else(|message| panic!("{message}"));
+        validate_interest(&parsed.interest).unwrap_or_else(|message| panic!("{message}"));
         assert!(parsed.physics.control_force_newtons > 0.0);
         assert!(parsed.physics.control_torque_newton_meters > 0.0);
         assert!((0.0..=1.0).contains(&parsed.physics.friction));
@@ -442,6 +595,19 @@ pub fn manifest() -> &'static ContentManifest {
             "P0 crafting requests are expressed as individual component quantities"
         );
         parsed
+    })
+}
+
+pub fn manifest_hash() -> &'static str {
+    static HASH: OnceLock<String> = OnceLock::new();
+    HASH.get_or_init(|| {
+        let canonical: serde_json::Value =
+            serde_json::from_str(P0_CONTENT).expect("embedded content must be valid JSON");
+        let bytes = serde_json::to_vec(&canonical).expect("content canonical JSON serializes");
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"the-verse/content-manifest/v11\0");
+        hasher.update(&bytes);
+        hasher.finalize().to_hex().to_string()
     })
 }
 
@@ -476,8 +642,8 @@ mod tests {
             .map(|definition| format!("{:?}", definition.kind))
             .collect::<BTreeSet<_>>();
         assert_eq!(block_kinds.len(), content.blocks.len());
-        assert_eq!(content.schema_version, 10);
-        assert_eq!(content.manifest_version, "p1.4.0");
+        assert_eq!(content.schema_version, 11);
+        assert_eq!(content.manifest_version, "p1.5.0");
         assert_eq!(content.physics.voxel_collision_chunk_edge_cells, 8);
         assert_eq!(content.survival.suit_oxygen_capacity_milli, 1_000);
         assert_eq!(content.survival.critical_oxygen_milli, 200);
@@ -490,6 +656,18 @@ mod tests {
         assert!(content.survival.respawn_jetpack_enabled);
         assert_eq!(content.production.scheduler_interval_millis, 1_000);
         assert_eq!(content.production.queue_limit_per_machine, 32);
+        assert_eq!(content.interest.spatial_bucket_edge_m, 256);
+        assert_eq!(content.interest.enter_radius_m, 2_000);
+        assert_eq!(content.interest.exit_radius_m, 2_250);
+        assert_eq!(content.interest.exit_consecutive_ticks, 2);
+        assert_eq!(content.interest.maximum_visible_entities, 4_096);
+        assert_eq!(content.interest.public_spectator_anchor_um, I64Vec3::ZERO);
+        assert_eq!(content.interest.entity_bands.len(), 4);
+        assert_eq!(
+            content.celestial.minimum_fixed_body_surface_gap_um,
+            3_000_000_000
+        );
+        assert_eq!(manifest_hash().len(), 64);
         assert_eq!(content.recipes.refining.duration_ticks_per_batch, 120);
         assert_eq!(
             content.recipes.component_crafting.duration_ticks_per_batch,
@@ -608,6 +786,61 @@ mod tests {
             .blocks
             .retain(|definition| definition.kind != BlockKind::Assembler);
         assert!(validate_production(&content).is_err());
+    }
+
+    #[test]
+    fn celestial_gap_and_definition_allowlists_are_pinned() {
+        let celestial = &manifest().celestial;
+        assert!(celestial.contains_geometry("procedural-voxel-v1"));
+        assert!(celestial.contains_voxel("origin-voxel-field-v1"));
+        assert!(celestial.contains_material("terrestrial-regolith-v1"));
+        assert!(celestial.contains_gravity("radial-inverse-square-v1"));
+        assert!(celestial.contains_atmosphere("oxygen-gradient-v1"));
+        assert!(celestial.contains_resource("ferrite-deposit-v1"));
+
+        let mut wrong_gap = celestial.clone();
+        wrong_gap.minimum_fixed_body_surface_gap_um -= 1;
+        assert!(validate_celestial(&wrong_gap).is_err());
+
+        let mut duplicate = celestial.clone();
+        duplicate
+            .geometry_definition_ids
+            .push("sphere-heightfield-v1".into());
+        assert!(validate_celestial(&duplicate).is_err());
+
+        let mut unsorted = celestial.clone();
+        unsorted.material_definition_ids.reverse();
+        assert!(validate_celestial(&unsorted).is_err());
+
+        let mut empty = celestial.clone();
+        empty.voxel_definition_ids.clear();
+        assert!(validate_celestial(&empty).is_err());
+    }
+
+    #[test]
+    fn interest_bands_anchor_and_budgets_are_pinned() {
+        let interest = &manifest().interest;
+        assert!(validate_interest(interest).is_ok());
+
+        let mut reordered = interest.clone();
+        reordered.entity_bands.swap(0, 1);
+        assert!(validate_interest(&reordered).is_err());
+
+        let mut duplicate = interest.clone();
+        duplicate.entity_bands[1].kind = InterestEntityKind::Player;
+        assert!(validate_interest(&duplicate).is_err());
+
+        let mut invalid_exit = interest.clone();
+        invalid_exit.entity_bands[0].exit_radius_m = invalid_exit.entity_bands[0].enter_radius_m;
+        assert!(validate_interest(&invalid_exit).is_err());
+
+        let mut excessive = interest.clone();
+        excessive.entity_bands[0].maximum_entities = excessive.maximum_visible_entities;
+        assert!(validate_interest(&excessive).is_err());
+
+        let mut spoofable_anchor = interest.clone();
+        spoofable_anchor.public_spectator_anchor_um.x = 1;
+        assert!(validate_interest(&spoofable_anchor).is_err());
     }
 
     #[test]

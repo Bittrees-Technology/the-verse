@@ -24,6 +24,10 @@ if [[ -n "${godot_binary}" ]]; then
     --headless \
     --path apps/native-client \
     --script res://tests/motion_impairment_smoke.gd
+  "${godot_binary}" \
+    --headless \
+    --path apps/native-client \
+    --script res://tests/p15_interest_stream_smoke.gd
   GODOT_BIN="${godot_binary}" tools/e2e/verify-local.sh
 else
   tools/e2e/verify-local.sh

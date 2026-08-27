@@ -50,7 +50,7 @@ func _new_client(add_to_tree := false) -> Node3D:
 	client.set("camera", camera)
 	var player := _base_player()
 	client.set("snapshot", {
-		"projection_schema_version": 2,
+		"projection_schema_version": 3,
 		"event_sequence": 0,
 		"simulation_tick": 0,
 		"world_hash": "impairment-0",
@@ -188,7 +188,7 @@ func _motion_message(
 	grids: Array = []
 ) -> Dictionary:
 	return {
-		"projection_schema_version": 2,
+		"projection_schema_version": 3,
 		"event_sequence": event_sequence,
 		"simulation_tick": simulation_tick,
 		"world_hash": "impairment-%d" % event_sequence,
@@ -656,7 +656,7 @@ func _test_private_projection_lifecycle() -> void:
 	spoofed_public_motion["position"] = _protocol_vec3(Vector3(1.0, 0.0, 0.0))
 	spoofed_public_motion["last_processed_input_sequence"] = 99
 	client.call("_apply_motion_state", {
-		"projection_schema_version": 2,
+		"projection_schema_version": 3,
 		"event_sequence": 1,
 		"simulation_tick": 1,
 		"world_hash": "public-only-motion",
@@ -677,7 +677,7 @@ func _test_private_projection_lifecycle() -> void:
 	private_motion["last_received_input_sequence"] = 2
 	private_motion["last_processed_input_sequence"] = 2
 	client.call("_apply_motion_state", {
-		"projection_schema_version": 2,
+		"projection_schema_version": 3,
 		"event_sequence": 2,
 		"simulation_tick": 2,
 		"world_hash": "private-motion",
@@ -706,7 +706,7 @@ func _test_private_projection_lifecycle() -> void:
 	wrong_private_motion["player_id"] = "player-foreign"
 	client.set("authoritative_player_ready", true)
 	client.call("_apply_motion_state", {
-		"projection_schema_version": 2,
+		"projection_schema_version": 3,
 		"event_sequence": 3,
 		"simulation_tick": 3,
 		"world_hash": "wrong-private-actor-motion",
@@ -1155,7 +1155,7 @@ func _test_bound_player_roster_selection() -> void:
 	)
 	remote["position"] = _protocol_vec3(Vector3(9.0, 1.0, -2.0))
 	client.call("_apply_motion_state", {
-		"projection_schema_version": 2,
+		"projection_schema_version": 3,
 		"event_sequence": 1,
 		"simulation_tick": 1,
 		"world_hash": "impairment-roster-1",

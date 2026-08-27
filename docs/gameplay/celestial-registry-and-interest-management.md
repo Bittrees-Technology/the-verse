@@ -2,7 +2,8 @@
 
 **Feature IDs:** F-003, F-012, F-014, F-038
 
-**Status:** Accepted implementation target; not yet implemented
+**Status:** Local proof implemented and cross-process validated; production-scale
+release evidence and independent client hash verification remain open
 
 **Owner:** Universe, simulation-worker, protocol, native-client, and browser
 maintainers
@@ -377,7 +378,7 @@ event, and schema versions without publishing private inventory or queue data.
 2. Body IDs and addresses are unique; a materialized body cannot move after a
    generator upgrade without an explicit migration.
 3. Every P1.5 fixed-body exclusion volume satisfies the manifest-pinned
-   2,500-metre proof surface gap, equality passes, one micrometre below fails,
+   3,000-metre proof surface gap, equality passes, one micrometre below fails,
    and asteroid-field membership is deterministic. This proof value is not the
    production planet-separation decision.
 4. Global address serialization round-trips signed values without JavaScript

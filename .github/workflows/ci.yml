@@ -77,16 +77,25 @@ jobs:
       - name: Build and smoke-test native package
         env:
           GODOT_BIN: ${{ matrix.godot_binary }}
-          VERSE_RELEASE_VERSION: p0.10.0-ci-${{ github.sha }}
+          VERSE_RELEASE_VERSION: p1.5.0-ci-${{ github.sha }}
         run: tools/release/package-native.sh
-      - name: Measure Linux P0.10 physics distribution
+      - name: Verify P1.5 cross-platform registry and interest client
+        env:
+          GODOT_BIN: ${{ matrix.godot_binary }}
+        run: |
+          cargo test --locked -p verse-simulation \
+            celestial::tests::registry_and_universe_manifest_match_cross_platform_golden_hashes \
+            -- --exact
+          "${GODOT_BIN}" --headless --path apps/native-client \
+            --script res://tests/p15_interest_stream_smoke.gd
+      - name: Measure inherited grounded-locomotion distribution
         if: runner.os == 'Linux'
         env:
           GODOT_BIN: ${{ matrix.godot_binary }}
         run: |
-          benchmark_file="artifacts/release/P0.10-grounded-locomotion-linux.txt"
+          benchmark_file="artifacts/release/P1.5-grounded-locomotion-linux.txt"
           {
-            echo "The Verse P0.10 hosted Linux release distribution"
+            echo "The Verse P1.5 hosted Linux release distribution"
             uname -a
             lscpu
             rustc --version
@@ -103,7 +112,7 @@ jobs:
       - name: Upload native development package
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: the-verse-p0.10.0-${{ matrix.package }}
+          name: the-verse-p1.5.0-${{ matrix.package }}
           path: |
             artifacts/release/*.zip
             artifacts/release/*.tar.gz
