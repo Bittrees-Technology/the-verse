@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 
 /// The only protocol version accepted by this build.
-pub const PROTOCOL_VERSION: u32 = 11;
+pub const PROTOCOL_VERSION: u32 = 12;
 
 /// A stable integer voxel or block coordinate.
 #[derive(
@@ -224,9 +224,16 @@ impl InventoryContents {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum InventoryDomain {
-    Player { player_id: String },
-    Cargo { block_id: String },
-    Dropped { reason: String },
+    Player {
+        player_id: String,
+    },
+    Cargo {
+        block_id: String,
+    },
+    Dropped {
+        reason: String,
+        owner_player_id: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -375,6 +382,7 @@ pub struct PowerSnapshot {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GridSnapshot {
     pub grid_id: String,
+    pub owner_player_id: String,
     pub position: Vec3,
     pub orientation: Quat,
     pub linear_velocity: Vec3,
@@ -706,7 +714,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v11_character_control_contains_jump_but_no_transform_or_time() {
+    fn protocol_v12_character_control_contains_jump_but_no_transform_or_time() {
         let message = ClientMessage::SetPlayerControl {
             operation_id: "player-control-3-41".into(),
             movement_epoch: 3,
@@ -745,8 +753,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v11_exposes_tagged_life_state_and_death_cause() {
-        assert_eq!(PROTOCOL_VERSION, 11);
+    fn protocol_v12_exposes_tagged_life_state_and_death_cause() {
+        assert_eq!(PROTOCOL_VERSION, 12);
         let life_state = PlayerLifeState::Incapacitated {
             death_id: "death-player-local-42".into(),
             cause: PlayerDeathCause::OxygenDepleted,
@@ -765,7 +773,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v11_snapshot_exposes_locomotion_input_oxygen_and_death_drops() {
+    fn protocol_v12_snapshot_exposes_locomotion_input_oxygen_and_death_drops() {
         let death_drop = DeathDropSnapshot {
             drop_id: "drop-player-local-42".into(),
             death_id: "death-player-local-42".into(),
@@ -829,8 +837,8 @@ mod tests {
             }),
         };
         let world = WorldSnapshot {
-            schema_version: 14,
-            content_manifest_version: "p0.10.0".into(),
+            schema_version: 15,
+            content_manifest_version: "p1.1.0".into(),
             universe_id: "the-verse-local".into(),
             cell_id: "cell-origin".into(),
             event_sequence: 42,
@@ -885,7 +893,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v11_hello_separates_authentication_from_gameplay_intents() {
+    fn protocol_v12_hello_separates_authentication_from_gameplay_intents() {
         let hello = ClientMessage::Hello {
             protocol_version: PROTOCOL_VERSION,
             client_name: "native-test".into(),
@@ -909,6 +917,40 @@ mod tests {
         let value = serde_json::to_value(welcome).expect("welcome serializes");
         assert_eq!(value["session_role"]["kind"], "player");
         assert_eq!(value["session_role"]["player_id"], "player-local");
+    }
+
+    #[test]
+    fn protocol_v12_exposes_grid_ownership_and_owner_preserving_drops() {
+        let grid = GridSnapshot {
+            grid_id: "grid-starter".into(),
+            owner_player_id: "player-local".into(),
+            position: Vec3::ZERO,
+            orientation: Quat::IDENTITY,
+            linear_velocity: Vec3::ZERO,
+            angular_velocity: Vec3::ZERO,
+            mass_kg: 1.0,
+            anchored: false,
+            power: PowerSnapshot::default(),
+            blocks: Vec::new(),
+        };
+        let value = serde_json::to_value(&grid).expect("grid snapshot serializes");
+        assert_eq!(value["owner_player_id"], "player-local");
+        assert_eq!(
+            serde_json::from_value::<GridSnapshot>(value).expect("grid snapshot deserializes"),
+            grid
+        );
+
+        let dropped = InventoryDomain::Dropped {
+            reason: "cargo_block_destroyed".into(),
+            owner_player_id: "player-local".into(),
+        };
+        let value = serde_json::to_value(&dropped).expect("drop domain serializes");
+        assert_eq!(value["kind"], "dropped");
+        assert_eq!(value["owner_player_id"], "player-local");
+        assert_eq!(
+            serde_json::from_value::<InventoryDomain>(value).expect("drop domain deserializes"),
+            dropped
+        );
     }
 
     #[test]

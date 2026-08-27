@@ -18,6 +18,7 @@ pub struct ContentManifest {
     pub physics: PhysicsDefinition,
     pub character: CharacterDefinition,
     pub survival: SurvivalDefinition,
+    pub experience_rewards: ExperienceRewards,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -98,6 +99,19 @@ pub struct SurvivalDefinition {
     pub respawn_helmet_closed: bool,
     pub respawn_jetpack_enabled: bool,
     pub proof_recovery_position: Vec3,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExperienceRewards {
+    pub mined_ore_unit: u64,
+    pub refining_batch: u64,
+    pub crafted_component: u64,
+    pub frame_placed: u64,
+    pub construction_completed: u64,
+    pub weld_progress_or_repair: u64,
+    pub inventory_transfer: u64,
+    pub first_anchor_engagement: u64,
+    pub block_damage: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -303,7 +317,7 @@ pub fn manifest() -> &'static ContentManifest {
     MANIFEST.get_or_init(|| {
         let parsed: ContentManifest =
             serde_json::from_str(P0_CONTENT).expect("embedded P0 content must be valid JSON");
-        assert_eq!(parsed.schema_version, 8, "unsupported P0 content schema");
+        assert_eq!(parsed.schema_version, 9, "unsupported P1.1 content schema");
         assert_eq!(
             parsed.license, "AGPL-3.0-or-later",
             "content definition license must be explicit"
@@ -369,8 +383,8 @@ mod tests {
             .map(|definition| format!("{:?}", definition.kind))
             .collect::<BTreeSet<_>>();
         assert_eq!(block_kinds.len(), content.blocks.len());
-        assert_eq!(content.schema_version, 8);
-        assert_eq!(content.manifest_version, "p0.10.0");
+        assert_eq!(content.schema_version, 9);
+        assert_eq!(content.manifest_version, "p1.1.0");
         assert_eq!(content.physics.voxel_collision_chunk_edge_cells, 8);
         assert_eq!(content.survival.suit_oxygen_capacity_milli, 1_000);
         assert_eq!(content.survival.critical_oxygen_milli, 200);
@@ -392,6 +406,15 @@ mod tests {
             content.recipes.component_crafting.refined_input,
             content.recipes.component_crafting.component_output
         );
+        assert_eq!(content.experience_rewards.mined_ore_unit, 5);
+        assert_eq!(content.experience_rewards.refining_batch, 12);
+        assert_eq!(content.experience_rewards.crafted_component, 18);
+        assert_eq!(content.experience_rewards.frame_placed, 5);
+        assert_eq!(content.experience_rewards.construction_completed, 20);
+        assert_eq!(content.experience_rewards.weld_progress_or_repair, 0);
+        assert_eq!(content.experience_rewards.inventory_transfer, 0);
+        assert_eq!(content.experience_rewards.first_anchor_engagement, 40);
+        assert_eq!(content.experience_rewards.block_damage, 0);
     }
 
     #[test]

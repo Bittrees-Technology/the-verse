@@ -622,7 +622,7 @@ mod tests {
             }
             assert!(runtime.state().grids[STARTER_GRID_ID].blocks[&block_id].construction_complete);
             assert_eq!(runtime.state().player.career.blocks_built, 1);
-            assert_eq!(runtime.state().player.experience, 37);
+            assert_eq!(runtime.state().player.experience, 25);
             expected_hash = runtime.state().state_hash();
         }
 
@@ -906,8 +906,8 @@ mod tests {
     }
 
     #[test]
-    fn pre_p0_10_content_manifests_are_rejected_before_replay() {
-        for stored_version in ["p0.8.0", "p0.9.0"] {
+    fn pre_p1_1_content_manifests_are_rejected_before_replay() {
+        for stored_version in ["p0.8.0", "p0.9.0", "p0.10.0"] {
             let directory = tempdir().expect("tempdir");
             drop(Store::open(directory.path(), 41).expect("store"));
             let manifest_path = directory.path().join(MANIFEST_FILE);
@@ -923,7 +923,7 @@ mod tests {
             assert!(matches!(
                 Store::open(directory.path(), 41),
                 Err(PersistenceError::ContentManifestMismatch { stored, runtime })
-                    if stored == stored_version && runtime == "p0.10.0"
+                    if stored == stored_version && runtime == "p1.1.0"
             ));
         }
     }

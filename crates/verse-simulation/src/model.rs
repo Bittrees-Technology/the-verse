@@ -14,7 +14,7 @@ use verse_protocol::{
 
 use crate::content;
 
-pub const WORLD_SCHEMA_VERSION: u32 = 14;
+pub const WORLD_SCHEMA_VERSION: u32 = 15;
 pub const PLAYER_INVENTORY_ID: &str = "inventory-player-local";
 pub const STARTER_GRID_ID: &str = "grid-starter";
 pub const PLANET_CENTER: Vec3 = Vec3::new(900.0, -2_200.0, -3_800.0);
@@ -23,6 +23,14 @@ pub const PLANET_ATMOSPHERE_HEIGHT_M: f64 = 180.0;
 pub const PLANET_SURFACE_GRAVITY_M_S2: f64 = 6.2;
 pub const PLAYER_INVENTORY_CAPACITY_LITERS: u64 = 1_200;
 pub const CARGO_INVENTORY_CAPACITY_LITERS: u64 = 8_000;
+
+pub fn valid_player_id(player_id: &str) -> bool {
+    !player_id.is_empty()
+        && player_id.len() <= 128
+        && player_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
 
 pub fn radial_up(position: Vec3) -> Vec3 {
     let radial = position - PLANET_CENTER;
@@ -462,6 +470,11 @@ impl Block {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Grid {
     pub grid_id: String,
+    pub owner_player_id: String,
+    /// One non-duplicable opportunity for the grid lineage to award its first
+    /// successful anchor engagement. A split may preserve this only on its
+    /// deterministic primary fragment.
+    pub anchor_reward_eligible: bool,
     pub position: Vec3,
     pub orientation: Quat,
     pub linear_velocity: Vec3,
@@ -611,17 +624,21 @@ impl WorldState {
     }
 
     pub fn validate_player_roster(&self) -> Result<(), String> {
+        if self.schema_version != WORLD_SCHEMA_VERSION {
+            return Err(format!(
+                "world schema {} does not match required schema {WORLD_SCHEMA_VERSION}",
+                self.schema_version
+            ));
+        }
+        if self.content_manifest_version != content::manifest().manifest_version {
+            return Err("world content manifest does not match the active rules".into());
+        }
         self.player.validate().map_err(str::to_owned)?;
         let mut inventory_ids = BTreeSet::new();
         let finite_vec =
             |value: Vec3| value.x.is_finite() && value.y.is_finite() && value.z.is_finite();
         for (player_id, player) in self.player.iter() {
-            if player_id.is_empty()
-                || player_id.len() > 128
-                || !player_id
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-            {
+            if !valid_player_id(player_id) {
                 return Err(
                     "player IDs must be 1-128 ASCII letters, numbers, dots, hyphens, or underscores"
                         .into(),
@@ -673,7 +690,231 @@ impl WorldState {
                 );
             }
         }
+        self.validate_authority_graph()?;
         Ok(())
+    }
+
+    /// Validates every durable ownership edge independently of active session
+    /// state. Grid and drop owners are permitted to be offline, but their IDs,
+    /// inventory linkage, and asset identities remain canonical.
+    pub fn validate_authority_graph(&self) -> Result<(), String> {
+        let finite_vec =
+            |value: Vec3| value.x.is_finite() && value.y.is_finite() && value.z.is_finite();
+        let normalized_quat = |orientation: Quat| {
+            let length_squared = f64::from(orientation.x).mul_add(
+                f64::from(orientation.x),
+                f64::from(orientation.y).mul_add(
+                    f64::from(orientation.y),
+                    f64::from(orientation.z).mul_add(
+                        f64::from(orientation.z),
+                        f64::from(orientation.w) * f64::from(orientation.w),
+                    ),
+                ),
+            );
+            orientation.is_finite() && (length_squared - 1.0).abs() <= 1.0e-3
+        };
+
+        let mut global_block_ids = BTreeSet::new();
+        let mut cargo_inventory_by_block = BTreeMap::new();
+        for (grid_id, grid) in &self.grids {
+            if grid_id != &grid.grid_id || grid_id.trim().is_empty() {
+                return Err("grid map keys must match nonempty canonical grid IDs".into());
+            }
+            if !valid_player_id(&grid.owner_player_id) {
+                return Err("every grid must retain one syntactically valid player owner".into());
+            }
+            if !finite_vec(grid.position)
+                || !finite_vec(grid.linear_velocity)
+                || !finite_vec(grid.angular_velocity)
+                || !finite_vec(grid.control_linear_input)
+                || !finite_vec(grid.control_angular_input)
+                || !normalized_quat(grid.orientation)
+            {
+                return Err("grid kinematics and controls must be finite and normalized".into());
+            }
+            if grid.anchored && !grid.anchor_touches(&self.voxels) {
+                return Err(
+                    "an anchored grid must retain a completed voxel-touching anchor".into(),
+                );
+            }
+
+            let mut coordinates = BTreeSet::new();
+            for (block_id, block) in &grid.blocks {
+                if block_id != &block.block_id || block_id.trim().is_empty() {
+                    return Err("block map keys must match nonempty canonical block IDs".into());
+                }
+                if !global_block_ids.insert(block_id.as_str()) {
+                    return Err("block IDs must be globally unique across all grids".into());
+                }
+                if !coordinates.insert(block.coordinate) {
+                    return Err("a grid cannot contain two blocks at one coordinate".into());
+                }
+                let definition = content::block(block.kind);
+                if block.orientation > 3
+                    || block.component_cost != definition.component_cost
+                    || block.health == 0
+                    || block.health > definition.max_health
+                {
+                    return Err(
+                        "blocks must retain canonical orientation, cost, and positive integrity"
+                            .into(),
+                    );
+                }
+                match (block.kind, &block.inventory_id) {
+                    (BlockKind::Cargo, Some(inventory_id)) => {
+                        if cargo_inventory_by_block
+                            .insert(block_id.clone(), inventory_id.clone())
+                            .is_some()
+                        {
+                            return Err("a cargo block may own only one inventory".into());
+                        }
+                    }
+                    (BlockKind::Cargo, None) => {
+                        return Err("every cargo block must retain its inventory identity".into());
+                    }
+                    (_, Some(_)) => {
+                        return Err("only cargo blocks may reference an inventory".into());
+                    }
+                    (_, None) => {}
+                }
+            }
+        }
+
+        for (inventory_id, inventory) in &self.inventories {
+            if inventory_id != &inventory.inventory_id
+                || inventory_id.trim().is_empty()
+                || inventory.capacity_liters == 0
+                || inventory.used_liters() > inventory.capacity_liters
+            {
+                return Err(
+                    "inventory keys, identities, capacity, and contents must remain canonical"
+                        .into(),
+                );
+            }
+            match &inventory.domain {
+                InventoryDomain::Player { player_id } => {
+                    let player = self.player.get(player_id).ok_or_else(|| {
+                        "player inventory domains must reference a canonical player".to_owned()
+                    })?;
+                    if player.inventory_id != *inventory_id {
+                        return Err(
+                            "player inventory domains must match the player's carried inventory"
+                                .into(),
+                        );
+                    }
+                }
+                InventoryDomain::Cargo { block_id } => {
+                    if cargo_inventory_by_block.get(block_id) != Some(inventory_id) {
+                        return Err(
+                            "cargo inventories require one bidirectional live cargo-block link"
+                                .into(),
+                        );
+                    }
+                }
+                InventoryDomain::Dropped {
+                    reason,
+                    owner_player_id,
+                } => {
+                    if reason.trim().is_empty() || !valid_player_id(owner_player_id) {
+                        return Err(
+                            "dropped inventories must retain a reason and valid prior owner".into(),
+                        );
+                    }
+                }
+            }
+        }
+
+        for (block_id, inventory_id) in &cargo_inventory_by_block {
+            let inventory = self.inventories.get(inventory_id).ok_or_else(|| {
+                "every cargo block must reference one existing inventory".to_owned()
+            })?;
+            if inventory.domain
+                != (InventoryDomain::Cargo {
+                    block_id: block_id.clone(),
+                })
+            {
+                return Err("cargo block and inventory ownership links must agree".into());
+            }
+        }
+
+        let mut dropped_inventory_ids = BTreeSet::new();
+        for (drop_id, drop) in &self.death_drops {
+            if drop_id != &drop.drop_id
+                || drop_id.trim().is_empty()
+                || drop.death_id.trim().is_empty()
+                || !valid_player_id(&drop.owner_player_id)
+                || !finite_vec(drop.position)
+                || drop.created_event_sequence > self.event_sequence
+                || !dropped_inventory_ids.insert(drop.inventory_id.as_str())
+            {
+                return Err(
+                    "death-drop identity, owner, position, and sequence must be valid".into(),
+                );
+            }
+            let inventory = self.inventories.get(&drop.inventory_id).ok_or_else(|| {
+                "every death drop must reference one existing sealed inventory".to_owned()
+            })?;
+            match &inventory.domain {
+                InventoryDomain::Dropped {
+                    owner_player_id, ..
+                } if owner_player_id == &drop.owner_player_id => {}
+                _ => {
+                    return Err(
+                        "death-drop inventory domain must preserve the death-drop owner".into(),
+                    );
+                }
+            }
+        }
+
+        for (actor_player_id, operations) in &self.processed_operations {
+            if !valid_player_id(actor_player_id) {
+                return Err(
+                    "operation namespaces require syntactically valid player actors".into(),
+                );
+            }
+            for (operation_id, receipt) in operations {
+                if operation_id.trim().is_empty()
+                    || operation_id.len() > 128
+                    || receipt.operation_id != *operation_id
+                    || receipt.event_sequence > self.event_sequence
+                {
+                    return Err(
+                        "processed operation receipts must retain canonical identity".into(),
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolves the durable economic owner without caching cargo ownership in
+    /// two mutable places. Dropped inventories preserve the owner captured at
+    /// the moment their live player or grid linkage ended.
+    pub fn inventory_owner_player_id(&self, inventory_id: &str) -> Result<&str, String> {
+        let inventory = self
+            .inventories
+            .get(inventory_id)
+            .ok_or_else(|| format!("inventory {inventory_id} does not exist"))?;
+        match &inventory.domain {
+            InventoryDomain::Player { player_id } => Ok(player_id),
+            InventoryDomain::Dropped {
+                owner_player_id, ..
+            } => Ok(owner_player_id),
+            InventoryDomain::Cargo { block_id } => {
+                let mut owner = None;
+                for grid in self.grids.values() {
+                    if grid.blocks.contains_key(block_id) {
+                        if owner.is_some() {
+                            return Err(format!(
+                                "cargo block {block_id} is linked from multiple grids"
+                            ));
+                        }
+                        owner = Some(grid.owner_player_id.as_str());
+                    }
+                }
+                owner.ok_or_else(|| format!("cargo inventory {inventory_id} has no live owner"))
+            }
+        }
     }
 
     pub fn genesis(seed: u64) -> Self {
@@ -750,6 +991,8 @@ impl WorldState {
 
         let grid = Grid {
             grid_id: STARTER_GRID_ID.into(),
+            owner_player_id: "player-local".into(),
+            anchor_reward_eligible: true,
             position: Vec3::new(11.0, 0.0, 0.0),
             orientation: Quat::IDENTITY,
             linear_velocity: Vec3::ZERO,
@@ -913,6 +1156,7 @@ impl WorldState {
             .values()
             .map(|grid| GridSnapshot {
                 grid_id: grid.grid_id.clone(),
+                owner_player_id: grid.owner_player_id.clone(),
                 position: grid.position,
                 orientation: grid.orientation,
                 linear_velocity: grid.linear_velocity,
@@ -1119,7 +1363,16 @@ mod tests {
     fn genesis_is_conserved_and_playable() {
         let world = WorldState::genesis(7);
         assert!(world.conservation().valid);
+        assert!(world.validate_player_roster().is_ok());
         assert_eq!(world.grids[STARTER_GRID_ID].blocks.len(), 25);
+        assert_eq!(world.grids[STARTER_GRID_ID].owner_player_id, "player-local");
+        assert!(world.grids[STARTER_GRID_ID].anchor_reward_eligible);
+        assert_eq!(
+            world
+                .inventory_owner_player_id("inventory-cargo-starter")
+                .unwrap(),
+            "player-local"
+        );
         assert!(world.grids[STARTER_GRID_ID].power().online);
         assert!(world.voxels.occupied.len() > 1_000);
         assert!(world.voxels.occupied.contains(&IVec3::new(8, 0, 0)));
@@ -1128,8 +1381,95 @@ mod tests {
         let snapshot = world.snapshot();
         assert_eq!(snapshot.players.len(), 1);
         assert_eq!(snapshot.players[0], snapshot.player);
+        assert_eq!(snapshot.grids[0].owner_player_id, "player-local");
         let persisted = serde_json::to_value(&world).expect("world serializes");
         assert!(persisted.get("players").is_some());
         assert!(persisted.get("player").is_none());
+    }
+
+    #[test]
+    fn cargo_owner_is_derived_from_its_containing_grid() {
+        let mut world = WorldState::genesis(7);
+        world
+            .grids
+            .get_mut(STARTER_GRID_ID)
+            .unwrap()
+            .owner_player_id = "player-remote".into();
+
+        assert_eq!(
+            world
+                .inventory_owner_player_id("inventory-cargo-starter")
+                .unwrap(),
+            "player-remote"
+        );
+        assert!(world.validate_authority_graph().is_ok());
+    }
+
+    #[test]
+    fn authority_graph_rejects_duplicate_blocks_and_broken_cargo_links() {
+        let mut duplicate = WorldState::genesis(7);
+        let block = duplicate.grids[STARTER_GRID_ID].blocks["block-core"].clone();
+        let mut second = duplicate.grids[STARTER_GRID_ID].clone();
+        second.grid_id = "grid-duplicate".into();
+        second.position = Vec3::new(100.0, 0.0, 0.0);
+        second.blocks = BTreeMap::from([(block.block_id.clone(), block)]);
+        duplicate.grids.insert(second.grid_id.clone(), second);
+        assert_eq!(
+            duplicate.validate_authority_graph().unwrap_err(),
+            "block IDs must be globally unique across all grids"
+        );
+
+        let mut broken = WorldState::genesis(7);
+        broken
+            .inventories
+            .get_mut("inventory-cargo-starter")
+            .unwrap()
+            .domain = InventoryDomain::Cargo {
+            block_id: "block-missing".into(),
+        };
+        assert_eq!(
+            broken.validate_authority_graph().unwrap_err(),
+            "cargo inventories require one bidirectional live cargo-block link"
+        );
+    }
+
+    #[test]
+    fn dropped_inventories_retain_a_valid_prior_owner() {
+        let mut world = WorldState::genesis(7);
+        world.inventories.insert(
+            "inventory-destroyed-cargo".into(),
+            InventoryRecord {
+                inventory_id: "inventory-destroyed-cargo".into(),
+                domain: InventoryDomain::Dropped {
+                    reason: "cargo_block_destroyed".into(),
+                    owner_player_id: "player-remote".into(),
+                },
+                contents: InventoryContents::default(),
+                capacity_liters: CARGO_INVENTORY_CAPACITY_LITERS,
+            },
+        );
+        assert_eq!(
+            world
+                .inventory_owner_player_id("inventory-destroyed-cargo")
+                .unwrap(),
+            "player-remote"
+        );
+        assert!(world.validate_authority_graph().is_ok());
+
+        let InventoryDomain::Dropped {
+            owner_player_id, ..
+        } = &mut world
+            .inventories
+            .get_mut("inventory-destroyed-cargo")
+            .unwrap()
+            .domain
+        else {
+            unreachable!();
+        };
+        owner_player_id.clear();
+        assert_eq!(
+            world.validate_authority_graph().unwrap_err(),
+            "dropped inventories must retain a reason and valid prior owner"
+        );
     }
 }

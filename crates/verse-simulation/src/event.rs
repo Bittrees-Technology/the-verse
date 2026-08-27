@@ -9,7 +9,7 @@ use verse_protocol::{
 use crate::model::{Block, ContactPairKey, DeathDrop, InventoryRecord};
 
 pub const EVENT_SCHEMA_NAME: &str = "verse.world_event";
-pub const EVENT_SCHEMA_VERSION: u32 = 10;
+pub const EVENT_SCHEMA_VERSION: u32 = 11;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event_type", rename_all = "snake_case")]
@@ -73,6 +73,7 @@ pub enum EventPayload {
     },
     BlockBuilt {
         grid_id: String,
+        component_inventory_id: String,
         block: Block,
     },
     BlockWelded {
@@ -92,6 +93,7 @@ pub enum EventPayload {
     GridAnchorSet {
         grid_id: String,
         anchored: bool,
+        reward_credited: bool,
     },
     BlockDamaged {
         grid_id: String,
@@ -163,33 +165,37 @@ pub enum PhysicsContactPhase {
 
 impl EventPayload {
     pub fn experience_reward(&self) -> u64 {
+        let rewards = &crate::content::manifest().experience_rewards;
         match self {
-            Self::VoxelMined { ore_yield, .. } => ore_yield * 5,
-            Self::OreRefined { batches, .. } => batches * 12,
-            Self::ComponentCrafted { quantity, .. } => quantity * 18,
-            Self::InventoryTransferred { .. } => 2,
-            Self::BlockBuilt { .. } => 5,
+            Self::VoxelMined { ore_yield, .. } => ore_yield.saturating_mul(rewards.mined_ore_unit),
+            Self::OreRefined { batches, .. } => batches.saturating_mul(rewards.refining_batch),
+            Self::ComponentCrafted { quantity, .. } => {
+                quantity.saturating_mul(rewards.crafted_component)
+            }
+            Self::InventoryTransferred { .. } => rewards.inventory_transfer,
+            Self::BlockBuilt { .. } => rewards.frame_placed,
             Self::BlockWelded {
                 completed_construction,
                 ..
             } => {
                 if *completed_construction {
-                    20
+                    rewards.construction_completed
                 } else {
-                    6
+                    rewards.weld_progress_or_repair
                 }
             }
-            Self::GridAnchorSet { anchored: true, .. } => 40,
-            Self::BlockDamaged { .. } => 3,
+            Self::GridAnchorSet {
+                reward_credited: true,
+                ..
+            } => rewards.first_anchor_engagement,
+            Self::BlockDamaged { .. } => rewards.block_damage,
             Self::PlayerControlSet { .. }
             | Self::SuitModeChanged { .. }
             | Self::SuitOxygenChanged { .. }
             | Self::PlayerIncapacitated { .. }
             | Self::PlayerRespawned { .. }
             | Self::GridControlSet { .. }
-            | Self::GridAnchorSet {
-                anchored: false, ..
-            }
+            | Self::GridAnchorSet { .. }
             | Self::PhysicsStepCommitted { .. } => 0,
         }
     }
@@ -396,7 +402,7 @@ mod tests {
     fn event_hash_detects_payload_tampering() {
         let mut event = CanonicalEvent::new(
             1,
-            "p0.10.0",
+            "p1.1.0",
             "universe",
             "cell",
             9,
@@ -427,5 +433,44 @@ mod tests {
             expires_at_simulation_tick: 18,
         };
         assert!(!event.hash_is_valid());
+    }
+
+    #[test]
+    fn p11_rewards_close_repeatable_work_loops() {
+        let transfer = EventPayload::InventoryTransferred {
+            source_inventory_id: "suit".into(),
+            destination_inventory_id: "cargo".into(),
+            resource: ResourceKind::Ore,
+            quantity: 1,
+        };
+        let repair = EventPayload::BlockWelded {
+            grid_id: "grid".into(),
+            block_id: "block".into(),
+            previous_health: 50,
+            new_health: 75,
+            max_health: 100,
+            completed_construction: false,
+        };
+        let damage = EventPayload::BlockDamaged {
+            grid_id: "grid".into(),
+            block_id: "block".into(),
+            damage: 35,
+        };
+        let anchor = EventPayload::GridAnchorSet {
+            grid_id: "grid".into(),
+            anchored: true,
+            reward_credited: true,
+        };
+        let repeated_anchor = EventPayload::GridAnchorSet {
+            grid_id: "grid".into(),
+            anchored: true,
+            reward_credited: false,
+        };
+
+        assert_eq!(transfer.experience_reward(), 0);
+        assert_eq!(repair.experience_reward(), 0);
+        assert_eq!(damage.experience_reward(), 0);
+        assert_eq!(anchor.experience_reward(), 40);
+        assert_eq!(repeated_anchor.experience_reward(), 0);
     }
 }
