@@ -10,12 +10,12 @@ This checkpoint targets F-005, F-006, F-007, and F-010 and the acceptance eviden
 
 ## Authority contract
 
-1. Grid clients submit bounded control, tool, and construction intents. They never submit a grid pose, velocity, contact, damage amount, or split result. Input-only character control is specified separately by [ADR-0013](../decisions/ADR-0013-input-only-authoritative-character-motion.md); until P0.9 is implemented, the current client still proposes a collision-checked absolute character position.
+1. Grid clients submit bounded control, tool, and construction intents. They never submit a grid pose, velocity, contact, damage amount, or split result. P0.9 folds input-only EVA, landing/contact, and rotation into the same atomic `PhysicsStepCommitted` event under [ADR-0013](../decisions/ADR-0013-input-only-authoritative-character-motion.md); until it is implemented, the current client still proposes a collision-checked absolute character position.
 2. The server owns collision shapes, mass, inertia, friction, restitution, force application, anchoring, contact damage, and grid separation.
 3. Completed blocks and physical inventory contribute to body mass. Incomplete frames are represented consistently but do not gain completed functional behavior.
 4. Static voxel collision is derived from canonical occupied cells. Content pins 8×8×8-cell collision chunks with Euclidean floor ownership, stable chunk-body and cell-collider identities, and chunk-local child poses. Accepted mining atomically replaces only the owning collision body under [ADR-0011](../decisions/ADR-0011-dirty-voxel-collision-chunks.md).
 5. Anchoring converts a valid voxel-connected grid to an immovable body. Removing its final valid anchor returns it to dynamic eligibility without teleporting it.
-6. Player motion is swept or subdivided against authoritative voxel and grid volumes so a series of individually valid intents cannot tunnel through matter.
+6. Current player-position proposals are swept or subdivided against authoritative voxel and grid volumes. P0.9 replaces that path with a dynamic Jolt sphere using `LinearCast` motion quality and commits its optional `PlayerPhysicsOutcome` atomically with grid physics. Walking and jump remain P0.10-or-later work.
 
 ## Fixed-step contract
 
