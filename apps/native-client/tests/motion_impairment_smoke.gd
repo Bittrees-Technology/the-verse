@@ -20,13 +20,14 @@ func _run() -> void:
 	_test_bound_player_roster_selection()
 	_test_short_roll_taps_and_idle_silence()
 	_test_exact_tool_targeting()
+	_test_actor_owned_industry_selection()
 	if not failures.is_empty():
 		for failure in failures:
 			printerr("VERSE_NATIVE_IMPAIRMENT_FAILED %s" % failure)
 		quit(1)
 		return
 	print(
-		"VERSE_NATIVE_IMPAIRMENT_OK queued_ack=ordered motion=monotonic corrections=bounded menu=neutral_prediction lifecycle=reset buffers=bounded roll_tap=durable idle=silent rebuild=none targeting=closest_hit"
+		"VERSE_NATIVE_IMPAIRMENT_OK queued_ack=ordered motion=monotonic corrections=bounded menu=neutral_prediction lifecycle=reset buffers=bounded roll_tap=durable idle=silent rebuild=none targeting=closest_hit ownership=filtered"
 	)
 	quit(0)
 
@@ -374,29 +375,228 @@ func _test_exact_tool_targeting() -> void:
 	client.free()
 
 
+func _test_actor_owned_industry_selection() -> void:
+	var client := _new_client()
+	var local := _base_player()
+	local["player_id"] = "player-local"
+	local["inventory_id"] = "inventory-player-local"
+	var remote := _base_player()
+	remote["player_id"] = "player-remote"
+	remote["inventory_id"] = "inventory-player-remote"
+	client.set("bound_player_id", "player-remote")
+
+	var local_cargo := _target_block(
+		"block-cargo-local", Vector3i.ZERO, "cargo", "inventory-cargo-local"
+	)
+	var remote_cargo_a := _target_block(
+		"block-cargo-a", Vector3i.ZERO, "cargo", "inventory-cargo-a"
+	)
+	var remote_cargo_z := _target_block(
+		"block-cargo-z", Vector3i.ZERO, "cargo", "inventory-cargo-z"
+	)
+	var unfinished_cargo := _target_block(
+		"block-cargo-frame", Vector3i.ZERO, "cargo", "inventory-cargo-frame", false
+	)
+	var ambiguous_cargo_first := _target_block(
+		"block-cargo-ambiguous", Vector3i.ZERO, "cargo", "inventory-cargo-ambiguous"
+	)
+	var ambiguous_cargo_second := ambiguous_cargo_first.duplicate(true)
+	var grid_local := _target_grid(
+		"grid-local", Vector3.ZERO, Quaternion.IDENTITY, [local_cargo], "player-local"
+	)
+	var grid_remote_a := _target_grid(
+		"grid-remote-a", Vector3.ZERO, Quaternion.IDENTITY, [remote_cargo_a], "player-remote"
+	)
+	var grid_remote_z := _target_grid(
+		"grid-remote-z", Vector3.ZERO, Quaternion.IDENTITY, [remote_cargo_z], "player-remote"
+	)
+	var grid_remote_frame := _target_grid(
+		"grid-remote-frame", Vector3.ZERO, Quaternion.IDENTITY,
+		[unfinished_cargo], "player-remote"
+	)
+	var grid_ambiguous_a := _target_grid(
+		"grid-ambiguous-a", Vector3.ZERO, Quaternion.IDENTITY,
+		[ambiguous_cargo_first], "player-remote"
+	)
+	var grid_ambiguous_b := _target_grid(
+		"grid-ambiguous-b", Vector3.ZERO, Quaternion.IDENTITY,
+		[ambiguous_cargo_second], "player-remote"
+	)
+	var grids := [
+		grid_remote_z,
+		grid_local,
+		grid_remote_frame,
+		grid_ambiguous_b,
+		grid_remote_a,
+		grid_ambiguous_a,
+	]
+	client.set("grid_lookup", {
+		"grid-remote-z": grid_remote_z,
+		"grid-local": grid_local,
+		"grid-remote-frame": grid_remote_frame,
+		"grid-ambiguous-b": grid_ambiguous_b,
+		"grid-remote-a": grid_remote_a,
+		"grid-ambiguous-a": grid_ambiguous_a,
+	})
+	var authoritative: Dictionary = client.get("snapshot")
+	authoritative["player"] = remote
+	authoritative["players"] = [local, remote]
+	authoritative["grids"] = grids
+	authoritative["inventories"] = [
+		_inventory_snapshot("inventory-cargo-z", "cargo", "block-cargo-z"),
+		_inventory_snapshot("inventory-cargo-local", "cargo", "block-cargo-local"),
+		_inventory_snapshot("inventory-player-remote", "player", "player-remote"),
+		_inventory_snapshot("inventory-cargo-frame", "cargo", "block-cargo-frame"),
+		_inventory_snapshot("inventory-cargo-a", "cargo", "block-cargo-a"),
+		_inventory_snapshot("inventory-cargo-ambiguous", "cargo", "block-cargo-ambiguous"),
+		_inventory_snapshot("inventory-player-local", "player", "player-local"),
+	]
+	client.set("snapshot", authoritative)
+
+	var candidates: Array = client.call("_owned_cargo_candidates")
+	_check(candidates.size() == 2, "only completed uniquely bound owned cargo is selectable")
+	_check(
+		candidates.size() == 2
+		and String(candidates[0].get("inventory_id", "")) == "inventory-cargo-a"
+		and String(candidates[1].get("inventory_id", "")) == "inventory-cargo-z",
+		"owned cargo selection has stable grid and block order"
+	)
+	client.set("selected_cargo_inventory_id", "inventory-cargo-z")
+	client.set("target_block", {})
+	client.call("_refresh_owned_cargo_selection")
+	_check(
+		String(client.get("selected_cargo_inventory_id")) == "inventory-cargo-z",
+		"valid explicit cargo selection is preserved"
+	)
+	client.set("target_block", {
+		"grid_id": "grid-remote-a", "grid": grid_remote_a, "block": remote_cargo_a,
+	})
+	client.call("_refresh_owned_cargo_selection")
+	_check(
+		String(client.get("selected_cargo_inventory_id")) == "inventory-cargo-a",
+		"targeted owned grid cargo is preferred"
+	)
+	client.set("target_block", {
+		"grid_id": "grid-local", "grid": grid_local, "block": local_cargo,
+	})
+	_check(not bool(client.call("_target_grid_owned_by_local")), "foreign target is locked")
+	_check(
+		String(client.call("_owned_grid_for_command", false)).is_empty(),
+		"foreign target never falls back to an owned grid"
+	)
+	client.call("_refresh_owned_cargo_selection")
+	_check(
+		String(client.get("selected_cargo_inventory_id")) == "inventory-cargo-a",
+		"foreign target cannot select its cargo or displace owned cargo"
+	)
+	client.set("target_block", {})
+	_check(
+		String(client.call("_owned_grid_for_command", false)) == "grid-ambiguous-a",
+		"no target uses the first stable owned grid"
+	)
+
+	client.set("active_grid_control_id", "grid-remote-z")
+	client.set("target_block", {
+		"grid_id": "grid-local", "grid": grid_local, "block": local_cargo,
+	})
+	_check(
+		String(client.call("_take_active_grid_control_id")) == "grid-remote-z",
+		"grid release uses the exact press-latched grid despite target changes"
+	)
+	_check(String(client.get("active_grid_control_id")).is_empty(), "grid release clears latch")
+
+	var transfer_button := Button.new()
+	var cargo_selector := OptionButton.new()
+	var cargo_title := Label.new()
+	var cargo_subtitle := Label.new()
+	client.add_child(transfer_button)
+	client.add_child(cargo_selector)
+	client.add_child(cargo_title)
+	client.add_child(cargo_subtitle)
+	var transfer_buttons: Array = client.get("inventory_transfer_buttons")
+	transfer_buttons.append(transfer_button)
+	client.set("inventory_selectors", {"cargo": cargo_selector})
+	client.set("inventory_title_labels", {"cargo": cargo_title})
+	client.set("inventory_subtitle_labels", {"cargo": cargo_subtitle})
+	var available_candidates: Array = client.call("_refresh_owned_cargo_selection")
+	client.call("_update_cargo_inventory_selector", available_candidates)
+	_check(not transfer_button.disabled, "authorized cargo enables transfer controls")
+	_check(not cargo_selector.disabled, "authorized cargo enables cargo selector")
+	_check(cargo_selector.item_count == 2, "selector exposes all authorized cargo links")
+	_check(
+		String(cargo_selector.get_item_metadata(cargo_selector.selected))
+		== "inventory-cargo-a",
+		"selector identifies the preserved authorized cargo link"
+	)
+	_check(cargo_title.text == "GRID-REMOTE-A", "authorized cargo identifies its owned grid")
+	_check(
+		cargo_subtitle.text == "AUTHORIZED CARGO // block-cargo-a",
+		"authorized cargo identifies its containing block"
+	)
+	client.set("bound_player_id", "player-without-assets")
+	var empty_candidates: Array = client.call("_refresh_owned_cargo_selection")
+	client.call("_update_cargo_inventory_selector", empty_candidates)
+	_check(empty_candidates.is_empty(), "player without assets has no cargo candidates")
+	_check(transfer_button.disabled, "no cargo disables transfer controls")
+	_check(cargo_selector.disabled, "no cargo disables cargo selector")
+	_check(
+		cargo_title.text == "NO AUTHORIZED CARGO LINK",
+		"no cargo presents the explicit authorization state"
+	)
+	client.free()
+
+
+func _inventory_snapshot(
+	inventory_id: String, domain_kind: String, owner_id: String
+) -> Dictionary:
+	var domain := {"kind": domain_kind}
+	if domain_kind == "cargo":
+		domain["block_id"] = owner_id
+	else:
+		domain["player_id"] = owner_id
+	return {
+		"inventory_id": inventory_id,
+		"domain": domain,
+		"contents": {"ore": 0, "refined_material": 0, "components": 0},
+		"capacity_liters": 100,
+		"used_liters": 0,
+		"mass_grams": 0,
+	}
+
+
 func _target_grid(
 	_grid_id: String,
 	position: Vector3,
 	orientation: Quaternion,
-	blocks: Array
+	blocks: Array,
+	owner_player_id := ""
 ) -> Dictionary:
 	return {
+		"grid_id": _grid_id,
+		"owner_player_id": owner_player_id,
 		"position": _protocol_vec3(position),
 		"orientation": _protocol_quat(orientation),
 		"blocks": blocks,
 	}
 
 
-func _target_block(block_id: String, coordinate: Vector3i) -> Dictionary:
+func _target_block(
+	block_id: String,
+	coordinate: Vector3i,
+	kind := "structural",
+	inventory_id := "",
+	construction_complete := true
+) -> Dictionary:
 	return {
 		"block_id": block_id,
 		"coordinate": {
 			"x": coordinate.x, "y": coordinate.y, "z": coordinate.z,
 		},
-		"kind": "structural",
+		"kind": kind,
 		"health": 100,
 		"max_health": 100,
-		"construction_complete": true,
+		"construction_complete": construction_complete,
+		"inventory_id": inventory_id,
 	}
 
 
