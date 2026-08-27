@@ -1966,7 +1966,7 @@ impl WorldState {
                     .as_deref()
                     .is_none_or(|player_id| !self.player.by_id.contains_key(player_id))
                     || event.operation_id.as_deref().is_none_or(|operation_id| {
-                        operation_id.is_empty() || operation_id.len() > 128
+                        operation_id.trim().is_empty() || operation_id.len() > 128
                     })
                     || event
                         .operation_sequence
@@ -6043,6 +6043,35 @@ mod tests {
         ));
         assert!(runtime.is_halted());
         assert_eq!(runtime.state().event_sequence, 0);
+    }
+
+    #[test]
+    fn replay_rejects_trim_empty_operation_id_before_any_state_mutation() {
+        let state = WorldState::genesis(151);
+        let mut event = state
+            .prepare_client_event(&sequenced_suit_message(1, "canonical-id", false))
+            .expect("canonical suit event prepares");
+        let whitespace_message = sequenced_suit_message(1, " \t ", false);
+        event.operation_id = Some(" \t ".into());
+        event.intent_fingerprint = Some(
+            state
+                .client_intent_fingerprint("player-local", &whitespace_message)
+                .expect("typed whitespace operation ID fingerprints"),
+        );
+        event.event_hash = event.calculate_hash();
+
+        let mut candidate = state.clone();
+        let before = candidate.clone();
+        let before_bytes = serde_json::to_vec(&candidate).expect("canonical state serializes");
+        let error = candidate
+            .apply_event(&event)
+            .expect_err("trim-empty replay operation ID rejects");
+        assert_eq!(error.code(), "replay_actor_envelope_invalid");
+        assert_eq!(candidate, before);
+        assert_eq!(
+            serde_json::to_vec(&candidate).expect("rejected state serializes"),
+            before_bytes
+        );
     }
 
     fn move_player_near_grid(runtime: &mut Runtime) {

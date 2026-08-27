@@ -693,6 +693,9 @@ impl WorldState {
             || record.operation_id.len() > 128
             || !valid_blake3_hex(&record.intent_fingerprint)
             || record.receipt.operation_id != record.operation_id
+            || record.receipt.event_sequence == 0
+            || record.receipt.event_sequence < record.receipt.operation_sequence
+            || record.receipt.event_sequence > self.event_sequence
             || record.receipt.code.trim().is_empty()
         {
             return Err("processed operation record identity is invalid".into());
@@ -710,6 +713,15 @@ impl WorldState {
                 "operation sequence {} does not match expected {expected}",
                 record.receipt.operation_sequence
             ));
+        }
+        if history
+            .retained
+            .last_key_value()
+            .is_some_and(|(_, prior)| prior.receipt.event_sequence >= record.receipt.event_sequence)
+        {
+            return Err(
+                "processed operation receipt event sequences must advance monotonically".into(),
+            );
         }
         history.committed_through = expected;
         history.retained.insert(expected, record);
@@ -981,13 +993,10 @@ impl WorldState {
             if !valid_player_id(actor_player_id) || self.player.get(actor_player_id).is_none() {
                 return Err("operation namespaces require present canonical player actors".into());
             }
-            let retained_bytes = history
-                .retained
-                .values()
-                .map(processed_operation_record_bytes)
-                .fold(0_usize, usize::saturating_add);
+            let retained_bytes = processed_operation_retained_bytes(&history.retained);
             if history.committed_through == 0
                 || history.compacted_through > history.committed_through
+                || history.committed_through > self.event_sequence
                 || history.retained.len() > PROCESSED_OPERATION_RETENTION_LIMIT
                 || retained_bytes > PROCESSED_OPERATION_RETAINED_BYTES_LIMIT
                 || (history.compacted_through == 0 && !history.compacted_history_hash.is_empty())
@@ -997,6 +1006,7 @@ impl WorldState {
                 return Err("operation history bounds and commitment must remain canonical".into());
             }
             let mut last_seen = history.compacted_through;
+            let mut last_receipt_event_sequence = 0;
             for (operation_sequence, record) in &history.retained {
                 let expected_sequence = last_seen
                     .checked_add(1)
@@ -1009,12 +1019,16 @@ impl WorldState {
                         > PROCESSED_OPERATION_RECORD_BYTES_LIMIT
                     || record.receipt.operation_sequence != *operation_sequence
                     || record.receipt.operation_id != record.operation_id
+                    || record.receipt.event_sequence == 0
+                    || record.receipt.event_sequence < *operation_sequence
+                    || record.receipt.event_sequence <= last_receipt_event_sequence
                     || record.receipt.event_sequence > self.event_sequence
                     || record.receipt.code.trim().is_empty()
                 {
                     return Err("processed operations must form one bounded contiguous suffix with canonical receipts and fingerprints".into());
                 }
                 last_seen = *operation_sequence;
+                last_receipt_event_sequence = record.receipt.event_sequence;
             }
             if last_seen != history.committed_through {
                 return Err(
@@ -1440,13 +1454,18 @@ fn processed_operation_record_bytes(record: &ProcessedOperationRecord) -> usize 
         .len()
 }
 
+/// Canonical byte budget for the retained suffix. Serializing the complete map
+/// includes operation-sequence keys and collection delimiters as well as every
+/// record, so validation and compaction measure exactly the same representation.
+fn processed_operation_retained_bytes(retained: &BTreeMap<u64, ProcessedOperationRecord>) -> usize {
+    serde_json::to_vec(retained)
+        .expect("canonical processed operation retained map serializes")
+        .len()
+}
+
 fn operation_history_crosses_retention_bound(history: &ActorOperationHistory) -> bool {
     history.retained.len() > PROCESSED_OPERATION_RETENTION_LIMIT
-        || history
-            .retained
-            .values()
-            .map(processed_operation_record_bytes)
-            .fold(0_usize, usize::saturating_add)
+        || processed_operation_retained_bytes(&history.retained)
             > PROCESSED_OPERATION_RETAINED_BYTES_LIMIT
         || history.retained.values().any(|record| {
             processed_operation_record_bytes(record) > PROCESSED_OPERATION_RECORD_BYTES_LIMIT
@@ -1472,6 +1491,19 @@ mod tests {
                 message: "synthetic bounded-history receipt".into(),
             },
         }
+    }
+
+    fn synthetic_operation_record_with_size(
+        operation_sequence: u64,
+        target_bytes: usize,
+    ) -> ProcessedOperationRecord {
+        let mut record = synthetic_operation_record(operation_sequence);
+        record.receipt.message.clear();
+        let base_bytes = processed_operation_record_bytes(&record);
+        assert!(target_bytes >= base_bytes);
+        record.receipt.message = "x".repeat(target_bytes - base_bytes);
+        assert_eq!(processed_operation_record_bytes(&record), target_bytes);
+        record
     }
 
     proptest! {
@@ -1508,11 +1540,7 @@ mod tests {
             prop_assert_eq!(first_history.committed_through, operation_count);
             prop_assert!(first_history.retained.len() <= PROCESSED_OPERATION_RETENTION_LIMIT);
             prop_assert!(
-                first_history
-                    .retained
-                    .values()
-                    .map(processed_operation_record_bytes)
-                    .fold(0_usize, usize::saturating_add)
+                processed_operation_retained_bytes(&first_history.retained)
                     <= PROCESSED_OPERATION_RETAINED_BYTES_LIMIT
             );
             let all_records_bounded = first_history.retained.values().all(|record| {
@@ -1527,6 +1555,104 @@ mod tests {
             );
             prop_assert!(first.validate_player_roster().is_ok());
         }
+    }
+
+    #[test]
+    fn operation_history_rejects_impossible_global_and_receipt_frontiers() {
+        let mut impossible_compacted = WorldState::genesis(103);
+        impossible_compacted.event_sequence = 1;
+        impossible_compacted.processed_operations.insert(
+            "player-local".into(),
+            ActorOperationHistory {
+                committed_through: 100,
+                compacted_through: 100,
+                compacted_history_hash: "0".repeat(64),
+                retained: BTreeMap::new(),
+            },
+        );
+        assert!(
+            impossible_compacted
+                .validate_player_roster()
+                .expect_err("an actor frontier cannot exceed the global event frontier")
+                .contains("operation history bounds")
+        );
+
+        let mut first = synthetic_operation_record(1);
+        first.receipt.event_sequence = 3;
+        let mut second = synthetic_operation_record(2);
+        second.receipt.event_sequence = 2;
+        let mut out_of_order = WorldState::genesis(107);
+        out_of_order.event_sequence = 3;
+        out_of_order.processed_operations.insert(
+            "player-local".into(),
+            ActorOperationHistory {
+                committed_through: 2,
+                compacted_through: 0,
+                compacted_history_hash: String::new(),
+                retained: BTreeMap::from([(1, first), (2, second)]),
+            },
+        );
+        assert!(
+            out_of_order
+                .validate_player_roster()
+                .expect_err("retained receipt events must advance with actor operations")
+                .contains("canonical receipts")
+        );
+
+        let mut zero_receipt = WorldState::genesis(109);
+        zero_receipt.event_sequence = 1;
+        let mut record = synthetic_operation_record(1);
+        record.receipt.event_sequence = 0;
+        zero_receipt.processed_operations.insert(
+            "player-local".into(),
+            ActorOperationHistory {
+                committed_through: 1,
+                compacted_through: 0,
+                compacted_history_hash: String::new(),
+                retained: BTreeMap::from([(1, record)]),
+            },
+        );
+        assert!(zero_receipt.validate_player_roster().is_err());
+    }
+
+    #[test]
+    fn retained_history_byte_budget_includes_sequence_keys_and_delimiters() {
+        const RECORD_COUNT: u64 = 32;
+        const RECORD_BYTES: usize = 4_091;
+
+        let candidate = (1..=RECORD_COUNT)
+            .map(|sequence| {
+                (
+                    sequence,
+                    synthetic_operation_record_with_size(sequence, RECORD_BYTES),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let value_bytes = candidate
+            .values()
+            .map(processed_operation_record_bytes)
+            .sum::<usize>();
+        assert!(value_bytes <= PROCESSED_OPERATION_RETAINED_BYTES_LIMIT);
+        assert!(
+            processed_operation_retained_bytes(&candidate)
+                > PROCESSED_OPERATION_RETAINED_BYTES_LIMIT,
+            "map keys and delimiters must count toward the canonical byte budget"
+        );
+
+        let mut world = WorldState::genesis(113);
+        world.event_sequence = RECORD_COUNT;
+        for record in candidate.into_values() {
+            world
+                .record_processed_operation("player-local", record)
+                .expect("boundary records commit contiguously");
+        }
+        let history = &world.processed_operations["player-local"];
+        assert!(history.compacted_through > 0);
+        assert!(
+            processed_operation_retained_bytes(&history.retained)
+                <= PROCESSED_OPERATION_RETAINED_BYTES_LIMIT
+        );
+        assert!(world.validate_player_roster().is_ok());
     }
 
     #[test]
