@@ -2,15 +2,24 @@
 
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
+import { resolve } from "node:path";
 import test from "node:test";
+import { pathToFileURL } from "node:url";
 
-import initializeWasm, {
+const generatedDirectory = process.env.VERSE_BROWSER_VERIFIER_GENERATED_DIR;
+const loaderUrl = generatedDirectory
+  ? pathToFileURL(resolve(generatedDirectory, "verse_interest_verifier.js"))
+  : new URL("./generated/verse_interest_verifier.js", import.meta.url);
+const wasmUrl = generatedDirectory
+  ? pathToFileURL(resolve(generatedDirectory, "verse_interest_verifier_bg.wasm"))
+  : new URL("./generated/verse_interest_verifier_bg.wasm", import.meta.url);
+const generatedModule = await import(loaderUrl.href);
+const {
+  default: initializeWasm,
   BrowserInterestVerifier,
-} from "./generated/verse_interest_verifier.js";
+} = generatedModule;
 
-const wasmBytes = await readFile(
-  new URL("./generated/verse_interest_verifier_bg.wasm", import.meta.url),
-);
+const wasmBytes = await readFile(wasmUrl);
 await initializeWasm({ module_or_path: wasmBytes });
 
 const proofCommitments = {
