@@ -20,5 +20,6 @@ ADRs capture durable choices and their consequences.
 | [0014](ADR-0014-authoritative-grounded-and-magnetic-locomotion.md) | Grounded and magnetic locomotion from canonical support | Accepted |
 | [0015](ADR-0015-session-bound-multiplayer-cell.md) | Session-bound actors and deterministic multi-player cell state | Proposed |
 | [0016](ADR-0016-session-private-state-projection.md) | Public world plus session-private player state projections | Accepted |
+| [0017](ADR-0017-bounded-conflict-safe-idempotency.md) | Bounded conflict-safe actor operation sequences | Accepted |
 
 Status values: Proposed, Accepted, Superseded, Rejected.

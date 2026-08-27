@@ -35,6 +35,7 @@ These documents form the initial specification baseline.
 ## Architecture
 
 - [System overview](architecture/system-overview.md)
+- [Operation idempotency and retry contract](architecture/operation-idempotency.md)
 - [Current P0 implementation guide](architecture/p0-implementation.md)
 - [Universe simulation](architecture/universe-simulation.md)
 - [Data and events](architecture/data-and-events.md)
