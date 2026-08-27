@@ -54,7 +54,7 @@ const PLAYER_ROTATION_SLOP_RADIANS_PER_STEP: f64 = 0.000_1;
 const REPLAY_QUANTIZATION_SLOP: f64 = 0.000_004;
 #[cfg(test)]
 const REPLAY_CONTACT_SLOP_M: f64 = 0.15;
-const PHYSICS_SPECULATIVE_DISTANCE_M: f64 = 0.02;
+const PHYSICS_MINIMUM_SPECULATIVE_DISTANCE_M: f64 = 0.02;
 const PHYSICS_CONTACT_POINT_SLOP_M: f64 = 0.001;
 const PLAYER_PLANET_PENETRATION_LIMIT_M: f64 = 0.28;
 const PLAYER_BOX_PENETRATION_LIMIT_M: f64 = 0.85;
@@ -3738,7 +3738,19 @@ impl WorldState {
                         ) {
                             return Err(IntentError::rejected(
                                 "replay_player_contact_spatially_invalid",
-                                "player contact must lie on the plausible swept player and counterpart geometry",
+                                format!(
+                                    "player contact must lie on the plausible swept player and counterpart geometry: substep={} pair={}/{}:{}/{} point=({:.6},{:.6},{:.6}) penetration_m={:.6} closing_speed_mm_per_second={}",
+                                    contact.substep_index,
+                                    contact.body_a_id,
+                                    contact.collider_a_id,
+                                    contact.body_b_id,
+                                    contact.collider_b_id,
+                                    contact.point.x,
+                                    contact.point.y,
+                                    contact.point.z,
+                                    contact.penetration_m,
+                                    contact.closing_speed_mm_per_second,
+                                ),
                             ));
                         }
                     }
@@ -4464,7 +4476,16 @@ impl WorldState {
         let per_step_reach = f64::from(limits.max_linear_velocity_mps) * fixed_delta_seconds
             + PLAYER_POSITION_CORRECTION_BUDGET_M_PER_STEP
             + REPLAY_QUANTIZATION_SLOP;
-        let surface_slack = 0.5 * contact.penetration_m.max(PHYSICS_SPECULATIVE_DISTANCE_M)
+        // Jolt's linear-cast motion quality may report a speculative manifold
+        // anywhere along the configured fixed-step velocity sweep. The stored
+        // contact point is the midpoint between the two manifold surfaces, so
+        // replay must allow half of that bounded separation. The event keeps
+        // overlap as a non-negative penetration value and therefore cannot
+        // recover the native manifold's negative speculative depth directly.
+        let maximum_speculative_separation = (f64::from(limits.max_linear_velocity_mps)
+            * fixed_delta_seconds)
+            .max(PHYSICS_MINIMUM_SPECULATIVE_DISTANCE_M);
+        let surface_slack = 0.5 * contact.penetration_m.max(maximum_speculative_separation)
             + PHYSICS_CONTACT_POINT_SLOP_M
             + REPLAY_QUANTIZATION_SLOP;
         let capsule_half_height = character_capsule_half_height();
@@ -9091,6 +9112,75 @@ mod tests {
         let player = &mut players[0];
         player.surface_contact = true;
         reject(wrong_contact, "replay_player_surface_contact_invalid");
+    }
+
+    #[test]
+    fn replay_accepts_bounded_linear_cast_voxel_contact_midpoint() {
+        let runtime = runtime();
+        let state = runtime.state();
+        let coordinate = IVec3::new(6, 6, 1);
+        assert!(
+            state.voxels.occupied.contains(&coordinate),
+            "regression fixture voxel remains present"
+        );
+        let mut prior_player = state.player.primary().clone();
+        let contact_point = Vec3::new(6.500_020, 5.946_797, 1.593_079);
+        set_test_player_position(&mut prior_player, contact_point);
+        let mut player = stationary_player_outcomes(state, 1)
+            .into_iter()
+            .find(|candidate| candidate.player_id == prior_player.player_id)
+            .expect("primary player outcome exists");
+        player.position = prior_player.position;
+        player.address = prior_player.address.clone();
+        player.orientation = prior_player.orientation;
+        let voxel_body =
+            voxel_collision_chunk_body_id(voxel_collision_chunk_coordinate(coordinate));
+        let contact = PhysicsContactOutcome {
+            substep_index: 0,
+            body_a_id: player_body_id(&prior_player.player_id),
+            collider_a_id: player_collider_id(&prior_player.player_id),
+            body_b_id: voxel_body.clone(),
+            collider_b_id: voxel_collision_collider_id(coordinate),
+            point_address: exact_test_address(contact_point),
+            point: contact_point,
+            normal: Vec3::new(1.0, 0.0, 0.0),
+            penetration_m: 0.0,
+            closing_speed_mm_per_second: 69,
+            estimated_normal_impulse_millinewton_seconds: 0,
+            reduced_translational_mass_grams: reduced_translational_contact_mass_grams(
+                state,
+                &player_body_id(&prior_player.player_id),
+                &voxel_body,
+            ),
+            phase: PhysicsContactPhase::Began,
+        };
+
+        assert!(state.player_contact_is_spatially_plausible(
+            &contact,
+            &prior_player,
+            &player,
+            &[],
+            1,
+            &physics_scene_config(),
+        ));
+
+        let implausible_point = Vec3::new(contact_point.x, contact_point.y, 2.1);
+        let mut implausible_player = prior_player.clone();
+        set_test_player_position(&mut implausible_player, implausible_point);
+        let mut implausible_outcome = player;
+        implausible_outcome.position = implausible_player.position;
+        implausible_outcome.address = implausible_player.address.clone();
+        let mut implausible_contact = contact;
+        implausible_contact.point = implausible_point;
+        implausible_contact.point_address = exact_test_address(implausible_point);
+        assert!(!state.player_contact_is_spatially_plausible(
+            &implausible_contact,
+            &implausible_player,
+            &implausible_outcome,
+            &[],
+            1,
+            &physics_scene_config(),
+        ));
     }
 
     #[test]

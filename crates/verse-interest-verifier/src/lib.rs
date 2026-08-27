@@ -7,18 +7,25 @@
 
 mod canonical;
 mod error;
+mod registry;
 mod strict_json;
+#[cfg(any(test, all(feature = "browser-wasm", target_arch = "wasm32")))]
+mod wasm_browser;
+
+#[cfg(all(feature = "browser-wasm", target_arch = "wasm32"))]
+pub use wasm_browser::BrowserInterestVerifier;
 
 use std::collections::{BTreeMap, BTreeSet};
 
 pub use error::{ErrorCode, VerifyError};
 use serde::Serialize;
 use verse_protocol::{
-    ActorPrivateSnapshot, CELESTIAL_REGISTRY_SCHEMA_VERSION, CelestialRegistrySnapshot,
+    ActorPrivateSnapshot, BlockKind, CELESTIAL_REGISTRY_SCHEMA_VERSION, CelestialRegistrySnapshot,
     EnvironmentSnapshot, INTEREST_SCHEMA_VERSION, InterestEntityKind, InterestEntityPayload,
     InterestEntityProjection, InterestFrameKind, InterestObserverClass, InterestSnapshot,
-    PROJECTION_SCHEMA_VERSION, PROTOCOL_VERSION, PlayerMotionSnapshot, ProjectedInterestDelta,
-    ProjectedWorldSnapshot, PublicDeathDropSnapshot, PublicGridSnapshot, PublicPlayerSnapshot,
+    InventoryDomain, InventorySnapshot, PROJECTION_SCHEMA_VERSION, PROTOCOL_VERSION,
+    PlayerMotionSnapshot, ProductionRecipeKind, ProjectedInterestDelta, ProjectedWorldSnapshot,
+    PublicBlockSnapshot, PublicDeathDropSnapshot, PublicGridSnapshot, PublicPlayerSnapshot,
     PublicVoxelChunkSnapshot, ServerMessage, SessionRole, UNIVERSE_MANIFEST_SCHEMA_VERSION,
     UniverseAddress, UniverseManifestSnapshot,
 };
@@ -38,6 +45,10 @@ pub struct ResourceLimits {
     pub max_blocks_per_grid: usize,
     pub max_voxels_per_chunk: usize,
     pub max_private_records: usize,
+    /// Maximum immutable celestial records accepted in one registry frame.
+    pub max_registry_bodies: usize,
+    /// Maximum pairwise separation checks accepted for one registry frame.
+    pub max_registry_pair_comparisons: usize,
 }
 
 impl Default for ResourceLimits {
@@ -53,6 +64,8 @@ impl Default for ResourceLimits {
             max_blocks_per_grid: 100_000,
             max_voxels_per_chunk: 250_000,
             max_private_records: 100_000,
+            max_registry_bodies: 512,
+            max_registry_pair_comparisons: 130_816,
         }
     }
 }
@@ -65,16 +78,25 @@ pub struct VerifierConfig {
     pub event_schema_version: u32,
     pub content_schema_version: u32,
     pub content_manifest_version: String,
+    pub expected_content_hash: String,
+    pub expected_universe_id: String,
+    pub expected_celestial_registry_hash: String,
+    pub expected_universe_manifest_hash: String,
     pub limits: ResourceLimits,
 }
 
 impl VerifierConfig {
+    #[allow(clippy::too_many_arguments)] // Every immutable trust root is intentionally explicit.
     pub fn new(
         expected_role: SessionRole,
         world_schema_version: u32,
         event_schema_version: u32,
         content_schema_version: u32,
         content_manifest_version: impl Into<String>,
+        expected_content_hash: impl Into<String>,
+        expected_universe_id: impl Into<String>,
+        expected_celestial_registry_hash: impl Into<String>,
+        expected_universe_manifest_hash: impl Into<String>,
     ) -> Self {
         Self {
             expected_role,
@@ -82,6 +104,10 @@ impl VerifierConfig {
             event_schema_version,
             content_schema_version,
             content_manifest_version: content_manifest_version.into(),
+            expected_content_hash: expected_content_hash.into(),
+            expected_universe_id: expected_universe_id.into(),
+            expected_celestial_registry_hash: expected_celestial_registry_hash.into(),
+            expected_universe_manifest_hash: expected_universe_manifest_hash.into(),
             limits: ResourceLimits::default(),
         }
     }
@@ -136,12 +162,7 @@ struct WelcomeBinding {
     role: SessionRole,
 }
 
-#[derive(Debug, Clone)]
-struct RegistryBinding {
-    universe_id: String,
-    registry_hash: String,
-    universe_manifest_hash: String,
-}
+type RegistryBinding = registry::ValidatedRegistry;
 
 #[derive(Debug, Clone)]
 struct ViewState {
@@ -218,6 +239,12 @@ impl InterestVerifier {
                 "configured content manifest version must be nonempty",
             ));
         }
+        registry::validate_expected_commitments(
+            &config.expected_universe_id,
+            &config.expected_content_hash,
+            &config.expected_celestial_registry_hash,
+            &config.expected_universe_manifest_hash,
+        )?;
         Ok(Self {
             config,
             committed: CommittedState::default(),
@@ -300,7 +327,8 @@ impl InterestVerifier {
                 if self.committed.registry.is_some() {
                     return Err(unexpected("registry"));
                 }
-                let binding = validate_registry(welcome, &registry, &universe_manifest)?;
+                let binding =
+                    validate_registry(welcome, &self.config, &registry, &universe_manifest)?;
                 next.registry = Some(binding);
                 StageKind::Registry
             }
@@ -552,11 +580,16 @@ impl InterestVerifier {
                 "baseline frontier or operation shape is invalid",
             ));
         }
-        validate_entity_vector(&interest.entered, &self.config.limits)?;
+        validate_entity_vector(&interest.entered, &self.config.limits, binding)?;
         validate_baseline_payload_arrays(baseline, &interest.entered)?;
         if let Some(private) = &baseline.actor_private {
-            validate_actor_private(private, &self.config.limits)?;
+            validate_actor_private(private, &self.config.limits, binding)?;
         }
+        validate_private_linkage(
+            &welcome.role,
+            baseline.actor_private.as_ref(),
+            &interest.entered,
+        )?;
 
         let mut state = ViewState {
             content_manifest_version: baseline.content_manifest_version.clone(),
@@ -619,8 +652,8 @@ impl InterestVerifier {
             ));
         }
 
-        validate_entity_vector(&delta.interest.entered, &self.config.limits)?;
-        validate_entity_vector(&delta.interest.replaced, &self.config.limits)?;
+        validate_entity_vector(&delta.interest.entered, &self.config.limits, binding)?;
+        validate_entity_vector(&delta.interest.replaced, &self.config.limits, binding)?;
         validate_removals(&delta.interest.removed, &self.config.limits)?;
         validate_disjoint_operations(&delta.interest, &self.config.limits)?;
 
@@ -675,9 +708,10 @@ impl InterestVerifier {
 
         let mut actor_private = current.actor_private.clone();
         if let Some(replacement) = &delta.actor_private {
-            validate_actor_private(replacement, &self.config.limits)?;
+            validate_actor_private(replacement, &self.config.limits, binding)?;
             actor_private = Some(replacement.clone());
         } else if let Some(motion) = &delta.actor_private_motion {
+            validate_private_motion(motion, binding)?;
             let Some(private) = actor_private.as_mut() else {
                 return Err(VerifyError::new(
                     ErrorCode::InvalidDelta,
@@ -693,12 +727,15 @@ impl InterestVerifier {
             apply_private_motion(private, motion);
         }
 
+        let entities: Vec<_> = entities.into_values().collect();
+        validate_private_linkage(&welcome.role, actor_private.as_ref(), &entities)?;
+
         let mut state = current.clone();
         state.delta_sequence = delta.interest.delta_sequence;
         state.canonical_event_sequence = delta.interest.canonical_event_sequence;
         state.canonical_tick = delta.interest.canonical_tick;
         state.local_origin = delta.interest.local_origin_address.clone();
-        state.entities = entities.into_values().collect();
+        state.entities = entities;
         state.environment = delta
             .environment
             .clone()
@@ -735,6 +772,8 @@ fn validate_limits(limits: &ResourceLimits) -> Result<()> {
         limits.max_blocks_per_grid,
         limits.max_voxels_per_chunk,
         limits.max_private_records,
+        limits.max_registry_bodies,
+        limits.max_registry_pair_comparisons,
     ];
     if values.contains(&0) || limits.max_json_depth > 128 {
         return Err(VerifyError::new(
@@ -747,38 +786,24 @@ fn validate_limits(limits: &ResourceLimits) -> Result<()> {
 
 fn validate_registry(
     welcome: &WelcomeBinding,
+    config: &VerifierConfig,
     registry: &CelestialRegistrySnapshot,
     manifest: &UniverseManifestSnapshot,
 ) -> Result<RegistryBinding> {
-    let valid = registry.schema_version == CELESTIAL_REGISTRY_SCHEMA_VERSION
-        && manifest.schema_version == UNIVERSE_MANIFEST_SCHEMA_VERSION
-        && manifest.world_schema_version == welcome.world_schema_version
-        && manifest.event_schema_version == welcome.event_schema_version
-        && manifest.content_schema_version == welcome.content_schema_version
-        && manifest.content_manifest_version == welcome.content_manifest_version
-        && manifest.celestial_registry_schema_version == registry.schema_version
-        && manifest.celestial_registry_hash == registry.registry_hash
-        && manifest.universe_id == registry.universe_id
-        && manifest.generation_rule_version == registry.generation_rule_version
-        && registry.bodies.iter().all(|body| {
-            body.content_manifest_version == welcome.content_manifest_version
-                && body.content_hash == manifest.content_hash
-                && body.center.universe_id == registry.universe_id
-        })
-        && !registry.registry_hash.is_empty()
-        && !manifest.manifest_hash.is_empty()
-        && !registry.universe_id.is_empty();
-    if !valid {
-        return Err(VerifyError::new(
-            ErrorCode::BindingMismatch,
-            "registry and universe manifest bindings disagree",
-        ));
-    }
-    Ok(RegistryBinding {
-        universe_id: registry.universe_id.clone(),
-        registry_hash: registry.registry_hash.clone(),
-        universe_manifest_hash: manifest.manifest_hash.clone(),
-    })
+    registry::validate_documents(
+        welcome.world_schema_version,
+        welcome.event_schema_version,
+        welcome.content_schema_version,
+        &welcome.content_manifest_version,
+        &config.expected_content_hash,
+        &config.expected_universe_id,
+        &config.expected_celestial_registry_hash,
+        &config.expected_universe_manifest_hash,
+        config.limits.max_registry_bodies,
+        config.limits.max_registry_pair_comparisons,
+        registry,
+        manifest,
+    )
 }
 
 fn validate_outer_baseline(
@@ -799,6 +824,10 @@ fn validate_outer_baseline(
             "baseline outer header disagrees with the established binding",
         ));
     }
+    binding.validate_address(&baseline.cell_address, "baseline cell address")?;
+    binding.require_body(&baseline.gravity_body_id, "baseline gravity_body_id")?;
+    binding.require_body(&baseline.voxel_body_id, "baseline voxel_body_id")?;
+    binding.validate_environment(&baseline.environment, "baseline environment")?;
     Ok(())
 }
 
@@ -820,6 +849,12 @@ fn validate_outer_delta(
             "delta outer header disagrees with the established binding",
         ));
     }
+    binding.validate_address(&delta.cell_address, "delta cell address")?;
+    binding.require_body(&delta.gravity_body_id, "delta gravity_body_id")?;
+    binding.require_body(&delta.voxel_body_id, "delta voxel_body_id")?;
+    if let Some(environment) = &delta.environment {
+        binding.validate_environment(environment, "delta environment")?;
+    }
     Ok(())
 }
 
@@ -840,6 +875,11 @@ fn validate_interest_header(
             "interest header disagrees with frame kind or established binding",
         ));
     }
+    binding.validate_address(&interest.cell_address, "interest cell address")?;
+    binding.validate_address(
+        &interest.local_origin_address,
+        "interest local-origin address",
+    )?;
     Ok(())
 }
 
@@ -952,6 +992,7 @@ fn entity_key(entity: &InterestEntityProjection) -> EntityKey {
 fn validate_entity_vector(
     entities: &[InterestEntityProjection],
     limits: &ResourceLimits,
+    binding: &RegistryBinding,
 ) -> Result<()> {
     if entities.len() > limits.max_entities {
         return Err(VerifyError::new(
@@ -969,19 +1010,25 @@ fn validate_entity_vector(
         }
         match (&entity.kind, &entity.payload) {
             (InterestEntityKind::Player, InterestEntityPayload::Player(value))
-                if entity.entity_id == value.player_id => {}
+                if entity.entity_id == value.player_id =>
+            {
+                binding.validate_address(&value.address, "public player address")?;
+            }
             (InterestEntityKind::Grid, InterestEntityPayload::Grid(value))
                 if entity.entity_id == value.grid_id =>
             {
-                validate_grid(value, limits)?;
+                validate_grid(value, limits, binding)?;
             }
             (InterestEntityKind::VoxelChunk, InterestEntityPayload::VoxelChunk(value))
                 if entity.entity_id == value.chunk_id =>
             {
-                validate_voxel_chunk(value, limits)?;
+                validate_voxel_chunk(value, limits, binding)?;
             }
             (InterestEntityKind::DeathDrop, InterestEntityPayload::DeathDrop(value))
-                if entity.entity_id == value.drop_id => {}
+                if entity.entity_id == value.drop_id =>
+            {
+                binding.validate_address(&value.address, "public death-drop address")?;
+            }
             _ => {
                 return Err(VerifyError::new(
                     ErrorCode::InvalidEntity,
@@ -1010,7 +1057,12 @@ fn validate_removals(
     )
 }
 
-fn validate_grid(grid: &PublicGridSnapshot, limits: &ResourceLimits) -> Result<()> {
+fn validate_grid(
+    grid: &PublicGridSnapshot,
+    limits: &ResourceLimits,
+    binding: &RegistryBinding,
+) -> Result<()> {
+    binding.validate_address(&grid.address, "public grid address")?;
     if grid.blocks.len() > limits.max_blocks_per_grid {
         return Err(VerifyError::new(
             ErrorCode::ResourceLimit,
@@ -1020,7 +1072,12 @@ fn validate_grid(grid: &PublicGridSnapshot, limits: &ResourceLimits) -> Result<(
     ensure_strictly_sorted(&grid.blocks, |block| block.block_id.clone(), "grid blocks")
 }
 
-fn validate_voxel_chunk(chunk: &PublicVoxelChunkSnapshot, limits: &ResourceLimits) -> Result<()> {
+fn validate_voxel_chunk(
+    chunk: &PublicVoxelChunkSnapshot,
+    limits: &ResourceLimits,
+    binding: &RegistryBinding,
+) -> Result<()> {
+    binding.require_body(&chunk.body_id, "voxel chunk body_id")?;
     if chunk.voxels.len() > limits.max_voxels_per_chunk {
         return Err(VerifyError::new(
             ErrorCode::ResourceLimit,
@@ -1034,7 +1091,18 @@ fn validate_voxel_chunk(chunk: &PublicVoxelChunkSnapshot, limits: &ResourceLimit
     )
 }
 
-fn validate_actor_private(private: &ActorPrivateSnapshot, limits: &ResourceLimits) -> Result<()> {
+fn validate_actor_private(
+    private: &ActorPrivateSnapshot,
+    limits: &ResourceLimits,
+    binding: &RegistryBinding,
+) -> Result<()> {
+    binding.validate_address(&private.player.address, "private player address")?;
+    if let Some(environment) = &private.player.environment {
+        binding.validate_environment(environment, "private player environment")?;
+    }
+    for drop in &private.death_drops {
+        binding.validate_address(&drop.address, "private death-drop address")?;
+    }
     let count = private
         .inventories
         .len()
@@ -1074,6 +1142,258 @@ fn validate_actor_private(private: &ActorPrivateSnapshot, limits: &ResourceLimit
         |value| value.machine_block_id.clone(),
         "production queues",
     )
+}
+
+fn validate_private_motion(motion: &PlayerMotionSnapshot, binding: &RegistryBinding) -> Result<()> {
+    binding.validate_address(&motion.address, "private player motion address")?;
+    if let Some(environment) = &motion.environment {
+        binding.validate_environment(environment, "private player motion environment")?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct PublicBlockLink<'a> {
+    grid: &'a PublicGridSnapshot,
+    block: &'a PublicBlockSnapshot,
+}
+
+struct PublicLinkIndex<'a> {
+    players: BTreeMap<&'a str, &'a PublicPlayerSnapshot>,
+    grids: BTreeMap<&'a str, &'a PublicGridSnapshot>,
+    drops: BTreeMap<&'a str, &'a PublicDeathDropSnapshot>,
+    blocks: BTreeMap<&'a str, Vec<PublicBlockLink<'a>>>,
+}
+
+fn validate_private_linkage(
+    role: &SessionRole,
+    private: Option<&ActorPrivateSnapshot>,
+    entities: &[InterestEntityProjection],
+) -> Result<()> {
+    let (actor_id, private) = match (role, private) {
+        (SessionRole::Player { player_id }, Some(private)) => (player_id.as_str(), private),
+        (SessionRole::Player { .. }, None) => {
+            return Err(invalid_private_linkage(
+                "bound-player view has no actor-private overlay",
+            ));
+        }
+        (SessionRole::Spectator, None) => return Ok(()),
+        (SessionRole::Spectator, Some(_)) => {
+            return Err(invalid_private_linkage(
+                "spectator view contains actor-private state",
+            ));
+        }
+    };
+    if private.player.player_id != actor_id {
+        return Err(invalid_private_linkage(
+            "private player identity differs from the bound actor",
+        ));
+    }
+
+    let public = build_public_link_index(entities);
+    let public_player = public.players.get(actor_id).ok_or_else(|| {
+        invalid_private_linkage("bound private player has no visible public player")
+    })?;
+    if public_player.address != private.player.address {
+        return Err(invalid_private_linkage(
+            "bound public and private player addresses disagree",
+        ));
+    }
+
+    let inventories: BTreeMap<&str, &InventorySnapshot> = private
+        .inventories
+        .iter()
+        .map(|inventory| (inventory.inventory_id.as_str(), inventory))
+        .collect();
+    let mut carried_inventory_count = 0_usize;
+    let mut cargo_blocks = BTreeSet::new();
+    let mut dropped_inventory_ids = BTreeSet::new();
+    for inventory in &private.inventories {
+        match &inventory.domain {
+            InventoryDomain::Player { player_id } => {
+                if player_id != actor_id || inventory.inventory_id != private.player.inventory_id {
+                    return Err(invalid_private_linkage(
+                        "carried inventory identity or player domain differs from the bound actor",
+                    ));
+                }
+                carried_inventory_count = carried_inventory_count.saturating_add(1);
+            }
+            InventoryDomain::Cargo { block_id } => {
+                if !cargo_blocks.insert(block_id.as_str()) {
+                    return Err(invalid_private_linkage(
+                        "more than one private inventory names the same cargo block",
+                    ));
+                }
+                let link = require_unique_public_block(&public, block_id, "cargo inventory")?;
+                if link.grid.owner_player_id != actor_id || link.block.kind != BlockKind::Cargo {
+                    return Err(invalid_private_linkage(
+                        "cargo inventory does not resolve to one visible actor-owned cargo block",
+                    ));
+                }
+            }
+            InventoryDomain::Dropped {
+                owner_player_id, ..
+            } => {
+                if owner_player_id != actor_id {
+                    return Err(invalid_private_linkage(
+                        "dropped inventory owner differs from the bound actor",
+                    ));
+                }
+                dropped_inventory_ids.insert(inventory.inventory_id.as_str());
+            }
+        }
+    }
+    if carried_inventory_count != 1
+        || !inventories.contains_key(private.player.inventory_id.as_str())
+    {
+        return Err(invalid_private_linkage(
+            "private player must resolve exactly one carried player inventory",
+        ));
+    }
+
+    let mut linked_drop_inventories = BTreeSet::new();
+    for drop in &private.death_drops {
+        if drop.owner_player_id != actor_id {
+            return Err(invalid_private_linkage(
+                "private death-drop owner differs from the bound actor",
+            ));
+        }
+        let public_drop = public.drops.get(drop.drop_id.as_str()).ok_or_else(|| {
+            invalid_private_linkage("private death drop has no visible public death drop")
+        })?;
+        if public_drop.address != drop.address {
+            return Err(invalid_private_linkage(
+                "public and private death-drop addresses disagree",
+            ));
+        }
+        let inventory = inventories
+            .get(drop.inventory_id.as_str())
+            .ok_or_else(|| invalid_private_linkage("private death drop inventory is absent"))?;
+        if !matches!(
+            &inventory.domain,
+            InventoryDomain::Dropped { owner_player_id, .. } if owner_player_id == actor_id
+        ) {
+            return Err(invalid_private_linkage(
+                "private death drop does not resolve to an actor-owned dropped inventory",
+            ));
+        }
+        if !linked_drop_inventories.insert(drop.inventory_id.as_str()) {
+            return Err(invalid_private_linkage(
+                "more than one private death drop names the same inventory",
+            ));
+        }
+    }
+    if dropped_inventory_ids != linked_drop_inventories {
+        return Err(invalid_private_linkage(
+            "actor-private dropped inventories and death drops are not one-to-one",
+        ));
+    }
+
+    for mass in &private.owned_grid_masses {
+        let grid = public.grids.get(mass.grid_id.as_str()).ok_or_else(|| {
+            invalid_private_linkage("private grid mass has no visible public grid")
+        })?;
+        if grid.owner_player_id != actor_id {
+            return Err(invalid_private_linkage(
+                "private grid mass resolves to a grid owned by another actor",
+            ));
+        }
+    }
+
+    for queue in &private.production_queues {
+        let machine =
+            require_unique_public_block(&public, &queue.machine_block_id, "production queue")?;
+        if machine.grid.owner_player_id != actor_id
+            || !matches!(
+                machine.block.kind,
+                BlockKind::Refinery | BlockKind::Assembler
+            )
+        {
+            return Err(invalid_private_linkage(
+                "production queue does not resolve to one visible actor-owned machine",
+            ));
+        }
+        let mut job_ids = BTreeSet::new();
+        for job in &queue.jobs {
+            if !job_ids.insert(job.job_id.as_str())
+                || job.owner_player_id != actor_id
+                || job.machine_block_id != queue.machine_block_id
+            {
+                return Err(invalid_private_linkage(
+                    "production job identity, owner, or machine differs from its queue",
+                ));
+            }
+            let recipe_matches_machine = matches!(
+                (job.recipe, machine.block.kind),
+                (ProductionRecipeKind::Refining, BlockKind::Refinery)
+                    | (ProductionRecipeKind::Component, BlockKind::Assembler)
+            );
+            if !recipe_matches_machine {
+                return Err(invalid_private_linkage(
+                    "production job recipe does not match its visible machine",
+                ));
+            }
+            if !inventories.contains_key(job.source_inventory_id.as_str())
+                || !inventories.contains_key(job.destination_inventory_id.as_str())
+            {
+                return Err(invalid_private_linkage(
+                    "production job endpoint inventory is absent from actor-private state",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn build_public_link_index(entities: &[InterestEntityProjection]) -> PublicLinkIndex<'_> {
+    let mut index = PublicLinkIndex {
+        players: BTreeMap::new(),
+        grids: BTreeMap::new(),
+        drops: BTreeMap::new(),
+        blocks: BTreeMap::new(),
+    };
+    for entity in entities {
+        match &entity.payload {
+            InterestEntityPayload::Player(player) => {
+                index.players.insert(player.player_id.as_str(), player);
+            }
+            InterestEntityPayload::Grid(grid) => {
+                index.grids.insert(grid.grid_id.as_str(), grid);
+                for block in &grid.blocks {
+                    index
+                        .blocks
+                        .entry(block.block_id.as_str())
+                        .or_default()
+                        .push(PublicBlockLink { grid, block });
+                }
+            }
+            InterestEntityPayload::DeathDrop(drop) => {
+                index.drops.insert(drop.drop_id.as_str(), drop);
+            }
+            InterestEntityPayload::VoxelChunk(_) => {}
+        }
+    }
+    index
+}
+
+fn require_unique_public_block<'a>(
+    index: &'a PublicLinkIndex<'a>,
+    block_id: &str,
+    label: &str,
+) -> Result<PublicBlockLink<'a>> {
+    let links = index.blocks.get(block_id).ok_or_else(|| {
+        invalid_private_linkage(format!("{label} block is absent from the public view"))
+    })?;
+    if links.len() != 1 {
+        return Err(invalid_private_linkage(format!(
+            "{label} block identity is ambiguous in the public view"
+        )));
+    }
+    Ok(links[0])
+}
+
+fn invalid_private_linkage(detail: impl Into<String>) -> VerifyError {
+    VerifyError::new(ErrorCode::InvalidPrivateLinkage, detail)
 }
 
 fn ensure_strictly_sorted<T, K, F>(values: &[T], key: F, label: &str) -> Result<()>
@@ -1249,8 +1569,12 @@ fn require_wire_hash(wire: &str, computed: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use verse_protocol::{
-        CelestialRegistrySnapshot, CelestialScaleClass, CellCoordinate, I64Vec3, InterestSnapshot,
-        SectorCoordinate, Vec3,
+        CareerSnapshot, CelestialBodyKind, CelestialBodySnapshot, CelestialRegistrySnapshot,
+        CelestialScaleClass, CellCoordinate, DeathDropSnapshot, I64Vec3, InterestSnapshot,
+        InventoryContents, InventorySnapshot, LocomotionKind, OwnedGridMassSnapshot,
+        PlayerDeathCause, PlayerLifeState, PlayerLocomotionSnapshot, PlayerSnapshot, PowerSnapshot,
+        ProductionJobSnapshot, ProductionJobStatus, ProductionQueueSnapshot, PublicMachineState,
+        PublicPlayerLifeState, Quat, SectorCoordinate, Vec3,
     };
 
     use super::*;
@@ -1258,12 +1582,13 @@ mod tests {
     const WORLD_SCHEMA: u32 = 11;
     const EVENT_SCHEMA: u32 = 12;
     const CONTENT_SCHEMA: u32 = 13;
+    const CONTENT_HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     fn address() -> UniverseAddress {
         UniverseAddress {
             universe_id: "universe-test".into(),
             sector: SectorCoordinate {
-                x: "-0".into(),
+                x: "0".into(),
                 y: "2".into(),
                 z: "3".into(),
             },
@@ -1292,13 +1617,296 @@ mod tests {
         }
     }
 
+    fn private_snapshot() -> ActorPrivateSnapshot {
+        ActorPrivateSnapshot {
+            player: PlayerSnapshot {
+                player_id: "player-a".into(),
+                address: address(),
+                position: Vec3::ZERO,
+                orientation: Quat::IDENTITY,
+                linear_velocity: Vec3::ZERO,
+                angular_velocity: Vec3::ZERO,
+                surface_contact: false,
+                locomotion: PlayerLocomotionSnapshot {
+                    kind: LocomotionKind::Eva,
+                    up: Vec3::new(0.0, 1.0, 0.0),
+                    view_pitch_radians: 0.0,
+                    support: None,
+                    jump_held: false,
+                    jump_buffer_expires_at_simulation_tick: 0,
+                    support_grace_expires_at_simulation_tick: 0,
+                    magnetic_boots_enabled: false,
+                    magnetic_reattach_after_simulation_tick: 0,
+                },
+                movement_epoch: 1,
+                last_received_input_sequence: 0,
+                last_processed_input_sequence: 0,
+                control_linear_input: Vec3::ZERO,
+                control_angular_input: Vec3::ZERO,
+                boost: false,
+                dampeners: true,
+                jump: false,
+                control_expires_at_simulation_tick: 0,
+                inventory_id: "inventory-player-a".into(),
+                experience: 0,
+                level: 1,
+                next_level_experience: 100,
+                career: CareerSnapshot::default(),
+                life_state: PlayerLifeState::Alive,
+                suit_oxygen_milli: 1_000,
+                critical_oxygen_milli: 100,
+                helmet_closed: true,
+                jetpack_enabled: true,
+                environment: Some(environment()),
+            },
+            committed_operation_sequence: 0,
+            inventories: Vec::new(),
+            death_drops: vec![DeathDropSnapshot {
+                drop_id: "drop-a".into(),
+                death_id: "death-a".into(),
+                inventory_id: "inventory-drop-a".into(),
+                owner_player_id: "player-a".into(),
+                address: address(),
+                position: Vec3::ZERO,
+                created_event_sequence: 1,
+                cause: PlayerDeathCause::OxygenDepleted,
+            }],
+            owned_grid_masses: Vec::new(),
+            production_queues: Vec::new(),
+        }
+    }
+
+    fn private_motion() -> PlayerMotionSnapshot {
+        let player = private_snapshot().player;
+        PlayerMotionSnapshot {
+            player_id: player.player_id,
+            address: player.address,
+            position: Vec3::ZERO,
+            orientation: player.orientation,
+            linear_velocity: player.linear_velocity,
+            angular_velocity: player.angular_velocity,
+            surface_contact: player.surface_contact,
+            locomotion: player.locomotion,
+            movement_epoch: player.movement_epoch,
+            last_received_input_sequence: player.last_received_input_sequence,
+            last_processed_input_sequence: player.last_processed_input_sequence,
+            control_linear_input: player.control_linear_input,
+            control_angular_input: player.control_angular_input,
+            boost: player.boost,
+            dampeners: player.dampeners,
+            jump: player.jump,
+            control_expires_at_simulation_tick: player.control_expires_at_simulation_tick,
+            jetpack_enabled: player.jetpack_enabled,
+            life_state: player.life_state,
+            environment: player.environment,
+        }
+    }
+
+    fn linked_public_entities() -> Vec<InterestEntityProjection> {
+        let drop = PublicDeathDropSnapshot {
+            drop_id: "drop-a".into(),
+            address: address(),
+        };
+        let grid = PublicGridSnapshot {
+            grid_id: "grid-a".into(),
+            owner_player_id: "player-a".into(),
+            address: address(),
+            position: Vec3::ZERO,
+            orientation: Quat::IDENTITY,
+            linear_velocity: Vec3::ZERO,
+            angular_velocity: Vec3::ZERO,
+            anchored: false,
+            power: PowerSnapshot::default(),
+            blocks: vec![
+                PublicBlockSnapshot {
+                    block_id: "cargo-block".into(),
+                    coordinate: verse_protocol::IVec3::ZERO,
+                    kind: BlockKind::Cargo,
+                    orientation: 0,
+                    health: 100,
+                    max_health: 100,
+                    construction_complete: true,
+                    machine_state: None,
+                },
+                PublicBlockSnapshot {
+                    block_id: "refinery-block".into(),
+                    coordinate: verse_protocol::IVec3::new(1, 0, 0),
+                    kind: BlockKind::Refinery,
+                    orientation: 0,
+                    health: 100,
+                    max_health: 100,
+                    construction_complete: true,
+                    machine_state: Some(PublicMachineState::Idle),
+                },
+            ],
+        };
+        let player = PublicPlayerSnapshot {
+            player_id: "player-a".into(),
+            address: address(),
+            position: Vec3::ZERO,
+            orientation: Quat::IDENTITY,
+            linear_velocity: Vec3::ZERO,
+            angular_velocity: Vec3::ZERO,
+            surface_contact: false,
+            locomotion_kind: LocomotionKind::Eva,
+            life_state: PublicPlayerLifeState::Alive,
+            helmet_closed: true,
+            jetpack_enabled: true,
+        };
+        vec![
+            InterestEntityProjection {
+                entity_id: "drop-a".into(),
+                kind: InterestEntityKind::DeathDrop,
+                projected_revision: 1,
+                component_schema_version: PROJECTION_SCHEMA_VERSION,
+                payload: InterestEntityPayload::DeathDrop(drop),
+            },
+            InterestEntityProjection {
+                entity_id: "grid-a".into(),
+                kind: InterestEntityKind::Grid,
+                projected_revision: 1,
+                component_schema_version: PROJECTION_SCHEMA_VERSION,
+                payload: InterestEntityPayload::Grid(grid),
+            },
+            InterestEntityProjection {
+                entity_id: "player-a".into(),
+                kind: InterestEntityKind::Player,
+                projected_revision: 1,
+                component_schema_version: PROJECTION_SCHEMA_VERSION,
+                payload: InterestEntityPayload::Player(player),
+            },
+        ]
+    }
+
+    fn linked_private_snapshot() -> ActorPrivateSnapshot {
+        let mut private = private_snapshot();
+        private.player.inventory_id = "inventory-player".into();
+        private.inventories = vec![
+            InventorySnapshot {
+                inventory_id: "inventory-cargo".into(),
+                domain: InventoryDomain::Cargo {
+                    block_id: "cargo-block".into(),
+                },
+                contents: InventoryContents::default(),
+                capacity_liters: 100,
+                used_liters: 0,
+                mass_grams: 0,
+            },
+            InventorySnapshot {
+                inventory_id: "inventory-drop".into(),
+                domain: InventoryDomain::Dropped {
+                    reason: "player_death".into(),
+                    owner_player_id: "player-a".into(),
+                },
+                contents: InventoryContents::default(),
+                capacity_liters: 100,
+                used_liters: 0,
+                mass_grams: 0,
+            },
+            InventorySnapshot {
+                inventory_id: "inventory-player".into(),
+                domain: InventoryDomain::Player {
+                    player_id: "player-a".into(),
+                },
+                contents: InventoryContents::default(),
+                capacity_liters: 100,
+                used_liters: 0,
+                mass_grams: 0,
+            },
+        ];
+        private.death_drops[0].inventory_id = "inventory-drop".into();
+        private.owned_grid_masses = vec![OwnedGridMassSnapshot {
+            grid_id: "grid-a".into(),
+            mass_kg: 1_000.0,
+        }];
+        private.production_queues = vec![ProductionQueueSnapshot {
+            machine_block_id: "refinery-block".into(),
+            jobs: vec![ProductionJobSnapshot {
+                job_id: "job-a".into(),
+                owner_player_id: "player-a".into(),
+                machine_block_id: "refinery-block".into(),
+                recipe: ProductionRecipeKind::Refining,
+                batches: 1,
+                source_inventory_id: "inventory-cargo".into(),
+                destination_inventory_id: "inventory-player".into(),
+                progress_ticks: 0,
+                duration_ticks: 100,
+                status: ProductionJobStatus::Queued,
+                reserved_inputs: InventoryContents::default(),
+                pending_outputs: InventoryContents::default(),
+            }],
+        }];
+        private
+    }
+
+    fn player_role() -> SessionRole {
+        SessionRole::Player {
+            player_id: "player-a".into(),
+        }
+    }
+
+    fn linkage_error(
+        private: &ActorPrivateSnapshot,
+        entities: &[InterestEntityProjection],
+    ) -> ErrorCode {
+        validate_private_linkage(&player_role(), Some(private), entities)
+            .expect_err("invalid linkage is rejected")
+            .code()
+    }
+
+    fn linked_player_baseline() -> ServerMessage {
+        let entities = linked_public_entities();
+        let private = linked_private_snapshot();
+        let mut state = view_state(0);
+        state.observer_class = InterestObserverClass::BoundPlayer;
+        state.entities.clone_from(&entities);
+        state.actor_private = Some(private.clone());
+        state.view_hash = hash_view(&state).expect("linked player fixture hashes");
+
+        let mut message = baseline();
+        let ServerMessage::InterestBaseline { baseline } = &mut message else {
+            unreachable!();
+        };
+        baseline.players = entities
+            .iter()
+            .filter_map(|entity| match &entity.payload {
+                InterestEntityPayload::Player(player) => Some(player.clone()),
+                _ => None,
+            })
+            .collect();
+        baseline.grids = entities
+            .iter()
+            .filter_map(|entity| match &entity.payload {
+                InterestEntityPayload::Grid(grid) => Some(grid.clone()),
+                _ => None,
+            })
+            .collect();
+        baseline.death_drops = entities
+            .iter()
+            .filter_map(|entity| match &entity.payload {
+                InterestEntityPayload::DeathDrop(drop) => Some(drop.clone()),
+                _ => None,
+            })
+            .collect();
+        baseline.interest.observer_class = InterestObserverClass::BoundPlayer;
+        baseline.interest.entered = entities;
+        baseline.interest.view_hash = state.view_hash;
+        baseline.actor_private = Some(private);
+        message
+    }
+
     fn config() -> VerifierConfig {
+        let (registry_hash, manifest_hash) = binding_hashes();
         VerifierConfig::new(
             SessionRole::Spectator,
             WORLD_SCHEMA,
             EVENT_SCHEMA,
             CONTENT_SCHEMA,
             "content-v1",
+            CONTENT_HASH,
+            "universe-test",
+            registry_hash,
+            manifest_hash,
         )
     }
 
@@ -1319,39 +1927,110 @@ mod tests {
     }
 
     fn registry() -> ServerMessage {
+        let body = CelestialBodySnapshot {
+            body_id: "body-a".into(),
+            display_name: "Body A".into(),
+            kind: CelestialBodyKind::Asteroid,
+            parent_body_id: None,
+            field_id: None,
+            center: address(),
+            surface_radius_um: 10,
+            exclusion_radius_um: 10,
+            fixed_orientation_microradians: I64Vec3::ZERO,
+            surface_gravity_millimetres_per_second_squared: 0,
+            atmosphere_height_um: 0,
+            oxygen_parts_per_million: 0,
+            voxel_field_id: Some("voxel-a".into()),
+            geometry_definition_id: "geometry-a".into(),
+            voxel_definition_id: Some("voxel-definition-a".into()),
+            material_definition_id: "material-a".into(),
+            gravity_definition_id: "gravity-a".into(),
+            atmosphere_definition_id: "atmosphere-a".into(),
+            resource_definition_id: "resource-a".into(),
+            visual_descriptor_id: "visual-a".into(),
+            scale_class: CelestialScaleClass::Proof,
+            generation_seed: "seed-a".into(),
+            generation_rule_version: "generation-v1".into(),
+            materialized_registry_version: 1,
+            content_manifest_version: "content-v1".into(),
+            content_hash: CONTENT_HASH.into(),
+        };
+        let mut registry = CelestialRegistrySnapshot {
+            schema_version: CELESTIAL_REGISTRY_SCHEMA_VERSION,
+            registry_hash: String::new(),
+            license: "CC-BY-SA-4.0".into(),
+            universe_id: "universe-test".into(),
+            generation_rule_version: "generation-v1".into(),
+            minimum_fixed_body_surface_gap_um: 1,
+            bodies: vec![body],
+        };
+        registry.registry_hash =
+            registry::registry_hash(&registry).expect("registry fixture hashes");
+        let mut manifest = UniverseManifestSnapshot {
+            schema_version: UNIVERSE_MANIFEST_SCHEMA_VERSION,
+            manifest_hash: String::new(),
+            universe_id: "universe-test".into(),
+            world_seed: "seed".into(),
+            address_schema_version: 1,
+            sector_edge_um: 1_000,
+            cell_edge_um: 100,
+            cells_per_sector_axis: 10,
+            generation_rule_version: "generation-v1".into(),
+            frontier_policy_version: "frontier-v1".into(),
+            celestial_registry_schema_version: CELESTIAL_REGISTRY_SCHEMA_VERSION,
+            celestial_registry_hash: registry.registry_hash.clone(),
+            content_schema_version: CONTENT_SCHEMA,
+            content_manifest_version: "content-v1".into(),
+            content_hash: CONTENT_HASH.into(),
+            world_schema_version: WORLD_SCHEMA,
+            event_schema_version: EVENT_SCHEMA,
+        };
+        manifest.manifest_hash =
+            registry::manifest_hash(&manifest).expect("manifest fixture hashes");
         ServerMessage::Registry {
-            registry: Box::new(CelestialRegistrySnapshot {
-                schema_version: CELESTIAL_REGISTRY_SCHEMA_VERSION,
-                registry_hash: "registry-hash".into(),
-                license: "CC-BY-SA-4.0".into(),
-                universe_id: "universe-test".into(),
-                generation_rule_version: "generation-v1".into(),
-                minimum_fixed_body_surface_gap_um: 1,
-                bodies: Vec::new(),
-            }),
-            universe_manifest: Box::new(UniverseManifestSnapshot {
-                schema_version: UNIVERSE_MANIFEST_SCHEMA_VERSION,
-                manifest_hash: "manifest-hash".into(),
-                universe_id: "universe-test".into(),
-                world_seed: "seed".into(),
-                address_schema_version: 1,
-                sector_edge_um: 1_000,
-                cell_edge_um: 100,
-                cells_per_sector_axis: 10,
-                generation_rule_version: "generation-v1".into(),
-                frontier_policy_version: "frontier-v1".into(),
-                celestial_registry_schema_version: CELESTIAL_REGISTRY_SCHEMA_VERSION,
-                celestial_registry_hash: "registry-hash".into(),
-                content_schema_version: CONTENT_SCHEMA,
-                content_manifest_version: "content-v1".into(),
-                content_hash: "content-hash".into(),
-                world_schema_version: WORLD_SCHEMA,
-                event_schema_version: EVENT_SCHEMA,
-            }),
+            registry: Box::new(registry),
+            universe_manifest: Box::new(manifest),
         }
     }
 
+    fn binding_hashes() -> (String, String) {
+        let ServerMessage::Registry {
+            registry,
+            universe_manifest,
+        } = registry()
+        else {
+            unreachable!();
+        };
+        (registry.registry_hash, universe_manifest.manifest_hash)
+    }
+
+    fn registry_binding() -> RegistryBinding {
+        let ServerMessage::Registry {
+            registry,
+            universe_manifest,
+        } = registry()
+        else {
+            unreachable!();
+        };
+        registry::validate_documents(
+            WORLD_SCHEMA,
+            EVENT_SCHEMA,
+            CONTENT_SCHEMA,
+            "content-v1",
+            &universe_manifest.content_hash,
+            &universe_manifest.universe_id,
+            &registry.registry_hash,
+            &universe_manifest.manifest_hash,
+            512,
+            130_816,
+            &registry,
+            &universe_manifest,
+        )
+        .expect("registry fixture validates")
+    }
+
     fn interest(kind: InterestFrameKind, sequence: u64) -> InterestSnapshot {
+        let (registry_hash, manifest_hash) = binding_hashes();
         InterestSnapshot {
             schema_version: INTEREST_SCHEMA_VERSION,
             frame_kind: kind,
@@ -1362,8 +2041,8 @@ mod tests {
             observer_class: InterestObserverClass::PublicOriginSpectator,
             cell_address: address(),
             local_origin_address: address(),
-            registry_hash: "registry-hash".into(),
-            universe_manifest_hash: "manifest-hash".into(),
+            registry_hash,
+            universe_manifest_hash: manifest_hash,
             canonical_event_sequence: 50 + sequence,
             canonical_tick: 60 + sequence,
             canonical_world_hash: format!("world-{sequence}"),
@@ -1376,12 +2055,13 @@ mod tests {
     }
 
     fn view_state(sequence: u64) -> ViewState {
+        let (registry_hash, manifest_hash) = binding_hashes();
         let mut state = ViewState {
             content_manifest_version: "content-v1".into(),
             universe_id: "universe-test".into(),
             cell_id: "cell-a".into(),
-            universe_manifest_hash: "manifest-hash".into(),
-            celestial_registry_hash: "registry-hash".into(),
+            universe_manifest_hash: manifest_hash,
+            celestial_registry_hash: registry_hash,
             cell_address: address(),
             local_origin: address(),
             gravity_body_id: "body-a".into(),
@@ -1407,6 +2087,7 @@ mod tests {
         let state = view_state(0);
         let mut frontier = interest(InterestFrameKind::Baseline, 0);
         frontier.view_hash = state.view_hash;
+        let (registry_hash, manifest_hash) = binding_hashes();
         ServerMessage::InterestBaseline {
             baseline: Box::new(ProjectedWorldSnapshot {
                 projection_schema_version: PROJECTION_SCHEMA_VERSION,
@@ -1414,8 +2095,8 @@ mod tests {
                 content_manifest_version: "content-v1".into(),
                 universe_id: "universe-test".into(),
                 cell_id: "cell-a".into(),
-                universe_manifest_hash: "manifest-hash".into(),
-                celestial_registry_hash: "registry-hash".into(),
+                universe_manifest_hash: manifest_hash,
+                celestial_registry_hash: registry_hash,
                 cell_address: address(),
                 gravity_body_id: "body-a".into(),
                 voxel_body_id: "body-a".into(),
@@ -1440,6 +2121,7 @@ mod tests {
         let mut frontier = interest(InterestFrameKind::Delta, 1);
         frontier.previous_view_hash = Some(previous.into());
         frontier.view_hash = state.view_hash;
+        let (registry_hash, manifest_hash) = binding_hashes();
         ServerMessage::InterestDelta {
             delta: Box::new(ProjectedInterestDelta {
                 projection_schema_version: PROJECTION_SCHEMA_VERSION,
@@ -1447,8 +2129,8 @@ mod tests {
                 content_manifest_version: "content-v1".into(),
                 universe_id: "universe-test".into(),
                 cell_id: "cell-a".into(),
-                universe_manifest_hash: "manifest-hash".into(),
-                celestial_registry_hash: "registry-hash".into(),
+                universe_manifest_hash: manifest_hash,
+                celestial_registry_hash: registry_hash,
                 cell_address: address(),
                 gravity_body_id: "body-a".into(),
                 voxel_body_id: "body-a".into(),
@@ -1466,7 +2148,7 @@ mod tests {
 
     fn rebased_delta(previous: &str) -> ServerMessage {
         let mut origin = address();
-        origin.local_um.x = 123_456;
+        origin.local_um.x = -50;
         let mut state = view_state(1);
         state.local_origin = origin.clone();
         state.view_hash = hash_view(&state).expect("fixture hashes");
@@ -1601,8 +2283,9 @@ mod tests {
             }),
         };
         let unordered = vec![make_drop("z"), make_drop("a")];
+        let binding = registry_binding();
         assert_eq!(
-            validate_entity_vector(&unordered, &ResourceLimits::default())
+            validate_entity_vector(&unordered, &ResourceLimits::default(), &binding)
                 .expect_err("unordered entities are rejected")
                 .code(),
             ErrorCode::NonCanonicalOrder
@@ -1613,10 +2296,507 @@ mod tests {
         };
         value.drop_id = "other".into();
         assert_eq!(
-            validate_entity_vector(&[wrong_identity], &ResourceLimits::default())
+            validate_entity_vector(&[wrong_identity], &ResourceLimits::default(), &binding)
                 .expect_err("payload identity mismatch is rejected")
                 .code(),
             ErrorCode::InvalidEntity
+        );
+    }
+
+    #[test]
+    fn recursively_rejects_noncanonical_addresses_and_unknown_body_references() {
+        let binding = registry_binding();
+        let limits = ResourceLimits::default();
+        let invalid_address = || {
+            let mut value = address();
+            value.sector.x = "-0".into();
+            value
+        };
+
+        let public_player = InterestEntityProjection {
+            entity_id: "player-a".into(),
+            kind: InterestEntityKind::Player,
+            projected_revision: 1,
+            component_schema_version: PROJECTION_SCHEMA_VERSION,
+            payload: InterestEntityPayload::Player(PublicPlayerSnapshot {
+                player_id: "player-a".into(),
+                address: invalid_address(),
+                position: Vec3::ZERO,
+                orientation: Quat::IDENTITY,
+                linear_velocity: Vec3::ZERO,
+                angular_velocity: Vec3::ZERO,
+                surface_contact: false,
+                locomotion_kind: LocomotionKind::Eva,
+                life_state: PublicPlayerLifeState::Alive,
+                helmet_closed: true,
+                jetpack_enabled: true,
+            }),
+        };
+        assert_eq!(
+            validate_entity_vector(&[public_player], &limits, &binding)
+                .expect_err("public player address is independently rejected")
+                .code(),
+            ErrorCode::InvalidAddress
+        );
+
+        let public_grid = InterestEntityProjection {
+            entity_id: "grid-a".into(),
+            kind: InterestEntityKind::Grid,
+            projected_revision: 1,
+            component_schema_version: PROJECTION_SCHEMA_VERSION,
+            payload: InterestEntityPayload::Grid(PublicGridSnapshot {
+                grid_id: "grid-a".into(),
+                owner_player_id: "player-a".into(),
+                address: invalid_address(),
+                position: Vec3::ZERO,
+                orientation: Quat::IDENTITY,
+                linear_velocity: Vec3::ZERO,
+                angular_velocity: Vec3::ZERO,
+                anchored: false,
+                power: PowerSnapshot::default(),
+                blocks: Vec::new(),
+            }),
+        };
+        assert_eq!(
+            validate_entity_vector(&[public_grid], &limits, &binding)
+                .expect_err("public grid address is independently rejected")
+                .code(),
+            ErrorCode::InvalidAddress
+        );
+
+        let public_drop = InterestEntityProjection {
+            entity_id: "drop-a".into(),
+            kind: InterestEntityKind::DeathDrop,
+            projected_revision: 1,
+            component_schema_version: PROJECTION_SCHEMA_VERSION,
+            payload: InterestEntityPayload::DeathDrop(PublicDeathDropSnapshot {
+                drop_id: "drop-a".into(),
+                address: invalid_address(),
+            }),
+        };
+        assert_eq!(
+            validate_entity_vector(&[public_drop], &limits, &binding)
+                .expect_err("public drop address is independently rejected")
+                .code(),
+            ErrorCode::InvalidAddress
+        );
+
+        let unknown_chunk = InterestEntityProjection {
+            entity_id: "chunk-a".into(),
+            kind: InterestEntityKind::VoxelChunk,
+            projected_revision: 1,
+            component_schema_version: PROJECTION_SCHEMA_VERSION,
+            payload: InterestEntityPayload::VoxelChunk(PublicVoxelChunkSnapshot {
+                chunk_id: "chunk-a".into(),
+                body_id: "unknown-body".into(),
+                revision: 1,
+                voxels: Vec::new(),
+            }),
+        };
+        assert_eq!(
+            validate_entity_vector(&[unknown_chunk], &limits, &binding)
+                .expect_err("voxel chunk body reference is independently rejected")
+                .code(),
+            ErrorCode::BindingMismatch
+        );
+
+        let mut private = private_snapshot();
+        private.player.address = invalid_address();
+        assert_eq!(
+            validate_actor_private(&private, &limits, &binding)
+                .expect_err("private player address is independently rejected")
+                .code(),
+            ErrorCode::InvalidAddress
+        );
+        let mut private = private_snapshot();
+        private.death_drops[0].address = invalid_address();
+        assert_eq!(
+            validate_actor_private(&private, &limits, &binding)
+                .expect_err("private drop address is independently rejected")
+                .code(),
+            ErrorCode::InvalidAddress
+        );
+        let mut motion = private_motion();
+        motion.address.cell.x = 10;
+        assert_eq!(
+            validate_private_motion(&motion, &binding)
+                .expect_err("private motion address is independently rejected")
+                .code(),
+            ErrorCode::InvalidAddress
+        );
+
+        let mut environment = environment();
+        environment.nearest_body_id = "unknown-body".into();
+        assert_eq!(
+            binding
+                .validate_environment(&environment, "test environment")
+                .expect_err("unknown environment reference is rejected")
+                .code(),
+            ErrorCode::BindingMismatch
+        );
+
+        let mut verifier = ready_verifier();
+        let mut invalid_header = baseline();
+        let ServerMessage::InterestBaseline { baseline: snapshot } = &mut invalid_header else {
+            unreachable!();
+        };
+        snapshot.interest.local_origin_address = invalid_address();
+        assert_eq!(
+            verifier
+                .stage(&bytes(&invalid_header))
+                .expect_err("invalid local origin is rejected before hashing")
+                .code(),
+            ErrorCode::InvalidAddress
+        );
+        let mut unknown_header_body = baseline();
+        let ServerMessage::InterestBaseline { baseline: snapshot } = &mut unknown_header_body
+        else {
+            unreachable!();
+        };
+        snapshot.gravity_body_id = "unknown-body".into();
+        assert_eq!(
+            verifier
+                .stage(&bytes(&unknown_header_body))
+                .expect_err("unknown header body is rejected before hashing")
+                .code(),
+            ErrorCode::BindingMismatch
+        );
+
+        let mut verifier = InterestVerifier::new(config()).expect("config is valid");
+        commit_message(&mut verifier, &welcome());
+        let mut invalid_registry = registry();
+        let ServerMessage::Registry { registry, .. } = &mut invalid_registry else {
+            unreachable!();
+        };
+        registry.bodies[0].center = invalid_address();
+        assert_eq!(
+            verifier
+                .stage(&bytes(&invalid_registry))
+                .expect_err("invalid registry center is rejected before commitment")
+                .code(),
+            ErrorCode::InvalidAddress
+        );
+    }
+
+    #[test]
+    fn actor_private_linkage_accepts_complete_actor_owned_structure() {
+        let entities = linked_public_entities();
+        let private = linked_private_snapshot();
+        assert!(validate_private_linkage(&player_role(), Some(&private), &entities).is_ok());
+        assert!(validate_private_linkage(&SessionRole::Spectator, None, &entities).is_ok());
+    }
+
+    #[test]
+    fn actor_private_player_and_carried_inventory_must_bind_exactly() {
+        let entities = linked_public_entities();
+        let mut private = linked_private_snapshot();
+        private.player.player_id = "other-player".into();
+        assert_eq!(
+            linkage_error(&private, &entities),
+            ErrorCode::InvalidPrivateLinkage
+        );
+
+        let mut no_public_player = entities.clone();
+        no_public_player.retain(|entity| entity.kind != InterestEntityKind::Player);
+        assert_eq!(
+            linkage_error(&linked_private_snapshot(), &no_public_player),
+            ErrorCode::InvalidPrivateLinkage
+        );
+
+        let mut wrong_public_address = entities.clone();
+        let InterestEntityPayload::Player(player) = &mut wrong_public_address[2].payload else {
+            unreachable!();
+        };
+        player.address.local_um.x += 1;
+        assert_eq!(
+            linkage_error(&linked_private_snapshot(), &wrong_public_address),
+            ErrorCode::InvalidPrivateLinkage
+        );
+
+        let mut wrong_carried_owner = linked_private_snapshot();
+        wrong_carried_owner.inventories[2].domain = InventoryDomain::Player {
+            player_id: "other-player".into(),
+        };
+        assert_eq!(
+            linkage_error(&wrong_carried_owner, &entities),
+            ErrorCode::InvalidPrivateLinkage
+        );
+
+        let mut wrong_carried_id = linked_private_snapshot();
+        wrong_carried_id.player.inventory_id = "inventory-cargo".into();
+        assert_eq!(
+            linkage_error(&wrong_carried_id, &entities),
+            ErrorCode::InvalidPrivateLinkage
+        );
+
+        let mut missing_carried = linked_private_snapshot();
+        missing_carried.inventories.pop();
+        assert_eq!(
+            linkage_error(&missing_carried, &entities),
+            ErrorCode::InvalidPrivateLinkage
+        );
+    }
+
+    #[test]
+    fn actor_private_cargo_requires_one_visible_actor_owned_cargo_block() {
+        let entities = linked_public_entities();
+        let mut missing = linked_private_snapshot();
+        missing.inventories[0].domain = InventoryDomain::Cargo {
+            block_id: "missing-block".into(),
+        };
+        assert_eq!(
+            linkage_error(&missing, &entities),
+            ErrorCode::InvalidPrivateLinkage
+        );
+
+        let mut foreign = entities.clone();
+        let InterestEntityPayload::Grid(grid) = &mut foreign[1].payload else {
+            unreachable!();
+        };
+        grid.owner_player_id = "other-player".into();
+        assert_eq!(
+            linkage_error(&linked_private_snapshot(), &foreign),
+            ErrorCode::InvalidPrivateLinkage
+        );
+
+        let mut wrong_kind = entities.clone();
+        let InterestEntityPayload::Grid(grid) = &mut wrong_kind[1].payload else {
+            unreachable!();
+        };
+        grid.blocks[0].kind = BlockKind::Structural;
+        assert_eq!(
+            linkage_error(&linked_private_snapshot(), &wrong_kind),
+            ErrorCode::InvalidPrivateLinkage
+        );
+
+        let mut ambiguous = entities.clone();
+        let InterestEntityPayload::Grid(grid) = &mut ambiguous[1].payload else {
+            unreachable!();
+        };
+        grid.blocks.push(grid.blocks[0].clone());
+        assert_eq!(
+            linkage_error(&linked_private_snapshot(), &ambiguous),
+            ErrorCode::InvalidPrivateLinkage
+        );
+
+        let mut duplicate_inventory = linked_private_snapshot();
+        let mut duplicate = duplicate_inventory.inventories[0].clone();
+        duplicate.inventory_id = "inventory-cargo-second".into();
+        duplicate_inventory.inventories.insert(1, duplicate);
+        assert_eq!(
+            linkage_error(&duplicate_inventory, &entities),
+            ErrorCode::InvalidPrivateLinkage
+        );
+    }
+
+    #[test]
+    fn actor_private_drops_require_actor_inventory_and_visible_public_drop() {
+        let entities = linked_public_entities();
+        let mut wrong_owner = linked_private_snapshot();
+        wrong_owner.death_drops[0].owner_player_id = "other-player".into();
+        assert_eq!(
+            linkage_error(&wrong_owner, &entities),
+            ErrorCode::InvalidPrivateLinkage
+        );
+
+        let mut no_public_drop = entities.clone();
+        no_public_drop.retain(|entity| entity.kind != InterestEntityKind::DeathDrop);
+        assert_eq!(
+            linkage_error(&linked_private_snapshot(), &no_public_drop),
+            ErrorCode::InvalidPrivateLinkage
+        );
+
+        let mut wrong_public_address = entities.clone();
+        let InterestEntityPayload::DeathDrop(drop) = &mut wrong_public_address[0].payload else {
+            unreachable!();
+        };
+        drop.address.local_um.x += 1;
+        assert_eq!(
+            linkage_error(&linked_private_snapshot(), &wrong_public_address),
+            ErrorCode::InvalidPrivateLinkage
+        );
+
+        let mut missing_inventory = linked_private_snapshot();
+        missing_inventory.death_drops[0].inventory_id = "missing-inventory".into();
+        assert_eq!(
+            linkage_error(&missing_inventory, &entities),
+            ErrorCode::InvalidPrivateLinkage
+        );
+
+        let mut wrong_inventory_owner = linked_private_snapshot();
+        wrong_inventory_owner.inventories[1].domain = InventoryDomain::Dropped {
+            reason: "player_death".into(),
+            owner_player_id: "other-player".into(),
+        };
+        assert_eq!(
+            linkage_error(&wrong_inventory_owner, &entities),
+            ErrorCode::InvalidPrivateLinkage
+        );
+
+        let mut orphan_inventory = linked_private_snapshot();
+        orphan_inventory.death_drops.clear();
+        assert_eq!(
+            linkage_error(&orphan_inventory, &entities),
+            ErrorCode::InvalidPrivateLinkage
+        );
+
+        let mut duplicate_drop_inventory = linked_private_snapshot();
+        let mut second = duplicate_drop_inventory.death_drops[0].clone();
+        second.drop_id = "drop-b".into();
+        duplicate_drop_inventory.death_drops.push(second);
+        let mut duplicate_public = entities.clone();
+        duplicate_public.insert(
+            1,
+            InterestEntityProjection {
+                entity_id: "drop-b".into(),
+                kind: InterestEntityKind::DeathDrop,
+                projected_revision: 1,
+                component_schema_version: PROJECTION_SCHEMA_VERSION,
+                payload: InterestEntityPayload::DeathDrop(PublicDeathDropSnapshot {
+                    drop_id: "drop-b".into(),
+                    address: address(),
+                }),
+            },
+        );
+        assert_eq!(
+            linkage_error(&duplicate_drop_inventory, &duplicate_public),
+            ErrorCode::InvalidPrivateLinkage
+        );
+    }
+
+    #[test]
+    fn actor_private_masses_queues_and_jobs_require_visible_owned_authority() {
+        let entities = linked_public_entities();
+        let mut missing_mass_grid = linked_private_snapshot();
+        missing_mass_grid.owned_grid_masses[0].grid_id = "missing-grid".into();
+        assert_eq!(
+            linkage_error(&missing_mass_grid, &entities),
+            ErrorCode::InvalidPrivateLinkage
+        );
+
+        let mut foreign_grid = entities.clone();
+        let InterestEntityPayload::Grid(grid) = &mut foreign_grid[1].payload else {
+            unreachable!();
+        };
+        grid.owner_player_id = "other-player".into();
+        assert_eq!(
+            linkage_error(&linked_private_snapshot(), &foreign_grid),
+            ErrorCode::InvalidPrivateLinkage
+        );
+
+        let mut missing_machine = linked_private_snapshot();
+        missing_machine.production_queues[0].machine_block_id = "missing-machine".into();
+        assert_eq!(
+            linkage_error(&missing_machine, &entities),
+            ErrorCode::InvalidPrivateLinkage
+        );
+
+        let mut non_machine = entities.clone();
+        let InterestEntityPayload::Grid(grid) = &mut non_machine[1].payload else {
+            unreachable!();
+        };
+        grid.blocks[1].kind = BlockKind::Structural;
+        assert_eq!(
+            linkage_error(&linked_private_snapshot(), &non_machine),
+            ErrorCode::InvalidPrivateLinkage
+        );
+
+        let mut wrong_job_owner = linked_private_snapshot();
+        wrong_job_owner.production_queues[0].jobs[0].owner_player_id = "other-player".into();
+        assert_eq!(
+            linkage_error(&wrong_job_owner, &entities),
+            ErrorCode::InvalidPrivateLinkage
+        );
+
+        let mut wrong_job_machine = linked_private_snapshot();
+        wrong_job_machine.production_queues[0].jobs[0].machine_block_id = "other-machine".into();
+        assert_eq!(
+            linkage_error(&wrong_job_machine, &entities),
+            ErrorCode::InvalidPrivateLinkage
+        );
+
+        let mut wrong_recipe = linked_private_snapshot();
+        wrong_recipe.production_queues[0].jobs[0].recipe = ProductionRecipeKind::Component;
+        assert_eq!(
+            linkage_error(&wrong_recipe, &entities),
+            ErrorCode::InvalidPrivateLinkage
+        );
+
+        for endpoint in ["source", "destination"] {
+            let mut missing_endpoint = linked_private_snapshot();
+            let job = &mut missing_endpoint.production_queues[0].jobs[0];
+            if endpoint == "source" {
+                job.source_inventory_id = "missing-inventory".into();
+            } else {
+                job.destination_inventory_id = "missing-inventory".into();
+            }
+            assert_eq!(
+                linkage_error(&missing_endpoint, &entities),
+                ErrorCode::InvalidPrivateLinkage
+            );
+        }
+
+        let mut duplicate_job = linked_private_snapshot();
+        let second = duplicate_job.production_queues[0].jobs[0].clone();
+        duplicate_job.production_queues[0].jobs.push(second);
+        assert_eq!(
+            linkage_error(&duplicate_job, &entities),
+            ErrorCode::InvalidPrivateLinkage
+        );
+    }
+
+    #[test]
+    fn retained_private_overlay_is_revalidated_after_public_removal() {
+        let mut config = VerifierConfig::new(
+            player_role(),
+            WORLD_SCHEMA,
+            EVENT_SCHEMA,
+            CONTENT_SCHEMA,
+            "content-v1",
+            CONTENT_HASH,
+            "universe-test",
+            binding_hashes().0,
+            binding_hashes().1,
+        );
+        config.limits = ResourceLimits::default();
+        let mut verifier = InterestVerifier::new(config).expect("player verifier config is valid");
+        let mut player_welcome = welcome();
+        let ServerMessage::Welcome { session_role, .. } = &mut player_welcome else {
+            unreachable!();
+        };
+        *session_role = player_role();
+        commit_message(&mut verifier, &player_welcome);
+        commit_message(&mut verifier, &registry());
+        commit_message(&mut verifier, &linked_player_baseline());
+        let previous = verifier
+            .committed_view()
+            .expect("linked baseline commits")
+            .view_hash;
+
+        let mut removal = delta(&previous);
+        let ServerMessage::InterestDelta { delta } = &mut removal else {
+            unreachable!();
+        };
+        delta.interest.observer_class = InterestObserverClass::BoundPlayer;
+        delta.interest.removed = vec![verse_protocol::InterestRemoval {
+            entity_id: "grid-a".into(),
+            kind: InterestEntityKind::Grid,
+            reason: verse_protocol::InterestRemovalReason::OutOfInterest,
+        }];
+        delta.interest.view_hash = "0".repeat(64);
+        assert_eq!(
+            verifier
+                .stage(&bytes(&removal))
+                .expect_err("retained private links are invalid after grid removal")
+                .code(),
+            ErrorCode::InvalidPrivateLinkage
+        );
+        assert_eq!(
+            verifier
+                .committed_view()
+                .expect("prior committed view is retained")
+                .delta_sequence,
+            0
         );
     }
 
@@ -1636,7 +2816,7 @@ mod tests {
             Some(concat!(
                 "{\"type\":\"acknowledge_interest\",\"session_epoch\":\"session-1\",",
                 "\"interest_epoch\":41,\"baseline_id\":\"baseline-1\",\"delta_sequence\":0,",
-                "\"view_hash\":\"63a0e17a89f61f4d96ac0e41f464112f5ef8ef2c082b98f02469218879587801\"}"
+                "\"view_hash\":\"dba65a263bb44f56c7615d695baaa1194566c1043fb8b6b1a56af00ede03f87b\"}"
             ))
         );
 
@@ -1799,6 +2979,10 @@ mod tests {
             EVENT_SCHEMA,
             CONTENT_SCHEMA,
             "content-v1",
+            CONTENT_HASH,
+            "universe-test",
+            binding_hashes().0,
+            binding_hashes().1,
         );
         player_config.limits = ResourceLimits::default();
         let mut player_verifier = InterestVerifier::new(player_config).expect("config is valid");
@@ -1920,7 +3104,7 @@ mod tests {
     fn empty_spectator_view_hash_is_frozen() {
         assert_eq!(
             view_state(0).view_hash,
-            "63a0e17a89f61f4d96ac0e41f464112f5ef8ef2c082b98f02469218879587801"
+            "dba65a263bb44f56c7615d695baaa1194566c1043fb8b6b1a56af00ede03f87b"
         );
     }
 }

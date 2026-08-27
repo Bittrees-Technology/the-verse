@@ -2386,7 +2386,7 @@ mod tests {
         drop.position = Vec3::new(x, 0.0, 0.0);
     }
 
-    fn verifier_for(role: SessionRole) -> InterestVerifier {
+    fn verifier_for(world: &WorldState, role: SessionRole) -> InterestVerifier {
         let manifest = content::manifest();
         InterestVerifier::new(VerifierConfig::new(
             role,
@@ -2394,6 +2394,10 @@ mod tests {
             crate::EVENT_SCHEMA_VERSION,
             manifest.schema_version,
             &manifest.manifest_version,
+            crate::content::manifest_hash(),
+            &world.universe_id,
+            &world.celestial_registry_hash,
+            &world.universe_manifest_hash,
         ))
         .expect("verifier config")
     }
@@ -2552,7 +2556,7 @@ mod tests {
         let role = SessionRole::Player {
             player_id: "player-local".into(),
         };
-        let mut verifier = verifier_for(role.clone());
+        let mut verifier = verifier_for(&world, role.clone());
         establish_verifier(&mut verifier, &world, role);
 
         let mut cursor =
@@ -2621,7 +2625,7 @@ mod tests {
     fn independent_verifier_rejects_tampering_and_accepts_a_real_recovery_baseline() {
         let world = world_with_two_actors();
         let role = SessionRole::Spectator;
-        let mut verifier = verifier_for(role.clone());
+        let mut verifier = verifier_for(&world, role.clone());
         establish_verifier(&mut verifier, &world, role);
         let mut cursor =
             InterestProjectionState::public_origin_spectator("independent-spectator-session");

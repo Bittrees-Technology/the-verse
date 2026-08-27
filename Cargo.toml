@@ -3,6 +3,7 @@ resolver = "2"
 members = [
   "crates/verse-protocol",
   "crates/verse-interest-verifier",
+  "crates/verse-godot-interest-adapter",
   "crates/verse-physics",
   "crates/verse-simulation",
   "services/simulation-worker",
@@ -22,6 +23,7 @@ blake3 = "1.8"
 clap = { version = "4.5", features = ["derive", "env"] }
 futures-util = "0.3"
 fs2 = "0.4"
+godot = { version = "=0.5.4", features = ["api-4-7"] }
 http = "1.3"
 joltc-sys = { git = "https://github.com/SecondHalfGames/jolt-rust", rev = "72ac0cb1acc2037c72dc29865da6f52a5483dadc", features = ["double-precision"] }
 parking_lot = "0.12"

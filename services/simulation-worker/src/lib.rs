@@ -44,6 +44,10 @@ use verse_simulation::{
 const COMMAND_CENTER_HTML: &str = include_str!("../../../apps/web-command-center/index.html");
 const COMMAND_CENTER_JS: &str = include_str!("../../../apps/web-command-center/app.js");
 const COMMAND_CENTER_CSS: &str = include_str!("../../../apps/web-command-center/styles.css");
+const VERIFIER_WORKER_JS: &str =
+    include_str!("../../../apps/web-command-center/verifier-worker.js");
+const VERIFIER_WORKER_CORE_JS: &str =
+    include_str!("../../../apps/web-command-center/verifier-worker-core.js");
 const REPLICATION_PERIOD: Duration = Duration::from_nanos(16_666_667);
 const DYNAMIC_CACHE_CONTROL: &str = "no-store";
 const MAX_CLIENT_NAME_BYTES: usize = 128;
@@ -635,6 +639,19 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/", get(command_center))
         .route("/app.js", get(command_center_javascript))
         .route("/styles.css", get(command_center_styles))
+        .route("/verifier-worker.js", get(verifier_worker_javascript))
+        .route(
+            "/verifier-worker-core.js",
+            get(verifier_worker_core_javascript),
+        )
+        .route(
+            "/generated/verse_interest_verifier.js",
+            get(generated_verifier_javascript),
+        )
+        .route(
+            "/generated/verse_interest_verifier_bg.wasm",
+            get(generated_verifier_wasm),
+        )
         .route("/healthz", get(health))
         .route("/api/v1/status", get(status))
         .route("/api/v1/registry", get(registry))
@@ -648,22 +665,81 @@ pub fn router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
-async fn command_center() -> Html<&'static str> {
-    Html(COMMAND_CENTER_HTML)
+async fn command_center() -> Response {
+    no_store(Html(COMMAND_CENTER_HTML).into_response())
 }
 
-async fn command_center_javascript() -> impl IntoResponse {
-    (
-        [(CONTENT_TYPE, "text/javascript; charset=utf-8")],
-        COMMAND_CENTER_JS,
+async fn command_center_javascript() -> Response {
+    no_store(
+        (
+            [(CONTENT_TYPE, "text/javascript; charset=utf-8")],
+            COMMAND_CENTER_JS,
+        )
+            .into_response(),
     )
 }
 
-async fn command_center_styles() -> impl IntoResponse {
-    (
-        [(CONTENT_TYPE, "text/css; charset=utf-8")],
-        COMMAND_CENTER_CSS,
+async fn command_center_styles() -> Response {
+    no_store(
+        (
+            [(CONTENT_TYPE, "text/css; charset=utf-8")],
+            COMMAND_CENTER_CSS,
+        )
+            .into_response(),
     )
+}
+
+async fn verifier_worker_javascript() -> Response {
+    no_store(
+        (
+            [(CONTENT_TYPE, "text/javascript; charset=utf-8")],
+            VERIFIER_WORKER_JS,
+        )
+            .into_response(),
+    )
+}
+
+async fn verifier_worker_core_javascript() -> Response {
+    no_store(
+        (
+            [(CONTENT_TYPE, "text/javascript; charset=utf-8")],
+            VERIFIER_WORKER_CORE_JS,
+        )
+            .into_response(),
+    )
+}
+
+async fn generated_verifier_javascript() -> Response {
+    generated_browser_asset(
+        "verse_interest_verifier.js",
+        "text/javascript; charset=utf-8",
+    )
+    .await
+}
+
+async fn generated_verifier_wasm() -> Response {
+    generated_browser_asset("verse_interest_verifier_bg.wasm", "application/wasm").await
+}
+
+async fn generated_browser_asset(file_name: &str, content_type: &'static str) -> Response {
+    let directory = std::env::var_os("VERSE_BROWSER_VERIFIER_ASSET_DIR").map_or_else(
+        || {
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../apps/web-command-center/generated")
+        },
+        std::path::PathBuf::from,
+    );
+    match tokio::fs::read(directory.join(file_name)).await {
+        Ok(bytes) => no_store(([(CONTENT_TYPE, content_type)], bytes).into_response()),
+        Err(_) => no_store(
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(CONTENT_TYPE, content_type)],
+                "browser verifier asset is unavailable; run tools/ci/build-browser-verifier.sh",
+            )
+                .into_response(),
+        ),
+    }
 }
 
 async fn health(State(state): State<Arc<AppState>>) -> StatusCode {
@@ -1596,6 +1672,16 @@ mod tests {
             .await
             .expect("additional test websocket connects");
         additional
+    }
+
+    async fn wait_for_player_release(state: &AppState, player_id: &str) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while state.connected_players.lock().contains(player_id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("closed gameplay session releases its player binding");
     }
 
     async fn complete_session(socket: &mut TestSocket, hello: &ClientMessage) -> serde_json::Value {
@@ -3678,7 +3764,7 @@ mod tests {
         }
 
         local.close(None).await.expect("local closes");
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        wait_for_player_release(&state, "player-local").await;
         let mut reconnected = connect_additional(&remote).await;
         let reconnect_snapshot = complete_session(
             &mut reconnected,
@@ -3773,6 +3859,8 @@ mod tests {
             ("/", "text/html"),
             ("/app.js", "text/javascript"),
             ("/styles.css", "text/css"),
+            ("/verifier-worker.js", "text/javascript"),
+            ("/verifier-worker-core.js", "text/javascript"),
         ] {
             let response = test_app()
                 .oneshot(
@@ -3790,6 +3878,43 @@ mod tests {
                     .get(CONTENT_TYPE)
                     .and_then(|value| value.to_str().ok())
                     .is_some_and(|value| value.starts_with(expected_content_type))
+            );
+            assert_eq!(
+                response.headers().get(CACHE_CONTROL),
+                Some(&HeaderValue::from_static("no-store"))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn generated_browser_verifier_routes_are_typed_and_never_cached() {
+        for (uri, expected_content_type) in [
+            ("/generated/verse_interest_verifier.js", "text/javascript"),
+            (
+                "/generated/verse_interest_verifier_bg.wasm",
+                "application/wasm",
+            ),
+        ] {
+            let response = test_app()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(
+                response
+                    .headers()
+                    .get(CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|value| value.starts_with(expected_content_type))
+            );
+            assert_eq!(
+                response.headers().get(CACHE_CONTROL),
+                Some(&HeaderValue::from_static("no-store"))
             );
         }
     }
