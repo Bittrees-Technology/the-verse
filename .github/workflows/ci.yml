@@ -79,6 +79,26 @@ jobs:
           GODOT_BIN: ${{ matrix.godot_binary }}
           VERSE_RELEASE_VERSION: p0.10.0-ci-${{ github.sha }}
         run: tools/release/package-native.sh
+      - name: Measure Linux P0.10 physics distribution
+        if: runner.os == 'Linux'
+        env:
+          GODOT_BIN: ${{ matrix.godot_binary }}
+        run: |
+          benchmark_file="artifacts/release/P0.10-grounded-locomotion-linux.txt"
+          {
+            echo "The Verse P0.10 hosted Linux release distribution"
+            uname -a
+            lscpu
+            rustc --version
+            cmake --version
+            "${GODOT_BIN}" --headless --version
+          } > "${benchmark_file}"
+          for sample in 1 2 3 4 5; do
+            echo "sample=${sample}" | tee -a "${benchmark_file}"
+            cargo test -p verse-physics --release --locked \
+              --test compound_grid_benchmark -- --ignored --nocapture \
+              2>&1 | tee -a "${benchmark_file}"
+          done
       - name: Upload native development package
         uses: actions/upload-artifact@v4
         with:
@@ -87,5 +107,6 @@ jobs:
             artifacts/release/*.zip
             artifacts/release/*.tar.gz
             artifacts/release/*.sha256
+            artifacts/release/*.txt
           if-no-files-found: error
           retention-days: 7
