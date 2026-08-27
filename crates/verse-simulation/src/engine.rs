@@ -813,7 +813,10 @@ impl WorldState {
             )
         })?;
         if actor_player_id != self.player.primary_player_id
-            && !matches!(message, ClientMessage::SetPlayerControl { .. })
+            && !matches!(
+                message,
+                ClientMessage::SetPlayerControl { .. } | ClientMessage::MineVoxel { .. }
+            )
         {
             return Err(IntentError::rejected(
                 "actor_action_not_available",
@@ -917,9 +920,7 @@ impl WorldState {
                     f64::from(coordinate.y),
                     f64::from(coordinate.z),
                 );
-                if self.player.position.squared_distance(voxel_position)
-                    > MINING_RANGE * MINING_RANGE
-                {
+                if actor.position.squared_distance(voxel_position) > MINING_RANGE * MINING_RANGE {
                     return Err(IntentError::rejected(
                         "voxel_out_of_range",
                         "target voxel is beyond the mining tool range",
@@ -927,7 +928,7 @@ impl WorldState {
                 }
                 let ore_yield = content::voxel(material).ore_yield;
                 if !self
-                    .inventory(&self.player.inventory_id)?
+                    .inventory(&actor.inventory_id)?
                     .can_add(ResourceKind::Ore, ore_yield)
                 {
                     return Err(IntentError::rejected(
@@ -949,7 +950,7 @@ impl WorldState {
                     coordinate: *coordinate,
                     material,
                     ore_yield,
-                    inventory_id: self.player.inventory_id.clone(),
+                    inventory_id: actor.inventory_id.clone(),
                 }
             }
             ClientMessage::RefineOre {
@@ -1361,6 +1362,16 @@ impl WorldState {
                     "character control requires the authoritative player actor and an operation ID",
                 ));
             }
+            EventPayload::VoxelMined { .. }
+                if event.actor_type != "human"
+                    || event.actor_player_id.is_none()
+                    || event.operation_id.as_deref().is_none_or(str::is_empty) =>
+            {
+                return Err(IntentError::rejected(
+                    "replay_mining_envelope_invalid",
+                    "voxel mining requires the authoritative player actor and an operation ID",
+                ));
+            }
             EventPayload::PhysicsStepCommitted { .. }
                 if event.actor_player_id.is_some()
                     || event.actor_type != "system"
@@ -1595,17 +1606,72 @@ impl WorldState {
                 ore_yield,
                 inventory_id,
             } => {
-                let removed = self.voxels.remove(*coordinate).ok_or_else(|| {
+                let actor_player_id = event
+                    .actor_player_id
+                    .as_deref()
+                    .expect("validated mining event has a human actor");
+                let actor = self
+                    .player
+                    .get(actor_player_id)
+                    .expect("validated mining actor is present");
+                if inventory_id != &actor.inventory_id {
+                    return Err(IntentError::rejected(
+                        "replay_mining_actor_inventory_invalid",
+                        "mined ore must be credited to the authenticated actor's carried inventory",
+                    ));
+                }
+                let canonical_material = self.voxels.material(*coordinate).ok_or_else(|| {
                     IntentError::rejected("replay_voxel_missing", "event target voxel is missing")
                 })?;
-                if removed != *material {
+                if canonical_material != *material {
                     return Err(IntentError::rejected(
                         "replay_material_mismatch",
                         "event material does not match voxel material",
                     ));
                 }
-                self.inventory_mut(inventory_id)?.contents.ore += ore_yield;
-                self.ledger.mined_ore += ore_yield;
+                let voxel_position = Vec3::new(
+                    f64::from(coordinate.x),
+                    f64::from(coordinate.y),
+                    f64::from(coordinate.z),
+                );
+                if actor.position.squared_distance(voxel_position) > MINING_RANGE * MINING_RANGE {
+                    return Err(IntentError::rejected(
+                        "replay_mining_range_invalid",
+                        "mining event target is beyond the authenticated actor's tool range",
+                    ));
+                }
+                let canonical_ore_yield = content::voxel(canonical_material).ore_yield;
+                if *ore_yield != canonical_ore_yield {
+                    return Err(IntentError::rejected(
+                        "replay_mining_yield_invalid",
+                        "mining event yield does not match the canonical voxel material",
+                    ));
+                }
+                if !self
+                    .inventory(inventory_id)?
+                    .can_add(ResourceKind::Ore, canonical_ore_yield)
+                {
+                    return Err(IntentError::rejected(
+                        "replay_mining_inventory_capacity_invalid",
+                        "mining event exceeds the authenticated actor's carried inventory capacity",
+                    ));
+                }
+                if self.grids.values().any(|grid| {
+                    grid.anchored
+                        && grid.anchor_touches(&self.voxels)
+                        && !grid.anchor_touches_after_removal(&self.voxels, Some(*coordinate))
+                }) {
+                    return Err(IntentError::rejected(
+                        "replay_mining_anchor_support_invalid",
+                        "mining event would remove the final voxel support from an anchored grid",
+                    ));
+                }
+
+                self.voxels
+                    .remove(*coordinate)
+                    .expect("validated mining target remains present");
+                self.inventory_mut(inventory_id)?.contents.ore += canonical_ore_yield;
+                self.ledger.mined_ore += canonical_ore_yield;
                 let body_id =
                     voxel_collision_chunk_body_id(voxel_collision_chunk_coordinate(*coordinate));
                 let collider_id = voxel_collision_collider_id(*coordinate);
@@ -2298,12 +2364,32 @@ impl WorldState {
             }
         }
 
-        self.player.experience = self
-            .player
-            .experience
-            .saturating_add(event.payload.experience_reward());
+        let experience_reward = event.payload.experience_reward();
+        if matches!(&event.payload, EventPayload::VoxelMined { .. }) {
+            let actor_player_id = event
+                .actor_player_id
+                .as_deref()
+                .expect("validated mining event has a human actor");
+            let actor = self
+                .player
+                .get_mut(actor_player_id)
+                .expect("validated mining actor is present");
+            actor.experience = actor.experience.saturating_add(experience_reward);
+        } else {
+            self.player.experience = self.player.experience.saturating_add(experience_reward);
+        }
         match &event.payload {
-            EventPayload::VoxelMined { .. } => self.player.career.voxels_mined += 1,
+            EventPayload::VoxelMined { .. } => {
+                let actor_player_id = event
+                    .actor_player_id
+                    .as_deref()
+                    .expect("validated mining event has a human actor");
+                self.player
+                    .get_mut(actor_player_id)
+                    .expect("validated mining actor is present")
+                    .career
+                    .voxels_mined += 1;
+            }
             EventPayload::OreRefined { batches, .. } => {
                 self.player.career.refining_batches += batches;
             }
@@ -5525,6 +5611,376 @@ mod tests {
         assert_eq!(runtime.physics_chunk_replacements, 1);
         assert_eq!(runtime.physics_full_rebuilds, 0);
         assert!(runtime.state().conservation().valid);
+    }
+
+    #[test]
+    fn authenticated_secondary_mining_credits_only_its_actor_and_recovers_exactly() {
+        let directory = tempdir().expect("tempdir");
+        let mut runtime = Runtime::open(directory.path(), 141, 1_000).expect("runtime opens");
+        runtime
+            .admit_development_player("player-remote")
+            .expect("remote development player admits");
+        let primary_position = runtime
+            .state()
+            .player
+            .get("player-local")
+            .expect("primary player exists")
+            .position;
+        let target = runtime
+            .state()
+            .voxels
+            .occupied
+            .iter()
+            .copied()
+            .find(|coordinate| {
+                let position = Vec3::new(
+                    f64::from(coordinate.x),
+                    f64::from(coordinate.y),
+                    f64::from(coordinate.z),
+                );
+                primary_position.squared_distance(position) > MINING_RANGE * MINING_RANGE
+            })
+            .expect("asteroid has a voxel outside primary mining range");
+        let target_position = Vec3::new(
+            f64::from(target.x),
+            f64::from(target.y),
+            f64::from(target.z),
+        );
+        let remote = runtime
+            .state
+            .player
+            .get_mut("player-remote")
+            .expect("remote player exists");
+        remote.position = target_position + Vec3::new(0.0, 3.0, 0.0);
+        remote.linear_velocity = Vec3::ZERO;
+        remote.angular_velocity = Vec3::ZERO;
+        runtime
+            .physics
+            .rebuild(&physics_body_specs(&runtime.state))
+            .expect("remote mining fixture physics builds");
+        runtime
+            .persist_snapshot()
+            .expect("remote mining baseline persists");
+
+        let material = runtime
+            .state()
+            .voxels
+            .material(target)
+            .expect("target voxel exists");
+        let ore_yield = content::voxel(material).ore_yield;
+        let primary_before = runtime
+            .state()
+            .player
+            .get("player-local")
+            .expect("primary player exists")
+            .clone();
+        let primary_inventory_before = runtime.state().inventories[&primary_before.inventory_id]
+            .contents
+            .clone();
+        let remote_before = runtime
+            .state()
+            .player
+            .get("player-remote")
+            .expect("remote player exists")
+            .clone();
+        let intent = ClientMessage::MineVoxel {
+            operation_id: "shared-mining-operation".into(),
+            coordinate: target,
+        };
+
+        let receipt = runtime
+            .execute_as("player-remote", &intent)
+            .expect("authenticated remote actor mines reachable voxel");
+        assert_eq!(receipt.code, "voxel_mined");
+        assert_eq!(runtime.state().voxels.material(target), None);
+        assert_eq!(
+            runtime.state().inventories[&remote_before.inventory_id]
+                .contents
+                .ore,
+            ore_yield
+        );
+        let remote_after = runtime
+            .state()
+            .player
+            .get("player-remote")
+            .expect("remote player remains present")
+            .clone();
+        assert_eq!(
+            remote_after.experience,
+            remote_before.experience + ore_yield * 5
+        );
+        assert_eq!(
+            remote_after.career.voxels_mined,
+            remote_before.career.voxels_mined + 1
+        );
+        assert_eq!(
+            runtime
+                .state()
+                .player
+                .get("player-local")
+                .expect("primary player remains present"),
+            &primary_before
+        );
+        assert_eq!(
+            runtime.state().inventories[&primary_before.inventory_id].contents,
+            primary_inventory_before
+        );
+        assert_eq!(
+            runtime
+                .state()
+                .processed_operation("player-remote", "shared-mining-operation"),
+            Some(&receipt)
+        );
+        assert!(
+            runtime
+                .state()
+                .processed_operation("player-local", "shared-mining-operation")
+                .is_none()
+        );
+        let journal = fs::read_to_string(directory.path().join("events.ndjson"))
+            .expect("mining journal reads");
+        let event: CanonicalEvent = serde_json::from_str(
+            journal
+                .lines()
+                .last()
+                .expect("mining event is durably journaled"),
+        )
+        .expect("mining event parses");
+        assert_eq!(event.actor_player_id.as_deref(), Some("player-remote"));
+        assert!(matches!(
+            event.payload,
+            EventPayload::VoxelMined { ref inventory_id, .. }
+                if inventory_id == &remote_before.inventory_id
+        ));
+        let accepted_hash = runtime.state().state_hash();
+        assert_eq!(
+            runtime
+                .execute_as("player-remote", &intent)
+                .expect("remote mining retry is idempotent"),
+            receipt
+        );
+        assert_eq!(runtime.state().state_hash(), accepted_hash);
+        assert!(runtime.state().conservation().valid);
+
+        drop(runtime);
+        let recovered = Runtime::open(directory.path(), 141, 1_000).expect("runtime recovers");
+        assert_eq!(recovered.state().state_hash(), accepted_hash);
+        assert_eq!(
+            recovered
+                .state()
+                .player
+                .get("player-remote")
+                .expect("remote actor recovers"),
+            &remote_after
+        );
+        assert_eq!(
+            recovered
+                .state()
+                .player
+                .get("player-local")
+                .expect("primary actor recovers"),
+            &primary_before
+        );
+    }
+
+    #[test]
+    fn secondary_mining_rejections_are_exactly_non_mutating() {
+        let directory = tempdir().expect("tempdir");
+        let mut runtime = Runtime::open(directory.path(), 142, 1_000).expect("runtime opens");
+        runtime
+            .admit_development_player("player-remote")
+            .expect("remote development player admits");
+        let out_of_range_target = runtime
+            .state()
+            .voxels
+            .occupied
+            .iter()
+            .copied()
+            .max_by(|left, right| {
+                let remote_position = runtime
+                    .state()
+                    .player
+                    .get("player-remote")
+                    .expect("remote exists")
+                    .position;
+                let distance = |coordinate: &IVec3| {
+                    remote_position.squared_distance(Vec3::new(
+                        f64::from(coordinate.x),
+                        f64::from(coordinate.y),
+                        f64::from(coordinate.z),
+                    ))
+                };
+                distance(left).total_cmp(&distance(right))
+            })
+            .expect("asteroid has voxels");
+        let assert_unchanged =
+            |runtime: &mut Runtime, operation_id: &str, coordinate: IVec3, expected_code: &str| {
+                let before_hash = runtime.state().state_hash();
+                let before_sequence = runtime.state().event_sequence;
+                let before_fingerprint = runtime.physics.body_collider_fingerprint();
+                let before_journal = fs::read(directory.path().join("events.ndjson"))
+                    .expect("journal reads before rejection");
+                let result = runtime.execute_as(
+                    "player-remote",
+                    &ClientMessage::MineVoxel {
+                        operation_id: operation_id.into(),
+                        coordinate,
+                    },
+                );
+                assert!(matches!(
+                    result,
+                    Err(RuntimeError::Intent(IntentError::Rejected { ref code, .. }))
+                        if code == expected_code
+                ));
+                assert_eq!(runtime.state().state_hash(), before_hash);
+                assert_eq!(runtime.state().event_sequence, before_sequence);
+                assert_eq!(
+                    runtime.physics.body_collider_fingerprint(),
+                    before_fingerprint
+                );
+                assert_eq!(
+                    fs::read(directory.path().join("events.ndjson"))
+                        .expect("journal reads after rejection"),
+                    before_journal
+                );
+                assert!(
+                    runtime
+                        .state()
+                        .processed_operation("player-remote", operation_id)
+                        .is_none()
+                );
+            };
+        assert_unchanged(
+            &mut runtime,
+            "remote-mine-out-of-range",
+            out_of_range_target,
+            "voxel_out_of_range",
+        );
+
+        let reachable_target = *runtime
+            .state()
+            .voxels
+            .occupied
+            .iter()
+            .next()
+            .expect("asteroid has a reachable fixture voxel");
+        let reachable_position = Vec3::new(
+            f64::from(reachable_target.x),
+            f64::from(reachable_target.y),
+            f64::from(reachable_target.z),
+        );
+        let remote = runtime
+            .state
+            .player
+            .get_mut("player-remote")
+            .expect("remote player exists");
+        remote.position = reachable_position + Vec3::new(0.0, 3.0, 0.0);
+        remote.life_state = PlayerLifeState::Incapacitated {
+            death_id: "remote-test-death".into(),
+            cause: PlayerDeathCause::OxygenDepleted,
+        };
+        runtime
+            .physics
+            .rebuild(&physics_body_specs(&runtime.state))
+            .expect("incapacitated fixture physics builds");
+        runtime
+            .persist_snapshot()
+            .expect("incapacitated mining baseline persists");
+        assert_unchanged(
+            &mut runtime,
+            "remote-mine-incapacitated",
+            reachable_target,
+            "player_incapacitated",
+        );
+    }
+
+    #[test]
+    fn replay_rejects_cross_actor_mining_inventory_spoof_without_mutation() {
+        let mut runtime = runtime();
+        runtime
+            .admit_development_player("player-remote")
+            .expect("remote development player admits");
+        let primary_position = runtime.state().player.primary().position;
+        let target = runtime
+            .state()
+            .voxels
+            .occupied
+            .iter()
+            .copied()
+            .find(|coordinate| {
+                primary_position.squared_distance(Vec3::new(
+                    f64::from(coordinate.x),
+                    f64::from(coordinate.y),
+                    f64::from(coordinate.z),
+                )) > MINING_RANGE * MINING_RANGE
+            })
+            .expect("asteroid has a fixture voxel outside primary mining range");
+        let target_position = Vec3::new(
+            f64::from(target.x),
+            f64::from(target.y),
+            f64::from(target.z),
+        );
+        runtime
+            .state
+            .player
+            .get_mut("player-remote")
+            .expect("remote player exists")
+            .position = target_position + Vec3::new(0.0, 3.0, 0.0);
+        let canonical_event = runtime
+            .state()
+            .prepare_client_event_as(
+                "player-remote",
+                &ClientMessage::MineVoxel {
+                    operation_id: "forged-mining-owner".into(),
+                    coordinate: target,
+                },
+            )
+            .expect("canonical remote mining event prepares");
+        let primary_inventory_id = runtime.state().player.primary().inventory_id.clone();
+        let assert_replay_rejected_without_mutation =
+            |event: &CanonicalEvent, expected_code: &str| {
+                let mut candidate = runtime.state().clone();
+                let before_hash = candidate.state_hash();
+                let result = candidate.apply_event(event);
+                assert!(matches!(
+                    result,
+                    Err(IntentError::Rejected { ref code, .. }) if code == expected_code
+                ));
+                assert_eq!(candidate.state_hash(), before_hash);
+                assert!(candidate.voxels.material(target).is_some());
+                assert_eq!(candidate.inventories[&primary_inventory_id].contents.ore, 0);
+                assert_eq!(
+                    candidate.inventories["inventory-player-remote"]
+                        .contents
+                        .ore,
+                    0
+                );
+            };
+
+        let mut event = canonical_event.clone();
+        let EventPayload::VoxelMined { inventory_id, .. } = &mut event.payload else {
+            unreachable!("mining intent prepares a mining event")
+        };
+        inventory_id.clone_from(&primary_inventory_id);
+        event.event_hash = event.calculate_hash();
+        assert_replay_rejected_without_mutation(&event, "replay_mining_actor_inventory_invalid");
+
+        let mut event = canonical_event.clone();
+        event.actor_player_id = Some("player-local".into());
+        let EventPayload::VoxelMined { inventory_id, .. } = &mut event.payload else {
+            unreachable!("mining intent prepares a mining event")
+        };
+        inventory_id.clone_from(&primary_inventory_id);
+        event.event_hash = event.calculate_hash();
+        assert_replay_rejected_without_mutation(&event, "replay_mining_range_invalid");
+
+        let mut event = canonical_event;
+        let EventPayload::VoxelMined { ore_yield, .. } = &mut event.payload else {
+            unreachable!("mining intent prepares a mining event")
+        };
+        *ore_yield = ore_yield.saturating_add(1);
+        event.event_hash = event.calculate_hash();
+        assert_replay_rejected_without_mutation(&event, "replay_mining_yield_invalid");
     }
 
     #[test]
