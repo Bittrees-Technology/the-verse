@@ -208,7 +208,7 @@ impl Runtime {
         if self.halted {
             return Err(RuntimeError::Halted);
         }
-        if actor_player_id != self.state.player.player_id {
+        if !self.state.player.by_id.contains_key(actor_player_id) {
             return Err(IntentError::rejected(
                 "actor_not_present",
                 "the authenticated player is not present in this simulation cell",
@@ -222,7 +222,10 @@ impl Runtime {
             )
         })?;
 
-        if let Some(receipt) = self.state.processed_operations.get(operation_id) {
+        if let Some(receipt) = self
+            .state
+            .processed_operation(actor_player_id, operation_id)
+        {
             return Ok(receipt.clone());
         }
 
@@ -257,8 +260,7 @@ impl Runtime {
         self.after_event()?;
 
         self.state
-            .processed_operations
-            .get(operation_id)
+            .processed_operation(actor_player_id, operation_id)
             .cloned()
             .ok_or_else(|| {
                 IntentError::rejected(
@@ -713,10 +715,18 @@ impl WorldState {
         actor_player_id: &str,
         message: &ClientMessage,
     ) -> Result<CanonicalEvent, IntentError> {
-        if actor_player_id != self.player.player_id {
-            return Err(IntentError::rejected(
+        let actor = self.player.get(actor_player_id).ok_or_else(|| {
+            IntentError::rejected(
                 "actor_not_present",
                 "the authenticated player is not present in this simulation cell",
+            )
+        })?;
+        if actor_player_id != self.player.primary_player_id
+            && !matches!(message, ClientMessage::SetPlayerControl { .. })
+        {
+            return Err(IntentError::rejected(
+                "actor_action_not_available",
+                "this action is not actor-scoped yet and remains disabled for secondary players",
             ));
         }
         let operation_id = message.operation_id().ok_or_else(|| {
@@ -728,7 +738,7 @@ impl WorldState {
                 "operation ID must contain between 1 and 128 characters",
             ));
         }
-        if !matches!(self.player.life_state, PlayerLifeState::Alive)
+        if !matches!(actor.life_state, PlayerLifeState::Alive)
             && !matches!(message, ClientMessage::RespawnPlayer { .. })
         {
             return Err(IntentError::rejected(
@@ -750,13 +760,13 @@ impl WorldState {
             } => {
                 ensure_bounded_control(*linear_input, "character linear control")?;
                 ensure_bounded_control(*angular_input, "character angular control")?;
-                if *movement_epoch != self.player.movement_epoch {
+                if *movement_epoch != actor.movement_epoch {
                     return Err(IntentError::rejected(
                         "movement_epoch_stale",
                         "character control does not match the current movement epoch",
                     ));
                 }
-                if *input_sequence <= self.player.last_received_input_sequence {
+                if *input_sequence <= actor.last_received_input_sequence {
                     return Err(IntentError::rejected(
                         "movement_input_out_of_order",
                         "character control sequence must advance monotonically",
@@ -766,7 +776,7 @@ impl WorldState {
                     usize::try_from(content::manifest().character.control_lease_ticks)
                         .unwrap_or(usize::MAX)
                         .min(MAX_PENDING_PLAYER_CONTROL_FRAMES);
-                if self.player.pending_control_frames.len() >= lease_queue_limit {
+                if actor.pending_control_frames.len() >= lease_queue_limit {
                     return Err(IntentError::rejected(
                         "movement_input_backpressure",
                         "character control queue is full; wait for an authoritative physics acknowledgement",
@@ -1154,7 +1164,7 @@ impl WorldState {
         };
 
         Ok(self.new_event(
-            actor_player_id,
+            Some(actor_player_id),
             "human",
             Some(operation_id.to_owned()),
             payload,
@@ -1162,12 +1172,12 @@ impl WorldState {
     }
 
     pub fn prepare_system_event(&self, payload: EventPayload) -> CanonicalEvent {
-        self.new_event("simulation-worker", "system", None, payload)
+        self.new_event(None, "system", None, payload)
     }
 
     fn new_event(
         &self,
-        actor_profile_id: &str,
+        actor_player_id: Option<&str>,
         actor_type: &str,
         operation_id: Option<String>,
         payload: EventPayload,
@@ -1178,7 +1188,7 @@ impl WorldState {
             self.universe_id.clone(),
             self.cell_id.clone(),
             self.fencing_token,
-            actor_profile_id,
+            actor_player_id.map(str::to_owned),
             actor_type,
             operation_id,
             self.last_event_hash.clone(),
@@ -1212,8 +1222,38 @@ impl WorldState {
         if event.content_manifest_version != self.content_manifest_version {
             return Err(IntentError::ContentManifestMismatch);
         }
-        if let Some(operation_id) = &event.operation_id
-            && self.processed_operations.contains_key(operation_id)
+        match event.actor_type.as_str() {
+            "human"
+                if event
+                    .actor_player_id
+                    .as_deref()
+                    .is_none_or(|player_id| !self.player.by_id.contains_key(player_id))
+                    || event.operation_id.as_deref().is_none_or(str::is_empty) =>
+            {
+                return Err(IntentError::rejected(
+                    "replay_actor_envelope_invalid",
+                    "human events require one present canonical player actor and an operation ID",
+                ));
+            }
+            "system" if event.actor_player_id.is_some() || event.operation_id.is_some() => {
+                return Err(IntentError::rejected(
+                    "replay_actor_envelope_invalid",
+                    "system events cannot impersonate a player or carry a client operation ID",
+                ));
+            }
+            "human" | "system" => {}
+            _ => {
+                return Err(IntentError::rejected(
+                    "replay_actor_envelope_invalid",
+                    "event actor type must be human or system",
+                ));
+            }
+        }
+        if let (Some(actor_player_id), Some(operation_id)) =
+            (&event.actor_player_id, &event.operation_id)
+            && self
+                .processed_operation(actor_player_id, operation_id)
+                .is_some()
         {
             return Err(IntentError::rejected(
                 "replay_operation_duplicate",
@@ -1222,8 +1262,7 @@ impl WorldState {
         }
         match &event.payload {
             EventPayload::PlayerControlSet { .. }
-                if event.actor_profile_id != self.player.player_id
-                    || event.actor_type != "human"
+                if event.actor_type != "human"
                     || event.operation_id.as_deref().is_none_or(str::is_empty) =>
             {
                 return Err(IntentError::rejected(
@@ -1232,7 +1271,7 @@ impl WorldState {
                 ));
             }
             EventPayload::PhysicsStepCommitted { .. }
-                if event.actor_profile_id != "simulation-worker"
+                if event.actor_player_id.is_some()
                     || event.actor_type != "system"
                     || event.operation_id.is_some() =>
             {
@@ -1242,7 +1281,7 @@ impl WorldState {
                 ));
             }
             EventPayload::SuitOxygenChanged { .. } | EventPayload::PlayerIncapacitated { .. }
-                if event.actor_profile_id != "simulation-worker"
+                if event.actor_player_id.is_some()
                     || event.actor_type != "system"
                     || event.operation_id.is_some() =>
             {
@@ -1252,7 +1291,7 @@ impl WorldState {
                 ));
             }
             EventPayload::PlayerRespawned { .. }
-                if event.actor_profile_id != self.player.player_id
+                if event.actor_player_id.as_deref() != Some(self.player.player_id.as_str())
                     || event.actor_type != "human"
                     || event.operation_id.as_deref().is_none_or(str::is_empty) =>
             {
@@ -1263,11 +1302,15 @@ impl WorldState {
             }
             _ => {}
         }
-        if !matches!(self.player.life_state, PlayerLifeState::Alive)
+        if let Some(actor_player_id) = event.actor_player_id.as_deref()
             && !matches!(
-                &event.payload,
-                EventPayload::PlayerRespawned { .. } | EventPayload::PhysicsStepCommitted { .. }
+                self.player
+                    .get(actor_player_id)
+                    .expect("validated human actor is present")
+                    .life_state,
+                PlayerLifeState::Alive
             )
+            && !matches!(&event.payload, EventPayload::PlayerRespawned { .. })
         {
             return Err(IntentError::rejected(
                 "replay_player_incapacitated",
@@ -1286,10 +1329,18 @@ impl WorldState {
                 jump,
                 expires_at_simulation_tick,
             } => {
+                let actor_player_id = event
+                    .actor_player_id
+                    .as_deref()
+                    .expect("validated player control has a human actor");
+                let actor = self
+                    .player
+                    .get_mut(actor_player_id)
+                    .expect("validated player control actor is present");
                 ensure_bounded_control(*linear_input, "replayed character linear control")?;
                 ensure_bounded_control(*angular_input, "replayed character angular control")?;
-                if *movement_epoch != self.player.movement_epoch
-                    || *input_sequence <= self.player.last_received_input_sequence
+                if *movement_epoch != actor.movement_epoch
+                    || *input_sequence <= actor.last_received_input_sequence
                     || *expires_at_simulation_tick
                         != self
                             .simulation_tick
@@ -1304,24 +1355,22 @@ impl WorldState {
                     usize::try_from(content::manifest().character.control_lease_ticks)
                         .unwrap_or(usize::MAX)
                         .min(MAX_PENDING_PLAYER_CONTROL_FRAMES);
-                if self.player.pending_control_frames.len() >= lease_queue_limit {
+                if actor.pending_control_frames.len() >= lease_queue_limit {
                     return Err(IntentError::rejected(
                         "replay_player_control_backpressure_invalid",
                         "character control event exceeds the canonical pending-frame bound",
                     ));
                 }
-                self.player
-                    .pending_control_frames
-                    .push_back(PlayerControlFrame {
-                        input_sequence: *input_sequence,
-                        linear_input: *linear_input,
-                        angular_input: *angular_input,
-                        boost: *boost,
-                        dampeners: *dampeners,
-                        jump: *jump,
-                        expires_at_simulation_tick: *expires_at_simulation_tick,
-                    });
-                self.player.last_received_input_sequence = *input_sequence;
+                actor.pending_control_frames.push_back(PlayerControlFrame {
+                    input_sequence: *input_sequence,
+                    linear_input: *linear_input,
+                    angular_input: *angular_input,
+                    boost: *boost,
+                    dampeners: *dampeners,
+                    jump: *jump,
+                    expires_at_simulation_tick: *expires_at_simulation_tick,
+                });
+                actor.last_received_input_sequence = *input_sequence;
             }
             EventPayload::SuitModeChanged {
                 helmet_closed,
@@ -2195,17 +2244,22 @@ impl WorldState {
 
         self.event_sequence = event.event_sequence;
         self.last_event_hash.clone_from(&event.event_hash);
-        if let Some(operation_id) = &event.operation_id {
+        if let (Some(actor_player_id), Some(operation_id)) =
+            (&event.actor_player_id, &event.operation_id)
+        {
             let (code, message) = event.payload.receipt();
-            self.processed_operations.insert(
-                operation_id.clone(),
-                IntentReceipt {
-                    operation_id: operation_id.clone(),
-                    event_sequence: event.event_sequence,
-                    code: code.into(),
-                    message,
-                },
-            );
+            self.processed_operations
+                .entry(actor_player_id.clone())
+                .or_default()
+                .insert(
+                    operation_id.clone(),
+                    IntentReceipt {
+                        operation_id: operation_id.clone(),
+                        event_sequence: event.event_sequence,
+                        code: code.into(),
+                        message,
+                    },
+                );
         }
 
         if !self.conservation().valid {
@@ -4376,8 +4430,11 @@ mod tests {
         assert_eq!(runtime.state().player.last_received_input_sequence, 1);
         assert_eq!(receipt.event_sequence, before_sequence + 1);
         assert_eq!(
-            runtime.state().processed_operations["actor-isolation-1"],
-            receipt
+            runtime
+                .state()
+                .processed_operation("player-local", "actor-isolation-1")
+                .expect("actor-scoped receipt exists"),
+            &receipt
         );
     }
 
@@ -4388,6 +4445,153 @@ mod tests {
             .physics
             .rebuild(&physics_body_specs(&runtime.state))
             .expect("test setup rebuilds player near the grid");
+    }
+
+    fn add_remote_player(runtime: &mut Runtime) {
+        let mut remote = runtime.state.player.primary().clone();
+        remote.player_id = "player-remote".into();
+        remote.inventory_id = "inventory-player-remote".into();
+        remote.position.x += 4.0;
+        remote.linear_velocity = Vec3::new(0.25, 0.0, 0.0);
+        runtime
+            .state
+            .player
+            .by_id
+            .insert(remote.player_id.clone(), remote);
+        runtime.state.inventories.insert(
+            "inventory-player-remote".into(),
+            InventoryRecord {
+                inventory_id: "inventory-player-remote".into(),
+                domain: InventoryDomain::Player {
+                    player_id: "player-remote".into(),
+                },
+                contents: InventoryContents::default(),
+                capacity_liters: crate::model::PLAYER_INVENTORY_CAPACITY_LITERS,
+            },
+        );
+        runtime
+            .physics
+            .rebuild(&physics_body_specs(&runtime.state))
+            .expect("two-player physics scene builds");
+    }
+
+    #[test]
+    fn operation_ids_and_control_frontiers_are_scoped_per_player() {
+        let directory = tempdir().expect("tempdir");
+        let mut runtime = Runtime::open(directory.path(), 68, 1_000).expect("runtime opens");
+        add_remote_player(&mut runtime);
+        runtime
+            .persist_snapshot()
+            .expect("two-player baseline persists");
+        let control = |player: &Player, linear_input: Vec3| ClientMessage::SetPlayerControl {
+            operation_id: "shared-operation-id".into(),
+            movement_epoch: player.movement_epoch,
+            input_sequence: 1,
+            linear_input,
+            angular_input: Vec3::ZERO,
+            boost: false,
+            dampeners: true,
+            jump: false,
+        };
+        let local_intent = control(
+            runtime
+                .state
+                .player
+                .get("player-local")
+                .expect("local exists"),
+            Vec3::new(1.0, 0.0, 0.0),
+        );
+        let remote_intent = control(
+            runtime
+                .state
+                .player
+                .get("player-remote")
+                .expect("remote exists"),
+            Vec3::new(-1.0, 0.0, 0.0),
+        );
+
+        let local_receipt = runtime
+            .execute_as("player-local", &local_intent)
+            .expect("local control commits");
+        let remote_receipt = runtime
+            .execute_as("player-remote", &remote_intent)
+            .expect("remote control with the same operation ID commits independently");
+        assert_ne!(local_receipt.event_sequence, remote_receipt.event_sequence);
+        assert_eq!(
+            runtime
+                .state
+                .player
+                .get("player-local")
+                .unwrap()
+                .last_received_input_sequence,
+            1
+        );
+        assert_eq!(
+            runtime
+                .state
+                .player
+                .get("player-remote")
+                .unwrap()
+                .last_received_input_sequence,
+            1
+        );
+        assert_eq!(
+            runtime
+                .state
+                .processed_operation("player-local", "shared-operation-id"),
+            Some(&local_receipt)
+        );
+        assert_eq!(
+            runtime
+                .state
+                .processed_operation("player-remote", "shared-operation-id"),
+            Some(&remote_receipt)
+        );
+        let accepted_hash = runtime.state().state_hash();
+        let accepted_sequence = runtime.state().event_sequence;
+        assert_eq!(
+            runtime
+                .execute_as("player-local", &local_intent)
+                .expect("local retry is idempotent"),
+            local_receipt
+        );
+        assert_eq!(
+            runtime
+                .execute_as("player-remote", &remote_intent)
+                .expect("remote retry is idempotent"),
+            remote_receipt
+        );
+        assert_eq!(runtime.state().state_hash(), accepted_hash);
+        assert_eq!(runtime.state().event_sequence, accepted_sequence);
+
+        let unavailable = runtime
+            .execute_as(
+                "player-remote",
+                &ClientMessage::SetSuitMode {
+                    operation_id: "remote-suit-disabled".into(),
+                    helmet_closed: false,
+                    jetpack_enabled: true,
+                    magnetic_boots_enabled: false,
+                },
+            )
+            .expect_err("unconverted remote action rejects instead of targeting primary");
+        assert!(matches!(
+            unavailable,
+            RuntimeError::Intent(IntentError::Rejected { ref code, .. })
+                if code == "actor_action_not_available"
+        ));
+        assert_eq!(runtime.state().state_hash(), accepted_hash);
+        assert_eq!(runtime.state().event_sequence, accepted_sequence);
+
+        drop(runtime);
+        let recovered = Runtime::open(directory.path(), 68, 1_000).expect("runtime recovers");
+        assert_eq!(recovered.state().state_hash(), accepted_hash);
+        assert_eq!(
+            recovered
+                .state()
+                .processed_operation("player-remote", "shared-operation-id"),
+            Some(&remote_receipt)
+        );
     }
 
     fn stationary_player_outcomes(state: &WorldState, step_count: u8) -> Vec<PlayerPhysicsOutcome> {
@@ -5051,31 +5255,7 @@ mod tests {
     fn two_player_physics_commits_in_order_and_recovers_exactly() {
         let directory = tempdir().expect("tempdir");
         let mut runtime = Runtime::open(directory.path(), 67, 1_000).expect("runtime opens");
-        let mut remote = runtime.state.player.primary().clone();
-        remote.player_id = "player-remote".into();
-        remote.inventory_id = "inventory-player-remote".into();
-        remote.position.x += 4.0;
-        remote.linear_velocity = Vec3::new(0.25, 0.0, 0.0);
-        runtime
-            .state
-            .player
-            .by_id
-            .insert(remote.player_id.clone(), remote);
-        runtime.state.inventories.insert(
-            "inventory-player-remote".into(),
-            InventoryRecord {
-                inventory_id: "inventory-player-remote".into(),
-                domain: InventoryDomain::Player {
-                    player_id: "player-remote".into(),
-                },
-                contents: InventoryContents::default(),
-                capacity_liters: crate::model::PLAYER_INVENTORY_CAPACITY_LITERS,
-            },
-        );
-        runtime
-            .physics
-            .rebuild(&physics_body_specs(&runtime.state))
-            .expect("two-player physics scene builds");
+        add_remote_player(&mut runtime);
         runtime
             .persist_snapshot()
             .expect("two-player baseline persists");
@@ -5548,10 +5728,10 @@ mod tests {
         assert_eq!(runtime.physics_chunk_replacements, 0);
         assert_eq!(runtime.physics_full_rebuilds, 0);
         assert!(
-            !runtime
+            runtime
                 .state()
-                .processed_operations
-                .contains_key("mine-final-anchor-support")
+                .processed_operation("player-local", "mine-final-anchor-support")
+                .is_none()
         );
         assert_eq!(
             fs::read(directory.path().join("events.ndjson")).expect("journal rereads"),
@@ -6526,7 +6706,7 @@ mod tests {
         ];
         for (index, payload) in replay_payloads.into_iter().enumerate() {
             let event = runtime.state().new_event(
-                "player-local",
+                Some("player-local"),
                 "human",
                 Some(format!("forged-drop-operation-{index}")),
                 payload,
@@ -6896,7 +7076,7 @@ mod tests {
         let canonical = dead.player_respawn_payload().expect("respawn prepares");
         let reject = |payload: EventPayload| {
             let event = dead.new_event(
-                "player-local",
+                Some("player-local"),
                 "human",
                 Some("tampered-respawn".into()),
                 payload,
@@ -6972,7 +7152,7 @@ mod tests {
         assert!(position.y > primary.y);
 
         let event = state.new_event(
-            "player-local",
+            Some("player-local"),
             "human",
             Some("blocked-primary-recovery".into()),
             payload,
@@ -7053,7 +7233,7 @@ mod tests {
             .oxygen_incapacitation_payload()
             .expect("death prepares");
         let forged_death = state.new_event(
-            "player-local",
+            Some("player-local"),
             "human",
             Some("forged-death".into()),
             death.clone(),
@@ -7077,13 +7257,17 @@ mod tests {
         ));
 
         let operation_id = "canonical-recovery";
-        let respawn_event =
-            state.new_event("player-local", "human", Some(operation_id.into()), respawn);
+        let respawn_event = state.new_event(
+            Some("player-local"),
+            "human",
+            Some(operation_id.into()),
+            respawn,
+        );
         state
             .apply_event(&respawn_event)
             .expect("human respawn with operation applies");
         let duplicate = state.new_event(
-            "player-local",
+            Some("player-local"),
             "human",
             Some(operation_id.into()),
             EventPayload::PlayerControlSet {
