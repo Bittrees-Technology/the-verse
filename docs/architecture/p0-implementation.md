@@ -9,7 +9,7 @@ P0.10 connects a first-person Godot client and a browser command center to one R
 ```mermaid
 flowchart LR
     Native["Godot native client"] -->|"intent only"| Worker["Rust simulation worker"]
-    Browser["Browser command center"] -->|"intent only"| Worker
+    Browser["Browser command center"] -->|"spectator hello and reads"| Worker
     Worker --> Rules["Versioned content rules"]
     Worker --> Kernel["Authoritative world kernel"]
     Kernel --> Jolt["Derived Jolt contact scene"]
@@ -25,7 +25,7 @@ Clients choose targets and request actions; they never choose yields, damage, he
 
 The content manifest `p0.10.0` and content schema 8 identify the current contact-physics, survival, and character-motion rule set. Voxel yields, recipes, block health, component costs, construction integrity, power behavior, inventory capacity, resource volume and mass, exact integer block mass, collision chunk edge, grid controls, capsule dimensions and inertia, EVA and ground motion limits, slope/step/snap thresholds, magnetic catch rules, control leases, environment constants, oxygen rates, critical threshold, and proof recovery defaults are server owned. The manifest version is stored in universe manifests and snapshots and included in every canonical event hash. Opening a universe under a different rule version fails explicitly.
 
-The save schema is version 13, the canonical event schema is version 8, and the client protocol is version 10. In addition to construction, grid physics, survival, and death-drop state, they include canonical character orientation, velocity, locomotion mode, support identity/local anchor, magnetic preference, jump state, input frontiers, a bounded persisted control FIFO, the active lease, atomic player physics outcomes, and lightweight motion replication. A receipt proves durable acceptance, not fixed-step consumption; `last_processed_input_sequence` advances only when the control is retired or applied by the authoritative step. A client receives no world state and can submit no intent until a compatible `hello`; mismatch is fatal and closes the socket. Save and event headers are checked before version-specific payloads are deserialized, so older formats fail explicitly instead of being guessed.
+The save schema is version 13 and the canonical event schema is version 8. The cross-platform P0.10 evidence used client protocol 10; the active P1 branch uses protocol 11 to authenticate before welcome, bind a socket to the admitted development player, and expose a separate read-only spectator role without changing P0 world or event state. In addition to construction, grid physics, survival, and death-drop state, the schemas include canonical character orientation, velocity, locomotion mode, support identity/local anchor, magnetic preference, jump state, input frontiers, a bounded persisted control FIFO, the active lease, atomic player physics outcomes, and lightweight motion replication. A receipt proves durable acceptance, not fixed-step consumption; `last_processed_input_sequence` advances only when the control is retired or applied by the authoritative step. A client receives no world state and can submit no intent until a compatible authenticated `hello`; mismatch is fatal and closes the socket. Save and event headers are checked before version-specific payloads are deserialized, so older formats fail explicitly instead of being guessed.
 
 ## Local operation
 
@@ -48,7 +48,7 @@ Its local interfaces are:
 
 | Interface | Address | Purpose |
 | --- | --- | --- |
-| Browser UI | `http://127.0.0.1:7777/` | Spectate and issue production/grid commands |
+| Browser UI | `http://127.0.0.1:7777/` | Read-only public cell spectating |
 | Status | `http://127.0.0.1:7777/api/v1/status` | Health, authority, hash, and conservation |
 | World read | `http://127.0.0.1:7777/api/v1/world` | Complete public P0 snapshot |
 | WebSocket | `ws://127.0.0.1:7777/ws` | Versioned client protocol |
@@ -74,6 +74,6 @@ This slice has one local player, one orbital asteroid, one 25-block salvage skif
 
 ## Migration and rollback
 
-P0.10 has no deployed predecessor to migrate. It rejects save schemas 1 through 12 and event schemas before 8 because their player, inventory, environment, block, physics, life-state, support, or queued-control contracts differ. A universe records content manifest `p0.10.0` and refuses to open under another rule set, including `p0.9.0` worlds without canonical capsule support. Protocols before 10 are rejected at the handshake. Local testers can use `tools/dev/reset-local-world.sh` to move an incompatible world into a recoverable backup before creating a new one.
+P0.10 has no deployed predecessor to migrate. It rejects save schemas 1 through 12 and event schemas before 8 because their player, inventory, environment, block, physics, life-state, support, or queued-control contracts differ. A universe records content manifest `p0.10.0` and refuses to open under another rule set, including `p0.9.0` worlds without canonical capsule support. The active P1 branch rejects protocols before 11 at the handshake; the P0.10 release evidence used protocol 10. Local testers can use `tools/dev/reset-local-world.sh` to move an incompatible world into a recoverable backup before creating a new one.
 
 Rollback is operational only: stop the worker, preserve its data directory, and return to the prior repository revision. No P0.10 action reaches a blockchain or changes external custody. A future content migration must be explicit, versioned, tested against a copy, and documented before the runtime will accept it.

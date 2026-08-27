@@ -1,8 +1,10 @@
 # Authoritative multi-player cell
 
-**Status:** P1.0 specification; implementation pending
+**Status:** P1.0 in progress; session-bound actor foundation verified
 
 This checkpoint targets F-012, SIM-011, and SIM-012. It converts the P0.10 single-pilot proof into a shared authoritative cell without claiming production universe scale.
+
+Protocol 11 currently completes the first trust-boundary increment: authentication precedes the welcome and world snapshot; a socket is bound to the one admitted development player or to a read-only spectator role; unknown and concurrently claimed players fail closed; and the simulation receives the bound actor separately from the client intent. The native client, browser spectator, Rust unit tests, and exact-recovery end-to-end scenario exercise this handshake. The deterministic player roster, second admitted player, shared multi-capsule physics event, and actor-scoped inventory/idempotency conversion remain the next implementation increment, so F-012 and SIM-012 are not yet complete.
 
 ## Player-visible contract
 

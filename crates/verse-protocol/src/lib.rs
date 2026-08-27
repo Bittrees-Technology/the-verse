@@ -8,8 +8,8 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The only protocol version accepted by this P0 build.
-pub const PROTOCOL_VERSION: u32 = 10;
+/// The only protocol version accepted by this build.
+pub const PROTOCOL_VERSION: u32 = 11;
 
 /// A stable integer voxel or block coordinate.
 #[derive(
@@ -457,6 +457,24 @@ pub struct WorldSnapshot {
     pub conservation: ConservationSnapshot,
 }
 
+/// Authentication material is interpreted only by the connection boundary and
+/// never becomes canonical simulation state. The local-development mode is
+/// permitted only on a loopback-bound worker; production profiles will use a
+/// short-lived session credential issued after passkey authentication.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ClientAuthentication {
+    Spectator,
+    LocalDevelopment { player_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SessionRole {
+    Spectator,
+    Player { player_id: String },
+}
+
 /// Commands sent by all P0 clients. Every mutating command carries an operation
 /// ID so retrying a packet returns the original result.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -465,6 +483,7 @@ pub enum ClientMessage {
     Hello {
         protocol_version: u32,
         client_name: String,
+        authentication: ClientAuthentication,
     },
     RequestSnapshot,
     SetPlayerControl {
@@ -571,6 +590,7 @@ pub enum ServerMessage {
     Welcome {
         protocol_version: u32,
         server_name: String,
+        session_role: SessionRole,
     },
     Snapshot {
         snapshot: Box<WorldSnapshot>,
@@ -674,7 +694,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v10_character_control_contains_jump_but_no_transform_or_time() {
+    fn protocol_v11_character_control_contains_jump_but_no_transform_or_time() {
         let message = ClientMessage::SetPlayerControl {
             operation_id: "player-control-3-41".into(),
             movement_epoch: 3,
@@ -713,8 +733,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v10_exposes_tagged_life_state_and_death_cause() {
-        assert_eq!(PROTOCOL_VERSION, 10);
+    fn protocol_v11_exposes_tagged_life_state_and_death_cause() {
+        assert_eq!(PROTOCOL_VERSION, 11);
         let life_state = PlayerLifeState::Incapacitated {
             death_id: "death-player-local-42".into(),
             cause: PlayerDeathCause::OxygenDepleted,
@@ -733,7 +753,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v10_snapshot_exposes_locomotion_input_oxygen_and_death_drops() {
+    fn protocol_v11_snapshot_exposes_locomotion_input_oxygen_and_death_drops() {
         let death_drop = DeathDropSnapshot {
             drop_id: "drop-player-local-42".into(),
             death_id: "death-player-local-42".into(),
@@ -820,6 +840,33 @@ mod tests {
             serde_json::from_value::<WorldSnapshot>(value).expect("world snapshot deserializes"),
             world
         );
+    }
+
+    #[test]
+    fn protocol_v11_hello_separates_authentication_from_gameplay_intents() {
+        let hello = ClientMessage::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            client_name: "native-test".into(),
+            authentication: ClientAuthentication::LocalDevelopment {
+                player_id: "player-local".into(),
+            },
+        };
+        let value = serde_json::to_value(&hello).expect("hello serializes");
+        assert_eq!(value["type"], "hello");
+        assert_eq!(value["authentication"]["kind"], "local_development");
+        assert_eq!(value["authentication"]["player_id"], "player-local");
+        assert!(hello.operation_id().is_none());
+
+        let welcome = ServerMessage::Welcome {
+            protocol_version: PROTOCOL_VERSION,
+            server_name: "test".into(),
+            session_role: SessionRole::Player {
+                player_id: "player-local".into(),
+            },
+        };
+        let value = serde_json::to_value(welcome).expect("welcome serializes");
+        assert_eq!(value["session_role"]["kind"], "player");
+        assert_eq!(value["session_role"]["player_id"], "player-local");
     }
 
     #[test]

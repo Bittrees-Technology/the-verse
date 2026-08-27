@@ -322,15 +322,23 @@ async function run() {
     );
   });
 
-  const welcome = await waitFor(
-    (message) => message.type === "welcome",
-    "welcome",
-  );
-  assert.equal(welcome.protocol_version, 10);
   send({
     type: "hello",
-    protocol_version: 10,
+    protocol_version: 11,
     client_name: "node-authoritative-e2e",
+    authentication: {
+      kind: "local_development",
+      player_id: "player-local",
+    },
+  });
+  const welcome = await waitFor(
+    (message) => message.type === "welcome",
+    "authenticated welcome",
+  );
+  assert.equal(welcome.protocol_version, 11);
+  assert.deepEqual(welcome.session_role, {
+    kind: "player",
+    player_id: "player-local",
   });
   let world = (
     await waitFor(

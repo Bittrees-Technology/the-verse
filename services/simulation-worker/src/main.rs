@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 use tokio::net::TcpListener;
 use tracing::{error, info};
@@ -51,6 +51,11 @@ async fn main() -> Result<()> {
         .init();
 
     let arguments = Arguments::parse();
+    if !arguments.bind.ip().is_loopback() {
+        bail!(
+            "protocol 11 local-development player authentication is restricted to a loopback bind; use 127.0.0.1 or wait for the configured session authority"
+        );
+    }
     let runtime = Runtime::open(
         &arguments.data_directory,
         arguments.world_seed,

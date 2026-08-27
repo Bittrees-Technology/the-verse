@@ -14,6 +14,7 @@ let socket;
 let world;
 let operationSequence = 0;
 let selectedGridId = "grid-starter";
+let sessionRole = { kind: "spectator" };
 
 function connect() {
   const protocol = location.protocol === "https:" ? "wss:" : "ws:";
@@ -23,8 +24,9 @@ function connect() {
     elements.connection.className = "connection online";
     socket.send(JSON.stringify({
       type: "hello",
-      protocol_version: 9,
-      client_name: "browser-command-center-p0.9",
+      protocol_version: 11,
+      client_name: "browser-command-center-p1.0",
+      authentication: { kind: "spectator" },
     }));
   });
   socket.addEventListener("close", () => {
@@ -34,7 +36,15 @@ function connect() {
   });
   socket.addEventListener("message", ({ data }) => {
     const message = JSON.parse(data);
-    if (message.type === "snapshot") {
+    if (message.type === "welcome") {
+      sessionRole = message.session_role ?? { kind: "spectator" };
+      activity(
+        sessionRole.kind === "spectator"
+          ? "Public spectator session — gameplay controls are read-only"
+          : "Gameplay session bound to " + sessionRole.player_id,
+        false,
+      );
+    } else if (message.type === "snapshot") {
       world = message.snapshot;
       render();
     } else if (message.type === "motion_state" && world) {
@@ -70,6 +80,10 @@ function intent(type, payload = {}) {
     activity("No authoritative connection", true);
     return;
   }
+  if (sessionRole.kind !== "player") {
+    activity("This public spectator session is read-only", true);
+    return;
+  }
   operationSequence += 1;
   socket.send(JSON.stringify({
     type,
@@ -92,6 +106,7 @@ function selectedGrid() {
 }
 
 function render() {
+  const canMutate = sessionRole.kind === "player";
   elements.universe.textContent = world.universe_id;
   elements.cell.textContent = world.cell_id;
   elements["event-sequence"].textContent =
@@ -127,8 +142,8 @@ function render() {
     (world.player.next_level_experience ?? 100).toLocaleString() + " XP • " +
     (career.voxels_mined ?? 0).toLocaleString() + " VOXELS • " +
     (career.blocks_built ?? 0).toLocaleString() + " BLOCKS";
-  elements.refine.disabled = ore < 2;
-  elements.craft.disabled = refined < 1;
+  elements.refine.disabled = !canMutate || ore < 2;
+  elements.craft.disabled = !canMutate || refined < 1;
 
   const grid = selectedGrid();
   if (grid) {
@@ -152,8 +167,10 @@ function render() {
     const hasAnchor = grid.blocks.some(
       (block) => block.kind === "anchor" && block.construction_complete,
     );
-    elements.anchor.disabled = !grid.anchored && (!hasAnchor || !grid.power.online);
-    elements.stop.disabled = grid.anchored || (
+    elements.anchor.disabled = !canMutate || (
+      !grid.anchored && (!hasAnchor || !grid.power.online)
+    );
+    elements.stop.disabled = !canMutate || grid.anchored || (
       grid.linear_velocity.x === 0 &&
       grid.linear_velocity.y === 0 &&
       grid.linear_velocity.z === 0 &&

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use axum::{
@@ -22,7 +23,8 @@ use tower_http::{
 };
 use tracing::{error, info, warn};
 use verse_protocol::{
-    ClientMessage, MotionSnapshot, PROTOCOL_VERSION, ServerMessage, WorldSnapshot,
+    ClientAuthentication, ClientMessage, MotionSnapshot, PROTOCOL_VERSION, ServerMessage,
+    SessionRole, WorldSnapshot,
 };
 use verse_simulation::{IntentError, Runtime, RuntimeError};
 
@@ -34,6 +36,7 @@ const COMMAND_CENTER_CSS: &str = include_str!("../../../apps/web-command-center/
 pub struct AppState {
     runtime: Mutex<Runtime>,
     updates: broadcast::Sender<ServerMessage>,
+    connected_players: Mutex<BTreeSet<String>>,
 }
 
 impl AppState {
@@ -42,6 +45,7 @@ impl AppState {
         Arc::new(Self {
             runtime: Mutex::new(runtime),
             updates,
+            connected_players: Mutex::new(BTreeSet::new()),
         })
     }
 
@@ -81,6 +85,38 @@ impl AppState {
             let _ = self.updates.send(update);
         }
         Ok(changed)
+    }
+
+    fn claim_player(&self, player_id: &str) -> bool {
+        self.connected_players.lock().insert(player_id.to_owned())
+    }
+
+    fn release_player(&self, player_id: &str) {
+        self.connected_players.lock().remove(player_id);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SessionBinding {
+    Spectator,
+    Player(String),
+}
+
+impl SessionBinding {
+    fn role(&self) -> SessionRole {
+        match self {
+            Self::Spectator => SessionRole::Spectator,
+            Self::Player(player_id) => SessionRole::Player {
+                player_id: player_id.clone(),
+            },
+        }
+    }
+
+    fn player_id(&self) -> Option<&str> {
+        match self {
+            Self::Spectator => None,
+            Self::Player(player_id) => Some(player_id),
+        }
     }
 }
 
@@ -178,22 +214,28 @@ async fn websocket_upgrade(
 
 async fn websocket_session(socket: WebSocket, state: Arc<AppState>) {
     let (mut sender, mut receiver) = socket.split();
+    let Some((client_name, binding)) = complete_handshake(&mut receiver, &mut sender, &state).await
+    else {
+        return;
+    };
+    info!(%client_name, role = ?binding, "client completed protocol handshake");
+
     if send_server_message(
         &mut sender,
         &ServerMessage::Welcome {
             protocol_version: PROTOCOL_VERSION,
             server_name: "The Verse local universe".into(),
+            session_role: binding.role(),
         },
     )
     .await
     .is_err()
     {
+        if let Some(player_id) = binding.player_id() {
+            state.release_player(player_id);
+        }
         return;
     }
-    let Some(client_name) = complete_handshake(&mut receiver, &mut sender).await else {
-        return;
-    };
-    info!(%client_name, "client completed protocol handshake");
 
     let mut updates = state.updates.subscribe();
     let initial_snapshot = state.snapshot();
@@ -207,6 +249,9 @@ async fn websocket_session(socket: WebSocket, state: Arc<AppState>) {
     .await
     .is_err()
     {
+        if let Some(player_id) = binding.player_id() {
+            state.release_player(player_id);
+        }
         return;
     }
 
@@ -218,6 +263,7 @@ async fn websocket_session(socket: WebSocket, state: Arc<AppState>) {
                         if !handle_client_message(
                             message,
                             &state,
+                            &binding,
                             &mut sender,
                             &mut last_sent_event_sequence,
                         ).await {
@@ -267,12 +313,17 @@ async fn websocket_session(socket: WebSocket, state: Arc<AppState>) {
             }
         }
     }
+
+    if let Some(player_id) = binding.player_id() {
+        state.release_player(player_id);
+    }
 }
 
 async fn complete_handshake(
     receiver: &mut futures_util::stream::SplitStream<WebSocket>,
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
-) -> Option<String> {
+    state: &Arc<AppState>,
+) -> Option<(String, SessionBinding)> {
     loop {
         let message = match receiver.next().await {
             Some(Ok(message)) => message,
@@ -287,7 +338,34 @@ async fn complete_handshake(
                 Ok(ClientMessage::Hello {
                     protocol_version,
                     client_name,
-                }) if protocol_version == PROTOCOL_VERSION => return Some(client_name),
+                    authentication,
+                }) if protocol_version == PROTOCOL_VERSION => {
+                    let binding = match authentication {
+                        ClientAuthentication::Spectator => SessionBinding::Spectator,
+                        ClientAuthentication::LocalDevelopment { player_id } => {
+                            if player_id != state.snapshot().player.player_id {
+                                send_fatal_and_close(
+                                    sender,
+                                    "actor_not_present",
+                                    "the requested local-development player is not present in this cell",
+                                )
+                                .await;
+                                return None;
+                            }
+                            if !state.claim_player(&player_id) {
+                                send_fatal_and_close(
+                                    sender,
+                                    "player_already_connected",
+                                    "the requested player already has an active gameplay session",
+                                )
+                                .await;
+                                return None;
+                            }
+                            SessionBinding::Player(player_id)
+                        }
+                    };
+                    return Some((client_name, binding));
+                }
                 Ok(ClientMessage::Hello {
                     protocol_version, ..
                 }) => {
@@ -338,6 +416,7 @@ async fn complete_handshake(
 async fn handle_client_message(
     message: Message,
     state: &Arc<AppState>,
+    binding: &SessionBinding,
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
     last_sent_event_sequence: &mut u64,
 ) -> bool {
@@ -383,8 +462,20 @@ async fn handle_client_message(
             .is_ok()
         }
         intent => {
+            let Some(actor_player_id) = binding.player_id() else {
+                return send_server_message(
+                    sender,
+                    &ServerMessage::IntentRejected {
+                        operation_id: intent.operation_id().map(str::to_owned),
+                        code: "spectator_read_only".into(),
+                        message: "spectator sessions cannot submit gameplay mutations".into(),
+                    },
+                )
+                .await
+                .is_ok();
+            };
             let player_control = matches!(&intent, ClientMessage::SetPlayerControl { .. });
-            let result = state.runtime.lock().execute(&intent);
+            let result = state.runtime.lock().execute_as(actor_player_id, &intent);
             match result {
                 Ok(receipt) => {
                     if send_server_message(sender, &ServerMessage::IntentAccepted { receipt })
@@ -559,6 +650,16 @@ mod tests {
             .expect("client message sends");
     }
 
+    fn local_player_hello(client_name: &str) -> ClientMessage {
+        ClientMessage::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            client_name: client_name.into(),
+            authentication: ClientAuthentication::LocalDevelopment {
+                player_id: "player-local".into(),
+            },
+        }
+    }
+
     async fn assert_socket_closes(socket: &mut TestSocket) {
         let next = tokio::time::timeout(Duration::from_secs(2), socket.next())
             .await
@@ -572,10 +673,6 @@ mod tests {
     #[tokio::test]
     async fn websocket_requires_hello_before_snapshot_or_mutation() {
         let (mut socket, state, server) = connect_test_socket().await;
-        assert!(matches!(
-            receive_server_message(&mut socket).await,
-            ServerMessage::Welcome { .. }
-        ));
         send_client_message(
             &mut socket,
             &ClientMessage::SetPlayerControl {
@@ -602,15 +699,12 @@ mod tests {
     #[tokio::test]
     async fn websocket_rejects_and_closes_an_incompatible_protocol() {
         let (mut socket, state, server) = connect_test_socket().await;
-        assert!(matches!(
-            receive_server_message(&mut socket).await,
-            ServerMessage::Welcome { .. }
-        ));
         send_client_message(
             &mut socket,
             &ClientMessage::Hello {
                 protocol_version: PROTOCOL_VERSION - 1,
                 client_name: "obsolete-client".into(),
+                authentication: ClientAuthentication::Spectator,
             },
         )
         .await;
@@ -626,21 +720,15 @@ mod tests {
     #[tokio::test]
     async fn websocket_sends_snapshot_only_after_a_compatible_hello() {
         let (mut socket, _state, server) = connect_test_socket().await;
+        send_client_message(&mut socket, &local_player_hello("compatible-test-client")).await;
         assert!(matches!(
             receive_server_message(&mut socket).await,
             ServerMessage::Welcome {
                 protocol_version: PROTOCOL_VERSION,
+                session_role: SessionRole::Player { .. },
                 ..
             }
         ));
-        send_client_message(
-            &mut socket,
-            &ClientMessage::Hello {
-                protocol_version: PROTOCOL_VERSION,
-                client_name: "compatible-test-client".into(),
-            },
-        )
-        .await;
         assert!(matches!(
             receive_server_message(&mut socket).await,
             ServerMessage::Snapshot { .. }
@@ -650,20 +738,115 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn character_control_acknowledges_with_lightweight_atomic_motion_state() {
+    async fn spectator_session_can_observe_but_cannot_mutate() {
         let (mut socket, state, server) = connect_test_socket().await;
-        assert!(matches!(
-            receive_server_message(&mut socket).await,
-            ServerMessage::Welcome { .. }
-        ));
         send_client_message(
             &mut socket,
             &ClientMessage::Hello {
                 protocol_version: PROTOCOL_VERSION,
-                client_name: "motion-state-test-client".into(),
+                client_name: "spectator-test-client".into(),
+                authentication: ClientAuthentication::Spectator,
             },
         )
         .await;
+        assert!(matches!(
+            receive_server_message(&mut socket).await,
+            ServerMessage::Welcome {
+                session_role: SessionRole::Spectator,
+                ..
+            }
+        ));
+        let ServerMessage::Snapshot { snapshot } = receive_server_message(&mut socket).await else {
+            panic!("spectator receives the public authoritative snapshot");
+        };
+        let before_hash = snapshot.world_hash;
+
+        send_client_message(
+            &mut socket,
+            &ClientMessage::SetPlayerControl {
+                operation_id: "spectator-spoof-1".into(),
+                movement_epoch: snapshot.player.movement_epoch,
+                input_sequence: 1,
+                linear_input: verse_protocol::Vec3::new(0.0, 0.0, -1.0),
+                angular_input: verse_protocol::Vec3::ZERO,
+                boost: false,
+                jump: false,
+                dampeners: true,
+            },
+        )
+        .await;
+        assert!(matches!(
+            receive_server_message(&mut socket).await,
+            ServerMessage::IntentRejected { ref code, .. } if code == "spectator_read_only"
+        ));
+        assert_eq!(state.snapshot().event_sequence, 0);
+        assert_eq!(state.snapshot().world_hash, before_hash);
+        socket.close(None).await.expect("test socket closes");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn handshake_rejects_unknown_and_concurrently_connected_players() {
+        let (mut first, _state, server) = connect_test_socket().await;
+        send_client_message(&mut first, &local_player_hello("first-player-session")).await;
+        assert!(matches!(
+            receive_server_message(&mut first).await,
+            ServerMessage::Welcome { .. }
+        ));
+        assert!(matches!(
+            receive_server_message(&mut first).await,
+            ServerMessage::Snapshot { .. }
+        ));
+
+        let address = match first.get_ref() {
+            MaybeTlsStream::Plain(stream) => stream.peer_addr().expect("server address"),
+            _ => panic!("test connection is plain WebSocket"),
+        };
+        let (mut duplicate, _) = connect_async(format!("ws://{address}/ws"))
+            .await
+            .expect("second test websocket connects");
+        send_client_message(
+            &mut duplicate,
+            &local_player_hello("duplicate-player-session"),
+        )
+        .await;
+        assert!(matches!(
+            receive_server_message(&mut duplicate).await,
+            ServerMessage::Fatal { ref code, .. } if code == "player_already_connected"
+        ));
+        assert_socket_closes(&mut duplicate).await;
+
+        first.close(None).await.expect("first session closes");
+        server.abort();
+
+        let (mut unknown, _state, unknown_server) = connect_test_socket().await;
+        send_client_message(
+            &mut unknown,
+            &ClientMessage::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                client_name: "unknown-player-session".into(),
+                authentication: ClientAuthentication::LocalDevelopment {
+                    player_id: "player-not-admitted".into(),
+                },
+            },
+        )
+        .await;
+        assert!(matches!(
+            receive_server_message(&mut unknown).await,
+            ServerMessage::Fatal { ref code, .. } if code == "actor_not_present"
+        ));
+        assert_socket_closes(&mut unknown).await;
+        unknown_server.abort();
+    }
+
+    #[tokio::test]
+    async fn character_control_acknowledges_with_lightweight_atomic_motion_state() {
+        let (mut socket, state, server) = connect_test_socket().await;
+        send_client_message(&mut socket, &local_player_hello("motion-state-test-client")).await;
+        assert!(matches!(
+            receive_server_message(&mut socket).await,
+            ServerMessage::Welcome { .. }
+        ));
         let ServerMessage::Snapshot { snapshot } = receive_server_message(&mut socket).await else {
             panic!("compatible handshake must receive a full snapshot");
         };
@@ -712,18 +895,15 @@ mod tests {
     #[tokio::test]
     async fn websocket_carries_magnetic_preference_and_jump_through_authoritative_motion() {
         let (mut socket, state, server) = connect_test_socket().await;
+        send_client_message(
+            &mut socket,
+            &local_player_hello("p0.10-locomotion-test-client"),
+        )
+        .await;
         assert!(matches!(
             receive_server_message(&mut socket).await,
             ServerMessage::Welcome { .. }
         ));
-        send_client_message(
-            &mut socket,
-            &ClientMessage::Hello {
-                protocol_version: PROTOCOL_VERSION,
-                client_name: "p0.10-locomotion-test-client".into(),
-            },
-        )
-        .await;
         let ServerMessage::Snapshot { snapshot } = receive_server_message(&mut socket).await else {
             panic!("compatible handshake must receive a full snapshot");
         };
