@@ -18,13 +18,14 @@ func _run() -> void:
 	_test_menu_dead_disconnect_and_bounds()
 	_test_life_state_reset()
 	_test_bound_player_roster_selection()
+	_test_short_roll_taps_and_idle_silence()
 	if not failures.is_empty():
 		for failure in failures:
 			printerr("VERSE_NATIVE_IMPAIRMENT_FAILED %s" % failure)
 		quit(1)
 		return
 	print(
-		"VERSE_NATIVE_IMPAIRMENT_OK queued_ack=ordered motion=monotonic corrections=bounded menu=neutral_prediction lifecycle=reset buffers=bounded rebuild=none"
+		"VERSE_NATIVE_IMPAIRMENT_OK queued_ack=ordered motion=monotonic corrections=bounded menu=neutral_prediction lifecycle=reset buffers=bounded roll_tap=durable idle=silent rebuild=none"
 	)
 	quit(0)
 
@@ -501,6 +502,88 @@ func _test_life_state_reset() -> void:
 	_check((client.get("mouse_delta_accumulator") as Vector2).is_zero_approx(), "death cleared mouse")
 	_check(not bool(client.get("require_neutral_baseline")), "death blocked baseline send")
 	client.free()
+
+
+func _test_short_roll_taps_and_idle_silence() -> void:
+	var client := _new_client()
+	client.call("_register_inputs")
+	var previous_mouse_mode := Input.mouse_mode
+	Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
+
+	# Both transitions happen before a physics sample. The press must remain at
+	# the front of the queue and the release must follow it on the next sample.
+	client.call("_capture_roll_key_transition", _key_event(KEY_Q, true))
+	client.call("_capture_roll_key_transition", _key_event(KEY_Q, false))
+	var q_transitions: Array = client.get("pending_roll_transitions")
+	_check(q_transitions.size() == 2, "short Q tap retained press and release")
+	_check(
+		q_transitions.size() == 2 and float(q_transitions[0]) > 0.99,
+		"Q tap rolls left with positive local Z"
+	)
+	_check(
+		q_transitions.size() == 2 and is_zero_approx(float(q_transitions[1])),
+		"Q release follows the queued press"
+	)
+	q_transitions.clear()
+
+	client.call("_capture_roll_key_transition", _key_event(KEY_E, true))
+	client.call("_capture_roll_key_transition", _key_event(KEY_E, false))
+	var e_transitions: Array = client.get("pending_roll_transitions")
+	_check(
+		e_transitions.size() == 2 and float(e_transitions[0]) < -0.99,
+		"E tap rolls right with negative local Z"
+	)
+	_check(
+		e_transitions.size() == 2 and is_zero_approx(float(e_transitions[1])),
+		"E release follows the queued press"
+	)
+	e_transitions.clear()
+
+	var combined: Vector3 = client.call("_bounded_angular_input", Vector2(8.0, -6.0), 1.0)
+	_check(
+		combined.length() <= 0.9999991,
+		"combined mouse and roll input keeps float32-safe headroom"
+	)
+	client.call("_capture_roll_key_transition", _key_event(KEY_Q, true))
+	client.call("_clear_transient_character_input")
+	_check(
+		(client.get("pending_roll_transitions") as Array).is_empty(),
+		"modal reset clears queued roll transitions"
+	)
+
+	var idle: Dictionary = client.call("_neutral_player_control")
+	var held := idle.duplicate(true)
+	held["angular_input"] = Vector3(0.0, 0.0, 0.5)
+	var drift := idle.duplicate(true)
+	drift["dampeners"] = false
+	_check(
+		not bool(client.call("_control_send_due", idle, idle.duplicate(true), 60.0)),
+		"unchanged idle control does not create periodic traffic"
+	)
+	_check(
+		bool(client.call("_control_send_due", held, held.duplicate(true), 0.10)),
+		"held roll refreshes its authoritative lease"
+	)
+	_check(
+		bool(client.call("_control_send_due", drift, drift.duplicate(true), 0.10)),
+		"dampeners-off drift refreshes its authoritative lease"
+	)
+	_check(
+		bool(client.call("_control_send_due", idle, held, 0.0)),
+		"neutral release transition sends immediately"
+	)
+
+	Input.mouse_mode = previous_mouse_mode
+	client.free()
+
+
+func _key_event(keycode: Key, pressed: bool) -> InputEventKey:
+	var event := InputEventKey.new()
+	event.keycode = keycode
+	event.physical_keycode = keycode
+	event.pressed = pressed
+	event.echo = false
+	return event
 
 
 func _protocol_vec3(value: Vector3) -> Dictionary:
