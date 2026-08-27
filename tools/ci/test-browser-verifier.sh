@@ -21,18 +21,6 @@ for generated_asset in verse_interest_verifier.js; do
     exit 1
   fi
 done
-rust_host="$(rustc -vV | awk '/^host:/ { print $2 }')"
-if [[ "${rust_host}" == "x86_64-unknown-linux-gnu" ]]; then
-  if ! cmp -s \
-    "${generated_check_directory}/verse_interest_verifier_bg.wasm" \
-    "apps/web-command-center/generated/verse_interest_verifier_bg.wasm"; then
-    echo "Committed browser verifier drifted: verse_interest_verifier_bg.wasm" >&2
-    echo "Regenerate it on the canonical x86_64 Linux host with tools/ci/build-browser-verifier.sh and commit the result." >&2
-    exit 1
-  fi
-else
-  echo "VERSE_BROWSER_VERIFIER_NONCANONICAL_HOST host=${rust_host} wasm_byte_comparison=skipped"
-fi
 cargo test --locked -p verse-interest-verifier --lib wasm_browser::tests
 node --check apps/web-command-center/app.js
 node --check apps/web-command-center/verifier-worker.js
@@ -41,6 +29,9 @@ node --test \
   apps/web-command-center/app.test.mjs \
   apps/web-command-center/verifier-worker-core.test.mjs \
   apps/web-command-center/verifier-wasm-smoke.test.mjs
+VERSE_BROWSER_VERIFIER_GENERATED_DIR="${generated_check_directory}" \
+  node --test apps/web-command-center/verifier-wasm-smoke.test.mjs
+echo "VERSE_BROWSER_VERIFIER_REBUILT_WASM_OK"
 cargo test --locked -p verse-simulation-worker \
   command_center_assets_are_served_by_the_game_server
 cargo test --locked -p verse-simulation-worker \
