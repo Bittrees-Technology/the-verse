@@ -1,7 +1,7 @@
 # P1 replication and backpressure
 
-**Status:** P1.5 local interest transport implemented and verified; hosted load
-and independent client hash evidence pending
+**Status:** P1.5 local and hosted proof transport verified; production active-
+player load and independent client hash evidence pending
 
 ## Failure being prevented
 
@@ -176,6 +176,11 @@ acceptance additionally requires:
 - published Mac and hosted-Linux distributions for `2`, `8`, `16`, `32`, and
   `64` active players plus synthetic nearby entities. The current spectator
   harness does not satisfy this active-player gate.
+
+[Hosted CI run 33112815767](https://github.com/Bittrees-Technology/the-verse/actions/runs/33112815767)
+passes the complete Linux replay and packages Linux and Apple Silicon clients
+for implementation revision `bb4ab4e`; it does not widen the spectator harness
+into an active-player or production-capacity claim.
 
 This is still a local-cell scale slice. A final binary codec, multi-process
 cell scheduler, cross-cell handoff, and thousand-participant production result

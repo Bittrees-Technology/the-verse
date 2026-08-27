@@ -2,8 +2,8 @@
 
 **Feature ID:** F-023
 
-**Status:** Implemented and locally verified for one active simulation cell;
-hosted evidence and background-cell equivalence pending
+**Status:** Implemented and locally/hosted verified for one active simulation
+cell; background-cell equivalence pending
 
 **Owner:** Core simulation, worker, protocol, and native-client maintainers
 

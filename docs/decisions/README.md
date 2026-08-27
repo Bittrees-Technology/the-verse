@@ -24,5 +24,6 @@ ADRs capture durable choices and their consequences.
 | [0018](ADR-0018-authoritative-physical-industry.md) | Authoritative physical industry and conveyor production | Accepted |
 | [0019](ADR-0019-fixed-celestial-registry.md) | Fixed celestial registry and canonical universe addresses | Accepted |
 | [0020](ADR-0020-spatial-interest-replication.md) | Server-derived spatial interest replication | Accepted |
+| [0021](ADR-0021-independent-interest-view-verification.md) | Independent interest-view verification before client apply | Accepted |
 
 Status values: Proposed, Accepted, Superseded, Rejected.
