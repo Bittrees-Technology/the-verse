@@ -58,7 +58,7 @@ if "${godot_binary}" \
   echo "The native client started without its mandatory verifier." >&2
   exit 1
 fi
-if ! rg -q \
+if ! grep -Fq \
   'VERSE_SMOKE_CLIENT_FATAL NATIVE INTEREST VERIFIER EXTENSION UNAVAILABLE' \
   "${missing_startup_log}"; then
   sed -n '1,200p' "${missing_startup_log}" >&2
