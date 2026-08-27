@@ -58,23 +58,41 @@ fn move_player(
     target: Vec3,
     sequence: &mut u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    loop {
+    for _ in 0..240 {
         let current = runtime.state().player.position;
         let delta = Vec3::new(
             target.x - current.x,
             target.y - current.y,
             target.z - current.z,
         );
-        if delta.magnitude() <= 0.01 {
+        if delta.magnitude() <= 0.5 {
+            runtime.execute(&ClientMessage::SetPlayerControl {
+                operation_id: format!("benchmark-control-{sequence}"),
+                movement_epoch: runtime.state().player.movement_epoch,
+                input_sequence: *sequence + 1,
+                linear_input: Vec3::ZERO,
+                angular_input: Vec3::ZERO,
+                boost: false,
+                dampeners: true,
+            })?;
+            *sequence += 1;
+            runtime.advance(100)?;
             return Ok(());
         }
-        let next = current + delta.clamped(2.8);
-        runtime.execute(&ClientMessage::MovePlayer {
-            operation_id: format!("benchmark-move-{sequence}"),
-            position: next,
+        let direction = delta * (1.0 / delta.magnitude());
+        runtime.execute(&ClientMessage::SetPlayerControl {
+            operation_id: format!("benchmark-control-{sequence}"),
+            movement_epoch: runtime.state().player.movement_epoch,
+            input_sequence: *sequence + 1,
+            linear_input: direction,
+            angular_input: Vec3::ZERO,
+            boost: true,
+            dampeners: true,
         })?;
         *sequence += 1;
+        runtime.advance(100)?;
     }
+    Err("authoritative player movement did not converge".into())
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

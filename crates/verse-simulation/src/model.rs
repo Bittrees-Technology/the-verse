@@ -5,14 +5,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use verse_protocol::{
     BlockKind, BlockSnapshot, CareerSnapshot, ConservationSnapshot, DeathDropSnapshot,
-    EnvironmentSnapshot, GridSnapshot, IVec3, InventoryContents, InventoryDomain,
-    InventorySnapshot, PlayerDeathCause, PlayerLifeState, PlayerSnapshot, PowerSnapshot, Quat,
-    ResourceKind, Vec3, VoxelMaterial, VoxelSnapshot, WorldSnapshot,
+    EnvironmentSnapshot, GridMotionSnapshot, GridSnapshot, IVec3, InventoryContents,
+    InventoryDomain, InventorySnapshot, MotionSnapshot, PlayerDeathCause, PlayerLifeState,
+    PlayerMotionSnapshot, PlayerSnapshot, PowerSnapshot, Quat, ResourceKind, Vec3, VoxelMaterial,
+    VoxelSnapshot, WorldSnapshot,
 };
 
 use crate::content;
 
-pub const WORLD_SCHEMA_VERSION: u32 = 10;
+pub const WORLD_SCHEMA_VERSION: u32 = 11;
 pub const PLAYER_INVENTORY_ID: &str = "inventory-player-local";
 pub const STARTER_GRID_ID: &str = "grid-starter";
 pub const PLANET_CENTER: Vec3 = Vec3::new(900.0, -2_200.0, -3_800.0);
@@ -150,9 +151,21 @@ fn fixed_lerp(left: i64, right: i64, fraction: i32) -> i64 {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct Player {
     pub player_id: String,
     pub position: Vec3,
+    pub orientation: Quat,
+    pub linear_velocity: Vec3,
+    pub angular_velocity: Vec3,
+    pub surface_contact: bool,
+    pub movement_epoch: u64,
+    pub last_processed_input_sequence: u64,
+    pub control_linear_input: Vec3,
+    pub control_angular_input: Vec3,
+    pub boost: bool,
+    pub dampeners: bool,
+    pub control_expires_at_simulation_tick: u64,
     pub inventory_id: String,
     pub experience: u64,
     pub career: CareerSnapshot,
@@ -528,6 +541,17 @@ impl WorldState {
             player: Player {
                 player_id: "player-local".into(),
                 position: Vec3::new(12.0, 4.5, 10.0),
+                orientation: Quat::IDENTITY,
+                linear_velocity: Vec3::ZERO,
+                angular_velocity: Vec3::ZERO,
+                surface_contact: false,
+                movement_epoch: 1,
+                last_processed_input_sequence: 0,
+                control_linear_input: Vec3::ZERO,
+                control_angular_input: Vec3::ZERO,
+                boost: false,
+                dampeners: true,
+                control_expires_at_simulation_tick: 0,
                 inventory_id: PLAYER_INVENTORY_ID.into(),
                 experience: 0,
                 career: CareerSnapshot::default(),
@@ -677,6 +701,17 @@ impl WorldState {
             player: PlayerSnapshot {
                 player_id: self.player.player_id.clone(),
                 position: self.player.position,
+                orientation: self.player.orientation,
+                linear_velocity: self.player.linear_velocity,
+                angular_velocity: self.player.angular_velocity,
+                surface_contact: self.player.surface_contact,
+                movement_epoch: self.player.movement_epoch,
+                last_processed_input_sequence: self.player.last_processed_input_sequence,
+                control_linear_input: self.player.control_linear_input,
+                control_angular_input: self.player.control_angular_input,
+                boost: self.player.boost,
+                dampeners: self.player.dampeners,
+                control_expires_at_simulation_tick: self.player.control_expires_at_simulation_tick,
                 inventory_id: self.player.inventory_id.clone(),
                 experience: self.player.experience,
                 level: self.player.level(),
@@ -717,6 +752,42 @@ impl WorldState {
                 })
                 .collect(),
             conservation: self.conservation(),
+        }
+    }
+
+    pub fn motion_snapshot(&self) -> MotionSnapshot {
+        MotionSnapshot {
+            event_sequence: self.event_sequence,
+            simulation_tick: self.simulation_tick,
+            world_hash: self.state_hash(),
+            player: PlayerMotionSnapshot {
+                player_id: self.player.player_id.clone(),
+                position: self.player.position,
+                orientation: self.player.orientation,
+                linear_velocity: self.player.linear_velocity,
+                angular_velocity: self.player.angular_velocity,
+                surface_contact: self.player.surface_contact,
+                movement_epoch: self.player.movement_epoch,
+                last_processed_input_sequence: self.player.last_processed_input_sequence,
+                control_linear_input: self.player.control_linear_input,
+                control_angular_input: self.player.control_angular_input,
+                boost: self.player.boost,
+                dampeners: self.player.dampeners,
+                control_expires_at_simulation_tick: self.player.control_expires_at_simulation_tick,
+                jetpack_enabled: self.player.jetpack_enabled,
+                life_state: self.player.life_state.clone(),
+            },
+            grids: self
+                .grids
+                .values()
+                .map(|grid| GridMotionSnapshot {
+                    grid_id: grid.grid_id.clone(),
+                    position: grid.position,
+                    orientation: grid.orientation,
+                    linear_velocity: grid.linear_velocity,
+                    angular_velocity: grid.angular_velocity,
+                })
+                .collect(),
         }
     }
 

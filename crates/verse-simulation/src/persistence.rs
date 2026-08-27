@@ -526,21 +526,7 @@ mod tests {
         let expected_hash;
         {
             let mut runtime = Runtime::open(directory.path(), 29, 100).expect("runtime starts");
-            for (index, position) in [
-                Vec3::new(11.0, 3.5, 7.5),
-                Vec3::new(10.5, 2.5, 5.0),
-                Vec3::new(10.0, 1.0, 3.0),
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                runtime
-                    .execute(&ClientMessage::MovePlayer {
-                        operation_id: format!("recovery-move-{index}"),
-                        position,
-                    })
-                    .expect("player approaches construction range");
-            }
+            runtime.relocate_player_for_test(Vec3::new(10.0, 1.0, 3.0));
             runtime
                 .execute(&ClientMessage::BuildBlock {
                     operation_id: "recovery-frame".into(),
@@ -584,21 +570,10 @@ mod tests {
         let expected_hash;
         {
             let mut runtime = Runtime::open(directory.path(), 30, 100).expect("runtime starts");
-            for (index, position) in [
-                Vec3::new(11.0, 3.5, 7.5),
-                Vec3::new(10.5, 2.5, 5.0),
-                Vec3::new(10.0, 1.0, 3.0),
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                runtime
-                    .execute(&ClientMessage::MovePlayer {
-                        operation_id: format!("completed-recovery-move-{index}"),
-                        position,
-                    })
-                    .expect("player approaches construction range");
-            }
+            runtime.relocate_player_for_test(Vec3::new(10.0, 1.0, 3.0));
+            runtime
+                .persist_snapshot()
+                .expect("durable range-test baseline persists");
             runtime
                 .execute(&ClientMessage::BuildBlock {
                     operation_id: "completed-recovery-frame".into(),
@@ -804,11 +779,16 @@ mod tests {
         {
             let mut runtime = Runtime::open(directory.path(), 47, 100).expect("runtime starts");
             runtime
-                .execute(&ClientMessage::MovePlayer {
+                .execute(&ClientMessage::SetPlayerControl {
                     operation_id: "committed-before-torn-tail".into(),
-                    position: Vec3::new(12.1, 4.5, 10.0),
+                    movement_epoch: 1,
+                    input_sequence: 1,
+                    linear_input: Vec3::new(1.0, 0.0, 0.0),
+                    angular_input: Vec3::ZERO,
+                    boost: false,
+                    dampeners: true,
                 })
-                .expect("committed movement");
+                .expect("committed character control");
             expected_hash = runtime.state().state_hash();
         }
         let journal_path = directory.path().join(JOURNAL_FILE);
@@ -824,9 +804,14 @@ mod tests {
                 Runtime::open(directory.path(), 47, 100).expect("prior state recovers");
             assert_eq!(recovered.state().state_hash(), expected_hash);
             recovered
-                .execute(&ClientMessage::MovePlayer {
+                .execute(&ClientMessage::SetPlayerControl {
                     operation_id: "committed-after-torn-tail".into(),
-                    position: Vec3::new(12.2, 4.5, 10.0),
+                    movement_epoch: 1,
+                    input_sequence: 2,
+                    linear_input: Vec3::ZERO,
+                    angular_input: Vec3::ZERO,
+                    boost: false,
+                    dampeners: true,
                 })
                 .expect("journal remains appendable after truncation");
         }
@@ -886,7 +871,7 @@ mod tests {
         assert!(matches!(
             Store::open(directory.path(), 41),
             Err(PersistenceError::ContentManifestMismatch { stored, runtime })
-                if stored == "p0.7.3" && runtime == "p0.8.0"
+                if stored == "p0.7.3" && runtime == "p0.9.0"
         ));
     }
 

@@ -7,6 +7,7 @@ const socket = new WebSocket(url);
 const buffered = [];
 const waiters = [];
 let operationSequence = 0;
+let authoritativeWorld;
 
 function dispatch(message) {
   const index = waiters.findIndex((waiter) => waiter.predicate(message));
@@ -61,14 +62,49 @@ async function intent(type, payload) {
     );
   }
   const eventSequence = result.receipt.event_sequence;
+  const acceptsMotionState = type === "set_player_control";
   const state = await waitFor(
     (message) =>
-      message.type === "snapshot" &&
-      message.snapshot.event_sequence >= eventSequence,
-    type + " authoritative snapshot",
+      (message.type === "snapshot" &&
+        message.snapshot.event_sequence >= eventSequence) ||
+      (acceptsMotionState && message.type === "motion_state" &&
+        message.motion.event_sequence >= eventSequence),
+    type + " authoritative state",
   );
-  assert.equal(state.snapshot.conservation.valid, true);
-  return state.snapshot;
+  authoritativeWorld = state.type === "snapshot"
+    ? state.snapshot
+    : applyMotion(authoritativeWorld, state.motion);
+  assert.equal(authoritativeWorld.conservation.valid, true);
+  return authoritativeWorld;
+}
+
+function applyMotion(world, motion) {
+  assert.ok(world, "a full snapshot precedes motion deltas");
+  const movingGrids = new Map(
+    motion.grids.map((grid) => [grid.grid_id, grid]),
+  );
+  return {
+    ...world,
+    event_sequence: motion.event_sequence,
+    simulation_tick: motion.simulation_tick,
+    world_hash: motion.world_hash,
+    player: { ...world.player, ...motion.player },
+    grids: world.grids.map((grid) => ({
+      ...grid,
+      ...(movingGrids.get(grid.grid_id) ?? {}),
+    })),
+  };
+}
+
+async function waitForMotionAfter(simulationTick, description) {
+  const state = await waitFor(
+    (message) =>
+      message.type === "motion_state" &&
+      message.motion.simulation_tick > simulationTick,
+    description,
+  );
+  authoritativeWorld = applyMotion(authoritativeWorld, state.motion);
+  return authoritativeWorld;
 }
 
 function playerInventory(world) {
@@ -122,7 +158,8 @@ function blockAt(world, coordinate, kind) {
 }
 
 async function movePlayerTo(world, target) {
-  while (distanceSquared(world.player.position, target) > 0.0001) {
+  for (let attempt = 0; attempt < 240; attempt += 1) {
+    if (distanceSquared(world.player.position, target) <= 0.25) break;
     const current = world.player.position;
     const delta = {
       x: target.x - current.x,
@@ -130,15 +167,36 @@ async function movePlayerTo(world, target) {
       z: target.z - current.z,
     };
     const magnitude = Math.sqrt(distanceSquared(delta, { x: 0, y: 0, z: 0 }));
-    const scale = Math.min(1, 2.8 / magnitude);
-    world = await intent("move_player", {
-      position: {
-        x: current.x + delta.x * scale,
-        y: current.y + delta.y * scale,
-        z: current.z + delta.z * scale,
+    const inputSequence = world.player.last_processed_input_sequence + 1;
+    const tick = world.simulation_tick;
+    world = await intent("set_player_control", {
+      movement_epoch: world.player.movement_epoch,
+      input_sequence: inputSequence,
+      linear_input: {
+        x: delta.x / magnitude,
+        y: delta.y / magnitude,
+        z: delta.z / magnitude,
       },
+      angular_input: { x: 0, y: 0, z: 0 },
+      boost: false,
+      dampeners: true,
     });
+    world = await waitForMotionAfter(tick, "integrated character motion");
   }
+  assert.ok(
+    distanceSquared(world.player.position, target) <= 0.25,
+    "authoritative character control reaches the work area",
+  );
+  const tick = world.simulation_tick;
+  world = await intent("set_player_control", {
+    movement_epoch: world.player.movement_epoch,
+    input_sequence: world.player.last_processed_input_sequence + 1,
+    linear_input: { x: 0, y: 0, z: 0 },
+    angular_input: { x: 0, y: 0, z: 0 },
+    boost: false,
+    dampeners: true,
+  });
+  world = await waitForMotionAfter(tick, "neutral character control settles");
   return world;
 }
 
@@ -173,10 +231,10 @@ async function run() {
     (message) => message.type === "welcome",
     "welcome",
   );
-  assert.equal(welcome.protocol_version, 7);
+  assert.equal(welcome.protocol_version, 8);
   send({
     type: "hello",
-    protocol_version: 7,
+    protocol_version: 8,
     client_name: "node-authoritative-e2e",
   });
   let world = (
@@ -185,8 +243,9 @@ async function run() {
       "post-handshake genesis snapshot",
     )
   ).snapshot;
+  authoritativeWorld = world;
   assert.equal(world.conservation.valid, true);
-  assert.equal(world.content_manifest_version, "p0.8.0");
+  assert.equal(world.content_manifest_version, "p0.9.0");
   assert.equal(world.grids.length, 1);
   assert.ok(world.voxels.length > 1_000);
   assert.equal(world.environment.celestial_body_name, "Khepri Prime");
@@ -271,14 +330,7 @@ async function run() {
     angular_input: { x: 0.0, y: 0.1, z: 0.0 },
     dampeners: true,
   });
-  world = (
-    await waitFor(
-      (message) =>
-        message.type === "snapshot" &&
-        message.snapshot.simulation_tick > tickBeforeMotion,
-      "integrated grid motion",
-    )
-  ).snapshot;
+  world = await waitForMotionAfter(tickBeforeMotion, "integrated grid motion");
   assert.ok(world.grids[0].position.z > 0.0);
   world = await intent("set_grid_control", {
     grid_id: "grid-starter",

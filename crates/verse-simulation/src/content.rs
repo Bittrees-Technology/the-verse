@@ -16,6 +16,7 @@ pub struct ContentManifest {
     pub blocks: Vec<BlockDefinition>,
     pub recipes: Recipes,
     pub physics: PhysicsDefinition,
+    pub character: CharacterDefinition,
     pub survival: SurvivalDefinition,
 }
 
@@ -48,6 +49,21 @@ pub struct PhysicsDefinition {
     pub angular_dampener_newton_meters_per_radian: f64,
     pub friction: f32,
     pub restitution: f32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CharacterDefinition {
+    pub mass_kg: f64,
+    pub collision_radius_m: f64,
+    pub control_lease_ticks: u64,
+    pub thrust_acceleration_m_s2: f64,
+    pub boost_acceleration_m_s2: f64,
+    pub linear_dampener_acceleration_m_s2: f64,
+    pub angular_acceleration_radians_per_second_squared: f64,
+    pub angular_dampener_acceleration_radians_per_second_squared: f64,
+    pub maximum_speed_m_s: f64,
+    pub boost_maximum_speed_m_s: f64,
+    pub maximum_angular_speed_radians_per_second: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -139,7 +155,7 @@ pub fn manifest() -> &'static ContentManifest {
     MANIFEST.get_or_init(|| {
         let parsed: ContentManifest =
             serde_json::from_str(P0_CONTENT).expect("embedded P0 content must be valid JSON");
-        assert_eq!(parsed.schema_version, 6, "unsupported P0 content schema");
+        assert_eq!(parsed.schema_version, 7, "unsupported P0 content schema");
         assert_eq!(
             parsed.license, "AGPL-3.0-or-later",
             "content definition license must be explicit"
@@ -154,6 +170,29 @@ pub fn manifest() -> &'static ContentManifest {
         assert!(parsed.physics.control_torque_newton_meters > 0.0);
         assert!((0.0..=1.0).contains(&parsed.physics.friction));
         assert!((0.0..=1.0).contains(&parsed.physics.restitution));
+        assert!(parsed.character.mass_kg > 0.0);
+        assert!(parsed.character.collision_radius_m > 0.0);
+        assert!(parsed.character.control_lease_ticks > 0);
+        assert!(parsed.character.thrust_acceleration_m_s2 > 0.0);
+        assert!(
+            parsed.character.boost_acceleration_m_s2 > parsed.character.thrust_acceleration_m_s2
+        );
+        assert!(parsed.character.linear_dampener_acceleration_m_s2 > 0.0);
+        assert!(
+            parsed
+                .character
+                .angular_acceleration_radians_per_second_squared
+                > 0.0
+        );
+        assert!(
+            parsed
+                .character
+                .angular_dampener_acceleration_radians_per_second_squared
+                > 0.0
+        );
+        assert!(parsed.character.maximum_speed_m_s > 0.0);
+        assert!(parsed.character.boost_maximum_speed_m_s > parsed.character.maximum_speed_m_s);
+        assert!(parsed.character.maximum_angular_speed_radians_per_second > 0.0);
         assert_eq!(parsed.blocks.len(), 8, "every P0 block must be defined");
         assert_eq!(
             parsed.voxel_materials.len(),
@@ -204,8 +243,8 @@ mod tests {
             .map(|definition| format!("{:?}", definition.kind))
             .collect::<BTreeSet<_>>();
         assert_eq!(block_kinds.len(), content.blocks.len());
-        assert_eq!(content.schema_version, 6);
-        assert_eq!(content.manifest_version, "p0.8.0");
+        assert_eq!(content.schema_version, 7);
+        assert_eq!(content.manifest_version, "p0.9.0");
         assert_eq!(content.physics.voxel_collision_chunk_edge_cells, 8);
         assert_eq!(content.survival.suit_oxygen_capacity_milli, 1_000);
         assert_eq!(content.survival.critical_oxygen_milli, 200);

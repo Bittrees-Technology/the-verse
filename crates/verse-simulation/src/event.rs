@@ -7,13 +7,19 @@ use verse_protocol::{IVec3, PlayerDeathCause, Quat, ResourceKind, Vec3, VoxelMat
 use crate::model::{Block, ContactPairKey, DeathDrop, InventoryRecord};
 
 pub const EVENT_SCHEMA_NAME: &str = "verse.world_event";
-pub const EVENT_SCHEMA_VERSION: u32 = 5;
+pub const EVENT_SCHEMA_VERSION: u32 = 6;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event_type", rename_all = "snake_case")]
 pub enum EventPayload {
-    PlayerMoved {
-        position: Vec3,
+    PlayerControlSet {
+        movement_epoch: u64,
+        input_sequence: u64,
+        linear_input: Vec3,
+        angular_input: Vec3,
+        boost: bool,
+        dampeners: bool,
+        expires_at_simulation_tick: u64,
     },
     SuitModeChanged {
         helmet_closed: bool,
@@ -90,9 +96,25 @@ pub enum EventPayload {
         step_count: u8,
         remaining_step_phase: u32,
         bodies: Vec<PhysicsBodyOutcome>,
+        player: Option<PlayerPhysicsOutcome>,
         contacts: Vec<PhysicsContactOutcome>,
         active_contacts_after: Vec<ContactPairKey>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlayerPhysicsOutcome {
+    pub player_id: String,
+    pub position: Vec3,
+    pub orientation: Quat,
+    pub linear_velocity: Vec3,
+    pub angular_velocity: Vec3,
+    pub surface_contact: bool,
+    pub control_linear_input: Vec3,
+    pub control_angular_input: Vec3,
+    pub boost: bool,
+    pub dampeners: bool,
+    pub control_expires_at_simulation_tick: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -147,7 +169,7 @@ impl EventPayload {
             }
             Self::GridAnchorSet { anchored: true, .. } => 40,
             Self::BlockDamaged { .. } => 3,
-            Self::PlayerMoved { .. }
+            Self::PlayerControlSet { .. }
             | Self::SuitModeChanged { .. }
             | Self::SuitOxygenChanged { .. }
             | Self::PlayerIncapacitated { .. }
@@ -162,7 +184,10 @@ impl EventPayload {
 
     pub fn receipt(&self) -> (&'static str, String) {
         match self {
-            Self::PlayerMoved { .. } => ("player_moved", "Position accepted".into()),
+            Self::PlayerControlSet { input_sequence, .. } => (
+                "player_control_set",
+                format!("Character control {input_sequence} accepted"),
+            ),
             Self::SuitModeChanged {
                 helmet_closed,
                 jetpack_enabled,
@@ -351,7 +376,7 @@ mod tests {
     fn event_hash_detects_payload_tampering() {
         let mut event = CanonicalEvent::new(
             1,
-            "p0.8.0",
+            "p0.9.0",
             "universe",
             "cell",
             9,
@@ -359,13 +384,25 @@ mod tests {
             "human",
             Some("op-1".into()),
             "",
-            EventPayload::PlayerMoved {
-                position: Vec3::new(1.0, 2.0, 3.0),
+            EventPayload::PlayerControlSet {
+                movement_epoch: 1,
+                input_sequence: 1,
+                linear_input: Vec3::new(1.0, 0.0, 0.0),
+                angular_input: Vec3::ZERO,
+                boost: false,
+                dampeners: true,
+                expires_at_simulation_tick: 18,
             },
         );
         assert!(event.hash_is_valid());
-        event.payload = EventPayload::PlayerMoved {
-            position: Vec3::new(9.0, 2.0, 3.0),
+        event.payload = EventPayload::PlayerControlSet {
+            movement_epoch: 1,
+            input_sequence: 1,
+            linear_input: Vec3::new(0.0, 1.0, 0.0),
+            angular_input: Vec3::ZERO,
+            boost: false,
+            dampeners: true,
+            expires_at_simulation_tick: 18,
         };
         assert!(!event.hash_is_valid());
     }

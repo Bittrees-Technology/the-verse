@@ -23,8 +23,8 @@ function connect() {
     elements.connection.className = "connection online";
     socket.send(JSON.stringify({
       type: "hello",
-      protocol_version: 7,
-      client_name: "browser-command-center-p0.8",
+      protocol_version: 8,
+      client_name: "browser-command-center-p0.9",
     }));
   });
   socket.addEventListener("close", () => {
@@ -36,6 +36,24 @@ function connect() {
     const message = JSON.parse(data);
     if (message.type === "snapshot") {
       world = message.snapshot;
+      render();
+    } else if (message.type === "motion_state" && world) {
+      const motion = message.motion;
+      if (motion.event_sequence <= world.event_sequence) return;
+      const gridMotion = new Map(
+        motion.grids.map((grid) => [grid.grid_id, grid]),
+      );
+      world = {
+        ...world,
+        event_sequence: motion.event_sequence,
+        simulation_tick: motion.simulation_tick,
+        world_hash: motion.world_hash,
+        player: { ...world.player, ...motion.player },
+        grids: world.grids.map((grid) => ({
+          ...grid,
+          ...(gridMotion.get(grid.grid_id) ?? {}),
+        })),
+      };
       render();
     } else if (message.type === "intent_accepted") {
       activity(message.receipt.message, false);
