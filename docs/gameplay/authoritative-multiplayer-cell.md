@@ -1,6 +1,7 @@
 # Authoritative multi-player cell
 
-**Status:** P1.4 local proof verified; P1.5 interest-managed visibility specified
+**Status:** P1.5 local interest-managed multiplayer proof implemented and
+verified; production scale gates remain open
 
 This checkpoint targets F-012, SIM-011, and SIM-012. It converts the P0.10 single-pilot proof into a shared authoritative cell without claiming production universe scale. The next delivery contract is [P1.5 fixed celestial registry and interest-managed visibility](celestial-registry-and-interest-management.md); it changes which public entities a session receives without changing actor authority or canonical simulation.
 
@@ -133,14 +134,19 @@ aims and mines one shared voxel as the remote actor, proves actor-only ore and
 career credit, retries idempotently, and converges both clients on the same
 hash. The full scenario derives construction coordinates from exact hit faces
 and proves that an intentionally occluded damage request cannot mutate state.
+Protocol-16 sessions now receive bounded interest baselines and deltas rather
+than the complete cell. The worker shares one immutable spatial source per
+authoritative revision, and local public-spectator distributions through 64
+concurrent sessions plus an irrelevant-far-entity regression prove the current
+bounded-work slice without claiming active-player or production capacity.
 
 ## Not yet included
 
 P1.4 provides physical cargo, conveyors, refinery and assembler queues, power
 gating, conserved escrow, and actor-private production state. Grid control is
 still owner-authorized remotely without a cockpit, terminal, or signal system.
-The implemented transport remains complete-cell JSON; P1.5 interest-managed
-visibility is specified but not yet implemented. Cell transfer, public passkey
+The implemented P1.5 transport remains JSON and single-cell; independent client
+hash verification and the production binary codec remain open. Cell transfer, public passkey
 authentication, teams, company permissions, capital safe-zone enforcement,
 offline turret behavior, cleanup scheduling, combat sensor rules, and browser
 gameplay remain later work.

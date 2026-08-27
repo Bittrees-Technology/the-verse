@@ -1,6 +1,7 @@
 # P1 replication and backpressure
 
-**Status:** P1.4 latest-state transport implemented; P1.5 interest contract accepted with implementation evidence pending
+**Status:** P1.5 local interest transport implemented and verified; hosted load
+and independent client hash evidence pending
 
 ## Failure being prevented
 
@@ -26,6 +27,15 @@ select its authority or widen interest.
 Interest is derived network state. Coalescing, congestion, disconnect, or view
 membership never changes the canonical journal, physics scene, intent
 validation, ownership, inventory, production, or economic state.
+
+The implemented worker publishes a cheap immutable world revision after each
+canonical mutation and lazily materializes one shared `ProjectionSource` on
+the first session demand for that revision. Exact-address 256-metre spatial
+buckets bound ordinary candidate discovery to intersecting buckets, prior
+hysteresis members, and actor/support-critical identities. Projection and JSON
+serialization occur without holding the authoritative runtime lock. A new
+canonical revision invalidates the shared source; concurrent sessions never
+share their cursors, private overlays, epochs, or serialized messages.
 
 ## Baseline and delta frontier
 
@@ -150,9 +160,11 @@ schema `1`.
 
 ## Evidence gates
 
-Existing P1.4 tests cover 4,096-motion coalescing, structural ordering,
-fresh-snapshot recovery, bounded bursts, a 60 Hz send ceiling, and actor-private
-projection. P1.5 additionally requires:
+Existing tests cover 4,096-motion coalescing, structural ordering,
+fresh-snapshot recovery, bounded bursts, a 60 Hz send ceiling, actor-private
+projection, exact spatial membership, irrelevant-far-entity query independence,
+and a local `2`/`8`/`16`/`32`/`64` public-spectator distribution. P1.5 release
+acceptance additionally requires:
 
 - exact enter/exit/hysteresis and negative-coordinate membership vectors;
 - delay, loss, duplicate, reorder, stale epoch, and hash mismatch recovery;
@@ -162,7 +174,8 @@ projection. P1.5 additionally requires:
 - bounded messages, bytes, work, and baseline rate for a slow consumer;
 - structural enter/removal before dependent motion; and
 - published Mac and hosted-Linux distributions for `2`, `8`, `16`, `32`, and
-  `64` active players plus synthetic nearby entities.
+  `64` active players plus synthetic nearby entities. The current spectator
+  harness does not satisfy this active-player gate.
 
 This is still a local-cell scale slice. A final binary codec, multi-process
 cell scheduler, cross-cell handoff, and thousand-participant production result
