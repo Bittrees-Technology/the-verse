@@ -467,6 +467,8 @@ mod tests {
     fn grid(grid_id: &str, position: Vec3, orientation: Quat, blocks: Vec<Block>) -> Grid {
         Grid {
             grid_id: grid_id.into(),
+            owner_player_id: "player-local".into(),
+            anchor_reward_eligible: true,
             position,
             orientation,
             linear_velocity: Vec3::ZERO,

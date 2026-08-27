@@ -903,7 +903,12 @@ impl WorldState {
             InventoryDomain::Cargo { block_id } => {
                 let mut owner = None;
                 for grid in self.grids.values() {
-                    if grid.blocks.contains_key(block_id) {
+                    if let Some(block) = grid.blocks.get(block_id) {
+                        if block.inventory_id.as_deref() != Some(inventory_id) {
+                            return Err(format!(
+                                "cargo block {block_id} does not link back to inventory {inventory_id}"
+                            ));
+                        }
                         if owner.is_some() {
                             return Err(format!(
                                 "cargo block {block_id} is linked from multiple grids"

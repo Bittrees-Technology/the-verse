@@ -20,10 +20,11 @@ use crate::event::{
     CanonicalEvent, EVENT_SCHEMA_NAME, EVENT_SCHEMA_VERSION, EventPayload, PhysicsBodyOutcome,
     PhysicsContactOutcome, PhysicsContactPhase, PlayerPhysicsOutcome,
 };
+#[cfg(test)]
+use crate::model::PLAYER_INVENTORY_ID;
 use crate::model::{
     Block, CARGO_INVENTORY_CAPACITY_LITERS, ContactPairKey, DeathDrop, Grid, InventoryRecord,
-    PLANET_CENTER, PLANET_SURFACE_RADIUS_M, PLAYER_INVENTORY_ID, Player, PlayerControlFrame,
-    WorldState, radial_up,
+    PLANET_CENTER, PLANET_SURFACE_RADIUS_M, Player, PlayerControlFrame, WorldState, radial_up,
 };
 use crate::persistence::{PersistenceError, Store};
 #[cfg(test)]
@@ -833,6 +834,7 @@ impl WorldState {
                     inventory_id: inventory_id.clone(),
                     domain: InventoryDomain::Dropped {
                         reason: "player_oxygen_depleted".into(),
+                        owner_player_id: player.player_id.clone(),
                     },
                     contents: inventory.contents.clone(),
                     capacity_liters: inventory.capacity_liters,
@@ -939,20 +941,6 @@ impl WorldState {
                 "the authenticated player is not present in this simulation cell",
             )
         })?;
-        if actor_player_id != self.player.primary_player_id
-            && !matches!(
-                message,
-                ClientMessage::SetPlayerControl { .. }
-                    | ClientMessage::SetSuitMode { .. }
-                    | ClientMessage::RespawnPlayer { .. }
-                    | ClientMessage::MineVoxel { .. }
-            )
-        {
-            return Err(IntentError::rejected(
-                "actor_action_not_available",
-                "this action is not actor-scoped yet and remains disabled for secondary players",
-            ));
-        }
         let operation_id = message.operation_id().ok_or_else(|| {
             IntentError::rejected("not_a_mutating_intent", "message has no operation ID")
         })?;
@@ -1096,12 +1084,33 @@ impl WorldState {
                     .ok_or_else(|| {
                         IntentError::rejected("quantity_overflow", "refining quantity is too large")
                     })?;
+                self.ensure_actor_owns_inventory(actor_player_id, inventory_id)?;
                 self.ensure_inventory_functional(inventory_id)?;
                 let inventory = self.inventory(inventory_id)?;
                 if inventory.contents.ore < ore_required {
                     return Err(IntentError::rejected(
                         "insufficient_ore",
                         format!("refining requires {ore_required} ore"),
+                    ));
+                }
+                let refined_output = batches
+                    .checked_mul(content::manifest().recipes.refining.refined_output)
+                    .ok_or_else(|| {
+                        IntentError::rejected("quantity_overflow", "refining output is too large")
+                    })?;
+                let mut projected = inventory.clone();
+                projected.contents.ore -= ore_required;
+                projected.contents.refined_material = projected
+                    .contents
+                    .refined_material
+                    .checked_add(refined_output)
+                    .ok_or_else(|| {
+                        IntentError::rejected("quantity_overflow", "refined inventory overflowed")
+                    })?;
+                if projected.used_liters() > projected.capacity_liters {
+                    return Err(IntentError::rejected(
+                        "inventory_capacity_exceeded",
+                        "the inventory has no volume for the refined output",
                     ));
                 }
                 EventPayload::OreRefined {
@@ -1120,6 +1129,7 @@ impl WorldState {
                         "crafting requires at least one component",
                     ));
                 }
+                self.ensure_actor_owns_inventory(actor_player_id, inventory_id)?;
                 self.ensure_inventory_functional(inventory_id)?;
                 let inventory = self.inventory(inventory_id)?;
                 let refined_required = quantity
@@ -1133,21 +1143,26 @@ impl WorldState {
                         format!("crafting requires {refined_required} refined material"),
                     ));
                 }
-                let refined_output = quantity.saturating_mul(
-                    content::manifest()
-                        .recipes
-                        .component_crafting
-                        .component_output,
-                );
-                let used_after = inventory
-                    .used_liters()
-                    .saturating_sub(refined_required.saturating_mul(
-                        crate::model::resource_unit_volume_liters(ResourceKind::RefinedMaterial),
-                    ))
-                    .saturating_add(refined_output.saturating_mul(
-                        crate::model::resource_unit_volume_liters(ResourceKind::Component),
-                    ));
-                if used_after > inventory.capacity_liters {
+                let component_output = quantity
+                    .checked_mul(
+                        content::manifest()
+                            .recipes
+                            .component_crafting
+                            .component_output,
+                    )
+                    .ok_or_else(|| {
+                        IntentError::rejected("quantity_overflow", "crafting output is too large")
+                    })?;
+                let mut projected = inventory.clone();
+                projected.contents.refined_material -= refined_required;
+                projected.contents.components = projected
+                    .contents
+                    .components
+                    .checked_add(component_output)
+                    .ok_or_else(|| {
+                        IntentError::rejected("quantity_overflow", "component inventory overflowed")
+                    })?;
+                if projected.used_liters() > projected.capacity_liters {
                     return Err(IntentError::rejected(
                         "inventory_capacity_exceeded",
                         "the inventory has no volume for the fabricated component",
@@ -1177,6 +1192,8 @@ impl WorldState {
                         "transfer quantity must be positive",
                     ));
                 }
+                self.ensure_actor_owns_inventory(actor_player_id, source_inventory_id)?;
+                self.ensure_actor_owns_inventory(actor_player_id, destination_inventory_id)?;
                 self.ensure_inventory_functional(source_inventory_id)?;
                 self.ensure_inventory_functional(destination_inventory_id)?;
                 let source = self.inventory(source_inventory_id)?;
@@ -1210,6 +1227,7 @@ impl WorldState {
                 orientation,
                 ..
             } => {
+                self.ensure_actor_owns_grid(actor_player_id, grid_id)?;
                 let grid = self.grid(grid_id)?;
                 if *orientation > 3 {
                     return Err(IntentError::rejected(
@@ -1253,7 +1271,7 @@ impl WorldState {
                         "a block frame cannot be created around the living player collider",
                     ));
                 }
-                let player_inventory = self.inventory(PLAYER_INVENTORY_ID)?;
+                let player_inventory = self.inventory(&actor.inventory_id)?;
                 let component_cost = content::block(*kind).component_cost;
                 if player_inventory.contents.components < component_cost {
                     return Err(IntentError::rejected(
@@ -1272,12 +1290,14 @@ impl WorldState {
                 }
                 EventPayload::BlockBuilt {
                     grid_id: grid_id.clone(),
+                    component_inventory_id: actor.inventory_id.clone(),
                     block,
                 }
             }
             ClientMessage::WeldBlock {
                 grid_id, block_id, ..
             } => {
+                self.ensure_actor_owns_grid(actor_player_id, grid_id)?;
                 let grid = self.grid(grid_id)?;
                 let block = grid.blocks.get(block_id).ok_or_else(|| {
                     IntentError::rejected("block_missing", "weld target does not exist")
@@ -1319,6 +1339,7 @@ impl WorldState {
             } => {
                 ensure_finite(*linear_input, "grid linear control")?;
                 ensure_finite(*angular_input, "grid angular control")?;
+                self.ensure_actor_owns_grid(actor_player_id, grid_id)?;
                 let grid = self.grid(grid_id)?;
                 if grid.anchored {
                     return Err(IntentError::rejected(
@@ -1348,6 +1369,7 @@ impl WorldState {
                 }
             }
             ClientMessage::ToggleGridAnchor { grid_id, .. } => {
+                self.ensure_actor_owns_grid(actor_player_id, grid_id)?;
                 let grid = self.grid(grid_id)?;
                 let anchored = !grid.anchored;
                 if anchored {
@@ -1367,6 +1389,7 @@ impl WorldState {
                 EventPayload::GridAnchorSet {
                     grid_id: grid_id.clone(),
                     anchored,
+                    reward_credited: anchored && grid.anchor_reward_eligible,
                 }
             }
             ClientMessage::DamageBlock {
@@ -1517,8 +1540,13 @@ impl WorldState {
                     "voxel mining requires the authoritative player actor and an operation ID",
                 ));
             }
-            EventPayload::BlockBuilt { .. }
+            EventPayload::OreRefined { .. }
+            | EventPayload::ComponentCrafted { .. }
+            | EventPayload::InventoryTransferred { .. }
+            | EventPayload::BlockBuilt { .. }
             | EventPayload::BlockWelded { .. }
+            | EventPayload::GridControlSet { .. }
+            | EventPayload::GridAnchorSet { .. }
             | EventPayload::BlockDamaged { .. }
                 if event.actor_type != "human"
                     || event.actor_player_id.is_none()
@@ -1526,7 +1554,7 @@ impl WorldState {
             {
                 return Err(IntentError::rejected(
                     "replay_hand_tool_envelope_invalid",
-                    "construction, welding, and hand-tool damage require an authenticated player actor and operation ID",
+                    "industry, construction, grid control, anchoring, and hand-tool damage require an authenticated player actor and operation ID",
                 ));
             }
             EventPayload::PhysicsStepCommitted { .. }
@@ -1874,6 +1902,10 @@ impl WorldState {
                 inventory_id,
                 batches,
             } => {
+                let actor_player_id = event
+                    .actor_player_id
+                    .as_deref()
+                    .expect("validated refining event has a human actor");
                 let recipe = &content::manifest().recipes.refining;
                 if *batches == 0 {
                     return Err(IntentError::rejected(
@@ -1887,22 +1919,60 @@ impl WorldState {
                         "refining event quantity overflowed",
                     )
                 })?;
+                let refined_output =
+                    batches.checked_mul(recipe.refined_output).ok_or_else(|| {
+                        IntentError::rejected(
+                            "replay_refining_quantity_invalid",
+                            "refining event output overflowed",
+                        )
+                    })?;
+                self.ensure_actor_owns_inventory(actor_player_id, inventory_id)?;
                 self.ensure_inventory_functional(inventory_id)?;
-                if self.inventory(inventory_id)?.contents.ore < ore_required {
+                let mut projected = self.inventory(inventory_id)?.clone();
+                if projected.contents.ore < ore_required {
                     return Err(IntentError::rejected(
                         "replay_refining_inventory_invalid",
                         "refining event exceeds the authoritative ore inventory",
                     ));
                 }
-                let inventory = self.inventory_mut(inventory_id)?;
-                inventory.contents.ore -= ore_required;
-                inventory.contents.refined_material += batches * recipe.refined_output;
-                self.ledger.refine_batches += batches;
+                projected.contents.ore -= ore_required;
+                projected.contents.refined_material = projected
+                    .contents
+                    .refined_material
+                    .checked_add(refined_output)
+                    .ok_or_else(|| {
+                        IntentError::rejected(
+                            "replay_refining_inventory_invalid",
+                            "refining event overflows the authoritative inventory",
+                        )
+                    })?;
+                if projected.used_liters() > projected.capacity_liters {
+                    return Err(IntentError::rejected(
+                        "replay_refining_inventory_invalid",
+                        "refining event exceeds authoritative inventory capacity",
+                    ));
+                }
+                let next_batches = self
+                    .ledger
+                    .refine_batches
+                    .checked_add(*batches)
+                    .ok_or_else(|| {
+                        IntentError::rejected(
+                            "replay_refining_ledger_invalid",
+                            "refining event overflows the canonical ledger",
+                        )
+                    })?;
+                self.inventory_mut(inventory_id)?.contents = projected.contents;
+                self.ledger.refine_batches = next_batches;
             }
             EventPayload::ComponentCrafted {
                 inventory_id,
                 quantity,
             } => {
+                let actor_player_id = event
+                    .actor_player_id
+                    .as_deref()
+                    .expect("validated crafting event has a human actor");
                 let recipe = &content::manifest().recipes.component_crafting;
                 if *quantity == 0 {
                     return Err(IntentError::rejected(
@@ -1917,17 +1987,53 @@ impl WorldState {
                             "crafting event quantity overflowed",
                         )
                     })?;
+                let component_output =
+                    quantity
+                        .checked_mul(recipe.component_output)
+                        .ok_or_else(|| {
+                            IntentError::rejected(
+                                "replay_crafting_quantity_invalid",
+                                "crafting event output overflowed",
+                            )
+                        })?;
+                self.ensure_actor_owns_inventory(actor_player_id, inventory_id)?;
                 self.ensure_inventory_functional(inventory_id)?;
-                if self.inventory(inventory_id)?.contents.refined_material < refined_required {
+                let mut projected = self.inventory(inventory_id)?.clone();
+                if projected.contents.refined_material < refined_required {
                     return Err(IntentError::rejected(
                         "replay_crafting_inventory_invalid",
                         "crafting event exceeds the authoritative refined inventory",
                     ));
                 }
-                let inventory = self.inventory_mut(inventory_id)?;
-                inventory.contents.refined_material -= refined_required;
-                inventory.contents.components += quantity * recipe.component_output;
-                self.ledger.crafted_components += quantity;
+                projected.contents.refined_material -= refined_required;
+                projected.contents.components = projected
+                    .contents
+                    .components
+                    .checked_add(component_output)
+                    .ok_or_else(|| {
+                        IntentError::rejected(
+                            "replay_crafting_inventory_invalid",
+                            "crafting event overflows the authoritative inventory",
+                        )
+                    })?;
+                if projected.used_liters() > projected.capacity_liters {
+                    return Err(IntentError::rejected(
+                        "replay_crafting_inventory_invalid",
+                        "crafting event exceeds authoritative inventory capacity",
+                    ));
+                }
+                let next_crafted = self
+                    .ledger
+                    .crafted_components
+                    .checked_add(*quantity)
+                    .ok_or_else(|| {
+                        IntentError::rejected(
+                            "replay_crafting_ledger_invalid",
+                            "crafting event overflows the canonical ledger",
+                        )
+                    })?;
+                self.inventory_mut(inventory_id)?.contents = projected.contents;
+                self.ledger.crafted_components = next_crafted;
             }
             EventPayload::InventoryTransferred {
                 source_inventory_id,
@@ -1935,12 +2041,18 @@ impl WorldState {
                 resource,
                 quantity,
             } => {
+                let actor_player_id = event
+                    .actor_player_id
+                    .as_deref()
+                    .expect("validated transfer event has a human actor");
                 if source_inventory_id == destination_inventory_id || *quantity == 0 {
                     return Err(IntentError::rejected(
                         "replay_inventory_transfer_invalid",
                         "inventory transfer must use distinct inventories and a positive quantity",
                     ));
                 }
+                self.ensure_actor_owns_inventory(actor_player_id, source_inventory_id)?;
+                self.ensure_actor_owns_inventory(actor_player_id, destination_inventory_id)?;
                 self.ensure_inventory_functional(source_inventory_id)?;
                 self.ensure_inventory_functional(destination_inventory_id)?;
                 if self
@@ -1957,18 +2069,32 @@ impl WorldState {
                         "inventory transfer exceeds authoritative contents or capacity",
                     ));
                 }
-                mutate_resource(
-                    &mut self.inventory_mut(source_inventory_id)?.contents,
-                    *resource,
-                    |amount| *amount -= quantity,
-                );
-                mutate_resource(
-                    &mut self.inventory_mut(destination_inventory_id)?.contents,
-                    *resource,
-                    |amount| *amount += quantity,
-                );
+                let mut source_contents = self.inventory(source_inventory_id)?.contents.clone();
+                let mut destination_contents =
+                    self.inventory(destination_inventory_id)?.contents.clone();
+                mutate_resource(&mut source_contents, *resource, |amount| {
+                    *amount -= quantity;
+                });
+                let destination_amount = destination_contents
+                    .amount(*resource)
+                    .checked_add(*quantity)
+                    .ok_or_else(|| {
+                        IntentError::rejected(
+                            "replay_inventory_transfer_invalid",
+                            "inventory transfer overflows the destination quantity",
+                        )
+                    })?;
+                mutate_resource(&mut destination_contents, *resource, |amount| {
+                    *amount = destination_amount;
+                });
+                self.inventory_mut(source_inventory_id)?.contents = source_contents;
+                self.inventory_mut(destination_inventory_id)?.contents = destination_contents;
             }
-            EventPayload::BlockBuilt { grid_id, block } => {
+            EventPayload::BlockBuilt {
+                grid_id,
+                component_inventory_id,
+                block,
+            } => {
                 let definition = content::block(block.kind);
                 let expected_block_id = format!("block-{}", event.event_sequence);
                 let expected_inventory_id = (block.kind == BlockKind::Cargo)
@@ -2008,6 +2134,14 @@ impl WorldState {
                     .player
                     .get(actor_player_id)
                     .expect("validated construction actor is present");
+                self.ensure_actor_owns_grid(actor_player_id, grid_id)?;
+                if component_inventory_id != &actor.inventory_id {
+                    return Err(IntentError::rejected(
+                        "replay_construction_inventory_invalid",
+                        "construction must debit the authenticated actor's carried inventory",
+                    ));
+                }
+                self.ensure_actor_owns_inventory(actor_player_id, component_inventory_id)?;
                 if grid.blocks.len() >= MAX_GRID_BLOCKS_P0
                     || grid.block_at(block.coordinate).is_some()
                     || (!grid.blocks.is_empty()
@@ -2033,14 +2167,17 @@ impl WorldState {
                         "placed frame intersects the authoritative player collider",
                     ));
                 }
-                if self.inventory(PLAYER_INVENTORY_ID)?.contents.components < block.component_cost {
+                if self.inventory(component_inventory_id)?.contents.components
+                    < block.component_cost
+                {
                     return Err(IntentError::rejected(
                         "replay_construction_components_invalid",
                         "placed frame exceeds the authoritative component inventory",
                     ));
                 }
-                self.inventory_mut(PLAYER_INVENTORY_ID)?.contents.components -=
-                    block.component_cost;
+                self.inventory_mut(component_inventory_id)?
+                    .contents
+                    .components -= block.component_cost;
                 if let Some(inventory_id) = &block.inventory_id {
                     self.inventories.insert(
                         inventory_id.clone(),
@@ -2075,6 +2212,7 @@ impl WorldState {
                     .player
                     .get(actor_player_id)
                     .expect("validated weld actor is present");
+                self.ensure_actor_owns_grid(actor_player_id, grid_id)?;
                 let grid = self.grid(grid_id)?;
                 let _targeted_block = grid.blocks.get(block_id).ok_or_else(|| {
                     IntentError::rejected("replay_block_missing", "weld target is missing")
@@ -2131,15 +2269,56 @@ impl WorldState {
                 angular_input,
                 dampeners,
             } => {
+                let actor_player_id = event
+                    .actor_player_id
+                    .as_deref()
+                    .expect("validated grid control event has a human actor");
+                self.ensure_actor_owns_grid(actor_player_id, grid_id)?;
+                ensure_finite(*linear_input, "replayed grid linear control")?;
+                ensure_finite(*angular_input, "replayed grid angular control")?;
+                let grid = self.grid(grid_id)?;
+                if grid.anchored
+                    || !grid.power().online
+                    || linear_input.magnitude() > MAX_GRID_CONTROL_INPUT + CONTROL_INPUT_EPSILON
+                    || angular_input.magnitude() > MAX_GRID_CONTROL_INPUT + CONTROL_INPUT_EPSILON
+                {
+                    return Err(IntentError::rejected(
+                        "replay_grid_control_invalid",
+                        "grid control requires an owned, powered, released grid and normalized finite inputs",
+                    ));
+                }
                 let grid = self.grid_mut(grid_id)?;
                 grid.control_linear_input = *linear_input;
                 grid.control_angular_input = *angular_input;
                 grid.dampeners = *dampeners;
             }
-            EventPayload::GridAnchorSet { grid_id, anchored } => {
+            EventPayload::GridAnchorSet {
+                grid_id,
+                anchored,
+                reward_credited,
+            } => {
+                let actor_player_id = event
+                    .actor_player_id
+                    .as_deref()
+                    .expect("validated anchor event has a human actor");
+                self.ensure_actor_owns_grid(actor_player_id, grid_id)?;
+                let grid = self.grid(grid_id)?;
+                let expected_reward = *anchored && grid.anchor_reward_eligible;
+                if *anchored == grid.anchored
+                    || (*anchored && (!grid.power().online || !grid.anchor_touches(&self.voxels)))
+                    || *reward_credited != expected_reward
+                {
+                    return Err(IntentError::rejected(
+                        "replay_grid_anchor_invalid",
+                        "anchor event must be an authorized toggle with canonical power, contact, and reward state",
+                    ));
+                }
                 let grid = self.grid_mut(grid_id)?;
                 grid.anchored = *anchored;
                 if *anchored {
+                    if *reward_credited {
+                        grid.anchor_reward_eligible = false;
+                    }
                     grid.linear_velocity = Vec3::ZERO;
                     grid.angular_velocity = Vec3::ZERO;
                     grid.control_linear_input = Vec3::ZERO;
@@ -2159,6 +2338,12 @@ impl WorldState {
                     .player
                     .get(actor_player_id)
                     .expect("validated damage actor is present");
+                if *damage != 35 {
+                    return Err(IntentError::rejected(
+                        "replay_damage_amount_invalid",
+                        "hand-tool damage must match the canonical amount",
+                    ));
+                }
                 let grid = self.grid(grid_id)?;
                 let _block = grid.blocks.get(block_id).ok_or_else(|| {
                     IntentError::rejected("replay_block_missing", "damage target is missing")
@@ -2605,18 +2790,16 @@ impl WorldState {
         }
 
         let experience_reward = event.payload.experience_reward();
-        if matches!(&event.payload, EventPayload::VoxelMined { .. }) {
+        if experience_reward > 0 {
             let actor_player_id = event
                 .actor_player_id
                 .as_deref()
-                .expect("validated mining event has a human actor");
+                .expect("reward-bearing events have a validated human actor");
             let actor = self
                 .player
                 .get_mut(actor_player_id)
-                .expect("validated mining actor is present");
+                .expect("validated reward actor is present");
             actor.experience = actor.experience.saturating_add(experience_reward);
-        } else {
-            self.player.experience = self.player.experience.saturating_add(experience_reward);
         }
         match &event.payload {
             EventPayload::VoxelMined { .. } => {
@@ -2631,17 +2814,51 @@ impl WorldState {
                     .voxels_mined += 1;
             }
             EventPayload::OreRefined { batches, .. } => {
-                self.player.career.refining_batches += batches;
+                let actor_player_id = event
+                    .actor_player_id
+                    .as_deref()
+                    .expect("validated refining event has a human actor");
+                self.player
+                    .get_mut(actor_player_id)
+                    .expect("validated refining actor is present")
+                    .career
+                    .refining_batches += batches;
             }
             EventPayload::ComponentCrafted { quantity, .. } => {
-                self.player.career.components_crafted += quantity;
+                let actor_player_id = event
+                    .actor_player_id
+                    .as_deref()
+                    .expect("validated crafting event has a human actor");
+                self.player
+                    .get_mut(actor_player_id)
+                    .expect("validated crafting actor is present")
+                    .career
+                    .components_crafted += quantity;
             }
             EventPayload::BlockWelded {
                 completed_construction: true,
                 ..
-            } => self.player.career.blocks_built += 1,
+            } => {
+                let actor_player_id = event
+                    .actor_player_id
+                    .as_deref()
+                    .expect("validated weld event has a human actor");
+                self.player
+                    .get_mut(actor_player_id)
+                    .expect("validated weld actor is present")
+                    .career
+                    .blocks_built += 1;
+            }
             EventPayload::GridAnchorSet { anchored: true, .. } => {
-                self.player.career.anchors_engaged += 1;
+                let actor_player_id = event
+                    .actor_player_id
+                    .as_deref()
+                    .expect("validated anchor event has a human actor");
+                self.player
+                    .get_mut(actor_player_id)
+                    .expect("validated anchor actor is present")
+                    .career
+                    .anchors_engaged += 1;
             }
             EventPayload::PlayerControlSet { .. }
             | EventPayload::SuitModeChanged { .. }
@@ -2694,6 +2911,7 @@ impl WorldState {
         damage: u16,
         event_sequence: u64,
     ) -> Result<(), IntentError> {
+        let grid_owner_player_id = self.grid(grid_id)?.owner_player_id.clone();
         let removed = {
             let grid = self.grid_mut(grid_id)?;
             let block = grid.blocks.get_mut(block_id).ok_or_else(|| {
@@ -2717,6 +2935,7 @@ impl WorldState {
         {
             inventory.domain = InventoryDomain::Dropped {
                 reason: "cargo_block_destroyed".into(),
+                owner_player_id: grid_owner_player_id,
             };
         }
         self.split_disconnected_grid(grid_id, event_sequence)?;
@@ -2728,10 +2947,11 @@ impl WorldState {
         grid_id: &str,
         event_sequence: u64,
     ) -> Result<(), IntentError> {
-        let original = self.grids.remove(grid_id).ok_or_else(|| {
+        let original = self.grids.get(grid_id).cloned().ok_or_else(|| {
             IntentError::rejected("replay_grid_missing", "grid split target is missing")
         })?;
         if original.blocks.is_empty() {
+            self.grids.remove(grid_id);
             return Ok(());
         }
 
@@ -2769,12 +2989,33 @@ impl WorldState {
             })
             .unwrap_or(0);
 
+        let split_grid_ids = components
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                if index == primary_index {
+                    original.grid_id.clone()
+                } else {
+                    format!("{}-split-{event_sequence}-{index}", original.grid_id)
+                }
+            })
+            .collect::<Vec<_>>();
+        if split_grid_ids
+            .iter()
+            .enumerate()
+            .any(|(index, split_id)| index != primary_index && self.grids.contains_key(split_id))
+        {
+            return Err(IntentError::rejected(
+                "replay_grid_split_identity_duplicate",
+                "deterministic grid split identity is already in use",
+            ));
+        }
+
+        let did_split = components.len() > 1;
+        self.grids.remove(grid_id);
+
         for (index, component) in components.into_iter().enumerate() {
-            let new_grid_id = if index == primary_index {
-                original.grid_id.clone()
-            } else {
-                format!("{}-split-{event_sequence}-{index}", original.grid_id)
-            };
+            let new_grid_id = split_grid_ids[index].clone();
             let blocks = component
                 .iter()
                 .map(|coordinate| {
@@ -2784,13 +3025,23 @@ impl WorldState {
                 .collect();
             let mut grid = Grid {
                 grid_id: new_grid_id.clone(),
+                owner_player_id: original.owner_player_id.clone(),
+                anchor_reward_eligible: original.anchor_reward_eligible && index == primary_index,
                 position: original.position,
                 orientation: original.orientation,
                 linear_velocity: original.linear_velocity,
                 angular_velocity: original.angular_velocity,
-                control_linear_input: original.control_linear_input,
-                control_angular_input: original.control_angular_input,
-                dampeners: original.dampeners,
+                control_linear_input: if did_split {
+                    Vec3::ZERO
+                } else {
+                    original.control_linear_input
+                },
+                control_angular_input: if did_split {
+                    Vec3::ZERO
+                } else {
+                    original.control_angular_input
+                },
+                dampeners: original.dampeners || did_split,
                 anchored: original.anchored,
                 blocks,
             };
@@ -2858,6 +3109,53 @@ impl WorldState {
         }
     }
 
+    /// Resolve inventory authority from canonical ownership rather than from
+    /// client-selected IDs. Carried inventory belongs to its linked player;
+    /// cargo inherits the owner of the one grid containing its live block.
+    /// Dropped inventory deliberately has no generic-use authority.
+    fn ensure_actor_owns_inventory(
+        &self,
+        actor_player_id: &str,
+        inventory_id: &str,
+    ) -> Result<(), IntentError> {
+        let inventory = self.inventory(inventory_id)?;
+        if matches!(inventory.domain, InventoryDomain::Dropped { .. }) {
+            return Err(IntentError::rejected(
+                "dropped_inventory_sealed",
+                "dropped inventory requires an explicit recovery or salvage action",
+            ));
+        }
+        let owner_player_id = self
+            .inventory_owner_player_id(inventory_id)
+            .map_err(|message| IntentError::rejected("inventory_authority_invalid", message))?;
+        if owner_player_id != actor_player_id {
+            return Err(IntentError::rejected(
+                "inventory_access_denied",
+                "the authenticated player cannot access the selected inventory",
+            ));
+        }
+        match &inventory.domain {
+            InventoryDomain::Player { player_id } => {
+                let actor = self.player.get(actor_player_id).ok_or_else(|| {
+                    IntentError::rejected(
+                        "actor_not_present",
+                        "the authenticated inventory actor is not present",
+                    )
+                })?;
+                if player_id == actor_player_id && actor.inventory_id == inventory_id {
+                    Ok(())
+                } else {
+                    Err(IntentError::rejected(
+                        "inventory_access_denied",
+                        "the authenticated player cannot access the selected carried inventory",
+                    ))
+                }
+            }
+            InventoryDomain::Cargo { .. } => Ok(()),
+            InventoryDomain::Dropped { .. } => unreachable!("dropped inventories reject above"),
+        }
+    }
+
     fn inventory_mut(&mut self, inventory_id: &str) -> Result<&mut InventoryRecord, IntentError> {
         self.inventories.get_mut(inventory_id).ok_or_else(|| {
             IntentError::rejected(
@@ -2871,6 +3169,21 @@ impl WorldState {
         self.grids.get(grid_id).ok_or_else(|| {
             IntentError::rejected("grid_missing", format!("grid {grid_id} does not exist"))
         })
+    }
+
+    fn ensure_actor_owns_grid(
+        &self,
+        actor_player_id: &str,
+        grid_id: &str,
+    ) -> Result<(), IntentError> {
+        if self.grid(grid_id)?.owner_player_id == actor_player_id {
+            Ok(())
+        } else {
+            Err(IntentError::rejected(
+                "grid_access_denied",
+                "the authenticated player cannot perform this action on the selected grid",
+            ))
+        }
     }
 
     fn grid_mut(&mut self, grid_id: &str) -> Result<&mut Grid, IntentError> {
@@ -4925,6 +5238,25 @@ mod tests {
         aim_player_for_build(runtime, STARTER_GRID_ID, IVec3::new(0, 1, 0));
     }
 
+    fn copy_primary_tool_pose_to(runtime: &mut Runtime, player_id: &str) {
+        let primary = runtime.state.player.primary().clone();
+        let player = runtime
+            .state
+            .player
+            .get_mut(player_id)
+            .expect("tool-pose target player exists");
+        player.position = primary.position;
+        player.orientation = primary.orientation;
+        player.linear_velocity = primary.linear_velocity;
+        player.angular_velocity = primary.angular_velocity;
+        player.surface_contact = primary.surface_contact;
+        player.locomotion = primary.locomotion;
+        runtime
+            .physics
+            .rebuild(&physics_body_specs(&runtime.state))
+            .expect("actor-specific tool pose rebuilds the physics scene");
+    }
+
     fn normalized(value: Vec3) -> Vec3 {
         value * value.magnitude().recip()
     }
@@ -5311,6 +5643,271 @@ mod tests {
         );
     }
 
+    #[test]
+    fn actor_owned_industry_and_engineering_are_isolated_and_recover_exactly() {
+        let directory = tempdir().expect("tempdir");
+        let expected_hash;
+        {
+            let mut runtime =
+                Runtime::open(directory.path(), 169, 5).expect("authority runtime opens");
+            runtime
+                .admit_development_player("player-remote")
+                .expect("secondary actor admits");
+            runtime
+                .state
+                .grids
+                .get_mut(STARTER_GRID_ID)
+                .expect("starter grid exists")
+                .owner_player_id = "player-remote".into();
+            runtime
+                .state
+                .inventories
+                .get_mut(PLAYER_INVENTORY_ID)
+                .expect("primary inventory exists")
+                .contents
+                .components -= 4;
+            runtime
+                .state
+                .inventories
+                .get_mut("inventory-player-remote")
+                .expect("secondary inventory exists")
+                .contents = InventoryContents {
+                ore: 2,
+                refined_material: 1,
+                components: 4,
+            };
+            runtime.state.ledger.genesis_ore += 2;
+            runtime.state.ledger.genesis_refined += 1;
+            assert!(runtime.state().conservation().valid);
+            runtime
+                .persist_snapshot()
+                .expect("owned-grid authority fixture persists");
+
+            let denied = [
+                (
+                    ClientMessage::RefineOre {
+                        operation_id: "remote-refine-primary".into(),
+                        inventory_id: PLAYER_INVENTORY_ID.into(),
+                        batches: 1,
+                    },
+                    "inventory_access_denied",
+                ),
+                (
+                    ClientMessage::CraftComponent {
+                        operation_id: "remote-craft-primary".into(),
+                        inventory_id: PLAYER_INVENTORY_ID.into(),
+                        quantity: 1,
+                    },
+                    "inventory_access_denied",
+                ),
+                (
+                    ClientMessage::TransferInventory {
+                        operation_id: "remote-transfer-from-primary".into(),
+                        source_inventory_id: PLAYER_INVENTORY_ID.into(),
+                        destination_inventory_id: "inventory-player-remote".into(),
+                        resource: ResourceKind::Component,
+                        quantity: 1,
+                    },
+                    "inventory_access_denied",
+                ),
+                (
+                    ClientMessage::TransferInventory {
+                        operation_id: "remote-transfer-to-primary".into(),
+                        source_inventory_id: "inventory-player-remote".into(),
+                        destination_inventory_id: PLAYER_INVENTORY_ID.into(),
+                        resource: ResourceKind::Component,
+                        quantity: 1,
+                    },
+                    "inventory_access_denied",
+                ),
+            ];
+            for (message, expected_code) in denied {
+                let before = runtime.state().state_hash();
+                let error = runtime
+                    .execute_as("player-remote", &message)
+                    .expect_err("cross-owner inventory intent rejects");
+                assert!(matches!(
+                    error,
+                    RuntimeError::Intent(IntentError::Rejected { ref code, .. })
+                        if code == expected_code
+                ));
+                assert_eq!(runtime.state().state_hash(), before);
+            }
+
+            let foreign_grid_intents = [
+                ClientMessage::BuildBlock {
+                    operation_id: "primary-build-foreign".into(),
+                    grid_id: STARTER_GRID_ID.into(),
+                    coordinate: IVec3::new(0, 1, 0),
+                    kind: BlockKind::Structural,
+                    orientation: 0,
+                },
+                ClientMessage::WeldBlock {
+                    operation_id: "primary-weld-foreign".into(),
+                    grid_id: STARTER_GRID_ID.into(),
+                    block_id: "block-core".into(),
+                },
+                ClientMessage::SetGridControl {
+                    operation_id: "primary-control-foreign".into(),
+                    grid_id: STARTER_GRID_ID.into(),
+                    linear_input: Vec3::new(0.25, 0.0, 0.0),
+                    angular_input: Vec3::ZERO,
+                    dampeners: true,
+                },
+                ClientMessage::ToggleGridAnchor {
+                    operation_id: "primary-anchor-foreign".into(),
+                    grid_id: STARTER_GRID_ID.into(),
+                },
+            ];
+            for message in foreign_grid_intents {
+                let before = runtime.state().state_hash();
+                let error = runtime
+                    .execute_as("player-local", &message)
+                    .expect_err("foreign constructive grid intent rejects");
+                assert!(matches!(
+                    error,
+                    RuntimeError::Intent(IntentError::Rejected { ref code, .. })
+                        if code == "grid_access_denied"
+                ));
+                assert_eq!(runtime.state().state_hash(), before);
+            }
+
+            runtime
+                .execute_as(
+                    "player-remote",
+                    &ClientMessage::RefineOre {
+                        operation_id: "remote-refine-owned".into(),
+                        inventory_id: "inventory-player-remote".into(),
+                        batches: 1,
+                    },
+                )
+                .expect("secondary actor refines its carried ore");
+            runtime
+                .execute_as(
+                    "player-remote",
+                    &ClientMessage::CraftComponent {
+                        operation_id: "remote-craft-owned".into(),
+                        inventory_id: "inventory-player-remote".into(),
+                        quantity: 1,
+                    },
+                )
+                .expect("secondary actor crafts in its carried inventory");
+            runtime
+                .execute_as(
+                    "player-remote",
+                    &ClientMessage::TransferInventory {
+                        operation_id: "remote-transfer-to-owned-cargo".into(),
+                        source_inventory_id: "inventory-player-remote".into(),
+                        destination_inventory_id: "inventory-cargo-starter".into(),
+                        resource: ResourceKind::Component,
+                        quantity: 1,
+                    },
+                )
+                .expect("secondary actor deposits into its completed cargo");
+            runtime
+                .execute_as(
+                    "player-remote",
+                    &ClientMessage::TransferInventory {
+                        operation_id: "remote-transfer-from-owned-cargo".into(),
+                        source_inventory_id: "inventory-cargo-starter".into(),
+                        destination_inventory_id: "inventory-player-remote".into(),
+                        resource: ResourceKind::Component,
+                        quantity: 1,
+                    },
+                )
+                .expect("secondary actor withdraws from its completed cargo");
+            runtime
+                .execute_as(
+                    "player-remote",
+                    &ClientMessage::SetGridControl {
+                        operation_id: "remote-control-owned-grid".into(),
+                        grid_id: STARTER_GRID_ID.into(),
+                        linear_input: Vec3::new(0.25, 0.0, 0.0),
+                        angular_input: Vec3::ZERO,
+                        dampeners: true,
+                    },
+                )
+                .expect("secondary owner controls its powered released grid");
+
+            aim_player_for_build(&mut runtime, STARTER_GRID_ID, IVec3::new(0, 1, 0));
+            copy_primary_tool_pose_to(&mut runtime, "player-remote");
+            runtime
+                .execute_as(
+                    "player-remote",
+                    &ClientMessage::BuildBlock {
+                        operation_id: "remote-build-owned-grid".into(),
+                        grid_id: STARTER_GRID_ID.into(),
+                        coordinate: IVec3::new(0, 1, 0),
+                        kind: BlockKind::Structural,
+                        orientation: 0,
+                    },
+                )
+                .expect("secondary owner places a frame using its carried components");
+            let frame_id = runtime.state().grids[STARTER_GRID_ID]
+                .block_at(IVec3::new(0, 1, 0))
+                .expect("secondary frame exists")
+                .block_id
+                .clone();
+            for stage in 0..3 {
+                aim_player_at_block(&mut runtime, STARTER_GRID_ID, &frame_id);
+                copy_primary_tool_pose_to(&mut runtime, "player-remote");
+                runtime
+                    .execute_as(
+                        "player-remote",
+                        &ClientMessage::WeldBlock {
+                            operation_id: format!("remote-weld-owned-grid-{stage}"),
+                            grid_id: STARTER_GRID_ID.into(),
+                            block_id: frame_id.clone(),
+                        },
+                    )
+                    .expect("secondary owner welds its frame");
+            }
+
+            let local_experience_before = runtime.state().player.primary().experience;
+            aim_player_at_block(&mut runtime, STARTER_GRID_ID, "block-deck-e");
+            runtime
+                .execute_as(
+                    "player-local",
+                    &ClientMessage::DamageBlock {
+                        operation_id: "primary-damage-foreign-grid".into(),
+                        grid_id: STARTER_GRID_ID.into(),
+                        block_id: "block-deck-e".into(),
+                    },
+                )
+                .expect("non-owner PvP damage remains legal in the unsecured cell");
+
+            let primary = runtime.state().player.primary();
+            let remote = runtime
+                .state()
+                .player
+                .get("player-remote")
+                .expect("secondary actor remains present");
+            assert_eq!(primary.experience, local_experience_before);
+            assert_eq!(primary.career, CareerSnapshot::default());
+            assert_eq!(remote.experience, 55);
+            assert_eq!(remote.career.refining_batches, 1);
+            assert_eq!(remote.career.components_crafted, 1);
+            assert_eq!(remote.career.blocks_built, 1);
+            assert_eq!(
+                runtime.state().grids[STARTER_GRID_ID].owner_player_id,
+                "player-remote"
+            );
+            assert!(runtime.state().conservation().valid);
+            runtime
+                .persist_snapshot()
+                .expect("actor-owned progression snapshot persists");
+            expected_hash = runtime.state().state_hash();
+        }
+
+        let recovered =
+            Runtime::open(directory.path(), 169, 5).expect("actor-owned progression recovers");
+        assert_eq!(recovered.state().state_hash(), expected_hash);
+        assert_eq!(
+            recovered.state().grids[STARTER_GRID_ID].owner_player_id,
+            "player-remote"
+        );
+    }
+
     fn stationary_player_outcomes(state: &WorldState, step_count: u8) -> Vec<PlayerPhysicsOutcome> {
         state
             .player
@@ -5486,6 +6083,18 @@ mod tests {
         wrong_damage_target.event_hash = wrong_damage_target.calculate_hash();
         reject(&wrong_damage_target, "replay_damage_target_invalid", &state);
 
+        let mut wrong_damage_amount = damage.clone();
+        let EventPayload::BlockDamaged {
+            damage: forged_damage,
+            ..
+        } = &mut wrong_damage_amount.payload
+        else {
+            unreachable!();
+        };
+        *forged_damage = 0;
+        wrong_damage_amount.event_hash = wrong_damage_amount.calculate_hash();
+        reject(&wrong_damage_amount, "replay_damage_amount_invalid", &state);
+
         let mut wrong_damage_actor = damage;
         wrong_damage_actor.actor_player_id = Some("player-remote".into());
         wrong_damage_actor.event_hash = wrong_damage_actor.calculate_hash();
@@ -5518,11 +6127,7 @@ mod tests {
         let mut wrong_build_actor = build.clone();
         wrong_build_actor.actor_player_id = Some("player-remote".into());
         wrong_build_actor.event_hash = wrong_build_actor.calculate_hash();
-        reject(
-            &wrong_build_actor,
-            "replay_construction_target_invalid",
-            &build_state,
-        );
+        reject(&wrong_build_actor, "grid_access_denied", &build_state);
 
         let mut post_build_state = build_state;
         post_build_state
@@ -5608,6 +6213,8 @@ mod tests {
     ) -> Grid {
         Grid {
             grid_id: grid_id.into(),
+            owner_player_id: "player-local".into(),
+            anchor_reward_eligible: true,
             position,
             orientation: Quat::IDENTITY,
             linear_velocity,
@@ -5637,10 +6244,34 @@ mod tests {
         runtime.state.simulation_tick = 0;
         runtime.state.physics_step_phase = 0;
         runtime.physics_step_phase = 0;
-        runtime
+        let cargo_links = runtime
             .state
-            .inventories
-            .retain(|inventory_id, _| inventory_id == PLAYER_INVENTORY_ID);
+            .grids
+            .values()
+            .flat_map(|grid| grid.blocks.values())
+            .filter_map(|block| {
+                block
+                    .inventory_id
+                    .as_ref()
+                    .map(|inventory_id| (inventory_id.clone(), block.block_id.clone()))
+            })
+            .collect::<BTreeMap<_, _>>();
+        runtime.state.inventories.retain(|inventory_id, inventory| {
+            matches!(inventory.domain, InventoryDomain::Player { .. })
+                || cargo_links.contains_key(inventory_id)
+        });
+        for (inventory_id, block_id) in cargo_links {
+            runtime
+                .state
+                .inventories
+                .entry(inventory_id.clone())
+                .or_insert_with(|| InventoryRecord {
+                    inventory_id,
+                    domain: InventoryDomain::Cargo { block_id },
+                    contents: InventoryContents::default(),
+                    capacity_liters: CARGO_INVENTORY_CAPACITY_LITERS,
+                });
+        }
         runtime.state.ledger.genesis_installed_components = runtime
             .state
             .grids
@@ -9030,6 +9661,49 @@ mod tests {
     }
 
     #[test]
+    fn industry_and_grid_replay_require_authenticated_human_envelopes() {
+        let state = WorldState::genesis(171);
+        let payloads = [
+            EventPayload::OreRefined {
+                inventory_id: PLAYER_INVENTORY_ID.into(),
+                batches: 1,
+            },
+            EventPayload::ComponentCrafted {
+                inventory_id: PLAYER_INVENTORY_ID.into(),
+                quantity: 1,
+            },
+            EventPayload::InventoryTransferred {
+                source_inventory_id: PLAYER_INVENTORY_ID.into(),
+                destination_inventory_id: "inventory-cargo-starter".into(),
+                resource: ResourceKind::Component,
+                quantity: 1,
+            },
+            EventPayload::GridControlSet {
+                grid_id: STARTER_GRID_ID.into(),
+                linear_input: Vec3::ZERO,
+                angular_input: Vec3::ZERO,
+                dampeners: true,
+            },
+            EventPayload::GridAnchorSet {
+                grid_id: STARTER_GRID_ID.into(),
+                anchored: true,
+                reward_credited: true,
+            },
+        ];
+
+        for payload in payloads {
+            let event = state.prepare_system_event(payload);
+            let mut candidate = state.clone();
+            let before = candidate.state_hash();
+            let error = candidate
+                .apply_event(&event)
+                .expect_err("client work with a system envelope rejects");
+            assert_eq!(error.code(), "replay_hand_tool_envelope_invalid");
+            assert_eq!(candidate.state_hash(), before);
+        }
+    }
+
+    #[test]
     fn snapshot_and_journal_restarts_preserve_dead_and_post_respawn_states() {
         for respawned in [false, true] {
             for snapshot_target in [false, true] {
@@ -9193,7 +9867,7 @@ mod tests {
                 .construction_complete
         );
         assert_eq!(runtime.state().player.career.blocks_built, 1);
-        assert_eq!(runtime.state().player.experience, 37);
+        assert_eq!(runtime.state().player.experience, 25);
         let sequence = runtime.state().event_sequence;
         let completed = runtime.execute(&ClientMessage::WeldBlock {
             operation_id: "over-weld".into(),
@@ -9310,7 +9984,7 @@ mod tests {
                 .expect("damaged block appears in the snapshot");
             assert!(damaged_snapshot.construction_complete);
             assert_eq!(runtime.state().player.career.blocks_built, 0);
-            assert_eq!(runtime.state().player.experience, 3);
+            assert_eq!(runtime.state().player.experience, 0);
 
             let mut weld_index = 0_u32;
             while runtime.state().grids[STARTER_GRID_ID].blocks[&block_id].health
@@ -9330,7 +10004,7 @@ mod tests {
             assert_eq!(repaired.health, repaired.max_health());
             assert!(repaired.construction_complete);
             assert_eq!(runtime.state().player.career.blocks_built, 0);
-            assert_eq!(runtime.state().player.experience, 15);
+            assert_eq!(runtime.state().player.experience, 0);
             assert!(runtime.state().conservation().valid);
             runtime.persist_snapshot().expect("snapshot persists");
             expected_hash = runtime.state().state_hash();
@@ -9439,6 +10113,29 @@ mod tests {
                 if code == "anchor_not_touching_voxel"
         ));
         weld_to_completion(&mut runtime, anchor_coordinate, "weld-anchor");
+        let experience_before_anchor = runtime.state().player.experience;
+        let mut forged_anchor = runtime
+            .state()
+            .prepare_client_event(&ClientMessage::ToggleGridAnchor {
+                operation_id: "forged-anchor-reward".into(),
+                grid_id: STARTER_GRID_ID.into(),
+            })
+            .expect("canonical rewarded anchor event prepares");
+        let EventPayload::GridAnchorSet {
+            reward_credited, ..
+        } = &mut forged_anchor.payload
+        else {
+            unreachable!();
+        };
+        *reward_credited = false;
+        forged_anchor.event_hash = forged_anchor.calculate_hash();
+        let mut forged_candidate = runtime.state().clone();
+        let forged_before = forged_candidate.state_hash();
+        let forged_error = forged_candidate
+            .apply_event(&forged_anchor)
+            .expect_err("forged one-time anchor reward decision rejects");
+        assert_eq!(forged_error.code(), "replay_grid_anchor_invalid");
+        assert_eq!(forged_candidate.state_hash(), forged_before);
         runtime
             .execute(&ClientMessage::ToggleGridAnchor {
                 operation_id: "engage-complete-anchor".into(),
@@ -9446,6 +10143,28 @@ mod tests {
             })
             .expect("complete anchor engages");
         assert!(runtime.state().grids[STARTER_GRID_ID].anchored);
+        assert!(!runtime.state().grids[STARTER_GRID_ID].anchor_reward_eligible);
+        assert_eq!(
+            runtime.state().player.experience,
+            experience_before_anchor + 40
+        );
+        runtime
+            .execute(&ClientMessage::ToggleGridAnchor {
+                operation_id: "release-complete-anchor".into(),
+                grid_id: STARTER_GRID_ID.into(),
+            })
+            .expect("complete anchor releases");
+        runtime
+            .execute(&ClientMessage::ToggleGridAnchor {
+                operation_id: "reengage-complete-anchor".into(),
+                grid_id: STARTER_GRID_ID.into(),
+            })
+            .expect("complete anchor reengages without another reward");
+        assert_eq!(
+            runtime.state().player.experience,
+            experience_before_anchor + 40
+        );
+        assert_eq!(runtime.state().player.career.anchors_engaged, 2);
         assert!(runtime.state().conservation().valid);
     }
 
@@ -10583,7 +11302,6 @@ mod tests {
             .grids
             .get_mut(STARTER_GRID_ID)
             .expect("starter grid exists");
-        grid.anchored = true;
         let block_position = grid.world_position(IVec3::ZERO);
         runtime.state.player.position = block_position + Vec3::new(0.0, 0.5 + radius + 2.0, 0.0);
         runtime.state.player.linear_velocity = Vec3::new(0.0, -24.0, 0.0);
@@ -10893,6 +11611,15 @@ mod tests {
         runtime.execute(&build_top).expect("top block built");
         weld_to_completion(&mut runtime, IVec3::new(0, 1, 0), "weld-bridge");
         weld_to_completion(&mut runtime, IVec3::new(0, 2, 0), "weld-top");
+        runtime
+            .execute(&ClientMessage::SetGridControl {
+                operation_id: "control-before-split".into(),
+                grid_id: STARTER_GRID_ID.into(),
+                linear_input: Vec3::new(0.25, 0.0, 0.0),
+                angular_input: Vec3::new(0.0, 0.1, 0.0),
+                dampeners: false,
+            })
+            .expect("owned grid control engages before structural split");
         let bridge_id = runtime.state().grids[STARTER_GRID_ID]
             .block_at(IVec3::new(0, 1, 0))
             .expect("bridge block")
@@ -10919,6 +11646,21 @@ mod tests {
             block_ids.iter().collect::<BTreeSet<_>>().len()
         );
         assert_eq!(runtime.state().grids.len(), 2);
+        assert!(runtime.state().grids.values().all(|grid| {
+            grid.owner_player_id == "player-local"
+                && grid.control_linear_input == Vec3::ZERO
+                && grid.control_angular_input == Vec3::ZERO
+                && grid.dampeners
+        }));
+        assert_eq!(
+            runtime
+                .state()
+                .grids
+                .values()
+                .filter(|grid| grid.anchor_reward_eligible)
+                .count(),
+            1
+        );
         assert!(runtime.state().conservation().valid);
     }
 
@@ -10947,6 +11689,59 @@ mod tests {
         );
         assert!(grid.linear_velocity.x > -0.25);
         assert!(runtime.state().simulation_tick >= 24);
+    }
+
+    #[test]
+    fn grid_control_replay_revalidates_bounds_power_and_anchor_state() {
+        let state = WorldState::genesis(172);
+        let valid = state
+            .prepare_client_event(&ClientMessage::SetGridControl {
+                operation_id: "canonical-grid-control".into(),
+                grid_id: STARTER_GRID_ID.into(),
+                linear_input: Vec3::new(0.25, 0.0, 0.0),
+                angular_input: Vec3::ZERO,
+                dampeners: true,
+            })
+            .expect("canonical grid control prepares");
+
+        let mut oversized = valid.clone();
+        let EventPayload::GridControlSet { linear_input, .. } = &mut oversized.payload else {
+            unreachable!();
+        };
+        *linear_input = Vec3::new(1.25, 0.0, 0.0);
+        oversized.event_hash = oversized.calculate_hash();
+
+        let mut anchored_state = state.clone();
+        anchored_state
+            .grids
+            .get_mut(STARTER_GRID_ID)
+            .expect("starter grid exists")
+            .anchored = true;
+        let mut unpowered_state = state.clone();
+        for block in unpowered_state
+            .grids
+            .get_mut(STARTER_GRID_ID)
+            .expect("starter grid exists")
+            .blocks
+            .values_mut()
+        {
+            if matches!(block.kind, BlockKind::PowerSource | BlockKind::Battery) {
+                block.construction_complete = false;
+            }
+        }
+
+        for (mut candidate, event) in [
+            (state.clone(), oversized),
+            (anchored_state, valid.clone()),
+            (unpowered_state, valid),
+        ] {
+            let before = candidate.state_hash();
+            let error = candidate
+                .apply_event(&event)
+                .expect_err("forged grid control replay rejects");
+            assert_eq!(error.code(), "replay_grid_control_invalid");
+            assert_eq!(candidate.state_hash(), before);
+        }
     }
 
     #[test]
