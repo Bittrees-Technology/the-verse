@@ -182,7 +182,9 @@ Implemented and continuously verified:
 - Persistent 90-degree block orientations transmitted in protocol snapshots.
 - Frames that consume components once, begin at 25 percent integrity, and require three accepted weld stages.
 - Power and anchor rules that ignore unfinished construction.
-- Completion-derived career progress and idempotent welding receipts.
+- Sealed cargo inventories until construction completes.
+- Durable completion state that keeps damaged armor visually distinct from frames and prevents repair from re-awarding build credit.
+- Completion-derived career progress, exact recovery, and idempotent final-weld receipts.
 - Exact mined-coordinate removal assertions in the cross-process scenario.
 - Client-side frame skeletons, rotating directional holograms, integrity telemetry, and confirmed-edit rock fragments.
 
@@ -216,13 +218,14 @@ Implemented foundation:
 - An isolated, license-recorded Jolt adapter for dynamic and static compound bodies.
 - Server-owned grid forces, poses, velocities, contacts, and anchoring body transitions.
 - Canonical quantized body/contact `PhysicsStepCommitted` outcomes so replay never depends on repeating floating-point collision solving.
+- Native Jolt manifolds, explicit pairwise-estimate semantics, and canonical contact onset/persistence that survives derived-scene rebuild and restart.
 - Authoritative player collision against voxels and grids.
 - Sparse dirty-chunk rendering after accepted voxel edits.
 - Initial contact, conservation, recovery, body-count, native-client, and macOS evidence.
 
 Still required for checkpoint acceptance:
 
-- Solved-contact collision damage and atomic damage/split outcomes.
+- A project-owned post-solve applied-impulse binding, collision damage, and atomic damage/split outcomes.
 - Dirty collision-body replacement after voxel edits.
 - Grid–grid, anchor stability, mass response, player–grid, crash-boundary, edit-remesh, Ubuntu, Linux-artifact, network, and scaling evidence.
 

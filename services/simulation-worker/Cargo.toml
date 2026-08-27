@@ -26,6 +26,7 @@ verse-simulation = { path = "../../crates/verse-simulation" }
 
 [dev-dependencies]
 tempfile.workspace = true
+tokio-tungstenite.workspace = true
 tower.workspace = true
 
 [lints]

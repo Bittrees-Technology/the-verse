@@ -7,23 +7,32 @@
 
 use std::collections::BTreeMap;
 use std::ffi::CStr;
+use std::ffi::c_void;
+use std::mem::MaybeUninit;
 use std::ptr;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use joltc_sys::{
-    JPC_ACTIVATION_ACTIVATE, JPC_ACTIVATION_DONT_ACTIVATE, JPC_BodyCreationSettings, JPC_BodyID,
+    JPC_ACTIVATION_ACTIVATE, JPC_ACTIVATION_DONT_ACTIVATE, JPC_Body_GetPointVelocity,
+    JPC_Body_GetShape, JPC_Body_GetUserData, JPC_BodyCreationSettings, JPC_BodyID,
     JPC_BodyInterface_AddBody, JPC_BodyInterface_AddForceAndTorque, JPC_BodyInterface_CreateBody,
     JPC_BodyInterface_DestroyBody, JPC_BodyInterface_GetAngularVelocity,
     JPC_BodyInterface_GetLinearVelocity, JPC_BodyInterface_GetPosition,
     JPC_BodyInterface_GetRotation, JPC_BodyInterface_IsActive, JPC_BodyInterface_RemoveBody,
-    JPC_BoxShapeSettings, JPC_BoxShapeSettings_Create, JPC_JobSystemThreadPool,
-    JPC_JobSystemThreadPool_delete, JPC_JobSystemThreadPool_new3, JPC_MOTION_QUALITY_DISCRETE,
-    JPC_MOTION_QUALITY_LINEAR_CAST, JPC_MOTION_TYPE_DYNAMIC, JPC_MOTION_TYPE_STATIC,
-    JPC_PHYSICS_UPDATE_ERROR_NONE, JPC_PhysicsSystem_GetBodyInterface, JPC_PhysicsSystem_Update,
-    JPC_Quat, JPC_RVec3, JPC_Shape, JPC_Shape_Release, JPC_StaticCompoundShapeSettings,
+    JPC_BoxShapeSettings, JPC_BoxShapeSettings_Create, JPC_CollideShapeResult,
+    JPC_CollisionEstimationResult, JPC_ContactListener as JpcContactListener,
+    JPC_ContactListener_delete, JPC_ContactListener_new, JPC_ContactListenerFns,
+    JPC_ContactManifold, JPC_ContactSettings, JPC_EstimateCollisionResponse,
+    JPC_JobSystemThreadPool, JPC_JobSystemThreadPool_delete, JPC_JobSystemThreadPool_new3,
+    JPC_MOTION_QUALITY_DISCRETE, JPC_MOTION_TYPE_DYNAMIC, JPC_MOTION_TYPE_STATIC,
+    JPC_PHYSICS_UPDATE_ERROR_NONE, JPC_PhysicsSystem_GetBodyInterface,
+    JPC_PhysicsSystem_SetContactListener, JPC_PhysicsSystem_Update, JPC_Quat, JPC_RVec3, JPC_Shape,
+    JPC_Shape_GetSubShapeUserData, JPC_Shape_Release, JPC_StaticCompoundShapeSettings,
     JPC_StaticCompoundShapeSettings_Create, JPC_String, JPC_String_c_str, JPC_String_delete,
-    JPC_SubShapeSettings, JPC_TempAllocatorImpl, JPC_TempAllocatorImpl_delete,
-    JPC_TempAllocatorImpl_new, JPC_Vec3,
+    JPC_SubShapeIDPair, JPC_SubShapeSettings, JPC_TempAllocatorImpl, JPC_TempAllocatorImpl_delete,
+    JPC_TempAllocatorImpl_new, JPC_VALIDATE_RESULT_ACCEPT_ALL_CONTACTS, JPC_ValidateResult,
+    JPC_Vec3,
 };
 use rolt::{
     BroadPhaseLayer, BroadPhaseLayerInterface, ObjectLayer, ObjectLayerPairFilter,
@@ -31,8 +40,8 @@ use rolt::{
 };
 
 use crate::{
-    BodyControl, BodyMotion, BodySpec, BodyState, BoxColliderSpec, PhysicsError, Pose, Quat,
-    SceneConfig, Vec3,
+    BodyControl, BodyMotion, BodySpec, BodyState, BoxColliderSpec, ContactInvariant, ContactPhase,
+    ContactRecord, ContactSource, PhysicsError, Pose, Quat, SceneConfig, Vec3,
 };
 
 const OBJECT_LAYER_STATIC: u16 = 0;
@@ -89,11 +98,322 @@ struct NativeBody {
     id: JPC_BodyID,
 }
 
+#[derive(Debug)]
+struct ContactBuffer {
+    bodies: Vec<BodyContactCatalog>,
+    contacts: Vec<RawContact>,
+    max_contacts: usize,
+    overflowed: bool,
+}
+
+#[derive(Debug)]
+struct BodyContactCatalog {
+    body_id: String,
+    collider_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RawContact {
+    body1_index: usize,
+    collider1_index: usize,
+    body2_index: usize,
+    collider2_index: usize,
+    normal: Vec3,
+    point: Vec3,
+    penetration_m: f64,
+    impact_speed_mps: f64,
+    estimated_normal_impulse_ns: f64,
+    phase: ContactPhase,
+}
+
+#[derive(Debug)]
+struct NativeContactListener {
+    buffer: Mutex<ContactBuffer>,
+    failure_code: AtomicU8,
+}
+
+impl NativeContactListener {
+    fn new(max_contacts: usize) -> Result<Self, PhysicsError> {
+        let mut contacts = Vec::new();
+        contacts.try_reserve_exact(max_contacts).map_err(|error| {
+            PhysicsError::InvalidConfiguration(format!(
+                "contact callback budget cannot be allocated: {error}"
+            ))
+        })?;
+        Ok(Self {
+            buffer: Mutex::new(ContactBuffer {
+                bodies: Vec::new(),
+                contacts,
+                max_contacts,
+                overflowed: false,
+            }),
+            failure_code: AtomicU8::new(0),
+        })
+    }
+
+    fn fail(&self, invariant: ContactInvariant) {
+        let _ = self.failure_code.compare_exchange(
+            0,
+            invariant as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    fn failure(&self) -> Option<ContactInvariant> {
+        let code = self.failure_code.load(Ordering::Acquire);
+        if code == 0 {
+            None
+        } else {
+            Some(ContactInvariant::from_code(code).unwrap_or(ContactInvariant::Unknown))
+        }
+    }
+
+    unsafe fn capture(
+        &self,
+        body1: *const joltc_sys::JPC_Body,
+        body2: *const joltc_sys::JPC_Body,
+        manifold: *const JPC_ContactManifold,
+        settings: *const JPC_ContactSettings,
+        phase: ContactPhase,
+    ) {
+        if body1.is_null() || body2.is_null() || manifold.is_null() || settings.is_null() {
+            self.fail(ContactInvariant::NullCallbackInput);
+            return;
+        }
+        // SAFETY: Jolt guarantees all callback pointers are live for the call.
+        // Individual initialized scalar fields are copied with raw reads; no
+        // Rust reference is formed to the C mirror's uninitialized tail slots.
+        let body1_user_data = unsafe { JPC_Body_GetUserData(body1) };
+        let body2_user_data = unsafe { JPC_Body_GetUserData(body2) };
+        let shape1 = unsafe { JPC_Body_GetShape(body1) };
+        let shape2 = unsafe { JPC_Body_GetShape(body2) };
+        if body1_user_data == 0 || body2_user_data == 0 || shape1.is_null() || shape2.is_null() {
+            self.fail(ContactInvariant::MissingBodyIdentity);
+            return;
+        }
+        let sub_shape1 = unsafe { ptr::addr_of!((*manifold).SubShapeID1).read() };
+        let sub_shape2 = unsafe { ptr::addr_of!((*manifold).SubShapeID2).read() };
+        let collider1_user_data = unsafe { JPC_Shape_GetSubShapeUserData(shape1, sub_shape1) };
+        let collider2_user_data = unsafe { JPC_Shape_GetSubShapeUserData(shape2, sub_shape2) };
+        if collider1_user_data == 0 || collider2_user_data == 0 {
+            self.fail(ContactInvariant::MissingColliderIdentity);
+            return;
+        }
+        let (Some(body1_index), Some(collider1_index), Some(body2_index), Some(collider2_index)) = (
+            usize::try_from(body1_user_data - 1).ok(),
+            usize::try_from(collider1_user_data - 1).ok(),
+            usize::try_from(body2_user_data - 1).ok(),
+            usize::try_from(collider2_user_data - 1).ok(),
+        ) else {
+            self.fail(ContactInvariant::IdentityIndexOverflow);
+            return;
+        };
+
+        let contacts_on_left = unsafe { ptr::addr_of!((*manifold).RelativeContactPointsOn1) };
+        let contacts_on_right = unsafe { ptr::addr_of!((*manifold).RelativeContactPointsOn2) };
+        let left_contact_count = unsafe { ptr::addr_of!((*contacts_on_left).length).read() };
+        let right_contact_count = unsafe { ptr::addr_of!((*contacts_on_right).length).read() };
+        let (Ok(contact_count), Ok(right_contact_count)) = (
+            usize::try_from(left_contact_count),
+            usize::try_from(right_contact_count),
+        ) else {
+            self.fail(ContactInvariant::ContactCountOverflow);
+            return;
+        };
+        if contact_count == 0 || contact_count != right_contact_count || contact_count > 64 {
+            self.fail(ContactInvariant::ContactCountMismatch);
+            return;
+        }
+        let base = from_world_vec3(unsafe { ptr::addr_of!((*manifold).BaseOffset).read() });
+        if !base.is_finite() {
+            self.fail(ContactInvariant::NonFiniteBaseOffset);
+            return;
+        }
+        let left_point_data =
+            unsafe { ptr::addr_of!((*contacts_on_left).points).cast::<JPC_Vec3>() };
+        let right_point_data =
+            unsafe { ptr::addr_of!((*contacts_on_right).points).cast::<JPC_Vec3>() };
+        let mut sum = Vec3::ZERO;
+        for index in 0..contact_count {
+            let point_on_left =
+                base + from_local_vec3(unsafe { left_point_data.add(index).read() });
+            let point_on_right =
+                base + from_local_vec3(unsafe { right_point_data.add(index).read() });
+            if !point_on_left.is_finite() || !point_on_right.is_finite() {
+                self.fail(ContactInvariant::NonFiniteContactPoint);
+                return;
+            }
+            sum = sum + (point_on_left + point_on_right) * 0.5;
+        }
+        let point = sum * (1.0 / contact_count as f64);
+        let raw_normal =
+            from_local_vec3(unsafe { ptr::addr_of!((*manifold).WorldSpaceNormal).read() });
+        let Some(normal) = raw_normal.normalized() else {
+            self.fail(ContactInvariant::InvalidNormal);
+            return;
+        };
+        let velocity1 =
+            from_local_vec3(unsafe { JPC_Body_GetPointVelocity(body1, world_vec3(point)) });
+        let velocity2 =
+            from_local_vec3(unsafe { JPC_Body_GetPointVelocity(body2, world_vec3(point)) });
+        if !point.is_finite() || !velocity1.is_finite() || !velocity2.is_finite() {
+            self.fail(ContactInvariant::NonFinitePointVelocity);
+            return;
+        }
+
+        // Zero initialization makes every otherwise-unwritten tail impulse a
+        // valid Rust float value before the C API fills the active prefix.
+        let mut estimate = MaybeUninit::<JPC_CollisionEstimationResult>::zeroed();
+        let friction = unsafe { ptr::addr_of!((*settings).CombinedFriction).read() };
+        let restitution = unsafe { ptr::addr_of!((*settings).CombinedRestitution).read() };
+        if !friction.is_finite() || !restitution.is_finite() {
+            self.fail(ContactInvariant::NonFiniteMaterialResponse);
+            return;
+        }
+        unsafe {
+            JPC_EstimateCollisionResponse(
+                body1,
+                body2,
+                manifold,
+                estimate.as_mut_ptr(),
+                friction,
+                restitution,
+                1.0,
+                10,
+            );
+        }
+        let estimate = unsafe { estimate.assume_init() };
+        let Ok(impulse_count) = usize::try_from(estimate.NumImpulses) else {
+            self.fail(ContactInvariant::ImpulseCountOverflow);
+            return;
+        };
+        if impulse_count > estimate.Impulses.len() {
+            self.fail(ContactInvariant::ImpulseCountCapacityExceeded);
+            return;
+        }
+        if impulse_count != contact_count {
+            self.fail(ContactInvariant::ImpulseContactCountMismatch);
+            return;
+        }
+        let mut estimated_normal_impulse_ns = 0.0;
+        for impulse in &estimate.Impulses[..impulse_count] {
+            let value = f64::from(impulse.ContactImpulse);
+            let Some(total) =
+                accumulate_estimated_normal_impulse(estimated_normal_impulse_ns, value)
+            else {
+                self.fail(ContactInvariant::InvalidEstimatedImpulse);
+                return;
+            };
+            estimated_normal_impulse_ns = total;
+        }
+        let signed_penetration_m =
+            f64::from(unsafe { ptr::addr_of!((*manifold).PenetrationDepth).read() });
+        let closing_speed_mps = (velocity1 - velocity2).dot(normal).max(0.0);
+        if !estimated_normal_impulse_ns.is_finite() {
+            self.fail(ContactInvariant::EstimatedImpulseSumInvalid);
+            return;
+        }
+        if !signed_penetration_m.is_finite() {
+            self.fail(ContactInvariant::NonFinitePenetration);
+            return;
+        }
+        if !closing_speed_mps.is_finite() {
+            self.fail(ContactInvariant::NonFiniteClosingSpeed);
+            return;
+        }
+        // Jolt can report a negative depth for a valid speculative contact.
+        // The public field represents overlap only, so separation maps to zero.
+        let penetration_m = signed_penetration_m.max(0.0);
+
+        let Ok(mut buffer) = self.buffer.lock() else {
+            self.fail(ContactInvariant::BufferLockPoisoned);
+            return;
+        };
+        if buffer
+            .bodies
+            .get(body1_index)
+            .is_none_or(|body| body.collider_ids.get(collider1_index).is_none())
+            || buffer
+                .bodies
+                .get(body2_index)
+                .is_none_or(|body| body.collider_ids.get(collider2_index).is_none())
+        {
+            self.fail(ContactInvariant::CatalogIdentityMissing);
+            return;
+        }
+        if buffer.contacts.len() >= buffer.max_contacts {
+            buffer.overflowed = true;
+            return;
+        }
+        buffer.contacts.push(RawContact {
+            body1_index,
+            collider1_index,
+            body2_index,
+            collider2_index,
+            normal,
+            point,
+            penetration_m,
+            impact_speed_mps: closing_speed_mps,
+            estimated_normal_impulse_ns,
+            phase,
+        });
+    }
+}
+
+unsafe extern "C" fn contact_validate(
+    _this: *mut c_void,
+    _body1: *const joltc_sys::JPC_Body,
+    _body2: *const joltc_sys::JPC_Body,
+    _base_offset: JPC_RVec3,
+    _collision_result: *const JPC_CollideShapeResult,
+) -> JPC_ValidateResult {
+    JPC_VALIDATE_RESULT_ACCEPT_ALL_CONTACTS
+}
+
+unsafe extern "C" fn contact_added(
+    this: *mut c_void,
+    body1: *const joltc_sys::JPC_Body,
+    body2: *const joltc_sys::JPC_Body,
+    manifold: *const JPC_ContactManifold,
+    settings: *mut JPC_ContactSettings,
+) {
+    if let Some(listener) = unsafe { this.cast::<NativeContactListener>().as_ref() } {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            listener.capture(body1, body2, manifold, settings, ContactPhase::Began);
+        }));
+        if result.is_err() {
+            listener.fail(ContactInvariant::CallbackPanicked);
+        }
+    }
+}
+
+unsafe extern "C" fn contact_persisted(
+    this: *mut c_void,
+    body1: *const joltc_sys::JPC_Body,
+    body2: *const joltc_sys::JPC_Body,
+    manifold: *const JPC_ContactManifold,
+    settings: *mut JPC_ContactSettings,
+) {
+    if let Some(listener) = unsafe { this.cast::<NativeContactListener>().as_ref() } {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            listener.capture(body1, body2, manifold, settings, ContactPhase::Persisted);
+        }));
+        if result.is_err() {
+            listener.fail(ContactInvariant::CallbackPanicked);
+        }
+    }
+}
+
+unsafe extern "C" fn contact_removed(_this: *mut c_void, _pair: *const JPC_SubShapeIDPair) {}
+
 pub(crate) struct NativeScene {
     physics: Option<PhysicsSystem>,
     temporary_allocator: *mut JPC_TempAllocatorImpl,
     job_system: *mut JPC_JobSystemThreadPool,
     bodies: BTreeMap<String, NativeBody>,
+    contact_listener: *mut JpcContactListener,
+    contact_listener_state: Box<NativeContactListener>,
 }
 
 impl std::fmt::Debug for NativeScene {
@@ -107,14 +427,18 @@ impl std::fmt::Debug for NativeScene {
 
 // SAFETY: NativeScene exclusively owns all Jolt resources and native callbacks.
 // Its public owner exposes mutation only through `&mut self`, it has no Sync
-// implementation, the job system has zero worker threads, and callback `this`
-// pointers owned by rolt point to stable heap allocations rather than into this
-// movable struct. Moving a dormant scene between worker threads therefore does
-// not create concurrent native access or invalidate a pointer.
+// implementation, the job system has zero worker threads, and the raw callback
+// `this` pointer targets a stable owned Box rather than this movable struct.
+// Moving a dormant scene between worker threads therefore does not create
+// concurrent native access or invalidate a pointer.
 unsafe impl Send for NativeScene {}
 
 impl NativeScene {
     pub(crate) fn new(config: &SceneConfig) -> Result<Self, PhysicsError> {
+        // Allocate every fallible Rust-owned callback resource before any raw
+        // native allocation so an allocation error cannot leak Jolt objects.
+        let mut contact_listener_state =
+            Box::new(NativeContactListener::new(contact_record_budget(config)?)?);
         initialize_jolt();
         let mut physics = PhysicsSystem::new();
         physics.init(
@@ -126,7 +450,6 @@ impl NativeScene {
             ObjectVsBroadPhase,
             ObjectPairs,
         );
-
         // SAFETY: The constructors return owned opaque pointers. A zero-thread
         // job system executes submitted work on the calling thread, which keeps
         // the authoritative step single-threaded. Both pointers are checked and
@@ -157,11 +480,39 @@ impl NativeScene {
                 "native allocator or job system allocation returned null".into(),
             ));
         }
+        let callbacks = JPC_ContactListenerFns {
+            OnContactValidate: Some(contact_validate),
+            OnContactAdded: Some(contact_added),
+            OnContactPersisted: Some(contact_persisted),
+            OnContactRemoved: Some(contact_removed),
+        };
+        // SAFETY: The callback state is heap allocated and remains stable until
+        // after PhysicsSystem is detached and destroyed in Drop.
+        let contact_listener = unsafe {
+            JPC_ContactListener_new(
+                ptr::from_mut(contact_listener_state.as_mut()).cast::<c_void>(),
+                callbacks,
+            )
+        };
+        if contact_listener.is_null() {
+            // SAFETY: Both are live owned allocations and no update can exist.
+            unsafe {
+                JPC_JobSystemThreadPool_delete(job_system);
+                JPC_TempAllocatorImpl_delete(temporary_allocator);
+            }
+            return Err(PhysicsError::Initialization(
+                "native contact listener allocation returned null".into(),
+            ));
+        }
+        // SAFETY: Both pointers are live and remain so through every update.
+        unsafe { JPC_PhysicsSystem_SetContactListener(physics.raw(), contact_listener) };
         Ok(Self {
             physics: Some(physics),
             temporary_allocator,
             job_system,
             bodies: BTreeMap::new(),
+            contact_listener,
+            contact_listener_state,
         })
     }
 
@@ -184,6 +535,22 @@ impl NativeScene {
     }
 
     fn add_body(&mut self, config: &SceneConfig, spec: &BodySpec) -> Result<(), PhysicsError> {
+        let body_user_data = {
+            let mut buffer = self.contact_listener_state.buffer.lock().map_err(|_| {
+                PhysicsError::Initialization("native contact buffer lock was poisoned".into())
+            })?;
+            buffer.bodies.push(BodyContactCatalog {
+                body_id: spec.body_id.clone(),
+                collider_ids: spec
+                    .colliders
+                    .iter()
+                    .map(|collider| collider.collider_id.clone())
+                    .collect(),
+            });
+            u64::try_from(buffer.bodies.len()).map_err(|_| {
+                PhysicsError::Initialization("native body contact catalog overflowed".into())
+            })?
+        };
         let mut child_shapes = Vec::with_capacity(spec.colliders.len());
         let mut sub_shapes = Vec::with_capacity(spec.colliders.len());
         for (index, collider) in spec.colliders.iter().enumerate() {
@@ -192,7 +559,7 @@ impl NativeScene {
                 Shape: shape.0,
                 Position: local_vec3(collider.local_pose.position),
                 Rotation: quat(collider.local_pose.rotation),
-                UserData: u32::try_from(index).unwrap_or(u32::MAX),
+                UserData: u32::try_from(index + 1).unwrap_or(u32::MAX),
                 ..JPC_SubShapeSettings::default()
             });
             child_shapes.push(shape);
@@ -222,10 +589,7 @@ impl NativeScene {
                 BodyMotion::Static => JPC_MOTION_TYPE_STATIC,
                 BodyMotion::Dynamic => JPC_MOTION_TYPE_DYNAMIC,
             },
-            MotionQuality: match spec.motion {
-                BodyMotion::Static => JPC_MOTION_QUALITY_DISCRETE,
-                BodyMotion::Dynamic => JPC_MOTION_QUALITY_LINEAR_CAST,
-            },
+            MotionQuality: JPC_MOTION_QUALITY_DISCRETE,
             AllowSleeping: spec.allow_sleeping,
             Friction: spec.friction,
             Restitution: spec.restitution,
@@ -233,6 +597,7 @@ impl NativeScene {
             MaxLinearVelocity: config.max_linear_velocity_mps,
             MaxAngularVelocity: config.max_angular_velocity_radians_per_second,
             Shape: compound.0,
+            UserData: body_user_data,
             ..JPC_BodyCreationSettings::default()
         };
         // A static body's stored velocities must be zero even if an input was
@@ -287,6 +652,15 @@ impl NativeScene {
     }
 
     pub(crate) fn step(&mut self, config: &SceneConfig) -> Result<(), PhysicsError> {
+        let mut contact_buffer = self.contact_listener_state.buffer.lock().map_err(|_| {
+            PhysicsError::Initialization("native contact buffer lock was poisoned".into())
+        })?;
+        contact_buffer.contacts.clear();
+        contact_buffer.overflowed = false;
+        drop(contact_buffer);
+        self.contact_listener_state
+            .failure_code
+            .store(0, Ordering::Release);
         let physics = self
             .physics
             .as_ref()
@@ -296,11 +670,11 @@ impl NativeScene {
         // fixed delta and substep count were validated by the safe layer.
         let error = unsafe {
             JPC_PhysicsSystem_Update(
-                physics.as_raw(),
+                physics.raw(),
                 config.fixed_delta_seconds,
                 config.collision_substeps,
                 self.temporary_allocator,
-                self.job_system,
+                self.job_system.cast::<joltc_sys::JPC_JobSystem>(),
             )
         };
         if error == JPC_PHYSICS_UPDATE_ERROR_NONE {
@@ -310,7 +684,67 @@ impl NativeScene {
         }
     }
 
-    pub(crate) fn body_states(&self) -> Vec<BodyState> {
+    pub(crate) fn take_contacts(&mut self) -> Result<Vec<ContactRecord>, PhysicsError> {
+        let mut buffer = self.contact_listener_state.buffer.lock().map_err(|_| {
+            PhysicsError::Initialization("native contact buffer lock was poisoned".into())
+        })?;
+        if let Some(failure) = self.contact_listener_state.failure() {
+            return Err(PhysicsError::ContactCallbackFailed(failure));
+        }
+        if buffer.overflowed {
+            return Err(PhysicsError::ContactOverflow);
+        }
+        let raw_contacts = buffer.contacts.drain(..).collect::<Vec<_>>();
+        let mut contacts = Vec::with_capacity(raw_contacts.len());
+        for raw in raw_contacts {
+            let Some(left) = buffer.bodies.get(raw.body1_index) else {
+                return Err(PhysicsError::ContactCallbackFailed(
+                    ContactInvariant::LeftBodyCatalogMissing,
+                ));
+            };
+            let Some(right) = buffer.bodies.get(raw.body2_index) else {
+                return Err(PhysicsError::ContactCallbackFailed(
+                    ContactInvariant::RightBodyCatalogMissing,
+                ));
+            };
+            let Some(left_collider) = left.collider_ids.get(raw.collider1_index) else {
+                return Err(PhysicsError::ContactCallbackFailed(
+                    ContactInvariant::LeftColliderCatalogMissing,
+                ));
+            };
+            let Some(right_collider) = right.collider_ids.get(raw.collider2_index) else {
+                return Err(PhysicsError::ContactCallbackFailed(
+                    ContactInvariant::RightColliderCatalogMissing,
+                ));
+            };
+            let mut left_body_id = left.body_id.clone();
+            let mut left_collider_id = left_collider.clone();
+            let mut right_body_id = right.body_id.clone();
+            let mut right_collider_id = right_collider.clone();
+            let mut normal = raw.normal;
+            if (&right_body_id, &right_collider_id) < (&left_body_id, &left_collider_id) {
+                std::mem::swap(&mut left_body_id, &mut right_body_id);
+                std::mem::swap(&mut left_collider_id, &mut right_collider_id);
+                normal = -normal;
+            }
+            contacts.push(ContactRecord {
+                body_a_id: left_body_id,
+                collider_a_id: left_collider_id,
+                body_b_id: right_body_id,
+                collider_b_id: right_collider_id,
+                normal,
+                point: raw.point,
+                penetration_m: raw.penetration_m,
+                impact_speed_mps: raw.impact_speed_mps,
+                estimated_normal_impulse_ns: raw.estimated_normal_impulse_ns,
+                phase: raw.phase,
+                source: ContactSource::JoltEstimatedResponse,
+            });
+        }
+        Ok(contacts)
+    }
+
+    pub(crate) fn body_states(&self, config: &SceneConfig) -> Result<Vec<BodyState>, PhysicsError> {
         let interface = self.body_interface();
         self.bodies
             .iter()
@@ -326,13 +760,15 @@ impl NativeScene {
                         JPC_BodyInterface_IsActive(interface, body.id),
                     )
                 };
-                BodyState {
-                    body_id: body_id.clone(),
-                    pose: Pose::new(from_world_vec3(position), from_quat(rotation)),
-                    linear_velocity: from_local_vec3(linear_velocity),
-                    angular_velocity: from_local_vec3(angular_velocity),
+                validated_body_state(
+                    body_id,
+                    from_world_vec3(position),
+                    from_quat(rotation),
+                    from_local_vec3(linear_velocity),
+                    from_local_vec3(angular_velocity),
                     active,
-                }
+                    config,
+                )
             })
             .collect()
     }
@@ -344,13 +780,40 @@ impl NativeScene {
             .expect("live native scene owns physics system");
         // SAFETY: `physics` is live and owns its body interface for its entire
         // lifetime. The returned pointer never escapes NativeScene methods.
-        unsafe { JPC_PhysicsSystem_GetBodyInterface(physics.as_raw()) }
+        unsafe { JPC_PhysicsSystem_GetBodyInterface(physics.raw()) }
     }
+}
+
+fn contact_record_budget(config: &SceneConfig) -> Result<usize, PhysicsError> {
+    usize::try_from(config.max_contact_constraints)
+        .ok()
+        .and_then(|constraints| {
+            usize::try_from(config.collision_substeps)
+                .ok()
+                .and_then(|substeps| constraints.checked_mul(substeps))
+        })
+        .ok_or_else(|| {
+            PhysicsError::InvalidConfiguration(
+                "contact callback budget overflows the platform address space".into(),
+            )
+        })
+}
+
+fn accumulate_estimated_normal_impulse(total: f64, value: f64) -> Option<f64> {
+    if !total.is_finite() || !value.is_finite() || value < 0.0 {
+        return None;
+    }
+    let next = total + value;
+    next.is_finite().then_some(next)
 }
 
 impl Drop for NativeScene {
     fn drop(&mut self) {
         if self.physics.is_some() {
+            let physics_raw = self
+                .physics
+                .as_ref()
+                .map_or(ptr::null_mut(), PhysicsSystem::raw);
             let interface = self.body_interface();
             for body in self.bodies.values() {
                 // SAFETY: Stored bodies were added exactly once and have not
@@ -361,10 +824,20 @@ impl Drop for NativeScene {
                 }
             }
             self.bodies.clear();
+            // SAFETY: No update is active. Detaching prevents PhysicsSystem
+            // destruction from retaining the separately owned listener.
+            unsafe {
+                JPC_PhysicsSystem_SetContactListener(physics_raw, ptr::null_mut());
+            }
         }
-        // Drop PhysicsSystem (and its callback bridges) before the allocators
-        // used by updates. No native body remains at this point.
+        // Drop PhysicsSystem before the callback and update allocators. No
+        // native body remains at this point.
         drop(self.physics.take());
+        if !self.contact_listener.is_null() {
+            // SAFETY: Listener is detached, owned, and released exactly once.
+            unsafe { JPC_ContactListener_delete(self.contact_listener) };
+            self.contact_listener = ptr::null_mut();
+        }
         if !self.job_system.is_null() {
             // SAFETY: Owned pointer, no update is in progress, released once.
             unsafe { JPC_JobSystemThreadPool_delete(self.job_system) };
@@ -408,7 +881,7 @@ fn create_box(
     index: usize,
 ) -> Result<ShapeRef, PhysicsError> {
     let settings = JPC_BoxShapeSettings {
-        UserData: u64::try_from(index).unwrap_or(u64::MAX),
+        UserData: u64::try_from(index + 1).unwrap_or(u64::MAX),
         Density: collider.density_kg_per_m3,
         HalfExtent: local_vec3(collider.half_extents),
         ConvexRadius: 0.0,
@@ -509,6 +982,139 @@ fn from_world_vec3(value: JPC_RVec3) -> Vec3 {
 
 fn from_quat(value: JPC_Quat) -> Quat {
     Quat::new(value.x, value.y, value.z, value.w)
-        .normalized()
-        .unwrap_or(Quat::IDENTITY)
+}
+
+fn validated_body_state(
+    body_id: &str,
+    position: Vec3,
+    rotation: Quat,
+    linear_velocity: Vec3,
+    angular_velocity: Vec3,
+    active: bool,
+    config: &SceneConfig,
+) -> Result<BodyState, PhysicsError> {
+    for (field, value) in [
+        ("position", position),
+        ("linear velocity", linear_velocity),
+        ("angular velocity", angular_velocity),
+    ] {
+        if !value.is_finite() {
+            return Err(PhysicsError::BodyStateInvalid {
+                body_id: body_id.into(),
+                field,
+            });
+        }
+    }
+    let rotation =
+        crate::validated_rotation(rotation).ok_or_else(|| PhysicsError::BodyStateInvalid {
+            body_id: body_id.into(),
+            field: "rotation",
+        })?;
+    if linear_velocity.length() > f64::from(config.max_linear_velocity_mps) {
+        return Err(PhysicsError::BodyStateInvalid {
+            body_id: body_id.into(),
+            field: "linear velocity bound",
+        });
+    }
+    if angular_velocity.length() > f64::from(config.max_angular_velocity_radians_per_second) {
+        return Err(PhysicsError::BodyStateInvalid {
+            body_id: body_id.into(),
+            field: "angular velocity bound",
+        });
+    }
+    Ok(BodyState {
+        body_id: body_id.into(),
+        pose: Pose::new(position, rotation),
+        linear_velocity,
+        angular_velocity,
+        active,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn callback_budget_covers_every_internal_collision_step() {
+        let config = SceneConfig {
+            collision_substeps: 2,
+            max_contact_constraints: 16_384,
+            ..SceneConfig::default()
+        };
+        assert_eq!(contact_record_budget(&config), Ok(32_768));
+    }
+
+    #[test]
+    fn estimated_impulse_conversion_rejects_corrupt_values() {
+        assert_eq!(accumulate_estimated_normal_impulse(2.0, 3.0), Some(5.0));
+        assert_eq!(accumulate_estimated_normal_impulse(2.0, -0.1), None);
+        assert_eq!(accumulate_estimated_normal_impulse(2.0, f64::NAN), None);
+        assert_eq!(
+            accumulate_estimated_normal_impulse(f64::MAX, f64::MAX),
+            None
+        );
+    }
+
+    #[test]
+    fn callback_failure_retains_the_first_named_invariant() {
+        let listener = NativeContactListener::new(4).expect("small callback buffer allocates");
+        listener.fail(ContactInvariant::InvalidNormal);
+        listener.fail(ContactInvariant::CallbackPanicked);
+        assert_eq!(listener.failure(), Some(ContactInvariant::InvalidNormal));
+    }
+
+    #[test]
+    fn body_state_extraction_rejects_corrupt_native_values() {
+        let non_finite = validated_body_state(
+            "grid",
+            Vec3::new(f64::NAN, 0.0, 0.0),
+            Quat::IDENTITY,
+            Vec3::ZERO,
+            Vec3::ZERO,
+            true,
+            &SceneConfig::default(),
+        );
+        assert!(matches!(
+            non_finite,
+            Err(PhysicsError::BodyStateInvalid {
+                field: "position",
+                ..
+            })
+        ));
+
+        let invalid_rotation = validated_body_state(
+            "grid",
+            Vec3::ZERO,
+            Quat::new(0.0, 0.0, 0.0, 0.0),
+            Vec3::ZERO,
+            Vec3::ZERO,
+            true,
+            &SceneConfig::default(),
+        );
+        assert!(matches!(
+            invalid_rotation,
+            Err(PhysicsError::BodyStateInvalid {
+                field: "rotation",
+                ..
+            })
+        ));
+
+        let over_speed = validated_body_state(
+            "grid",
+            Vec3::ZERO,
+            Quat::IDENTITY,
+            Vec3::new(1_001.0, 0.0, 0.0),
+            Vec3::ZERO,
+            true,
+            &SceneConfig::default(),
+        );
+        assert!(matches!(
+            over_speed,
+            Err(PhysicsError::BodyStateInvalid {
+                field: "linear velocity bound",
+                ..
+            })
+        ));
+    }
 }

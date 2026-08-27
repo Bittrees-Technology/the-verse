@@ -231,8 +231,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ad534f4357a5264cce5019c989cf66a4f0dc4e0d1b1d15f8aacec0ff7360273"
 dependencies = [
  "find-msvc-tools",
- "jobserver",
- "libc",
  "shlex 2.0.1",
 ]
 
@@ -507,9 +505,9 @@ dependencies = [
 
 [[package]]
 name = "glam"
-version = "0.27.0"
+version = "0.33.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9e05e7e6723e3455f4818c7b26e855439f7546cf617ef669d1adedb8669e5cb9"
+checksum = "c426daf70099baff33fac0ba85151c42424861c56828cef9ba02dacb78eb6b26"
 
 [[package]]
 name = "glob"
@@ -634,24 +632,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
-name = "jobserver"
-version = "0.1.35"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1c00acbd29eabad4a2392fa0e921c874934dbbf4194312ad20f04a0ed67a3cb3"
-dependencies = [
- "getrandom 0.4.3",
- "libc",
-]
-
-[[package]]
 name = "joltc-sys"
 version = "0.3.1+Jolt-5.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "846f2354e51c0a8214e687fc22a676e8cae894fd2ea647d3e5bb511583c4b297"
+source = "git+https://github.com/SecondHalfGames/jolt-rust?rev=72ac0cb1acc2037c72dc29865da6f52a5483dadc#72ac0cb1acc2037c72dc29865da6f52a5483dadc"
 dependencies = [
  "anyhow",
  "bindgen",
- "cc",
  "cmake",
  "walkdir",
 ]
@@ -1000,8 +986,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "rolt"
 version = "0.3.1+Jolt-5.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dd0675375c16f769f5c726fecd4ffea39f1ee4ebb46b9060d7dd6a58db5d3961"
+source = "git+https://github.com/SecondHalfGames/jolt-rust?rev=72ac0cb1acc2037c72dc29865da6f52a5483dadc#72ac0cb1acc2037c72dc29865da6f52a5483dadc"
 dependencies = [
  "glam",
  "joltc-sys",
@@ -1250,7 +1235,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",
@@ -1536,6 +1521,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-tungstenite",
  "tower",
  "tower-http",
  "tracing",

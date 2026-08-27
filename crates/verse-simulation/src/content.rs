@@ -32,13 +32,14 @@ pub struct BlockDefinition {
     pub power_requirement: f64,
     pub stored_power: f64,
     pub component_cost: u64,
-    pub mass_kg: f64,
+    pub mass_grams: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct PhysicsDefinition {
     pub fixed_step_hz: u16,
     pub fixed_delta_seconds: f32,
+    pub collision_substeps: i32,
     pub control_force_newtons: f64,
     pub control_torque_newton_meters: f64,
     pub linear_dampener_newtons_per_mps: f64,
@@ -71,13 +72,14 @@ pub fn manifest() -> &'static ContentManifest {
     MANIFEST.get_or_init(|| {
         let parsed: ContentManifest =
             serde_json::from_str(P0_CONTENT).expect("embedded P0 content must be valid JSON");
-        assert_eq!(parsed.schema_version, 3, "unsupported P0 content schema");
+        assert_eq!(parsed.schema_version, 4, "unsupported P0 content schema");
         assert_eq!(
             parsed.license, "AGPL-3.0-or-later",
             "content definition license must be explicit"
         );
         assert!(parsed.physics.fixed_delta_seconds > 0.0);
         assert_eq!(parsed.physics.fixed_step_hz, 60);
+        assert!((1..=16).contains(&parsed.physics.collision_substeps));
         assert!(parsed.physics.control_force_newtons > 0.0);
         assert!(parsed.physics.control_torque_newton_meters > 0.0);
         assert!((0.0..=1.0).contains(&parsed.physics.friction));
@@ -133,10 +135,7 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(block_kinds.len(), content.blocks.len());
         assert!(content.blocks.iter().all(|definition| {
-            definition.max_health > 0
-                && definition.component_cost > 0
-                && definition.mass_kg.is_finite()
-                && definition.mass_kg > 0.0
+            definition.max_health > 0 && definition.component_cost > 0 && definition.mass_grams > 0
         }));
         assert_eq!(
             content.recipes.component_crafting.refined_input,

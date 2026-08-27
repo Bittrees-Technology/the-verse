@@ -177,20 +177,33 @@ async fn websocket_session(socket: WebSocket, state: Arc<AppState>) {
     {
         return;
     }
+    let Some(client_name) = complete_handshake(&mut receiver, &mut sender).await else {
+        return;
+    };
+    let gameplay_session = client_name.starts_with("godot-native-");
+    if gameplay_session {
+        state.active_player_sessions.fetch_add(1, Ordering::Relaxed);
+    }
+    info!(%client_name, "client completed protocol handshake");
+
+    let mut updates = state.updates.subscribe();
+    let initial_snapshot = state.snapshot();
+    let mut last_sent_event_sequence = initial_snapshot.event_sequence;
     if send_server_message(
         &mut sender,
         &ServerMessage::Snapshot {
-            snapshot: Box::new(state.snapshot()),
+            snapshot: Box::new(initial_snapshot),
         },
     )
     .await
     .is_err()
     {
+        if gameplay_session {
+            state.active_player_sessions.fetch_sub(1, Ordering::Relaxed);
+        }
         return;
     }
 
-    let mut updates = state.updates.subscribe();
-    let mut gameplay_session = false;
     loop {
         tokio::select! {
             client_message = receiver.next() => {
@@ -200,7 +213,7 @@ async fn websocket_session(socket: WebSocket, state: Arc<AppState>) {
                             message,
                             &state,
                             &mut sender,
-                            &mut gameplay_session,
+                            &mut last_sent_event_sequence,
                         ).await {
                             break;
                         }
@@ -215,16 +228,24 @@ async fn websocket_session(socket: WebSocket, state: Arc<AppState>) {
             update = updates.recv() => {
                 match update {
                     Ok(message) => {
+                        if let ServerMessage::Snapshot { snapshot } = &message {
+                            if snapshot.event_sequence <= last_sent_event_sequence {
+                                continue;
+                            }
+                            last_sent_event_sequence = snapshot.event_sequence;
+                        }
                         if send_server_message(&mut sender, &message).await.is_err() {
                             break;
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         warn!(skipped, "client lagged; sending a complete snapshot");
+                        let snapshot = state.snapshot();
+                        last_sent_event_sequence = snapshot.event_sequence;
                         if send_server_message(
                             &mut sender,
                             &ServerMessage::Snapshot {
-                                snapshot: Box::new(state.snapshot()),
+                                snapshot: Box::new(snapshot),
                             },
                         ).await.is_err() {
                             break;
@@ -240,11 +261,77 @@ async fn websocket_session(socket: WebSocket, state: Arc<AppState>) {
     }
 }
 
+async fn complete_handshake(
+    receiver: &mut futures_util::stream::SplitStream<WebSocket>,
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+) -> Option<String> {
+    loop {
+        let message = match receiver.next().await {
+            Some(Ok(message)) => message,
+            Some(Err(source)) => {
+                warn!(%source, "websocket handshake receive failed");
+                return None;
+            }
+            None => return None,
+        };
+        match message {
+            Message::Text(text) => match serde_json::from_str::<ClientMessage>(&text) {
+                Ok(ClientMessage::Hello {
+                    protocol_version,
+                    client_name,
+                }) if protocol_version == PROTOCOL_VERSION => return Some(client_name),
+                Ok(ClientMessage::Hello {
+                    protocol_version, ..
+                }) => {
+                    send_fatal_and_close(
+                        sender,
+                        "protocol_version_mismatch",
+                        format!(
+                            "server requires protocol {PROTOCOL_VERSION}, client sent {protocol_version}"
+                        ),
+                    )
+                    .await;
+                    return None;
+                }
+                Ok(_) => {
+                    send_fatal_and_close(
+                        sender,
+                        "protocol_handshake_required",
+                        "send a compatible hello before requesting state or submitting intents",
+                    )
+                    .await;
+                    return None;
+                }
+                Err(source) => {
+                    send_fatal_and_close(sender, "invalid_handshake", source.to_string()).await;
+                    return None;
+                }
+            },
+            Message::Ping(payload) => {
+                if sender.send(Message::Pong(payload)).await.is_err() {
+                    return None;
+                }
+            }
+            Message::Pong(_) => {}
+            Message::Close(_) => return None,
+            Message::Binary(_) => {
+                send_fatal_and_close(
+                    sender,
+                    "invalid_handshake",
+                    "the protocol handshake must be a JSON text message",
+                )
+                .await;
+                return None;
+            }
+        }
+    }
+}
+
 async fn handle_client_message(
     message: Message,
     state: &Arc<AppState>,
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
-    gameplay_session: &mut bool,
+    last_sent_event_sequence: &mut u64,
 ) -> bool {
     let Message::Text(text) = message else {
         return !matches!(message, Message::Close(_));
@@ -266,38 +353,27 @@ async fn handle_client_message(
     };
 
     match parsed {
-        ClientMessage::Hello {
-            protocol_version,
-            client_name,
-        } => {
-            if protocol_version != PROTOCOL_VERSION {
-                return send_server_message(
-                    sender,
-                    &ServerMessage::Fatal {
-                        code: "protocol_version_mismatch".into(),
-                        message: format!(
-                            "server requires protocol {PROTOCOL_VERSION}, client sent {protocol_version}"
-                        ),
-                    },
-                )
-                .await
-                .is_ok();
-            }
-            if client_name.starts_with("godot-native-") && !*gameplay_session {
-                *gameplay_session = true;
-                state.active_player_sessions.fetch_add(1, Ordering::Relaxed);
-            }
-            info!(%client_name, "client completed protocol handshake");
-            true
+        ClientMessage::Hello { .. } => {
+            send_fatal_and_close(
+                sender,
+                "protocol_handshake_already_complete",
+                "a connection may complete the protocol handshake only once",
+            )
+            .await;
+            false
         }
-        ClientMessage::RequestSnapshot => send_server_message(
-            sender,
-            &ServerMessage::Snapshot {
-                snapshot: Box::new(state.snapshot()),
-            },
-        )
-        .await
-        .is_ok(),
+        ClientMessage::RequestSnapshot => {
+            let snapshot = state.snapshot();
+            *last_sent_event_sequence = snapshot.event_sequence;
+            send_server_message(
+                sender,
+                &ServerMessage::Snapshot {
+                    snapshot: Box::new(snapshot),
+                },
+            )
+            .await
+            .is_ok()
+        }
         intent => {
             let result = state.runtime.lock().execute(&intent);
             match result {
@@ -318,37 +394,33 @@ async fn handle_client_message(
                 }
                 Err(RuntimeError::Persistence(source)) => {
                     error!(%source, "persistence failure while processing intent");
-                    send_server_message(
+                    send_fatal_and_close(
                         sender,
-                        &ServerMessage::Fatal {
-                            code: "persistence_failure".into(),
-                            message: "authoritative persistence failed; writes are stopped".into(),
-                        },
+                        "persistence_failure",
+                        "authoritative persistence failed; writes are stopped",
                     )
-                    .await
-                    .is_ok()
+                    .await;
+                    false
                 }
                 Err(RuntimeError::Physics(source)) => {
                     error!(%source, "physics failure while processing intent");
-                    send_server_message(
+                    send_fatal_and_close(
                         sender,
-                        &ServerMessage::Fatal {
-                            code: "physics_failure".into(),
-                            message: "authoritative physics rejected the operation".into(),
-                        },
+                        "physics_failure",
+                        "authoritative physics rejected the operation",
                     )
-                    .await
-                    .is_ok()
+                    .await;
+                    false
                 }
-                Err(RuntimeError::Halted) => send_server_message(
-                    sender,
-                    &ServerMessage::Fatal {
-                        code: "authoritative_writes_halted".into(),
-                        message: "the universe is in fail-closed recovery mode".into(),
-                    },
-                )
-                .await
-                .is_ok(),
+                Err(RuntimeError::Halted) => {
+                    send_fatal_and_close(
+                        sender,
+                        "authoritative_writes_halted",
+                        "the universe is in fail-closed recovery mode",
+                    )
+                    .await;
+                    false
+                }
             }
         }
     }
@@ -380,6 +452,22 @@ async fn send_server_message(
     sender.send(Message::Text(text.into())).await
 }
 
+async fn send_fatal_and_close(
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    code: &str,
+    message: impl Into<String>,
+) {
+    let _ = send_server_message(
+        sender,
+        &ServerMessage::Fatal {
+            code: code.into(),
+            message: message.into(),
+        },
+    )
+    .await;
+    let _ = sender.send(Message::Close(None)).await;
+}
+
 pub fn internal_error(source: impl std::fmt::Display) -> impl IntoResponse {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -389,17 +477,154 @@ pub fn internal_error(source: impl std::fmt::Display) -> impl IntoResponse {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use axum::body::{Body, to_bytes};
+    use futures_util::{SinkExt as _, StreamExt as _};
     use http::Request;
     use tempfile::tempdir;
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::tungstenite::Message as ClientWebSocketMessage;
+    use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
     use tower::ServiceExt;
 
     use super::*;
 
     fn test_app() -> Router {
+        router(test_state())
+    }
+
+    fn test_state() -> Arc<AppState> {
         let directory = tempdir().expect("tempdir").keep();
-        let runtime = Runtime::open(directory, 99, 20).expect("runtime");
-        router(AppState::new(runtime))
+        AppState::new(Runtime::open(directory, 99, 20).expect("runtime"))
+    }
+
+    type TestSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+
+    async fn connect_test_socket() -> (TestSocket, Arc<AppState>, tokio::task::JoinHandle<()>) {
+        let state = test_state();
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener binds");
+        let address = listener.local_addr().expect("listener has address");
+        let server_state = state.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router(server_state))
+                .await
+                .expect("test server runs");
+        });
+        let (socket, _) = connect_async(format!("ws://{address}/ws"))
+            .await
+            .expect("test websocket connects");
+        (socket, state, server)
+    }
+
+    async fn receive_server_message(socket: &mut TestSocket) -> ServerMessage {
+        loop {
+            let message = tokio::time::timeout(Duration::from_secs(2), socket.next())
+                .await
+                .expect("server message arrives before timeout")
+                .expect("websocket remains open")
+                .expect("websocket message is valid");
+            if let ClientWebSocketMessage::Text(text) = message {
+                return serde_json::from_str(&text).expect("server message is valid protocol JSON");
+            }
+        }
+    }
+
+    async fn send_client_message(socket: &mut TestSocket, message: &ClientMessage) {
+        socket
+            .send(ClientWebSocketMessage::Text(
+                serde_json::to_string(message)
+                    .expect("client message serializes")
+                    .into(),
+            ))
+            .await
+            .expect("client message sends");
+    }
+
+    async fn assert_socket_closes(socket: &mut TestSocket) {
+        let next = tokio::time::timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("server closes incompatible connection promptly");
+        assert!(matches!(
+            next,
+            None | Some(Ok(ClientWebSocketMessage::Close(_)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn websocket_requires_hello_before_snapshot_or_mutation() {
+        let (mut socket, state, server) = connect_test_socket().await;
+        assert!(matches!(
+            receive_server_message(&mut socket).await,
+            ServerMessage::Welcome { .. }
+        ));
+        send_client_message(
+            &mut socket,
+            &ClientMessage::MovePlayer {
+                operation_id: "pre-handshake-mutation".into(),
+                position: verse_protocol::Vec3::new(12.1, 4.5, 10.0),
+            },
+        )
+        .await;
+        assert!(matches!(
+            receive_server_message(&mut socket).await,
+            ServerMessage::Fatal { ref code, .. } if code == "protocol_handshake_required"
+        ));
+        assert_eq!(state.snapshot().event_sequence, 0);
+        assert_socket_closes(&mut socket).await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn websocket_rejects_and_closes_an_incompatible_protocol() {
+        let (mut socket, state, server) = connect_test_socket().await;
+        assert!(matches!(
+            receive_server_message(&mut socket).await,
+            ServerMessage::Welcome { .. }
+        ));
+        send_client_message(
+            &mut socket,
+            &ClientMessage::Hello {
+                protocol_version: PROTOCOL_VERSION - 1,
+                client_name: "obsolete-client".into(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            receive_server_message(&mut socket).await,
+            ServerMessage::Fatal { ref code, .. } if code == "protocol_version_mismatch"
+        ));
+        assert_eq!(state.snapshot().event_sequence, 0);
+        assert_socket_closes(&mut socket).await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn websocket_sends_snapshot_only_after_a_compatible_hello() {
+        let (mut socket, _state, server) = connect_test_socket().await;
+        assert!(matches!(
+            receive_server_message(&mut socket).await,
+            ServerMessage::Welcome {
+                protocol_version: PROTOCOL_VERSION,
+                ..
+            }
+        ));
+        send_client_message(
+            &mut socket,
+            &ClientMessage::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                client_name: "compatible-test-client".into(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            receive_server_message(&mut socket).await,
+            ServerMessage::Snapshot { .. }
+        ));
+        socket.close(None).await.expect("test socket closes");
+        server.abort();
     }
 
     #[tokio::test]

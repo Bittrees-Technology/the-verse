@@ -2,13 +2,11 @@
 
 //! Domain-neutral, safe adapter around the pinned Jolt Physics bindings.
 //!
-//! Jolt performs motion integration and collision response. The current pinned
-//! `JoltC` API does not expose solved contact manifolds, so contact telemetry is
-//! conservatively reconstructed from the same compound box geometry. Callers
-//! must treat [`ContactRecord::impact_speed_mps`] as a bounded gameplay input,
-//! not as a solver impulse.
+//! Jolt performs motion integration and collision response. Its native contact
+//! listener supplies authoritative manifold identity and ordered pre-solver
+//! telemetry. Jolt's estimated response is not an applied solver impulse and
+//! must not drive collision damage.
 
-mod contact;
 mod ffi;
 mod math;
 
@@ -16,6 +14,13 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub use math::{Pose, Quat, Vec3};
 use thiserror::Error;
+
+const MAX_NATIVE_BODIES: u32 = 262_144;
+const MAX_NATIVE_BODY_PAIRS: u32 = 1_048_576;
+const MAX_NATIVE_CONTACT_CONSTRAINTS: u32 = 262_144;
+const MAX_NATIVE_CONTACT_RECORDS: u64 = 1_048_576;
+const MAX_TEMPORARY_ALLOCATOR_BYTES: u32 = 1024 * 1024 * 1024;
+const MAX_COLLIDERS_PER_BODY: usize = 262_144;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BodyMotion {
@@ -114,9 +119,80 @@ pub struct BodyState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContactSource {
-    /// Approximate compound-box telemetry because `JoltC` 0.3.1 does not expose
-    /// Jolt's contact listener or solved manifolds.
-    GeometricFallback,
+    /// Jolt 5.1+ manifold plus `EstimateCollisionResponse`, captured inside the
+    /// pre-solver contact callback.
+    JoltEstimatedResponse,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContactPhase {
+    Began,
+    Persisted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ContactInvariant {
+    Unknown = 0,
+    NullCallbackInput = 1,
+    MissingBodyIdentity = 2,
+    MissingColliderIdentity = 3,
+    IdentityIndexOverflow = 4,
+    ContactCountOverflow = 5,
+    ContactCountMismatch = 6,
+    NonFiniteBaseOffset = 7,
+    NonFiniteContactPoint = 8,
+    InvalidNormal = 9,
+    NonFinitePointVelocity = 10,
+    NonFiniteMaterialResponse = 11,
+    ImpulseCountOverflow = 12,
+    ImpulseCountCapacityExceeded = 13,
+    InvalidEstimatedImpulse = 14,
+    EstimatedImpulseSumInvalid = 15,
+    BufferLockPoisoned = 16,
+    CatalogIdentityMissing = 17,
+    CallbackPanicked = 18,
+    LeftBodyCatalogMissing = 19,
+    RightBodyCatalogMissing = 20,
+    LeftColliderCatalogMissing = 21,
+    RightColliderCatalogMissing = 22,
+    NonFinitePenetration = 23,
+    ImpulseContactCountMismatch = 24,
+    NonFiniteClosingSpeed = 25,
+}
+
+impl ContactInvariant {
+    pub const fn from_code(code: u8) -> Option<Self> {
+        Some(match code {
+            0 => Self::Unknown,
+            1 => Self::NullCallbackInput,
+            2 => Self::MissingBodyIdentity,
+            3 => Self::MissingColliderIdentity,
+            4 => Self::IdentityIndexOverflow,
+            5 => Self::ContactCountOverflow,
+            6 => Self::ContactCountMismatch,
+            7 => Self::NonFiniteBaseOffset,
+            8 => Self::NonFiniteContactPoint,
+            9 => Self::InvalidNormal,
+            10 => Self::NonFinitePointVelocity,
+            11 => Self::NonFiniteMaterialResponse,
+            12 => Self::ImpulseCountOverflow,
+            13 => Self::ImpulseCountCapacityExceeded,
+            14 => Self::InvalidEstimatedImpulse,
+            15 => Self::EstimatedImpulseSumInvalid,
+            16 => Self::BufferLockPoisoned,
+            17 => Self::CatalogIdentityMissing,
+            18 => Self::CallbackPanicked,
+            19 => Self::LeftBodyCatalogMissing,
+            20 => Self::RightBodyCatalogMissing,
+            21 => Self::LeftColliderCatalogMissing,
+            22 => Self::RightColliderCatalogMissing,
+            23 => Self::NonFinitePenetration,
+            24 => Self::ImpulseContactCountMismatch,
+            25 => Self::NonFiniteClosingSpeed,
+            _ => return None,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -129,8 +205,11 @@ pub struct ContactRecord {
     pub normal: Vec3,
     pub point: Vec3,
     pub penetration_m: f64,
-    /// Closing speed at the approximate contact point before the step.
+    /// Closing speed at the manifold contact point before the solver step.
     pub impact_speed_mps: f64,
+    /// Sum of Jolt's pre-solver estimated normal impulses for the manifold in N s.
+    pub estimated_normal_impulse_ns: f64,
+    pub phase: ContactPhase,
     pub source: ContactSource,
 }
 
@@ -208,12 +287,24 @@ pub enum PhysicsError {
     BodyCreation(String),
     #[error("Jolt update failed with error mask {0:#x}")]
     Update(u32),
+    #[error("Jolt emitted invalid {field} for body {body_id}")]
+    BodyStateInvalid {
+        body_id: String,
+        field: &'static str,
+    },
+    #[error("Jolt emitted more contacts than the configured authoritative budget")]
+    ContactOverflow,
+    #[error("Jolt contact callback failed invariant {0:?} during the authoritative update")]
+    ContactCallbackFailed(ContactInvariant),
+    #[error("the native scene must be rebuilt after a failed authoritative update")]
+    SceneRequiresRebuild,
 }
 
 pub struct Scene {
     config: SceneConfig,
     specs: BTreeMap<String, BodySpec>,
     native: ffi::NativeScene,
+    requires_rebuild: bool,
 }
 
 impl std::fmt::Debug for Scene {
@@ -234,6 +325,7 @@ impl Scene {
             config,
             specs: BTreeMap::new(),
             native,
+            requires_rebuild: false,
         })
     }
 
@@ -244,17 +336,23 @@ impl Scene {
         let native = ffi::NativeScene::build(&self.config, specs.values())?;
         self.native = native;
         self.specs = specs;
+        self.requires_rebuild = false;
         Ok(())
     }
 
     /// Applies bounded controls and advances exactly one configured fixed step.
     pub fn step(&mut self, controls: &[BodyControl]) -> Result<StepOutput, PhysicsError> {
+        if self.requires_rebuild {
+            return Err(PhysicsError::SceneRequiresRebuild);
+        }
         validate_controls(&self.config, &self.specs, controls)?;
-        let before = self.native.body_states();
         self.native.apply_controls(controls);
-        self.native.step(&self.config)?;
-        let bodies = self.native.body_states();
-        let contacts = contact::contacts_for_step(&self.specs, &before, &bodies);
+        let update = self.native.step(&self.config);
+        self.require_native_success(update)?;
+        let extraction = self.native.body_states(&self.config);
+        let bodies = self.require_native_success(extraction)?;
+        let extraction = self.native.take_contacts();
+        let contacts = aggregate_contacts(self.require_native_success(extraction)?);
         Ok(StepOutput {
             fixed_delta_seconds: self.config.fixed_delta_seconds,
             bodies,
@@ -262,12 +360,73 @@ impl Scene {
         })
     }
 
-    pub fn body_states(&self) -> Vec<BodyState> {
-        self.native.body_states()
+    pub fn body_states(&mut self) -> Result<Vec<BodyState>, PhysicsError> {
+        if self.requires_rebuild {
+            return Err(PhysicsError::SceneRequiresRebuild);
+        }
+        let extraction = self.native.body_states(&self.config);
+        self.require_native_success(extraction)
     }
 
     pub fn body_count(&self) -> usize {
         self.specs.len()
+    }
+
+    fn require_native_success<T>(
+        &mut self,
+        result: Result<T, PhysicsError>,
+    ) -> Result<T, PhysicsError> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(source) => {
+                self.requires_rebuild = true;
+                Err(source)
+            }
+        }
+    }
+}
+
+fn aggregate_contacts(contacts: Vec<ContactRecord>) -> Vec<ContactRecord> {
+    let mut aggregate = BTreeMap::new();
+    for contact in contacts {
+        let key = (
+            contact.body_a_id.clone(),
+            contact.collider_a_id.clone(),
+            contact.body_b_id.clone(),
+            contact.collider_b_id.clone(),
+        );
+        match aggregate.entry(key) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(contact);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                if contact_preference(&contact, entry.get()).is_gt() {
+                    entry.insert(contact);
+                }
+            }
+        }
+    }
+    aggregate.into_values().collect()
+}
+
+fn contact_preference(left: &ContactRecord, right: &ContactRecord) -> std::cmp::Ordering {
+    left.estimated_normal_impulse_ns
+        .total_cmp(&right.estimated_normal_impulse_ns)
+        .then_with(|| left.impact_speed_mps.total_cmp(&right.impact_speed_mps))
+        .then_with(|| left.penetration_m.total_cmp(&right.penetration_m))
+        .then_with(|| contact_phase_rank(left.phase).cmp(&contact_phase_rank(right.phase)))
+        .then_with(|| left.point.x.total_cmp(&right.point.x))
+        .then_with(|| left.point.y.total_cmp(&right.point.y))
+        .then_with(|| left.point.z.total_cmp(&right.point.z))
+        .then_with(|| left.normal.x.total_cmp(&right.normal.x))
+        .then_with(|| left.normal.y.total_cmp(&right.normal.y))
+        .then_with(|| left.normal.z.total_cmp(&right.normal.z))
+}
+
+const fn contact_phase_rank(phase: ContactPhase) -> u8 {
+    match phase {
+        ContactPhase::Persisted => 0,
+        ContactPhase::Began => 1,
     }
 }
 
@@ -293,6 +452,22 @@ fn validate_config(config: &SceneConfig) -> Result<(), PhysicsError> {
     {
         return Err(PhysicsError::InvalidConfiguration(
             "body, pair, contact, collider, and allocator budgets must be positive".into(),
+        ));
+    }
+    let collision_substeps = u64::try_from(config.collision_substeps).map_err(|_| {
+        PhysicsError::InvalidConfiguration("collision substeps must be positive".into())
+    })?;
+    let contact_records = u64::from(config.max_contact_constraints) * collision_substeps;
+    if config.max_bodies > MAX_NATIVE_BODIES
+        || config.max_body_pairs > MAX_NATIVE_BODY_PAIRS
+        || config.max_contact_constraints > MAX_NATIVE_CONTACT_CONSTRAINTS
+        || contact_records > MAX_NATIVE_CONTACT_RECORDS
+        || config.temporary_allocator_bytes > MAX_TEMPORARY_ALLOCATOR_BYTES
+        || config.max_colliders_per_body > MAX_COLLIDERS_PER_BODY
+    {
+        return Err(PhysicsError::InvalidConfiguration(
+            "native body, pair, contact, collider, or allocator budget exceeds the practical authority limit"
+                .into(),
         ));
     }
     for (label, value) in [
@@ -478,4 +653,96 @@ fn validate_controls(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn contact(estimated_impulse: f64, speed: f64, penetration: f64, point: Vec3) -> ContactRecord {
+        ContactRecord {
+            body_a_id: "body-a".into(),
+            collider_a_id: "collider-a".into(),
+            body_b_id: "body-b".into(),
+            collider_b_id: "collider-b".into(),
+            normal: Vec3::new(1.0, 0.0, 0.0),
+            point,
+            penetration_m: penetration,
+            impact_speed_mps: speed,
+            estimated_normal_impulse_ns: estimated_impulse,
+            phase: ContactPhase::Began,
+            source: ContactSource::JoltEstimatedResponse,
+        }
+    }
+
+    #[test]
+    fn contact_aggregation_selects_one_whole_deterministic_record() {
+        let high_speed = contact(2.0, 9.0, 0.8, Vec3::new(1.0, 2.0, 3.0));
+        let high_estimate = contact(7.0, 1.0, 0.1, Vec3::new(4.0, 5.0, 6.0));
+        let first = aggregate_contacts(vec![high_speed.clone(), high_estimate.clone()]);
+        let reversed = aggregate_contacts(vec![high_estimate.clone(), high_speed]);
+        assert_eq!(first, vec![high_estimate.clone()]);
+        assert_eq!(reversed, vec![high_estimate]);
+    }
+
+    #[test]
+    fn contact_aggregation_breaks_equal_estimate_ties_without_arrival_order() {
+        let left = contact(3.0, 2.0, 0.2, Vec3::new(1.0, 0.0, 0.0));
+        let right = contact(3.0, 2.0, 0.2, Vec3::new(2.0, 0.0, 0.0));
+        assert_eq!(
+            aggregate_contacts(vec![left.clone(), right.clone()]),
+            aggregate_contacts(vec![right, left])
+        );
+    }
+
+    #[test]
+    fn post_update_failure_requires_rebuild_before_another_step() {
+        let mut scene = Scene::new(SceneConfig::default()).expect("scene initializes");
+        let body = BodySpec::dynamic(
+            "grid",
+            Pose::IDENTITY,
+            vec![BoxColliderSpec::unit_cube("block")],
+        );
+        scene
+            .rebuild(std::slice::from_ref(&body))
+            .expect("scene builds");
+        assert_eq!(
+            scene.require_native_success::<()>(Err(PhysicsError::ContactOverflow)),
+            Err(PhysicsError::ContactOverflow)
+        );
+        assert_eq!(scene.step(&[]), Err(PhysicsError::SceneRequiresRebuild));
+        scene.rebuild(&[body]).expect("explicit rebuild succeeds");
+        assert!(scene.step(&[]).is_ok());
+    }
+
+    #[test]
+    fn practical_native_budget_limits_reject_unbounded_allocations() {
+        let too_many_bodies = SceneConfig {
+            max_bodies: MAX_NATIVE_BODIES + 1,
+            ..SceneConfig::default()
+        };
+        assert!(matches!(
+            validate_config(&too_many_bodies),
+            Err(PhysicsError::InvalidConfiguration(_))
+        ));
+
+        let too_many_contact_records = SceneConfig {
+            collision_substeps: 16,
+            max_contact_constraints: MAX_NATIVE_CONTACT_RECORDS as u32 / 16 + 1,
+            ..SceneConfig::default()
+        };
+        assert!(matches!(
+            validate_config(&too_many_contact_records),
+            Err(PhysicsError::InvalidConfiguration(_))
+        ));
+
+        let too_large_allocator = SceneConfig {
+            temporary_allocator_bytes: MAX_TEMPORARY_ALLOCATOR_BYTES + 1,
+            ..SceneConfig::default()
+        };
+        assert!(matches!(
+            validate_config(&too_large_allocator),
+            Err(PhysicsError::InvalidConfiguration(_))
+        ));
+    }
 }

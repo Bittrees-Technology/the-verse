@@ -4,19 +4,19 @@
 Its public API contains no Jolt handles and accepts only validated body,
 collider, control, and scene descriptions.
 
-The adapter pins `rolt` and `joltc-sys` `0.3.1+Jolt-5.0.0` with double-precision
-world coordinates. Jolt owns integration and collision response. The pinned
-JoltC surface does not expose Jolt's contact listener or solved manifolds, so
-this checkpoint reconstructs sorted contact telemetry from the same compound
-box geometry before and after each fixed step. The records provide stable body
-and collider IDs, an approximate point and normal, penetration/proximity, and
-closing speed. They are suitable for testing and conservative impact inputs,
-but are not solver impulses. A future binding upgrade must replace this
-fallback before impulse-derived production damage is enabled.
+The adapter pins `rolt` and `joltc-sys` git revision
+`72ac0cb1acc2037c72dc29865da6f52a5483dadc` with double-precision world
+coordinates and embedded Jolt Physics 5.3 source. Jolt owns integration and
+collision response. A native contact listener captures Jolt manifolds, stable
+leaf-collider identity, onset/persistence, contact points, closing speed, and
+`EstimateCollisionResponse` normal impulse estimates.
 
-The fallback first rejects non-overlapping collider pairs with conservative
-swept world bounds, including translation and intermediate rotation. The
-focused 2,048-collider probe remains available with:
+The estimate is pre-solver and pairwise. It is not the final applied solver
+impulse, may diverge during multi-body contact, and is therefore telemetry—not
+production collision-damage evidence. Dynamic bodies use bounded discrete
+motion in this checkpoint so discarded LinearCast CCD candidates cannot become
+canonical contact telemetry. The focused 2,048-collider probe remains
+available with:
 
 ```console
 cargo test -p verse-physics --test compound_grid_benchmark -- --ignored --nocapture
@@ -32,7 +32,17 @@ All project-owned unsafe operations are isolated in `src/ffi.rs`. The adapter:
   and retained shape for their complete native lifetimes;
 - releases bodies before their system and releases the system before its
   allocators;
-- keeps callback implementations owned by `rolt::PhysicsSystem`;
+- uses raw JoltC callbacks that read only initialized manifold entries instead
+  of forming a Rust reference to fixed native tail storage;
+- writes only numeric records into a preallocated contact buffer sized for
+  every configured internal collision substep, resolves strings after the
+  update, and fails the step closed on overflow or any native invariant breach;
+- chooses one complete manifold record per collider pair with a total
+  deterministic ordering rather than combining fields from different native
+  callbacks;
+- marks a scene as requiring an explicit rebuild after an update or contact
+  extraction error, preventing reuse of partially advanced native state;
+- detaches and releases the callback after the physics system stops using it;
 - permits a scene to move between threads but requires exclusive mutable access
   for rebuild and step operations; and
 - does not implement `Sync` or expose native pointers.

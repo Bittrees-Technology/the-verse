@@ -10,7 +10,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::content;
-use crate::event::CanonicalEvent;
+use crate::event::{CanonicalEvent, EVENT_SCHEMA_NAME, EVENT_SCHEMA_VERSION};
 use crate::model::{WORLD_SCHEMA_VERSION, WorldState};
 
 const MANIFEST_FILE: &str = "universe-manifest.json";
@@ -44,6 +44,16 @@ pub enum PersistenceError {
     SnapshotHashMismatch,
     #[error("journal line {line} is corrupt: {message}")]
     CorruptJournal { line: usize, message: String },
+    #[error(
+        "journal line {line} uses event schema {found_name} v{found_version}; expected {expected_name} v{expected_version}"
+    )]
+    EventSchema {
+        line: usize,
+        found_name: String,
+        found_version: u32,
+        expected_name: &'static str,
+        expected_version: u32,
+    },
     #[error("writer fencing token changed from {expected} to {found}")]
     FencingTokenChanged { expected: u64, found: u64 },
     #[error("journal replay rejected event {event_sequence}: {message}")]
@@ -68,6 +78,18 @@ struct SnapshotDocument {
     event_sequence: u64,
     last_event_hash: String,
     state: WorldState,
+}
+
+#[derive(Debug, Deserialize)]
+struct SnapshotHeader {
+    schema_version: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct EventHeader {
+    schema_name: String,
+    schema_version: u32,
+    event_sequence: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,13 +193,14 @@ impl Store {
     pub fn load_world(&mut self) -> Result<WorldState, PersistenceError> {
         let snapshot_path = self.root.join(SNAPSHOT_FILE);
         let mut state = if snapshot_path.exists() {
-            let snapshot: SnapshotDocument = read_json(&snapshot_path)?;
-            if snapshot.schema_version != WORLD_SCHEMA_VERSION {
+            let header: SnapshotHeader = read_json(&snapshot_path)?;
+            if header.schema_version != WORLD_SCHEMA_VERSION {
                 return Err(PersistenceError::SnapshotSchema {
-                    found: snapshot.schema_version,
+                    found: header.schema_version,
                     expected: WORLD_SCHEMA_VERSION,
                 });
             }
+            let snapshot: SnapshotDocument = read_json(&snapshot_path)?;
             if snapshot.state_hash != snapshot.state.state_hash()
                 || snapshot.event_sequence != snapshot.state.event_sequence
                 || snapshot.last_event_hash != snapshot.state.last_event_hash
@@ -226,14 +249,30 @@ impl Store {
             if line.trim().is_empty() {
                 continue;
             }
+            let header: EventHeader =
+                serde_json::from_str(line).map_err(|source| PersistenceError::CorruptJournal {
+                    line: index + 1,
+                    message: source.to_string(),
+                })?;
+            if header.event_sequence <= state.event_sequence {
+                continue;
+            }
+            if header.schema_name != EVENT_SCHEMA_NAME
+                || header.schema_version != EVENT_SCHEMA_VERSION
+            {
+                return Err(PersistenceError::EventSchema {
+                    line: index + 1,
+                    found_name: header.schema_name,
+                    found_version: header.schema_version,
+                    expected_name: EVENT_SCHEMA_NAME,
+                    expected_version: EVENT_SCHEMA_VERSION,
+                });
+            }
             let event: CanonicalEvent =
                 serde_json::from_str(line).map_err(|source| PersistenceError::CorruptJournal {
                     line: index + 1,
                     message: source.to_string(),
                 })?;
-            if event.event_sequence <= state.event_sequence {
-                continue;
-            }
             state
                 .apply_event(&event)
                 .map_err(|source| PersistenceError::Replay {
@@ -389,6 +428,8 @@ mod tests {
 
     use super::*;
     use crate::Runtime;
+    use crate::event::EventPayload;
+    use crate::model::{STARTER_GRID_ID, WorldState};
 
     #[test]
     fn second_writer_is_rejected_and_fencing_token_advances() {
@@ -491,8 +532,173 @@ mod tests {
         assert_eq!(block.orientation, 2);
         assert_eq!(block.health, 50);
         assert_eq!(block.max_health(), 100);
+        assert!(!block.construction_complete);
         assert_eq!(recovered.state().state_hash(), expected_hash);
         assert!(recovered.state().conservation().valid);
+    }
+
+    #[test]
+    fn completed_construction_and_career_recover_from_journal_and_snapshot() {
+        let directory = tempdir().expect("tempdir");
+        let expected_hash;
+        {
+            let mut runtime = Runtime::open(directory.path(), 30, 100).expect("runtime starts");
+            for (index, position) in [
+                Vec3::new(11.0, 3.5, 7.5),
+                Vec3::new(10.5, 2.5, 5.0),
+                Vec3::new(10.0, 1.0, 3.0),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                runtime
+                    .execute(&ClientMessage::MovePlayer {
+                        operation_id: format!("completed-recovery-move-{index}"),
+                        position,
+                    })
+                    .expect("player approaches construction range");
+            }
+            runtime
+                .execute(&ClientMessage::BuildBlock {
+                    operation_id: "completed-recovery-frame".into(),
+                    grid_id: STARTER_GRID_ID.into(),
+                    coordinate: IVec3::new(0, 1, 0),
+                    kind: BlockKind::Structural,
+                    orientation: 3,
+                })
+                .expect("construction frame placed");
+            let block_id = runtime.state().grids[STARTER_GRID_ID]
+                .block_at(IVec3::new(0, 1, 0))
+                .expect("frame exists")
+                .block_id
+                .clone();
+            for stage in 0..3 {
+                runtime
+                    .execute(&ClientMessage::WeldBlock {
+                        operation_id: format!("completed-recovery-weld-{stage}"),
+                        grid_id: STARTER_GRID_ID.into(),
+                        block_id: block_id.clone(),
+                    })
+                    .expect("weld accepted");
+            }
+            assert!(runtime.state().grids[STARTER_GRID_ID].blocks[&block_id].construction_complete);
+            assert_eq!(runtime.state().player.career.blocks_built, 1);
+            assert_eq!(runtime.state().player.experience, 37);
+            expected_hash = runtime.state().state_hash();
+        }
+
+        {
+            let mut journal_recovered =
+                Runtime::open(directory.path(), 30, 100).expect("journal recovers");
+            let block = journal_recovered.state().grids[STARTER_GRID_ID]
+                .block_at(IVec3::new(0, 1, 0))
+                .expect("completed block recovers from journal");
+            assert!(block.construction_complete);
+            assert_eq!(journal_recovered.state().player.career.blocks_built, 1);
+            assert_eq!(journal_recovered.state().state_hash(), expected_hash);
+            journal_recovered
+                .persist_snapshot()
+                .expect("completed state snapshot persists");
+        }
+
+        let snapshot_recovered =
+            Runtime::open(directory.path(), 30, 100).expect("snapshot recovers");
+        let block = snapshot_recovered.state().grids[STARTER_GRID_ID]
+            .block_at(IVec3::new(0, 1, 0))
+            .expect("completed block recovers from snapshot");
+        assert!(block.construction_complete);
+        assert_eq!(snapshot_recovered.state().player.career.blocks_built, 1);
+        assert_eq!(snapshot_recovered.state().state_hash(), expected_hash);
+    }
+
+    #[test]
+    fn old_snapshot_schema_is_rejected_before_new_fields_are_deserialized() {
+        let directory = tempdir().expect("tempdir");
+        {
+            let mut runtime = Runtime::open(directory.path(), 32, 100).expect("runtime starts");
+            runtime.persist_snapshot().expect("snapshot persists");
+        }
+        let snapshot_path = directory.path().join(SNAPSHOT_FILE);
+        let mut snapshot: serde_json::Value = read_json(&snapshot_path).expect("snapshot reads");
+        snapshot["schema_version"] = serde_json::json!(WORLD_SCHEMA_VERSION - 1);
+        snapshot["state"]
+            .as_object_mut()
+            .expect("state is an object")
+            .remove("active_contact_pairs");
+        for grid in snapshot["state"]["grids"]
+            .as_object_mut()
+            .expect("grids are an object")
+            .values_mut()
+        {
+            for block in grid["blocks"]
+                .as_object_mut()
+                .expect("blocks are an object")
+                .values_mut()
+            {
+                block
+                    .as_object_mut()
+                    .expect("block is an object")
+                    .remove("construction_complete");
+            }
+        }
+        fs::write(
+            &snapshot_path,
+            serde_json::to_vec_pretty(&snapshot).expect("old snapshot serializes"),
+        )
+        .expect("old snapshot fixture writes");
+
+        assert!(matches!(
+            Runtime::open(directory.path(), 32, 100),
+            Err(crate::RuntimeError::Persistence(
+                PersistenceError::SnapshotSchema {
+                    found,
+                    expected: WORLD_SCHEMA_VERSION,
+                }
+            )) if found == WORLD_SCHEMA_VERSION - 1
+        ));
+    }
+
+    #[test]
+    fn old_event_schema_is_rejected_before_new_payload_fields_are_deserialized() {
+        let directory = tempdir().expect("tempdir");
+        {
+            let _runtime = Runtime::open(directory.path(), 33, 100).expect("runtime starts");
+        }
+        let state = WorldState::genesis(33);
+        let max_health = state.grids[STARTER_GRID_ID].blocks["block-core"].max_health();
+        let event = state.prepare_system_event(EventPayload::BlockWelded {
+            grid_id: STARTER_GRID_ID.into(),
+            block_id: "block-core".into(),
+            previous_health: max_health - 1,
+            new_health: max_health,
+            max_health,
+            completed_construction: false,
+        });
+        let mut fixture = serde_json::to_value(event).expect("event serializes");
+        fixture["schema_version"] = serde_json::json!(EVENT_SCHEMA_VERSION - 1);
+        fixture["payload"]
+            .as_object_mut()
+            .expect("payload is an object")
+            .remove("completed_construction");
+        fs::write(
+            directory.path().join(JOURNAL_FILE),
+            format!(
+                "{}\n",
+                serde_json::to_string(&fixture).expect("old event serializes")
+            ),
+        )
+        .expect("old event fixture writes");
+
+        assert!(matches!(
+            Runtime::open(directory.path(), 33, 100),
+            Err(crate::RuntimeError::Persistence(
+                PersistenceError::EventSchema {
+                    found_version,
+                    expected_version: EVENT_SCHEMA_VERSION,
+                    ..
+                }
+            )) if found_version == EVENT_SCHEMA_VERSION - 1
+        ));
     }
 
     #[test]
