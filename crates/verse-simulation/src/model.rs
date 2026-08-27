@@ -594,10 +594,20 @@ pub struct WorldState {
     pub inventories: BTreeMap<String, InventoryRecord>,
     pub death_drops: BTreeMap<String, DeathDrop>,
     pub ledger: Ledger,
-    pub processed_operations: BTreeMap<String, verse_protocol::IntentReceipt>,
+    pub processed_operations: BTreeMap<String, BTreeMap<String, verse_protocol::IntentReceipt>>,
 }
 
 impl WorldState {
+    pub fn processed_operation(
+        &self,
+        actor_player_id: &str,
+        operation_id: &str,
+    ) -> Option<&verse_protocol::IntentReceipt> {
+        self.processed_operations
+            .get(actor_player_id)
+            .and_then(|operations| operations.get(operation_id))
+    }
+
     pub fn validate_player_roster(&self) -> Result<(), String> {
         self.player.validate().map_err(str::to_owned)?;
         let mut inventory_ids = BTreeSet::new();
