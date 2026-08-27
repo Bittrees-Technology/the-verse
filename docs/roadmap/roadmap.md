@@ -38,8 +38,10 @@ lock. The local distribution harness has admitted and resynchronized `2`, `8`,
 per session. A synthetic regression adds 2,048 irrelevant far entities and
 proves the queried bucket count, visited candidate count, selected identities,
 and resulting view remain unchanged. These are local correctness and bounded-
-work results, not a production-capacity claim. Active-player load, independent
-client view-hash verification, hosted evidence for the latest revision, and the
+work results, not a production-capacity claim. The latest implementation
+revision passed the complete hosted Linux replay and Linux/Apple Silicon
+packaging in [CI run 33112815767](https://github.com/Bittrees-Technology/the-verse/actions/runs/33112815767).
+Active-player load, independent client view-hash verification, and the
 partitioned thousand-participant envelope remain open gates.
 
 P1.5 deliberately remains inside one active authoritative cell. It does not

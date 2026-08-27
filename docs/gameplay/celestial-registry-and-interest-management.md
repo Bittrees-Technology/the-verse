@@ -86,10 +86,12 @@ selected view membership.
 The full local playable scenario passes two-player mining and control,
 refining, manufacturing, inventory transfer, construction, welding, damage,
 grid splitting, death-drop, oxygen, respawn, exact recovery, and both native
-client identities. Still open are independent client-side view-hash
-verification, active-player rather than spectator load distributions, hosted
-evidence for the latest revision, WAN/failure/soak testing, partitioned
-thousand-participant evidence, and the production binary codec.
+client identities. [Hosted CI run 33112815767](https://github.com/Bittrees-Technology/the-verse/actions/runs/33112815767)
+replays the complete Linux verification suite and packages Linux and Apple
+Silicon clients for implementation revision `bb4ab4e`. Still open are
+independent client-side view-hash verification, active-player rather than
+spectator load distributions, WAN/failure/soak testing, partitioned thousand-
+participant evidence, and the production binary codec.
 
 ## Scope
 
