@@ -21,6 +21,7 @@ These documents form the initial specification baseline.
 - [P0.6 Orbital Operations](gameplay/orbital-operations.md)
 - [P0.7 Server-Authoritative Contact Physics](gameplay/contact-physics.md)
 - [P0.8 Survival Death Foundation](gameplay/survival-death.md)
+- [P0.9 Authoritative Character Motion](gameplay/authoritative-character-motion.md)
 
 ## Research
 

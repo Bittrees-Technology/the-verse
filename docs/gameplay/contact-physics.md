@@ -10,7 +10,7 @@ This checkpoint targets F-005, F-006, F-007, and F-010 and the acceptance eviden
 
 ## Authority contract
 
-1. Grid clients submit bounded control, tool, and construction intents. They never submit a grid pose, velocity, contact, damage amount, or split result. The current P0 character client still proposes an absolute position that is range-, planet-, voxel-, and grid-collision checked; input-only character simulation remains required.
+1. Grid clients submit bounded control, tool, and construction intents. They never submit a grid pose, velocity, contact, damage amount, or split result. Input-only character control is specified separately by [ADR-0013](../decisions/ADR-0013-input-only-authoritative-character-motion.md); until P0.9 is implemented, the current client still proposes a collision-checked absolute character position.
 2. The server owns collision shapes, mass, inertia, friction, restitution, force application, anchoring, contact damage, and grid separation.
 3. Completed blocks and physical inventory contribute to body mass. Incomplete frames are represented consistently but do not gain completed functional behavior.
 4. Static voxel collision is derived from canonical occupied cells. Content pins 8×8×8-cell collision chunks with Euclidean floor ownership, stable chunk-body and cell-collider identities, and chunk-local child poses. Accepted mining atomically replaces only the owning collision body under [ADR-0011](../decisions/ADR-0011-dirty-voxel-collision-chunks.md).

@@ -255,6 +255,31 @@ Still required for complete death-drop lifecycle:
 
 The complete implemented boundary is [P0.8 survival death foundation](../gameplay/survival-death.md), with transaction and deferral rationale in [ADR-0012](../decisions/ADR-0012-oxygen-incapacitation-and-proof-respawn.md).
 
+## P0.9 authoritative character-motion target
+
+Accepted implementation boundary:
+
+- Protocol 8 removes client-submitted character positions. Sequenced controls contain only a movement epoch, bounded local translation/angular input, boost, dampeners, and a one-shot jump edge.
+- Content `p0.9.0` owns all character speed, acceleration, damping, collision, fixed-step, and stale-control limits.
+- World schema 11 stores canonical player orientation, velocity, grounded state, input sequence/epoch, current controls, jump latch, and control lease.
+- Event schema 6 persists idempotent player-control changes and one atomic fixed-step outcome for grid and player motion under a shared 60 Hz phase.
+- The clean-room server controller owns radial gravity, jetpack acceleration, boost, dampening, gravity-tangent walking, grounded jump, and swept sphere collision with the planet, voxels, and grids.
+- Stale controls expire into neutral dampened state; death clears motion and increments the movement epoch; respawn starts stationary.
+- The native client predicts from the same content values but reconciles every newer canonical player state by input acknowledgement and replay. Lifecycle, reconnect, large-error, and epoch changes hard-snap.
+- Lightweight player-state replication does not rebuild the complete voxel/grid presentation every motion tick. The browser may display this canonical state without a transform-submission path.
+
+Required evidence before implementation status:
+
+- Serialization and adversarial tests prove that clients cannot send pose, velocity, collision results, or elapsed time and cannot use stale, duplicate, non-finite, or excessive controls to mutate or accelerate the player.
+- Fixed-step fixtures prove bounded EVA, boost, drift, dampening, walking, grounded jump, no tunneling, collision response, input-lease expiry, and exact macOS/Linux outcomes.
+- Replay tamper, idempotency, before-write/after-sync, snapshot/journal, death-mid-motion, respawn, disconnect, and reconnect tests preserve exact motion state.
+- The live protocol scenario reaches a voxel by input, completes a range-gated action, survives lifecycle recovery and restart, and retains the exact canonical pose, velocity, controls, and world hash.
+- Native impairment tests cover fixed-step prediction, input acknowledgement, small correction smoothing, large/epoch correction snaps, menu-open gravity continuity, and bounded queues without per-tick world rebuilds.
+
+Walking slopes/steps, ladders, magnetic boots, moving platforms, player-to-player collision, ragdolls, impact damage, suit fuel/power, cockpit possession, lag compensation, rollback, authenticated control ownership, production browser spectating, and multiplayer replication remain explicit later work.
+
+The target contract is [P0.9 authoritative character motion](../gameplay/authoritative-character-motion.md), with authority and recovery rationale in [ADR-0013](../decisions/ADR-0013-input-only-authoritative-character-motion.md).
+
 ## Exit decision
 
 P0 ends with one of:
