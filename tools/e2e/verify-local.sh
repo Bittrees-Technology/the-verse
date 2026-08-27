@@ -21,9 +21,10 @@ cargo build --locked -p verse-simulation-worker
 
 start_server() {
   local mode="${1:-live}"
+  local data_directory="${2:-${verse_test_dir}}"
   local server_command=(
     target/debug/verse-simulation-worker
-    --data-directory "${verse_test_dir}"
+    --data-directory "${data_directory}"
     --bind "127.0.0.1:${verse_port}"
     --snapshot-every 5
   )
@@ -47,6 +48,16 @@ stop_server() {
   wait "${verse_server_pid}"
   verse_server_pid=""
 }
+
+# Exercise concurrent actor binding, actor-owned mining, and actor-scoped
+# control against an isolated universe so its movement cannot perturb the
+# longer progression scenario.
+start_server live "${verse_test_dir}/two-player-control"
+if ! node tools/e2e/two-player-control-smoke.mjs "ws://127.0.0.1:${verse_port}/ws"; then
+  sed -n '1,240p' "${verse_test_dir}/server.log" >&2
+  exit 1
+fi
+stop_server
 
 start_server
 if ! node tools/e2e/protocol-smoke.mjs "ws://127.0.0.1:${verse_port}/ws"; then

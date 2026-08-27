@@ -4,7 +4,7 @@
 
 This checkpoint targets F-012, SIM-011, and SIM-012. It converts the P0.10 single-pilot proof into a shared authoritative cell without claiming production universe scale.
 
-Protocol 11 completes the first trust-boundary increment: authentication precedes the welcome and world snapshot; a socket is bound to an admitted player or to a read-only spectator role; unknown and concurrently claimed players fail closed; and the simulation receives the bound actor separately from the client intent. World schema 14 now persists one canonically ordered player map and actor-scoped operation namespaces. Event schema 9 stores an optional canonical player actor on human events, no player actor on system events, and an ordered outcome for every living roster member in the same fixed-step event as all grids. Each capsule has independent control scheduling and collides with planets, voxels, and grids while character-to-character collision and locomotion-query occlusion are disabled. Unit tests cover roster ownership and kinematics, atomic two-player live stepping and exact restart recovery, per-player idempotency and input frontiers, canonical outcome order, collision-layer/query behavior, and rejection of forged character contacts. A fresh loopback development worker now pre-admits `player-local` and `player-remote`; separate sockets can bind and advance independent control frontiers, the native client selects its actor from welcome metadata and renders the other engineering suit, and the browser merges and displays the complete roster. Secondary-player actions other than character control fail closed until their ownership rules are converted, so F-012 and SIM-012 are not yet complete.
+Protocol 11 completes the first trust-boundary increment: authentication precedes the welcome and world snapshot; a socket is bound to an admitted player or to a read-only spectator role; unknown and concurrently claimed players fail closed; and the simulation receives the bound actor separately from the client intent. World schema 14 now persists one canonically ordered player map and actor-scoped operation namespaces. Event schema 9 stores an optional canonical player actor on human events, no player actor on system events, and an ordered outcome for every living roster member in the same fixed-step event as all grids. Each capsule has independent control scheduling and collides with planets, voxels, and grids while character-to-character collision and locomotion-query occlusion are disabled. Unit tests cover roster ownership and kinematics, atomic two-player live stepping and exact restart recovery, per-player idempotency and input frontiers, canonical outcome order, collision-layer/query behavior, and rejection of forged character contacts. A fresh loopback development worker now pre-admits `player-local` and `player-remote`; separate sockets bind, advance independent control frontiers, and mine using only their own pose, inventory, experience, and career state. The native client selects its actor from welcome metadata and renders the other engineering suit, while the browser merges and displays the complete roster. Secondary-player refining, manufacturing, transfers, construction, suit, lifecycle, and grid actions fail closed until their ownership rules are converted, so F-012 and SIM-012 are not yet complete.
 
 ## Player-visible contract
 
@@ -82,7 +82,10 @@ Current evidence additionally runs the native visual/control smoke once as each
 development identity and verifies identical shared-state recovery after the
 mining, refining, manufacturing, construction, destruction, death, and respawn
 scenario. The browser unit harness proves deterministic roster ordering and
-identity-based motion merging.
+identity-based motion merging. A concurrent two-socket scenario submits the
+same operation IDs from both actors, verifies independent processed frontiers,
+mines one shared voxel as the remote actor, proves actor-only ore and career
+credit, retries idempotently, and converges both clients on the same hash.
 
 ## Not yet included
 

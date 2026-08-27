@@ -199,7 +199,11 @@ impl Runtime {
         player_id.clone_into(&mut player.player_id);
         let roster_offset =
             u32::try_from(next_state.player.by_id.len()).map_or(f64::from(u32::MAX), f64::from);
-        player.position.x += 4.0 * roster_offset;
+        // Keep the loopback co-op fixture inside the starter asteroid's hand-
+        // tool envelope while giving each suit a visibly distinct spawn. The
+        // character collision layer already prevents these nearby capsules
+        // from pushing or becoming locomotion support for one another.
+        player.position.y += 1.5 * roster_offset;
         player.orientation = Quat::IDENTITY;
         player.linear_velocity = Vec3::ZERO;
         player.angular_velocity = Vec3::ZERO;
