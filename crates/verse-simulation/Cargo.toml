@@ -21,6 +21,7 @@ verse-physics = { path = "../verse-physics" }
 [dev-dependencies]
 proptest.workspace = true
 tempfile.workspace = true
+verse-interest-verifier = { path = "../verse-interest-verifier" }
 
 [lints]
 workspace = true

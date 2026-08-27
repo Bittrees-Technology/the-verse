@@ -129,6 +129,10 @@ role configured by the client. The registry and universe manifest must bind the
 same universe, schema tuple, content manifest, registry hash, and universe
 manifest hash. These bindings are immutable until reset.
 
+Typed intent receipts, intent rejections, and fatal messages may be staged and
+sanitized for presentation in protocol-valid phases. They never change the
+committed view and never produce an interest acknowledgement.
+
 Every state frame's outer header, interest header, and established binding must
 agree wherever a value is repeated. The interest frame kind must match its
 server message kind. A spectator has observer class `public_origin_spectator`
@@ -141,9 +145,16 @@ ID. Protocol-15 `snapshot` and `motion_state` messages are rejected.
 A baseline must have delta sequence zero, no previous view hash, a new nonempty
 session epoch and baseline ID, complete entered entities, no replacements or
 removals, complete environment and conservation state, and optional complete
-actor-private state. The verifier constructs the complete material, computes
-the digest, and compares it with `interest.view_hash` using exact lowercase
-hexadecimal bytes.
+actor-private state. A bound-player baseline requires actor-private state for
+the exact welcomed player; a spectator baseline forbids it. The verifier
+constructs the complete material, computes the digest, and compares it with
+`interest.view_hash` using exact lowercase hexadecimal bytes.
+
+The first baseline enters `current`. A later baseline is accepted only as a
+bounded recovery replacement for the same connection, role, and immutable
+registry/manifest binding. It retains the session epoch, advances the interest
+epoch, uses a new baseline ID, and atomically replaces the complete prior view
+only after verification and commit.
 
 Successful verification creates a pending state only. Committed state changes
 only when the pending stage token is committed.
@@ -151,9 +162,12 @@ only when the pending stage token is committed.
 ## Delta transition
 
 A delta must match the committed session epoch, interest epoch, baseline ID,
-observer, universe/registry bindings, cell, and local origin rules. Its sequence
-is the committed sequence plus one, and `previous_view_hash` exactly matches the
-committed digest.
+observer, universe/registry bindings, and cell. Its sequence is the committed
+sequence plus one, and `previous_view_hash` exactly matches the committed
+digest. Canonical event and simulation-tick frontiers cannot regress even
+though they are not hash material. A changed `local_origin_address` is an
+explicit absolute rebase: it becomes the resulting view's hash input and moves
+no canonical entity.
 
 The verifier stages operations over the complete committed entity map. Omitted
 environment, conservation, and actor-private fields retain their committed
