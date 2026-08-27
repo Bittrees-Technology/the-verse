@@ -23,7 +23,7 @@ func _run() -> void:
 		quit(1)
 		return
 	print(
-		"VERSE_NATIVE_IMPAIRMENT_OK queued_ack=ordered motion=monotonic corrections=bounded menu=neutral lifecycle=reset history=bounded rebuild=none"
+		"VERSE_NATIVE_IMPAIRMENT_OK queued_ack=ordered motion=monotonic corrections=bounded menu=neutral_prediction lifecycle=reset buffers=bounded rebuild=none"
 	)
 	quit(0)
 
@@ -284,31 +284,41 @@ func _test_ordering_corrections_and_motion_only_updates() -> void:
 	correction_client.call("_apply_authoritative_player", canonical, 2, 2, "large", "motion_state")
 	_check(
 		(correction_client.get("presentation_position_offset") as Vector3).is_zero_approx(),
-		"large correction snapped"
+		"large position correction snapped"
+	)
+
+	camera.position = Vector3.ZERO
+	camera.quaternion = Quaternion(Vector3.UP, 1.3)
+	correction_client.call("_apply_authoritative_player", canonical, 3, 3, "large-angle", "motion_state")
+	_check(
+		(correction_client.get("presentation_orientation_offset") as Quaternion).is_equal_approx(
+			Quaternion.IDENTITY
+		),
+		"large orientation correction snapped"
 	)
 
 	(correction_client.get("pending_controls") as Array).append({"input_sequence": 1})
 	(correction_client.get("prediction_history") as Array).append({"simulation_tick": 3})
 	var epoch_player := canonical.duplicate(true)
 	epoch_player["movement_epoch"] = 2
-	correction_client.call("_apply_authoritative_player", epoch_player, 3, 3, "epoch", "motion_state")
+	correction_client.call("_apply_authoritative_player", epoch_player, 4, 4, "epoch", "motion_state")
 	_check((correction_client.get("pending_controls") as Array).is_empty(), "epoch cleared controls")
 	_check((correction_client.get("prediction_history") as Array).is_empty(), "epoch cleared history")
 
-	correction_client.set("predicted_simulation_tick", 6)
+	correction_client.set("predicted_simulation_tick", 7)
 	(correction_client.get("prediction_history") as Array).append({
-		"movement_epoch": 2, "input_sequence": 3, "simulation_tick": 6,
+		"movement_epoch": 2, "input_sequence": 3, "simulation_tick": 7,
 	})
 	(correction_client.get("pending_controls") as Array).append({
 		"movement_epoch": 2, "input_sequence": 3,
 	})
-	correction_client.call("_apply_authoritative_player", epoch_player, 4, 4, "gap", "motion_state")
+	correction_client.call("_apply_authoritative_player", epoch_player, 5, 5, "gap", "motion_state")
 	_check((correction_client.get("prediction_history") as Array).is_empty(), "history gap hard reset")
 	_check((correction_client.get("pending_controls") as Array).is_empty(), "history gap cleared controls")
 
 	(correction_client.get("prediction_history") as Array).append({"simulation_tick": 5})
 	(correction_client.get("pending_controls") as Array).append({"input_sequence": 4})
-	correction_client.call("_apply_authoritative_player", epoch_player, 5, 5, "reconnect", "reconnect")
+	correction_client.call("_apply_authoritative_player", epoch_player, 6, 6, "reconnect", "reconnect")
 	_check((correction_client.get("prediction_history") as Array).is_empty(), "reconnect cleared history")
 	_check((correction_client.get("pending_controls") as Array).is_empty(), "reconnect cleared controls")
 	correction_client.free()
@@ -333,7 +343,10 @@ func _test_menu_dead_disconnect_and_bounds() -> void:
 	_check(int(client.get("predicted_simulation_tick")) == 1, "menu continued prediction")
 	_check((client.get("predicted_linear_velocity") as Vector3).x < 0.0, "menu accumulated gravity")
 	_check((client.get("mouse_delta_accumulator") as Vector2).is_zero_approx(), "menu cleared mouse")
-	_check(int(client.get("next_input_sequence")) == 1, "menu emitted no control")
+	_check(
+		int(client.get("next_input_sequence")) == 1,
+		"menu did not refresh unchanged neutral control before due"
+	)
 
 	client.set("connected", false)
 	var disconnected_tick := int(client.get("predicted_simulation_tick"))
@@ -364,6 +377,20 @@ func _test_menu_dead_disconnect_and_bounds() -> void:
 	_check((bound_client.get("prediction_history") as Array).size() == HISTORY_LIMIT, "history bounded")
 	_check(bool(bound_client.get("prediction_history_invalid")), "history overflow invalidated replay")
 	bound_client.free()
+
+	var pending_bound_client := _new_client()
+	for index in HISTORY_LIMIT + 1:
+		pending_bound_client.call("_record_pending_control", 1, index + 1, bound_control)
+	var bounded_pending: Array = pending_bound_client.get("pending_controls")
+	_check(bounded_pending.size() == HISTORY_LIMIT, "pending controls bounded")
+	_check(bool(pending_bound_client.get("prediction_history_invalid")), "pending overflow invalidated replay")
+	_check(
+		bounded_pending.size() == HISTORY_LIMIT
+		and int(bounded_pending.front().get("input_sequence", 0)) == 2
+		and int(bounded_pending.back().get("input_sequence", 0)) == HISTORY_LIMIT + 1,
+		"pending append path retained newest controls"
+	)
+	pending_bound_client.free()
 	client.free()
 
 

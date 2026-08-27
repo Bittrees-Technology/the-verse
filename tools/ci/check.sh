@@ -18,6 +18,10 @@ if [[ -z "${godot_binary}" ]] && [[ -x "artifacts/toolchains/godot-4.7.2/Godot.a
 fi
 if [[ -n "${godot_binary}" ]]; then
   "${godot_binary}" --headless --editor --path apps/native-client --quit
+  "${godot_binary}" \
+    --headless \
+    --path apps/native-client \
+    --script res://tests/motion_impairment_smoke.gd
   GODOT_BIN="${godot_binary}" tools/e2e/verify-local.sh
 else
   tools/e2e/verify-local.sh
