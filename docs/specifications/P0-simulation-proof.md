@@ -1,6 +1,6 @@
 # P0 specification: simulation proof
 
-**Status:** In implementation; P0.9 authoritative EVA is verified on macOS and hosted Ubuntu, and P0.10 grounded locomotion is locally verified
+**Status:** P0 exit evidence complete; Godot/Rust/Jolt acceptance proposed
 
 ## Purpose
 
@@ -19,6 +19,8 @@ Prove that the proposed open-source stack can support the irreducible technical 
 - F-009 inventory conservation ledger.
 - F-010 damage and grid split.
 - F-011 snapshot and recovery.
+- F-057 server-authoritative EVA, landing, and rotation.
+- F-058 server-authoritative grounded and magnetic locomotion.
 
 ## Demonstration scenario
 
@@ -276,18 +278,15 @@ Implemented and locally verified evidence:
 - The live protocol scenario reaches a voxel by input, completes a range-gated action, survives lifecycle recovery and restart, and retains the exact canonical pose, velocity, controls, and world hash.
 - The gated native impairment harness covers received-versus-processed acknowledgement replay, skipped and stale motion messages, small correction smoothing, angular and lifecycle hard snaps, menu-open gravity continuity, bounded production prediction buffers, dead/disconnected gating, and motion-only updates without per-tick world rebuilds.
 
-Still required for cross-platform P0 evidence:
+The quantized fixed-step, headless Godot, live-client, release-container, native Linux package, native Apple Silicon package, and serialized cross-platform performance evidence pass in [hosted P0.10 run 33077252402](https://github.com/Bittrees-Technology/the-verse/actions/runs/33077252402). The raw Linux distribution is attached to its package artifact and summarized in the [hosted Linux baseline](../benchmarks/P0.10-grounded-locomotion-linux.md).
 
-- Retain the green quantized fixed-step, headless Godot, live-client, and release-container evidence from [hosted Ubuntu run 33047681929](https://github.com/Bittrees-Technology/the-verse/actions/runs/33047681929) as the P0.9 cross-platform checkpoint.
-- Publish the native Linux direct-download artifact and the remaining Ubuntu, network, packaging, and scale evidence required by the overall P0 exit gate.
-
-Walking, jump, and a canonical grounded-locomotion state are explicitly P0.10-or-later work, together with slopes, stairs, ladders, magnetic boots, and moving-platform attachment. Player-to-player collision, ragdolls, impact damage, suit fuel/power, cockpit possession, lag compensation, rollback, authenticated control ownership, production browser spectating, and multiplayer replication also remain later work.
+Player-to-player collision, ragdolls, impact damage, suit fuel/power, cockpit possession, lag compensation, rollback, authenticated control ownership, production browser spectating, and multiplayer replication remain later work.
 
 The implemented contract is [P0.9 authoritative EVA physics](../gameplay/authoritative-character-motion.md), with authority and recovery rationale in [ADR-0013](../decisions/ADR-0013-input-only-authoritative-character-motion.md).
 
 ## P0.10 authoritative grounded-locomotion checkpoint
 
-Implemented local boundary:
+Implemented boundary:
 
 - Extend the P0.9 input FIFO rather than adding a client transform or a second character clock.
 - Use protocol 10, world schema 13, event schema 8, content schema 8, and manifest `p0.10.0` for the incompatible locomotion state.
@@ -297,17 +296,16 @@ Implemented local boundary:
 - Keep grids and the player in one atomic `PhysicsStepCommitted` time domain; replay validates committed support-aware envelopes without rerunning Jolt.
 - Reconcile native prediction relative to a stable support and expose original `EVA`, `FREEFALL`, `GROUND`, `MAG-LOCK`, and `BOOTS ARMED` feedback.
 
-Locally verified evidence now covers the true capsule collider and stable casts; walk/sprint/brake; buffered edge-triggered jump; 50° entry and 52° exit slope thresholds; bounded clear-step acceptance and over-height rejection; ground snap; radial upright alignment on all six planet axes and continuous pole-neighborhood traversal without quaternion flips; completed-block-only magnetic eligibility; translating-grid support velocity; rotating-grid local-anchor retention; destruction-driven detach without teleportation; collider-identity rebind after a grid split; full-capsule respawn and construction exclusion; client-side radial-upright prediction; persistence replay; real client/server restart recovery; and an Apple Silicon portable package whose bundled server and exported client pass the native smoke scenario. Hosted Ubuntu, hosted Linux package, and Linux release-performance evidence remain required before P0.10 publication.
+Verified evidence covers the true capsule collider and stable casts; walk/sprint/brake; buffered edge-triggered jump; 50° entry and 52° exit slope thresholds; bounded clear-step acceptance and over-height rejection; ground snap; radial upright alignment on all six planet axes and continuous pole-neighborhood traversal without quaternion flips; completed-block-only magnetic eligibility; translating-grid support velocity; rotating-grid local-anchor retention; destruction-driven detach without teleportation; collider-identity rebind after a grid split; full-capsule respawn and construction exclusion; client-side radial-upright prediction; persistence replay; real client/server restart recovery; and portable Linux and Apple Silicon packages whose bundled servers and exported clients pass the native smoke scenario.
 
 The complete contract and acceptance matrix are [P0.10 authoritative grounded and magnetic locomotion](../gameplay/authoritative-grounded-locomotion.md), with the authority decision in [ADR-0014](../decisions/ADR-0014-authoritative-grounded-and-magnetic-locomotion.md). Ladders, crouching, ragdolls, character-to-character collision, impact damage, suit power, artificial gravity, cockpit possession, and production multiplayer remain later checkpoints.
 
 ## Exit decision
 
-P0 ends with one of:
+The P0 evidence supports accepting the Godot client plus Rust/Jolt authoritative architecture for P1. This draft branch proposes that choice; repository merge and governance review remain human-controlled. The alternatives not selected by the proposal are:
 
-- Accept Godot/Jolt plus Rust architecture.
 - Retain Godot client but replace the server physics/grid kernel.
 - Replace the client engine.
 - Reduce or redesign an unsupported requirement through a new product decision.
 
-No production content work begins before this gate.
+Approval of this proposal closes the simulation-proof gate; it is not a production-capacity or public-universe claim.

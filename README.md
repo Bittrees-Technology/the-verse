@@ -2,7 +2,7 @@
 
 The Verse is an open-source persistent voxel space universe, work-and-economy simulator, and Web3 marketplace.
 
-The repository now contains the **locally verified P0.10 grounded-locomotion implementation**, built on the hosted P0.9 authoritative-EVA checkpoint, Orbital Operations, server-authoritative contact physics, and the P0.8 survival-death foundation. It is still a single-player proof—not yet the public multiplayer universe or real-value economy—but input-only EVA and boots-on-deck movement, realistic orbital separation, physical inventory, consequential oxygen, mining, staged construction, and persistent recovery now share one authoritative world. Hosted release evidence for P0.10 remains in progress.
+The repository now contains the **cross-platform verified P0.10 simulation proof**, including authoritative grounded locomotion, EVA, orbital operations, contact physics, survival death, mining, production, construction, and exact recovery. It is still a single-player proof—not yet the public multiplayer universe or real-value economy—but the irreducible gameplay loop now shares one authoritative world on packaged macOS and Linux clients.
 
 ## Play it on macOS
 
@@ -88,7 +88,7 @@ Start with [the documentation map](docs/README.md), then read:
 
 ## Current status
 
-P0.10 retains durable input-only controls and one atomic Jolt-backed character/grid physics step, while protocol 10 adds jump and magnetic preference without accepting a client transform. A 1.8 m dynamic capsule now owns radial upright alignment, tangent walk/sprint, buffered jump, 50° slope entry with 2° exit hysteresis, bounded 45 cm steps, 18 cm ground snap, magnetic attachment to completed grid blocks, and moving-support velocity inheritance. The native client predicts these modes, presents `EVA`, `FREEFALL`, `GROUND`, and `MAG-LOCK`, and retains the P0.8 oxygen, death-drop, and recovery loop. Local Rust, Godot, protocol, impairment, exact-recovery, and packaged Apple Silicon gates are green; hosted P0.10 and Linux package evidence plus the published Linux performance baseline remain required. Multiplayer, drop recovery/expiry, global streaming, safe zones, accounts, AMMs, and blockchain settlement remain sequenced in the [delivery roadmap](docs/roadmap/roadmap.md).
+P0.10 retains durable input-only controls and one atomic Jolt-backed character/grid physics step, while protocol 10 adds jump and magnetic preference without accepting a client transform. A 1.8 m dynamic capsule owns radial upright alignment, tangent walk/sprint, buffered jump, 50° slope entry with 2° exit hysteresis, bounded 45 cm steps, 18 cm ground snap, magnetic attachment to completed grid blocks, and moving-support velocity inheritance. The native client predicts these modes, presents `EVA`, `FREEFALL`, `GROUND`, and `MAG-LOCK`, and retains the oxygen, death-drop, and recovery loop. Local and hosted Rust, Godot, protocol, impairment, exact-recovery, package, container, and serialized performance gates are green in [run 33077252402](https://github.com/Bittrees-Technology/the-verse/actions/runs/33077252402). Multiplayer, drop recovery/expiry, global streaming, safe zones, accounts, AMMs, and blockchain settlement remain sequenced in the [delivery roadmap](docs/roadmap/roadmap.md).
 
 ## Licensing
 

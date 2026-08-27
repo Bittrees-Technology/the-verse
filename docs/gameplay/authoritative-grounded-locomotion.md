@@ -1,6 +1,6 @@
 # P0.10 authoritative grounded and magnetic locomotion
 
-**Status:** Local implementation verified; remaining acceptance and hosted release evidence in progress
+**Status:** Implemented and verified on macOS and hosted Ubuntu
 
 ## Player promise
 
@@ -74,9 +74,9 @@ The server persists received controls before acknowledging them, consumes at mos
 
 ## Implementation state
 
-Implemented and locally gated: capsule bodies and stable casts; versioned locomotion state and input-only intents, including cross-process jump and magnetic-preference delivery; walk/sprint/brake; jump; radial upright alignment on all six planet axes and continuous pole-neighborhood traversal; slope hysteresis; bounded steps and snap; completed-grid-only magnetic support; translating and rotating support retention; deterministic detach when a bound block is destroyed; collider-identity rebind after a grid split; complete-capsule construction and respawn exclusion; native controls, prediction, camera, and HUD; impaired-network behavior; real client/server playability; and exact restart recovery.
+Implemented and gated: capsule bodies and stable casts; versioned locomotion state and input-only intents, including cross-process jump and magnetic-preference delivery; walk/sprint/brake; jump; radial upright alignment on all six planet axes and continuous pole-neighborhood traversal; slope hysteresis; bounded steps and snap; completed-grid-only magnetic support; translating and rotating support retention; deterministic detach when a bound block is destroyed; collider-identity rebind after a grid split; complete-capsule construction and respawn exclusion; native controls, prediction, camera, and HUD; impaired-network behavior; real client/server playability; and exact restart recovery.
 
-Still required before publication: hosted Ubuntu evidence for this version, hosted Linux package evidence, and the Linux P0 performance envelope. The local Apple Silicon package already passes checksum verification and the exported-client scenario against its bundled authoritative server.
+The complete Ubuntu gate, Linux package, Apple Silicon package, bundled-server/exported-client smokes, and serialized Linux release distribution pass in [hosted run 33077252402](https://github.com/Bittrees-Technology/the-verse/actions/runs/33077252402). The corresponding [Apple Silicon](../benchmarks/P0.10-grounded-locomotion-apple-silicon.md) and [hosted Linux](../benchmarks/P0.10-grounded-locomotion-linux.md) baselines publish the measured envelope and its limits.
 
 ## Explicit limits
 
