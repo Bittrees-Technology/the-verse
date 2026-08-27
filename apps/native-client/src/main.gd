@@ -19,6 +19,9 @@ const STARTER_GRID := "grid-starter"
 # The server remains authoritative for elapsed time, contacts, and final motion.
 const CHARACTER_FIXED_DELTA := 1.0 / 60.0
 const CONTROL_SEND_INTERVAL := 0.10
+# Leave enough headroom for Godot's float32 Vector3 components to survive
+# JSON's float64 reconstruction without crossing the authoritative unit sphere.
+const CONTROL_INPUT_SAFE_LIMIT := 0.999999
 const PREDICTION_HISTORY_LIMIT := 180
 const POSITION_SNAP_DISTANCE := 2.0
 const ORIENTATION_SNAP_ANGLE := PI / 3.0
@@ -106,6 +109,9 @@ var prediction_history: Array[Dictionary] = []
 var pending_controls: Array[Dictionary] = []
 var prediction_history_invalid := false
 var mouse_delta_accumulator := Vector2.ZERO
+var roll_left_held := false
+var roll_right_held := false
+var pending_roll_transitions: Array[float] = []
 var presentation_position_offset := Vector3.ZERO
 var presentation_orientation_offset := Quaternion.IDENTITY
 var require_neutral_baseline := true
@@ -227,13 +233,17 @@ func _physics_process(delta: float) -> void:
 	if _local_player_incapacitated():
 		return
 	control_send_elapsed += delta
-	var control := _sample_player_control()
+	var control := _neutral_player_control()
+	var sampled_roll_transition := false
 	if require_neutral_baseline:
-		control = _neutral_player_control()
 		if _send_player_control(control, true):
 			require_neutral_baseline = false
-	elif _should_send_player_control(control):
-		_send_player_control(control, false)
+	else:
+		sampled_roll_transition = not pending_roll_transitions.is_empty()
+		control = _sample_player_control()
+		if _should_send_player_control(control) and _send_player_control(control, false):
+			if sampled_roll_transition and not pending_roll_transitions.is_empty():
+				pending_roll_transitions.pop_front()
 	_predict_player_step(control, CHARACTER_FIXED_DELTA, true)
 
 
@@ -265,6 +275,14 @@ func _input(event: InputEvent) -> void:
 			_set_inventory_open(false)
 		return
 
+	if (
+		event is InputEventKey
+		and not event.echo
+		and event.keycode in [KEY_Q, KEY_E]
+		and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED
+	):
+		_capture_roll_key_transition(event)
+
 	if event is InputEventKey and event.keycode == KEY_M and not event.echo:
 		if event.pressed and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
 			_move_target_grid()
@@ -283,6 +301,7 @@ func _input(event: InputEvent) -> void:
 						if Input.mouse_mode == Input.MOUSE_MODE_CAPTURED
 						else Input.MOUSE_MODE_CAPTURED
 					)
+					_clear_transient_character_input()
 			KEY_I:
 				_set_inventory_open(not inventory_open)
 			KEY_J:
@@ -1884,7 +1903,7 @@ func _apply_authoritative_player(
 		desired_magnetic_boots = bool(incoming_locomotion.get("magnetic_boots_enabled", false))
 		last_sent_control = {}
 		control_send_elapsed = CONTROL_SEND_INTERVAL
-		mouse_delta_accumulator = Vector2.ZERO
+		_clear_transient_character_input()
 		require_neutral_baseline = incoming_life_state == "alive"
 	elif history_reset:
 		# The missing local timeline cannot be replayed safely. Preserve sequence
@@ -1898,7 +1917,7 @@ func _apply_authoritative_player(
 		desired_magnetic_boots = bool(incoming_locomotion.get("magnetic_boots_enabled", false))
 		last_sent_control = {}
 		control_send_elapsed = CONTROL_SEND_INTERVAL
-		mouse_delta_accumulator = Vector2.ZERO
+		_clear_transient_character_input()
 		require_neutral_baseline = incoming_life_state == "alive"
 	else:
 		prediction_history.clear()
@@ -2027,7 +2046,7 @@ func _begin_player_resync() -> void:
 	prediction_gravity_fallback = Vector3.ZERO
 	last_sent_control = {}
 	control_send_elapsed = 0.0
-	mouse_delta_accumulator = Vector2.ZERO
+	_clear_transient_character_input()
 	presentation_position_offset = Vector3.ZERO
 	presentation_orientation_offset = Quaternion.IDENTITY
 	require_neutral_baseline = true
@@ -2512,7 +2531,7 @@ func _stable_unit_seed(text: String) -> float:
 
 func _sample_player_control() -> Dictionary:
 	if Input.mouse_mode != Input.MOUSE_MODE_CAPTURED or inventory_open:
-		mouse_delta_accumulator = Vector2.ZERO
+		_clear_transient_character_input()
 		return _neutral_player_control()
 	var player: Dictionary = snapshot.get("player", {})
 	var jetpack_enabled := bool(player.get("jetpack_enabled", true))
@@ -2525,17 +2544,16 @@ func _sample_player_control() -> Dictionary:
 		Input.get_action_strength("move_right") - Input.get_action_strength("move_left"),
 		vertical_input,
 		Input.get_action_strength("move_backward") - Input.get_action_strength("move_forward")
-	).limit_length(1.0)
+	).limit_length(CONTROL_INPUT_SAFE_LIMIT)
 	var roll_input := (
 		Input.get_action_strength("roll_right") - Input.get_action_strength("roll_left")
 	)
+	var roll_angular_input := -roll_input
+	if not pending_roll_transitions.is_empty():
+		roll_angular_input = pending_roll_transitions.front()
 	var mouse_delta := mouse_delta_accumulator
 	mouse_delta_accumulator = Vector2.ZERO
-	var angular_input := Vector3(
-		-mouse_delta.y * MOUSE_ANGULAR_INPUT_PER_PIXEL,
-		-mouse_delta.x * MOUSE_ANGULAR_INPUT_PER_PIXEL,
-		-roll_input
-	).limit_length(1.0)
+	var angular_input := _bounded_angular_input(mouse_delta, roll_angular_input)
 	return {
 		"linear_input": linear_input,
 		"angular_input": angular_input,
@@ -2543,6 +2561,14 @@ func _sample_player_control() -> Dictionary:
 		"jump": not jetpack_enabled and Input.is_action_pressed("move_up"),
 		"dampeners": desired_dampeners,
 	}
+
+
+func _bounded_angular_input(mouse_delta: Vector2, roll_angular_input: float) -> Vector3:
+	return Vector3(
+		-mouse_delta.y * MOUSE_ANGULAR_INPUT_PER_PIXEL,
+		-mouse_delta.x * MOUSE_ANGULAR_INPUT_PER_PIXEL,
+		roll_angular_input
+	).limit_length(CONTROL_INPUT_SAFE_LIMIT)
 
 
 func _neutral_player_control() -> Dictionary:
@@ -2579,7 +2605,20 @@ func _control_send_due(control: Dictionary, previous: Dictionary, elapsed: float
 	return (
 		previous.is_empty()
 		or not _controls_equal(control, previous)
-		or elapsed >= CONTROL_SEND_INTERVAL
+		or (
+			_control_requires_lease_refresh(control)
+			and elapsed >= CONTROL_SEND_INTERVAL
+		)
+	)
+
+
+func _control_requires_lease_refresh(control: Dictionary) -> bool:
+	return (
+		(control.get("linear_input", Vector3.ZERO) as Vector3).length_squared() > 0.00000001
+		or (control.get("angular_input", Vector3.ZERO) as Vector3).length_squared() > 0.00000001
+		or bool(control.get("boost", false))
+		or bool(control.get("jump", false))
+		or not bool(control.get("dampeners", true))
 	)
 
 
@@ -2592,8 +2631,12 @@ func _send_player_control(control: Dictionary, force: bool) -> bool:
 	):
 		return false
 	var bounded_control := {
-		"linear_input": (control.get("linear_input", Vector3.ZERO) as Vector3).limit_length(1.0),
-		"angular_input": (control.get("angular_input", Vector3.ZERO) as Vector3).limit_length(1.0),
+		"linear_input": (control.get("linear_input", Vector3.ZERO) as Vector3).limit_length(
+			CONTROL_INPUT_SAFE_LIMIT
+		),
+		"angular_input": (control.get("angular_input", Vector3.ZERO) as Vector3).limit_length(
+			CONTROL_INPUT_SAFE_LIMIT
+		),
 		"boost": bool(control.get("boost", false)),
 		"jump": bool(control.get("jump", false)),
 		"dampeners": bool(control.get("dampeners", true)),
@@ -2612,6 +2655,31 @@ func _send_player_control(control: Dictionary, force: bool) -> bool:
 		smoke_operation = operation_id
 		smoke_input_sequence = sequence
 	return true
+
+
+func _capture_roll_key_transition(event: InputEventKey) -> void:
+	var changed := false
+	if event.keycode == KEY_Q and roll_left_held != event.pressed:
+		roll_left_held = event.pressed
+		changed = true
+	elif event.keycode == KEY_E and roll_right_held != event.pressed:
+		roll_right_held = event.pressed
+		changed = true
+	if not changed:
+		return
+	var roll_input := float(int(roll_right_held) - int(roll_left_held))
+	var angular_roll := -roll_input * CONTROL_INPUT_SAFE_LIMIT
+	if pending_roll_transitions.is_empty() or not is_equal_approx(
+		pending_roll_transitions.back(), angular_roll
+	):
+		pending_roll_transitions.append(angular_roll)
+
+
+func _clear_transient_character_input() -> void:
+	mouse_delta_accumulator = Vector2.ZERO
+	roll_left_held = false
+	roll_right_held = false
+	pending_roll_transitions.clear()
 
 
 func _record_pending_control(epoch: int, sequence: int, control: Dictionary) -> void:
@@ -3439,7 +3507,10 @@ func _run_motion_prediction_smoke_assertions() -> bool:
 		and not _controls_equal(dampened_control, roll_control)
 		and _control_send_due(dampened_control, thrust_control, 0.0)
 		and not _control_send_due(dampened_control, dampened_control, 0.05)
-		and _control_send_due(dampened_control, dampened_control, CONTROL_SEND_INTERVAL)
+		and not _control_send_due(
+			dampened_control, dampened_control, CONTROL_SEND_INTERVAL
+		)
+		and _control_send_due(roll_control, roll_control, CONTROL_SEND_INTERVAL)
 		and absf(shortest_orientation.dot(rolled_orientation)) > 0.999
 	)
 	if not valid:
@@ -3847,7 +3918,7 @@ func _set_inventory_open(open: bool) -> void:
 	inventory_overlay.visible = open
 	build_mode = false if open else build_mode
 	action_charge = 0.0
-	mouse_delta_accumulator = Vector2.ZERO
+	_clear_transient_character_input()
 	Input.mouse_mode = Input.MOUSE_MODE_VISIBLE if open else Input.MOUSE_MODE_CAPTURED
 	_set_message(
 		"Engineering inventory terminal online" if open else "Engineering terminal closed"
@@ -3860,7 +3931,7 @@ func _enter_incapacitated_state() -> void:
 	prediction_history.clear()
 	pending_controls.clear()
 	last_sent_control = {}
-	mouse_delta_accumulator = Vector2.ZERO
+	_clear_transient_character_input()
 	require_neutral_baseline = false
 	action_charge = 0.0
 	action_target_key = ""

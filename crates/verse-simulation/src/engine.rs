@@ -37,6 +37,10 @@ const MINING_RANGE: f64 = 8.5;
 const HAND_TOOL_RANGE: f64 = 9.0;
 const MAX_GRID_CONTROL_INPUT: f64 = 1.0;
 const CONTROL_INPUT_EPSILON: f64 = 1.0e-9;
+// Godot's standard Vector3 uses float32 components. Normalizing in float32 and
+// reconstructing those components as JSON float64 can put the calculated
+// magnitude a few ULPs above one even though the source vector was valid.
+const CONTROL_INPUT_SOURCE_PRECISION_EPSILON: f64 = 8.0 * f32::EPSILON as f64;
 const MAX_GRID_BLOCKS_P0: usize = 2_048;
 const MAX_PENDING_PLAYER_CONTROL_FRAMES: usize = 64;
 const PLAYER_POSITION_CORRECTION_BUDGET_M_PER_STEP: f64 = 0.55;
@@ -4666,7 +4670,7 @@ fn ensure_finite(value: Vec3, label: &str) -> Result<(), IntentError> {
 
 fn ensure_bounded_control(value: Vec3, label: &str) -> Result<(), IntentError> {
     ensure_finite(value, label)?;
-    if value.magnitude() > MAX_GRID_CONTROL_INPUT + CONTROL_INPUT_EPSILON {
+    if value.magnitude() > MAX_GRID_CONTROL_INPUT + CONTROL_INPUT_SOURCE_PRECISION_EPSILON {
         Err(IntentError::rejected(
             "control_input_out_of_range",
             format!("{label} magnitude must not exceed one"),
@@ -6607,6 +6611,54 @@ mod tests {
         assert_eq!(runtime.state().player.control_linear_input, Vec3::ZERO);
         assert_eq!(runtime.state().player.pending_control_frames.len(), 1);
         assert!(runtime.state().conservation().valid);
+    }
+
+    proptest! {
+        #[test]
+        fn godot_float32_mouse_and_roll_vectors_survive_json_reconstruction(
+            mouse_x in -32_768_i32..=32_767,
+            mouse_y in -32_768_i32..=32_767,
+            roll in -1_i8..=1,
+        ) {
+            // This mirrors Godot's standard float32 Vector3 limit_length(1.0)
+            // before serde reconstructs the JSON components as float64.
+            let mut x = -(mouse_y as f32) * 0.12_f32;
+            let mut y = -(mouse_x as f32) * 0.12_f32;
+            let mut z = f32::from(roll);
+            let magnitude = (x * x + y * y + z * z).sqrt();
+            if magnitude > 1.0 {
+                let scale = 1.0_f32 / magnitude;
+                x *= scale;
+                y *= scale;
+                z *= scale;
+            }
+            let reconstructed = Vec3::new(f64::from(x), f64::from(y), f64::from(z));
+
+            prop_assert!(
+                ensure_bounded_control(reconstructed, "Godot reconstructed control").is_ok(),
+                "float32-valid source magnitude {} was rejected",
+                reconstructed.magnitude(),
+            );
+            prop_assert!(
+                reconstructed.magnitude()
+                    <= MAX_GRID_CONTROL_INPUT + CONTROL_INPUT_SOURCE_PRECISION_EPSILON
+            );
+        }
+    }
+
+    #[test]
+    fn control_precision_tolerance_does_not_admit_materially_unbounded_input() {
+        let source_precision_boundary = Vec3::new(
+            MAX_GRID_CONTROL_INPUT + CONTROL_INPUT_SOURCE_PRECISION_EPSILON,
+            0.0,
+            0.0,
+        );
+        assert!(ensure_bounded_control(source_precision_boundary, "boundary control").is_ok());
+        assert!(matches!(
+            ensure_bounded_control(Vec3::new(1.000_01, 0.0, 0.0), "materially unbounded"),
+            Err(IntentError::Rejected { ref code, .. })
+                if code == "control_input_out_of_range"
+        ));
     }
 
     #[test]
