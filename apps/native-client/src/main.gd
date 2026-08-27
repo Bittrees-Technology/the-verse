@@ -11,7 +11,7 @@ const PLANET_SHADER: Shader = preload("res://shaders/planet_surface.gdshader")
 const ATMOSPHERE_SHADER: Shader = preload("res://shaders/planet_atmosphere.gdshader")
 const CLOUD_SHADER: Shader = preload("res://shaders/planet_clouds.gdshader")
 const BLOCK_DAMAGE_SHADER: Shader = preload("res://shaders/block_damage.gdshader")
-const PROTOCOL_VERSION := 11
+const PROTOCOL_VERSION := 12
 const DEFAULT_SERVER := "ws://127.0.0.1:7777/ws"
 const DEFAULT_PLAYER_ID := "player-local"
 const STARTER_GRID := "grid-starter"
@@ -153,11 +153,17 @@ var build_rotation_quarters := 0
 var last_level := 1
 var pending_mine_position: Variant = null
 var inventory_open := false
-var grid_control_active := false
+var active_grid_control_id := ""
+var selected_cargo_inventory_id := ""
+var last_targeted_owned_grid_id := ""
 var inventory_item_labels: Dictionary = {}
 var inventory_capacity_labels: Dictionary = {}
 var inventory_capacity_bars: Dictionary = {}
 var inventory_rows: Dictionary = {}
+var inventory_title_labels: Dictionary = {}
+var inventory_subtitle_labels: Dictionary = {}
+var inventory_selectors: Dictionary = {}
+var inventory_transfer_buttons: Array[Button] = []
 var inventory_selected_resource := "component"
 var inventory_selected_side := "suit"
 var inventory_filters := {"suit": "all", "cargo": "all"}
@@ -271,7 +277,7 @@ func _input(event: InputEvent) -> void:
 	# Inventory text entry owns keyboard input. A held grid-control key still gets
 	# its release so opening the terminal cannot leave thrust latched.
 	if inventory_open and event is InputEventKey:
-		if event.keycode == KEY_M and not event.pressed and grid_control_active:
+		if event.keycode == KEY_M and not event.pressed and not active_grid_control_id.is_empty():
 			_stop_target_grid()
 		var focus_owner := get_viewport().gui_get_focus_owner()
 		var text_entry_focused := focus_owner is LineEdit or focus_owner is TextEdit
@@ -290,7 +296,7 @@ func _input(event: InputEvent) -> void:
 	if event is InputEventKey and event.keycode == KEY_M and not event.echo:
 		if event.pressed and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
 			_move_target_grid()
-		elif grid_control_active:
+		elif not active_grid_control_id.is_empty():
 			_stop_target_grid()
 		return
 
@@ -1234,15 +1240,20 @@ func _inventory_column(
 	var title_label := _hud_label(title, Vector2(16.0, 12.0), 16)
 	title_label.add_theme_color_override("font_color", Color(0.80, 0.89, 0.91))
 	panel.add_child(title_label)
+	inventory_title_labels[side] = title_label
 	var subtitle_label := _hud_label(subtitle, Vector2(16.0, 36.0), 10)
 	subtitle_label.add_theme_color_override("font_color", Color(0.38, 0.67, 0.74))
 	panel.add_child(subtitle_label)
+	inventory_subtitle_labels[side] = subtitle_label
 
 	var selector := OptionButton.new()
 	selector.position = Vector2(16.0, 60.0)
 	selector.size = Vector2(438.0, 32.0)
 	selector.add_item("%s  /  %s" % [title, subtitle])
+	if side == "cargo":
+		selector.item_selected.connect(_cargo_inventory_selected)
 	panel.add_child(selector)
+	inventory_selectors[side] = selector
 	var search := LineEdit.new()
 	search.placeholder_text = "Search inventory"
 	search.position = Vector2(16.0, 99.0)
@@ -1364,10 +1375,22 @@ func _add_transfer_controls(parent: Control) -> void:
 		button.size = Vector2(44.0, 34.0)
 		button.pressed.connect(_transfer_selected_inventory.bind(bool(data[2]), bool(data[3])))
 		parent.add_child(button)
+		inventory_transfer_buttons.append(button)
 
 
 func _transfer_selected_inventory(reverse: bool, all: bool) -> void:
 	_transfer_inventory_resource(inventory_selected_resource, reverse, all)
+
+
+func _cargo_inventory_selected(index: int) -> void:
+	var selector: OptionButton = inventory_selectors.get("cargo", null)
+	if selector == null or index < 0 or index >= selector.item_count:
+		return
+	var inventory_id := String(selector.get_item_metadata(index))
+	for candidate in _owned_cargo_candidates():
+		if String(candidate.get("inventory_id", "")) == inventory_id:
+			selected_cargo_inventory_id = inventory_id
+			return
 
 
 func _select_inventory_resource(side: String, resource: String) -> void:
@@ -1496,7 +1519,7 @@ func _poll_socket() -> void:
 			_send({
 				"type": "hello",
 				"protocol_version": PROTOCOL_VERSION,
-				"client_name": "godot-native-p1.0",
+				"client_name": "godot-native-p1.1",
 				"authentication": {
 					"kind": "local_development",
 					"player_id": requested_player_id,
@@ -2042,6 +2065,8 @@ func _correction_requires_snap(
 func _begin_player_resync() -> void:
 	authoritative_player_ready = false
 	bound_player_id = ""
+	active_grid_control_id = ""
+	last_targeted_owned_grid_id = ""
 	awaiting_reconnect_baseline = true
 	prediction_history.clear()
 	pending_controls.clear()
@@ -3090,7 +3115,12 @@ func _update_target() -> void:
 		)
 	else:
 		target_highlight.visible = false
-	if build_mode and not target_block.is_empty() and not _block_needs_weld(target_block["block"]):
+	if (
+		build_mode
+		and not target_block.is_empty()
+		and _target_grid_owned_by_local()
+		and not _block_needs_weld(target_block["block"])
+	):
 		var grid: Dictionary = target_block["grid"]
 		var grid_position := _vec3(grid.get("position", {}))
 		var grid_basis := _grid_basis(grid)
@@ -3945,7 +3975,12 @@ func _update_tool_action(delta: float) -> void:
 		action_key = "damage:%s" % target_block["block"].get("block_id", "")
 		duration = DAMAGE_DURATION
 		action_name = "CUTTING ARMOR"
-	elif holding_primary and build_mode and not target_block.is_empty():
+	elif (
+		holding_primary
+		and build_mode
+		and not target_block.is_empty()
+		and _target_grid_owned_by_local()
+	):
 		var construction_target: Dictionary = target_block["block"]
 		if _block_needs_weld(construction_target):
 			action_key = "weld:%s" % construction_target.get("block_id", "")
@@ -4079,6 +4114,9 @@ func _build_selected_block() -> void:
 	if target_block.is_empty():
 		_set_message("Aim at a grid block before building", true)
 		return
+	if not _target_grid_owned_by_local():
+		_report_foreign_grid_access(target_block.get("grid", {}))
+		return
 	var coordinate := _build_coordinate()
 	_send({
 		"type": "build_block",
@@ -4093,6 +4131,9 @@ func _build_selected_block() -> void:
 func _weld_target_block() -> void:
 	if target_block.is_empty():
 		_set_message("Aim at an unfinished frame or damaged block", true)
+		return
+	if not _target_grid_owned_by_local():
+		_report_foreign_grid_access(target_block.get("grid", {}))
 		return
 	var block: Dictionary = target_block["block"]
 	if not _block_needs_weld(block):
@@ -4121,7 +4162,9 @@ func _build_coordinate() -> Vector3i:
 
 
 func _toggle_anchor() -> void:
-	var grid_id := _target_or_starter_grid()
+	var grid_id := _owned_grid_for_command()
+	if grid_id.is_empty():
+		return
 	_send({
 		"type": "toggle_grid_anchor",
 		"operation_id": _operation_id("anchor"),
@@ -4130,61 +4173,83 @@ func _toggle_anchor() -> void:
 
 
 func _move_target_grid() -> void:
-	var grid_id := _target_or_starter_grid()
+	var grid_id := _owned_grid_for_command()
+	if grid_id.is_empty():
+		return
 	var direction := -camera.global_transform.basis.z.normalized()
 	var grid: Dictionary = grid_lookup.get(grid_id, {})
 	var local_direction := (_grid_basis(grid).inverse() * direction).limit_length(0.999)
-	grid_control_active = true
-	_send({
+	if _send({
 		"type": "set_grid_control",
 		"operation_id": _operation_id("grid-control"),
 		"grid_id": grid_id,
 		"linear_input": _protocol_vec3(local_direction),
 		"angular_input": _protocol_vec3(Vector3(0.0, 0.24, 0.0)),
 		"dampeners": true,
-	})
+	}):
+		active_grid_control_id = grid_id
 
 
 func _stop_target_grid() -> void:
-	grid_control_active = false
+	var grid_id := _take_active_grid_control_id()
+	if grid_id.is_empty():
+		return
 	_send({
 		"type": "set_grid_control",
 		"operation_id": _operation_id("grid-stop"),
-		"grid_id": _target_or_starter_grid(),
+		"grid_id": grid_id,
 		"linear_input": _protocol_vec3(Vector3.ZERO),
 		"angular_input": _protocol_vec3(Vector3.ZERO),
 		"dampeners": true,
 	})
 
 
+func _take_active_grid_control_id() -> String:
+	var grid_id := active_grid_control_id
+	active_grid_control_id = ""
+	return grid_id
+
+
 func _refine_ore() -> void:
+	var inventory_id := _local_inventory_id()
+	if inventory_id.is_empty():
+		_set_message("No authoritative suit inventory is available", true)
+		return
 	_send({
 		"type": "refine_ore",
 		"operation_id": _operation_id("refine"),
-		"inventory_id": _local_inventory_id(),
+		"inventory_id": inventory_id,
 		"batches": 1,
 	})
 
 
 func _craft_component() -> void:
+	var inventory_id := _local_inventory_id()
+	if inventory_id.is_empty():
+		_set_message("No authoritative suit inventory is available", true)
+		return
 	_send({
 		"type": "craft_component",
 		"operation_id": _operation_id("craft"),
-		"inventory_id": _local_inventory_id(),
+		"inventory_id": inventory_id,
 		"quantity": 1,
 	})
 
 
 func _transfer_to_or_from_cargo(reverse: bool) -> void:
-	var cargo_id := _first_cargo_inventory()
+	var cargo_id := _selected_owned_cargo_inventory()
 	if cargo_id.is_empty():
-		_set_message("No live cargo inventory is available", true)
+		_set_message("NO AUTHORIZED CARGO LINK", true)
+		return
+	var suit_id := _local_inventory_id()
+	if suit_id.is_empty():
+		_set_message("No authoritative suit inventory is available", true)
 		return
 	_send({
 		"type": "transfer_inventory",
 		"operation_id": _operation_id("transfer"),
-		"source_inventory_id": cargo_id if reverse else _local_inventory_id(),
-		"destination_inventory_id": _local_inventory_id() if reverse else cargo_id,
+		"source_inventory_id": cargo_id if reverse else suit_id,
+		"destination_inventory_id": suit_id if reverse else cargo_id,
 		"resource": "ore",
 		"quantity": 1,
 	})
@@ -4216,7 +4281,7 @@ func _enter_incapacitated_state() -> void:
 	action_target_key = ""
 	action_cooldown = 0.0
 	build_mode = false
-	grid_control_active = false
+	active_grid_control_id = ""
 	recovery_operation = ""
 	if inventory_open:
 		inventory_open = false
@@ -4281,12 +4346,16 @@ func _toggle_helmet() -> void:
 
 
 func _transfer_inventory_resource(resource: String, reverse: bool, all: bool) -> void:
-	var cargo_id := _first_cargo_inventory()
+	var cargo_id := _selected_owned_cargo_inventory()
 	if cargo_id.is_empty():
-		_set_message("No live cargo inventory is available", true)
+		_set_message("NO AUTHORIZED CARGO LINK", true)
 		return
-	var source_id := cargo_id if reverse else _local_inventory_id()
-	var destination_id := _local_inventory_id() if reverse else cargo_id
+	var suit_id := _local_inventory_id()
+	if suit_id.is_empty():
+		_set_message("No authoritative suit inventory is available", true)
+		return
+	var source_id := cargo_id if reverse else suit_id
+	var destination_id := suit_id if reverse else cargo_id
 	var quantity := 1
 	if all:
 		quantity = _resource_amount(_inventory(source_id).get("contents", {}), resource)
@@ -4314,22 +4383,159 @@ func _resource_amount(contents: Dictionary, resource: String) -> int:
 	return 0
 
 
-func _first_cargo_inventory() -> String:
-	for inventory in snapshot.get("inventories", []):
-		var domain: Dictionary = inventory.get("domain", {})
-		if domain.get("kind", "") == "cargo":
-			return inventory.get("inventory_id", "")
+func _selected_owned_cargo_inventory() -> String:
+	_refresh_owned_cargo_selection()
+	return selected_cargo_inventory_id
+
+
+func _refresh_owned_cargo_selection() -> Array[Dictionary]:
+	var candidates := _owned_cargo_candidates()
+	if candidates.is_empty():
+		selected_cargo_inventory_id = ""
+		last_targeted_owned_grid_id = _targeted_owned_grid_id()
+		return candidates
+
+	var candidate_ids: Array[String] = []
+	for candidate in candidates:
+		candidate_ids.append(String(candidate.get("inventory_id", "")))
+	var targeted_grid_id := _targeted_owned_grid_id()
+	if targeted_grid_id != last_targeted_owned_grid_id and not targeted_grid_id.is_empty():
+		for candidate in candidates:
+			if String(candidate.get("grid_id", "")) == targeted_grid_id:
+				selected_cargo_inventory_id = String(candidate.get("inventory_id", ""))
+				break
+	last_targeted_owned_grid_id = targeted_grid_id
+	if not selected_cargo_inventory_id in candidate_ids:
+		selected_cargo_inventory_id = String(candidates.front().get("inventory_id", ""))
+	return candidates
+
+
+func _owned_cargo_candidates() -> Array[Dictionary]:
+	var candidates: Array[Dictionary] = []
+	for inventory_value in snapshot.get("inventories", []):
+		if not inventory_value is Dictionary:
+			continue
+		var inventory: Dictionary = inventory_value
+		if String(inventory.get("domain", {}).get("kind", "")) != "cargo":
+			continue
+		var binding := _cargo_inventory_binding(inventory)
+		if binding.is_empty():
+			continue
+		var grid: Dictionary = binding["grid"]
+		var block: Dictionary = binding["block"]
+		if (
+			not _grid_owned_by_local(grid)
+			or not bool(block.get("construction_complete", false))
+			or int(block.get("health", 0)) <= 0
+		):
+			continue
+		candidates.append({
+			"inventory_id": String(inventory.get("inventory_id", "")),
+			"grid_id": String(binding.get("grid_id", "")),
+			"block_id": String(block.get("block_id", "")),
+		})
+	candidates.sort_custom(func(first: Dictionary, second: Dictionary) -> bool:
+		var first_grid := String(first.get("grid_id", ""))
+		var second_grid := String(second.get("grid_id", ""))
+		if first_grid != second_grid:
+			return first_grid < second_grid
+		var first_block := String(first.get("block_id", ""))
+		var second_block := String(second.get("block_id", ""))
+		if first_block != second_block:
+			return first_block < second_block
+		return String(first.get("inventory_id", "")) < String(second.get("inventory_id", ""))
+	)
+	return candidates
+
+
+func _cargo_inventory_binding(inventory: Dictionary) -> Dictionary:
+	var inventory_id := String(inventory.get("inventory_id", ""))
+	var domain: Dictionary = inventory.get("domain", {})
+	var block_id := String(domain.get("block_id", ""))
+	if inventory_id.is_empty() or block_id.is_empty():
+		return {}
+	var matches: Array[Dictionary] = []
+	for grid_id in _all_grid_ids():
+		var grid := _grid_record(grid_id)
+		for block_value in grid.get("blocks", []):
+			if not block_value is Dictionary:
+				continue
+			var block: Dictionary = block_value
+			if (
+				String(block.get("block_id", "")) == block_id
+				and String(block.get("inventory_id", "")) == inventory_id
+				and String(block.get("kind", "")) == "cargo"
+			):
+				matches.append({"grid_id": grid_id, "grid": grid, "block": block})
+	return matches.front() if matches.size() == 1 else {}
+
+
+func _all_grid_ids() -> Array[String]:
+	var ids: Dictionary = {}
+	for grid_value in snapshot.get("grids", []):
+		if grid_value is Dictionary:
+			var grid_id := String(grid_value.get("grid_id", ""))
+			if not grid_id.is_empty():
+				ids[grid_id] = true
+	for grid_id in grid_lookup:
+		ids[String(grid_id)] = true
+	var ordered: Array[String] = []
+	for grid_id in ids:
+		ordered.append(String(grid_id))
+	ordered.sort()
+	return ordered
+
+
+func _grid_record(grid_id: String) -> Dictionary:
+	if grid_lookup.has(grid_id):
+		return grid_lookup[grid_id]
+	for grid_value in snapshot.get("grids", []):
+		if grid_value is Dictionary and String(grid_value.get("grid_id", "")) == grid_id:
+			return grid_value
+	return {}
+
+
+func _grid_owned_by_local(grid: Dictionary) -> bool:
+	var owner_player_id := String(grid.get("owner_player_id", ""))
+	return not owner_player_id.is_empty() and owner_player_id == _controlled_player_id()
+
+
+func _target_grid_owned_by_local() -> bool:
+	return not target_block.is_empty() and _grid_owned_by_local(target_block.get("grid", {}))
+
+
+func _targeted_owned_grid_id() -> String:
+	return String(target_block.get("grid_id", "")) if _target_grid_owned_by_local() else ""
+
+
+func _owned_grid_ids() -> Array[String]:
+	var owned: Array[String] = []
+	for grid_id in _all_grid_ids():
+		if _grid_owned_by_local(_grid_record(grid_id)):
+			owned.append(grid_id)
+	return owned
+
+
+func _owned_grid_for_command(report_error := true) -> String:
+	if not target_block.is_empty():
+		if _target_grid_owned_by_local():
+			return String(target_block.get("grid_id", ""))
+		if report_error:
+			_report_foreign_grid_access(target_block.get("grid", {}))
+		return ""
+	var owned := _owned_grid_ids()
+	if not owned.is_empty():
+		return owned.front()
+	if report_error:
+		_set_message("No owned grid is available for engineering control", true)
 	return ""
 
 
-func _target_or_starter_grid() -> String:
-	if not target_block.is_empty():
-		return target_block.get("grid_id", STARTER_GRID)
-	if grid_lookup.has(STARTER_GRID):
-		return STARTER_GRID
-	if not grid_lookup.is_empty():
-		return grid_lookup.keys()[0]
-	return STARTER_GRID
+func _report_foreign_grid_access(grid: Dictionary) -> void:
+	var owner := String(grid.get("owner_player_id", "UNREGISTERED"))
+	if owner.is_empty():
+		owner = "UNREGISTERED"
+	_set_message("ACCESS LOCKED // PROPERTY OF %s" % owner, true)
 
 
 func _send(message: Dictionary) -> bool:
@@ -4515,7 +4721,17 @@ func _update_interface() -> void:
 		var health := int(block.get("health", 0))
 		var max_health := maxi(int(block.get("max_health", health)), 1)
 		var integrity := health * 100 / max_health
-		if build_mode:
+		if not _target_grid_owned_by_local():
+			var owner := String(target_block.get("grid", {}).get(
+				"owner_player_id", "UNREGISTERED"
+			))
+			if owner.is_empty():
+				owner = "UNREGISTERED"
+			target_label.text = (
+				"%s // INTEGRITY %d%%\nACCESS LOCKED // PROPERTY OF %s\nHOLD RMB  //  CUT AND SALVAGE"
+				% [String(block.get("kind", "block")).to_upper(), integrity, owner]
+			)
+		elif build_mode:
 			if health < max_health:
 				if bool(block.get("construction_complete", false)):
 					target_label.text = "%s DAMAGED // INTEGRITY %d%%\nHOLD LMB  //  REPAIR" % [
@@ -4542,8 +4758,10 @@ func _update_interface() -> void:
 			if build_mode
 			else "EVA NAVIGATION // AIM AT ROCK OR MACHINERY"
 		)
-	if grid_control_active:
-		mode_label.text = "GRID CONTROL ACTIVE // RELEASE M OR PRESS X TO DAMPEN"
+	if not active_grid_control_id.is_empty():
+		mode_label.text = "GRID CONTROL ACTIVE // %s // RELEASE M OR PRESS X TO DAMPEN" % active_grid_control_id
+	elif build_mode and not target_block.is_empty() and not _target_grid_owned_by_local():
+		mode_label.text = "CONSTRUCTION ACCESS LOCKED // TARGET AN OWNED GRID"
 	elif action_charge <= 0.0:
 		mode_label.text = (
 			"CONSTRUCTION HOLOGRAM // %s // ROT %03d°" % [
@@ -4562,8 +4780,10 @@ func _update_interface() -> void:
 
 
 func _update_inventory_terminal() -> void:
+	var cargo_candidates := _refresh_owned_cargo_selection()
+	_update_cargo_inventory_selector(cargo_candidates)
 	var suit_inventory := _inventory(_local_inventory_id())
-	var cargo_inventory := _inventory(_first_cargo_inventory())
+	var cargo_inventory := _inventory(selected_cargo_inventory_id)
 	for side_data in [["suit", suit_inventory], ["cargo", cargo_inventory]]:
 		var side := String(side_data[0])
 		var inventory: Dictionary = side_data[1]
@@ -4587,15 +4807,62 @@ func _update_inventory_terminal() -> void:
 			if mass_data.size() == 2:
 				var mass_label: Label = mass_data[0]
 				mass_label.text = "%.1f kg" % (float(quantity) * float(mass_data[1]))
-		var capacity := maxi(int(inventory.get("capacity_liters", 0)), 1)
+		var reported_capacity := int(inventory.get("capacity_liters", 0))
+		var capacity := maxi(reported_capacity, 1)
 		var used := int(inventory.get("used_liters", 0))
 		var mass_kg := float(inventory.get("mass_grams", 0)) / 1000.0
 		var capacity_label: Label = inventory_capacity_labels.get(side, null)
 		if capacity_label != null:
-			capacity_label.text = "%d / %d L  //  %.1f kg" % [used, capacity, mass_kg]
+			capacity_label.text = "%d / %d L  //  %.1f kg" % [
+				used, reported_capacity, mass_kg
+			]
 		var capacity_bar: ProgressBar = inventory_capacity_bars.get(side, null)
 		if capacity_bar != null:
 			capacity_bar.value = clampf(float(used) / float(capacity), 0.0, 1.0)
+
+
+func _update_cargo_inventory_selector(candidates: Array[Dictionary]) -> void:
+	var selector: OptionButton = inventory_selectors.get("cargo", null)
+	var title_label: Label = inventory_title_labels.get("cargo", null)
+	var subtitle_label: Label = inventory_subtitle_labels.get("cargo", null)
+	var available := not selected_cargo_inventory_id.is_empty()
+	for button in inventory_transfer_buttons:
+		button.disabled = not available
+	if selector == null:
+		return
+	selector.clear()
+	if not available:
+		selector.add_item("NO AUTHORIZED CARGO LINK")
+		selector.set_item_metadata(0, "")
+		selector.disabled = true
+		if title_label != null:
+			title_label.text = "NO AUTHORIZED CARGO LINK"
+		if subtitle_label != null:
+			subtitle_label.text = "OWNED COMPLETED CARGO REQUIRED"
+		return
+
+	selector.disabled = false
+	var selected_index := 0
+	var selected_candidate: Dictionary = {}
+	for index in candidates.size():
+		var candidate: Dictionary = candidates[index]
+		var grid_id := String(candidate.get("grid_id", ""))
+		var block_id := String(candidate.get("block_id", ""))
+		var inventory_id := String(candidate.get("inventory_id", ""))
+		selector.add_item("%s  /  %s" % [grid_id, block_id])
+		selector.set_item_metadata(index, inventory_id)
+		if inventory_id == selected_cargo_inventory_id:
+			selected_index = index
+			selected_candidate = candidate
+	selector.select(selected_index)
+	if selected_candidate.is_empty() and not candidates.is_empty():
+		selected_candidate = candidates[selected_index]
+	if title_label != null:
+		title_label.text = String(selected_candidate.get("grid_id", "OWNED GRID")).to_upper()
+	if subtitle_label != null:
+		subtitle_label.text = "AUTHORIZED CARGO // %s" % String(
+			selected_candidate.get("block_id", "")
+		)
 
 
 func _mission_text(career: Dictionary) -> String:
