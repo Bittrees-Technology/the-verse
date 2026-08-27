@@ -184,8 +184,27 @@ impl Runtime {
     }
 
     pub fn execute(&mut self, message: &ClientMessage) -> Result<IntentReceipt, RuntimeError> {
+        let actor_player_id = self.state.player.player_id.clone();
+        self.execute_as(&actor_player_id, message)
+    }
+
+    /// Execute one client intent for the player identity already authenticated
+    /// by the connection boundary. The actor is deliberately separate from the
+    /// client payload so changing JSON fields cannot select another player.
+    pub fn execute_as(
+        &mut self,
+        actor_player_id: &str,
+        message: &ClientMessage,
+    ) -> Result<IntentReceipt, RuntimeError> {
         if self.halted {
             return Err(RuntimeError::Halted);
+        }
+        if actor_player_id != self.state.player.player_id {
+            return Err(IntentError::rejected(
+                "actor_not_present",
+                "the authenticated player is not present in this simulation cell",
+            )
+            .into());
         }
         let operation_id = message.operation_id().ok_or_else(|| {
             IntentError::rejected(
@@ -198,7 +217,9 @@ impl Runtime {
             return Ok(receipt.clone());
         }
 
-        let event = self.state.prepare_client_event(message)?;
+        let event = self
+            .state
+            .prepare_client_event_as(actor_player_id, message)?;
         let mut next_state = self.state.clone();
         next_state.apply_event(&event)?;
         if let EventPayload::VoxelMined { coordinate, .. } = &event.payload {
@@ -650,6 +671,20 @@ impl WorldState {
         &self,
         message: &ClientMessage,
     ) -> Result<CanonicalEvent, IntentError> {
+        self.prepare_client_event_as(&self.player.player_id, message)
+    }
+
+    pub fn prepare_client_event_as(
+        &self,
+        actor_player_id: &str,
+        message: &ClientMessage,
+    ) -> Result<CanonicalEvent, IntentError> {
+        if actor_player_id != self.player.player_id {
+            return Err(IntentError::rejected(
+                "actor_not_present",
+                "the authenticated player is not present in this simulation cell",
+            ));
+        }
         let operation_id = message.operation_id().ok_or_else(|| {
             IntentError::rejected("not_a_mutating_intent", "message has no operation ID")
         })?;
@@ -1085,7 +1120,7 @@ impl WorldState {
         };
 
         Ok(self.new_event(
-            "player-local",
+            actor_player_id,
             "human",
             Some(operation_id.to_owned()),
             payload,
@@ -1183,7 +1218,7 @@ impl WorldState {
                 ));
             }
             EventPayload::PlayerRespawned { .. }
-                if event.actor_profile_id != "player-local"
+                if event.actor_profile_id != self.player.player_id
                     || event.actor_type != "human"
                     || event.operation_id.as_deref().is_none_or(str::is_empty) =>
             {
@@ -4128,6 +4163,45 @@ mod tests {
 
     fn runtime() -> Runtime {
         Runtime::open(tempdir().expect("tempdir").keep(), 42, 5).expect("runtime opens")
+    }
+
+    #[test]
+    fn authenticated_actor_is_separate_from_the_client_intent() {
+        let mut runtime = runtime();
+        let before_hash = runtime.state().state_hash();
+        let before_sequence = runtime.state().event_sequence;
+        let intent = ClientMessage::SetPlayerControl {
+            operation_id: "actor-isolation-1".into(),
+            movement_epoch: runtime.state().player.movement_epoch,
+            input_sequence: 1,
+            linear_input: Vec3::new(0.0, 0.0, -1.0),
+            angular_input: Vec3::ZERO,
+            boost: false,
+            dampeners: true,
+            jump: false,
+        };
+
+        let rejected = runtime
+            .execute_as("another-player", &intent)
+            .expect_err("an unbound actor cannot control the canonical player");
+        assert!(matches!(
+            rejected,
+            RuntimeError::Intent(IntentError::Rejected { ref code, .. })
+                if code == "actor_not_present"
+        ));
+        assert_eq!(runtime.state().event_sequence, before_sequence);
+        assert_eq!(runtime.state().state_hash(), before_hash);
+
+        let receipt = runtime
+            .execute_as("player-local", &intent)
+            .expect("the bound actor can submit its own control");
+        assert_eq!(runtime.state().event_sequence, before_sequence + 1);
+        assert_eq!(runtime.state().player.last_received_input_sequence, 1);
+        assert_eq!(receipt.event_sequence, before_sequence + 1);
+        assert_eq!(
+            runtime.state().processed_operations["actor-isolation-1"],
+            receipt
+        );
     }
 
     fn move_player_near_grid(runtime: &mut Runtime) {

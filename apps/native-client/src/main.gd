@@ -11,7 +11,7 @@ const PLANET_SHADER: Shader = preload("res://shaders/planet_surface.gdshader")
 const ATMOSPHERE_SHADER: Shader = preload("res://shaders/planet_atmosphere.gdshader")
 const CLOUD_SHADER: Shader = preload("res://shaders/planet_clouds.gdshader")
 const BLOCK_DAMAGE_SHADER: Shader = preload("res://shaders/block_damage.gdshader")
-const PROTOCOL_VERSION := 10
+const PROTOCOL_VERSION := 11
 const DEFAULT_SERVER := "ws://127.0.0.1:7777/ws"
 const PLAYER_INVENTORY := "inventory-player-local"
 const STARTER_GRID := "grid-starter"
@@ -1441,7 +1441,11 @@ func _poll_socket() -> void:
 			_send({
 				"type": "hello",
 				"protocol_version": PROTOCOL_VERSION,
-				"client_name": "godot-native-p0.10",
+				"client_name": "godot-native-p1.0",
+				"authentication": {
+					"kind": "local_development",
+					"player_id": "player-local",
+				},
 			})
 		while socket.get_available_packet_count() > 0:
 			var text := socket.get_packet().get_string_from_utf8()
