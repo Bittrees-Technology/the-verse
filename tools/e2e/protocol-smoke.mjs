@@ -175,13 +175,23 @@ async function run() {
   ).snapshot;
   send({
     type: "hello",
-    protocol_version: 3,
+    protocol_version: 4,
     client_name: "node-authoritative-e2e",
   });
   assert.equal(world.conservation.valid, true);
-  assert.equal(world.content_manifest_version, "p0.4.0");
+  assert.equal(world.content_manifest_version, "p0.5.0");
   assert.equal(world.grids.length, 1);
   assert.ok(world.voxels.length > 1_000);
+  assert.equal(world.environment.celestial_body_name, "Khepri Prime");
+  assert.equal(world.environment.breathable, true);
+  assert.ok(world.environment.gravity_m_s2 > 4.0);
+  assert.ok(world.environment.atmosphere_density > 0.5);
+  assert.equal(world.player.suit_oxygen_milli, 1_000);
+  assert.equal(world.player.helmet_closed, true);
+  assert.equal(world.player.jetpack_enabled, true);
+  assert.ok(playerInventory(world).capacity_liters > 0);
+  assert.ok(playerInventory(world).used_liters > 0);
+  assert.ok(playerInventory(world).mass_grams > 0);
 
   const mined = new Set();
   while (playerInventory(world).contents.ore < 4 || mined.size < 3) {
@@ -214,6 +224,7 @@ async function run() {
     (inventory) => inventory.domain.kind === "cargo",
   );
   assert.ok(cargo, "starter cargo inventory exists");
+  assert.ok(cargo.capacity_liters > playerInventory(world).capacity_liters);
   world = await intent("transfer_inventory", {
     source_inventory_id: "inventory-player-local",
     destination_inventory_id: cargo.inventory_id,

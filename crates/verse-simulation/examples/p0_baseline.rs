@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tempfile::tempdir;
-use verse_protocol::{BlockKind, ClientMessage, IVec3, Vec3};
+use verse_protocol::{BlockKind, ClientMessage, IVec3, ResourceKind, Vec3};
 use verse_simulation::Runtime;
 
 #[derive(Debug, Serialize)]
@@ -92,6 +92,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &mut mining_move_sequence,
     )?;
     let mut mining_samples = Vec::new();
+    let cargo_inventory_id = runtime
+        .state()
+        .inventories
+        .keys()
+        .find(|inventory_id| inventory_id.contains("cargo"))
+        .cloned()
+        .ok_or("benchmark cargo inventory is missing")?;
     for index in 0..100_u64 {
         let target = runtime
             .state()
@@ -114,6 +121,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             coordinate: target,
         })?;
         mining_samples.push(started.elapsed());
+        let mined_quantity = runtime.state().inventories["inventory-player-local"]
+            .contents
+            .ore;
+        runtime.execute(&ClientMessage::TransferInventory {
+            operation_id: format!("benchmark-offload-{index}"),
+            source_inventory_id: "inventory-player-local".into(),
+            destination_inventory_id: cargo_inventory_id.clone(),
+            resource: ResourceKind::Ore,
+            quantity: mined_quantity,
+        })?;
     }
     runtime.persist_snapshot()?;
     let expected_hash = runtime.state().state_hash();

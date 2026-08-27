@@ -2,7 +2,7 @@
 
 The Verse is an open-source persistent voxel space universe, work-and-economy simulator, and Web3 marketplace.
 
-The repository now contains **P0.4: Engineering Hands**, built on the first-person Salvage Frontier loop. It is still a single-player proof of the authoritative loop—not yet the public multiplayer universe or real-value economy—but mining now proves visible persistent excavation and construction uses oriented frames, staged welding, and functional-integrity rules.
+The repository now contains **P0.5: Planetary Logistics**, built on the first-person Salvage Frontier and Engineering Hands loops. It is still a single-player proof—not yet the public multiplayer universe or real-value economy—but inventory volume and mass, suit modes, gravity, atmosphere, oxygen, mining, and staged construction now share one authoritative persistent world.
 
 ## Play it on macOS
 
@@ -15,7 +15,7 @@ tools/dev/run-local.sh
 
 The bootstrap downloads the pinned Godot 4.7.2 editor from the official release and verifies its checksum. The launcher starts the authoritative server and native client. While the server is running, the browser command center is available at <http://127.0.0.1:7777>.
 
-You begin outside a powered 25-block salvage skiff beside an asteroid. The guided contract asks you to extract three voxels, refine ore, fabricate a component, extend the rig, and anchor it into the rock. Actions earn persistent career experience and clearance levels.
+You begin above the surface of Khepri Prime beside a powered 25-block salvage skiff and a mineable outcrop. The guided contract asks you to extract three voxels, refine ore, fabricate a component, extend the rig, and anchor it into the rock. Turn off the jetpack to fall under planetary gravity and walk; open the helmet in breathable atmosphere to use ambient oxygen. Actions earn persistent career experience and clearance levels.
 
 Native controls are shown in the client:
 
@@ -24,6 +24,8 @@ Native controls are shown in the client:
 | EVA thrust / ascend / descend | `WASD` / `Space` / `C` |
 | Boost / toggle dampeners | `Shift` / `Z` |
 | Toggle helmet work light | `L` |
+| Toggle jetpack / helmet seal | `J` / `H` |
+| Open engineering inventory terminal | `I` |
 | Mine highlighted voxel | Hold left mouse |
 | Enter construction / choose block | `B` / `1`–`5` |
 | Rotate construction hologram | `Q` / `E` |
@@ -46,7 +48,7 @@ Linux native client packaging and signed direct downloads remain scheduled work.
 tools/ci/check.sh
 ```
 
-This runs the Rust tests and lints, browser syntax checks, Godot validation, and an end-to-end scenario that restarts the server and proves exact state recovery. See the [visual engineering checkpoint](docs/gameplay/engineering-realism.md), [Salvage Frontier gameplay specification](docs/gameplay/salvage-frontier.md), and [P0 implementation guide](docs/architecture/p0-implementation.md) for scope and limitations.
+This runs the Rust tests and lints, browser syntax checks, Godot validation, and an end-to-end scenario that restarts the server and proves exact state recovery. See the [Planetary Logistics checkpoint](docs/gameplay/planetary-logistics.md), [visual engineering checkpoint](docs/gameplay/engineering-realism.md), and [P0 implementation guide](docs/architecture/p0-implementation.md) for scope and limitations.
 
 ## Product pillars
 
@@ -73,7 +75,7 @@ Start with [the documentation map](docs/README.md), then read:
 
 ## Current status
 
-P0.4 adds server-range-checked frame placement, persistent quarter-turn orientation, three staged weld operations, nonfunctional unfinished blocks, authoritative construction completion, mined-coordinate regression proofs, construction-frame visuals, rotating holograms, integrity telemetry, and mining fragments. It retains the P0.3 continuous asteroid and physically shaded presentation. Multiplayer, character-body and rigid-grid collision physics, landable planets, safe zones, accounts, AMMs, and blockchain settlement are not in this slice. Those systems remain sequenced in the [delivery roadmap](docs/roadmap/roadmap.md).
+P0.5 adds a two-sided logistics terminal with exact stack transfers, physical volume and mass, capacity enforcement, a procedurally shaded planetary surface, atmosphere and local gravity telemetry, persistent helmet/jetpack modes, authoritative oxygen changes, gravity-aware walking and jumping, flush one-meter block envelopes, and clearer cargo, reactor, battery, drill, anchor, and control silhouettes. The Khepri surface is an environmental test body rather than a complete editable voxel planet; multiplayer, rigid-grid collision physics, global planetary streaming, safe zones, accounts, AMMs, and blockchain settlement remain sequenced in the [delivery roadmap](docs/roadmap/roadmap.md).
 
 ## Licensing
 

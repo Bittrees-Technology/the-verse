@@ -3,7 +3,8 @@ extends Node3D
 
 const ARMOR_TEXTURE: Texture2D = preload("res://assets/materials/verse_armor_albedo.png")
 const ASTEROID_SHADER: Shader = preload("res://shaders/asteroid_surface.gdshader")
-const PROTOCOL_VERSION := 3
+const PLANET_SHADER: Shader = preload("res://shaders/planet_surface.gdshader")
+const PROTOCOL_VERSION := 4
 const DEFAULT_SERVER := "ws://127.0.0.1:7777/ws"
 const PLAYER_INVENTORY := "inventory-player-local"
 const STARTER_GRID := "grid-starter"
@@ -17,6 +18,10 @@ const TARGET_RANGE := 9.0
 const MINE_DURATION := 0.72
 const WELD_DURATION := 0.52
 const DAMAGE_DURATION := 0.46
+const WALK_SPEED := 4.4
+const WALK_ACCELERATION := 15.0
+const JUMP_SPEED := 4.2
+const PLAYER_SURFACE_CLEARANCE := 1.05
 const ISO_LEVEL := 0.5
 const MARCHING_CORNERS: Array[Vector3i] = [
 	Vector3i(0, 0, 0), Vector3i(1, 0, 0),
@@ -68,11 +73,16 @@ var build_mode := false
 var build_rotation_quarters := 0
 var last_level := 1
 var pending_mine_position: Variant = null
+var inventory_open := false
+var inventory_item_labels: Dictionary = {}
+var inventory_capacity_labels: Dictionary = {}
+var inventory_capacity_bars: Dictionary = {}
 
 var camera: Camera3D
 var asteroid_root: Node3D
 var grids_root: Node3D
 var stars_root: Node3D
+var planet_root: Node3D
 var target_highlight: MeshInstance3D
 var status_label: Label
 var inventory_label: Label
@@ -96,6 +106,7 @@ var action_flare: MeshInstance3D
 var action_sparks: GPUParticles3D
 var mining_fragments: GPUParticles3D
 var suit_light: SpotLight3D
+var inventory_overlay: Control
 
 var rock_material: Material
 var block_materials: Dictionary = {}
@@ -126,7 +137,7 @@ func _process(delta: float) -> void:
 	_update_interface()
 
 
-func _unhandled_input(event: InputEvent) -> void:
+func _input(event: InputEvent) -> void:
 	if event is InputEventMouseMotion and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
 		camera.rotation.y -= event.relative.x * MOUSE_SENSITIVITY
 		camera.rotation.x = clamp(
@@ -139,11 +150,20 @@ func _unhandled_input(event: InputEvent) -> void:
 	if event is InputEventKey and event.pressed and not event.echo:
 		match event.keycode:
 			KEY_ESCAPE:
-				Input.mouse_mode = (
-					Input.MOUSE_MODE_VISIBLE
-					if Input.mouse_mode == Input.MOUSE_MODE_CAPTURED
-					else Input.MOUSE_MODE_CAPTURED
-				)
+				if inventory_open:
+					_set_inventory_open(false)
+				else:
+					Input.mouse_mode = (
+						Input.MOUSE_MODE_VISIBLE
+						if Input.mouse_mode == Input.MOUSE_MODE_CAPTURED
+						else Input.MOUSE_MODE_CAPTURED
+					)
+			KEY_I:
+				_set_inventory_open(not inventory_open)
+			KEY_J:
+				_toggle_jetpack()
+			KEY_H:
+				_toggle_helmet()
 			KEY_1:
 				selected_block_kind = "structural"
 				build_mode = true
@@ -235,13 +255,13 @@ func _build_environment() -> void:
 	var world_environment := WorldEnvironment.new()
 	var environment := Environment.new()
 	environment.background_mode = Environment.BG_COLOR
-	environment.background_color = Color(0.004, 0.007, 0.015)
+	environment.background_color = Color(0.006, 0.016, 0.032)
 	environment.ambient_light_source = Environment.AMBIENT_SOURCE_COLOR
 	environment.ambient_light_color = Color(0.20, 0.28, 0.42)
 	environment.ambient_light_energy = 0.38
 	environment.tonemap_mode = Environment.TONE_MAPPER_FILMIC
 	environment.fog_enabled = true
-	environment.fog_light_color = Color(0.035, 0.07, 0.12)
+	environment.fog_light_color = Color(0.055, 0.11, 0.16)
 	environment.fog_light_energy = 0.34
 	environment.fog_density = 0.0018
 	environment.fog_sky_affect = 0.18
@@ -288,6 +308,9 @@ func _build_environment() -> void:
 	stars_root = Node3D.new()
 	stars_root.name = "Starfield"
 	add_child(stars_root)
+	planet_root = Node3D.new()
+	planet_root.name = "KhepriPrime"
+	add_child(planet_root)
 
 	var asteroid_material := ShaderMaterial.new()
 	asteroid_material.shader = ASTEROID_SHADER
@@ -370,16 +393,46 @@ func _glass_material() -> StandardMaterial3D:
 
 func _build_distant_world() -> void:
 	var planet := MeshInstance3D.new()
-	planet.name = "KhepriDistantWorld"
+	planet.name = "KhepriPrimeSurface"
 	var planet_mesh := SphereMesh.new()
-	planet_mesh.radius = 22.0
-	planet_mesh.height = 44.0
-	planet_mesh.radial_segments = 48
-	planet_mesh.rings = 24
-	planet_mesh.material = _material(Color(0.055, 0.13, 0.18), 0.92, 0.02)
+	planet_mesh.radius = 90.0
+	planet_mesh.height = 180.0
+	planet_mesh.radial_segments = 128
+	planet_mesh.rings = 64
+	var surface_material := ShaderMaterial.new()
+	surface_material.shader = PLANET_SHADER
+	planet_mesh.material = surface_material
 	planet.mesh = planet_mesh
-	planet.position = Vector3(-86.0, -30.0, -180.0)
-	add_child(planet)
+	planet.position = Vector3(0.0, -98.0, 0.0)
+	planet_root.add_child(planet)
+
+	var atmosphere := MeshInstance3D.new()
+	atmosphere.name = "KhepriAtmosphere"
+	var atmosphere_mesh := SphereMesh.new()
+	atmosphere_mesh.radius = 128.0
+	atmosphere_mesh.height = 256.0
+	atmosphere_mesh.radial_segments = 64
+	atmosphere_mesh.rings = 32
+	var atmosphere_material := StandardMaterial3D.new()
+	atmosphere_material.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	atmosphere_material.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	atmosphere_material.cull_mode = BaseMaterial3D.CULL_FRONT
+	atmosphere_material.albedo_color = Color(0.08, 0.34, 0.55, 0.055)
+	atmosphere_material.emission_enabled = true
+	atmosphere_material.emission = Color(0.02, 0.12, 0.22)
+	atmosphere_material.emission_energy_multiplier = 0.32
+	atmosphere_mesh.material = atmosphere_material
+	atmosphere.mesh = atmosphere_mesh
+	atmosphere.position = Vector3(0.0, -98.0, 0.0)
+	planet_root.add_child(atmosphere)
+
+	var horizon_glow := OmniLight3D.new()
+	horizon_glow.light_color = Color(0.20, 0.55, 0.72)
+	horizon_glow.light_energy = 0.42
+	horizon_glow.omni_range = 62.0
+	horizon_glow.position = Vector3(0.0, -3.0, -18.0)
+	planet_root.add_child(horizon_glow)
+	_build_planet_surface_details()
 
 	var moon := MeshInstance3D.new()
 	var moon_mesh := SphereMesh.new()
@@ -390,7 +443,76 @@ func _build_distant_world() -> void:
 	moon_mesh.material = _material(Color(0.22, 0.18, 0.16), 0.98, 0.01)
 	moon.mesh = moon_mesh
 	moon.position = Vector3(64.0, 28.0, -130.0)
-	add_child(moon)
+	planet_root.add_child(moon)
+
+
+func _build_planet_surface_details() -> void:
+	var random := RandomNumberGenerator.new()
+	random.seed = 7_241_903
+	var ridge_mesh := CylinderMesh.new()
+	ridge_mesh.top_radius = 0.08
+	ridge_mesh.bottom_radius = 0.82
+	ridge_mesh.height = 1.0
+	ridge_mesh.radial_segments = 7
+	ridge_mesh.material = _material(Color(0.10, 0.13, 0.13), 0.96, 0.04)
+	var ridges := MultiMesh.new()
+	ridges.transform_format = MultiMesh.TRANSFORM_3D
+	ridges.mesh = ridge_mesh
+	ridges.instance_count = 48
+	for index in ridges.instance_count:
+		var angle := random.randf_range(0.0, TAU)
+		var distance := random.randf_range(24.0, 68.0)
+		var x := cos(angle) * distance + random.randf_range(-7.0, 7.0)
+		var z := sin(angle) * distance + random.randf_range(-7.0, 7.0)
+		var surface_y := _planet_surface_y(x, z)
+		var height := random.randf_range(2.2, 9.0)
+		var width := random.randf_range(1.2, 4.6)
+		var basis := Basis(Vector3.UP, random.randf_range(0.0, TAU)).scaled(
+			Vector3(width, height, width)
+		)
+		ridges.set_instance_transform(
+			index, Transform3D(basis, Vector3(x, surface_y + height * 0.48, z))
+		)
+	var ridge_instance := MultiMeshInstance3D.new()
+	ridge_instance.name = "ProceduralPlanetRidges"
+	ridge_instance.multimesh = ridges
+	planet_root.add_child(ridge_instance)
+
+	var boulder_mesh := SphereMesh.new()
+	boulder_mesh.radius = 0.5
+	boulder_mesh.height = 1.0
+	boulder_mesh.radial_segments = 8
+	boulder_mesh.rings = 5
+	boulder_mesh.material = _material(Color(0.15, 0.18, 0.17), 0.98, 0.02)
+	var boulders := MultiMesh.new()
+	boulders.transform_format = MultiMesh.TRANSFORM_3D
+	boulders.mesh = boulder_mesh
+	boulders.instance_count = 110
+	for index in boulders.instance_count:
+		var x := random.randf_range(-52.0, 52.0)
+		var z := random.randf_range(-52.0, 52.0)
+		if Vector2(x, z).length() < 13.0:
+			x += 16.0 if x >= 0.0 else -16.0
+		var scale := Vector3(
+			random.randf_range(0.35, 1.6),
+			random.randf_range(0.30, 1.25),
+			random.randf_range(0.35, 1.7)
+		)
+		boulders.set_instance_transform(
+			index,
+			Transform3D(
+				Basis(Vector3.UP, random.randf_range(0.0, TAU)).scaled(scale),
+				Vector3(x, _planet_surface_y(x, z) + scale.y * 0.42, z)
+			)
+		)
+	var boulder_instance := MultiMeshInstance3D.new()
+	boulder_instance.name = "ProceduralPlanetBoulders"
+	boulder_instance.multimesh = boulders
+	planet_root.add_child(boulder_instance)
+
+
+func _planet_surface_y(x: float, z: float) -> float:
+	return -98.0 + sqrt(maxf(90.0 * 90.0 - x * x - z * z, 0.0))
 
 
 func _build_orbital_dust() -> void:
@@ -552,7 +674,7 @@ func _build_target_highlight() -> void:
 	build_preview = Node3D.new()
 	build_preview.name = "ConstructionHologram"
 	var preview_mesh := BoxMesh.new()
-	preview_mesh.size = Vector3.ONE * 0.96
+	preview_mesh.size = Vector3.ONE * 1.0
 	preview_mesh.material = detail_materials["hologram"]
 	var preview_body := MeshInstance3D.new()
 	preview_body.mesh = preview_mesh
@@ -645,7 +767,7 @@ func _build_interface() -> void:
 	top_bar.add_child(accent)
 
 	var title := Label.new()
-	title.text = "THE VERSE  //  SALVAGE FRONTIER"
+	title.text = "THE VERSE  //  PLANETARY LOGISTICS"
 	title.position = Vector2(24.0, 13.0)
 	title.add_theme_font_size_override("font_size", 19)
 	title.add_theme_color_override("font_color", Color(0.78, 0.91, 0.98))
@@ -748,7 +870,7 @@ func _build_interface() -> void:
 	selected_label = hotbar_label
 
 	var controls := _hud_label(
-		"WASD / SPACE / C  EVA THRUST    SHIFT  BOOST    Z  DAMPENERS    L  LIGHT    B  BUILD    Q / E  ROTATE    HOLD LMB  WORK    RMB  CUT",
+		"WASD / SPACE / C  MOVE    SHIFT  BOOST    J  JETPACK    H  HELMET    I  INVENTORY    B  BUILD    HOLD LMB  WORK    RMB  CUT",
 		Vector2(20.0, -40.0),
 		11
 	)
@@ -767,6 +889,168 @@ func _build_interface() -> void:
 	message_label.size = Vector2(1350.0, 28.0)
 	message_label.add_theme_font_size_override("font_size", 12)
 	bottom_bar.add_child(message_label)
+	_build_inventory_terminal(canvas)
+
+
+func _build_inventory_terminal(canvas: CanvasLayer) -> void:
+	inventory_overlay = Control.new()
+	inventory_overlay.name = "EngineeringInventoryTerminal"
+	inventory_overlay.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	inventory_overlay.mouse_filter = Control.MOUSE_FILTER_STOP
+	inventory_overlay.visible = false
+	canvas.add_child(inventory_overlay)
+
+	var blackout := ColorRect.new()
+	blackout.color = Color(0.002, 0.008, 0.014, 0.90)
+	blackout.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	inventory_overlay.add_child(blackout)
+
+	var terminal := ColorRect.new()
+	terminal.color = Color(0.012, 0.030, 0.043, 0.985)
+	terminal.anchor_left = 0.055
+	terminal.anchor_top = 0.07
+	terminal.anchor_right = 0.945
+	terminal.anchor_bottom = 0.92
+	inventory_overlay.add_child(terminal)
+
+	var accent := ColorRect.new()
+	accent.color = Color(0.08, 0.70, 0.92)
+	accent.anchor_right = 1.0
+	accent.offset_bottom = 3.0
+	terminal.add_child(accent)
+	var heading := _hud_label("LOGISTICS // KHEPRI ENGINEERING TERMINAL", Vector2(24.0, 18.0), 21)
+	heading.add_theme_color_override("font_color", Color(0.72, 0.92, 1.0))
+	terminal.add_child(heading)
+	var subheading := _hud_label(
+		"PHYSICAL INVENTORIES  //  VOLUME, MASS, AND OWNERSHIP ARE SERVER AUTHORITATIVE",
+		Vector2(25.0, 51.0),
+		11
+	)
+	subheading.add_theme_color_override("font_color", Color(0.38, 0.59, 0.68))
+	terminal.add_child(subheading)
+
+	var close_button := Button.new()
+	close_button.text = "CLOSE  [I]"
+	close_button.set_anchors_preset(Control.PRESET_TOP_RIGHT)
+	close_button.position = Vector2(-138.0, 18.0)
+	close_button.size = Vector2(112.0, 34.0)
+	close_button.pressed.connect(_set_inventory_open.bind(false))
+	terminal.add_child(close_button)
+
+	var suit_panel := _inventory_column(terminal, 0.025, 0.455, "SUIT // ORPHEUS-7", "PLAYER CARGO HARNESS")
+	var cargo_panel := _inventory_column(terminal, 0.545, 0.975, "GRID // KHEPRI RELAY", "CONNECTED CARGO CONTAINER")
+	for resource_data in [
+		["ore", "FERRITE ORE", "RAW", Color(0.91, 0.32, 0.11), "37 L/u  //  3.5 kg/u"],
+		["refined_material", "REGISTERED ALLOY", "INGOT", Color(0.24, 0.76, 0.96), "15 L/u  //  2.4 kg/u"],
+		["component", "CONSTRUCTION PART", "COMP", Color(0.96, 0.70, 0.20), "22 L/u  //  4.8 kg/u"],
+	]:
+		var resource := String(resource_data[0])
+		var index := ["ore", "refined_material", "component"].find(resource)
+		_inventory_resource_row(
+			suit_panel, "suit", resource, String(resource_data[1]), String(resource_data[2]),
+			resource_data[3], String(resource_data[4]), 104.0 + float(index) * 92.0
+		)
+		_inventory_resource_row(
+			cargo_panel, "cargo", resource, String(resource_data[1]), String(resource_data[2]),
+			resource_data[3], String(resource_data[4]), 104.0 + float(index) * 92.0
+		)
+		_add_transfer_controls(terminal, resource, 123.0 + float(index) * 92.0)
+
+	var hint := _hud_label(
+		"ONE-UNIT ARROWS SUPPORT PRECISE LOADOUTS  //  DOUBLE ARROWS MOVE THE COMPLETE STACK  //  V REMAINS QUICK TRANSFER",
+		Vector2(24.0, -34.0),
+		11
+	)
+	hint.set_anchors_preset(Control.PRESET_BOTTOM_LEFT)
+	hint.add_theme_color_override("font_color", Color(0.45, 0.66, 0.73))
+	terminal.add_child(hint)
+
+
+func _inventory_column(
+	parent: Control, left: float, right: float, title: String, subtitle: String
+) -> ColorRect:
+	var panel := ColorRect.new()
+	panel.color = Color(0.022, 0.052, 0.067, 0.96)
+	panel.anchor_left = left
+	panel.anchor_top = 0.13
+	panel.anchor_right = right
+	panel.anchor_bottom = 0.91
+	parent.add_child(panel)
+	var title_label := _hud_label(title, Vector2(18.0, 14.0), 17)
+	title_label.add_theme_color_override("font_color", Color(0.78, 0.91, 0.96))
+	panel.add_child(title_label)
+	var subtitle_label := _hud_label(subtitle, Vector2(18.0, 40.0), 10)
+	subtitle_label.add_theme_color_override("font_color", Color(0.34, 0.62, 0.71))
+	panel.add_child(subtitle_label)
+	var capacity_bar := ProgressBar.new()
+	capacity_bar.position = Vector2(18.0, 70.0)
+	capacity_bar.size = Vector2(310.0, 8.0)
+	capacity_bar.max_value = 1.0
+	capacity_bar.show_percentage = false
+	capacity_bar.add_theme_stylebox_override("background", _bar_style(Color(0.01, 0.02, 0.03)))
+	capacity_bar.add_theme_stylebox_override("fill", _bar_style(Color(0.10, 0.72, 0.92)))
+	panel.add_child(capacity_bar)
+	var capacity_label := _hud_label("0 / 0 L", Vector2(338.0, 63.0), 11)
+	capacity_label.add_theme_color_override("font_color", Color(0.56, 0.78, 0.84))
+	panel.add_child(capacity_label)
+	var side := "suit" if left < 0.5 else "cargo"
+	inventory_capacity_bars[side] = capacity_bar
+	inventory_capacity_labels[side] = capacity_label
+	return panel
+
+
+func _inventory_resource_row(
+	parent: Control,
+	side: String,
+	resource: String,
+	name: String,
+	code: String,
+	color: Color,
+	detail: String,
+	y: float
+) -> void:
+	var row := ColorRect.new()
+	row.color = Color(0.015, 0.027, 0.035, 0.94)
+	row.position = Vector2(18.0, y)
+	row.size = Vector2(418.0, 76.0)
+	parent.add_child(row)
+	var stripe := ColorRect.new()
+	stripe.color = color
+	stripe.size = Vector2(5.0, 76.0)
+	row.add_child(stripe)
+	var code_label := _hud_label(code, Vector2(18.0, 15.0), 13)
+	code_label.add_theme_color_override("font_color", color)
+	row.add_child(code_label)
+	var name_label := _hud_label(name, Vector2(79.0, 10.0), 15)
+	name_label.add_theme_color_override("font_color", Color(0.82, 0.89, 0.91))
+	row.add_child(name_label)
+	var detail_label := _hud_label(detail, Vector2(79.0, 39.0), 10)
+	detail_label.add_theme_color_override("font_color", Color(0.37, 0.54, 0.59))
+	row.add_child(detail_label)
+	var quantity_label := _hud_label("000", Vector2(338.0, 18.0), 22)
+	quantity_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
+	quantity_label.size = Vector2(62.0, 34.0)
+	quantity_label.add_theme_color_override("font_color", Color(0.95, 0.75, 0.31))
+	row.add_child(quantity_label)
+	inventory_item_labels["%s:%s" % [side, resource]] = quantity_label
+
+
+func _add_transfer_controls(parent: Control, resource: String, y: float) -> void:
+	for data in [
+		["→", Vector2(-45.0, y), false, false],
+		["»", Vector2(3.0, y), false, true],
+		["←", Vector2(-45.0, y + 35.0), true, false],
+		["«", Vector2(3.0, y + 35.0), true, true],
+	]:
+		var button := Button.new()
+		button.text = String(data[0])
+		button.set_anchors_preset(Control.PRESET_CENTER_TOP)
+		button.position = data[1]
+		button.size = Vector2(42.0, 30.0)
+		button.pressed.connect(
+			_transfer_inventory_resource.bind(resource, bool(data[2]), bool(data[3]))
+		)
+		parent.add_child(button)
 
 
 func _hud_panel(position: Vector2, size: Vector2) -> ColorRect:
@@ -826,7 +1110,7 @@ func _poll_socket() -> void:
 			_send({
 				"type": "hello",
 				"protocol_version": PROTOCOL_VERSION,
-				"client_name": "godot-native-p0",
+				"client_name": "godot-native-p0.5",
 			})
 		while socket.get_available_packet_count() > 0:
 			var text := socket.get_packet().get_string_from_utf8()
@@ -1155,12 +1439,12 @@ func _build_block_visual(block: Dictionary) -> Node3D:
 		_add_construction_frame(root, integrity)
 		return root
 	var base := _box_visual(
-		Vector3.ONE * 0.92,
+		Vector3.ONE * 1.01,
 		block_materials.get(kind, block_materials["structural"])
 	)
 	root.add_child(base)
-	var front_panel := _box_visual(Vector3(0.64, 0.60, 0.035), detail_materials["dark"])
-	front_panel.position.z = -0.475
+	var front_panel := _box_visual(Vector3(0.70, 0.66, 0.026), detail_materials["dark"])
+	front_panel.position.z = -0.518
 	root.add_child(front_panel)
 
 	match kind:
@@ -1203,22 +1487,35 @@ func _build_block_visual(block: Dictionary) -> Node3D:
 			beacon.position = Vector3(0.0, 1.14, 0.0)
 			root.add_child(beacon)
 		"power_source":
+			var reactor_core := _cylinder_visual(0.22, 0.18, detail_materials["amber"])
+			reactor_core.rotation_degrees.x = 90.0
+			reactor_core.position.z = -0.56
+			root.add_child(reactor_core)
 			for y in [-0.25, 0.0, 0.25]:
-				var vent := _box_visual(Vector3(0.62, 0.07, 0.055), detail_materials["amber"])
-				vent.position = Vector3(0.0, y, -0.505)
+				var vent := _box_visual(Vector3(0.72, 0.055, 0.045), detail_materials["steel"])
+				vent.position = Vector3(0.0, y, -0.535)
 				root.add_child(vent)
+			root.add_child(_block_face_label("REACTOR", Color(1.0, 0.52, 0.12)))
 		"battery":
 			for x in [-0.22, 0.0, 0.22]:
-				var cell := _cylinder_visual(0.09, 0.62, detail_materials["amber"])
-				cell.position = Vector3(x, 0.0, -0.33)
+				var cell := _cylinder_visual(0.085, 0.56, detail_materials["amber"])
+				cell.position = Vector3(x, 0.0, -0.48)
 				root.add_child(cell)
+			var battery_bus := _box_visual(Vector3(0.66, 0.08, 0.055), detail_materials["cyan"])
+			battery_bus.position = Vector3(0.0, -0.35, -0.54)
+			root.add_child(battery_bus)
 		"cargo":
-			var door := _box_visual(Vector3(0.56, 0.52, 0.055), detail_materials["steel"])
-			door.position.z = -0.50
+			var door := _box_visual(Vector3(0.68, 0.62, 0.045), detail_materials["steel"])
+			door.position.z = -0.535
 			root.add_child(door)
+			for offset in [-0.25, 0.25]:
+				var latch := _box_visual(Vector3(0.075, 0.48, 0.04), detail_materials["dark"])
+				latch.position = Vector3(offset, -0.02, -0.565)
+				root.add_child(latch)
 			var cargo_light := _box_visual(Vector3(0.33, 0.055, 0.065), detail_materials["green"])
-			cargo_light.position = Vector3(0.0, 0.32, -0.53)
+			cargo_light.position = Vector3(0.0, 0.36, -0.57)
 			root.add_child(cargo_light)
+			root.add_child(_block_face_label("CARGO", Color(0.26, 1.0, 0.61)))
 		"drill":
 			var shaft := _cylinder_visual(0.16, 0.82, detail_materials["steel"])
 			shaft.rotation_degrees.x = 90.0
@@ -1236,6 +1533,10 @@ func _build_block_visual(block: Dictionary) -> Node3D:
 			bit.position.z = -1.30
 			root.add_child(bit)
 		"anchor":
+			var piston := _cylinder_visual(0.18, 0.58, detail_materials["dark"])
+			piston.rotation_degrees.x = 90.0
+			piston.position.z = -0.66
+			root.add_child(piston)
 			for x in [-0.22, 0.22]:
 				var prong := _box_visual(Vector3(0.13, 0.18, 0.65), detail_materials["steel"])
 				prong.position = Vector3(x, 0.0, -0.65)
@@ -1252,21 +1553,33 @@ func _build_block_visual(block: Dictionary) -> Node3D:
 	return root
 
 
+func _block_face_label(text: String, color: Color) -> Label3D:
+	var label := Label3D.new()
+	label.text = text
+	label.font_size = 28
+	label.pixel_size = 0.0032
+	label.modulate = color
+	label.outline_modulate = Color(0.0, 0.0, 0.0, 0.9)
+	label.outline_size = 5
+	label.position = Vector3(0.0, -0.35, -0.574)
+	return label
+
+
 func _add_construction_frame(root: Node3D, integrity: float) -> void:
 	var frame_material: Material = detail_materials["construction"]
 	for x in [-0.44, 0.44]:
 		for y in [-0.44, 0.44]:
-			var z_rail := _box_visual(Vector3(0.055, 0.055, 0.90), frame_material)
+			var z_rail := _box_visual(Vector3(0.055, 0.055, 1.0), frame_material)
 			z_rail.position = Vector3(x, y, 0.0)
 			root.add_child(z_rail)
 	for x in [-0.44, 0.44]:
 		for z in [-0.44, 0.44]:
-			var y_rail := _box_visual(Vector3(0.055, 0.90, 0.055), frame_material)
+			var y_rail := _box_visual(Vector3(0.055, 1.0, 0.055), frame_material)
 			y_rail.position = Vector3(x, 0.0, z)
 			root.add_child(y_rail)
 	for y in [-0.44, 0.44]:
 		for z in [-0.44, 0.44]:
-			var x_rail := _box_visual(Vector3(0.90, 0.055, 0.055), frame_material)
+			var x_rail := _box_visual(Vector3(1.0, 0.055, 0.055), frame_material)
 			x_rail.position = Vector3(0.0, y, z)
 			root.add_child(x_rail)
 	var completed_quarters := clampi(ceili(integrity * 4.0), 1, 3)
@@ -1277,25 +1590,64 @@ func _add_construction_frame(root: Node3D, integrity: float) -> void:
 
 
 func _update_movement(delta: float) -> void:
-	if Input.mouse_mode != Input.MOUSE_MODE_CAPTURED:
+	if Input.mouse_mode != Input.MOUSE_MODE_CAPTURED or inventory_open:
 		return
+	var player_state: Dictionary = snapshot.get("player", {})
+	var environment: Dictionary = snapshot.get("environment", {})
+	var jetpack_enabled := bool(player_state.get("jetpack_enabled", true))
+	var gravity := _vec3(environment.get("gravity", {}))
+	var planet_center := _vec3(environment.get("planet_center", {}))
+	var surface_radius := float(environment.get("surface_radius_m", 0.0))
+	var radial := camera.position - planet_center
+	var world_up := radial.normalized() if radial.length_squared() > 0.001 else Vector3.UP
+	var ground_radius := surface_radius + PLAYER_SURFACE_CLEARANCE
+	var grounded := surface_radius > 0.0 and radial.length() <= ground_radius + 0.12
 	var movement_input := Vector3(
 		Input.get_action_strength("move_right") - Input.get_action_strength("move_left"),
 		Input.get_action_strength("move_up") - Input.get_action_strength("move_down"),
 		Input.get_action_strength("move_backward") - Input.get_action_strength("move_forward")
 	)
-	var desired_velocity := player_velocity
-	if movement_input.length_squared() > 0.0:
-		movement_input = movement_input.normalized()
-		var speed := MOVE_SPEED
-		if Input.is_action_pressed("move_boost"):
-			speed *= BOOST_MULTIPLIER
-		desired_velocity = camera.basis * movement_input * speed
-		player_velocity = player_velocity.move_toward(desired_velocity, MOVE_ACCELERATION * delta)
-	elif dampeners_enabled:
-		player_velocity = player_velocity.move_toward(Vector3.ZERO, MOVE_DAMPING * delta)
+	if jetpack_enabled:
+		var desired_velocity := player_velocity
+		if movement_input.length_squared() > 0.0:
+			movement_input = movement_input.normalized()
+			var speed := MOVE_SPEED
+			if Input.is_action_pressed("move_boost"):
+				speed *= BOOST_MULTIPLIER
+			desired_velocity = camera.basis * movement_input * speed
+			player_velocity = player_velocity.move_toward(
+				desired_velocity, MOVE_ACCELERATION * delta
+			)
+		elif dampeners_enabled:
+			player_velocity = player_velocity.move_toward(Vector3.ZERO, MOVE_DAMPING * delta)
+	else:
+		var tangent_input := Vector3(movement_input.x, 0.0, movement_input.z)
+		var tangent_velocity := camera.basis * tangent_input
+		tangent_velocity -= world_up * tangent_velocity.dot(world_up)
+		if tangent_velocity.length_squared() > 0.0:
+			tangent_velocity = tangent_velocity.normalized() * WALK_SPEED
+			var vertical_velocity := world_up * player_velocity.dot(world_up)
+			player_velocity = player_velocity.move_toward(
+				tangent_velocity + vertical_velocity, WALK_ACCELERATION * delta
+			)
+		else:
+			var vertical_velocity := world_up * player_velocity.dot(world_up)
+			player_velocity = player_velocity.move_toward(
+				vertical_velocity, MOVE_DAMPING * delta
+			)
+		player_velocity += gravity * delta
+		if grounded and Input.is_action_just_pressed("move_up"):
+			player_velocity += world_up * JUMP_SPEED
 
 	var proposed_position := camera.position + player_velocity * delta
+	if surface_radius > 0.0:
+		var proposed_radial := proposed_position - planet_center
+		if proposed_radial.length() < ground_radius:
+			var surface_up := proposed_radial.normalized()
+			proposed_position = planet_center + surface_up * ground_radius
+			var inward_speed := player_velocity.dot(surface_up)
+			if inward_speed < 0.0:
+				player_velocity -= surface_up * inward_speed
 	if _position_is_clear(proposed_position):
 		camera.position = proposed_position
 	else:
@@ -1310,7 +1662,7 @@ func _update_movement(delta: float) -> void:
 	camera.fov = lerpf(camera.fov, 74.0 + boost_amount * 8.0, minf(delta * 5.0, 1.0))
 	camera.rotation.z = lerpf(
 		camera.rotation.z,
-		-movement_input.x * 0.028,
+		-movement_input.x * (0.028 if jetpack_enabled else 0.012),
 		minf(delta * 4.0, 1.0)
 	)
 
@@ -1423,6 +1775,11 @@ func _ray_target_block() -> Dictionary:
 
 
 func _update_tool_action(delta: float) -> void:
+	if inventory_open:
+		action_charge = 0.0
+		action_target_key = ""
+		action_progress.value = 0.0
+		return
 	action_cooldown = maxf(0.0, action_cooldown - delta)
 	var holding_primary := Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT)
 	var holding_secondary := Input.is_mouse_button_pressed(MOUSE_BUTTON_RIGHT)
@@ -1688,6 +2045,71 @@ func _transfer_to_or_from_cargo(reverse: bool) -> void:
 	})
 
 
+func _set_inventory_open(open: bool) -> void:
+	inventory_open = open
+	inventory_overlay.visible = open
+	build_mode = false if open else build_mode
+	action_charge = 0.0
+	Input.mouse_mode = Input.MOUSE_MODE_VISIBLE if open else Input.MOUSE_MODE_CAPTURED
+	_set_message(
+		"Engineering inventory terminal online" if open else "Engineering terminal closed"
+	)
+
+
+func _toggle_jetpack() -> void:
+	var player: Dictionary = snapshot.get("player", {})
+	_send({
+		"type": "set_suit_mode",
+		"operation_id": _operation_id("suit"),
+		"helmet_closed": bool(player.get("helmet_closed", true)),
+		"jetpack_enabled": not bool(player.get("jetpack_enabled", true)),
+	})
+
+
+func _toggle_helmet() -> void:
+	var player: Dictionary = snapshot.get("player", {})
+	_send({
+		"type": "set_suit_mode",
+		"operation_id": _operation_id("suit"),
+		"helmet_closed": not bool(player.get("helmet_closed", true)),
+		"jetpack_enabled": bool(player.get("jetpack_enabled", true)),
+	})
+
+
+func _transfer_inventory_resource(resource: String, reverse: bool, all: bool) -> void:
+	var cargo_id := _first_cargo_inventory()
+	if cargo_id.is_empty():
+		_set_message("No live cargo inventory is available", true)
+		return
+	var source_id := cargo_id if reverse else PLAYER_INVENTORY
+	var destination_id := PLAYER_INVENTORY if reverse else cargo_id
+	var quantity := 1
+	if all:
+		quantity = _resource_amount(_inventory(source_id).get("contents", {}), resource)
+	if quantity <= 0:
+		_set_message("The selected source stack is empty", true)
+		return
+	_send({
+		"type": "transfer_inventory",
+		"operation_id": _operation_id("terminal-transfer"),
+		"source_inventory_id": source_id,
+		"destination_inventory_id": destination_id,
+		"resource": resource,
+		"quantity": quantity,
+	})
+
+
+func _resource_amount(contents: Dictionary, resource: String) -> int:
+	match resource:
+		"ore":
+			return int(contents.get("ore", 0))
+		"refined_material":
+			return int(contents.get("refined_material", 0))
+		"component":
+			return int(contents.get("components", 0))
+	return 0
+
+
 func _first_cargo_inventory() -> String:
 	for inventory in snapshot.get("inventories", []):
 		var domain: Dictionary = inventory.get("domain", {})
@@ -1736,14 +2158,27 @@ func _update_interface() -> void:
 	var next_level := int(player.get("next_level_experience", 100))
 	level_label.text = "SALVAGER // LEVEL %d     REP %d / %d" % [level, experience, next_level]
 	var suit_power := clampi(100 - roundi(player_velocity.length() * 1.4), 72, 100)
-	telemetry_label.text = "INTEGRITY 100     O₂ 100     SUIT POWER %d" % suit_power
+	var oxygen_percent := int(player.get("suit_oxygen_milli", 1000)) / 10
+	var helmet_state := "SEALED" if player.get("helmet_closed", true) else "OPEN"
+	var jetpack_state := "JET" if player.get("jetpack_enabled", true) else "WALK"
+	telemetry_label.text = "O₂ %03d%%   PWR %03d%%   %s   %s" % [
+		oxygen_percent, suit_power, helmet_state, jetpack_state
+	]
+	telemetry_label.add_theme_color_override(
+		"font_color", Color(1.0, 0.32, 0.18) if oxygen_percent < 20 else Color(0.64, 0.90, 0.94)
+	)
+	var environment: Dictionary = snapshot.get("environment", {})
+	var gravity_g := float(environment.get("gravity_m_s2", 0.0)) / 9.80665
+	var atmosphere_percent := roundi(float(environment.get("atmosphere_density", 0.0)) * 100.0)
 	status_label.text = (
-		"%s  //  %s\nAUTH EVENT %d    TICK %d\nLEDGER %s    HASH %s"
+		"%s  //  ALT %.1f m\nGRAV %.2f g    ATM %03d%%    %s\nEVENT %d    LEDGER %s    %s"
 		% [
-			String(snapshot.get("universe_id", "AWAITING")).to_upper(),
-			String(snapshot.get("cell_id", "—")).to_upper(),
+			String(environment.get("celestial_body_name", "DEEP SPACE")).to_upper(),
+			float(environment.get("altitude_m", 0.0)),
+			gravity_g,
+			atmosphere_percent,
+			"BREATHABLE" if environment.get("breathable", false) else "VACUUM",
 			int(snapshot.get("event_sequence", 0)),
-			int(snapshot.get("simulation_tick", 0)),
 			"CONSERVED" if snapshot.get("conservation", {}).get("valid", false) else "FAULT",
 			String(snapshot.get("world_hash", "—")).left(8),
 		]
@@ -1752,8 +2187,10 @@ func _update_interface() -> void:
 	var contents: Dictionary = player_inventory.get("contents", {})
 	var conserved: Dictionary = snapshot.get("conservation", {})
 	inventory_label.text = (
-		"CARGO HARNESS\nORE  %03d     ALLOY  %03d     PARTS  %03d"
+		"CARGO HARNESS  //  %d / %d L\nORE  %03d     ALLOY  %03d     PARTS  %03d\n[I] OPEN LOGISTICS TERMINAL"
 	) % [
+		int(player_inventory.get("used_liters", 0)),
+		int(player_inventory.get("capacity_liters", 0)),
 		int(contents.get("ore", 0)),
 		int(contents.get("refined_material", 0)),
 		int(contents.get("components", 0)),
@@ -1764,6 +2201,7 @@ func _update_interface() -> void:
 		if conserved.get("valid", false)
 		else Color(1.0, 0.18, 0.18)
 	)
+	_update_inventory_terminal()
 	var career: Dictionary = player.get("career", {})
 	mission_label.text = _mission_text(career)
 	if build_mode:
@@ -1830,6 +2268,30 @@ func _update_interface() -> void:
 	action_progress.visible = action_charge > 0.0
 	message_label.text = recent_message
 	message_label.add_theme_color_override("font_color", recent_message_color)
+
+
+func _update_inventory_terminal() -> void:
+	var suit_inventory := _inventory(PLAYER_INVENTORY)
+	var cargo_inventory := _inventory(_first_cargo_inventory())
+	for side_data in [["suit", suit_inventory], ["cargo", cargo_inventory]]:
+		var side := String(side_data[0])
+		var inventory: Dictionary = side_data[1]
+		var contents: Dictionary = inventory.get("contents", {})
+		for resource in ["ore", "refined_material", "component"]:
+			var quantity_label: Label = inventory_item_labels.get(
+				"%s:%s" % [side, resource], null
+			)
+			if quantity_label != null:
+				quantity_label.text = "%03d" % _resource_amount(contents, resource)
+		var capacity := maxi(int(inventory.get("capacity_liters", 0)), 1)
+		var used := int(inventory.get("used_liters", 0))
+		var mass_kg := float(inventory.get("mass_grams", 0)) / 1000.0
+		var capacity_label: Label = inventory_capacity_labels.get(side, null)
+		if capacity_label != null:
+			capacity_label.text = "%d / %d L  //  %.1f kg" % [used, capacity, mass_kg]
+		var capacity_bar: ProgressBar = inventory_capacity_bars.get(side, null)
+		if capacity_bar != null:
+			capacity_bar.value = clampf(float(used) / float(capacity), 0.0, 1.0)
 
 
 func _mission_text(career: Dictionary) -> String:

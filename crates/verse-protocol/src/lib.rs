@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 
 /// The only protocol version accepted by this P0 build.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// A stable integer voxel or block coordinate.
 #[derive(
@@ -173,6 +173,9 @@ pub struct InventorySnapshot {
     pub inventory_id: String,
     pub domain: InventoryDomain,
     pub contents: InventoryContents,
+    pub capacity_liters: u64,
+    pub used_liters: u64,
+    pub mass_grams: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -184,6 +187,23 @@ pub struct PlayerSnapshot {
     pub level: u32,
     pub next_level_experience: u64,
     pub career: CareerSnapshot,
+    pub suit_oxygen_milli: u16,
+    pub helmet_closed: bool,
+    pub jetpack_enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EnvironmentSnapshot {
+    pub celestial_body_id: String,
+    pub celestial_body_name: String,
+    pub planet_center: Vec3,
+    pub surface_radius_m: f64,
+    pub altitude_m: f64,
+    pub gravity: Vec3,
+    pub gravity_m_s2: f64,
+    pub atmosphere_density: f64,
+    pub oxygen_fraction: f64,
+    pub breathable: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -251,6 +271,7 @@ pub struct WorldSnapshot {
     pub fencing_token: u64,
     pub world_hash: String,
     pub player: PlayerSnapshot,
+    pub environment: EnvironmentSnapshot,
     pub voxels: Vec<VoxelSnapshot>,
     pub grids: Vec<GridSnapshot>,
     pub inventories: Vec<InventorySnapshot>,
@@ -270,6 +291,11 @@ pub enum ClientMessage {
     MovePlayer {
         operation_id: String,
         position: Vec3,
+    },
+    SetSuitMode {
+        operation_id: String,
+        helmet_closed: bool,
+        jetpack_enabled: bool,
     },
     MineVoxel {
         operation_id: String,
@@ -326,6 +352,7 @@ impl ClientMessage {
         match self {
             Self::Hello { .. } | Self::RequestSnapshot => None,
             Self::MovePlayer { operation_id, .. }
+            | Self::SetSuitMode { operation_id, .. }
             | Self::MineVoxel { operation_id, .. }
             | Self::RefineOre { operation_id, .. }
             | Self::CraftComponent { operation_id, .. }
@@ -414,5 +441,18 @@ mod tests {
         .expect("weld intent serializes");
         assert_eq!(weld["type"], "weld_block");
         assert_eq!(weld["block_id"], "block-9");
+    }
+
+    #[test]
+    fn suit_mode_message_is_explicit_and_idempotent() {
+        let value = serde_json::to_value(ClientMessage::SetSuitMode {
+            operation_id: "suit-1".into(),
+            helmet_closed: false,
+            jetpack_enabled: true,
+        })
+        .expect("suit mode intent serializes");
+        assert_eq!(value["type"], "set_suit_mode");
+        assert_eq!(value["helmet_closed"], false);
+        assert_eq!(value["jetpack_enabled"], true);
     }
 }

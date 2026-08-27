@@ -1,6 +1,6 @@
 # P0 specification: simulation proof
 
-**Status:** In implementation; P0.4 Engineering Hands checkpoint available
+**Status:** In implementation; P0.5 Planetary Logistics checkpoint available
 
 ## Purpose
 
@@ -183,6 +183,18 @@ Implemented and continuously verified:
 - Completion-derived career progress and idempotent welding receipts.
 - Exact mined-coordinate removal assertions in the cross-process scenario.
 - Client-side frame skeletons, rotating directional holograms, integrity telemetry, and confirmed-edit rock fragments.
+
+## P0.5 planetary logistics checkpoint
+
+Implemented and continuously verified:
+
+- A two-sided native inventory terminal with exact and complete-stack transfers.
+- Server-owned inventory volume, mass, capacities, and overfill rejection.
+- Flush completed block envelopes and differentiated machinery faces.
+- A procedural Khepri Prime surface, atmosphere shell, terrain ridges, and boulder field.
+- Authoritative altitude, local gravity, atmosphere density, oxygen fraction, and breathability snapshots.
+- Persistent helmet seal, jetpack mode, suit oxygen, planetary-surface validation, and gravity-aware client prediction.
+- Protocol, persistence, live-interface, restart, and recovery checks for the new environment and logistics state.
 
 ## Exit decision
 

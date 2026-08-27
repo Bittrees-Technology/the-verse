@@ -1,10 +1,10 @@
-# P0.4 implementation guide
+# P0.5 implementation guide
 
 **Status:** Playable local vertical slice
 
 ## What this milestone proves
 
-P0.4 connects a first-person Godot client and a browser command center to one Rust authoritative simulation. A player begins beside a powered salvage skiff, excavates a deterministic irregular asteroid rendered as a continuous surface, then places oriented construction frames and welds them through three persistent integrity stages before they become functional. The five-stage industrial contract continues through manufacturing, anchoring, motion, damage, and splitting. The server persists each accepted event before acknowledging it and reconstructs the same world after restart.
+P0.5 connects a first-person Godot client and a browser command center to one Rust authoritative simulation. A player begins in Khepri Prime's atmosphere beside a powered salvage skiff and mineable outcrop, manages physical inventory through a two-sided logistics terminal, experiences local gravity with the jetpack offline, controls the helmet seal and oxygen reserve, then mines, manufactures, places oriented frames, welds them through persistent integrity stages, and operates or destroys the resulting grid. The server persists each accepted event before acknowledging it and reconstructs the same world after restart.
 
 ```mermaid
 flowchart LR
@@ -20,11 +20,11 @@ flowchart LR
 
 ## Authority and conservation
 
-Clients choose targets and request actions; they never choose yields, damage, health, power, production outputs, or final transforms. The simulation checks distance, adjacency, inventory, power, motion budgets, and anchor contact. A conservation proof runs after every accepted event. If ore, refined material, components, installed blocks, or destroyed blocks do not reconcile, the event is rejected.
+Clients choose targets and request actions; they never choose yields, damage, health, power, production outputs, oxygen outcomes, capacity, or final transforms. The simulation checks distance, adjacency, inventory volume, power, planetary surface penetration, motion budgets, and anchor contact. A conservation proof runs after every accepted event. If ore, refined material, components, installed blocks, or destroyed blocks do not reconcile, the event is rejected.
 
-The content manifest `p0.4.0` defines voxel yields, recipes, block health, component costs, construction integrity, and power behavior. Its version is stored in the universe manifest and snapshots and included in every canonical event hash. Opening a universe under a different rule version fails explicitly.
+The content manifest `p0.5.0` identifies the planetary-logistics rule set. Voxel yields, recipes, block health, component costs, construction integrity, power behavior, inventory capacity, resource volume and mass, and environment constants are server owned. The manifest version is stored in universe manifests and snapshots and included in every canonical event hash. Opening a universe under a different rule version fails explicitly.
 
-The save schema is version 4 and the client protocol is version 3. Save version 4 adds persistent block orientation. Protocol version 3 adds orientation and maximum integrity to snapshots plus the weld-block intent. A version mismatch fails explicitly; the runtime never guesses how to reinterpret an older save.
+The save schema is version 5 and the client protocol is version 4. Save version 5 adds inventory capacity plus persistent suit oxygen, helmet, and jetpack state. Protocol version 4 adds physical inventory metrics, the local environment snapshot, suit state, and the suit-mode intent. A version mismatch fails explicitly; the runtime never guesses how to reinterpret an older save.
 
 ## Local operation
 
@@ -58,7 +58,7 @@ Its local interfaces are:
 
 The scenario proves:
 
-1. Authoritative mining, refining, crafting, transfer, building, anchoring, motion, damage, split, experience, and contract progression.
+1. Authoritative environment, suit mode, inventory capacity, mining, refining, crafting, transfer, building, anchoring, motion, damage, split, experience, and contract progression.
 2. Conservation after every mutation.
 3. Exact world-hash recovery after graceful restart.
 4. A higher writer-fencing token after authority changes.
@@ -66,10 +66,10 @@ The scenario proves:
 
 ## Deliberate limits
 
-This slice has one local player, one small asteroid, one 25-block salvage skiff, and one five-stage contract. Orientation is currently limited to four yaw rotations, and one registered component is consumed entirely when its frame is placed. Grid motion is deterministic kinematic integration, not collision physics. It sends complete JSON snapshots and is not intended for production bandwidth. Its distant planet is visual context, not a landable voxel body. It has no accounts, safe zones, offline cleanup, multiplayer partitioning, real markets, token custody, or smart contracts. These are roadmap work, not implied capabilities of P0.4.
+This slice has one local player, one mineable outcrop, one 25-block salvage skiff, one bounded planetary surface region, and one five-stage contract. Orientation is limited to four yaw rotations, and one registered component is consumed entirely when its frame is placed. Grid motion is deterministic kinematic integration, not rigid-body collision physics. The planet surface is a gravity/atmosphere and rendering proof, not a globally streamed editable voxel sphere. Decorative ridges and boulders are not canonical mining targets. Complete JSON snapshots are not intended for production bandwidth. Accounts, safe zones, offline cleanup, multiplayer partitioning, pressurized-room graphs, real markets, token custody, and smart contracts remain roadmap work, not implied capabilities of P0.5.
 
 ## Migration and rollback
 
-P0.4 has no deployed predecessor to migrate. It rejects save schemas 1 through 3 because their player, generator, or block-orientation contracts differ. A universe also records content manifest `p0.4.0` and refuses to open under another rule set. Local testers can use `tools/dev/reset-local-world.sh` to move an incompatible world into a recoverable backup before creating a new one.
+P0.5 has no deployed predecessor to migrate. It rejects save schemas 1 through 4 because their player, inventory, environment, or block contracts differ. A universe also records content manifest `p0.5.0` and refuses to open under another rule set. Local testers can use `tools/dev/reset-local-world.sh` to move an incompatible world into a recoverable backup before creating a new one.
 
-Rollback is operational only: stop the worker, preserve its data directory, and return to the prior repository revision. No P0.4 action reaches a blockchain or changes external custody. A future content migration must be explicit, versioned, tested against a copy, and documented before the runtime will accept it.
+Rollback is operational only: stop the worker, preserve its data directory, and return to the prior repository revision. No P0.5 action reaches a blockchain or changes external custody. A future content migration must be explicit, versioned, tested against a copy, and documented before the runtime will accept it.
