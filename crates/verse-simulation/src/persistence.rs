@@ -525,7 +525,8 @@ mod tests {
                 .persist_snapshot()
                 .expect("aimed mining baseline persists");
             runtime
-                .execute(&ClientMessage::MineVoxel {
+                .execute_next_for_fixture(&ClientMessage::MineVoxel {
+                    operation_sequence: 0,
                     operation_id: "durable-mine".into(),
                     coordinate: target,
                 })
@@ -550,7 +551,8 @@ mod tests {
                 .persist_snapshot()
                 .expect("aimed build baseline persists");
             runtime
-                .execute(&ClientMessage::BuildBlock {
+                .execute_next_for_fixture(&ClientMessage::BuildBlock {
+                    operation_sequence: 0,
                     operation_id: "recovery-frame".into(),
                     grid_id: "grid-starter".into(),
                     coordinate: IVec3::new(0, 1, 0),
@@ -564,7 +566,8 @@ mod tests {
                 .block_id
                 .clone();
             runtime
-                .execute(&ClientMessage::WeldBlock {
+                .execute_next_for_fixture(&ClientMessage::WeldBlock {
+                    operation_sequence: 0,
                     operation_id: "recovery-weld".into(),
                     grid_id: "grid-starter".into(),
                     block_id,
@@ -598,7 +601,8 @@ mod tests {
                 .persist_snapshot()
                 .expect("durable aimed baseline persists");
             runtime
-                .execute(&ClientMessage::BuildBlock {
+                .execute_next_for_fixture(&ClientMessage::BuildBlock {
+                    operation_sequence: 0,
                     operation_id: "completed-recovery-frame".into(),
                     grid_id: STARTER_GRID_ID.into(),
                     coordinate: IVec3::new(0, 1, 0),
@@ -613,7 +617,8 @@ mod tests {
                 .clone();
             for stage in 0..3 {
                 runtime
-                    .execute(&ClientMessage::WeldBlock {
+                    .execute_next_for_fixture(&ClientMessage::WeldBlock {
+                        operation_sequence: 0,
                         operation_id: format!("completed-recovery-weld-{stage}"),
                         grid_id: STARTER_GRID_ID.into(),
                         block_id: block_id.clone(),
@@ -747,7 +752,8 @@ mod tests {
         {
             let mut runtime = Runtime::open(directory.path(), 37, 100).expect("runtime starts");
             runtime
-                .execute(&ClientMessage::SetSuitMode {
+                .execute_next_for_fixture(&ClientMessage::SetSuitMode {
+                    operation_sequence: 0,
                     operation_id: "persistent-suit-mode".into(),
                     helmet_closed: false,
                     jetpack_enabled: false,
@@ -803,7 +809,8 @@ mod tests {
         {
             let mut runtime = Runtime::open(directory.path(), 47, 100).expect("runtime starts");
             runtime
-                .execute(&ClientMessage::SetPlayerControl {
+                .execute_next_for_fixture(&ClientMessage::SetPlayerControl {
+                    operation_sequence: 0,
                     operation_id: "committed-before-torn-tail".into(),
                     movement_epoch: 1,
                     input_sequence: 1,
@@ -829,7 +836,8 @@ mod tests {
                 Runtime::open(directory.path(), 47, 100).expect("prior state recovers");
             assert_eq!(recovered.state().state_hash(), expected_hash);
             recovered
-                .execute(&ClientMessage::SetPlayerControl {
+                .execute_next_for_fixture(&ClientMessage::SetPlayerControl {
+                    operation_sequence: 0,
                     operation_id: "committed-after-torn-tail".into(),
                     movement_epoch: 1,
                     input_sequence: 2,

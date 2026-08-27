@@ -96,6 +96,7 @@ impl WorldState {
 
                 Ok(ActorPrivateSnapshot {
                     player,
+                    committed_operation_sequence: self.last_operation_sequence(actor),
                     inventories,
                     death_drops,
                     owned_grid_masses,
@@ -275,7 +276,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::model::{Block, DeathDrop, Grid, InventoryRecord};
+    use crate::model::{Block, DeathDrop, Grid, InventoryRecord, ProcessedOperationRecord};
 
     fn two_actor_world() -> WorldState {
         let mut world = WorldState::genesis(41);
@@ -390,6 +391,30 @@ mod tests {
         world.ledger.genesis_ore += 2;
         world.ledger.genesis_refined += 3;
 
+        for (actor, sequence) in [
+            ("player-local", 1_u64),
+            ("player-remote", 1_u64),
+            ("player-remote", 2_u64),
+        ] {
+            let operation_id = format!("projection-operation-{actor}-{sequence}");
+            world
+                .record_processed_operation(
+                    actor,
+                    ProcessedOperationRecord {
+                        operation_id: operation_id.clone(),
+                        intent_fingerprint: format!("{sequence:064x}"),
+                        receipt: verse_protocol::IntentReceipt {
+                            operation_sequence: sequence,
+                            operation_id,
+                            event_sequence: sequence,
+                            code: "fixture_committed".into(),
+                            message: "Fixture committed".into(),
+                        },
+                    },
+                )
+                .expect("projection operation history records");
+        }
+
         assert!(world.validate_player_roster().is_ok());
         assert!(world.conservation().valid);
         world
@@ -437,6 +462,8 @@ mod tests {
         let remote_private = remote.actor_private.expect("remote private projection");
         assert_eq!(local_private.player.player_id, "player-local");
         assert_eq!(remote_private.player.player_id, "player-remote");
+        assert_eq!(local_private.committed_operation_sequence, 1);
+        assert_eq!(remote_private.committed_operation_sequence, 2);
         assert_eq!(remote_private.player.experience, 275);
         assert_eq!(remote_private.player.suit_oxygen_milli, 412);
 
@@ -512,6 +539,7 @@ mod tests {
                 "career",
                 "suit_oxygen_milli",
                 "critical_oxygen_milli",
+                "committed_operation_sequence",
             ],
         );
         assert_eq!(value["conservation_valid"], true);

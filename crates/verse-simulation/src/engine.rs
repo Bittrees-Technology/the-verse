@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 
+use serde::Serialize;
 use thiserror::Error;
 use verse_physics::{
     BodyCollisionClass, BodyControl, BodySpec, BoxColliderSpec, CapsuleCast, CapsuleColliderSpec,
@@ -10,9 +11,10 @@ use verse_physics::{
     SphereColliderSpec, Vec3 as PhysicsVec3,
 };
 use verse_protocol::{
-    BlockKind, CareerSnapshot, ClientMessage, IVec3, IntentReceipt, InventoryContents,
-    InventoryDomain, LocomotionKind, LocomotionSupportSnapshot, MotionSnapshot, PlayerDeathCause,
-    PlayerLifeState, PlayerLocomotionSnapshot, Quat, ResourceKind, Vec3, WorldSnapshot,
+    BlockKind, CareerSnapshot, ClientMessage, INTENT_FINGERPRINT_SCHEMA_VERSION, IVec3,
+    IntentReceipt, InventoryContents, InventoryDomain, LocomotionKind, LocomotionSupportSnapshot,
+    MotionSnapshot, PROTOCOL_VERSION, PlayerDeathCause, PlayerLifeState, PlayerLocomotionSnapshot,
+    Quat, ResourceKind, Vec3, WorldSnapshot,
 };
 
 use crate::content;
@@ -24,7 +26,8 @@ use crate::event::{
 use crate::model::PLAYER_INVENTORY_ID;
 use crate::model::{
     Block, CARGO_INVENTORY_CAPACITY_LITERS, ContactPairKey, DeathDrop, Grid, InventoryRecord,
-    PLANET_CENTER, PLANET_SURFACE_RADIUS_M, Player, PlayerControlFrame, WorldState, radial_up,
+    PLANET_CENTER, PLANET_SURFACE_RADIUS_M, Player, PlayerControlFrame, ProcessedOperationRecord,
+    WORLD_SCHEMA_VERSION, WorldState, radial_up, valid_blake3_hex,
 };
 use crate::persistence::{PersistenceError, Store};
 #[cfg(test)]
@@ -56,12 +59,84 @@ const PLAYER_PLANET_PENETRATION_LIMIT_M: f64 = 0.28;
 const PLAYER_BOX_PENETRATION_LIMIT_M: f64 = 0.85;
 const CHARACTER_INERTIA_MULTIPLIER: f64 = 12.0;
 
+#[derive(Serialize)]
+struct IntentFingerprintMaterial<'a> {
+    domain: &'static str,
+    protocol_version: u32,
+    fingerprint_schema_version: u32,
+    world_schema_version: u32,
+    event_schema_version: u32,
+    universe_id: &'a str,
+    cell_id: &'a str,
+    actor_player_id: &'a str,
+    message: &'a serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
+struct OperationEventMetadata {
+    operation_id: String,
+    operation_sequence: u64,
+    intent_fingerprint: String,
+}
+
 fn player_body_id(player_id: &str) -> String {
     format!("player-body-{player_id}")
 }
 
 fn player_collider_id(player_id: &str) -> String {
     format!("player-collider-{player_id}")
+}
+
+fn client_message_floats_are_finite(message: &ClientMessage) -> bool {
+    let finite = |value: Vec3| value.x.is_finite() && value.y.is_finite() && value.z.is_finite();
+    match message {
+        ClientMessage::SetPlayerControl {
+            linear_input,
+            angular_input,
+            ..
+        }
+        | ClientMessage::SetGridControl {
+            linear_input,
+            angular_input,
+            ..
+        } => finite(*linear_input) && finite(*angular_input),
+        ClientMessage::Hello { .. }
+        | ClientMessage::RequestSnapshot
+        | ClientMessage::SetSuitMode { .. }
+        | ClientMessage::RespawnPlayer { .. }
+        | ClientMessage::MineVoxel { .. }
+        | ClientMessage::RefineOre { .. }
+        | ClientMessage::CraftComponent { .. }
+        | ClientMessage::TransferInventory { .. }
+        | ClientMessage::BuildBlock { .. }
+        | ClientMessage::WeldBlock { .. }
+        | ClientMessage::ToggleGridAnchor { .. }
+        | ClientMessage::DamageBlock { .. } => true,
+    }
+}
+
+fn normalize_json_signed_zero(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Number(number)
+            if number
+                .as_f64()
+                .is_some_and(|value| value == 0.0 && value.is_sign_negative()) =>
+        {
+            *number =
+                serde_json::Number::from_f64(0.0).expect("finite canonical zero is a JSON number");
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                normalize_json_signed_zero(value);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for value in map.values_mut() {
+                normalize_json_signed_zero(value);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -120,6 +195,8 @@ pub enum RuntimeError {
     Physics(#[from] PhysicsError),
     #[error("authoritative writes are halted after a persistence failure")]
     Halted,
+    #[error("canonical world invariant failed: {0}")]
+    CanonicalInvariant(String),
 }
 
 #[derive(Debug)]
@@ -187,6 +264,10 @@ impl Runtime {
     pub fn admit_development_player(&mut self, player_id: &str) -> Result<bool, RuntimeError> {
         if self.halted {
             return Err(RuntimeError::Halted);
+        }
+        if let Err(message) = self.state.validate_player_roster() {
+            self.halted = true;
+            return Err(RuntimeError::CanonicalInvariant(message));
         }
         if self.state.player.by_id.contains_key(player_id) {
             return Ok(false);
@@ -353,6 +434,10 @@ impl Runtime {
         if self.halted {
             return Err(RuntimeError::Halted);
         }
+        if let Err(message) = self.state.validate_player_roster() {
+            self.halted = true;
+            return Err(RuntimeError::CanonicalInvariant(message));
+        }
         if !self.state.player.by_id.contains_key(actor_player_id) {
             return Err(IntentError::rejected(
                 "actor_not_present",
@@ -366,12 +451,28 @@ impl Runtime {
                 "hello and snapshot requests are handled by the network service",
             )
         })?;
-
-        if let Some(receipt) = self
+        if operation_id.trim().is_empty() || operation_id.len() > 128 {
+            return Err(IntentError::rejected(
+                "invalid_operation_id",
+                "operation ID must contain between 1 and 128 characters",
+            )
+            .into());
+        }
+        let operation_sequence = message.operation_sequence().ok_or_else(|| {
+            IntentError::rejected(
+                "not_a_mutating_intent",
+                "hello and snapshot requests have no operation sequence",
+            )
+        })?;
+        let intent_fingerprint = self
             .state
-            .processed_operation(actor_player_id, operation_id)
-        {
-            return Ok(receipt.clone());
+            .client_intent_fingerprint(actor_player_id, message)?;
+        if let Some(receipt) = self.state.validate_operation_attempt(
+            actor_player_id,
+            operation_sequence,
+            &intent_fingerprint,
+        )? {
+            return Ok(receipt);
         }
 
         let event = self
@@ -405,8 +506,8 @@ impl Runtime {
         self.after_event()?;
 
         self.state
-            .processed_operation(actor_player_id, operation_id)
-            .cloned()
+            .processed_operation_record(actor_player_id, operation_sequence)
+            .map(|record| record.receipt.clone())
             .ok_or_else(|| {
                 IntentError::rejected(
                     "receipt_missing",
@@ -414,6 +515,46 @@ impl Runtime {
                 )
                 .into()
             })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn execute_next_for_fixture(
+        &mut self,
+        message: &ClientMessage,
+    ) -> Result<IntentReceipt, RuntimeError> {
+        let actor_player_id = self.state.player.player_id.clone();
+        self.execute_next_as_for_fixture(&actor_player_id, message)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn execute_next_as_for_fixture(
+        &mut self,
+        actor_player_id: &str,
+        message: &ClientMessage,
+    ) -> Result<IntentReceipt, RuntimeError> {
+        let mut sequenced = message.clone();
+        if sequenced.operation_sequence() == Some(0) {
+            let retained_sequence = sequenced.operation_id().and_then(|operation_id| {
+                self.state
+                    .processed_operations
+                    .get(actor_player_id)
+                    .and_then(|history| {
+                        history
+                            .retained
+                            .values()
+                            .find(|record| record.operation_id == operation_id)
+                    })
+                    .map(|record| record.receipt.operation_sequence)
+            });
+            let sequence = retained_sequence.unwrap_or_else(|| {
+                self.state
+                    .last_operation_sequence(actor_player_id)
+                    .checked_add(1)
+                    .expect("fixture operation sequence remains available")
+            });
+            assert!(sequenced.set_operation_sequence(sequence));
+        }
+        self.execute_as(actor_player_id, &sequenced)
     }
 
     pub fn advance(&mut self, delta_millis: u16) -> Result<bool, RuntimeError> {
@@ -923,11 +1064,278 @@ impl WorldState {
             && !self.player_movement_hits_grid(position, position, orientation)
     }
 
+    pub fn client_intent_fingerprint(
+        &self,
+        actor_player_id: &str,
+        message: &ClientMessage,
+    ) -> Result<String, IntentError> {
+        if message.operation_sequence().is_none() || message.operation_id().is_none() {
+            return Err(IntentError::rejected(
+                "not_a_mutating_intent",
+                "only mutating client messages have intent fingerprints",
+            ));
+        }
+        if !client_message_floats_are_finite(message) {
+            return Err(IntentError::rejected(
+                "invalid_vector",
+                "client intent floating-point fields must be finite",
+            ));
+        }
+        let mut canonical_message = serde_json::to_value(message).map_err(|_| {
+            IntentError::rejected(
+                "intent_fingerprint_invalid",
+                "client intent cannot be represented by the canonical fingerprint schema",
+            )
+        })?;
+        normalize_json_signed_zero(&mut canonical_message);
+        let material = IntentFingerprintMaterial {
+            domain: "the-verse-client-intent-v1",
+            protocol_version: PROTOCOL_VERSION,
+            fingerprint_schema_version: INTENT_FINGERPRINT_SCHEMA_VERSION,
+            world_schema_version: WORLD_SCHEMA_VERSION,
+            event_schema_version: EVENT_SCHEMA_VERSION,
+            universe_id: &self.universe_id,
+            cell_id: &self.cell_id,
+            actor_player_id,
+            message: &canonical_message,
+        };
+        let bytes = serde_json::to_vec(&material).map_err(|_| {
+            IntentError::rejected(
+                "intent_fingerprint_invalid",
+                "client intent cannot be represented by the canonical fingerprint schema",
+            )
+        })?;
+        Ok(blake3::hash(&bytes).to_hex().to_string())
+    }
+
+    fn validate_operation_attempt(
+        &self,
+        actor_player_id: &str,
+        operation_sequence: u64,
+        intent_fingerprint: &str,
+    ) -> Result<Option<IntentReceipt>, IntentError> {
+        if operation_sequence == 0 {
+            return Err(IntentError::rejected(
+                "operation_sequence_invalid",
+                "operation sequence must be positive",
+            ));
+        }
+        let Some(history) = self.processed_operations.get(actor_player_id) else {
+            if operation_sequence == 1 {
+                return Ok(None);
+            }
+            return Err(IntentError::rejected(
+                "operation_sequence_gap",
+                "operation sequence must begin at one for this actor",
+            ));
+        };
+        if operation_sequence <= history.compacted_through {
+            return Err(IntentError::rejected(
+                "operation_already_committed",
+                "operation committed but its historical receipt has been compacted",
+            ));
+        }
+        if let Some(record) = history.retained.get(&operation_sequence) {
+            if record.intent_fingerprint == intent_fingerprint {
+                return Ok(Some(record.receipt.clone()));
+            }
+            return Err(IntentError::rejected(
+                "operation_conflict",
+                "operation sequence is already bound to a different client intent",
+            ));
+        }
+        if operation_sequence <= history.committed_through {
+            return Err(IntentError::rejected(
+                "operation_history_invalid",
+                "canonical operation history is missing a committed retained record",
+            ));
+        }
+        let expected = history.committed_through.checked_add(1).ok_or_else(|| {
+            IntentError::rejected(
+                "operation_sequence_exhausted",
+                "the actor operation sequence has reached its maximum value",
+            )
+        })?;
+        if operation_sequence != expected {
+            return Err(IntentError::rejected(
+                "operation_sequence_gap",
+                format!("operation sequence must be the next committed value {expected}"),
+            ));
+        }
+        Ok(None)
+    }
+
+    fn client_message_for_human_event(
+        event: &CanonicalEvent,
+    ) -> Result<ClientMessage, IntentError> {
+        let operation_sequence = event
+            .operation_sequence
+            .expect("validated human event has an operation sequence");
+        let operation_id = event
+            .operation_id
+            .as_ref()
+            .expect("validated human event has an operation ID")
+            .clone();
+        let message = match &event.payload {
+            EventPayload::PlayerControlSet {
+                movement_epoch,
+                input_sequence,
+                linear_input,
+                angular_input,
+                boost,
+                dampeners,
+                jump,
+                ..
+            } => ClientMessage::SetPlayerControl {
+                operation_sequence,
+                operation_id,
+                movement_epoch: *movement_epoch,
+                input_sequence: *input_sequence,
+                linear_input: *linear_input,
+                angular_input: *angular_input,
+                boost: *boost,
+                dampeners: *dampeners,
+                jump: *jump,
+            },
+            EventPayload::SuitModeChanged {
+                helmet_closed,
+                jetpack_enabled,
+                magnetic_boots_enabled,
+            } => ClientMessage::SetSuitMode {
+                operation_sequence,
+                operation_id,
+                helmet_closed: *helmet_closed,
+                jetpack_enabled: *jetpack_enabled,
+                magnetic_boots_enabled: *magnetic_boots_enabled,
+            },
+            EventPayload::PlayerRespawned { .. } => ClientMessage::RespawnPlayer {
+                operation_sequence,
+                operation_id,
+            },
+            EventPayload::VoxelMined { coordinate, .. } => ClientMessage::MineVoxel {
+                operation_sequence,
+                operation_id,
+                coordinate: *coordinate,
+            },
+            EventPayload::OreRefined {
+                inventory_id,
+                batches,
+            } => ClientMessage::RefineOre {
+                operation_sequence,
+                operation_id,
+                inventory_id: inventory_id.clone(),
+                batches: *batches,
+            },
+            EventPayload::ComponentCrafted {
+                inventory_id,
+                quantity,
+            } => ClientMessage::CraftComponent {
+                operation_sequence,
+                operation_id,
+                inventory_id: inventory_id.clone(),
+                quantity: *quantity,
+            },
+            EventPayload::InventoryTransferred {
+                source_inventory_id,
+                destination_inventory_id,
+                resource,
+                quantity,
+            } => ClientMessage::TransferInventory {
+                operation_sequence,
+                operation_id,
+                source_inventory_id: source_inventory_id.clone(),
+                destination_inventory_id: destination_inventory_id.clone(),
+                resource: *resource,
+                quantity: *quantity,
+            },
+            EventPayload::BlockBuilt { grid_id, block, .. } => ClientMessage::BuildBlock {
+                operation_sequence,
+                operation_id,
+                grid_id: grid_id.clone(),
+                coordinate: block.coordinate,
+                kind: block.kind,
+                orientation: block.orientation,
+            },
+            EventPayload::BlockWelded {
+                grid_id, block_id, ..
+            } => ClientMessage::WeldBlock {
+                operation_sequence,
+                operation_id,
+                grid_id: grid_id.clone(),
+                block_id: block_id.clone(),
+            },
+            EventPayload::GridControlSet {
+                grid_id,
+                linear_input,
+                angular_input,
+                dampeners,
+            } => ClientMessage::SetGridControl {
+                operation_sequence,
+                operation_id,
+                grid_id: grid_id.clone(),
+                linear_input: *linear_input,
+                angular_input: *angular_input,
+                dampeners: *dampeners,
+            },
+            EventPayload::GridAnchorSet { grid_id, .. } => ClientMessage::ToggleGridAnchor {
+                operation_sequence,
+                operation_id,
+                grid_id: grid_id.clone(),
+            },
+            EventPayload::BlockDamaged {
+                grid_id, block_id, ..
+            } => ClientMessage::DamageBlock {
+                operation_sequence,
+                operation_id,
+                grid_id: grid_id.clone(),
+                block_id: block_id.clone(),
+            },
+            EventPayload::SuitOxygenChanged { .. } | EventPayload::PlayerIncapacitated { .. } => {
+                return Err(IntentError::rejected(
+                    "replay_lifecycle_envelope_invalid",
+                    "automatic life-support payload cannot use a human client envelope",
+                ));
+            }
+            EventPayload::PhysicsStepCommitted { .. } => {
+                return Err(IntentError::rejected(
+                    "replay_physics_envelope_invalid",
+                    "physics payload cannot use a human client envelope",
+                ));
+            }
+        };
+        Ok(message)
+    }
+
     pub fn prepare_client_event(
         &self,
         message: &ClientMessage,
     ) -> Result<CanonicalEvent, IntentError> {
         self.prepare_client_event_as(&self.player.player_id, message)
+    }
+
+    #[cfg(test)]
+    fn prepare_next_client_event_for_fixture(
+        &self,
+        message: &ClientMessage,
+    ) -> Result<CanonicalEvent, IntentError> {
+        self.prepare_next_client_event_as_for_fixture(&self.player.player_id, message)
+    }
+
+    #[cfg(test)]
+    fn prepare_next_client_event_as_for_fixture(
+        &self,
+        actor_player_id: &str,
+        message: &ClientMessage,
+    ) -> Result<CanonicalEvent, IntentError> {
+        let mut sequenced = message.clone();
+        if sequenced.operation_sequence() == Some(0) {
+            let sequence = self
+                .last_operation_sequence(actor_player_id)
+                .checked_add(1)
+                .expect("fixture operation sequence remains available");
+            assert!(sequenced.set_operation_sequence(sequence));
+        }
+        self.prepare_client_event_as(actor_player_id, &sequenced)
     }
 
     pub fn prepare_client_event_as(
@@ -944,10 +1352,23 @@ impl WorldState {
         let operation_id = message.operation_id().ok_or_else(|| {
             IntentError::rejected("not_a_mutating_intent", "message has no operation ID")
         })?;
+        let operation_sequence = message.operation_sequence().ok_or_else(|| {
+            IntentError::rejected("not_a_mutating_intent", "message has no operation sequence")
+        })?;
         if operation_id.trim().is_empty() || operation_id.len() > 128 {
             return Err(IntentError::rejected(
                 "invalid_operation_id",
                 "operation ID must contain between 1 and 128 characters",
+            ));
+        }
+        let intent_fingerprint = self.client_intent_fingerprint(actor_player_id, message)?;
+        if self
+            .validate_operation_attempt(actor_player_id, operation_sequence, &intent_fingerprint)?
+            .is_some()
+        {
+            return Err(IntentError::rejected(
+                "operation_already_committed",
+                "the retained operation has already committed; execute through the runtime to recover its receipt",
             ));
         }
         if !matches!(actor.life_state, PlayerLifeState::Alive)
@@ -1426,7 +1847,11 @@ impl WorldState {
         Ok(self.new_event(
             Some(actor_player_id),
             "human",
-            Some(operation_id.to_owned()),
+            Some(OperationEventMetadata {
+                operation_id: operation_id.to_owned(),
+                operation_sequence,
+                intent_fingerprint,
+            }),
             payload,
         ))
     }
@@ -1439,9 +1864,17 @@ impl WorldState {
         &self,
         actor_player_id: Option<&str>,
         actor_type: &str,
-        operation_id: Option<String>,
+        operation: Option<OperationEventMetadata>,
         payload: EventPayload,
     ) -> CanonicalEvent {
+        let (operation_id, operation_sequence, intent_fingerprint) =
+            operation.map_or((None, None, None), |operation| {
+                (
+                    Some(operation.operation_id),
+                    Some(operation.operation_sequence),
+                    Some(operation.intent_fingerprint),
+                )
+            });
         CanonicalEvent::new(
             self.event_sequence + 1,
             self.content_manifest_version.clone(),
@@ -1451,9 +1884,53 @@ impl WorldState {
             actor_player_id.map(str::to_owned),
             actor_type,
             operation_id,
+            operation_sequence,
+            intent_fingerprint,
             self.last_event_hash.clone(),
             payload,
         )
+    }
+
+    #[cfg(test)]
+    fn new_test_human_event(
+        &self,
+        actor_player_id: &str,
+        operation_id: impl Into<String>,
+        payload: EventPayload,
+    ) -> CanonicalEvent {
+        let operation_sequence = self
+            .last_operation_sequence(actor_player_id)
+            .checked_add(1)
+            .expect("test operation sequence remains available");
+        self.new_test_human_event_at(actor_player_id, operation_sequence, operation_id, payload)
+    }
+
+    #[cfg(test)]
+    fn new_test_human_event_at(
+        &self,
+        actor_player_id: &str,
+        operation_sequence: u64,
+        operation_id: impl Into<String>,
+        payload: EventPayload,
+    ) -> CanonicalEvent {
+        let mut event = self.new_event(
+            Some(actor_player_id),
+            "human",
+            Some(OperationEventMetadata {
+                operation_id: operation_id.into(),
+                operation_sequence,
+                intent_fingerprint: "0".repeat(64),
+            }),
+            payload,
+        );
+        let message = Self::client_message_for_human_event(&event)
+            .expect("test human payload reconstructs a typed client message");
+        event.intent_fingerprint = Some(
+            self.client_intent_fingerprint(actor_player_id, &message)
+                .expect("test human intent fingerprints"),
+        );
+        event.event_hash = event.calculate_hash();
+        event
     }
 
     pub fn apply_event(&mut self, event: &CanonicalEvent) -> Result<(), IntentError> {
@@ -1488,17 +1965,31 @@ impl WorldState {
                     .actor_player_id
                     .as_deref()
                     .is_none_or(|player_id| !self.player.by_id.contains_key(player_id))
-                    || event.operation_id.as_deref().is_none_or(str::is_empty) =>
+                    || event.operation_id.as_deref().is_none_or(|operation_id| {
+                        operation_id.is_empty() || operation_id.len() > 128
+                    })
+                    || event
+                        .operation_sequence
+                        .is_none_or(|sequence| sequence == 0)
+                    || event
+                        .intent_fingerprint
+                        .as_deref()
+                        .is_none_or(|fingerprint| !valid_blake3_hex(fingerprint)) =>
             {
                 return Err(IntentError::rejected(
                     "replay_actor_envelope_invalid",
-                    "human events require one present canonical player actor and an operation ID",
+                    "human events require one present canonical player actor, operation ID, positive operation sequence, and typed intent fingerprint",
                 ));
             }
-            "system" if event.actor_player_id.is_some() || event.operation_id.is_some() => {
+            "system"
+                if event.actor_player_id.is_some()
+                    || event.operation_id.is_some()
+                    || event.operation_sequence.is_some()
+                    || event.intent_fingerprint.is_some() =>
+            {
                 return Err(IntentError::rejected(
                     "replay_actor_envelope_invalid",
-                    "system events cannot impersonate a player or carry a client operation ID",
+                    "system events cannot carry any client operation metadata",
                 ));
             }
             "human" | "system" => {}
@@ -1509,16 +2000,40 @@ impl WorldState {
                 ));
             }
         }
-        if let (Some(actor_player_id), Some(operation_id)) =
-            (&event.actor_player_id, &event.operation_id)
-            && self
-                .processed_operation(actor_player_id, operation_id)
+        if event.actor_type == "human" {
+            let actor_player_id = event
+                .actor_player_id
+                .as_deref()
+                .expect("validated human event has an actor");
+            let operation_sequence = event
+                .operation_sequence
+                .expect("validated human event has an operation sequence");
+            let intent_fingerprint = event
+                .intent_fingerprint
+                .as_deref()
+                .expect("validated human event has an intent fingerprint");
+            if self
+                .validate_operation_attempt(
+                    actor_player_id,
+                    operation_sequence,
+                    intent_fingerprint,
+                )?
                 .is_some()
-        {
-            return Err(IntentError::rejected(
-                "replay_operation_duplicate",
-                "event operation ID was already committed",
-            ));
+            {
+                return Err(IntentError::rejected(
+                    "replay_operation_duplicate",
+                    "event operation sequence was already committed",
+                ));
+            }
+            let reconstructed = Self::client_message_for_human_event(event)?;
+            let expected_fingerprint =
+                self.client_intent_fingerprint(actor_player_id, &reconstructed)?;
+            if expected_fingerprint != intent_fingerprint {
+                return Err(IntentError::rejected(
+                    "replay_intent_fingerprint_mismatch",
+                    "event intent fingerprint does not bind its typed client request",
+                ));
+            }
         }
         match &event.payload {
             EventPayload::PlayerControlSet { .. }
@@ -2878,22 +3393,35 @@ impl WorldState {
 
         self.event_sequence = event.event_sequence;
         self.last_event_hash.clone_from(&event.event_hash);
-        if let (Some(actor_player_id), Some(operation_id)) =
-            (&event.actor_player_id, &event.operation_id)
-        {
+        if let (
+            Some(actor_player_id),
+            Some(operation_id),
+            Some(operation_sequence),
+            Some(intent_fingerprint),
+        ) = (
+            &event.actor_player_id,
+            &event.operation_id,
+            event.operation_sequence,
+            &event.intent_fingerprint,
+        ) {
             let (code, message) = event.payload.receipt();
-            self.processed_operations
-                .entry(actor_player_id.clone())
-                .or_default()
-                .insert(
-                    operation_id.clone(),
-                    IntentReceipt {
+            self.record_processed_operation(
+                actor_player_id,
+                ProcessedOperationRecord {
+                    operation_id: operation_id.clone(),
+                    intent_fingerprint: intent_fingerprint.clone(),
+                    receipt: IntentReceipt {
+                        operation_sequence,
                         operation_id: operation_id.clone(),
                         event_sequence: event.event_sequence,
                         code: code.into(),
                         message,
                     },
-                );
+                },
+            )
+            .map_err(|message| {
+                IntentError::rejected("replay_operation_history_invalid", message)
+            })?;
         }
 
         if !self.conservation().valid {
@@ -5185,7 +5713,9 @@ mod tests {
     use verse_protocol::IVec3;
 
     use super::*;
-    use crate::model::{STARTER_GRID_ID, VoxelField};
+    use crate::model::{
+        ActorOperationHistory, PROCESSED_OPERATION_RETENTION_LIMIT, STARTER_GRID_ID, VoxelField,
+    };
     use crate::persistence::AppendFailpoint;
 
     fn runtime() -> Runtime {
@@ -5198,6 +5728,7 @@ mod tests {
         let before_hash = runtime.state().state_hash();
         let before_sequence = runtime.state().event_sequence;
         let intent = ClientMessage::SetPlayerControl {
+            operation_sequence: 0,
             operation_id: "actor-isolation-1".into(),
             movement_epoch: runtime.state().player.movement_epoch,
             input_sequence: 1,
@@ -5209,7 +5740,7 @@ mod tests {
         };
 
         let rejected = runtime
-            .execute_as("another-player", &intent)
+            .execute_next_as_for_fixture("another-player", &intent)
             .expect_err("an unbound actor cannot control the canonical player");
         assert!(matches!(
             rejected,
@@ -5220,7 +5751,7 @@ mod tests {
         assert_eq!(runtime.state().state_hash(), before_hash);
 
         let receipt = runtime
-            .execute_as("player-local", &intent)
+            .execute_next_as_for_fixture("player-local", &intent)
             .expect("the bound actor can submit its own control");
         assert_eq!(runtime.state().event_sequence, before_sequence + 1);
         assert_eq!(runtime.state().player.last_received_input_sequence, 1);
@@ -5232,6 +5763,286 @@ mod tests {
                 .expect("actor-scoped receipt exists"),
             &receipt
         );
+    }
+
+    fn sequenced_suit_message(
+        operation_sequence: u64,
+        operation_id: impl Into<String>,
+        helmet_closed: bool,
+    ) -> ClientMessage {
+        ClientMessage::SetSuitMode {
+            operation_sequence,
+            operation_id: operation_id.into(),
+            helmet_closed,
+            jetpack_enabled: true,
+            magnetic_boots_enabled: false,
+        }
+    }
+
+    fn rejected_code(error: RuntimeError) -> String {
+        match error {
+            RuntimeError::Intent(IntentError::Rejected { code, .. }) => code,
+            other => panic!("expected an intent rejection, received {other}"),
+        }
+    }
+
+    #[test]
+    fn operation_sequences_detect_conflicts_gaps_and_reuse_rejected_frontier() {
+        let mut runtime = runtime();
+        let first = sequenced_suit_message(1, "sequence-one", false);
+        let first_receipt = runtime.execute(&first).expect("sequence one commits");
+        let committed_hash = runtime.state().state_hash();
+        assert_eq!(first_receipt.operation_sequence, 1);
+
+        assert_eq!(
+            runtime
+                .execute(&first)
+                .expect("an exact retry is idempotent"),
+            first_receipt
+        );
+        assert_eq!(runtime.state().state_hash(), committed_hash);
+
+        assert_eq!(
+            rejected_code(
+                runtime
+                    .execute(&sequenced_suit_message(1, "changed-id", false))
+                    .expect_err("a changed diagnostic ID changes the typed intent")
+            ),
+            "operation_conflict"
+        );
+        assert_eq!(
+            rejected_code(
+                runtime
+                    .execute(&sequenced_suit_message(1, "sequence-one", true))
+                    .expect_err("a changed payload conflicts at the committed sequence")
+            ),
+            "operation_conflict"
+        );
+        assert_eq!(runtime.state().state_hash(), committed_hash);
+
+        assert_eq!(
+            rejected_code(
+                runtime
+                    .execute(&sequenced_suit_message(0, "zero", true))
+                    .expect_err("zero is never a client operation sequence")
+            ),
+            "operation_sequence_invalid"
+        );
+        assert_eq!(
+            rejected_code(
+                runtime
+                    .execute(&sequenced_suit_message(3, "gap", true))
+                    .expect_err("a client cannot skip sequence two")
+            ),
+            "operation_sequence_gap"
+        );
+
+        let rejected_second = sequenced_suit_message(2, "rejected-two", false);
+        assert_eq!(
+            rejected_code(
+                runtime
+                    .execute(&rejected_second)
+                    .expect_err("an unchanged suit mode is rejected")
+            ),
+            "suit_mode_no_change"
+        );
+        assert_eq!(runtime.state().last_operation_sequence("player-local"), 1);
+        assert_eq!(runtime.state().state_hash(), committed_hash);
+
+        let corrected = sequenced_suit_message(2, "corrected-two", true);
+        let corrected_receipt = runtime
+            .execute(&corrected)
+            .expect("the rejected frontier can be reused with corrected intent");
+        assert_eq!(corrected_receipt.operation_sequence, 2);
+        assert_eq!(runtime.state().last_operation_sequence("player-local"), 2);
+    }
+
+    #[test]
+    fn operation_fingerprints_are_actor_scoped_and_canonicalize_signed_zero() {
+        let mut runtime = runtime();
+        runtime
+            .admit_development_player("player-remote")
+            .expect("second actor is pre-admitted");
+
+        let shared = sequenced_suit_message(1, "shared-diagnostic", false);
+        let local = runtime
+            .execute(&shared)
+            .expect("local sequence one commits");
+        let remote = runtime
+            .execute_as("player-remote", &shared)
+            .expect("remote has an independent sequence one");
+        assert_eq!(local.operation_sequence, 1);
+        assert_eq!(remote.operation_sequence, 1);
+        assert_ne!(local.event_sequence, remote.event_sequence);
+        assert_eq!(runtime.state().last_operation_sequence("player-local"), 1);
+        assert_eq!(runtime.state().last_operation_sequence("player-remote"), 1);
+
+        let positive_zero = ClientMessage::SetPlayerControl {
+            operation_sequence: 2,
+            operation_id: "zero-control".into(),
+            movement_epoch: 1,
+            input_sequence: 1,
+            linear_input: Vec3::new(0.0, 0.0, 0.0),
+            angular_input: Vec3::new(0.0, 0.0, 0.0),
+            boost: false,
+            dampeners: true,
+            jump: false,
+        };
+        let negative_zero = ClientMessage::SetPlayerControl {
+            operation_sequence: 2,
+            operation_id: "zero-control".into(),
+            movement_epoch: 1,
+            input_sequence: 1,
+            linear_input: Vec3::new(-0.0, 0.0, -0.0),
+            angular_input: Vec3::new(0.0, -0.0, 0.0),
+            boost: false,
+            dampeners: true,
+            jump: false,
+        };
+        assert_eq!(
+            runtime
+                .state()
+                .client_intent_fingerprint("player-local", &positive_zero)
+                .expect("positive zero fingerprints"),
+            runtime
+                .state()
+                .client_intent_fingerprint("player-local", &negative_zero)
+                .expect("negative zero fingerprints canonically")
+        );
+
+        let non_finite = ClientMessage::SetPlayerControl {
+            operation_sequence: 2,
+            operation_id: "zero-control".into(),
+            movement_epoch: 1,
+            input_sequence: 1,
+            linear_input: Vec3::new(f64::NAN, 0.0, 0.0),
+            angular_input: Vec3::ZERO,
+            boost: false,
+            dampeners: true,
+            jump: false,
+        };
+        assert_eq!(
+            runtime
+                .state()
+                .client_intent_fingerprint("player-local", &non_finite)
+                .expect_err("non-finite intent data is not fingerprintable")
+                .code(),
+            "invalid_vector"
+        );
+    }
+
+    #[test]
+    fn operation_compaction_and_exact_retry_survive_restart() {
+        let directory = tempdir().expect("tempdir");
+        let expected_hash;
+        let expected_compaction_hash: String;
+        let final_message = sequenced_suit_message(129, "bounded-129", false);
+        let final_receipt;
+        {
+            let mut runtime =
+                Runtime::open(directory.path(), 143, 1).expect("runtime opens for compaction");
+            let mut last_receipt = None;
+            for operation_sequence in 1..=129 {
+                let message = sequenced_suit_message(
+                    operation_sequence,
+                    format!("bounded-{operation_sequence}"),
+                    operation_sequence % 2 == 0,
+                );
+                last_receipt = Some(runtime.execute(&message).expect("operation commits"));
+            }
+            final_receipt = last_receipt.expect("the bounded campaign is nonempty");
+            let history = &runtime.state().processed_operations["player-local"];
+            assert_eq!(history.committed_through, 129);
+            assert_eq!(history.compacted_through, 1);
+            assert_eq!(history.retained.len(), PROCESSED_OPERATION_RETENTION_LIMIT);
+            assert_eq!(
+                history.retained.first_key_value().map(|(key, _)| *key),
+                Some(2)
+            );
+            assert!(valid_blake3_hex(&history.compacted_history_hash));
+            expected_compaction_hash = history.compacted_history_hash.clone();
+            expected_hash = runtime.state().state_hash();
+        }
+
+        let mut recovered =
+            Runtime::open(directory.path(), 143, 1).expect("compacted runtime recovers");
+        assert_eq!(recovered.state().state_hash(), expected_hash);
+        let history = &recovered.state().processed_operations["player-local"];
+        assert_eq!(history.compacted_history_hash, expected_compaction_hash);
+        assert_eq!(history.committed_through, 129);
+        assert_eq!(history.compacted_through, 1);
+
+        assert_eq!(
+            rejected_code(
+                recovered
+                    .execute(&sequenced_suit_message(1, "bounded-1", false))
+                    .expect_err("a compacted retry cannot reconstruct its exact receipt")
+            ),
+            "operation_already_committed"
+        );
+        assert_eq!(
+            recovered
+                .execute(&final_message)
+                .expect("a retained exact retry returns its durable receipt"),
+            final_receipt
+        );
+        assert_eq!(recovered.state().state_hash(), expected_hash);
+    }
+
+    #[test]
+    fn operation_frontier_recovers_across_append_failpoints() {
+        for (failpoint, durable) in [
+            (AppendFailpoint::BeforeWrite, false),
+            (AppendFailpoint::AfterSync, true),
+        ] {
+            let directory = tempdir().expect("tempdir");
+            let message = sequenced_suit_message(1, format!("failpoint-{durable}"), false);
+            {
+                let mut runtime = Runtime::open(directory.path(), 149, 100).expect("runtime opens");
+                runtime.store.set_append_failpoint(failpoint);
+                assert!(matches!(
+                    runtime.execute(&message),
+                    Err(RuntimeError::Persistence(
+                        PersistenceError::InjectedFailure(_)
+                    ))
+                ));
+                assert!(runtime.is_halted());
+                assert_eq!(runtime.state().last_operation_sequence("player-local"), 0);
+            }
+
+            let mut recovered =
+                Runtime::open(directory.path(), 149, 100).expect("runtime recovers");
+            assert_eq!(
+                recovered.state().last_operation_sequence("player-local"),
+                u64::from(durable)
+            );
+            let receipt = recovered
+                .execute(&message)
+                .expect("the same operation is accepted or retried exactly");
+            assert_eq!(receipt.operation_sequence, 1);
+            assert_eq!(recovered.state().last_operation_sequence("player-local"), 1);
+            assert_eq!(recovered.state().event_sequence, 1);
+        }
+    }
+
+    #[test]
+    fn malformed_operation_history_halts_before_intent_processing() {
+        let mut runtime = runtime();
+        runtime.state.processed_operations.insert(
+            "player-local".into(),
+            ActorOperationHistory {
+                committed_through: 2,
+                compacted_through: 0,
+                compacted_history_hash: String::new(),
+                retained: BTreeMap::new(),
+            },
+        );
+        assert!(matches!(
+            runtime.execute(&sequenced_suit_message(3, "must-not-run", false)),
+            Err(RuntimeError::CanonicalInvariant(_))
+        ));
+        assert!(runtime.is_halted());
+        assert_eq!(runtime.state().event_sequence, 0);
     }
 
     fn move_player_near_grid(runtime: &mut Runtime) {
@@ -5505,6 +6316,7 @@ mod tests {
             .persist_snapshot()
             .expect("two-player baseline persists");
         let control = |player: &Player, linear_input: Vec3| ClientMessage::SetPlayerControl {
+            operation_sequence: 0,
             operation_id: "shared-operation-id".into(),
             movement_epoch: player.movement_epoch,
             input_sequence: 1,
@@ -5532,10 +6344,10 @@ mod tests {
         );
 
         let local_receipt = runtime
-            .execute_as("player-local", &local_intent)
+            .execute_next_as_for_fixture("player-local", &local_intent)
             .expect("local control commits");
         let remote_receipt = runtime
-            .execute_as("player-remote", &remote_intent)
+            .execute_next_as_for_fixture("player-remote", &remote_intent)
             .expect("remote control with the same operation ID commits independently");
         assert_ne!(local_receipt.event_sequence, remote_receipt.event_sequence);
         assert_eq!(
@@ -5572,13 +6384,13 @@ mod tests {
         let accepted_sequence = runtime.state().event_sequence;
         assert_eq!(
             runtime
-                .execute_as("player-local", &local_intent)
+                .execute_next_as_for_fixture("player-local", &local_intent)
                 .expect("local retry is idempotent"),
             local_receipt
         );
         assert_eq!(
             runtime
-                .execute_as("player-remote", &remote_intent)
+                .execute_next_as_for_fixture("player-remote", &remote_intent)
                 .expect("remote retry is idempotent"),
             remote_receipt
         );
@@ -5591,9 +6403,10 @@ mod tests {
             runtime.state().player.locomotion.magnetic_boots_enabled,
         );
         let remote_suit_receipt = runtime
-            .execute_as(
+            .execute_next_as_for_fixture(
                 "player-remote",
                 &ClientMessage::SetSuitMode {
+                    operation_sequence: 0,
                     operation_id: "remote-suit-disabled".into(),
                     helmet_closed: false,
                     jetpack_enabled: true,
@@ -5617,9 +6430,10 @@ mod tests {
         let lifecycle_sequence = runtime.state().event_sequence;
         assert_eq!(
             runtime
-                .execute_as(
+                .execute_next_as_for_fixture(
                     "player-remote",
                     &ClientMessage::SetSuitMode {
+                        operation_sequence: 0,
                         operation_id: "remote-suit-disabled".into(),
                         helmet_closed: false,
                         jetpack_enabled: true,
@@ -5686,6 +6500,7 @@ mod tests {
             let denied = [
                 (
                     ClientMessage::RefineOre {
+                        operation_sequence: 0,
                         operation_id: "remote-refine-primary".into(),
                         inventory_id: PLAYER_INVENTORY_ID.into(),
                         batches: 1,
@@ -5694,6 +6509,7 @@ mod tests {
                 ),
                 (
                     ClientMessage::CraftComponent {
+                        operation_sequence: 0,
                         operation_id: "remote-craft-primary".into(),
                         inventory_id: PLAYER_INVENTORY_ID.into(),
                         quantity: 1,
@@ -5702,6 +6518,7 @@ mod tests {
                 ),
                 (
                     ClientMessage::TransferInventory {
+                        operation_sequence: 0,
                         operation_id: "remote-transfer-from-primary".into(),
                         source_inventory_id: PLAYER_INVENTORY_ID.into(),
                         destination_inventory_id: "inventory-player-remote".into(),
@@ -5712,6 +6529,7 @@ mod tests {
                 ),
                 (
                     ClientMessage::TransferInventory {
+                        operation_sequence: 0,
                         operation_id: "remote-transfer-to-primary".into(),
                         source_inventory_id: "inventory-player-remote".into(),
                         destination_inventory_id: PLAYER_INVENTORY_ID.into(),
@@ -5724,7 +6542,7 @@ mod tests {
             for (message, expected_code) in denied {
                 let before = runtime.state().state_hash();
                 let error = runtime
-                    .execute_as("player-remote", &message)
+                    .execute_next_as_for_fixture("player-remote", &message)
                     .expect_err("cross-owner inventory intent rejects");
                 assert!(matches!(
                     error,
@@ -5736,6 +6554,7 @@ mod tests {
 
             let foreign_grid_intents = [
                 ClientMessage::BuildBlock {
+                    operation_sequence: 0,
                     operation_id: "primary-build-foreign".into(),
                     grid_id: STARTER_GRID_ID.into(),
                     coordinate: IVec3::new(0, 1, 0),
@@ -5743,11 +6562,13 @@ mod tests {
                     orientation: 0,
                 },
                 ClientMessage::WeldBlock {
+                    operation_sequence: 0,
                     operation_id: "primary-weld-foreign".into(),
                     grid_id: STARTER_GRID_ID.into(),
                     block_id: "block-core".into(),
                 },
                 ClientMessage::SetGridControl {
+                    operation_sequence: 0,
                     operation_id: "primary-control-foreign".into(),
                     grid_id: STARTER_GRID_ID.into(),
                     linear_input: Vec3::new(0.25, 0.0, 0.0),
@@ -5755,6 +6576,7 @@ mod tests {
                     dampeners: true,
                 },
                 ClientMessage::ToggleGridAnchor {
+                    operation_sequence: 0,
                     operation_id: "primary-anchor-foreign".into(),
                     grid_id: STARTER_GRID_ID.into(),
                 },
@@ -5762,7 +6584,7 @@ mod tests {
             for message in foreign_grid_intents {
                 let before = runtime.state().state_hash();
                 let error = runtime
-                    .execute_as("player-local", &message)
+                    .execute_next_as_for_fixture("player-local", &message)
                     .expect_err("foreign constructive grid intent rejects");
                 assert!(matches!(
                     error,
@@ -5773,9 +6595,10 @@ mod tests {
             }
 
             runtime
-                .execute_as(
+                .execute_next_as_for_fixture(
                     "player-remote",
                     &ClientMessage::RefineOre {
+                        operation_sequence: 0,
                         operation_id: "remote-refine-owned".into(),
                         inventory_id: "inventory-player-remote".into(),
                         batches: 1,
@@ -5783,9 +6606,10 @@ mod tests {
                 )
                 .expect("secondary actor refines its carried ore");
             runtime
-                .execute_as(
+                .execute_next_as_for_fixture(
                     "player-remote",
                     &ClientMessage::CraftComponent {
+                        operation_sequence: 0,
                         operation_id: "remote-craft-owned".into(),
                         inventory_id: "inventory-player-remote".into(),
                         quantity: 1,
@@ -5793,9 +6617,10 @@ mod tests {
                 )
                 .expect("secondary actor crafts in its carried inventory");
             runtime
-                .execute_as(
+                .execute_next_as_for_fixture(
                     "player-remote",
                     &ClientMessage::TransferInventory {
+                        operation_sequence: 0,
                         operation_id: "remote-transfer-to-owned-cargo".into(),
                         source_inventory_id: "inventory-player-remote".into(),
                         destination_inventory_id: "inventory-cargo-starter".into(),
@@ -5805,9 +6630,10 @@ mod tests {
                 )
                 .expect("secondary actor deposits into its completed cargo");
             runtime
-                .execute_as(
+                .execute_next_as_for_fixture(
                     "player-remote",
                     &ClientMessage::TransferInventory {
+                        operation_sequence: 0,
                         operation_id: "remote-transfer-from-owned-cargo".into(),
                         source_inventory_id: "inventory-cargo-starter".into(),
                         destination_inventory_id: "inventory-player-remote".into(),
@@ -5817,9 +6643,10 @@ mod tests {
                 )
                 .expect("secondary actor withdraws from its completed cargo");
             runtime
-                .execute_as(
+                .execute_next_as_for_fixture(
                     "player-remote",
                     &ClientMessage::SetGridControl {
+                        operation_sequence: 0,
                         operation_id: "remote-control-owned-grid".into(),
                         grid_id: STARTER_GRID_ID.into(),
                         linear_input: Vec3::new(0.25, 0.0, 0.0),
@@ -5832,9 +6659,10 @@ mod tests {
             aim_player_for_build(&mut runtime, STARTER_GRID_ID, IVec3::new(0, 1, 0));
             copy_primary_tool_pose_to(&mut runtime, "player-remote");
             runtime
-                .execute_as(
+                .execute_next_as_for_fixture(
                     "player-remote",
                     &ClientMessage::BuildBlock {
+                        operation_sequence: 0,
                         operation_id: "remote-build-owned-grid".into(),
                         grid_id: STARTER_GRID_ID.into(),
                         coordinate: IVec3::new(0, 1, 0),
@@ -5852,9 +6680,10 @@ mod tests {
                 aim_player_at_block(&mut runtime, STARTER_GRID_ID, &frame_id);
                 copy_primary_tool_pose_to(&mut runtime, "player-remote");
                 runtime
-                    .execute_as(
+                    .execute_next_as_for_fixture(
                         "player-remote",
                         &ClientMessage::WeldBlock {
+                            operation_sequence: 0,
                             operation_id: format!("remote-weld-owned-grid-{stage}"),
                             grid_id: STARTER_GRID_ID.into(),
                             block_id: frame_id.clone(),
@@ -5866,9 +6695,10 @@ mod tests {
             let local_experience_before = runtime.state().player.primary().experience;
             aim_player_at_block(&mut runtime, STARTER_GRID_ID, "block-deck-e");
             runtime
-                .execute_as(
+                .execute_next_as_for_fixture(
                     "player-local",
                     &ClientMessage::DamageBlock {
+                        operation_sequence: 0,
                         operation_id: "primary-damage-foreign-grid".into(),
                         grid_id: STARTER_GRID_ID.into(),
                         block_id: "block-deck-e".into(),
@@ -5964,7 +6794,7 @@ mod tests {
             |runtime: &mut Runtime, message: ClientMessage, expected_code: &str| {
                 let before_hash = runtime.state().state_hash();
                 let before_sequence = runtime.state().event_sequence;
-                let result = runtime.execute(&message);
+                let result = runtime.execute_next_for_fixture(&message);
                 assert!(matches!(
                     result,
                     Err(RuntimeError::Intent(IntentError::Rejected { ref code, .. }))
@@ -5977,6 +6807,7 @@ mod tests {
         assert_rejected_unchanged(
             &mut runtime,
             ClientMessage::DamageBlock {
+                operation_sequence: 0,
                 operation_id: "occluded-damage-prepare".into(),
                 grid_id: STARTER_GRID_ID.into(),
                 block_id: "block-deck-e".into(),
@@ -5986,6 +6817,7 @@ mod tests {
         assert_rejected_unchanged(
             &mut runtime,
             ClientMessage::BuildBlock {
+                operation_sequence: 0,
                 operation_id: "wrong-build-face-prepare".into(),
                 grid_id: STARTER_GRID_ID.into(),
                 coordinate: IVec3::new(0, -1, 0),
@@ -6007,6 +6839,7 @@ mod tests {
         assert_rejected_unchanged(
             &mut runtime,
             ClientMessage::MineVoxel {
+                operation_sequence: 0,
                 operation_id: "occluded-mining-prepare".into(),
                 coordinate: different,
             },
@@ -6030,7 +6863,8 @@ mod tests {
         state.player.locomotion.up = Vec3::new(0.0, 1.0, 0.0);
         state.player.locomotion.view_pitch_radians = 0.0;
         state
-            .prepare_client_event(&ClientMessage::MineVoxel {
+            .prepare_next_client_event_for_fixture(&ClientMessage::MineVoxel {
+                operation_sequence: 0,
                 operation_id: "exact-nine-meter-surface".into(),
                 coordinate: IVec3::ZERO,
             })
@@ -6039,7 +6873,8 @@ mod tests {
         state.player.position.z += 1.0e-8;
         let before_hash = state.state_hash();
         let error = state
-            .prepare_client_event(&ClientMessage::MineVoxel {
+            .prepare_next_client_event_for_fixture(&ClientMessage::MineVoxel {
+                operation_sequence: 0,
                 operation_id: "beyond-nine-meter-surface".into(),
                 coordinate: IVec3::ZERO,
             })
@@ -6059,7 +6894,8 @@ mod tests {
         let state = runtime.state().clone();
 
         let damage = state
-            .prepare_client_event(&ClientMessage::DamageBlock {
+            .prepare_next_client_event_for_fixture(&ClientMessage::DamageBlock {
+                operation_sequence: 0,
                 operation_id: "canonical-targeted-damage".into(),
                 grid_id: STARTER_GRID_ID.into(),
                 block_id: "block-core".into(),
@@ -6081,7 +6917,11 @@ mod tests {
         };
         *block_id = "block-deck-e".into();
         wrong_damage_target.event_hash = wrong_damage_target.calculate_hash();
-        reject(&wrong_damage_target, "replay_damage_target_invalid", &state);
+        reject(
+            &wrong_damage_target,
+            "replay_intent_fingerprint_mismatch",
+            &state,
+        );
 
         let mut wrong_damage_amount = damage.clone();
         let EventPayload::BlockDamaged {
@@ -6098,13 +6938,18 @@ mod tests {
         let mut wrong_damage_actor = damage;
         wrong_damage_actor.actor_player_id = Some("player-remote".into());
         wrong_damage_actor.event_hash = wrong_damage_actor.calculate_hash();
-        reject(&wrong_damage_actor, "replay_damage_target_invalid", &state);
+        reject(
+            &wrong_damage_actor,
+            "replay_intent_fingerprint_mismatch",
+            &state,
+        );
 
         let mut build_runtime = runtime;
         move_player_near_grid(&mut build_runtime);
         let build_state = build_runtime.state().clone();
         let build = build_state
-            .prepare_client_event(&ClientMessage::BuildBlock {
+            .prepare_next_client_event_for_fixture(&ClientMessage::BuildBlock {
+                operation_sequence: 0,
                 operation_id: "canonical-targeted-build".into(),
                 grid_id: STARTER_GRID_ID.into(),
                 coordinate: IVec3::new(0, 1, 0),
@@ -6120,14 +6965,18 @@ mod tests {
         wrong_build_face.event_hash = wrong_build_face.calculate_hash();
         reject(
             &wrong_build_face,
-            "replay_construction_target_invalid",
+            "replay_intent_fingerprint_mismatch",
             &build_state,
         );
 
         let mut wrong_build_actor = build.clone();
         wrong_build_actor.actor_player_id = Some("player-remote".into());
         wrong_build_actor.event_hash = wrong_build_actor.calculate_hash();
-        reject(&wrong_build_actor, "grid_access_denied", &build_state);
+        reject(
+            &wrong_build_actor,
+            "replay_intent_fingerprint_mismatch",
+            &build_state,
+        );
 
         let mut post_build_state = build_state;
         post_build_state
@@ -6139,7 +6988,8 @@ mod tests {
             .block_id
             .clone();
         let weld = post_build_state
-            .prepare_client_event(&ClientMessage::WeldBlock {
+            .prepare_next_client_event_for_fixture(&ClientMessage::WeldBlock {
+                operation_sequence: 0,
                 operation_id: "canonical-targeted-weld".into(),
                 grid_id: STARTER_GRID_ID.into(),
                 block_id: frame_id,
@@ -6153,7 +7003,7 @@ mod tests {
         wrong_weld_target.event_hash = wrong_weld_target.calculate_hash();
         reject(
             &wrong_weld_target,
-            "replay_weld_target_invalid",
+            "replay_intent_fingerprint_mismatch",
             &post_build_state,
         );
     }
@@ -6196,7 +7046,8 @@ mod tests {
             }
             aim_player_at_block(runtime, STARTER_GRID_ID, &block.block_id);
             runtime
-                .execute(&ClientMessage::WeldBlock {
+                .execute_next_for_fixture(&ClientMessage::WeldBlock {
+                    operation_sequence: 0,
                     operation_id: format!("{prefix}-{}", block.health),
                     grid_id: STARTER_GRID_ID.into(),
                     block_id: block.block_id,
@@ -6888,10 +7739,9 @@ mod tests {
         let mut state = runtime.state().clone();
         let before_hash = state.state_hash();
         let max_health = state.grids[STARTER_GRID_ID].blocks["block-core"].max_health();
-        let event = state.new_event(
-            Some("player-local"),
-            "human",
-            Some("replayed-full-weld".into()),
+        let event = state.new_test_human_event(
+            "player-local",
+            "replayed-full-weld",
             EventPayload::BlockWelded {
                 grid_id: STARTER_GRID_ID.into(),
                 block_id: "block-core".into(),
@@ -6916,7 +7766,8 @@ mod tests {
         move_player_near_grid(&mut runtime);
         let state = runtime.state().clone();
         let canonical = state
-            .prepare_client_event(&ClientMessage::BuildBlock {
+            .prepare_next_client_event_for_fixture(&ClientMessage::BuildBlock {
+                operation_sequence: 0,
                 operation_id: "canonical-replay-frame".into(),
                 grid_id: STARTER_GRID_ID.into(),
                 coordinate: IVec3::new(0, 1, 0),
@@ -6977,15 +7828,20 @@ mod tests {
         let collider_id = voxel_collision_collider_id(target);
         assert!(runtime.physics.contains_collider(&body_id, &collider_id));
         let intent = ClientMessage::MineVoxel {
+            operation_sequence: 0,
             operation_id: "mine-once".into(),
             coordinate: target,
         };
-        let first = runtime.execute(&intent).expect("first mine accepted");
+        let first = runtime
+            .execute_next_for_fixture(&intent)
+            .expect("first mine accepted");
         assert_eq!(runtime.physics_chunk_replacements, 1);
         assert_eq!(runtime.physics_full_rebuilds, 0);
         assert!(!runtime.physics.contains_collider(&body_id, &collider_id));
         let hash_after_first = runtime.state().state_hash();
-        let second = runtime.execute(&intent).expect("retry accepted");
+        let second = runtime
+            .execute_next_for_fixture(&intent)
+            .expect("retry accepted");
         assert_eq!(first, second);
         assert_eq!(hash_after_first, runtime.state().state_hash());
         assert_eq!(runtime.physics_chunk_replacements, 1);
@@ -7050,12 +7906,13 @@ mod tests {
             .expect("remote player exists")
             .clone();
         let intent = ClientMessage::MineVoxel {
+            operation_sequence: 0,
             operation_id: "shared-mining-operation".into(),
             coordinate: target,
         };
 
         let receipt = runtime
-            .execute_as("player-remote", &intent)
+            .execute_next_as_for_fixture("player-remote", &intent)
             .expect("authenticated remote actor mines reachable voxel");
         assert_eq!(receipt.code, "voxel_mined");
         assert_eq!(runtime.state().voxels.material(target), None);
@@ -7121,7 +7978,7 @@ mod tests {
         let accepted_hash = runtime.state().state_hash();
         assert_eq!(
             runtime
-                .execute_as("player-remote", &intent)
+                .execute_next_as_for_fixture("player-remote", &intent)
                 .expect("remote mining retry is idempotent"),
             receipt
         );
@@ -7186,9 +8043,10 @@ mod tests {
                 let before_fingerprint = runtime.physics.body_collider_fingerprint();
                 let before_journal = fs::read(directory.path().join("events.ndjson"))
                     .expect("journal reads before rejection");
-                let result = runtime.execute_as(
+                let result = runtime.execute_next_as_for_fixture(
                     "player-remote",
                     &ClientMessage::MineVoxel {
+                        operation_sequence: 0,
                         operation_id: operation_id.into(),
                         coordinate,
                     },
@@ -7285,9 +8143,10 @@ mod tests {
         aim_player_at_voxel(&mut runtime, "player-remote", target);
         let canonical_event = runtime
             .state()
-            .prepare_client_event_as(
+            .prepare_next_client_event_as_for_fixture(
                 "player-remote",
                 &ClientMessage::MineVoxel {
+                    operation_sequence: 0,
                     operation_id: "forged-mining-owner".into(),
                     coordinate: target,
                 },
@@ -7329,7 +8188,7 @@ mod tests {
         };
         inventory_id.clone_from(&primary_inventory_id);
         event.event_hash = event.calculate_hash();
-        assert_replay_rejected_without_mutation(&event, "replay_mining_target_invalid");
+        assert_replay_rejected_without_mutation(&event, "replay_intent_fingerprint_mismatch");
 
         let mut event = canonical_event;
         let EventPayload::VoxelMined { ore_yield, .. } = &mut event.payload else {
@@ -7463,7 +8322,8 @@ mod tests {
             survivor_pair.clone(),
         ]);
         let event = state
-            .prepare_client_event(&ClientMessage::MineVoxel {
+            .prepare_next_client_event_for_fixture(&ClientMessage::MineVoxel {
+                operation_sequence: 0,
                 operation_id: "prune-mined-contact".into(),
                 coordinate: target,
             })
@@ -7502,7 +8362,8 @@ mod tests {
         runtime.relocate_player_for_test(Vec3::new(0.0, 3.0, 0.0));
         runtime.persist_snapshot().expect("player pose persists");
         runtime
-            .execute(&ClientMessage::SetGridControl {
+            .execute_next_for_fixture(&ClientMessage::SetGridControl {
+                operation_sequence: 0,
                 operation_id: "settle-on-two-voxels".into(),
                 grid_id: "resting-grid".into(),
                 linear_input: Vec3::new(0.0, -0.2, 0.0),
@@ -7536,7 +8397,8 @@ mod tests {
         aim_player_at_voxel(&mut runtime, "player-local", target);
 
         runtime
-            .execute(&ClientMessage::MineVoxel {
+            .execute_next_for_fixture(&ClientMessage::MineVoxel {
+                operation_sequence: 0,
                 operation_id: "mine-one-contact-leaf".into(),
                 coordinate: target,
             })
@@ -7612,7 +8474,8 @@ mod tests {
         let before_journal =
             fs::read(directory.path().join("events.ndjson")).expect("journal reads");
 
-        let result = runtime.execute(&ClientMessage::MineVoxel {
+        let result = runtime.execute_next_for_fixture(&ClientMessage::MineVoxel {
+            operation_sequence: 0,
             operation_id: "mine-final-anchor-support".into(),
             coordinate: target,
         });
@@ -7651,14 +8514,19 @@ mod tests {
             .cloned()
             .expect("cargo inventory");
         let intent = ClientMessage::TransferInventory {
+            operation_sequence: 0,
             operation_id: "transfer-components".into(),
             source_inventory_id: PLAYER_INVENTORY_ID.into(),
             destination_inventory_id: cargo_id.clone(),
             resource: ResourceKind::Component,
             quantity: 4,
         };
-        runtime.execute(&intent).expect("transfer accepted");
-        runtime.execute(&intent).expect("retry returns receipt");
+        runtime
+            .execute_next_for_fixture(&intent)
+            .expect("transfer accepted");
+        runtime
+            .execute_next_for_fixture(&intent)
+            .expect("retry returns receipt");
         assert_eq!(
             runtime.state().inventories[PLAYER_INVENTORY_ID]
                 .contents
@@ -7684,7 +8552,8 @@ mod tests {
                 .cloned()
                 .expect("cargo inventory");
             runtime
-                .execute(&ClientMessage::TransferInventory {
+                .execute_next_for_fixture(&ClientMessage::TransferInventory {
+                    operation_sequence: 0,
                     operation_id: format!("property-transfer-{quantity}"),
                     source_inventory_id: PLAYER_INVENTORY_ID.into(),
                     destination_inventory_id: cargo_id.clone(),
@@ -7710,7 +8579,8 @@ mod tests {
     #[test]
     fn character_control_rejects_wrong_epoch_out_of_order_and_unbounded_input() {
         let mut runtime = runtime();
-        let result = runtime.execute(&ClientMessage::SetPlayerControl {
+        let result = runtime.execute_next_for_fixture(&ClientMessage::SetPlayerControl {
+            operation_sequence: 0,
             operation_id: "wrong-epoch".into(),
             movement_epoch: 0,
             input_sequence: 1,
@@ -7739,7 +8609,8 @@ mod tests {
                 Vec3::new(0.0, f64::INFINITY, 0.0),
             ),
         ] {
-            let result = runtime.execute(&ClientMessage::SetPlayerControl {
+            let result = runtime.execute_next_for_fixture(&ClientMessage::SetPlayerControl {
+                operation_sequence: 0,
                 operation_id: operation_id.into(),
                 movement_epoch: 1,
                 input_sequence: 1,
@@ -7757,7 +8628,8 @@ mod tests {
             assert_eq!(runtime.state().event_sequence, 0);
         }
 
-        let result = runtime.execute(&ClientMessage::SetPlayerControl {
+        let result = runtime.execute_next_for_fixture(&ClientMessage::SetPlayerControl {
+            operation_sequence: 0,
             operation_id: "unbounded-control".into(),
             movement_epoch: 1,
             input_sequence: 1,
@@ -7775,6 +8647,7 @@ mod tests {
         assert_eq!(runtime.state().event_sequence, 0);
 
         let accepted_control = ClientMessage::SetPlayerControl {
+            operation_sequence: 0,
             operation_id: "control-1".into(),
             movement_epoch: 1,
             input_sequence: 1,
@@ -7785,14 +8658,15 @@ mod tests {
             dampeners: false,
         };
         let first_receipt = runtime
-            .execute(&accepted_control)
+            .execute_next_for_fixture(&accepted_control)
             .expect("bounded in-order control is accepted");
         let retry_receipt = runtime
-            .execute(&accepted_control)
+            .execute_next_for_fixture(&accepted_control)
             .expect("same operation retry returns its durable receipt");
         assert_eq!(retry_receipt, first_receipt);
         assert_eq!(runtime.state().event_sequence, 1);
-        let result = runtime.execute(&ClientMessage::SetPlayerControl {
+        let result = runtime.execute_next_for_fixture(&ClientMessage::SetPlayerControl {
+            operation_sequence: 0,
             operation_id: "control-reordered".into(),
             movement_epoch: 1,
             input_sequence: 1,
@@ -7869,7 +8743,8 @@ mod tests {
         let initial_orientation = runtime.state().player.orientation;
         for (input_sequence, angular_input) in [(1, Vec3::new(0.0, 0.0, 1.0)), (2, Vec3::ZERO)] {
             runtime
-                .execute(&ClientMessage::SetPlayerControl {
+                .execute_next_for_fixture(&ClientMessage::SetPlayerControl {
+                    operation_sequence: 0,
                     operation_id: format!("tap-{input_sequence}"),
                     movement_epoch: 1,
                     input_sequence,
@@ -7916,7 +8791,8 @@ mod tests {
                     [(1, Vec3::new(0.0, 0.0, 1.0)), (2, Vec3::ZERO)]
                 {
                     runtime
-                        .execute(&ClientMessage::SetPlayerControl {
+                        .execute_next_for_fixture(&ClientMessage::SetPlayerControl {
+                            operation_sequence: 0,
                             operation_id: format!("restart-tap-{snapshot_every}-{input_sequence}"),
                             movement_epoch: 1,
                             input_sequence,
@@ -7955,7 +8831,8 @@ mod tests {
                 let mut runtime = Runtime::open(directory.path(), 133, 100).expect("runtime opens");
                 runtime.store.set_append_failpoint(failpoint);
                 assert!(matches!(
-                    runtime.execute(&ClientMessage::SetPlayerControl {
+                    runtime.execute_next_for_fixture(&ClientMessage::SetPlayerControl {
+                        operation_sequence: 0,
                         operation_id: format!("queued-failpoint-{durable}"),
                         movement_epoch: 1,
                         input_sequence: 1,
@@ -7997,7 +8874,8 @@ mod tests {
         for offset in 0..queue_limit {
             let input_sequence = u64::try_from(offset + 1).expect("queue bound fits u64");
             runtime
-                .execute(&ClientMessage::SetPlayerControl {
+                .execute_next_for_fixture(&ClientMessage::SetPlayerControl {
+                    operation_sequence: 0,
                     operation_id: format!("queued-{input_sequence}"),
                     movement_epoch: 1,
                     input_sequence,
@@ -8011,7 +8889,8 @@ mod tests {
         }
         let before = runtime.state().state_hash();
         let rejected_sequence = u64::try_from(queue_limit + 1).expect("queue bound fits u64");
-        let result = runtime.execute(&ClientMessage::SetPlayerControl {
+        let result = runtime.execute_next_for_fixture(&ClientMessage::SetPlayerControl {
+            operation_sequence: 0,
             operation_id: "queue-overflow".into(),
             movement_epoch: 1,
             input_sequence: rejected_sequence,
@@ -8037,7 +8916,8 @@ mod tests {
     fn expired_queued_control_is_acked_without_reviving_stale_motion() {
         let mut runtime = runtime();
         runtime
-            .execute(&ClientMessage::SetPlayerControl {
+            .execute_next_for_fixture(&ClientMessage::SetPlayerControl {
+                operation_sequence: 0,
                 operation_id: "expired-front".into(),
                 movement_epoch: 1,
                 input_sequence: 1,
@@ -8064,7 +8944,8 @@ mod tests {
         {
             let mut runtime = Runtime::open(directory.path(), 131, 1).expect("runtime opens");
             runtime
-                .execute(&ClientMessage::SetPlayerControl {
+                .execute_next_for_fixture(&ClientMessage::SetPlayerControl {
+                    operation_sequence: 0,
                     operation_id: "disconnect-held-control".into(),
                     movement_epoch: 1,
                     input_sequence: 1,
@@ -8102,7 +8983,8 @@ mod tests {
     fn authoritative_character_control_drives_eva_rotation_and_expires_safely() {
         let mut runtime = runtime();
         runtime
-            .execute(&ClientMessage::SetPlayerControl {
+            .execute_next_for_fixture(&ClientMessage::SetPlayerControl {
+                operation_sequence: 0,
                 operation_id: "eva-control-1-1".into(),
                 movement_epoch: 1,
                 input_sequence: 1,
@@ -8149,7 +9031,8 @@ mod tests {
                 let mut runtime = runtime();
                 for input_sequence in 1_u64..=24 {
                     runtime
-                        .execute(&ClientMessage::SetPlayerControl {
+                        .execute_next_for_fixture(&ClientMessage::SetPlayerControl {
+                            operation_sequence: 0,
                             operation_id: format!("held-{dampeners}-{boost}-{input_sequence}"),
                             movement_epoch: runtime.state().player.movement_epoch,
                             input_sequence,
@@ -8192,7 +9075,8 @@ mod tests {
             .rebuild(&physics_body_specs(&runtime.state))
             .expect("high-inertia player fixture rebuilds");
         runtime
-            .execute(&ClientMessage::SetPlayerControl {
+            .execute_next_for_fixture(&ClientMessage::SetPlayerControl {
+                operation_sequence: 0,
                 operation_id: "coast-after-boost".into(),
                 movement_epoch: 1,
                 input_sequence: 1,
@@ -8208,7 +9092,8 @@ mod tests {
         assert!(runtime.state().player.angular_velocity.z > 2.9);
 
         runtime
-            .execute(&ClientMessage::SetPlayerControl {
+            .execute_next_for_fixture(&ClientMessage::SetPlayerControl {
+                operation_sequence: 0,
                 operation_id: "normal-thrust-above-normal-cap".into(),
                 movement_epoch: 1,
                 input_sequence: 2,
@@ -8232,7 +9117,8 @@ mod tests {
     fn quantized_eva_motion_matches_the_cross_platform_golden_fixture() {
         let mut runtime = runtime();
         runtime
-            .execute(&ClientMessage::SetPlayerControl {
+            .execute_next_for_fixture(&ClientMessage::SetPlayerControl {
+                operation_sequence: 0,
                 operation_id: "cross-platform-motion-golden".into(),
                 movement_epoch: 1,
                 input_sequence: 1,
@@ -8312,7 +9198,8 @@ mod tests {
         ));
         runtime.state.player.suit_oxygen_milli = 900;
         runtime
-            .execute(&ClientMessage::SetSuitMode {
+            .execute_next_for_fixture(&ClientMessage::SetSuitMode {
+                operation_sequence: 0,
                 operation_id: "open-helmet".into(),
                 helmet_closed: false,
                 jetpack_enabled: true,
@@ -8670,11 +9557,12 @@ mod tests {
         runtime.advance(1).expect("secondary death commits");
         let primary_before = runtime.state().player.primary().clone();
         let respawn = ClientMessage::RespawnPlayer {
+            operation_sequence: 0,
             operation_id: "remote-respawn".into(),
         };
 
         let first = runtime
-            .execute_as("player-remote", &respawn)
+            .execute_next_as_for_fixture("player-remote", &respawn)
             .expect("secondary recovery commits");
         let expected_hash = runtime.state().state_hash();
         let expected_sequence = runtime.state().event_sequence;
@@ -8684,7 +9572,7 @@ mod tests {
         assert_eq!(remote.movement_epoch, 2);
         assert_eq!(
             runtime
-                .execute_as("player-remote", &respawn)
+                .execute_next_as_for_fixture("player-remote", &respawn)
                 .expect("secondary recovery retry is idempotent"),
             first
         );
@@ -8764,10 +9652,9 @@ mod tests {
             .expect("secondary respawn prepares");
         reject(
             &dead,
-            dead.new_event(
-                Some("player-local"),
-                "human",
-                Some("forged-cross-player-respawn".into()),
+            dead.new_test_human_event(
+                "player-local",
+                "forged-cross-player-respawn",
                 remote_respawn,
             ),
             "player_already_alive",
@@ -8907,6 +9794,7 @@ mod tests {
 
         let blocked_messages = [
             ClientMessage::SetPlayerControl {
+                operation_sequence: 0,
                 operation_id: "dead-control".into(),
                 movement_epoch: runtime.state().player.movement_epoch,
                 input_sequence: 1,
@@ -8917,26 +9805,31 @@ mod tests {
                 dampeners: true,
             },
             ClientMessage::SetSuitMode {
+                operation_sequence: 0,
                 operation_id: "dead-suit".into(),
                 helmet_closed: false,
                 jetpack_enabled: false,
                 magnetic_boots_enabled: false,
             },
             ClientMessage::MineVoxel {
+                operation_sequence: 0,
                 operation_id: "dead-mine".into(),
                 coordinate: IVec3::ZERO,
             },
             ClientMessage::RefineOre {
+                operation_sequence: 0,
                 operation_id: "dead-refine".into(),
                 inventory_id: PLAYER_INVENTORY_ID.into(),
                 batches: 1,
             },
             ClientMessage::CraftComponent {
+                operation_sequence: 0,
                 operation_id: "dead-craft".into(),
                 inventory_id: PLAYER_INVENTORY_ID.into(),
                 quantity: 1,
             },
             ClientMessage::TransferInventory {
+                operation_sequence: 0,
                 operation_id: "dead-transfer".into(),
                 source_inventory_id: drop_inventory_id.clone(),
                 destination_inventory_id: PLAYER_INVENTORY_ID.into(),
@@ -8944,6 +9837,7 @@ mod tests {
                 quantity: 1,
             },
             ClientMessage::BuildBlock {
+                operation_sequence: 0,
                 operation_id: "dead-build".into(),
                 grid_id: STARTER_GRID_ID.into(),
                 coordinate: IVec3::new(0, 1, 0),
@@ -8951,11 +9845,13 @@ mod tests {
                 orientation: 0,
             },
             ClientMessage::WeldBlock {
+                operation_sequence: 0,
                 operation_id: "dead-weld".into(),
                 grid_id: STARTER_GRID_ID.into(),
                 block_id: "block-core".into(),
             },
             ClientMessage::SetGridControl {
+                operation_sequence: 0,
                 operation_id: "dead-control".into(),
                 grid_id: STARTER_GRID_ID.into(),
                 linear_input: Vec3::new(1.0, 0.0, 0.0),
@@ -8963,10 +9859,12 @@ mod tests {
                 dampeners: false,
             },
             ClientMessage::ToggleGridAnchor {
+                operation_sequence: 0,
                 operation_id: "dead-anchor".into(),
                 grid_id: STARTER_GRID_ID.into(),
             },
             ClientMessage::DamageBlock {
+                operation_sequence: 0,
                 operation_id: "dead-damage".into(),
                 grid_id: STARTER_GRID_ID.into(),
                 block_id: "block-core".into(),
@@ -8975,7 +9873,7 @@ mod tests {
         let dead_hash = runtime.state().state_hash();
         for message in blocked_messages {
             assert!(matches!(
-                runtime.execute(&message),
+                runtime.execute_next_for_fixture(&message),
                 Err(RuntimeError::Intent(IntentError::Rejected { ref code, .. }))
                     if code == "player_incapacitated"
             ));
@@ -8983,11 +9881,16 @@ mod tests {
         }
 
         let respawn = ClientMessage::RespawnPlayer {
+            operation_sequence: 0,
             operation_id: "recover-once".into(),
         };
-        let first = runtime.execute(&respawn).expect("recovery accepted");
+        let first = runtime
+            .execute_next_for_fixture(&respawn)
+            .expect("recovery accepted");
         let recovered_hash = runtime.state().state_hash();
-        let second = runtime.execute(&respawn).expect("recovery retry accepted");
+        let second = runtime
+            .execute_next_for_fixture(&respawn)
+            .expect("recovery retry accepted");
         assert_eq!(first, second);
         assert_eq!(runtime.state().state_hash(), recovered_hash);
         assert_eq!(runtime.state().event_sequence, death_sequence + 1);
@@ -9018,16 +9921,19 @@ mod tests {
 
         let sealed_intents = [
             ClientMessage::RefineOre {
+                operation_sequence: 0,
                 operation_id: "drop-refine".into(),
                 inventory_id: drop_inventory_id.clone(),
                 batches: 1,
             },
             ClientMessage::CraftComponent {
+                operation_sequence: 0,
                 operation_id: "drop-craft".into(),
                 inventory_id: drop_inventory_id.clone(),
                 quantity: 1,
             },
             ClientMessage::TransferInventory {
+                operation_sequence: 0,
                 operation_id: "drop-transfer-source".into(),
                 source_inventory_id: drop_inventory_id.clone(),
                 destination_inventory_id: PLAYER_INVENTORY_ID.into(),
@@ -9035,6 +9941,7 @@ mod tests {
                 quantity: 1,
             },
             ClientMessage::TransferInventory {
+                operation_sequence: 0,
                 operation_id: "drop-transfer-destination".into(),
                 source_inventory_id: PLAYER_INVENTORY_ID.into(),
                 destination_inventory_id: drop_inventory_id.clone(),
@@ -9044,7 +9951,7 @@ mod tests {
         ];
         for intent in sealed_intents {
             assert!(matches!(
-                runtime.execute(&intent),
+                runtime.execute_next_for_fixture(&intent),
                 Err(RuntimeError::Intent(IntentError::Rejected { ref code, .. }))
                     if code == "dropped_inventory_sealed"
             ));
@@ -9073,10 +9980,9 @@ mod tests {
             },
         ];
         for (index, payload) in replay_payloads.into_iter().enumerate() {
-            let event = runtime.state().new_event(
-                Some("player-local"),
-                "human",
-                Some(format!("forged-drop-operation-{index}")),
+            let event = runtime.state().new_test_human_event(
+                "player-local",
+                format!("forged-drop-operation-{index}"),
                 payload,
             );
             let mut candidate = runtime.state().clone();
@@ -9093,7 +9999,8 @@ mod tests {
     fn empty_inventory_oxygen_death_does_not_create_an_empty_drop() {
         let mut runtime = runtime();
         runtime
-            .execute(&ClientMessage::TransferInventory {
+            .execute_next_for_fixture(&ClientMessage::TransferInventory {
+                operation_sequence: 0,
                 operation_id: "stow-before-death".into(),
                 source_inventory_id: PLAYER_INVENTORY_ID.into(),
                 destination_inventory_id: "inventory-cargo-starter".into(),
@@ -9395,7 +10302,8 @@ mod tests {
                 runtime.persist_snapshot().expect("dead state persists");
                 runtime.store.set_append_failpoint(failpoint);
                 assert!(matches!(
-                    runtime.execute(&ClientMessage::RespawnPlayer {
+                    runtime.execute_next_for_fixture(&ClientMessage::RespawnPlayer {
+                        operation_sequence: 0,
                         operation_id: "recover-after-failure".into(),
                     }),
                     Err(RuntimeError::Persistence(
@@ -9447,12 +10355,7 @@ mod tests {
         dead.apply_event(&death_event).expect("death applies");
         let canonical = dead.player_respawn_payload().expect("respawn prepares");
         let reject = |payload: EventPayload| {
-            let event = dead.new_event(
-                Some("player-local"),
-                "human",
-                Some("tampered-respawn".into()),
-                payload,
-            );
+            let event = dead.new_test_human_event("player-local", "tampered-respawn", payload);
             let mut candidate = dead.clone();
             let before = candidate.state_hash();
             assert!(matches!(
@@ -9523,12 +10426,7 @@ mod tests {
         assert!((position.z - primary.z).abs() <= f64::EPSILON);
         assert!(position.y > primary.y);
 
-        let event = state.new_event(
-            Some("player-local"),
-            "human",
-            Some("blocked-primary-recovery".into()),
-            payload,
-        );
+        let event = state.new_test_human_event("player-local", "blocked-primary-recovery", payload);
         state.apply_event(&event).expect("fallback respawn applies");
         assert_eq!(state.player.position, position);
         assert_eq!(state.player.life_state, PlayerLifeState::Alive);
@@ -9607,7 +10505,11 @@ mod tests {
         let forged_death = state.new_event(
             Some("player-local"),
             "human",
-            Some("forged-death".into()),
+            Some(OperationEventMetadata {
+                operation_id: "forged-death".into(),
+                operation_sequence: 1,
+                intent_fingerprint: "0".repeat(64),
+            }),
             death.clone(),
         );
         assert!(matches!(
@@ -9629,19 +10531,14 @@ mod tests {
         ));
 
         let operation_id = "canonical-recovery";
-        let respawn_event = state.new_event(
-            Some("player-local"),
-            "human",
-            Some(operation_id.into()),
-            respawn,
-        );
+        let respawn_event = state.new_test_human_event("player-local", operation_id, respawn);
         state
             .apply_event(&respawn_event)
             .expect("human respawn with operation applies");
-        let duplicate = state.new_event(
-            Some("player-local"),
-            "human",
-            Some(operation_id.into()),
+        let duplicate = state.new_test_human_event_at(
+            "player-local",
+            1,
+            operation_id,
             EventPayload::PlayerControlSet {
                 movement_epoch: state.player.movement_epoch,
                 input_sequence: 1,
@@ -9656,7 +10553,7 @@ mod tests {
         );
         assert!(matches!(
             state.apply_event(&duplicate),
-            Err(IntentError::Rejected { ref code, .. }) if code == "replay_operation_duplicate"
+            Err(IntentError::Rejected { ref code, .. }) if code == "operation_conflict"
         ));
     }
 
@@ -9719,7 +10616,8 @@ mod tests {
                     }
                     if respawned {
                         runtime
-                            .execute(&ClientMessage::RespawnPlayer {
+                            .execute_next_for_fixture(&ClientMessage::RespawnPlayer {
+                                operation_sequence: 0,
                                 operation_id: "matrix-recovery".into(),
                             })
                             .expect("respawn commits");
@@ -9761,7 +10659,8 @@ mod tests {
             .get_mut(&cargo_id)
             .expect("cargo")
             .capacity_liters = 21;
-        let result = runtime.execute(&ClientMessage::TransferInventory {
+        let result = runtime.execute_next_for_fixture(&ClientMessage::TransferInventory {
+            operation_sequence: 0,
             operation_id: "overfill-cargo".into(),
             source_inventory_id: PLAYER_INVENTORY_ID.into(),
             destination_inventory_id: cargo_id,
@@ -9787,14 +10686,19 @@ mod tests {
         let mut runtime = runtime();
         move_player_near_grid(&mut runtime);
         let intent = ClientMessage::BuildBlock {
+            operation_sequence: 0,
             operation_id: "idempotent-build".into(),
             grid_id: STARTER_GRID_ID.into(),
             coordinate: IVec3::new(0, 1, 0),
             kind: BlockKind::Structural,
             orientation: 2,
         };
-        let first = runtime.execute(&intent).expect("build accepted");
-        let second = runtime.execute(&intent).expect("retry accepted");
+        let first = runtime
+            .execute_next_for_fixture(&intent)
+            .expect("build accepted");
+        let second = runtime
+            .execute_next_for_fixture(&intent)
+            .expect("retry accepted");
         assert_eq!(first, second);
         assert_eq!(
             runtime.state().inventories[PLAYER_INVENTORY_ID]
@@ -9818,7 +10722,8 @@ mod tests {
         let mut runtime = runtime();
         move_player_near_grid(&mut runtime);
         runtime
-            .execute(&ClientMessage::BuildBlock {
+            .execute_next_for_fixture(&ClientMessage::BuildBlock {
+                operation_sequence: 0,
                 operation_id: "place-frame".into(),
                 grid_id: STARTER_GRID_ID.into(),
                 coordinate: IVec3::new(0, 1, 0),
@@ -9832,32 +10737,41 @@ mod tests {
             .block_id
             .clone();
         let first_weld = ClientMessage::WeldBlock {
+            operation_sequence: 0,
             operation_id: "weld-once".into(),
             grid_id: STARTER_GRID_ID.into(),
             block_id: block_id.clone(),
         };
-        let first_receipt = runtime.execute(&first_weld).expect("first weld accepted");
-        let retry_receipt = runtime.execute(&first_weld).expect("weld retry accepted");
+        let first_receipt = runtime
+            .execute_next_for_fixture(&first_weld)
+            .expect("first weld accepted");
+        let retry_receipt = runtime
+            .execute_next_for_fixture(&first_weld)
+            .expect("weld retry accepted");
         assert_eq!(first_receipt, retry_receipt);
         assert_eq!(
             runtime.state().grids[STARTER_GRID_ID].blocks[&block_id].health,
             50
         );
         runtime
-            .execute(&ClientMessage::WeldBlock {
+            .execute_next_for_fixture(&ClientMessage::WeldBlock {
+                operation_sequence: 0,
                 operation_id: "weld-middle".into(),
                 grid_id: STARTER_GRID_ID.into(),
                 block_id: block_id.clone(),
             })
             .expect("middle weld accepted");
         let final_weld = ClientMessage::WeldBlock {
+            operation_sequence: 0,
             operation_id: "weld-final".into(),
             grid_id: STARTER_GRID_ID.into(),
             block_id: block_id.clone(),
         };
-        let final_receipt = runtime.execute(&final_weld).expect("final weld accepted");
+        let final_receipt = runtime
+            .execute_next_for_fixture(&final_weld)
+            .expect("final weld accepted");
         let final_retry = runtime
-            .execute(&final_weld)
+            .execute_next_for_fixture(&final_weld)
             .expect("final weld retry accepted");
         assert_eq!(final_receipt, final_retry);
         assert!(
@@ -9869,7 +10783,8 @@ mod tests {
         assert_eq!(runtime.state().player.career.blocks_built, 1);
         assert_eq!(runtime.state().player.experience, 25);
         let sequence = runtime.state().event_sequence;
-        let completed = runtime.execute(&ClientMessage::WeldBlock {
+        let completed = runtime.execute_next_for_fixture(&ClientMessage::WeldBlock {
+            operation_sequence: 0,
             operation_id: "over-weld".into(),
             grid_id: STARTER_GRID_ID.into(),
             block_id,
@@ -9888,7 +10803,8 @@ mod tests {
         let mut runtime = runtime();
         move_player_near_grid(&mut runtime);
         runtime
-            .execute(&ClientMessage::BuildBlock {
+            .execute_next_for_fixture(&ClientMessage::BuildBlock {
+                operation_sequence: 0,
                 operation_id: "place-cargo-frame".into(),
                 grid_id: STARTER_GRID_ID.into(),
                 coordinate: IVec3::new(0, 1, 0),
@@ -9904,7 +10820,8 @@ mod tests {
             .inventory_id
             .clone()
             .expect("cargo identity exists");
-        let sealed = runtime.execute(&ClientMessage::TransferInventory {
+        let sealed = runtime.execute_next_for_fixture(&ClientMessage::TransferInventory {
+            operation_sequence: 0,
             operation_id: "transfer-into-sealed-cargo".into(),
             source_inventory_id: PLAYER_INVENTORY_ID.into(),
             destination_inventory_id: cargo_inventory_id.clone(),
@@ -9925,7 +10842,8 @@ mod tests {
 
         weld_to_completion(&mut runtime, IVec3::new(0, 1, 0), "complete-cargo");
         runtime
-            .execute(&ClientMessage::TransferInventory {
+            .execute_next_for_fixture(&ClientMessage::TransferInventory {
+                operation_sequence: 0,
                 operation_id: "transfer-into-complete-cargo".into(),
                 source_inventory_id: PLAYER_INVENTORY_ID.into(),
                 destination_inventory_id: cargo_inventory_id.clone(),
@@ -9934,7 +10852,8 @@ mod tests {
             })
             .expect("completed cargo accepts inventory");
         runtime
-            .execute(&ClientMessage::TransferInventory {
+            .execute_next_for_fixture(&ClientMessage::TransferInventory {
+                operation_sequence: 0,
                 operation_id: "transfer-out-of-complete-cargo".into(),
                 source_inventory_id: cargo_inventory_id.clone(),
                 destination_inventory_id: PLAYER_INVENTORY_ID.into(),
@@ -9966,7 +10885,8 @@ mod tests {
             aim_player_at_block(&mut runtime, STARTER_GRID_ID, &block_id);
 
             runtime
-                .execute(&ClientMessage::DamageBlock {
+                .execute_next_for_fixture(&ClientMessage::DamageBlock {
+                    operation_sequence: 0,
                     operation_id: "damage-completed-armor".into(),
                     grid_id: STARTER_GRID_ID.into(),
                     block_id: block_id.clone(),
@@ -9992,7 +10912,8 @@ mod tests {
             {
                 aim_player_at_block(&mut runtime, STARTER_GRID_ID, &block_id);
                 runtime
-                    .execute(&ClientMessage::WeldBlock {
+                    .execute_next_for_fixture(&ClientMessage::WeldBlock {
+                        operation_sequence: 0,
                         operation_id: format!("repair-completed-armor-{weld_index}"),
                         grid_id: STARTER_GRID_ID.into(),
                         block_id: block_id.clone(),
@@ -10021,7 +10942,8 @@ mod tests {
     #[test]
     fn construction_rejects_remote_and_invalid_frames() {
         let mut runtime = runtime();
-        let remote = runtime.execute(&ClientMessage::BuildBlock {
+        let remote = runtime.execute_next_for_fixture(&ClientMessage::BuildBlock {
+            operation_sequence: 0,
             operation_id: "remote-frame".into(),
             grid_id: STARTER_GRID_ID.into(),
             coordinate: IVec3::new(0, 1, 0),
@@ -10037,7 +10959,8 @@ mod tests {
         let candidate = IVec3::new(0, 1, 0);
         runtime.state.player.position =
             runtime.state().grids[STARTER_GRID_ID].world_position(candidate);
-        let overlap = runtime.execute(&ClientMessage::BuildBlock {
+        let overlap = runtime.execute_next_for_fixture(&ClientMessage::BuildBlock {
+            operation_sequence: 0,
             operation_id: "overlapping-frame".into(),
             grid_id: STARTER_GRID_ID.into(),
             coordinate: candidate,
@@ -10049,7 +10972,8 @@ mod tests {
             Err(RuntimeError::Intent(IntentError::Rejected { ref code, .. }))
                 if code == "block_intersects_player"
         ));
-        let invalid = runtime.execute(&ClientMessage::BuildBlock {
+        let invalid = runtime.execute_next_for_fixture(&ClientMessage::BuildBlock {
+            operation_sequence: 0,
             operation_id: "invalid-orientation".into(),
             grid_id: STARTER_GRID_ID.into(),
             coordinate: IVec3::new(0, 1, 0),
@@ -10072,7 +10996,8 @@ mod tests {
         let mut state = runtime.state().clone();
         let coordinate = IVec3::new(0, 1, 0);
         let canonical = state
-            .prepare_client_event(&ClientMessage::BuildBlock {
+            .prepare_next_client_event_for_fixture(&ClientMessage::BuildBlock {
+                operation_sequence: 0,
                 operation_id: "prepared-clear-frame".into(),
                 grid_id: STARTER_GRID_ID.into(),
                 coordinate,
@@ -10095,7 +11020,8 @@ mod tests {
         let anchor_coordinate = IVec3::new(-2, 1, -1);
         aim_player_for_build(&mut runtime, STARTER_GRID_ID, anchor_coordinate);
         runtime
-            .execute(&ClientMessage::BuildBlock {
+            .execute_next_for_fixture(&ClientMessage::BuildBlock {
+                operation_sequence: 0,
                 operation_id: "place-anchor-frame".into(),
                 grid_id: STARTER_GRID_ID.into(),
                 coordinate: anchor_coordinate,
@@ -10103,7 +11029,8 @@ mod tests {
                 orientation: 3,
             })
             .expect("anchor frame placement accepted");
-        let unfinished = runtime.execute(&ClientMessage::ToggleGridAnchor {
+        let unfinished = runtime.execute_next_for_fixture(&ClientMessage::ToggleGridAnchor {
+            operation_sequence: 0,
             operation_id: "engage-unfinished-anchor".into(),
             grid_id: STARTER_GRID_ID.into(),
         });
@@ -10116,7 +11043,8 @@ mod tests {
         let experience_before_anchor = runtime.state().player.experience;
         let mut forged_anchor = runtime
             .state()
-            .prepare_client_event(&ClientMessage::ToggleGridAnchor {
+            .prepare_next_client_event_for_fixture(&ClientMessage::ToggleGridAnchor {
+                operation_sequence: 0,
                 operation_id: "forged-anchor-reward".into(),
                 grid_id: STARTER_GRID_ID.into(),
             })
@@ -10137,7 +11065,8 @@ mod tests {
         assert_eq!(forged_error.code(), "replay_grid_anchor_invalid");
         assert_eq!(forged_candidate.state_hash(), forged_before);
         runtime
-            .execute(&ClientMessage::ToggleGridAnchor {
+            .execute_next_for_fixture(&ClientMessage::ToggleGridAnchor {
+                operation_sequence: 0,
                 operation_id: "engage-complete-anchor".into(),
                 grid_id: STARTER_GRID_ID.into(),
             })
@@ -10149,13 +11078,15 @@ mod tests {
             experience_before_anchor + 40
         );
         runtime
-            .execute(&ClientMessage::ToggleGridAnchor {
+            .execute_next_for_fixture(&ClientMessage::ToggleGridAnchor {
+                operation_sequence: 0,
                 operation_id: "release-complete-anchor".into(),
                 grid_id: STARTER_GRID_ID.into(),
             })
             .expect("complete anchor releases");
         runtime
-            .execute(&ClientMessage::ToggleGridAnchor {
+            .execute_next_for_fixture(&ClientMessage::ToggleGridAnchor {
+                operation_sequence: 0,
                 operation_id: "reengage-complete-anchor".into(),
                 grid_id: STARTER_GRID_ID.into(),
             })
@@ -10174,7 +11105,8 @@ mod tests {
         move_player_near_grid(&mut runtime);
         let baseline = runtime.state().grids[STARTER_GRID_ID].power().produced;
         runtime
-            .execute(&ClientMessage::BuildBlock {
+            .execute_next_for_fixture(&ClientMessage::BuildBlock {
+                operation_sequence: 0,
                 operation_id: "place-power-frame".into(),
                 grid_id: STARTER_GRID_ID.into(),
                 coordinate: IVec3::new(0, 1, 0),
@@ -10210,7 +11142,8 @@ mod tests {
         )
         .expect("replacement lease writes");
 
-        let result = runtime.execute(&ClientMessage::SetPlayerControl {
+        let result = runtime.execute_next_for_fixture(&ClientMessage::SetPlayerControl {
+            operation_sequence: 0,
             operation_id: "stale-writer-control".into(),
             movement_epoch: 1,
             input_sequence: 1,
@@ -10229,7 +11162,8 @@ mod tests {
         assert_eq!(runtime.state().event_sequence, 0);
         assert_eq!(runtime.state().player.position, Vec3::new(12.0, 4.5, 10.0));
         assert!(matches!(
-            runtime.execute(&ClientMessage::SetPlayerControl {
+            runtime.execute_next_for_fixture(&ClientMessage::SetPlayerControl {
+                operation_sequence: 0,
                 operation_id: "halted-control".into(),
                 movement_epoch: 1,
                 input_sequence: 2,
@@ -10725,7 +11659,8 @@ mod tests {
 
         for sequence in 1..=12 {
             runtime
-                .execute(&ClientMessage::SetPlayerControl {
+                .execute_next_for_fixture(&ClientMessage::SetPlayerControl {
+                    operation_sequence: 0,
                     operation_id: format!("pole-walk-{sequence}"),
                     movement_epoch: runtime.state.player.movement_epoch,
                     input_sequence: sequence,
@@ -10793,7 +11728,8 @@ mod tests {
 
         let initial_x = runtime.state().player.position.x;
         runtime
-            .execute(&ClientMessage::SetPlayerControl {
+            .execute_next_for_fixture(&ClientMessage::SetPlayerControl {
+                operation_sequence: 0,
                 operation_id: "ground-walk".into(),
                 movement_epoch: 1,
                 input_sequence: 1,
@@ -10811,7 +11747,8 @@ mod tests {
         assert!(walk_speed <= content::manifest().character.walk_speed_m_s + 0.1);
 
         runtime
-            .execute(&ClientMessage::SetPlayerControl {
+            .execute_next_for_fixture(&ClientMessage::SetPlayerControl {
+                operation_sequence: 0,
                 operation_id: "ground-sprint".into(),
                 movement_epoch: 1,
                 input_sequence: 2,
@@ -10828,7 +11765,8 @@ mod tests {
         assert!(sprint_speed <= content::manifest().character.sprint_speed_m_s + 0.1);
 
         runtime
-            .execute(&ClientMessage::SetPlayerControl {
+            .execute_next_for_fixture(&ClientMessage::SetPlayerControl {
+                operation_sequence: 0,
                 operation_id: "ground-brake".into(),
                 movement_epoch: 1,
                 input_sequence: 3,
@@ -10872,7 +11810,8 @@ mod tests {
         runtime.advance(17).expect("support is classified");
 
         runtime
-            .execute(&ClientMessage::SetPlayerControl {
+            .execute_next_for_fixture(&ClientMessage::SetPlayerControl {
+                operation_sequence: 0,
                 operation_id: "ground-jump-press".into(),
                 movement_epoch: 1,
                 input_sequence: 1,
@@ -10893,7 +11832,8 @@ mod tests {
         let first_launch_speed = runtime.state().player.linear_velocity.y;
 
         runtime
-            .execute(&ClientMessage::SetPlayerControl {
+            .execute_next_for_fixture(&ClientMessage::SetPlayerControl {
+                operation_sequence: 0,
                 operation_id: "ground-jump-held".into(),
                 movement_epoch: 1,
                 input_sequence: 2,
@@ -11073,7 +12013,8 @@ mod tests {
                 &support.collider_id,
             );
             runtime
-                .execute(&ClientMessage::DamageBlock {
+                .execute_next_for_fixture(&ClientMessage::DamageBlock {
+                    operation_sequence: 0,
                     operation_id: format!("destroy-magnetic-support-{index}"),
                     grid_id: STARTER_GRID_ID.into(),
                     block_id: support.collider_id.clone(),
@@ -11159,7 +12100,8 @@ mod tests {
         for index in 0..bridge_health.div_ceil(35) {
             aim_player_at_block_preserving_locomotion(&mut runtime, "split-grid", "split-bridge");
             runtime
-                .execute(&ClientMessage::DamageBlock {
+                .execute_next_for_fixture(&ClientMessage::DamageBlock {
+                    operation_sequence: 0,
                     operation_id: format!("split-support-bridge-{index}"),
                     grid_id: "split-grid".into(),
                     block_id: "split-bridge".into(),
@@ -11392,7 +12334,8 @@ mod tests {
             let mut runtime = Runtime::open(before_directory.path(), 79, 100)
                 .expect("runtime starts for pre-write failure");
             runtime
-                .execute(&ClientMessage::SetGridControl {
+                .execute_next_for_fixture(&ClientMessage::SetGridControl {
+                    operation_sequence: 0,
                     operation_id: "pre-write-control".into(),
                     grid_id: STARTER_GRID_ID.into(),
                     linear_input: Vec3::new(0.0, 0.0, -1.0),
@@ -11430,7 +12373,8 @@ mod tests {
             let mut runtime = Runtime::open(after_directory.path(), 83, 100)
                 .expect("runtime starts for post-sync failure");
             runtime
-                .execute(&ClientMessage::SetGridControl {
+                .execute_next_for_fixture(&ClientMessage::SetGridControl {
+                    operation_sequence: 0,
                     operation_id: "post-sync-control".into(),
                     grid_id: STARTER_GRID_ID.into(),
                     linear_input: Vec3::new(0.0, 0.0, -1.0),
@@ -11510,7 +12454,8 @@ mod tests {
                 .store
                 .set_append_failpoint(AppendFailpoint::BeforeWrite);
             assert!(matches!(
-                runtime.execute(&ClientMessage::MineVoxel {
+                runtime.execute_next_for_fixture(&ClientMessage::MineVoxel {
+                    operation_sequence: 0,
                     operation_id: "mine-before-write".into(),
                     coordinate: before_target,
                 }),
@@ -11550,7 +12495,8 @@ mod tests {
                 .store
                 .set_append_failpoint(AppendFailpoint::AfterSync);
             assert!(matches!(
-                runtime.execute(&ClientMessage::MineVoxel {
+                runtime.execute_next_for_fixture(&ClientMessage::MineVoxel {
+                    operation_sequence: 0,
                     operation_id: "mine-after-sync".into(),
                     coordinate: after_target,
                 }),
@@ -11594,25 +12540,32 @@ mod tests {
         let mut runtime = runtime();
         move_player_near_grid(&mut runtime);
         let build = ClientMessage::BuildBlock {
+            operation_sequence: 0,
             operation_id: "build-bridge".into(),
             grid_id: STARTER_GRID_ID.into(),
             coordinate: IVec3::new(0, 1, 0),
             kind: BlockKind::DamageTest,
             orientation: 0,
         };
-        runtime.execute(&build).expect("bridge block built");
+        runtime
+            .execute_next_for_fixture(&build)
+            .expect("bridge block built");
         let build_top = ClientMessage::BuildBlock {
+            operation_sequence: 0,
             operation_id: "build-top".into(),
             grid_id: STARTER_GRID_ID.into(),
             coordinate: IVec3::new(0, 2, 0),
             kind: BlockKind::Structural,
             orientation: 0,
         };
-        runtime.execute(&build_top).expect("top block built");
+        runtime
+            .execute_next_for_fixture(&build_top)
+            .expect("top block built");
         weld_to_completion(&mut runtime, IVec3::new(0, 1, 0), "weld-bridge");
         weld_to_completion(&mut runtime, IVec3::new(0, 2, 0), "weld-top");
         runtime
-            .execute(&ClientMessage::SetGridControl {
+            .execute_next_for_fixture(&ClientMessage::SetGridControl {
+                operation_sequence: 0,
                 operation_id: "control-before-split".into(),
                 grid_id: STARTER_GRID_ID.into(),
                 linear_input: Vec3::new(0.25, 0.0, 0.0),
@@ -11628,7 +12581,8 @@ mod tests {
         for index in 0..2 {
             aim_player_at_block(&mut runtime, STARTER_GRID_ID, &bridge_id);
             runtime
-                .execute(&ClientMessage::DamageBlock {
+                .execute_next_for_fixture(&ClientMessage::DamageBlock {
+                    operation_sequence: 0,
                     operation_id: format!("damage-{index}"),
                     grid_id: STARTER_GRID_ID.into(),
                     block_id: bridge_id.clone(),
@@ -11668,7 +12622,8 @@ mod tests {
     fn authoritative_grid_controls_cannot_drive_through_asteroid_voxels() {
         let mut runtime = runtime();
         runtime
-            .execute(&ClientMessage::SetGridControl {
+            .execute_next_for_fixture(&ClientMessage::SetGridControl {
+                operation_sequence: 0,
                 operation_id: "drive-into-asteroid".into(),
                 grid_id: STARTER_GRID_ID.into(),
                 linear_input: Vec3::new(-1.0, 0.0, 0.0),
@@ -11695,7 +12650,8 @@ mod tests {
     fn grid_control_replay_revalidates_bounds_power_and_anchor_state() {
         let state = WorldState::genesis(172);
         let valid = state
-            .prepare_client_event(&ClientMessage::SetGridControl {
+            .prepare_next_client_event_for_fixture(&ClientMessage::SetGridControl {
+                operation_sequence: 0,
                 operation_id: "canonical-grid-control".into(),
                 grid_id: STARTER_GRID_ID.into(),
                 linear_input: Vec3::new(0.25, 0.0, 0.0),
@@ -11730,16 +12686,20 @@ mod tests {
             }
         }
 
-        for (mut candidate, event) in [
-            (state.clone(), oversized),
-            (anchored_state, valid.clone()),
-            (unpowered_state, valid),
+        for (mut candidate, event, expected_code) in [
+            (
+                state.clone(),
+                oversized,
+                "replay_intent_fingerprint_mismatch",
+            ),
+            (anchored_state, valid.clone(), "replay_grid_control_invalid"),
+            (unpowered_state, valid, "replay_grid_control_invalid"),
         ] {
             let before = candidate.state_hash();
             let error = candidate
                 .apply_event(&event)
                 .expect_err("forged grid control replay rejects");
-            assert_eq!(error.code(), "replay_grid_control_invalid");
+            assert_eq!(error.code(), expected_code);
             assert_eq!(candidate.state_hash(), before);
         }
     }
@@ -11839,7 +12799,8 @@ mod tests {
     fn runtime_cargo_mass_reduces_acceleration_under_the_same_force() {
         fn accelerate(runtime: &mut Runtime, operation_prefix: &str) -> f64 {
             runtime
-                .execute(&ClientMessage::SetGridControl {
+                .execute_next_for_fixture(&ClientMessage::SetGridControl {
+                    operation_sequence: 0,
                     operation_id: format!("{operation_prefix}-control"),
                     grid_id: STARTER_GRID_ID.into(),
                     linear_input: Vec3::new(1.0, 0.0, 0.0),
@@ -11870,7 +12831,8 @@ mod tests {
             .cloned()
             .expect("starter cargo exists");
         heavy
-            .execute(&ClientMessage::TransferInventory {
+            .execute_next_for_fixture(&ClientMessage::TransferInventory {
+                operation_sequence: 0,
                 operation_id: "load-physical-cargo".into(),
                 source_inventory_id: PLAYER_INVENTORY_ID.into(),
                 destination_inventory_id: cargo_id.clone(),
@@ -11934,7 +12896,8 @@ mod tests {
         assert!(runtime.state().grids["floor-grid"].anchor_touches(&runtime.state().voxels));
         assert!(runtime.state().grids["floor-grid"].power().online);
         runtime
-            .execute(&ClientMessage::SetGridControl {
+            .execute_next_for_fixture(&ClientMessage::SetGridControl {
+                operation_sequence: 0,
                 operation_id: "press-grid-onto-floor".into(),
                 grid_id: "resting-grid".into(),
                 linear_input: Vec3::new(0.0, -0.2, 0.0),
@@ -12076,7 +13039,8 @@ mod tests {
             );
             let before_rejected_control = runtime.state().state_hash();
             assert!(matches!(
-                runtime.execute(&ClientMessage::SetGridControl {
+                runtime.execute_next_for_fixture(&ClientMessage::SetGridControl {
+                    operation_sequence: 0,
                     operation_id: "reject-anchored-control".into(),
                     grid_id: "anchored-grid".into(),
                     linear_input: Vec3::new(1.0, 0.0, 0.0),
@@ -12111,7 +13075,8 @@ mod tests {
                 .state()
                 .grid_mass_grams(&runtime.state().grids["anchored-grid"]);
             runtime
-                .execute(&ClientMessage::ToggleGridAnchor {
+                .execute_next_for_fixture(&ClientMessage::ToggleGridAnchor {
+                    operation_sequence: 0,
                     operation_id: "release-final-anchor".into(),
                     grid_id: "anchored-grid".into(),
                 })
@@ -12135,7 +13100,8 @@ mod tests {
             assert!(runtime.state().conservation().valid);
 
             runtime
-                .execute(&ClientMessage::SetGridControl {
+                .execute_next_for_fixture(&ClientMessage::SetGridControl {
+                    operation_sequence: 0,
                     operation_id: "move-released-anchor".into(),
                     grid_id: "anchored-grid".into(),
                     linear_input: Vec3::new(1.0, 0.0, 0.0),
@@ -12171,7 +13137,8 @@ mod tests {
         let directory = tempfile::tempdir().expect("tempdir");
         let mut runtime = Runtime::open(directory.path(), 42, 1).expect("runtime opens");
         runtime
-            .execute(&ClientMessage::SetGridControl {
+            .execute_next_for_fixture(&ClientMessage::SetGridControl {
+                operation_sequence: 0,
                 operation_id: "contact-lifecycle-thrust".into(),
                 grid_id: STARTER_GRID_ID.into(),
                 linear_input: Vec3::new(-1.0, 0.0, 0.0),
@@ -12252,7 +13219,8 @@ mod tests {
         let directory = tempfile::tempdir().expect("tempdir");
         let mut runtime = Runtime::open(directory.path(), 7, 1_000).expect("runtime opens");
         runtime
-            .execute(&ClientMessage::SetGridControl {
+            .execute_next_for_fixture(&ClientMessage::SetGridControl {
+                operation_sequence: 0,
                 operation_id: "recovery-thrust".into(),
                 grid_id: STARTER_GRID_ID.into(),
                 linear_input: Vec3::new(0.0, 0.0, 0.5),
@@ -12287,7 +13255,8 @@ mod tests {
         let directory = tempfile::tempdir().expect("tempdir");
         let mut runtime = Runtime::open(directory.path(), 7, 1).expect("runtime opens");
         runtime
-            .execute(&ClientMessage::SetGridControl {
+            .execute_next_for_fixture(&ClientMessage::SetGridControl {
+                operation_sequence: 0,
                 operation_id: "timing-thrust".into(),
                 grid_id: STARTER_GRID_ID.into(),
                 linear_input: Vec3::new(0.0, 0.0, 0.25),

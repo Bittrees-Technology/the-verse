@@ -9,7 +9,7 @@ use verse_protocol::{
 use crate::model::{Block, ContactPairKey, DeathDrop, InventoryRecord};
 
 pub const EVENT_SCHEMA_NAME: &str = "verse.world_event";
-pub const EVENT_SCHEMA_VERSION: u32 = 11;
+pub const EVENT_SCHEMA_VERSION: u32 = 12;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event_type", rename_all = "snake_case")]
@@ -304,6 +304,8 @@ pub struct CanonicalEvent {
     pub actor_player_id: Option<String>,
     pub actor_type: String,
     pub operation_id: Option<String>,
+    pub operation_sequence: Option<u64>,
+    pub intent_fingerprint: Option<String>,
     pub previous_event_hash: String,
     pub payload: EventPayload,
     pub event_hash: String,
@@ -323,6 +325,8 @@ struct EventHashMaterial<'a> {
     actor_player_id: &'a Option<String>,
     actor_type: &'a str,
     operation_id: &'a Option<String>,
+    operation_sequence: &'a Option<u64>,
+    intent_fingerprint: &'a Option<String>,
     previous_event_hash: &'a str,
     payload: &'a EventPayload,
 }
@@ -338,6 +342,8 @@ impl CanonicalEvent {
         actor_player_id: Option<String>,
         actor_type: impl Into<String>,
         operation_id: Option<String>,
+        operation_sequence: Option<u64>,
+        intent_fingerprint: Option<String>,
         previous_event_hash: impl Into<String>,
         payload: EventPayload,
     ) -> Self {
@@ -360,6 +366,8 @@ impl CanonicalEvent {
             actor_player_id,
             actor_type: actor_type.into(),
             operation_id,
+            operation_sequence,
+            intent_fingerprint,
             previous_event_hash: previous_event_hash.into(),
             payload,
             event_hash: String::new(),
@@ -382,6 +390,8 @@ impl CanonicalEvent {
             actor_player_id: &self.actor_player_id,
             actor_type: &self.actor_type,
             operation_id: &self.operation_id,
+            operation_sequence: &self.operation_sequence,
+            intent_fingerprint: &self.intent_fingerprint,
             previous_event_hash: &self.previous_event_hash,
             payload: &self.payload,
         };
@@ -409,6 +419,8 @@ mod tests {
             Some("player".into()),
             "human",
             Some("op-1".into()),
+            Some(1),
+            Some("0".repeat(64)),
             "",
             EventPayload::PlayerControlSet {
                 movement_epoch: 1,
