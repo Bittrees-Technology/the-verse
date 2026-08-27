@@ -173,10 +173,10 @@ async function run() {
     (message) => message.type === "welcome",
     "welcome",
   );
-  assert.equal(welcome.protocol_version, 6);
+  assert.equal(welcome.protocol_version, 7);
   send({
     type: "hello",
-    protocol_version: 6,
+    protocol_version: 7,
     client_name: "node-authoritative-e2e",
   });
   let world = (
@@ -186,7 +186,7 @@ async function run() {
     )
   ).snapshot;
   assert.equal(world.conservation.valid, true);
-  assert.equal(world.content_manifest_version, "p0.7.3");
+  assert.equal(world.content_manifest_version, "p0.8.0");
   assert.equal(world.grids.length, 1);
   assert.ok(world.voxels.length > 1_000);
   assert.equal(world.environment.celestial_body_name, "Khepri Prime");
@@ -196,8 +196,11 @@ async function run() {
   assert.ok(world.environment.altitude_m > 3_000.0);
   assert.equal(world.environment.atmosphere_density, 0.0);
   assert.equal(world.player.suit_oxygen_milli, 1_000);
+  assert.equal(world.player.critical_oxygen_milli, 200);
+  assert.deepEqual(world.player.life_state, { kind: "alive" });
   assert.equal(world.player.helmet_closed, true);
   assert.equal(world.player.jetpack_enabled, true);
+  assert.deepEqual(world.death_drops, []);
   assert.ok(playerInventory(world).capacity_liters > 0);
   assert.ok(playerInventory(world).used_liters > 0);
   assert.ok(playerInventory(world).mass_grams > 0);
@@ -337,6 +340,66 @@ async function run() {
         inventory.contents.ore === 1,
     ),
   );
+
+  world = await intent("set_suit_mode", {
+    helmet_closed: false,
+    jetpack_enabled: true,
+  });
+  world = (
+    await waitFor(
+      (message) =>
+        message.type === "snapshot" &&
+        message.snapshot.player.life_state.kind === "incapacitated",
+      "canonical oxygen incapacitation",
+      30_000,
+    )
+  ).snapshot;
+  assert.equal(world.player.suit_oxygen_milli, 0);
+  assert.equal(world.player.jetpack_enabled, false);
+  assert.equal(playerInventory(world).used_liters, 0);
+  assert.equal(world.death_drops.length, 1);
+  assert.equal(
+    world.death_drops[0].death_id,
+    world.player.life_state.death_id,
+  );
+  assert.ok(
+    world.inventories.some(
+      (inventory) =>
+        inventory.inventory_id === world.death_drops[0].inventory_id &&
+        inventory.used_liters > 0,
+    ),
+    "the carried inventory is preserved in the canonical death drop",
+  );
+
+  const blockedOperation = operationId("dead-mine");
+  send({
+    type: "mine_voxel",
+    operation_id: blockedOperation,
+    coordinate: { x: 0, y: 0, z: 0 },
+  });
+  const blocked = await waitFor(
+    (message) =>
+      message.type === "intent_rejected" &&
+      message.operation_id === blockedOperation,
+    "incapacitated mutation rejection",
+  );
+  assert.equal(blocked.code, "player_incapacitated");
+
+  const progressionAtDeath = {
+    experience: world.player.experience,
+    career: world.player.career,
+  };
+  world = await intent("respawn_player", {});
+  assert.deepEqual(world.player.life_state, { kind: "alive" });
+  assert.equal(world.player.suit_oxygen_milli, 1_000);
+  assert.equal(world.player.helmet_closed, true);
+  assert.equal(world.player.jetpack_enabled, true);
+  assert.equal(playerInventory(world).used_liters, 0);
+  assert.equal(world.death_drops.length, 1);
+  assert.equal(world.player.experience, progressionAtDeath.experience);
+  assert.deepEqual(world.player.career, progressionAtDeath.career);
+  assert.equal(world.conservation.valid, true);
+
   console.log(
     JSON.stringify({
       result: "VERSE_E2E_OK",

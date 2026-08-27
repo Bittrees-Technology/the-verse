@@ -9,8 +9,8 @@ use verse_physics::{
     Scene, SceneConfig, Vec3 as PhysicsVec3,
 };
 use verse_protocol::{
-    BlockKind, ClientMessage, IVec3, IntentReceipt, InventoryContents, InventoryDomain, Quat,
-    ResourceKind, Vec3, WorldSnapshot,
+    BlockKind, ClientMessage, IVec3, IntentReceipt, InventoryContents, InventoryDomain,
+    PlayerDeathCause, PlayerLifeState, Quat, ResourceKind, Vec3, WorldSnapshot,
 };
 
 use crate::content;
@@ -19,8 +19,8 @@ use crate::event::{
     PhysicsContactOutcome, PhysicsContactPhase,
 };
 use crate::model::{
-    Block, CARGO_INVENTORY_CAPACITY_LITERS, ContactPairKey, Grid, InventoryRecord, PLANET_CENTER,
-    PLANET_SURFACE_RADIUS_M, PLAYER_INVENTORY_ID, WorldState,
+    Block, CARGO_INVENTORY_CAPACITY_LITERS, ContactPairKey, DeathDrop, Grid, InventoryRecord,
+    PLANET_CENTER, PLANET_SURFACE_RADIUS_M, PLAYER_INVENTORY_ID, WorldState,
 };
 use crate::persistence::{PersistenceError, Store};
 
@@ -208,14 +208,6 @@ impl Runtime {
     }
 
     pub fn advance(&mut self, delta_millis: u16) -> Result<bool, RuntimeError> {
-        self.advance_with_player_presence(delta_millis, true)
-    }
-
-    pub fn advance_with_player_presence(
-        &mut self,
-        delta_millis: u16,
-        player_active: bool,
-    ) -> Result<bool, RuntimeError> {
         if self.halted {
             return Err(RuntimeError::Halted);
         }
@@ -299,37 +291,27 @@ impl Runtime {
             }
         }
 
-        if player_active {
+        let player_life_support_active =
+            matches!(self.state.player.life_state, PlayerLifeState::Alive);
+        if player_life_support_active {
             self.life_support_elapsed_millis = self
                 .life_support_elapsed_millis
                 .saturating_add(u32::from(delta_millis));
+        } else if !matches!(self.state.player.life_state, PlayerLifeState::Alive) {
+            self.life_support_elapsed_millis = 0;
         }
-        if player_active && self.life_support_elapsed_millis >= 1_000 {
+        if player_life_support_active && self.life_support_elapsed_millis >= 1_000 {
             let elapsed_seconds = self.life_support_elapsed_millis / 1_000;
             self.life_support_elapsed_millis %= 1_000;
-            let previous_oxygen_milli = self.state.player.suit_oxygen_milli;
-            let environment = self.state.environment_at(self.state.player.position);
-            let per_second_delta = if !self.state.player.helmet_closed && environment.breathable {
-                25_i32
-            } else if !self.state.player.helmet_closed {
-                -40_i32
-            } else if environment.breathable {
-                0_i32
-            } else {
-                -5_i32
-            };
-            let new_oxygen_milli = u16::try_from(
-                (i32::from(previous_oxygen_milli)
-                    + per_second_delta * i32::try_from(elapsed_seconds).unwrap_or(i32::MAX))
-                .clamp(0, 1_000),
-            )
-            .expect("clamped suit oxygen always fits u16");
-            if new_oxygen_milli != previous_oxygen_milli {
-                self.commit_system_event(EventPayload::SuitOxygenChanged {
-                    previous_oxygen_milli,
-                    new_oxygen_milli,
-                })?;
+            for _ in 0..elapsed_seconds {
+                let Some(payload) = self.state.life_support_payload_after_one_second()? else {
+                    continue;
+                };
+                self.commit_system_event(payload)?;
                 changed = true;
+                if !matches!(self.state.player.life_state, PlayerLifeState::Alive) {
+                    break;
+                }
             }
         }
         Ok(changed)
@@ -370,6 +352,166 @@ impl Runtime {
 }
 
 impl WorldState {
+    fn next_suit_oxygen_after_one_second(&self) -> Result<u16, IntentError> {
+        if !matches!(self.player.life_state, PlayerLifeState::Alive)
+            || self.player.suit_oxygen_milli == 0
+        {
+            return Err(IntentError::rejected(
+                "player_not_alive",
+                "only an alive player with remaining oxygen has a life-support transition",
+            ));
+        }
+        let environment = self.environment_at(self.player.position);
+        let survival = &content::manifest().survival;
+        let per_second_delta = if !self.player.helmet_closed && environment.breathable {
+            survival.open_breathable_delta_milli_per_second
+        } else if !self.player.helmet_closed {
+            survival.open_vacuum_delta_milli_per_second
+        } else if environment.breathable {
+            survival.sealed_breathable_delta_milli_per_second
+        } else {
+            survival.sealed_vacuum_delta_milli_per_second
+        };
+        Ok(u16::try_from(
+            (i32::from(self.player.suit_oxygen_milli) + i32::from(per_second_delta))
+                .clamp(0, i32::from(survival.suit_oxygen_capacity_milli)),
+        )
+        .expect("clamped suit oxygen always fits u16"))
+    }
+
+    fn life_support_payload_after_one_second(&self) -> Result<Option<EventPayload>, IntentError> {
+        let previous_oxygen_milli = self.player.suit_oxygen_milli;
+        let new_oxygen_milli = self.next_suit_oxygen_after_one_second()?;
+        if new_oxygen_milli == previous_oxygen_milli {
+            return Ok(None);
+        }
+        if new_oxygen_milli == 0 {
+            return self.oxygen_incapacitation_payload().map(Some);
+        }
+        Ok(Some(EventPayload::SuitOxygenChanged {
+            previous_oxygen_milli,
+            new_oxygen_milli,
+        }))
+    }
+
+    fn oxygen_incapacitation_payload(&self) -> Result<EventPayload, IntentError> {
+        if !matches!(self.player.life_state, PlayerLifeState::Alive)
+            || self.player.suit_oxygen_milli == 0
+        {
+            return Err(IntentError::rejected(
+                "player_not_alive",
+                "only an alive player with remaining oxygen can become incapacitated",
+            ));
+        }
+        if self.next_suit_oxygen_after_one_second()? != 0 {
+            return Err(IntentError::rejected(
+                "oxygen_not_depleted",
+                "the authoritative one-second life-support transition does not reach zero",
+            ));
+        }
+        let event_sequence = self.event_sequence + 1;
+        let death_id = format!("death-{}-{event_sequence}", self.player.player_id);
+        let inventory = self.inventory(&self.player.inventory_id)?;
+        if inventory.domain
+            != (InventoryDomain::Player {
+                player_id: self.player.player_id.clone(),
+            })
+        {
+            return Err(IntentError::rejected(
+                "player_inventory_domain_invalid",
+                "the player inventory does not belong to the authoritative player",
+            ));
+        }
+        let has_carried_inventory = inventory.contents != InventoryContents::default();
+        let (dropped_inventory, death_drop) = if has_carried_inventory {
+            let drop_id = format!("drop-{}-{event_sequence}", self.player.player_id);
+            let inventory_id = format!("inventory-{drop_id}");
+            if self.death_drops.contains_key(&drop_id)
+                || self.inventories.contains_key(&inventory_id)
+            {
+                return Err(IntentError::rejected(
+                    "death_drop_identity_conflict",
+                    "the deterministic death-drop identity is already in use",
+                ));
+            }
+            (
+                Some(InventoryRecord {
+                    inventory_id: inventory_id.clone(),
+                    domain: InventoryDomain::Dropped {
+                        reason: "player_oxygen_depleted".into(),
+                    },
+                    contents: inventory.contents.clone(),
+                    capacity_liters: inventory.capacity_liters,
+                }),
+                Some(DeathDrop {
+                    drop_id,
+                    death_id: death_id.clone(),
+                    inventory_id,
+                    owner_player_id: self.player.player_id.clone(),
+                    position: self.player.position,
+                    created_event_sequence: event_sequence,
+                    cause: PlayerDeathCause::OxygenDepleted,
+                }),
+            )
+        } else {
+            (None, None)
+        };
+        Ok(EventPayload::PlayerIncapacitated {
+            death_id,
+            cause: PlayerDeathCause::OxygenDepleted,
+            position: self.player.position,
+            previous_oxygen_milli: self.player.suit_oxygen_milli,
+            dropped_inventory,
+            death_drop,
+        })
+    }
+
+    fn player_respawn_payload(&self) -> Result<EventPayload, IntentError> {
+        let PlayerLifeState::Incapacitated { death_id, .. } = &self.player.life_state else {
+            return Err(IntentError::rejected(
+                "player_already_alive",
+                "the player is already alive",
+            ));
+        };
+        let survival = &content::manifest().survival;
+        if self.inventory(&self.player.inventory_id)?.contents != InventoryContents::default() {
+            return Err(IntentError::rejected(
+                "respawn_inventory_not_empty",
+                "recovery requires the carried inventory to remain in its death drop",
+            ));
+        }
+        let position = (0..=2_048)
+            .map(|step| {
+                survival.proof_recovery_position + Vec3::new(0.0, f64::from(step) * 2.0, 0.0)
+            })
+            .find(|position| self.proof_recovery_position_is_clear(*position))
+            .ok_or_else(|| {
+                IntentError::rejected(
+                    "proof_recovery_region_exhausted",
+                    "the deterministic proof recovery corridor has no clear point",
+                )
+            })?;
+        Ok(EventPayload::PlayerRespawned {
+            death_id: death_id.clone(),
+            position,
+            suit_oxygen_milli: survival.respawn_oxygen_milli,
+            helmet_closed: survival.respawn_helmet_closed,
+            jetpack_enabled: survival.respawn_jetpack_enabled,
+        })
+    }
+
+    fn proof_recovery_position_is_clear(&self, position: Vec3) -> bool {
+        let planet_distance = Vec3::new(
+            position.x - PLANET_CENTER.x,
+            position.y - PLANET_CENTER.y,
+            position.z - PLANET_CENTER.z,
+        )
+        .magnitude();
+        planet_distance >= PLANET_SURFACE_RADIUS_M + 0.45
+            && !self.player_movement_hits_voxel(position, position)
+            && !self.player_movement_hits_grid(position, position)
+    }
+
     pub fn prepare_client_event(
         &self,
         message: &ClientMessage,
@@ -381,6 +523,14 @@ impl WorldState {
             return Err(IntentError::rejected(
                 "invalid_operation_id",
                 "operation ID must contain between 1 and 128 characters",
+            ));
+        }
+        if !matches!(self.player.life_state, PlayerLifeState::Alive)
+            && !matches!(message, ClientMessage::RespawnPlayer { .. })
+        {
+            return Err(IntentError::rejected(
+                "player_incapacitated",
+                "life support has failed; request recovery before performing work",
             ));
         }
 
@@ -446,6 +596,7 @@ impl WorldState {
                     jetpack_enabled: *jetpack_enabled,
                 }
             }
+            ClientMessage::RespawnPlayer { .. } => self.player_respawn_payload()?,
             ClientMessage::MineVoxel { coordinate, .. } => {
                 let material = self.voxels.material(*coordinate).ok_or_else(|| {
                     IntentError::rejected("voxel_missing", "target voxel is already empty")
@@ -845,6 +996,48 @@ impl WorldState {
         if event.content_manifest_version != self.content_manifest_version {
             return Err(IntentError::ContentManifestMismatch);
         }
+        if let Some(operation_id) = &event.operation_id
+            && self.processed_operations.contains_key(operation_id)
+        {
+            return Err(IntentError::rejected(
+                "replay_operation_duplicate",
+                "event operation ID was already committed",
+            ));
+        }
+        match &event.payload {
+            EventPayload::SuitOxygenChanged { .. } | EventPayload::PlayerIncapacitated { .. }
+                if event.actor_profile_id != "simulation-worker"
+                    || event.actor_type != "system"
+                    || event.operation_id.is_some() =>
+            {
+                return Err(IntentError::rejected(
+                    "replay_lifecycle_envelope_invalid",
+                    "automatic life-support events require the system actor and no operation ID",
+                ));
+            }
+            EventPayload::PlayerRespawned { .. }
+                if event.actor_profile_id != "player-local"
+                    || event.actor_type != "human"
+                    || event.operation_id.as_deref().is_none_or(str::is_empty) =>
+            {
+                return Err(IntentError::rejected(
+                    "replay_lifecycle_envelope_invalid",
+                    "respawn requires the authoritative player actor and an operation ID",
+                ));
+            }
+            _ => {}
+        }
+        if !matches!(self.player.life_state, PlayerLifeState::Alive)
+            && !matches!(
+                &event.payload,
+                EventPayload::PlayerRespawned { .. } | EventPayload::PhysicsStepCommitted { .. }
+            )
+        {
+            return Err(IntentError::rejected(
+                "replay_player_incapacitated",
+                "incapacitated players cannot commit gameplay events before recovery",
+            ));
+        }
 
         match &event.payload {
             EventPayload::PlayerMoved { position } => self.player.position = *position,
@@ -856,18 +1049,70 @@ impl WorldState {
                 self.player.jetpack_enabled = *jetpack_enabled;
             }
             EventPayload::SuitOxygenChanged {
-                previous_oxygen_milli,
-                new_oxygen_milli,
+                new_oxygen_milli, ..
             } => {
-                if self.player.suit_oxygen_milli != *previous_oxygen_milli
-                    || *new_oxygen_milli > 1_000
-                {
+                let expected = self.life_support_payload_after_one_second()?;
+                if expected.as_ref() != Some(&event.payload) {
                     return Err(IntentError::rejected(
                         "replay_suit_oxygen_invalid",
-                        "life-support event does not match the authoritative suit state",
+                        "life-support event is not the exact authoritative one-second outcome",
                     ));
                 }
                 self.player.suit_oxygen_milli = *new_oxygen_milli;
+            }
+            EventPayload::PlayerIncapacitated { .. } => {
+                let expected = self.oxygen_incapacitation_payload()?;
+                if expected != event.payload {
+                    return Err(IntentError::rejected(
+                        "replay_player_incapacitation_invalid",
+                        "incapacitation does not match authoritative life support or inventory",
+                    ));
+                }
+                let EventPayload::PlayerIncapacitated {
+                    death_id,
+                    cause,
+                    dropped_inventory,
+                    death_drop,
+                    ..
+                } = expected
+                else {
+                    unreachable!("incapacitation preparation returns incapacitation payload");
+                };
+                self.inventory_mut(&self.player.inventory_id.clone())?
+                    .contents = InventoryContents::default();
+                if let (Some(inventory), Some(drop)) = (dropped_inventory, death_drop) {
+                    self.inventories
+                        .insert(inventory.inventory_id.clone(), inventory);
+                    self.death_drops.insert(drop.drop_id.clone(), drop);
+                }
+                self.player.suit_oxygen_milli = 0;
+                self.player.jetpack_enabled = false;
+                self.player.life_state = PlayerLifeState::Incapacitated { death_id, cause };
+                for grid in self.grids.values_mut() {
+                    grid.control_linear_input = Vec3::ZERO;
+                    grid.control_angular_input = Vec3::ZERO;
+                    grid.dampeners = true;
+                }
+            }
+            EventPayload::PlayerRespawned {
+                position,
+                suit_oxygen_milli,
+                helmet_closed,
+                jetpack_enabled,
+                ..
+            } => {
+                let expected = self.player_respawn_payload()?;
+                if expected != event.payload {
+                    return Err(IntentError::rejected(
+                        "replay_player_respawn_invalid",
+                        "respawn does not match the server-selected recovery outcome",
+                    ));
+                }
+                self.player.position = *position;
+                self.player.suit_oxygen_milli = *suit_oxygen_milli;
+                self.player.helmet_closed = *helmet_closed;
+                self.player.jetpack_enabled = *jetpack_enabled;
+                self.player.life_state = PlayerLifeState::Alive;
             }
             EventPayload::VoxelMined {
                 coordinate,
@@ -1352,6 +1597,8 @@ impl WorldState {
             EventPayload::PlayerMoved { .. }
             | EventPayload::SuitModeChanged { .. }
             | EventPayload::SuitOxygenChanged { .. }
+            | EventPayload::PlayerIncapacitated { .. }
+            | EventPayload::PlayerRespawned { .. }
             | EventPayload::InventoryTransferred { .. }
             | EventPayload::BlockBuilt { .. }
             | EventPayload::BlockWelded { .. }
@@ -1520,8 +1767,15 @@ impl WorldState {
 
     fn ensure_inventory_functional(&self, inventory_id: &str) -> Result<(), IntentError> {
         let inventory = self.inventory(inventory_id)?;
-        let InventoryDomain::Cargo { block_id } = &inventory.domain else {
-            return Ok(());
+        let block_id = match &inventory.domain {
+            InventoryDomain::Player { .. } => return Ok(()),
+            InventoryDomain::Dropped { .. } => {
+                return Err(IntentError::rejected(
+                    "dropped_inventory_sealed",
+                    "dropped inventory requires an explicit recovery or salvage action",
+                ));
+            }
+            InventoryDomain::Cargo { block_id } => block_id,
         };
         let block = self
             .grids
@@ -1665,6 +1919,8 @@ fn event_changes_physics_scene(payload: &EventPayload) -> bool {
         EventPayload::PlayerMoved { .. }
             | EventPayload::SuitModeChanged { .. }
             | EventPayload::SuitOxygenChanged { .. }
+            | EventPayload::PlayerIncapacitated { .. }
+            | EventPayload::PlayerRespawned { .. }
             | EventPayload::GridControlSet { .. }
             | EventPayload::PhysicsStepCommitted { .. }
     )
@@ -2987,6 +3243,801 @@ mod tests {
             runtime.advance(250).expect("vacuum life support tick");
         }
         assert_eq!(runtime.state().player.suit_oxygen_milli, 885);
+    }
+
+    #[test]
+    fn oxygen_replay_accepts_only_the_exact_authoritative_one_second_outcome() {
+        let vacuum = Vec3::new(100.0, 100.0, 100.0);
+        let breathable = Vec3::new(
+            PLANET_CENTER.x,
+            PLANET_CENTER.y + PLANET_SURFACE_RADIUS_M + 10.0,
+            PLANET_CENTER.z,
+        );
+
+        let apply = |mut state: WorldState, payload: EventPayload| {
+            let event = state.prepare_system_event(payload);
+            let result = state.apply_event(&event);
+            (state, result)
+        };
+
+        let mut state = runtime().state().clone();
+        state.player.position = vacuum;
+        state.player.helmet_closed = false;
+        let (_, impossible) = apply(
+            state.clone(),
+            EventPayload::SuitOxygenChanged {
+                previous_oxygen_milli: 1_000,
+                new_oxygen_milli: 1,
+            },
+        );
+        assert!(matches!(
+            impossible,
+            Err(IntentError::Rejected { ref code, .. }) if code == "replay_suit_oxygen_invalid"
+        ));
+        let (exact_vacuum, accepted) = apply(
+            state,
+            EventPayload::SuitOxygenChanged {
+                previous_oxygen_milli: 1_000,
+                new_oxygen_milli: 960,
+            },
+        );
+        accepted.expect("open-vacuum exact delta applies");
+        assert_eq!(exact_vacuum.player.suit_oxygen_milli, 960);
+
+        let mut state = runtime().state().clone();
+        state.player.position = breathable;
+        state.player.helmet_closed = false;
+        state.player.suit_oxygen_milli = 900;
+        let (_, impossible) = apply(
+            state.clone(),
+            EventPayload::SuitOxygenChanged {
+                previous_oxygen_milli: 900,
+                new_oxygen_milli: 860,
+            },
+        );
+        assert!(matches!(
+            impossible,
+            Err(IntentError::Rejected { ref code, .. }) if code == "replay_suit_oxygen_invalid"
+        ));
+        let (exact_breathable, accepted) = apply(
+            state,
+            EventPayload::SuitOxygenChanged {
+                previous_oxygen_milli: 900,
+                new_oxygen_milli: 925,
+            },
+        );
+        accepted.expect("open-breathable exact delta applies");
+        assert_eq!(exact_breathable.player.suit_oxygen_milli, 925);
+
+        let mut full_oxygen = runtime().state().clone();
+        full_oxygen.player.position = vacuum;
+        let mut terminal = full_oxygen.clone();
+        terminal.player.suit_oxygen_milli = 5;
+        let impossible_death = terminal
+            .oxygen_incapacitation_payload()
+            .expect("terminal payload prepares");
+        let (_, rejected) = apply(full_oxygen, impossible_death);
+        assert!(matches!(
+            rejected,
+            Err(IntentError::Rejected { ref code, .. }) if code == "oxygen_not_depleted"
+        ));
+
+        let exact_death = terminal
+            .oxygen_incapacitation_payload()
+            .expect("sealed-vacuum terminal payload prepares");
+        let (dead, accepted) = apply(terminal, exact_death);
+        accepted.expect("sealed-vacuum five-to-zero death applies");
+        assert!(matches!(
+            dead.player.life_state,
+            PlayerLifeState::Incapacitated { .. }
+        ));
+    }
+
+    #[test]
+    fn oxygen_death_moves_inventory_once_gates_work_and_respawns_for_free() {
+        let mut runtime = runtime();
+        runtime
+            .state
+            .inventories
+            .get_mut(PLAYER_INVENTORY_ID)
+            .expect("player inventory")
+            .contents = InventoryContents {
+            ore: 4,
+            refined_material: 3,
+            components: 24,
+        };
+        runtime.state.ledger.genesis_ore = 4;
+        runtime.state.ledger.genesis_refined = 3;
+        runtime.state.player.suit_oxygen_milli = 5;
+        let death_position = runtime.state().player.position;
+        let experience_before = runtime.state().player.experience;
+        let career_before = runtime.state().player.career.clone();
+        let ledger_before = runtime.state().ledger.clone();
+        let carried_before = runtime.state().inventories[PLAYER_INVENTORY_ID]
+            .contents
+            .clone();
+
+        for _ in 0..3 {
+            assert!(!runtime.advance(250).expect("partial oxygen second"));
+        }
+        assert!(runtime.advance(250).expect("terminal oxygen second"));
+        assert_eq!(runtime.state().event_sequence, 1);
+        assert_eq!(runtime.state().player.suit_oxygen_milli, 0);
+        assert!(!runtime.state().player.jetpack_enabled);
+        let PlayerLifeState::Incapacitated { death_id, cause } = &runtime.state().player.life_state
+        else {
+            panic!("zero oxygen must incapacitate the player");
+        };
+        assert_eq!(death_id, "death-player-local-1");
+        assert_eq!(*cause, PlayerDeathCause::OxygenDepleted);
+        assert_eq!(
+            runtime.state().inventories[PLAYER_INVENTORY_ID].contents,
+            InventoryContents::default()
+        );
+        assert_eq!(runtime.state().death_drops.len(), 1);
+        let drop = &runtime.state().death_drops["drop-player-local-1"];
+        assert_eq!(drop.position, death_position);
+        assert_eq!(drop.death_id, "death-player-local-1");
+        assert_eq!(drop.owner_player_id, "player-local");
+        assert_eq!(drop.created_event_sequence, 1);
+        let drop_inventory_id = drop.inventory_id.clone();
+        assert_eq!(
+            runtime.state().inventories[&drop_inventory_id].contents,
+            carried_before
+        );
+        assert_eq!(runtime.state().player.experience, experience_before);
+        assert_eq!(runtime.state().player.career, career_before);
+        assert_eq!(runtime.state().ledger, ledger_before);
+        assert!(runtime.state().conservation().valid);
+
+        for _ in 0..8 {
+            assert!(!runtime.advance(250).expect("incapacitated tick is inert"));
+        }
+        assert_eq!(runtime.state().event_sequence, 1);
+        assert_eq!(runtime.state().death_drops.len(), 1);
+
+        let blocked_messages = [
+            ClientMessage::MovePlayer {
+                operation_id: "dead-move".into(),
+                position: death_position + Vec3::new(0.1, 0.0, 0.0),
+            },
+            ClientMessage::SetSuitMode {
+                operation_id: "dead-suit".into(),
+                helmet_closed: false,
+                jetpack_enabled: false,
+            },
+            ClientMessage::MineVoxel {
+                operation_id: "dead-mine".into(),
+                coordinate: IVec3::ZERO,
+            },
+            ClientMessage::RefineOre {
+                operation_id: "dead-refine".into(),
+                inventory_id: PLAYER_INVENTORY_ID.into(),
+                batches: 1,
+            },
+            ClientMessage::CraftComponent {
+                operation_id: "dead-craft".into(),
+                inventory_id: PLAYER_INVENTORY_ID.into(),
+                quantity: 1,
+            },
+            ClientMessage::TransferInventory {
+                operation_id: "dead-transfer".into(),
+                source_inventory_id: drop_inventory_id.clone(),
+                destination_inventory_id: PLAYER_INVENTORY_ID.into(),
+                resource: ResourceKind::Component,
+                quantity: 1,
+            },
+            ClientMessage::BuildBlock {
+                operation_id: "dead-build".into(),
+                grid_id: STARTER_GRID_ID.into(),
+                coordinate: IVec3::new(0, 1, 0),
+                kind: BlockKind::Structural,
+                orientation: 0,
+            },
+            ClientMessage::WeldBlock {
+                operation_id: "dead-weld".into(),
+                grid_id: STARTER_GRID_ID.into(),
+                block_id: "block-core".into(),
+            },
+            ClientMessage::SetGridControl {
+                operation_id: "dead-control".into(),
+                grid_id: STARTER_GRID_ID.into(),
+                linear_input: Vec3::new(1.0, 0.0, 0.0),
+                angular_input: Vec3::ZERO,
+                dampeners: false,
+            },
+            ClientMessage::ToggleGridAnchor {
+                operation_id: "dead-anchor".into(),
+                grid_id: STARTER_GRID_ID.into(),
+            },
+            ClientMessage::DamageBlock {
+                operation_id: "dead-damage".into(),
+                grid_id: STARTER_GRID_ID.into(),
+                block_id: "block-core".into(),
+            },
+        ];
+        let dead_hash = runtime.state().state_hash();
+        for message in blocked_messages {
+            assert!(matches!(
+                runtime.execute(&message),
+                Err(RuntimeError::Intent(IntentError::Rejected { ref code, .. }))
+                    if code == "player_incapacitated"
+            ));
+            assert_eq!(runtime.state().state_hash(), dead_hash);
+        }
+
+        let respawn = ClientMessage::RespawnPlayer {
+            operation_id: "recover-once".into(),
+        };
+        let first = runtime.execute(&respawn).expect("recovery accepted");
+        let recovered_hash = runtime.state().state_hash();
+        let second = runtime.execute(&respawn).expect("recovery retry accepted");
+        assert_eq!(first, second);
+        assert_eq!(runtime.state().state_hash(), recovered_hash);
+        assert_eq!(runtime.state().event_sequence, 2);
+        assert_eq!(runtime.state().player.life_state, PlayerLifeState::Alive);
+        assert_eq!(
+            runtime.state().player.position,
+            content::manifest().survival.proof_recovery_position
+        );
+        assert_eq!(
+            runtime.state().player.suit_oxygen_milli,
+            content::manifest().survival.respawn_oxygen_milli
+        );
+        assert_eq!(
+            runtime.state().inventories[PLAYER_INVENTORY_ID].contents,
+            InventoryContents::default()
+        );
+        assert_eq!(runtime.state().death_drops.len(), 1);
+        assert_eq!(runtime.state().player.experience, experience_before);
+        assert_eq!(runtime.state().player.career, career_before);
+        assert_eq!(runtime.state().ledger, ledger_before);
+        assert!(runtime.state().conservation().valid);
+
+        let sealed_intents = [
+            ClientMessage::RefineOre {
+                operation_id: "drop-refine".into(),
+                inventory_id: drop_inventory_id.clone(),
+                batches: 1,
+            },
+            ClientMessage::CraftComponent {
+                operation_id: "drop-craft".into(),
+                inventory_id: drop_inventory_id.clone(),
+                quantity: 1,
+            },
+            ClientMessage::TransferInventory {
+                operation_id: "drop-transfer-source".into(),
+                source_inventory_id: drop_inventory_id.clone(),
+                destination_inventory_id: PLAYER_INVENTORY_ID.into(),
+                resource: ResourceKind::Component,
+                quantity: 1,
+            },
+            ClientMessage::TransferInventory {
+                operation_id: "drop-transfer-destination".into(),
+                source_inventory_id: PLAYER_INVENTORY_ID.into(),
+                destination_inventory_id: drop_inventory_id.clone(),
+                resource: ResourceKind::Component,
+                quantity: 1,
+            },
+        ];
+        for intent in sealed_intents {
+            assert!(matches!(
+                runtime.execute(&intent),
+                Err(RuntimeError::Intent(IntentError::Rejected { ref code, .. }))
+                    if code == "dropped_inventory_sealed"
+            ));
+        }
+
+        let replay_payloads = [
+            EventPayload::OreRefined {
+                inventory_id: drop_inventory_id.clone(),
+                batches: 1,
+            },
+            EventPayload::ComponentCrafted {
+                inventory_id: drop_inventory_id.clone(),
+                quantity: 1,
+            },
+            EventPayload::InventoryTransferred {
+                source_inventory_id: drop_inventory_id.clone(),
+                destination_inventory_id: PLAYER_INVENTORY_ID.into(),
+                resource: ResourceKind::Component,
+                quantity: 1,
+            },
+            EventPayload::InventoryTransferred {
+                source_inventory_id: PLAYER_INVENTORY_ID.into(),
+                destination_inventory_id: drop_inventory_id,
+                resource: ResourceKind::Component,
+                quantity: 1,
+            },
+        ];
+        for (index, payload) in replay_payloads.into_iter().enumerate() {
+            let event = runtime.state().new_event(
+                "player-local",
+                "human",
+                Some(format!("forged-drop-operation-{index}")),
+                payload,
+            );
+            let mut candidate = runtime.state().clone();
+            let before = candidate.state_hash();
+            assert!(matches!(
+                candidate.apply_event(&event),
+                Err(IntentError::Rejected { ref code, .. }) if code == "dropped_inventory_sealed"
+            ));
+            assert_eq!(candidate.state_hash(), before);
+        }
+    }
+
+    #[test]
+    fn empty_inventory_oxygen_death_does_not_create_an_empty_drop() {
+        let mut runtime = runtime();
+        runtime
+            .execute(&ClientMessage::TransferInventory {
+                operation_id: "stow-before-death".into(),
+                source_inventory_id: PLAYER_INVENTORY_ID.into(),
+                destination_inventory_id: "inventory-cargo-starter".into(),
+                resource: ResourceKind::Component,
+                quantity: 24,
+            })
+            .expect("carried inventory stows");
+        runtime.state.player.suit_oxygen_milli = 5;
+        for _ in 0..4 {
+            runtime.advance(250).expect("oxygen advances");
+        }
+        assert!(matches!(
+            runtime.state().player.life_state,
+            PlayerLifeState::Incapacitated { .. }
+        ));
+        assert!(runtime.state().death_drops.is_empty());
+        assert_eq!(runtime.state().inventories.len(), 2);
+        assert!(runtime.state().conservation().valid);
+    }
+
+    #[test]
+    fn incapacitation_replay_rejects_tampering_and_clears_latched_controls() {
+        let mut state = runtime().state().clone();
+        state.player.suit_oxygen_milli = 5;
+        state
+            .grids
+            .get_mut(STARTER_GRID_ID)
+            .unwrap()
+            .control_linear_input = Vec3::new(1.0, 0.0, 0.0);
+        state
+            .grids
+            .get_mut(STARTER_GRID_ID)
+            .unwrap()
+            .control_angular_input = Vec3::new(0.0, 1.0, 0.0);
+        state.grids.get_mut(STARTER_GRID_ID).unwrap().dampeners = false;
+        let canonical = state
+            .oxygen_incapacitation_payload()
+            .expect("incapacitation prepares");
+        let reject = |payload: EventPayload| {
+            let event = state.prepare_system_event(payload);
+            let mut candidate = state.clone();
+            let before = candidate.state_hash();
+            assert!(matches!(
+                candidate.apply_event(&event),
+                Err(IntentError::Rejected { ref code, .. })
+                    if code == "replay_player_incapacitation_invalid"
+            ));
+            assert_eq!(candidate.state_hash(), before);
+        };
+
+        let mut wrong_death = canonical.clone();
+        let EventPayload::PlayerIncapacitated { death_id, .. } = &mut wrong_death else {
+            unreachable!();
+        };
+        death_id.push_str("-forged");
+        reject(wrong_death);
+
+        let mut wrong_position = canonical.clone();
+        let EventPayload::PlayerIncapacitated { position, .. } = &mut wrong_position else {
+            unreachable!();
+        };
+        position.x += 0.5;
+        reject(wrong_position);
+
+        let mut wrong_previous_oxygen = canonical.clone();
+        let EventPayload::PlayerIncapacitated {
+            previous_oxygen_milli,
+            ..
+        } = &mut wrong_previous_oxygen
+        else {
+            unreachable!();
+        };
+        *previous_oxygen_milli += 1;
+        reject(wrong_previous_oxygen);
+
+        let mut wrong_contents = canonical.clone();
+        let EventPayload::PlayerIncapacitated {
+            dropped_inventory, ..
+        } = &mut wrong_contents
+        else {
+            unreachable!();
+        };
+        dropped_inventory
+            .as_mut()
+            .expect("nonempty carried inventory creates drop")
+            .contents
+            .components -= 1;
+        reject(wrong_contents);
+
+        let mut wrong_capacity = canonical.clone();
+        let EventPayload::PlayerIncapacitated {
+            dropped_inventory, ..
+        } = &mut wrong_capacity
+        else {
+            unreachable!();
+        };
+        dropped_inventory
+            .as_mut()
+            .expect("drop exists")
+            .capacity_liters += 1;
+        reject(wrong_capacity);
+
+        let mut wrong_dropped_inventory_id = canonical.clone();
+        let EventPayload::PlayerIncapacitated {
+            dropped_inventory, ..
+        } = &mut wrong_dropped_inventory_id
+        else {
+            unreachable!();
+        };
+        dropped_inventory
+            .as_mut()
+            .expect("drop exists")
+            .inventory_id
+            .push_str("-forged");
+        reject(wrong_dropped_inventory_id);
+
+        let mut wrong_linked_inventory_id = canonical.clone();
+        let EventPayload::PlayerIncapacitated { death_drop, .. } = &mut wrong_linked_inventory_id
+        else {
+            unreachable!();
+        };
+        death_drop
+            .as_mut()
+            .expect("drop metadata exists")
+            .inventory_id
+            .push_str("-forged");
+        reject(wrong_linked_inventory_id);
+
+        let mut wrong_owner = canonical.clone();
+        let EventPayload::PlayerIncapacitated { death_drop, .. } = &mut wrong_owner else {
+            unreachable!();
+        };
+        death_drop
+            .as_mut()
+            .expect("drop metadata exists")
+            .owner_player_id = "attacker".into();
+        reject(wrong_owner);
+
+        let mut wrong_drop_death_id = canonical.clone();
+        let EventPayload::PlayerIncapacitated { death_drop, .. } = &mut wrong_drop_death_id else {
+            unreachable!();
+        };
+        death_drop
+            .as_mut()
+            .expect("drop metadata exists")
+            .death_id
+            .push_str("-forged");
+        reject(wrong_drop_death_id);
+
+        let event = state.prepare_system_event(canonical);
+        state.apply_event(&event).expect("canonical death applies");
+        let grid = &state.grids[STARTER_GRID_ID];
+        assert_eq!(grid.control_linear_input, Vec3::ZERO);
+        assert_eq!(grid.control_angular_input, Vec3::ZERO);
+        assert!(grid.dampeners);
+        assert!(state.conservation().valid);
+    }
+
+    #[test]
+    fn oxygen_death_commit_failpoints_recover_the_complete_prior_or_durable_drop() {
+        for (failpoint, durable) in [
+            (AppendFailpoint::BeforeWrite, false),
+            (AppendFailpoint::AfterSync, true),
+        ] {
+            let directory = tempdir().expect("tempdir");
+            let before_state;
+            {
+                let mut runtime = Runtime::open(directory.path(), 91, 100).expect("runtime opens");
+                runtime.state.player.suit_oxygen_milli = 5;
+                runtime
+                    .persist_snapshot()
+                    .expect("low-oxygen state persists");
+                before_state = runtime.state().clone();
+                for _ in 0..3 {
+                    assert!(!runtime.advance(250).expect("partial oxygen second"));
+                }
+                runtime.store.set_append_failpoint(failpoint);
+                assert!(matches!(
+                    runtime.advance(250),
+                    Err(RuntimeError::Persistence(
+                        PersistenceError::InjectedFailure(_)
+                    ))
+                ));
+                assert!(runtime.is_halted());
+                assert_eq!(runtime.state().state_hash(), before_state.state_hash());
+                assert_eq!(runtime.state().player.life_state, PlayerLifeState::Alive);
+                assert!(runtime.state().death_drops.is_empty());
+            }
+
+            let recovered =
+                Runtime::open(directory.path(), 91, 100).expect("runtime recovers after failure");
+            if durable {
+                let journal = fs::read_to_string(directory.path().join("events.ndjson"))
+                    .expect("journal reads");
+                let event: CanonicalEvent = serde_json::from_str(
+                    journal.lines().last().expect("durable death event exists"),
+                )
+                .expect("death event parses");
+                let mut expected = before_state.clone();
+                expected.apply_event(&event).expect("durable death replays");
+                assert_eq!(recovered.state().state_hash(), expected.state_hash());
+                assert!(matches!(
+                    recovered.state().player.life_state,
+                    PlayerLifeState::Incapacitated { .. }
+                ));
+                assert_eq!(recovered.state().death_drops.len(), 1);
+            } else {
+                assert_eq!(recovered.state().state_hash(), before_state.state_hash());
+                assert_eq!(recovered.state().player.life_state, PlayerLifeState::Alive);
+                assert!(recovered.state().death_drops.is_empty());
+            }
+            assert!(recovered.state().conservation().valid);
+        }
+    }
+
+    #[test]
+    fn respawn_commit_failpoints_recover_the_complete_dead_or_alive_state() {
+        for (failpoint, durable) in [
+            (AppendFailpoint::BeforeWrite, false),
+            (AppendFailpoint::AfterSync, true),
+        ] {
+            let directory = tempdir().expect("tempdir");
+            let dead_state;
+            {
+                let mut runtime = Runtime::open(directory.path(), 92, 100).expect("runtime opens");
+                runtime.state.player.suit_oxygen_milli = 5;
+                runtime
+                    .persist_snapshot()
+                    .expect("low-oxygen state persists");
+                for _ in 0..4 {
+                    runtime.advance(250).expect("oxygen death commits");
+                }
+                dead_state = runtime.state().clone();
+                runtime.persist_snapshot().expect("dead state persists");
+                runtime.store.set_append_failpoint(failpoint);
+                assert!(matches!(
+                    runtime.execute(&ClientMessage::RespawnPlayer {
+                        operation_id: "recover-after-failure".into(),
+                    }),
+                    Err(RuntimeError::Persistence(
+                        PersistenceError::InjectedFailure(_)
+                    ))
+                ));
+                assert!(runtime.is_halted());
+                assert_eq!(runtime.state().state_hash(), dead_state.state_hash());
+            }
+
+            let recovered =
+                Runtime::open(directory.path(), 92, 100).expect("runtime recovers after failure");
+            if durable {
+                let journal = fs::read_to_string(directory.path().join("events.ndjson"))
+                    .expect("journal reads");
+                let event: CanonicalEvent = serde_json::from_str(
+                    journal
+                        .lines()
+                        .last()
+                        .expect("durable respawn event exists"),
+                )
+                .expect("respawn event parses");
+                let mut expected = dead_state.clone();
+                expected
+                    .apply_event(&event)
+                    .expect("durable respawn replays");
+                assert_eq!(recovered.state().state_hash(), expected.state_hash());
+                assert_eq!(recovered.state().player.life_state, PlayerLifeState::Alive);
+            } else {
+                assert_eq!(recovered.state().state_hash(), dead_state.state_hash());
+                assert!(matches!(
+                    recovered.state().player.life_state,
+                    PlayerLifeState::Incapacitated { .. }
+                ));
+            }
+            assert_eq!(recovered.state().death_drops.len(), 1);
+            assert!(recovered.state().conservation().valid);
+        }
+    }
+
+    #[test]
+    fn respawn_replay_rejects_client_selected_outcomes_before_mutation() {
+        let mut dead = runtime().state().clone();
+        dead.player.suit_oxygen_milli = 5;
+        let death = dead
+            .oxygen_incapacitation_payload()
+            .expect("death prepares");
+        let death_event = dead.prepare_system_event(death);
+        dead.apply_event(&death_event).expect("death applies");
+        let canonical = dead.player_respawn_payload().expect("respawn prepares");
+        let reject = |payload: EventPayload| {
+            let event = dead.new_event(
+                "player-local",
+                "human",
+                Some("tampered-respawn".into()),
+                payload,
+            );
+            let mut candidate = dead.clone();
+            let before = candidate.state_hash();
+            assert!(matches!(
+                candidate.apply_event(&event),
+                Err(IntentError::Rejected { ref code, .. })
+                    if code == "replay_player_respawn_invalid"
+            ));
+            assert_eq!(candidate.state_hash(), before);
+        };
+
+        let mut wrong_position = canonical.clone();
+        let EventPayload::PlayerRespawned { position, .. } = &mut wrong_position else {
+            unreachable!();
+        };
+        position.x += 1.0;
+        reject(wrong_position);
+
+        let mut wrong_oxygen = canonical.clone();
+        let EventPayload::PlayerRespawned {
+            suit_oxygen_milli, ..
+        } = &mut wrong_oxygen
+        else {
+            unreachable!();
+        };
+        *suit_oxygen_milli -= 1;
+        reject(wrong_oxygen);
+
+        let mut wrong_mode = canonical.clone();
+        let EventPayload::PlayerRespawned { helmet_closed, .. } = &mut wrong_mode else {
+            unreachable!();
+        };
+        *helmet_closed = !*helmet_closed;
+        reject(wrong_mode);
+
+        let mut wrong_death = canonical;
+        let EventPayload::PlayerRespawned { death_id, .. } = &mut wrong_death else {
+            unreachable!();
+        };
+        death_id.push_str("-forged");
+        reject(wrong_death);
+    }
+
+    #[test]
+    fn respawn_uses_a_deterministic_clear_fallback_when_the_primary_point_is_blocked() {
+        let mut state = runtime().state().clone();
+        state.player.suit_oxygen_milli = 5;
+        let death = state
+            .oxygen_incapacitation_payload()
+            .expect("death prepares");
+        let death_event = state.prepare_system_event(death);
+        state.apply_event(&death_event).expect("death applies");
+
+        let primary = content::manifest().survival.proof_recovery_position;
+        state
+            .grids
+            .get_mut(STARTER_GRID_ID)
+            .expect("starter grid")
+            .position = primary;
+        assert!(!state.proof_recovery_position_is_clear(primary));
+
+        let payload = state.player_respawn_payload().expect("fallback exists");
+        let EventPayload::PlayerRespawned { position, .. } = payload.clone() else {
+            unreachable!();
+        };
+        assert_ne!(position, primary);
+        assert!(state.proof_recovery_position_is_clear(position));
+        assert!((position.x - primary.x).abs() <= f64::EPSILON);
+        assert!((position.z - primary.z).abs() <= f64::EPSILON);
+        assert!(position.y > primary.y);
+
+        let event = state.new_event(
+            "player-local",
+            "human",
+            Some("blocked-primary-recovery".into()),
+            payload,
+        );
+        state.apply_event(&event).expect("fallback respawn applies");
+        assert_eq!(state.player.position, position);
+        assert_eq!(state.player.life_state, PlayerLifeState::Alive);
+    }
+
+    #[test]
+    fn lifecycle_replay_requires_canonical_actor_and_operation_envelopes() {
+        let mut state = runtime().state().clone();
+        state.player.suit_oxygen_milli = 5;
+        let death = state
+            .oxygen_incapacitation_payload()
+            .expect("death prepares");
+        let forged_death = state.new_event(
+            "player-local",
+            "human",
+            Some("forged-death".into()),
+            death.clone(),
+        );
+        assert!(matches!(
+            state.clone().apply_event(&forged_death),
+            Err(IntentError::Rejected { ref code, .. })
+                if code == "replay_lifecycle_envelope_invalid"
+        ));
+
+        let death_event = state.prepare_system_event(death);
+        state
+            .apply_event(&death_event)
+            .expect("system death applies");
+        let respawn = state.player_respawn_payload().expect("respawn prepares");
+        let forged_respawn = state.prepare_system_event(respawn.clone());
+        assert!(matches!(
+            state.clone().apply_event(&forged_respawn),
+            Err(IntentError::Rejected { ref code, .. })
+                if code == "replay_lifecycle_envelope_invalid"
+        ));
+
+        let operation_id = "canonical-recovery";
+        let respawn_event =
+            state.new_event("player-local", "human", Some(operation_id.into()), respawn);
+        state
+            .apply_event(&respawn_event)
+            .expect("human respawn with operation applies");
+        let duplicate = state.new_event(
+            "player-local",
+            "human",
+            Some(operation_id.into()),
+            EventPayload::PlayerMoved {
+                position: state.player.position + Vec3::new(0.1, 0.0, 0.0),
+            },
+        );
+        assert!(matches!(
+            state.apply_event(&duplicate),
+            Err(IntentError::Rejected { ref code, .. }) if code == "replay_operation_duplicate"
+        ));
+    }
+
+    #[test]
+    fn snapshot_and_journal_restarts_preserve_dead_and_post_respawn_states() {
+        for respawned in [false, true] {
+            for snapshot_target in [false, true] {
+                let directory = tempdir().expect("tempdir");
+                let expected_hash;
+                {
+                    let mut runtime =
+                        Runtime::open(directory.path(), 93, 100).expect("runtime opens");
+                    runtime.state.player.suit_oxygen_milli = 5;
+                    runtime.persist_snapshot().expect("baseline persists");
+                    for _ in 0..4 {
+                        runtime.advance(250).expect("oxygen death commits");
+                    }
+                    if respawned {
+                        runtime
+                            .execute(&ClientMessage::RespawnPlayer {
+                                operation_id: "matrix-recovery".into(),
+                            })
+                            .expect("respawn commits");
+                    }
+                    expected_hash = runtime.state().state_hash();
+                    if snapshot_target {
+                        runtime
+                            .persist_snapshot()
+                            .expect("target snapshot persists");
+                    }
+                }
+
+                let recovered =
+                    Runtime::open(directory.path(), 93, 100).expect("target state reopens");
+                assert_eq!(recovered.state().state_hash(), expected_hash);
+                assert_eq!(
+                    recovered.state().player.life_state == PlayerLifeState::Alive,
+                    respawned
+                );
+                assert_eq!(recovered.state().death_drops.len(), 1);
+                assert!(recovered.state().conservation().valid);
+            }
+        }
     }
 
     #[test]

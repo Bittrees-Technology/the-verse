@@ -10,17 +10,19 @@ The accepted product rules require death to be free, move carried inventory atom
 
 ## Decision
 
-Content schema 6 and manifest `p0.8.0` move oxygen capacity, per-second atmosphere/helmet rates, the critical threshold, respawn suit defaults, and one temporary proof recovery coordinate into validated server-owned content. The proof coordinate is not called the capital and does not satisfy powered-facility spawn selection.
+Content schema 6 and manifest `p0.8.0` move oxygen capacity, per-second atmosphere/helmet rates, the critical threshold, respawn suit defaults, and one temporary proof recovery origin into validated server-owned content. The server tries that origin first, then searches a fixed two-meter, positive-Y corridor for the first collision-free point. The search is deterministic and bounded to 2,048 steps, beyond the P0 grid-span bound. The proof corridor is not called the capital and does not satisfy powered-facility spawn selection.
 
 World schema 10 stores an explicit player life state and canonical death-drop metadata. Protocol 7 exposes that state, death drops, and `RespawnPlayer { operation_id }`. Event schema 5 adds `PlayerIncapacitated` and `PlayerRespawned`. Older protocol, world, event, or content versions are rejected rather than implicitly migrated.
 
-An alive player whose authoritative oxygen calculation would reach zero transitions through one `PlayerIncapacitated` system event. No durable `alive + zero oxygen` intermediate state is permitted. The event records the cause, canonical position, previous oxygen, deterministic death identity, and the exact carried-inventory move. It sets oxygen to zero, disables the jetpack, and changes life state to incapacitated.
+An alive player whose authoritative oxygen calculation would reach zero transitions through one `PlayerIncapacitated` system event. No durable `alive + zero oxygen` intermediate state is permitted. The event records the cause, canonical position, previous oxygen, deterministic death identity, and the exact carried-inventory move. It sets oxygen to zero, disables the jetpack, clears player-issued grid control inputs into dampening, and changes life state to incapacitated.
+
+P0.8 advances the single canonical player's life support continuously while the simulation worker is running. WebSocket presence and client-provided names cannot start, stop, or reset the oxygen clock. Account-bound online/offline character presence is deferred until authenticated player sessions exist.
 
 If the carried inventory is nonempty, the same event creates one new dropped inventory and one metadata record. IDs derive from player identity and event sequence. The original suit inventory retains its stable ID and capacity but becomes empty. Empty carried inventory creates no empty drop. The ledger does not change, and conservation totals before and after the event are identical.
 
 An incapacitated player may request only respawn. Every other player mutation is rejected before event preparation. World-owned simulation may continue. Repeated life-support advances cannot create another death or drop.
 
-`RespawnPlayer` contains no client-selected location or outcome. The server prepares one `PlayerRespawned` event from validated content, restores the alive state at the proof recovery coordinate, refills suit oxygen, applies the configured helmet and jetpack defaults, and preserves experience, career, ledger, existing drops, and the empty suit inventory. The operation ID makes retries return the original receipt without a second respawn.
+`RespawnPlayer` contains no client-selected location or outcome. The server prepares one `PlayerRespawned` event from validated content, restores the alive state at the first clear point in the proof recovery corridor, refills suit oxygen, applies the configured helmet and jetpack defaults, and preserves experience, career, ledger, existing drops, and the empty suit inventory. The operation ID makes retries return the original receipt without a second respawn.
 
 Dropped inventories are sealed from generic refine, craft, and transfer paths. Recovery and salvage require later explicit permission-aware events; knowing an inventory ID never grants access.
 
@@ -40,7 +42,7 @@ Automatic death uses the existing append-before-publication transaction boundary
 - Mixed carried contents move into exactly one drop at the canonical death position; empty inventory creates no drop; conservation and career totals do not change.
 - Every non-respawn mutation is rejected while incapacitated, and generic inventory actions cannot address a dropped inventory.
 - Replay rejects tampered death identity, owner, position, oxygen, inventory ID, capacity, or contents before mutation.
-- Respawn position and suit outcome are server-selected, free, deterministic, and idempotent.
+- Respawn position and suit outcome are server-selected, obstruction-safe within the bounded P0 world, free, deterministic, and idempotent.
 - Before-write and after-sync failpoints recover either the complete alive state or the complete incapacitated/drop state, never a hybrid.
 - Snapshot and journal restart preserve incapacitated and post-respawn states exactly.
 - Protocol 6, world schema 9, event schema 4, and content `p0.7.3` fail explicitly at their version boundaries.

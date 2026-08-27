@@ -32,10 +32,10 @@ The engineering loop must read as physical survival work rather than counters ov
 2. The server rejects movement beneath the modeled planetary surface.
 3. `J` toggles the authoritative jetpack state. The client predicts the same gravity vector in both modes: jetpack drift accumulates gravity with dampeners off, powered dampeners compensate it when idle, and jetpack-off movement predicts walking, jumping, and surface contact. The server continues to validate accepted positions.
 4. `H` toggles the authoritative helmet seal.
-5. An open helmet replenishes suit oxygen in breathable atmosphere and rapidly loses oxygen in vacuum. A sealed helmet preserves oxygen in breathable atmosphere and consumes reserve oxygen in vacuum.
+5. An open helmet replenishes suit oxygen in breathable atmosphere and rapidly loses oxygen in vacuum. A sealed helmet preserves oxygen in breathable atmosphere and consumes reserve oxygen in vacuum. P0.8 makes terminal depletion canonically incapacitating under the separate survival-death contract.
 6. Suit oxygen and equipment modes persist through snapshots, events, restart, and reconnect.
 7. The surface shader, terrain ridges, boulder field, atmosphere shell, and horizon are disposable visual state; the Rust environment model remains authoritative.
 
 ## Explicit limits
 
-Khepri Prime is a bounded planetary-environment proof around the origin cell. Its visible surface is not yet a globally streamed editable voxel sphere, its decorative terrain scatter has no canonical resource yield, and the player controller is predicted rather than a production character-body solver. Gravity-aware jetpack behavior is a client prediction improvement, not server-authoritative input-based character motion. Full planet streaming, weather, pressurized rooms, air vents, airtightness graphs, oxygen tanks, health damage, grid gravity generators, and rigid-body ground collisions remain later checkpoints.
+Khepri Prime is a bounded planetary-environment proof around the origin cell. Its visible surface is not yet a globally streamed editable voxel sphere, its decorative terrain scatter has no canonical resource yield, and the player controller is predicted rather than a production character-body solver. Gravity-aware jetpack behavior is a client prediction improvement, not server-authoritative input-based character motion. Full planet streaming, weather, pressurized rooms, air vents, airtightness graphs, oxygen tanks, general combat/impact health, grid gravity generators, and rigid-body ground collisions remain later checkpoints.

@@ -4,14 +4,15 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use verse_protocol::{
-    BlockKind, BlockSnapshot, CareerSnapshot, ConservationSnapshot, EnvironmentSnapshot,
-    GridSnapshot, IVec3, InventoryContents, InventoryDomain, InventorySnapshot, PlayerSnapshot,
-    PowerSnapshot, Quat, ResourceKind, Vec3, VoxelMaterial, VoxelSnapshot, WorldSnapshot,
+    BlockKind, BlockSnapshot, CareerSnapshot, ConservationSnapshot, DeathDropSnapshot,
+    EnvironmentSnapshot, GridSnapshot, IVec3, InventoryContents, InventoryDomain,
+    InventorySnapshot, PlayerDeathCause, PlayerLifeState, PlayerSnapshot, PowerSnapshot, Quat,
+    ResourceKind, Vec3, VoxelMaterial, VoxelSnapshot, WorldSnapshot,
 };
 
 use crate::content;
 
-pub const WORLD_SCHEMA_VERSION: u32 = 9;
+pub const WORLD_SCHEMA_VERSION: u32 = 10;
 pub const PLAYER_INVENTORY_ID: &str = "inventory-player-local";
 pub const STARTER_GRID_ID: &str = "grid-starter";
 pub const PLANET_CENTER: Vec3 = Vec3::new(900.0, -2_200.0, -3_800.0);
@@ -158,6 +159,7 @@ pub struct Player {
     pub suit_oxygen_milli: u16,
     pub helmet_closed: bool,
     pub jetpack_enabled: bool,
+    pub life_state: PlayerLifeState,
 }
 
 impl Player {
@@ -182,6 +184,17 @@ pub struct InventoryRecord {
     pub domain: InventoryDomain,
     pub contents: InventoryContents,
     pub capacity_liters: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeathDrop {
+    pub drop_id: String,
+    pub death_id: String,
+    pub inventory_id: String,
+    pub owner_player_id: String,
+    pub position: Vec3,
+    pub created_event_sequence: u64,
+    pub cause: PlayerDeathCause,
 }
 
 impl InventoryRecord {
@@ -410,6 +423,7 @@ pub struct WorldState {
     pub voxels: VoxelField,
     pub grids: BTreeMap<String, Grid>,
     pub inventories: BTreeMap<String, InventoryRecord>,
+    pub death_drops: BTreeMap<String, DeathDrop>,
     pub ledger: Ledger,
     pub processed_operations: BTreeMap<String, verse_protocol::IntentReceipt>,
 }
@@ -520,6 +534,7 @@ impl WorldState {
                 suit_oxygen_milli: 1_000,
                 helmet_closed: true,
                 jetpack_enabled: true,
+                life_state: PlayerLifeState::Alive,
             },
             voxels: VoxelField::procedural_asteroid(seed, 8),
             grids: BTreeMap::from([(STARTER_GRID_ID.into(), grid)]),
@@ -527,6 +542,7 @@ impl WorldState {
                 (PLAYER_INVENTORY_ID.into(), player_inventory),
                 (cargo_inventory_id, cargo_inventory),
             ]),
+            death_drops: BTreeMap::new(),
             ledger: Ledger {
                 genesis_components: 24,
                 genesis_installed_components: 25,
@@ -669,6 +685,8 @@ impl WorldState {
                 suit_oxygen_milli: self.player.suit_oxygen_milli,
                 helmet_closed: self.player.helmet_closed,
                 jetpack_enabled: self.player.jetpack_enabled,
+                life_state: self.player.life_state.clone(),
+                critical_oxygen_milli: content::manifest().survival.critical_oxygen_milli,
             },
             environment: self.environment_at(self.player.position),
             voxels: self.voxels.snapshot(),
@@ -683,6 +701,19 @@ impl WorldState {
                     capacity_liters: inventory.capacity_liters,
                     used_liters: inventory.used_liters(),
                     mass_grams: inventory.mass_grams(),
+                })
+                .collect(),
+            death_drops: self
+                .death_drops
+                .values()
+                .map(|drop| DeathDropSnapshot {
+                    drop_id: drop.drop_id.clone(),
+                    death_id: drop.death_id.clone(),
+                    inventory_id: drop.inventory_id.clone(),
+                    owner_player_id: drop.owner_player_id.clone(),
+                    position: drop.position,
+                    created_event_sequence: drop.created_event_sequence,
+                    cause: drop.cause,
                 })
                 .collect(),
             conservation: self.conservation(),

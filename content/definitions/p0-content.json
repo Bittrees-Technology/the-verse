@@ -1,6 +1,6 @@
 {
-  "schema_version": 5,
-  "manifest_version": "p0.7.3",
+  "schema_version": 6,
+  "manifest_version": "p0.8.0",
   "license": "AGPL-3.0-or-later",
   "physics": {
     "fixed_step_hz": 60,
@@ -13,6 +13,22 @@
     "angular_dampener_newton_meters_per_radian": 3200.0,
     "friction": 0.62,
     "restitution": 0.05
+  },
+  "survival": {
+    "suit_oxygen_capacity_milli": 1000,
+    "critical_oxygen_milli": 200,
+    "open_breathable_delta_milli_per_second": 25,
+    "open_vacuum_delta_milli_per_second": -40,
+    "sealed_breathable_delta_milli_per_second": 0,
+    "sealed_vacuum_delta_milli_per_second": -5,
+    "respawn_oxygen_milli": 1000,
+    "respawn_helmet_closed": true,
+    "respawn_jetpack_enabled": true,
+    "proof_recovery_position": {
+      "x": 12.0,
+      "y": 4.5,
+      "z": 10.0
+    }
   },
   "voxel_materials": [
     {

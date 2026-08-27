@@ -2,7 +2,7 @@
 
 The Verse is an open-source persistent voxel space universe, work-and-economy simulator, and Web3 marketplace.
 
-The repository now contains **P0.6: Orbital Operations**, built on the first-person Salvage Frontier, Engineering Hands, and Planetary Logistics loops. It is still a single-player proof—not yet the public multiplayer universe or real-value economy—but realistic orbital separation, six-axis EVA orientation, physical inventory, oxygen, mining, and staged construction now share one authoritative persistent world.
+The repository now contains the **P0.8 survival-death foundation**, built on Orbital Operations and server-authoritative contact physics. It is still a single-player proof—not yet the public multiplayer universe or real-value economy—but realistic orbital separation, six-axis EVA orientation, physical inventory, consequential oxygen, mining, staged construction, and persistent recovery now share one authoritative world.
 
 ## Play it on macOS
 
@@ -34,6 +34,7 @@ Native controls are shown in the client:
 | Cut and salvage a block | Hold right mouse |
 | Refine / fabricate / transfer cargo | `R` / `T` / `V` (`Shift+V` reverses transfer) |
 | Anchor / move / stop targeted grid | `F` / `M` / `X` |
+| Request recovery when incapacitated | `Enter` |
 
 To run only the Linux-compatible headless server:
 
@@ -49,7 +50,7 @@ Linux native client packaging and signed direct downloads remain scheduled work.
 tools/ci/check.sh
 ```
 
-This runs the Rust tests and lints, browser syntax checks, Godot validation, and an end-to-end scenario that restarts the server and proves exact state recovery. See the [Orbital Operations checkpoint](docs/gameplay/orbital-operations.md), [Planetary Logistics checkpoint](docs/gameplay/planetary-logistics.md), and [P0 implementation guide](docs/architecture/p0-implementation.md) for scope and limitations.
+This runs the Rust tests and lints, browser syntax checks, Godot validation, and an end-to-end scenario that restarts the server and proves exact state recovery. See the [Survival Death checkpoint](docs/gameplay/survival-death.md), [Contact Physics checkpoint](docs/gameplay/contact-physics.md), and [P0 implementation guide](docs/architecture/p0-implementation.md) for scope and limitations.
 
 ## Product pillars
 
@@ -76,7 +77,7 @@ Start with [the documentation map](docs/README.md), then read:
 
 ## Current status
 
-P0.6 places the authoritative asteroid field in vacuum more than three kilometers above Khepri Prime, adds continuous and tap-controlled `Q`/`E` character roll, remaps block rotation to `[`/`]`, and rebuilds the logistics screen around compact connected-inventory lists, selectors, search, filters, amount/volume/mass columns, row selection, and central transfer actions. Original high-resolution surface maps, triplanar asteroid material, mapped planetary terrain, moving clouds, and limb atmosphere replace the earlier flat visual treatment. Planet landing, multiplayer, rigid-grid collision physics, global streaming, safe zones, accounts, AMMs, and blockchain settlement remain sequenced in the [delivery roadmap](docs/roadmap/roadmap.md).
+P0.8 adds atomic oxygen incapacitation, conserved death-drop creation, server-selected free recovery, critical/dead native HUD states, and mutation gating to the existing orbital mining, manufacturing, construction, destruction, inventory, and Jolt contact-physics loop. Inventory text entry now owns printable shortcuts, and jetpack drift follows authoritative environmental gravity in local prediction when dampeners are disabled. Input-only server character motion, planet landing, multiplayer, drop recovery/expiry, global streaming, safe zones, accounts, AMMs, and blockchain settlement remain sequenced in the [delivery roadmap](docs/roadmap/roadmap.md).
 
 ## Licensing
 
