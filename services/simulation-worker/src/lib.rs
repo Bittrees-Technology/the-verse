@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use axum::{
     Json, Router,
@@ -32,6 +33,7 @@ const COMMAND_CENTER_CSS: &str = include_str!("../../../apps/web-command-center/
 pub struct AppState {
     runtime: Mutex<Runtime>,
     updates: broadcast::Sender<ServerMessage>,
+    active_player_sessions: AtomicUsize,
 }
 
 impl AppState {
@@ -40,6 +42,7 @@ impl AppState {
         Arc::new(Self {
             runtime: Mutex::new(runtime),
             updates,
+            active_player_sessions: AtomicUsize::new(0),
         })
     }
 
@@ -51,9 +54,14 @@ impl AppState {
         self.runtime.lock().persist_snapshot()
     }
 
+    pub fn is_halted(&self) -> bool {
+        self.runtime.lock().is_halted()
+    }
+
     pub fn advance(&self, delta_millis: u16) -> Result<bool, RuntimeError> {
         let mut runtime = self.runtime.lock();
-        let changed = runtime.advance(delta_millis)?;
+        let player_active = self.active_player_sessions.load(Ordering::Relaxed) > 0;
+        let changed = runtime.advance_with_player_presence(delta_millis, player_active)?;
         if changed {
             let _ = self.updates.send(ServerMessage::Snapshot {
                 snapshot: Box::new(runtime.snapshot()),
@@ -75,6 +83,7 @@ struct StatusDocument {
     fencing_token: u64,
     world_hash: String,
     conservation_valid: bool,
+    authoritative_halted: bool,
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -116,8 +125,12 @@ async fn command_center_styles() -> impl IntoResponse {
     )
 }
 
-async fn health() -> StatusCode {
-    StatusCode::NO_CONTENT
+async fn health(State(state): State<Arc<AppState>>) -> StatusCode {
+    if state.is_halted() {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::NO_CONTENT
+    }
 }
 
 async fn status(State(state): State<Arc<AppState>>) -> Json<StatusDocument> {
@@ -133,6 +146,7 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<StatusDocument> {
         fencing_token: snapshot.fencing_token,
         world_hash: snapshot.world_hash,
         conservation_valid: snapshot.conservation.valid,
+        authoritative_halted: state.is_halted(),
     })
 }
 
@@ -176,12 +190,18 @@ async fn websocket_session(socket: WebSocket, state: Arc<AppState>) {
     }
 
     let mut updates = state.updates.subscribe();
+    let mut gameplay_session = false;
     loop {
         tokio::select! {
             client_message = receiver.next() => {
                 match client_message {
                     Some(Ok(message)) => {
-                        if !handle_client_message(message, &state, &mut sender).await {
+                        if !handle_client_message(
+                            message,
+                            &state,
+                            &mut sender,
+                            &mut gameplay_session,
+                        ).await {
                             break;
                         }
                     }
@@ -215,12 +235,16 @@ async fn websocket_session(socket: WebSocket, state: Arc<AppState>) {
             }
         }
     }
+    if gameplay_session {
+        state.active_player_sessions.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 async fn handle_client_message(
     message: Message,
     state: &Arc<AppState>,
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    gameplay_session: &mut bool,
 ) -> bool {
     let Message::Text(text) = message else {
         return !matches!(message, Message::Close(_));
@@ -258,6 +282,10 @@ async fn handle_client_message(
                 )
                 .await
                 .is_ok();
+            }
+            if client_name.starts_with("godot-native-") && !*gameplay_session {
+                *gameplay_session = true;
+                state.active_player_sessions.fetch_add(1, Ordering::Relaxed);
             }
             info!(%client_name, "client completed protocol handshake");
             true
@@ -300,6 +328,18 @@ async fn handle_client_message(
                     .await
                     .is_ok()
                 }
+                Err(RuntimeError::Physics(source)) => {
+                    error!(%source, "physics failure while processing intent");
+                    send_server_message(
+                        sender,
+                        &ServerMessage::Fatal {
+                            code: "physics_failure".into(),
+                            message: "authoritative physics rejected the operation".into(),
+                        },
+                    )
+                    .await
+                    .is_ok()
+                }
                 Err(RuntimeError::Halted) => send_server_message(
                     sender,
                     &ServerMessage::Fatal {
@@ -319,12 +359,13 @@ async fn send_intent_error(
     operation_id: Option<&str>,
     source: IntentError,
 ) -> bool {
+    let message = source.message();
     send_server_message(
         sender,
         &ServerMessage::IntentRejected {
             operation_id: operation_id.map(ToOwned::to_owned),
             code: source.code().into(),
-            message: source.to_string(),
+            message,
         },
     )
     .await
@@ -393,6 +434,16 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[test]
+    fn offline_player_life_support_does_not_drain() {
+        let directory = tempdir().expect("tempdir");
+        let state = AppState::new(Runtime::open(directory.path(), 99, 20).expect("runtime"));
+        for _ in 0..8 {
+            assert!(!state.advance(250).expect("offline tick"));
+        }
+        assert_eq!(state.snapshot().player.suit_oxygen_milli, 1_000);
     }
 
     #[tokio::test]

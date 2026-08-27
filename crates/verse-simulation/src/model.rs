@@ -6,12 +6,12 @@ use serde::{Deserialize, Serialize};
 use verse_protocol::{
     BlockKind, BlockSnapshot, CareerSnapshot, ConservationSnapshot, EnvironmentSnapshot,
     GridSnapshot, IVec3, InventoryContents, InventoryDomain, InventorySnapshot, PlayerSnapshot,
-    PowerSnapshot, ResourceKind, Vec3, VoxelMaterial, VoxelSnapshot, WorldSnapshot,
+    PowerSnapshot, Quat, ResourceKind, Vec3, VoxelMaterial, VoxelSnapshot, WorldSnapshot,
 };
 
 use crate::content;
 
-pub const WORLD_SCHEMA_VERSION: u32 = 6;
+pub const WORLD_SCHEMA_VERSION: u32 = 8;
 pub const PLAYER_INVENTORY_ID: &str = "inventory-player-local";
 pub const STARTER_GRID_ID: &str = "grid-starter";
 pub const PLANET_CENTER: Vec3 = Vec3::new(900.0, -2_200.0, -3_800.0);
@@ -278,9 +278,12 @@ impl Block {
 pub struct Grid {
     pub grid_id: String,
     pub position: Vec3,
-    pub yaw_radians: f64,
+    pub orientation: Quat,
     pub linear_velocity: Vec3,
-    pub angular_velocity: f64,
+    pub angular_velocity: Vec3,
+    pub control_linear_input: Vec3,
+    pub control_angular_input: Vec3,
+    pub dampeners: bool,
     pub anchored: bool,
     pub blocks: BTreeMap<String, Block>,
 }
@@ -326,15 +329,21 @@ impl Grid {
         }
     }
 
+    pub fn world_position(&self, local: IVec3) -> Vec3 {
+        self.position
+            + self.orientation.rotate(Vec3::new(
+                f64::from(local.x),
+                f64::from(local.y),
+                f64::from(local.z),
+            ))
+    }
+
     pub fn world_coordinate(&self, local: IVec3) -> IVec3 {
-        let cos = self.yaw_radians.cos();
-        let sin = self.yaw_radians.sin();
-        let x = f64::from(local.x).mul_add(cos, -f64::from(local.z) * sin);
-        let z = f64::from(local.x).mul_add(sin, f64::from(local.z) * cos);
+        let position = self.world_position(local);
         IVec3::new(
-            (self.position.x + x).round() as i32,
-            (self.position.y + f64::from(local.y)).round() as i32,
-            (self.position.z + z).round() as i32,
+            position.x.round() as i32,
+            position.y.round() as i32,
+            position.z.round() as i32,
         )
     }
 
@@ -376,6 +385,7 @@ pub struct WorldState {
     pub world_seed: u64,
     pub event_sequence: u64,
     pub simulation_tick: u64,
+    pub physics_step_phase: u64,
     pub fencing_token: u64,
     pub last_event_hash: String,
     pub player: Player,
@@ -460,10 +470,13 @@ impl WorldState {
 
         let grid = Grid {
             grid_id: STARTER_GRID_ID.into(),
-            position: Vec3::new(10.0, 0.0, 0.0),
-            yaw_radians: 0.0,
+            position: Vec3::new(11.0, 0.0, 0.0),
+            orientation: Quat::IDENTITY,
             linear_velocity: Vec3::ZERO,
-            angular_velocity: 0.0,
+            angular_velocity: Vec3::ZERO,
+            control_linear_input: Vec3::ZERO,
+            control_angular_input: Vec3::ZERO,
+            dampeners: true,
             anchored: false,
             blocks,
         };
@@ -476,6 +489,7 @@ impl WorldState {
             world_seed: seed,
             event_sequence: 0,
             simulation_tick: 0,
+            physics_step_phase: 0,
             fencing_token: 0,
             last_event_hash: String::new(),
             player: Player {
@@ -558,6 +572,26 @@ impl WorldState {
         }
     }
 
+    pub fn grid_mass_kg(&self, grid: &Grid) -> f64 {
+        let block_mass = grid
+            .blocks
+            .values()
+            .map(|block| {
+                let definition = content::block(block.kind);
+                let integrity = f64::from(block.health) / f64::from(block.max_health());
+                definition.mass_kg * integrity.max(0.1)
+            })
+            .sum::<f64>();
+        let inventory_mass = grid
+            .blocks
+            .values()
+            .filter_map(|block| block.inventory_id.as_ref())
+            .filter_map(|inventory_id| self.inventories.get(inventory_id))
+            .map(|inventory| inventory.mass_grams() as f64 / 1_000.0)
+            .sum::<f64>();
+        block_mass + inventory_mass
+    }
+
     pub fn snapshot(&self) -> WorldSnapshot {
         let mut grids = self
             .grids
@@ -565,9 +599,10 @@ impl WorldState {
             .map(|grid| GridSnapshot {
                 grid_id: grid.grid_id.clone(),
                 position: grid.position,
-                yaw_radians: grid.yaw_radians,
+                orientation: grid.orientation,
                 linear_velocity: grid.linear_velocity,
                 angular_velocity: grid.angular_velocity,
+                mass_kg: self.grid_mass_kg(grid),
                 anchored: grid.anchored,
                 power: grid.power(),
                 blocks: grid

@@ -1,6 +1,6 @@
 # P0 specification: simulation proof
 
-**Status:** In implementation; P0.6 Orbital Operations checkpoint available
+**Status:** In implementation; P0.6 Orbital Operations available and P0.7 contact physics in progress
 
 ## Purpose
 
@@ -149,6 +149,8 @@ Still required for the P0 exit gate:
 - Network bandwidth measurements and larger body/block-count scaling.
 - Crash injection at each persistence boundary, beyond the current corruption and restart suite.
 
+The native Linux requirement means a reproducible direct-download client artifact and an Ubuntu-compatible headless server at the P0 gate. Signing, differential updates, and the automatic updater remain P1 work.
+
 ## P0.2 gameplay checkpoint
 
 Implemented and continuously verified:
@@ -206,6 +208,25 @@ Implemented and continuously verified:
 - `[`/`]` construction yaw so flight orientation remains available during build mode and on compact keyboards.
 - A compact connected-inventory interface with container selection, search, category filters, tabular item metrics, selection, and central transfers.
 - Original CC BY-SA geological maps, triplanar asteroid mapping, displaced planet terrain, moving clouds, and atmospheric limb rendering.
+
+## P0.7 server-authoritative contact-physics checkpoint
+
+Implemented foundation:
+
+- An isolated, license-recorded Jolt adapter for dynamic and static compound bodies.
+- Server-owned grid forces, poses, velocities, contacts, and anchoring body transitions.
+- Canonical quantized body/contact `PhysicsStepCommitted` outcomes so replay never depends on repeating floating-point collision solving.
+- Authoritative player collision against voxels and grids.
+- Sparse dirty-chunk rendering after accepted voxel edits.
+- Initial contact, conservation, recovery, body-count, native-client, and macOS evidence.
+
+Still required for checkpoint acceptance:
+
+- Solved-contact collision damage and atomic damage/split outcomes.
+- Dirty collision-body replacement after voxel edits.
+- Grid–grid, anchor stability, mass response, player–grid, crash-boundary, edit-remesh, Ubuntu, Linux-artifact, network, and scaling evidence.
+
+The complete contract is [P0.7 server-authoritative contact physics](../gameplay/contact-physics.md), with recovery rationale in [ADR-0010](../decisions/ADR-0010-committed-physics-outcomes.md).
 
 ## Exit decision
 

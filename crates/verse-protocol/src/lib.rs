@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 
 /// The only protocol version accepted by this P0 build.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// A stable integer voxel or block coordinate.
 #[derive(
@@ -106,6 +106,67 @@ impl std::ops::Mul<f64> for Vec3 {
 
     fn mul(self, rhs: f64) -> Self::Output {
         Self::new(self.x * rhs, self.y * rhs, self.z * rhs)
+    }
+}
+
+impl std::ops::Sub for Vec3 {
+    type Output = Self;
+
+    fn sub(self, rhs: Self) -> Self::Output {
+        Self::new(self.x - rhs.x, self.y - rhs.y, self.z - rhs.z)
+    }
+}
+
+/// A normalized local-space rotation. Components use the same ordering as
+/// Godot and Jolt (`x`, `y`, `z`, `w`).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Quat {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    pub w: f32,
+}
+
+impl Quat {
+    pub const IDENTITY: Self = Self {
+        x: 0.0,
+        y: 0.0,
+        z: 0.0,
+        w: 1.0,
+    };
+
+    pub const fn new(x: f32, y: f32, z: f32, w: f32) -> Self {
+        Self { x, y, z, w }
+    }
+
+    pub fn is_finite(self) -> bool {
+        self.x.is_finite() && self.y.is_finite() && self.z.is_finite() && self.w.is_finite()
+    }
+
+    pub fn rotate(self, vector: Vec3) -> Vec3 {
+        let x = f64::from(self.x);
+        let y = f64::from(self.y);
+        let z = f64::from(self.z);
+        let w = f64::from(self.w);
+        let tx = 2.0 * (y * vector.z - z * vector.y);
+        let ty = 2.0 * (z * vector.x - x * vector.z);
+        let tz = 2.0 * (x * vector.y - y * vector.x);
+        Vec3::new(
+            vector.x + w * tx + (y * tz - z * ty),
+            vector.y + w * ty + (z * tx - x * tz),
+            vector.z + w * tz + (x * ty - y * tx),
+        )
+    }
+
+    #[must_use]
+    pub const fn conjugate(self) -> Self {
+        Self::new(-self.x, -self.y, -self.z, self.w)
+    }
+}
+
+impl Default for Quat {
+    fn default() -> Self {
+        Self::IDENTITY
     }
 }
 
@@ -238,9 +299,10 @@ pub struct PowerSnapshot {
 pub struct GridSnapshot {
     pub grid_id: String,
     pub position: Vec3,
-    pub yaw_radians: f64,
+    pub orientation: Quat,
     pub linear_velocity: Vec3,
-    pub angular_velocity: f64,
+    pub angular_velocity: Vec3,
+    pub mass_kg: f64,
     pub anchored: bool,
     pub power: PowerSnapshot,
     pub blocks: Vec<BlockSnapshot>,
@@ -330,11 +392,12 @@ pub enum ClientMessage {
         grid_id: String,
         block_id: String,
     },
-    SetGridMotion {
+    SetGridControl {
         operation_id: String,
         grid_id: String,
-        linear_velocity: Vec3,
-        angular_velocity: f64,
+        linear_input: Vec3,
+        angular_input: Vec3,
+        dampeners: bool,
     },
     ToggleGridAnchor {
         operation_id: String,
@@ -359,7 +422,7 @@ impl ClientMessage {
             | Self::TransferInventory { operation_id, .. }
             | Self::BuildBlock { operation_id, .. }
             | Self::WeldBlock { operation_id, .. }
-            | Self::SetGridMotion { operation_id, .. }
+            | Self::SetGridControl { operation_id, .. }
             | Self::ToggleGridAnchor { operation_id, .. }
             | Self::DamageBlock { operation_id, .. } => Some(operation_id),
         }
@@ -454,5 +517,21 @@ mod tests {
         assert_eq!(value["type"], "set_suit_mode");
         assert_eq!(value["helmet_closed"], false);
         assert_eq!(value["jetpack_enabled"], true);
+    }
+
+    #[test]
+    fn grid_control_carries_inputs_instead_of_client_owned_velocity() {
+        let value = serde_json::to_value(ClientMessage::SetGridControl {
+            operation_id: "control-1".into(),
+            grid_id: "grid-starter".into(),
+            linear_input: Vec3::new(0.0, 0.0, 0.75),
+            angular_input: Vec3::new(0.0, 0.2, 0.0),
+            dampeners: true,
+        })
+        .expect("grid control serializes");
+        assert_eq!(value["type"], "set_grid_control");
+        assert!(value.get("linear_velocity").is_none());
+        assert!(value.get("position").is_none());
+        assert_eq!(value["dampeners"], true);
     }
 }

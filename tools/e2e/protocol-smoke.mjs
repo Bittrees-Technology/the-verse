@@ -175,11 +175,11 @@ async function run() {
   ).snapshot;
   send({
     type: "hello",
-    protocol_version: 4,
+    protocol_version: 5,
     client_name: "node-authoritative-e2e",
   });
   assert.equal(world.conservation.valid, true);
-  assert.equal(world.content_manifest_version, "p0.6.0");
+  assert.equal(world.content_manifest_version, "p0.7.1");
   assert.equal(world.grids.length, 1);
   assert.ok(world.voxels.length > 1_000);
   assert.equal(world.environment.celestial_body_name, "Khepri Prime");
@@ -252,10 +252,11 @@ async function run() {
   assert.equal(world.grids[0].anchored, false);
 
   const tickBeforeMotion = world.simulation_tick;
-  world = await intent("set_grid_motion", {
+  world = await intent("set_grid_control", {
     grid_id: "grid-starter",
-    linear_velocity: { x: 0.0, y: 0.0, z: 0.5 },
-    angular_velocity: 0.1,
+    linear_input: { x: 0.0, y: 0.0, z: 0.5 },
+    angular_input: { x: 0.0, y: 0.1, z: 0.0 },
+    dampeners: true,
   });
   world = (
     await waitFor(
@@ -266,10 +267,11 @@ async function run() {
     )
   ).snapshot;
   assert.ok(world.grids[0].position.z > 0.0);
-  world = await intent("set_grid_motion", {
+  world = await intent("set_grid_control", {
     grid_id: "grid-starter",
-    linear_velocity: { x: 0.0, y: 0.0, z: 0.0 },
-    angular_velocity: 0.0,
+    linear_input: { x: 0.0, y: 0.0, z: 0.0 },
+    angular_input: { x: 0.0, y: 0.0, z: 0.0 },
+    dampeners: true,
   });
 
   world = await intent("build_block", {

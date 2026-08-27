@@ -190,10 +190,37 @@ impl Store {
         };
 
         let journal_path = self.root.join(JOURNAL_FILE);
-        let mut journal = String::new();
+        let mut journal_bytes = Vec::new();
         File::open(&journal_path)
-            .and_then(|mut file| file.read_to_string(&mut journal))
+            .and_then(|mut file| file.read_to_end(&mut journal_bytes))
             .map_err(|source| io_error(&journal_path, source))?;
+        let committed_length = if journal_bytes.last() == Some(&b'\n') {
+            journal_bytes.len()
+        } else {
+            journal_bytes
+                .iter()
+                .rposition(|byte| *byte == b'\n')
+                .map_or(0, |position| position + 1)
+        };
+        if committed_length != journal_bytes.len() {
+            self.journal_file
+                .set_len(u64::try_from(committed_length).expect("journal length fits u64"))
+                .and_then(|()| self.journal_file.sync_data())
+                .map_err(|source| io_error(&journal_path, source))?;
+            journal_bytes.truncate(committed_length);
+        }
+        let journal = String::from_utf8(journal_bytes).map_err(|source| {
+            let valid_up_to = source.utf8_error().valid_up_to();
+            let line = std::str::from_utf8(&source.as_bytes()[..valid_up_to])
+                .expect("String::from_utf8 reports a valid UTF-8 prefix")
+                .matches('\n')
+                .count()
+                + 1;
+            PersistenceError::CorruptJournal {
+                line,
+                message: source.to_string(),
+            }
+        })?;
 
         for (index, line) in journal.lines().enumerate() {
             if line.trim().is_empty() {
@@ -521,6 +548,53 @@ mod tests {
                 PersistenceError::CorruptJournal { .. }
             ))
         ));
+    }
+
+    #[test]
+    fn unterminated_final_journal_record_recovers_prior_state_and_is_truncated() {
+        let directory = tempdir().expect("tempdir");
+        let expected_hash;
+        {
+            let mut runtime = Runtime::open(directory.path(), 47, 100).expect("runtime starts");
+            runtime
+                .execute(&ClientMessage::MovePlayer {
+                    operation_id: "committed-before-torn-tail".into(),
+                    position: Vec3::new(12.1, 4.5, 10.0),
+                })
+                .expect("committed movement");
+            expected_hash = runtime.state().state_hash();
+        }
+        let journal_path = directory.path().join(JOURNAL_FILE);
+        OpenOptions::new()
+            .append(true)
+            .open(&journal_path)
+            .expect("journal opens")
+            .write_all(br#"{"schema_name":"verse.world_event""#)
+            .expect("torn tail written");
+
+        {
+            let mut recovered =
+                Runtime::open(directory.path(), 47, 100).expect("prior state recovers");
+            assert_eq!(recovered.state().state_hash(), expected_hash);
+            recovered
+                .execute(&ClientMessage::MovePlayer {
+                    operation_id: "committed-after-torn-tail".into(),
+                    position: Vec3::new(12.2, 4.5, 10.0),
+                })
+                .expect("journal remains appendable after truncation");
+        }
+
+        let journal = fs::read(&journal_path).expect("journal reads");
+        assert_eq!(journal.last(), Some(&b'\n'));
+        let journal_text = String::from_utf8(journal).expect("journal remains UTF-8");
+        assert_eq!(journal_text.lines().count(), 2);
+        assert!(
+            journal_text
+                .lines()
+                .all(|line| { serde_json::from_str::<CanonicalEvent>(line).is_ok() })
+        );
+        let recovered = Runtime::open(directory.path(), 47, 100).expect("second recovery works");
+        assert_eq!(recovered.state().event_sequence, 2);
     }
 
     #[test]

@@ -23,8 +23,8 @@ function connect() {
     elements.connection.className = "connection online";
     socket.send(JSON.stringify({
       type: "hello",
-      protocol_version: 4,
-      client_name: "browser-command-center-p0.6",
+      protocol_version: 5,
+      client_name: "browser-command-center-p0.7",
     }));
   });
   socket.addEventListener("close", () => {
@@ -136,7 +136,9 @@ function render() {
       grid.linear_velocity.x === 0 &&
       grid.linear_velocity.y === 0 &&
       grid.linear_velocity.z === 0 &&
-      grid.angular_velocity === 0
+      grid.angular_velocity.x === 0 &&
+      grid.angular_velocity.y === 0 &&
+      grid.angular_velocity.z === 0
     );
   } else {
     elements.anchor.disabled = true;
@@ -233,10 +235,11 @@ document.getElementById("anchor").addEventListener("click", () => {
 document.getElementById("stop").addEventListener("click", () => {
   const grid = selectedGrid();
   if (grid) {
-    intent("set_grid_motion", {
+    intent("set_grid_control", {
       grid_id: grid.grid_id,
-      linear_velocity: { x: 0, y: 0, z: 0 },
-      angular_velocity: 0,
+      linear_input: { x: 0, y: 0, z: 0 },
+      angular_input: { x: 0, y: 0, z: 0 },
+      dampeners: true,
     });
   }
 });
