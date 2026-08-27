@@ -35,6 +35,7 @@ const CHARACTER_ANGULAR_DAMPENER_ACCELERATION := 7.0
 const CHARACTER_MAXIMUM_SPEED := 12.0
 const CHARACTER_BOOST_MAXIMUM_SPEED := 24.0
 const CHARACTER_MAXIMUM_ANGULAR_SPEED := 2.5
+const CHARACTER_UPRIGHT_ALIGNMENT_ACCELERATION := 28.0
 const CHARACTER_WALK_SPEED := 4.5
 const CHARACTER_SPRINT_SPEED := 7.5
 const CHARACTER_GROUND_ACCELERATION := 18.0
@@ -1440,7 +1441,7 @@ func _poll_socket() -> void:
 			_send({
 				"type": "hello",
 				"protocol_version": PROTOCOL_VERSION,
-				"client_name": "godot-native-p0.9",
+				"client_name": "godot-native-p0.10",
 			})
 		while socket.get_available_packet_count() > 0:
 			var text := socket.get_packet().get_string_from_utf8()
@@ -2574,29 +2575,44 @@ func _integrate_player_motion(
 		linear_velocity += gravity * delta
 	linear_velocity = linear_velocity.limit_length(PHYSICS_MAXIMUM_LINEAR_SPEED)
 
-	var world_angular_input := (
-		body_basis * angular_input
-		if jetpack_enabled
-		else _vec3(locomotion.get("up", {"x": 0.0, "y": 1.0, "z": 0.0})).normalized()
-			* angular_input.y
-	)
-	if dampeners:
-		var target_angular_velocity := world_angular_input * CHARACTER_MAXIMUM_ANGULAR_SPEED
-		var angular_acceleration := (
-			CHARACTER_ANGULAR_ACCELERATION
-			if world_angular_input.length() > 0.00001
-			else CHARACTER_ANGULAR_DAMPENER_ACCELERATION
+	if jetpack_enabled:
+		var world_angular_input := body_basis * angular_input
+		if dampeners:
+			var target_angular_velocity := (
+				world_angular_input * CHARACTER_MAXIMUM_ANGULAR_SPEED
+			)
+			var angular_acceleration := (
+				CHARACTER_ANGULAR_ACCELERATION
+				if world_angular_input.length() > 0.00001
+				else CHARACTER_ANGULAR_DAMPENER_ACCELERATION
+			)
+			angular_velocity = angular_velocity.move_toward(
+				target_angular_velocity, angular_acceleration * delta
+			)
+		elif world_angular_input.length() > 0.00001:
+			var angular_speed_ceiling := maxf(
+				angular_velocity.length(), CHARACTER_MAXIMUM_ANGULAR_SPEED
+			)
+			angular_velocity = (
+				angular_velocity + world_angular_input * CHARACTER_ANGULAR_ACCELERATION * delta
+			).limit_length(angular_speed_ceiling)
+	else:
+		var desired_up := _vec3(
+			locomotion.get("up", {"x": 0.0, "y": 1.0, "z": 0.0})
 		)
+		desired_up = desired_up.normalized() if desired_up.length_squared() > 0.000001 else Vector3.UP
+		var current_up := (body_basis * Vector3.UP).normalized()
+		var upright_axis := current_up.cross(desired_up)
+		if upright_axis.length_squared() <= 0.00000001 and current_up.dot(desired_up) < 0.0:
+			upright_axis = (body_basis * Vector3.RIGHT).normalized()
+		var target_angular_velocity := (
+			desired_up * angular_input.y * CHARACTER_MAXIMUM_ANGULAR_SPEED
+			+ upright_axis * CHARACTER_MAXIMUM_ANGULAR_SPEED
+		).limit_length(CHARACTER_MAXIMUM_ANGULAR_SPEED)
 		angular_velocity = angular_velocity.move_toward(
-			target_angular_velocity, angular_acceleration * delta
+			target_angular_velocity,
+			CHARACTER_UPRIGHT_ALIGNMENT_ACCELERATION * delta
 		)
-	elif world_angular_input.length() > 0.00001:
-		var angular_speed_ceiling := maxf(
-			angular_velocity.length(), CHARACTER_MAXIMUM_ANGULAR_SPEED
-		)
-		angular_velocity = (
-			angular_velocity + world_angular_input * CHARACTER_ANGULAR_ACCELERATION * delta
-		).limit_length(angular_speed_ceiling)
 	angular_velocity = angular_velocity.limit_length(PHYSICS_MAXIMUM_ANGULAR_SPEED)
 	if angular_velocity.length_squared() > 0.00000001:
 		var delta_rotation := Quaternion(
@@ -3108,6 +3124,37 @@ func _run_motion_prediction_smoke_assertions() -> bool:
 		ground_roll_control, gravity_probe, false, CHARACTER_FIXED_DELTA,
 		grounded_locomotion
 	)
+	var radial_ground_locomotion := {
+		"kind": "grounded",
+		"up": {"x": 1.0, "y": 0.0, "z": 0.0},
+		"support": {},
+	}
+	var radial_orientation := Quaternion(Vector3.BACK, deg_to_rad(-65.0))
+	var radial_initial_alignment := (Basis(radial_orientation) * Vector3.UP).dot(Vector3.RIGHT)
+	var radial_upright := {
+		"position": Vector3.ZERO,
+		"orientation": radial_orientation,
+		"linear_velocity": Vector3.ZERO,
+		"angular_velocity": Vector3.ZERO,
+	}
+	for _index in range(90):
+		radial_upright = _integrate_player_motion(
+			radial_upright.get("position", Vector3.ZERO),
+			radial_upright.get("orientation", Quaternion.IDENTITY),
+			radial_upright.get("linear_velocity", Vector3.ZERO),
+			radial_upright.get("angular_velocity", Vector3.ZERO),
+			dampened_control,
+			Vector3.LEFT * 9.81,
+			false,
+			CHARACTER_FIXED_DELTA,
+			radial_ground_locomotion
+		)
+	var radial_final_orientation: Quaternion = radial_upright.get(
+		"orientation", Quaternion.IDENTITY
+	)
+	var radial_final_alignment := (
+		Basis(radial_final_orientation) * Vector3.UP
+	).dot(Vector3.RIGHT)
 	var message := _player_control_message("player-control-4-9", 4, 9, roll_control)
 	var forbidden_fields := [
 		"position", "orientation", "linear_velocity", "angular_velocity",
@@ -3180,6 +3227,8 @@ func _run_motion_prediction_smoke_assertions() -> bool:
 		and is_zero_approx((ground_walk.get("linear_velocity", Vector3.ZERO) as Vector3).y)
 		and (ground_jump.get("linear_velocity", Vector3.ZERO) as Vector3).y >= CHARACTER_JUMP_SPEED
 		and (ground_roll.get("angular_velocity", Vector3.ZERO) as Vector3).is_zero_approx()
+		and radial_final_alignment > radial_initial_alignment + 0.07
+		and radial_final_alignment > 0.98
 		and _controls_equal(dampened_control, dampened_control.duplicate(true))
 		and not _controls_equal(dampened_control, roll_control)
 		and _control_send_due(dampened_control, thrust_control, 0.0)
@@ -3191,7 +3240,7 @@ func _run_motion_prediction_smoke_assertions() -> bool:
 		printerr("VERSE_CHARACTER_PREDICTION_FAILED")
 		return false
 	print(
-		"VERSE_CHARACTER_PREDICTION_OK input_only=true roll=eva_only ground=walk_jump fixed_step=60hz drift=inertial caps=preserved"
+		"VERSE_CHARACTER_PREDICTION_OK input_only=true roll=eva_only ground=walk_jump radial=upright fixed_step=60hz drift=inertial caps=preserved"
 	)
 	return true
 

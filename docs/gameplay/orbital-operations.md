@@ -20,7 +20,7 @@ The opening salvage site must read as an asteroid operation in planetary orbit, 
 2. Holding either key produces continuous roll; tapping produces a readable orientation step.
 3. Mouse pitch and yaw operate in the character's current local frame so they preserve rolled orientation.
 4. Construction yaw moves to `[` and `]`, preventing build mode from stealing EVA roll controls while remaining available on compact Mac keyboards.
-5. Movement uses the camera basis, so thrust follows the complete six-axis orientation. P0.9 converts these local translation and angular controls into one server-owned EVA, landing/contact, and rotation step under [ADR-0013](../decisions/ADR-0013-input-only-authoritative-character-motion.md). A durably queued press and release are consumed on successive fixed substeps, preserving tapped `Q`/`E` roll. This does not add walking or jump.
+5. Movement uses the camera basis, so thrust follows the complete six-axis orientation. P0.9 converts these local translation and angular controls into one server-owned EVA, landing/contact, and rotation step under [ADR-0013](../decisions/ADR-0013-input-only-authoritative-character-motion.md). A durably queued press and release are consumed on successive fixed substeps, preserving tapped `Q`/`E` roll. P0.10 adds server-classified capsule walking and jump under [ADR-0014](../decisions/ADR-0014-authoritative-grounded-and-magnetic-locomotion.md), while `Q`/`E` remains EVA-only.
 
 ## Engineering inventory
 

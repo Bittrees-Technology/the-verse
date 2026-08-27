@@ -15,7 +15,7 @@ This checkpoint targets F-005, F-006, F-007, and F-010 and the acceptance eviden
 3. Completed blocks and physical inventory contribute to body mass. Incomplete frames are represented consistently but do not gain completed functional behavior.
 4. Static voxel collision is derived from canonical occupied cells. Content pins 8×8×8-cell collision chunks with Euclidean floor ownership, stable chunk-body and cell-collider identities, and chunk-local child poses. Accepted mining atomically replaces only the owning collision body under [ADR-0011](../decisions/ADR-0011-dirty-voxel-collision-chunks.md).
 5. Anchoring converts a valid voxel-connected grid to an immovable body. Removing its final valid anchor returns it to dynamic eligibility without teleporting it.
-6. The living player is a dynamic Jolt sphere using `LinearCast` motion quality. Its optional `PlayerPhysicsOutcome` commits atomically with grid physics and contact lifecycle against the planet, voxel chunks, and grids. Walking and jump remain P0.10-or-later work.
+6. The living player is a dynamic 1.8 m Jolt capsule using `LinearCast` motion quality. Its optional support-aware `PlayerPhysicsOutcome` commits atomically with grid physics and contact lifecycle against the planet, voxel chunks, and grids. P0.10 derives walking, jump, radial upright alignment, steps, slopes, and magnetic attachment from server-owned stable-identity capsule queries under [ADR-0014](../decisions/ADR-0014-authoritative-grounded-and-magnetic-locomotion.md).
 
 ## Fixed-step contract
 

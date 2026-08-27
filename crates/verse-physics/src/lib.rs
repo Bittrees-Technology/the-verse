@@ -322,6 +322,7 @@ pub struct SceneConfig {
     pub max_colliders_per_body: usize,
     pub max_force_newtons: f64,
     pub max_torque_newton_meters: f64,
+    pub max_body_translation_m: f64,
     pub max_linear_velocity_mps: f32,
     pub max_angular_velocity_radians_per_second: f32,
 }
@@ -338,6 +339,7 @@ impl Default for SceneConfig {
             max_colliders_per_body: 4_096,
             max_force_newtons: 10_000_000.0,
             max_torque_newton_meters: 10_000_000.0,
+            max_body_translation_m: 1.0,
             max_linear_velocity_mps: 1_000.0,
             max_angular_velocity_radians_per_second: 100.0,
         }
@@ -371,6 +373,12 @@ pub enum PhysicsError {
     ControlBodyStatic(String),
     #[error("duplicate control for body {0}")]
     DuplicateControl(String),
+    #[error("translated body {0} does not exist")]
+    BodyTranslationMissing(String),
+    #[error("translated body {0} is static")]
+    BodyTranslationStatic(String),
+    #[error("translation for body {body_id} exceeds limit {limit}")]
+    BodyTranslationOutOfBounds { body_id: String, limit: f64 },
     #[error("control for body {body_id} exceeds {kind} limit {limit}")]
     ControlOutOfBounds {
         body_id: String,
@@ -518,6 +526,43 @@ impl Scene {
     ) -> Result<Option<CapsuleCastHit>, PhysicsError> {
         validate_capsule_cast(&self.specs, query)?;
         self.native.cast_capsule(&self.specs, query)
+    }
+
+    /// Applies one bounded server-owned translation to a live dynamic body.
+    /// Callers must prove the complete swept destination is collision-clear
+    /// with queries before using this for character step or ground snap.
+    pub fn translate_dynamic_body(
+        &mut self,
+        body_id: &str,
+        displacement: Vec3,
+    ) -> Result<(), PhysicsError> {
+        if self.requires_rebuild {
+            return Err(PhysicsError::SceneRequiresRebuild);
+        }
+        let body = self
+            .specs
+            .get(body_id)
+            .ok_or_else(|| PhysicsError::BodyTranslationMissing(body_id.into()))?;
+        if body.motion != BodyMotion::Dynamic {
+            return Err(PhysicsError::BodyTranslationStatic(body_id.into()));
+        }
+        let prior_position = body.pose.position;
+        if !displacement.is_finite()
+            || displacement.length() <= f64::EPSILON
+            || displacement.length() > self.config.max_body_translation_m
+        {
+            return Err(PhysicsError::BodyTranslationOutOfBounds {
+                body_id: body_id.into(),
+                limit: self.config.max_body_translation_m,
+            });
+        }
+        self.native.translate_body(body_id, displacement);
+        self.specs
+            .get_mut(body_id)
+            .expect("validated live body remains in the stable catalog")
+            .pose
+            .position = prior_position + displacement;
+        Ok(())
     }
 
     pub fn body_count(&self) -> usize {
@@ -674,6 +719,7 @@ fn validate_config(config: &SceneConfig) -> Result<(), PhysicsError> {
     for (label, value) in [
         ("force", config.max_force_newtons),
         ("torque", config.max_torque_newton_meters),
+        ("body translation", config.max_body_translation_m),
         ("linear velocity", f64::from(config.max_linear_velocity_mps)),
         (
             "angular velocity",

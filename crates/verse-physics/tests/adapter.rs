@@ -736,6 +736,78 @@ fn invalid_inertia_multiplier_is_rejected_before_native_mutation() {
 }
 
 #[test]
+fn bounded_dynamic_translation_preserves_velocity_and_catalog_pose() {
+    let mut scene = Scene::new(SceneConfig {
+        max_body_translation_m: 0.5,
+        ..SceneConfig::default()
+    })
+    .expect("scene initializes");
+    let mut body = BodySpec::dynamic(
+        "character",
+        pose(2.0, 1.0, -3.0),
+        vec![BoxColliderSpec::unit_cube("body")],
+    );
+    body.linear_velocity = Vec3::new(1.0, 0.0, -0.5);
+    scene.rebuild(&[body]).expect("body builds");
+
+    scene
+        .translate_dynamic_body("character", Vec3::new(0.0, 0.45, 0.0))
+        .expect("bounded translation applies");
+    let translated = scene
+        .body_states()
+        .expect("translated state extracts")
+        .into_iter()
+        .next()
+        .expect("body remains live");
+    assert_eq!(translated.pose.position, Vec3::new(2.0, 1.45, -3.0));
+    assert_eq!(translated.linear_velocity, Vec3::new(1.0, 0.0, -0.5));
+}
+
+#[test]
+fn body_translation_rejects_missing_static_nonfinite_and_unbounded_requests() {
+    let mut scene = Scene::new(SceneConfig {
+        max_body_translation_m: 0.5,
+        ..SceneConfig::default()
+    })
+    .expect("scene initializes");
+    scene
+        .rebuild(&[
+            BodySpec::dynamic(
+                "character",
+                Pose::IDENTITY,
+                vec![BoxColliderSpec::unit_cube("character-body")],
+            ),
+            BodySpec::static_body(
+                "floor",
+                pose(0.0, -1.0, 0.0),
+                vec![BoxColliderSpec::unit_cube("floor-panel")],
+            ),
+        ])
+        .expect("bodies build");
+    let before = scene.body_states().expect("initial state extracts");
+
+    assert!(matches!(
+        scene.translate_dynamic_body("missing", Vec3::new(0.1, 0.0, 0.0)),
+        Err(PhysicsError::BodyTranslationMissing(_))
+    ));
+    assert!(matches!(
+        scene.translate_dynamic_body("floor", Vec3::new(0.1, 0.0, 0.0)),
+        Err(PhysicsError::BodyTranslationStatic(_))
+    ));
+    for displacement in [
+        Vec3::ZERO,
+        Vec3::new(f64::NAN, 0.0, 0.0),
+        Vec3::new(0.500_1, 0.0, 0.0),
+    ] {
+        assert!(matches!(
+            scene.translate_dynamic_body("character", displacement),
+            Err(PhysicsError::BodyTranslationOutOfBounds { .. })
+        ));
+    }
+    assert_eq!(scene.body_states().expect("scene remains usable"), before);
+}
+
+#[test]
 fn one_body_replacement_preserves_unrelated_bodies_and_can_remove_the_final_chunk() {
     let mut scene = Scene::new(SceneConfig::default()).expect("scene initializes");
     let target = BodySpec::static_body(

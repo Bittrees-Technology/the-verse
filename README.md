@@ -2,7 +2,7 @@
 
 The Verse is an open-source persistent voxel space universe, work-and-economy simulator, and Web3 marketplace.
 
-The repository now contains the **locally verified P0.9 authoritative-EVA checkpoint**, built on Orbital Operations, server-authoritative contact physics, and the P0.8 survival-death foundation. It is still a single-player proof—not yet the public multiplayer universe or real-value economy—but input-only six-axis EVA, realistic orbital separation, physical inventory, consequential oxygen, mining, staged construction, and persistent recovery now share one authoritative world.
+The repository now contains the **locally verified P0.10 grounded-locomotion implementation**, built on the hosted P0.9 authoritative-EVA checkpoint, Orbital Operations, server-authoritative contact physics, and the P0.8 survival-death foundation. It is still a single-player proof—not yet the public multiplayer universe or real-value economy—but input-only EVA and boots-on-deck movement, realistic orbital separation, physical inventory, consequential oxygen, mining, staged construction, and persistent recovery now share one authoritative world. Hosted release evidence for P0.10 remains in progress.
 
 ## Play it on macOS
 
@@ -21,11 +21,13 @@ Native controls are shown in the client:
 
 | Action | Control |
 | --- | --- |
-| EVA thrust / ascend / descend | `WASD` / `Space` / `C` |
-| Roll character left / right | `Q` / `E` |
-| Boost / toggle dampeners | `Shift` / `Z` |
+| Walk or EVA thrust | `WASD` |
+| Jump / EVA ascend / EVA descend | `Space` / `Space` / `C` |
+| EVA roll left / right | `Q` / `E` |
+| Sprint or boost / toggle dampeners | `Shift` / `Z` |
 | Toggle helmet work light | `L` |
 | Toggle jetpack / helmet seal | `J` / `H` |
+| Arm or release magnetic boots | `K` |
 | Open engineering inventory terminal | `I` |
 | Mine highlighted voxel | Hold left mouse |
 | Enter construction / choose block | `B` / `1`–`5` |
@@ -50,7 +52,7 @@ Linux native client packaging and signed direct downloads remain scheduled work.
 tools/ci/check.sh
 ```
 
-This runs the Rust tests and lints, browser syntax checks, Godot validation, native motion-impairment coverage, and an input-only end-to-end scenario that restarts the server and proves exact state recovery. See the [Authoritative EVA checkpoint](docs/gameplay/authoritative-character-motion.md), [Survival Death checkpoint](docs/gameplay/survival-death.md), [Contact Physics checkpoint](docs/gameplay/contact-physics.md), and [P0 implementation guide](docs/architecture/p0-implementation.md) for scope and limitations.
+This runs the Rust tests and lints, browser syntax checks, Godot validation, native motion-impairment coverage, and an input-only end-to-end scenario that restarts the server and proves exact state recovery. See the [Grounded and magnetic locomotion checkpoint](docs/gameplay/authoritative-grounded-locomotion.md), [Authoritative EVA checkpoint](docs/gameplay/authoritative-character-motion.md), [Survival Death checkpoint](docs/gameplay/survival-death.md), [Contact Physics checkpoint](docs/gameplay/contact-physics.md), and [P0 implementation guide](docs/architecture/p0-implementation.md) for scope and limitations.
 
 ## Product pillars
 
@@ -77,7 +79,7 @@ Start with [the documentation map](docs/README.md), then read:
 
 ## Current status
 
-P0.9 replaces client-submitted character positions with durable input-only controls and one atomic Jolt-backed character/grid physics step. Protocol 9 distinguishes a durably received control from one consumed by a fixed substep, so a back-to-back press and release—including tapped `Q`/`E` roll—cannot be overwritten between worker polls. The native client predicts inverse-square gravity and bounded EVA motion, reconciles lightweight authoritative states, and retains the P0.8 oxygen, death-drop, and recovery loop. The complete verification and dedicated native impairment harness are green on macOS and the hosted Ubuntu runner; a native Linux package and published Linux performance baseline remain required. Walking, jump, multiplayer, drop recovery/expiry, global streaming, safe zones, accounts, AMMs, and blockchain settlement remain sequenced in the [delivery roadmap](docs/roadmap/roadmap.md).
+P0.10 retains durable input-only controls and one atomic Jolt-backed character/grid physics step, while protocol 10 adds jump and magnetic preference without accepting a client transform. A 1.8 m dynamic capsule now owns radial upright alignment, tangent walk/sprint, buffered jump, 50° slope entry with 2° exit hysteresis, bounded 45 cm steps, 18 cm ground snap, magnetic attachment to completed grid blocks, and moving-support velocity inheritance. The native client predicts these modes, presents `EVA`, `FREEFALL`, `GROUND`, and `MAG-LOCK`, and retains the P0.8 oxygen, death-drop, and recovery loop. Local Rust, Godot, protocol, impairment, and exact-recovery gates are green; hosted P0.10 evidence, a native Linux package, and the published Linux performance baseline remain required. Multiplayer, drop recovery/expiry, global streaming, safe zones, accounts, AMMs, and blockchain settlement remain sequenced in the [delivery roadmap](docs/roadmap/roadmap.md).
 
 ## Licensing
 
