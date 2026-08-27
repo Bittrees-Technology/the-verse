@@ -192,10 +192,15 @@ function selectedGrid() {
   return preferred ?? world?.grids[0];
 }
 
+function environmentForPlayer(state, player = selectedPlayer(state)) {
+  return player?.environment ?? state?.environment;
+}
+
 function render() {
   const canMutate = sessionRole.kind === "player";
   const players = canonicalPlayers(world);
   const profile = selectedPlayer();
+  const environment = environmentForPlayer(world, profile);
   elements.universe.textContent = world.universe_id;
   elements.cell.textContent = world.cell_id;
   elements["event-sequence"].textContent =
@@ -211,9 +216,9 @@ function render() {
     world.voxels.length.toLocaleString() + " voxels";
   elements["grid-count"].textContent =
     world.grids.length.toLocaleString() + " grids • " +
-    world.environment.celestial_body_name + " • " +
-    (world.environment.gravity_m_s2 / 9.80665).toFixed(2) + " g • " +
-    Math.round(world.environment.atmosphere_density * 100) + "% atmosphere";
+    environment.celestial_body_name + " • " +
+    (environment.gravity_m_s2 / 9.80665).toFixed(2) + " g • " +
+    Math.round(environment.atmosphere_density * 100) + "% atmosphere";
   elements["active-players"].textContent =
     players.length.toLocaleString() +
     (players.length === 1 ? " AUTHORITATIVE PLAYER" : " AUTHORITATIVE PLAYERS");
@@ -437,6 +442,7 @@ if (globalThis.__VERSE_BROWSER_TEST__) {
     mergeMotionState,
     playerColor,
     playerPresentations,
+    environmentForPlayer,
   };
 } else {
   start();

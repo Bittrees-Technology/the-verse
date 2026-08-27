@@ -325,6 +325,8 @@ pub struct PlayerSnapshot {
     pub critical_oxygen_milli: u16,
     pub helmet_closed: bool,
     pub jetpack_enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<EnvironmentSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -404,6 +406,8 @@ pub struct PlayerMotionSnapshot {
     pub control_expires_at_simulation_tick: u64,
     pub jetpack_enabled: bool,
     pub life_state: PlayerLifeState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<EnvironmentSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -811,6 +815,18 @@ mod tests {
             critical_oxygen_milli: 100,
             helmet_closed: true,
             jetpack_enabled: false,
+            environment: Some(EnvironmentSnapshot {
+                celestial_body_id: "khepri-prime".into(),
+                celestial_body_name: "Khepri Prime".into(),
+                planet_center: Vec3::ZERO,
+                surface_radius_m: 1_200.0,
+                altitude_m: 3_000.0,
+                gravity: Vec3::ZERO,
+                gravity_m_s2: 0.0,
+                atmosphere_density: 0.0,
+                oxygen_fraction: 0.0,
+                breathable: false,
+            }),
         };
         let world = WorldSnapshot {
             schema_version: 14,
@@ -843,13 +859,29 @@ mod tests {
         };
         let value = serde_json::to_value(&world).expect("world snapshot serializes");
         assert_eq!(value["player"]["critical_oxygen_milli"], 100);
+        assert_eq!(value["player"]["environment"]["altitude_m"], 3_000.0);
         assert_eq!(value["players"][0]["player_id"], "player-local");
         assert_eq!(value["death_drops"][0]["drop_id"], death_drop.drop_id);
         assert_eq!(value["death_drops"][0]["cause"]["kind"], "oxygen_depleted");
         assert_eq!(
-            serde_json::from_value::<WorldSnapshot>(value).expect("world snapshot deserializes"),
+            serde_json::from_value::<WorldSnapshot>(value.clone())
+                .expect("world snapshot deserializes"),
             world
         );
+        let mut legacy = value;
+        legacy["player"]
+            .as_object_mut()
+            .expect("legacy primary is an object")
+            .remove("environment");
+        legacy["players"][0]
+            .as_object_mut()
+            .expect("legacy roster player is an object")
+            .remove("environment");
+        let legacy = serde_json::from_value::<WorldSnapshot>(legacy)
+            .expect("pre-environment player snapshots remain compatible");
+        assert_eq!(legacy.player.environment, None);
+        assert_eq!(legacy.players[0].environment, None);
+        assert_eq!(legacy.environment, world.environment);
     }
 
     #[test]

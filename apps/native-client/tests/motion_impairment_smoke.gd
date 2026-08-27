@@ -154,10 +154,22 @@ func _test_bound_player_roster_selection() -> void:
 	var primary := _base_player()
 	primary["player_id"] = "player-local"
 	primary["inventory_id"] = "inventory-player-local"
+	primary["environment"] = {
+		"celestial_body_name": "Khepri Prime",
+		"planet_center": _protocol_vec3(Vector3.ZERO),
+		"surface_radius_m": 1200.0,
+		"gravity": _protocol_vec3(Vector3(0.0, -0.5, 0.0)),
+	}
 	var remote := _base_player()
 	remote["player_id"] = "player-remote"
 	remote["inventory_id"] = "inventory-player-remote"
 	remote["position"] = _protocol_vec3(Vector3(4.0, 0.0, 0.0))
+	remote["environment"] = {
+		"celestial_body_name": "Remote Frontier",
+		"planet_center": _protocol_vec3(Vector3(100.0, 0.0, 0.0)),
+		"surface_radius_m": 1200.0,
+		"gravity": _protocol_vec3(Vector3(-2.0, 0.0, 0.0)),
+	}
 	client.set("bound_player_id", "player-remote")
 	var roster_snapshot: Dictionary = client.get("snapshot")
 	roster_snapshot["player"] = primary
@@ -183,6 +195,18 @@ func _test_bound_player_roster_selection() -> void:
 	_check(
 		client.call("_vec3", merged.get("position", {})).is_equal_approx(Vector3(9.0, 1.0, -2.0)),
 		"bound actor motion merged"
+	)
+	_check(
+		String((client.get("snapshot") as Dictionary).get("environment", {}).get(
+			"celestial_body_name", ""
+		)) == "Remote Frontier",
+		"bound actor environment selected"
+	)
+	_check(
+		(client.get("prediction_gravity_fallback") as Vector3).is_equal_approx(
+			Vector3(-2.0, 0.0, 0.0)
+		),
+		"bound actor gravity selected"
 	)
 	remote["life_state"] = {
 		"kind": "incapacitated",

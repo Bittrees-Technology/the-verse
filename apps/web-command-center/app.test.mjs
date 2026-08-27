@@ -152,3 +152,22 @@ test("player presentations distinguish primary and session-bound pilots", () => 
   assert.equal(bound[1].color, api.playerColor("player-remote", 1));
   assert.notEqual(bound[0].color, bound[1].color);
 });
+
+test("environment presentation follows the selected pilot with legacy fallback", () => {
+  const local = player("player-local", 1);
+  const remote = player("player-remote", 4);
+  local.environment = { celestial_body_name: "Khepri Prime", gravity_m_s2: 9.8 };
+  remote.environment = { celestial_body_name: "Deep Space", gravity_m_s2: 0 };
+  const state = {
+    player: local,
+    players: [remote, local],
+    environment: { celestial_body_name: "Legacy Primary", gravity_m_s2: 9.8 },
+  };
+
+  assert.equal(api.environmentForPlayer(state, remote).celestial_body_name, "Deep Space");
+  delete remote.environment;
+  assert.equal(
+    api.environmentForPlayer(state, remote).celestial_body_name,
+    "Legacy Primary",
+  );
+});

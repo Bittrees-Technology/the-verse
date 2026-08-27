@@ -9,7 +9,7 @@ use verse_protocol::{
 use crate::model::{Block, ContactPairKey, DeathDrop, InventoryRecord};
 
 pub const EVENT_SCHEMA_NAME: &str = "verse.world_event";
-pub const EVENT_SCHEMA_VERSION: u32 = 9;
+pub const EVENT_SCHEMA_VERSION: u32 = 10;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event_type", rename_all = "snake_case")]
@@ -30,10 +30,12 @@ pub enum EventPayload {
         magnetic_boots_enabled: bool,
     },
     SuitOxygenChanged {
+        player_id: String,
         previous_oxygen_milli: u16,
         new_oxygen_milli: u16,
     },
     PlayerIncapacitated {
+        player_id: String,
         death_id: String,
         cause: PlayerDeathCause,
         position: Vec3,

@@ -27,6 +27,7 @@ use crate::model::{
 };
 use crate::persistence::{PersistenceError, Store};
 
+#[cfg(test)]
 const PLAYER_BODY_ID: &str = "player-body-player-local";
 #[cfg(test)]
 const PLAYER_COLLIDER_ID: &str = "player-collider-player-local";
@@ -121,7 +122,7 @@ pub struct Runtime {
     state: WorldState,
     snapshot_every: u64,
     events_since_snapshot: u64,
-    life_support_elapsed_millis: u32,
+    life_support_elapsed_millis_by_player: BTreeMap<String, u32>,
     physics_step_phase: u64,
     physics: Scene,
     halted: bool,
@@ -144,12 +145,18 @@ impl Runtime {
         let mut physics = Scene::new(physics_scene_config())?;
         physics.rebuild(&physics_body_specs(&state))?;
         let physics_step_phase = state.physics_step_phase;
+        let life_support_elapsed_millis_by_player = state
+            .player
+            .by_id
+            .keys()
+            .map(|player_id| (player_id.clone(), 0))
+            .collect();
         let mut runtime = Self {
             store,
             state,
             snapshot_every: snapshot_every.max(1),
             events_since_snapshot: 0,
-            life_support_elapsed_millis: 0,
+            life_support_elapsed_millis_by_player,
             physics_step_phase,
             physics,
             halted: false,
@@ -260,6 +267,8 @@ impl Runtime {
         self.store.save_snapshot(&next_state)?;
         self.state = next_state;
         self.physics = next_physics;
+        self.life_support_elapsed_millis_by_player
+            .insert(player_id.to_owned(), 0);
         Ok(true)
     }
 
@@ -567,27 +576,63 @@ impl Runtime {
             }
         }
 
-        let player_life_support_active =
-            matches!(self.state.player.life_state, PlayerLifeState::Alive);
-        if player_life_support_active {
-            self.life_support_elapsed_millis = self
-                .life_support_elapsed_millis
-                .saturating_add(u32::from(delta_millis));
-        } else if !matches!(self.state.player.life_state, PlayerLifeState::Alive) {
-            self.life_support_elapsed_millis = 0;
+        let player_ids = self.state.player.by_id.keys().cloned().collect::<Vec<_>>();
+        let mut elapsed_seconds_by_player = BTreeMap::new();
+        for player_id in &player_ids {
+            let player = self
+                .state
+                .player
+                .get(player_id)
+                .expect("roster identity collected from canonical state");
+            let elapsed_millis = self
+                .life_support_elapsed_millis_by_player
+                .entry(player_id.clone())
+                .or_default();
+            if matches!(player.life_state, PlayerLifeState::Alive) {
+                *elapsed_millis = elapsed_millis.saturating_add(u32::from(delta_millis));
+                elapsed_seconds_by_player.insert(player_id.clone(), *elapsed_millis / 1_000);
+                *elapsed_millis %= 1_000;
+            } else {
+                *elapsed_millis = 0;
+            }
         }
-        if player_life_support_active && self.life_support_elapsed_millis >= 1_000 {
-            let elapsed_seconds = self.life_support_elapsed_millis / 1_000;
-            self.life_support_elapsed_millis %= 1_000;
-            for _ in 0..elapsed_seconds {
-                let Some(payload) = self.state.life_support_payload_after_one_second()? else {
+        self.life_support_elapsed_millis_by_player
+            .retain(|player_id, _| self.state.player.by_id.contains_key(player_id));
+
+        let max_elapsed_seconds = elapsed_seconds_by_player
+            .values()
+            .copied()
+            .max()
+            .unwrap_or_default();
+        // Each elapsed life-support second is a deterministic round. Players
+        // within the round are scheduled in canonical roster order so two
+        // simultaneous transitions always produce the same event chain.
+        for second_index in 0..max_elapsed_seconds {
+            for player_id in &player_ids {
+                if elapsed_seconds_by_player
+                    .get(player_id)
+                    .copied()
+                    .unwrap_or_default()
+                    <= second_index
+                    || !matches!(
+                        self.state
+                            .player
+                            .get(player_id)
+                            .expect("scheduled player remains in canonical roster")
+                            .life_state,
+                        PlayerLifeState::Alive
+                    )
+                {
+                    continue;
+                }
+                let Some(payload) = self
+                    .state
+                    .life_support_payload_after_one_second_for(player_id)?
+                else {
                     continue;
                 };
                 self.commit_system_event(payload)?;
                 changed = true;
-                if !matches!(self.state.player.life_state, PlayerLifeState::Alive) {
-                    break;
-                }
             }
         }
         Ok(changed)
@@ -635,20 +680,24 @@ impl Runtime {
 }
 
 impl WorldState {
-    fn next_suit_oxygen_after_one_second(&self) -> Result<u16, IntentError> {
-        if !matches!(self.player.life_state, PlayerLifeState::Alive)
-            || self.player.suit_oxygen_milli == 0
-        {
+    fn next_suit_oxygen_after_one_second_for(&self, player_id: &str) -> Result<u16, IntentError> {
+        let player = self.player.get(player_id).ok_or_else(|| {
+            IntentError::rejected(
+                "lifecycle_player_missing",
+                "life support target is not present in the canonical roster",
+            )
+        })?;
+        if !matches!(player.life_state, PlayerLifeState::Alive) || player.suit_oxygen_milli == 0 {
             return Err(IntentError::rejected(
                 "player_not_alive",
                 "only an alive player with remaining oxygen has a life-support transition",
             ));
         }
-        let environment = self.environment_at(self.player.position);
+        let environment = self.environment_at(player.position);
         let survival = &content::manifest().survival;
-        let per_second_delta = if !self.player.helmet_closed && environment.breathable {
+        let per_second_delta = if !player.helmet_closed && environment.breathable {
             survival.open_breathable_delta_milli_per_second
-        } else if !self.player.helmet_closed {
+        } else if !player.helmet_closed {
             survival.open_vacuum_delta_milli_per_second
         } else if environment.breathable {
             survival.sealed_breathable_delta_milli_per_second
@@ -656,48 +705,70 @@ impl WorldState {
             survival.sealed_vacuum_delta_milli_per_second
         };
         Ok(u16::try_from(
-            (i32::from(self.player.suit_oxygen_milli) + i32::from(per_second_delta))
+            (i32::from(player.suit_oxygen_milli) + i32::from(per_second_delta))
                 .clamp(0, i32::from(survival.suit_oxygen_capacity_milli)),
         )
         .expect("clamped suit oxygen always fits u16"))
     }
 
-    fn life_support_payload_after_one_second(&self) -> Result<Option<EventPayload>, IntentError> {
-        let previous_oxygen_milli = self.player.suit_oxygen_milli;
-        let new_oxygen_milli = self.next_suit_oxygen_after_one_second()?;
+    fn life_support_payload_after_one_second_for(
+        &self,
+        player_id: &str,
+    ) -> Result<Option<EventPayload>, IntentError> {
+        let player = self.player.get(player_id).ok_or_else(|| {
+            IntentError::rejected(
+                "lifecycle_player_missing",
+                "life support target is not present in the canonical roster",
+            )
+        })?;
+        let previous_oxygen_milli = player.suit_oxygen_milli;
+        let new_oxygen_milli = self.next_suit_oxygen_after_one_second_for(player_id)?;
         if new_oxygen_milli == previous_oxygen_milli {
             return Ok(None);
         }
         if new_oxygen_milli == 0 {
-            return self.oxygen_incapacitation_payload().map(Some);
+            return self.oxygen_incapacitation_payload_for(player_id).map(Some);
         }
         Ok(Some(EventPayload::SuitOxygenChanged {
+            player_id: player_id.to_owned(),
             previous_oxygen_milli,
             new_oxygen_milli,
         }))
     }
 
+    #[cfg(test)]
     fn oxygen_incapacitation_payload(&self) -> Result<EventPayload, IntentError> {
-        if !matches!(self.player.life_state, PlayerLifeState::Alive)
-            || self.player.suit_oxygen_milli == 0
-        {
+        self.oxygen_incapacitation_payload_for(&self.player.player_id)
+    }
+
+    fn oxygen_incapacitation_payload_for(
+        &self,
+        player_id: &str,
+    ) -> Result<EventPayload, IntentError> {
+        let player = self.player.get(player_id).ok_or_else(|| {
+            IntentError::rejected(
+                "lifecycle_player_missing",
+                "life support target is not present in the canonical roster",
+            )
+        })?;
+        if !matches!(player.life_state, PlayerLifeState::Alive) || player.suit_oxygen_milli == 0 {
             return Err(IntentError::rejected(
                 "player_not_alive",
                 "only an alive player with remaining oxygen can become incapacitated",
             ));
         }
-        if self.next_suit_oxygen_after_one_second()? != 0 {
+        if self.next_suit_oxygen_after_one_second_for(player_id)? != 0 {
             return Err(IntentError::rejected(
                 "oxygen_not_depleted",
                 "the authoritative one-second life-support transition does not reach zero",
             ));
         }
         let event_sequence = self.event_sequence + 1;
-        let death_id = format!("death-{}-{event_sequence}", self.player.player_id);
-        let inventory = self.inventory(&self.player.inventory_id)?;
+        let death_id = format!("death-{}-{event_sequence}", player.player_id);
+        let inventory = self.inventory(&player.inventory_id)?;
         if inventory.domain
             != (InventoryDomain::Player {
-                player_id: self.player.player_id.clone(),
+                player_id: player.player_id.clone(),
             })
         {
             return Err(IntentError::rejected(
@@ -707,7 +778,7 @@ impl WorldState {
         }
         let has_carried_inventory = inventory.contents != InventoryContents::default();
         let (dropped_inventory, death_drop) = if has_carried_inventory {
-            let drop_id = format!("drop-{}-{event_sequence}", self.player.player_id);
+            let drop_id = format!("drop-{}-{event_sequence}", player.player_id);
             let inventory_id = format!("inventory-{drop_id}");
             if self.death_drops.contains_key(&drop_id)
                 || self.inventories.contains_key(&inventory_id)
@@ -730,8 +801,8 @@ impl WorldState {
                     drop_id,
                     death_id: death_id.clone(),
                     inventory_id,
-                    owner_player_id: self.player.player_id.clone(),
-                    position: self.player.position,
+                    owner_player_id: player.player_id.clone(),
+                    position: player.position,
                     created_event_sequence: event_sequence,
                     cause: PlayerDeathCause::OxygenDepleted,
                 }),
@@ -740,24 +811,36 @@ impl WorldState {
             (None, None)
         };
         Ok(EventPayload::PlayerIncapacitated {
+            player_id: player.player_id.clone(),
             death_id,
             cause: PlayerDeathCause::OxygenDepleted,
-            position: self.player.position,
-            previous_oxygen_milli: self.player.suit_oxygen_milli,
+            position: player.position,
+            previous_oxygen_milli: player.suit_oxygen_milli,
             dropped_inventory,
             death_drop,
         })
     }
 
+    #[cfg(test)]
     fn player_respawn_payload(&self) -> Result<EventPayload, IntentError> {
-        let PlayerLifeState::Incapacitated { death_id, .. } = &self.player.life_state else {
+        self.player_respawn_payload_for(&self.player.player_id)
+    }
+
+    fn player_respawn_payload_for(&self, player_id: &str) -> Result<EventPayload, IntentError> {
+        let player = self.player.get(player_id).ok_or_else(|| {
+            IntentError::rejected(
+                "lifecycle_player_missing",
+                "respawn target is not present in the canonical roster",
+            )
+        })?;
+        let PlayerLifeState::Incapacitated { death_id, .. } = &player.life_state else {
             return Err(IntentError::rejected(
                 "player_already_alive",
                 "the player is already alive",
             ));
         };
         let survival = &content::manifest().survival;
-        if self.inventory(&self.player.inventory_id)?.contents != InventoryContents::default() {
+        if self.inventory(&player.inventory_id)?.contents != InventoryContents::default() {
             return Err(IntentError::rejected(
                 "respawn_inventory_not_empty",
                 "recovery requires the carried inventory to remain in its death drop",
@@ -819,7 +902,10 @@ impl WorldState {
         if actor_player_id != self.player.primary_player_id
             && !matches!(
                 message,
-                ClientMessage::SetPlayerControl { .. } | ClientMessage::MineVoxel { .. }
+                ClientMessage::SetPlayerControl { .. }
+                    | ClientMessage::SetSuitMode { .. }
+                    | ClientMessage::RespawnPlayer { .. }
+                    | ClientMessage::MineVoxel { .. }
             )
         {
             return Err(IntentError::rejected(
@@ -899,9 +985,9 @@ impl WorldState {
                 magnetic_boots_enabled,
                 ..
             } => {
-                if self.player.helmet_closed == *helmet_closed
-                    && self.player.jetpack_enabled == *jetpack_enabled
-                    && self.player.locomotion.magnetic_boots_enabled == *magnetic_boots_enabled
+                if actor.helmet_closed == *helmet_closed
+                    && actor.jetpack_enabled == *jetpack_enabled
+                    && actor.locomotion.magnetic_boots_enabled == *magnetic_boots_enabled
                 {
                     return Err(IntentError::rejected(
                         "suit_mode_no_change",
@@ -914,7 +1000,9 @@ impl WorldState {
                     magnetic_boots_enabled: *magnetic_boots_enabled,
                 }
             }
-            ClientMessage::RespawnPlayer { .. } => self.player_respawn_payload()?,
+            ClientMessage::RespawnPlayer { .. } => {
+                self.player_respawn_payload_for(actor_player_id)?
+            }
             ClientMessage::MineVoxel { coordinate, .. } => {
                 let material = self.voxels.material(*coordinate).ok_or_else(|| {
                     IntentError::rejected("voxel_missing", "target voxel is already empty")
@@ -1386,8 +1474,20 @@ impl WorldState {
                     "physics outcomes require the system actor and no operation ID",
                 ));
             }
-            EventPayload::SuitOxygenChanged { .. } | EventPayload::PlayerIncapacitated { .. }
-                if event.actor_player_id.is_some()
+            EventPayload::SuitModeChanged { .. }
+                if event.actor_player_id.is_none()
+                    || event.actor_type != "human"
+                    || event.operation_id.as_deref().is_none_or(str::is_empty) =>
+            {
+                return Err(IntentError::rejected(
+                    "replay_lifecycle_envelope_invalid",
+                    "suit mode requires the authenticated player actor and an operation ID",
+                ));
+            }
+            EventPayload::SuitOxygenChanged { player_id, .. }
+            | EventPayload::PlayerIncapacitated { player_id, .. }
+                if !self.player.by_id.contains_key(player_id)
+                    || event.actor_player_id.is_some()
                     || event.actor_type != "system"
                     || event.operation_id.is_some() =>
             {
@@ -1397,7 +1497,7 @@ impl WorldState {
                 ));
             }
             EventPayload::PlayerRespawned { .. }
-                if event.actor_player_id.as_deref() != Some(self.player.player_id.as_str())
+                if event.actor_player_id.is_none()
                     || event.actor_type != "human"
                     || event.operation_id.as_deref().is_none_or(str::is_empty) =>
             {
@@ -1483,30 +1583,43 @@ impl WorldState {
                 jetpack_enabled,
                 magnetic_boots_enabled,
             } => {
-                self.player.helmet_closed = *helmet_closed;
-                self.player.jetpack_enabled = *jetpack_enabled;
-                self.player.locomotion.magnetic_boots_enabled = *magnetic_boots_enabled;
+                let actor_player_id = event
+                    .actor_player_id
+                    .as_deref()
+                    .expect("validated suit mode has a human actor");
+                let player = self
+                    .player
+                    .get_mut(actor_player_id)
+                    .expect("validated suit-mode actor is present");
+                player.helmet_closed = *helmet_closed;
+                player.jetpack_enabled = *jetpack_enabled;
+                player.locomotion.magnetic_boots_enabled = *magnetic_boots_enabled;
                 if *jetpack_enabled {
-                    self.player.locomotion.kind = LocomotionKind::Eva;
-                    self.player.locomotion.support = None;
-                } else if matches!(self.player.locomotion.kind, LocomotionKind::Eva) {
-                    self.player.locomotion.kind = LocomotionKind::Airborne;
+                    player.locomotion.kind = LocomotionKind::Eva;
+                    player.locomotion.support = None;
+                } else if matches!(player.locomotion.kind, LocomotionKind::Eva) {
+                    player.locomotion.kind = LocomotionKind::Airborne;
                 }
             }
             EventPayload::SuitOxygenChanged {
-                new_oxygen_milli, ..
+                player_id,
+                new_oxygen_milli,
+                ..
             } => {
-                let expected = self.life_support_payload_after_one_second()?;
+                let expected = self.life_support_payload_after_one_second_for(player_id)?;
                 if expected.as_ref() != Some(&event.payload) {
                     return Err(IntentError::rejected(
                         "replay_suit_oxygen_invalid",
                         "life-support event is not the exact authoritative one-second outcome",
                     ));
                 }
-                self.player.suit_oxygen_milli = *new_oxygen_milli;
+                self.player
+                    .get_mut(player_id)
+                    .expect("validated lifecycle target is present")
+                    .suit_oxygen_milli = *new_oxygen_milli;
             }
-            EventPayload::PlayerIncapacitated { .. } => {
-                let expected = self.oxygen_incapacitation_payload()?;
+            EventPayload::PlayerIncapacitated { player_id, .. } => {
+                let expected = self.oxygen_incapacitation_payload_for(player_id)?;
                 if expected != event.payload {
                     return Err(IntentError::rejected(
                         "replay_player_incapacitation_invalid",
@@ -1514,6 +1627,7 @@ impl WorldState {
                     ));
                 }
                 let EventPayload::PlayerIncapacitated {
+                    player_id,
                     death_id,
                     cause,
                     dropped_inventory,
@@ -1523,39 +1637,43 @@ impl WorldState {
                 else {
                     unreachable!("incapacitation preparation returns incapacitation payload");
                 };
-                self.inventory_mut(&self.player.inventory_id.clone())?
-                    .contents = InventoryContents::default();
+                let inventory_id = self
+                    .player
+                    .get(&player_id)
+                    .expect("validated incapacitation target is present")
+                    .inventory_id
+                    .clone();
+                self.inventory_mut(&inventory_id)?.contents = InventoryContents::default();
                 if let (Some(inventory), Some(drop)) = (dropped_inventory, death_drop) {
                     self.inventories
                         .insert(inventory.inventory_id.clone(), inventory);
                     self.death_drops.insert(drop.drop_id.clone(), drop);
                 }
-                self.player.suit_oxygen_milli = 0;
-                self.player.jetpack_enabled = false;
-                self.player.linear_velocity = Vec3::ZERO;
-                self.player.angular_velocity = Vec3::ZERO;
-                self.player.surface_contact = false;
-                self.player.locomotion = reset_locomotion(
-                    self.player.position,
+                let player = self
+                    .player
+                    .get_mut(&player_id)
+                    .expect("validated incapacitation target is present");
+                player.suit_oxygen_milli = 0;
+                player.jetpack_enabled = false;
+                player.linear_velocity = Vec3::ZERO;
+                player.angular_velocity = Vec3::ZERO;
+                player.surface_contact = false;
+                player.locomotion = reset_locomotion(
+                    player.position,
                     LocomotionKind::Airborne,
                     false,
                     self.simulation_tick,
                 );
-                self.player.control_linear_input = Vec3::ZERO;
-                self.player.control_angular_input = Vec3::ZERO;
-                self.player.boost = false;
-                self.player.dampeners = true;
-                self.player.jump = false;
-                self.player.control_expires_at_simulation_tick = self.simulation_tick;
-                self.player.pending_control_frames.clear();
-                self.player.life_state = PlayerLifeState::Incapacitated { death_id, cause };
+                player.control_linear_input = Vec3::ZERO;
+                player.control_angular_input = Vec3::ZERO;
+                player.boost = false;
+                player.dampeners = true;
+                player.jump = false;
+                player.control_expires_at_simulation_tick = self.simulation_tick;
+                player.pending_control_frames.clear();
+                player.life_state = PlayerLifeState::Incapacitated { death_id, cause };
                 self.active_contact_pairs
-                    .retain(|pair| !contact_key_involves_player(pair));
-                for grid in self.grids.values_mut() {
-                    grid.control_linear_input = Vec3::ZERO;
-                    grid.control_angular_input = Vec3::ZERO;
-                    grid.dampeners = true;
-                }
+                    .retain(|pair| !contact_key_involves_player_id(pair, &player_id));
             }
             EventPayload::PlayerRespawned {
                 position,
@@ -1565,19 +1683,27 @@ impl WorldState {
                 magnetic_boots_enabled,
                 ..
             } => {
-                let expected = self.player_respawn_payload()?;
+                let actor_player_id = event
+                    .actor_player_id
+                    .as_deref()
+                    .expect("validated respawn has a human actor");
+                let expected = self.player_respawn_payload_for(actor_player_id)?;
                 if expected != event.payload {
                     return Err(IntentError::rejected(
                         "replay_player_respawn_invalid",
                         "respawn does not match the server-selected recovery outcome",
                     ));
                 }
-                self.player.position = *position;
-                self.player.orientation = Quat::IDENTITY;
-                self.player.linear_velocity = Vec3::ZERO;
-                self.player.angular_velocity = Vec3::ZERO;
-                self.player.surface_contact = false;
-                self.player.locomotion = reset_locomotion(
+                let player = self
+                    .player
+                    .get_mut(actor_player_id)
+                    .expect("validated respawn actor is present");
+                player.position = *position;
+                player.orientation = Quat::IDENTITY;
+                player.linear_velocity = Vec3::ZERO;
+                player.angular_velocity = Vec3::ZERO;
+                player.surface_contact = false;
+                player.locomotion = reset_locomotion(
                     *position,
                     if *jetpack_enabled {
                         LocomotionKind::Eva
@@ -1587,22 +1713,22 @@ impl WorldState {
                     *magnetic_boots_enabled,
                     self.simulation_tick,
                 );
-                self.player.movement_epoch = self.player.movement_epoch.saturating_add(1);
-                self.player.last_received_input_sequence = 0;
-                self.player.last_processed_input_sequence = 0;
-                self.player.pending_control_frames.clear();
-                self.player.control_linear_input = Vec3::ZERO;
-                self.player.control_angular_input = Vec3::ZERO;
-                self.player.boost = false;
-                self.player.dampeners = true;
-                self.player.jump = false;
-                self.player.control_expires_at_simulation_tick = self.simulation_tick;
-                self.player.suit_oxygen_milli = *suit_oxygen_milli;
-                self.player.helmet_closed = *helmet_closed;
-                self.player.jetpack_enabled = *jetpack_enabled;
-                self.player.life_state = PlayerLifeState::Alive;
+                player.movement_epoch = player.movement_epoch.saturating_add(1);
+                player.last_received_input_sequence = 0;
+                player.last_processed_input_sequence = 0;
+                player.pending_control_frames.clear();
+                player.control_linear_input = Vec3::ZERO;
+                player.control_angular_input = Vec3::ZERO;
+                player.boost = false;
+                player.dampeners = true;
+                player.jump = false;
+                player.control_expires_at_simulation_tick = self.simulation_tick;
+                player.suit_oxygen_milli = *suit_oxygen_milli;
+                player.helmet_closed = *helmet_closed;
+                player.jetpack_enabled = *jetpack_enabled;
+                player.life_state = PlayerLifeState::Alive;
                 self.active_contact_pairs
-                    .retain(|pair| !contact_key_involves_player(pair));
+                    .retain(|pair| !contact_key_involves_player_id(pair, actor_player_id));
             }
             EventPayload::VoxelMined {
                 coordinate,
@@ -4317,6 +4443,7 @@ fn contact_pair_key(contact: &verse_physics::ContactRecord) -> ContactPairKey {
     }
 }
 
+#[cfg(test)]
 fn contact_key_involves_player(contact: &ContactPairKey) -> bool {
     contact.body_a == PLAYER_BODY_ID || contact.body_b == PLAYER_BODY_ID
 }
@@ -4733,7 +4860,12 @@ mod tests {
         assert_eq!(runtime.state().state_hash(), accepted_hash);
         assert_eq!(runtime.state().event_sequence, accepted_sequence);
 
-        let unavailable = runtime
+        let primary_mode_before = (
+            runtime.state().player.helmet_closed,
+            runtime.state().player.jetpack_enabled,
+            runtime.state().player.locomotion.magnetic_boots_enabled,
+        );
+        let remote_suit_receipt = runtime
             .execute_as(
                 "player-remote",
                 &ClientMessage::SetSuitMode {
@@ -4743,18 +4875,41 @@ mod tests {
                     magnetic_boots_enabled: false,
                 },
             )
-            .expect_err("unconverted remote action rejects instead of targeting primary");
-        assert!(matches!(
-            unavailable,
-            RuntimeError::Intent(IntentError::Rejected { ref code, .. })
-                if code == "actor_action_not_available"
-        ));
-        assert_eq!(runtime.state().state_hash(), accepted_hash);
-        assert_eq!(runtime.state().event_sequence, accepted_sequence);
+            .expect("secondary suit mode targets its authenticated actor");
+        assert_eq!(
+            (
+                runtime.state().player.helmet_closed,
+                runtime.state().player.jetpack_enabled,
+                runtime.state().player.locomotion.magnetic_boots_enabled,
+            ),
+            primary_mode_before
+        );
+        let remote = runtime.state().player.get("player-remote").unwrap();
+        assert!(!remote.helmet_closed);
+        assert!(remote.jetpack_enabled);
+        assert!(!remote.locomotion.magnetic_boots_enabled);
+        let lifecycle_hash = runtime.state().state_hash();
+        let lifecycle_sequence = runtime.state().event_sequence;
+        assert_eq!(
+            runtime
+                .execute_as(
+                    "player-remote",
+                    &ClientMessage::SetSuitMode {
+                        operation_id: "remote-suit-disabled".into(),
+                        helmet_closed: false,
+                        jetpack_enabled: true,
+                        magnetic_boots_enabled: false,
+                    },
+                )
+                .expect("secondary suit retry is actor-scoped and idempotent"),
+            remote_suit_receipt
+        );
+        assert_eq!(runtime.state().state_hash(), lifecycle_hash);
+        assert_eq!(runtime.state().event_sequence, lifecycle_sequence);
 
         drop(runtime);
         let recovered = Runtime::open(directory.path(), 68, 1_000).expect("runtime recovers");
-        assert_eq!(recovered.state().state_hash(), accepted_hash);
+        assert_eq!(recovered.state().state_hash(), lifecycle_hash);
         assert_eq!(
             recovered
                 .state()
@@ -4927,6 +5082,7 @@ mod tests {
         let runtime = runtime();
         let mut state = runtime.state().clone();
         let mut event = state.prepare_system_event(EventPayload::SuitOxygenChanged {
+            player_id: "player-local".into(),
             previous_oxygen_milli: 1_000,
             new_oxygen_milli: 995,
         });
@@ -6943,6 +7099,7 @@ mod tests {
         let (_, impossible) = apply(
             state.clone(),
             EventPayload::SuitOxygenChanged {
+                player_id: "player-local".into(),
                 previous_oxygen_milli: 1_000,
                 new_oxygen_milli: 1,
             },
@@ -6954,6 +7111,7 @@ mod tests {
         let (exact_vacuum, accepted) = apply(
             state,
             EventPayload::SuitOxygenChanged {
+                player_id: "player-local".into(),
                 previous_oxygen_milli: 1_000,
                 new_oxygen_milli: 960,
             },
@@ -6968,6 +7126,7 @@ mod tests {
         let (_, impossible) = apply(
             state.clone(),
             EventPayload::SuitOxygenChanged {
+                player_id: "player-local".into(),
                 previous_oxygen_milli: 900,
                 new_oxygen_milli: 860,
             },
@@ -6979,6 +7138,7 @@ mod tests {
         let (exact_breathable, accepted) = apply(
             state,
             EventPayload::SuitOxygenChanged {
+                player_id: "player-local".into(),
                 previous_oxygen_milli: 900,
                 new_oxygen_milli: 925,
             },
@@ -7008,6 +7168,421 @@ mod tests {
             dead.player.life_state,
             PlayerLifeState::Incapacitated { .. }
         ));
+    }
+
+    #[test]
+    fn life_support_schedules_every_player_in_canonical_order_and_recovers_exactly() {
+        let directory = tempdir().expect("tempdir");
+        let mut runtime = Runtime::open(directory.path(), 143, 1_000).expect("runtime opens");
+        runtime
+            .admit_development_player("player-remote")
+            .expect("secondary player admits");
+        for player in runtime.state.player.by_id.values_mut() {
+            player.position = Vec3::new(100.0, 100.0, 100.0);
+            player.helmet_closed = true;
+            player.suit_oxygen_milli = 1_000;
+            player.linear_velocity = Vec3::ZERO;
+        }
+        runtime
+            .physics
+            .rebuild(&physics_body_specs(&runtime.state))
+            .expect("two-player vacuum fixture builds");
+        runtime.persist_snapshot().expect("fixture persists");
+
+        for _ in 0..3 {
+            assert!(
+                !runtime
+                    .advance(250)
+                    .expect("partial life-support second advances")
+            );
+        }
+        assert!(
+            runtime
+                .advance(250)
+                .expect("one life-support second advances")
+        );
+        assert_eq!(
+            runtime
+                .state()
+                .player
+                .get("player-local")
+                .unwrap()
+                .suit_oxygen_milli,
+            995
+        );
+        assert_eq!(
+            runtime
+                .state()
+                .player
+                .get("player-remote")
+                .unwrap()
+                .suit_oxygen_milli,
+            995
+        );
+        let journal =
+            fs::read_to_string(directory.path().join("events.ndjson")).expect("journal reads");
+        let lifecycle_targets = journal
+            .lines()
+            .map(|line| serde_json::from_str::<CanonicalEvent>(line).expect("event parses"))
+            .filter_map(|event| match event.payload {
+                EventPayload::SuitOxygenChanged { player_id, .. } => Some(player_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            lifecycle_targets,
+            vec!["player-local".to_owned(), "player-remote".to_owned()]
+        );
+        let expected_hash = runtime.state().state_hash();
+        let expected_sequence = runtime.state().event_sequence;
+
+        drop(runtime);
+        let recovered = Runtime::open(directory.path(), 143, 1_000).expect("runtime recovers");
+        assert_eq!(recovered.state().state_hash(), expected_hash);
+        assert_eq!(recovered.state().event_sequence, expected_sequence);
+    }
+
+    #[test]
+    fn secondary_oxygen_death_isolates_inventory_player_grid_and_contact_state() {
+        let directory = tempdir().expect("tempdir");
+        let mut runtime = Runtime::open(directory.path(), 144, 1_000).expect("runtime opens");
+        runtime
+            .admit_development_player("player-remote")
+            .expect("secondary player admits");
+        let remote_inventory_id = runtime
+            .state
+            .player
+            .get("player-remote")
+            .unwrap()
+            .inventory_id
+            .clone();
+        runtime
+            .state
+            .inventories
+            .get_mut(PLAYER_INVENTORY_ID)
+            .unwrap()
+            .contents
+            .components -= 3;
+        runtime
+            .state
+            .inventories
+            .get_mut(&remote_inventory_id)
+            .unwrap()
+            .contents
+            .components = 3;
+        let remote = runtime.state.player.get_mut("player-remote").unwrap();
+        remote.suit_oxygen_milli = 5;
+        remote.linear_velocity = Vec3::new(3.0, 2.0, 1.0);
+        remote.angular_velocity = Vec3::new(0.5, 0.25, 0.125);
+        remote.control_linear_input = Vec3::new(1.0, 0.0, 0.0);
+        remote.control_angular_input = Vec3::new(0.0, 1.0, 0.0);
+        remote.boost = true;
+        remote.dampeners = false;
+        let local_contact = ContactPairKey {
+            body_a: player_body_id("player-local"),
+            collider_a: player_collider_id("player-local"),
+            body_b: STARTER_GRID_ID.into(),
+            collider_b: "block-core".into(),
+        };
+        let remote_contact = ContactPairKey {
+            body_a: player_body_id("player-remote"),
+            collider_a: player_collider_id("player-remote"),
+            body_b: STARTER_GRID_ID.into(),
+            collider_b: "block-power".into(),
+        };
+        runtime.state.active_contact_pairs =
+            BTreeSet::from([local_contact.clone(), remote_contact]);
+        let grid = runtime.state.grids.get_mut(STARTER_GRID_ID).unwrap();
+        grid.control_linear_input = Vec3::new(0.25, 0.5, 0.75);
+        grid.control_angular_input = Vec3::new(0.1, 0.2, 0.3);
+        grid.dampeners = false;
+        let primary_before = runtime.state.player.primary().clone();
+        let grid_before = runtime.state.grids[STARTER_GRID_ID].clone();
+        runtime.persist_snapshot().expect("fixture persists");
+        runtime
+            .life_support_elapsed_millis_by_player
+            .insert("player-remote".into(), 999);
+
+        assert!(runtime.advance(1).expect("secondary death commits"));
+        assert_eq!(runtime.state().player.primary(), &primary_before);
+        assert_eq!(runtime.state().grids[STARTER_GRID_ID], grid_before);
+        assert_eq!(
+            runtime.state().active_contact_pairs,
+            BTreeSet::from([local_contact])
+        );
+        let remote = runtime.state().player.get("player-remote").unwrap();
+        assert!(matches!(
+            remote.life_state,
+            PlayerLifeState::Incapacitated { .. }
+        ));
+        assert_eq!(remote.suit_oxygen_milli, 0);
+        assert_eq!(remote.linear_velocity, Vec3::ZERO);
+        assert_eq!(remote.angular_velocity, Vec3::ZERO);
+        assert_eq!(
+            runtime.state().inventories[&remote_inventory_id].contents,
+            InventoryContents::default()
+        );
+        let death_drop = runtime
+            .state()
+            .death_drops
+            .values()
+            .next()
+            .expect("secondary carried inventory drops");
+        assert_eq!(death_drop.owner_player_id, "player-remote");
+        assert_eq!(
+            runtime.state().inventories[&death_drop.inventory_id]
+                .contents
+                .components,
+            3
+        );
+        assert!(runtime.state().conservation().valid);
+        let expected_hash = runtime.state().state_hash();
+
+        drop(runtime);
+        let recovered = Runtime::open(directory.path(), 144, 1_000).expect("runtime recovers");
+        assert_eq!(recovered.state().state_hash(), expected_hash);
+    }
+
+    #[test]
+    fn simultaneous_player_deaths_are_unique_ordered_and_recover_exactly() {
+        let directory = tempdir().expect("tempdir");
+        let mut runtime = Runtime::open(directory.path(), 145, 1_000).expect("runtime opens");
+        runtime
+            .admit_development_player("player-remote")
+            .expect("secondary player admits");
+        for (player_id, player) in &mut runtime.state.player.by_id {
+            player.suit_oxygen_milli = 5;
+            runtime
+                .life_support_elapsed_millis_by_player
+                .insert(player_id.clone(), 999);
+        }
+        runtime.persist_snapshot().expect("fixture persists");
+
+        assert!(runtime.advance(1).expect("simultaneous deaths commit"));
+        let local = runtime.state().player.get("player-local").unwrap();
+        let remote = runtime.state().player.get("player-remote").unwrap();
+        let PlayerLifeState::Incapacitated {
+            death_id: local_death,
+            ..
+        } = &local.life_state
+        else {
+            panic!("local player must be incapacitated");
+        };
+        let PlayerLifeState::Incapacitated {
+            death_id: remote_death,
+            ..
+        } = &remote.life_state
+        else {
+            panic!("remote player must be incapacitated");
+        };
+        assert_ne!(local_death, remote_death);
+        assert_eq!(local_death, "death-player-local-1");
+        assert_eq!(remote_death, "death-player-remote-2");
+        let journal =
+            fs::read_to_string(directory.path().join("events.ndjson")).expect("journal reads");
+        let targets = journal
+            .lines()
+            .map(|line| serde_json::from_str::<CanonicalEvent>(line).expect("event parses"))
+            .filter_map(|event| match event.payload {
+                EventPayload::PlayerIncapacitated { player_id, .. } => Some(player_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(targets, vec!["player-local", "player-remote"]);
+        let expected_hash = runtime.state().state_hash();
+
+        drop(runtime);
+        let recovered = Runtime::open(directory.path(), 145, 1_000).expect("runtime recovers");
+        assert_eq!(recovered.state().state_hash(), expected_hash);
+    }
+
+    #[test]
+    fn secondary_respawn_is_actor_scoped_idempotent_and_exactly_recoverable() {
+        let directory = tempdir().expect("tempdir");
+        let mut runtime = Runtime::open(directory.path(), 146, 1_000).expect("runtime opens");
+        runtime
+            .admit_development_player("player-remote")
+            .expect("secondary player admits");
+        runtime
+            .state
+            .player
+            .get_mut("player-remote")
+            .unwrap()
+            .suit_oxygen_milli = 5;
+        runtime.persist_snapshot().expect("fixture persists");
+        runtime
+            .life_support_elapsed_millis_by_player
+            .insert("player-remote".into(), 999);
+        runtime.advance(1).expect("secondary death commits");
+        let primary_before = runtime.state().player.primary().clone();
+        let respawn = ClientMessage::RespawnPlayer {
+            operation_id: "remote-respawn".into(),
+        };
+
+        let first = runtime
+            .execute_as("player-remote", &respawn)
+            .expect("secondary recovery commits");
+        let expected_hash = runtime.state().state_hash();
+        let expected_sequence = runtime.state().event_sequence;
+        assert_eq!(runtime.state().player.primary(), &primary_before);
+        let remote = runtime.state().player.get("player-remote").unwrap();
+        assert_eq!(remote.life_state, PlayerLifeState::Alive);
+        assert_eq!(remote.movement_epoch, 2);
+        assert_eq!(
+            runtime
+                .execute_as("player-remote", &respawn)
+                .expect("secondary recovery retry is idempotent"),
+            first
+        );
+        assert_eq!(runtime.state().state_hash(), expected_hash);
+        assert_eq!(runtime.state().event_sequence, expected_sequence);
+        assert!(
+            runtime
+                .state()
+                .processed_operation("player-local", "remote-respawn")
+                .is_none()
+        );
+        assert_eq!(
+            runtime
+                .state()
+                .processed_operation("player-remote", "remote-respawn"),
+            Some(&first)
+        );
+
+        drop(runtime);
+        let recovered = Runtime::open(directory.path(), 146, 1_000).expect("runtime recovers");
+        assert_eq!(recovered.state().state_hash(), expected_hash);
+    }
+
+    #[test]
+    fn replay_rejects_malformed_lifecycle_targets_without_mutation() {
+        let mut runtime = runtime();
+        runtime
+            .admit_development_player("player-remote")
+            .expect("secondary player admits");
+        let base = runtime.state().clone();
+        let reject = |state: &WorldState, event: CanonicalEvent, expected_code: &str| {
+            let mut candidate = state.clone();
+            let before = candidate.state_hash();
+            assert!(matches!(
+                candidate.apply_event(&event),
+                Err(IntentError::Rejected { ref code, .. }) if code == expected_code
+            ));
+            assert_eq!(candidate.state_hash(), before);
+        };
+
+        reject(
+            &base,
+            base.prepare_system_event(EventPayload::SuitOxygenChanged {
+                player_id: "player-ghost".into(),
+                previous_oxygen_milli: 1_000,
+                new_oxygen_milli: 995,
+            }),
+            "replay_lifecycle_envelope_invalid",
+        );
+        reject(
+            &base,
+            base.new_event(
+                None,
+                "system",
+                None,
+                EventPayload::SuitModeChanged {
+                    helmet_closed: false,
+                    jetpack_enabled: true,
+                    magnetic_boots_enabled: false,
+                },
+            ),
+            "replay_lifecycle_envelope_invalid",
+        );
+        let mut dead = base.clone();
+        dead.player
+            .get_mut("player-remote")
+            .unwrap()
+            .suit_oxygen_milli = 5;
+        let death = dead
+            .oxygen_incapacitation_payload_for("player-remote")
+            .expect("secondary death prepares");
+        let death_event = dead.prepare_system_event(death);
+        dead.apply_event(&death_event)
+            .expect("secondary death applies");
+        let remote_respawn = dead
+            .player_respawn_payload_for("player-remote")
+            .expect("secondary respawn prepares");
+        reject(
+            &dead,
+            dead.new_event(
+                Some("player-local"),
+                "human",
+                Some("forged-cross-player-respawn".into()),
+                remote_respawn,
+            ),
+            "player_already_alive",
+        );
+    }
+
+    #[test]
+    fn secondary_death_commit_failpoints_recover_prior_or_durable_actor_state() {
+        for (failpoint, durable) in [
+            (AppendFailpoint::BeforeWrite, false),
+            (AppendFailpoint::AfterSync, true),
+        ] {
+            let directory = tempdir().expect("tempdir");
+            let before_state;
+            {
+                let mut runtime =
+                    Runtime::open(directory.path(), 147, 1_000).expect("runtime opens");
+                runtime
+                    .admit_development_player("player-remote")
+                    .expect("secondary player admits");
+                runtime
+                    .state
+                    .player
+                    .get_mut("player-remote")
+                    .unwrap()
+                    .suit_oxygen_milli = 5;
+                runtime.persist_snapshot().expect("fixture persists");
+                before_state = runtime.state().clone();
+                runtime
+                    .life_support_elapsed_millis_by_player
+                    .insert("player-remote".into(), 999);
+                runtime.store.set_append_failpoint(failpoint);
+                assert!(matches!(
+                    runtime.advance(1),
+                    Err(RuntimeError::Persistence(
+                        PersistenceError::InjectedFailure(_)
+                    ))
+                ));
+                assert!(runtime.is_halted());
+            }
+
+            let recovered = Runtime::open(directory.path(), 147, 1_000).expect("runtime recovers");
+            let expected_hash = if durable {
+                let journal = fs::read_to_string(directory.path().join("events.ndjson"))
+                    .expect("durable journal reads");
+                let event = serde_json::from_str::<CanonicalEvent>(
+                    journal.lines().next().expect("durable death event exists"),
+                )
+                .expect("durable death event parses");
+                let mut expected = before_state.clone();
+                expected.apply_event(&event).expect("durable death replays");
+                expected.state_hash()
+            } else {
+                before_state.state_hash()
+            };
+            assert_eq!(recovered.state().state_hash(), expected_hash);
+            assert_eq!(
+                matches!(
+                    recovered
+                        .state()
+                        .player
+                        .get("player-remote")
+                        .unwrap()
+                        .life_state,
+                    PlayerLifeState::Incapacitated { .. }
+                ),
+                durable
+            );
+        }
     }
 
     #[test]
@@ -7304,7 +7879,9 @@ mod tests {
             body_b: STARTER_GRID_ID.into(),
             collider_b: "block-core".into(),
         });
-        runtime.life_support_elapsed_millis = 999;
+        runtime
+            .life_support_elapsed_millis_by_player
+            .insert("player-local".into(), 999);
 
         runtime
             .advance(1)
@@ -7479,9 +8056,9 @@ mod tests {
         let event = state.prepare_system_event(canonical);
         state.apply_event(&event).expect("canonical death applies");
         let grid = &state.grids[STARTER_GRID_ID];
-        assert_eq!(grid.control_linear_input, Vec3::ZERO);
-        assert_eq!(grid.control_angular_input, Vec3::ZERO);
-        assert!(grid.dampeners);
+        assert_eq!(grid.control_linear_input, Vec3::new(1.0, 0.0, 0.0));
+        assert_eq!(grid.control_angular_input, Vec3::new(0.0, 1.0, 0.0));
+        assert!(!grid.dampeners);
         assert!(state.player.pending_control_frames.is_empty());
         assert!(state.conservation().valid);
     }
@@ -7501,7 +8078,9 @@ mod tests {
                     .persist_snapshot()
                     .expect("low-oxygen state persists");
                 before_state = runtime.state().clone();
-                runtime.life_support_elapsed_millis = 999;
+                runtime
+                    .life_support_elapsed_millis_by_player
+                    .insert("player-local".into(), 999);
                 runtime.store.set_append_failpoint(failpoint);
                 assert!(matches!(
                     runtime.advance(1),

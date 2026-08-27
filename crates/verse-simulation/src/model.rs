@@ -291,7 +291,7 @@ impl Player {
         (1..=self.level()).map(|level| u64::from(level) * 100).sum()
     }
 
-    fn snapshot(&self) -> PlayerSnapshot {
+    fn snapshot(&self, environment: EnvironmentSnapshot) -> PlayerSnapshot {
         PlayerSnapshot {
             player_id: self.player_id.clone(),
             position: self.position,
@@ -319,10 +319,11 @@ impl Player {
             jetpack_enabled: self.jetpack_enabled,
             life_state: self.life_state.clone(),
             critical_oxygen_milli: content::manifest().survival.critical_oxygen_milli,
+            environment: Some(environment),
         }
     }
 
-    fn motion_snapshot(&self) -> PlayerMotionSnapshot {
+    fn motion_snapshot(&self, environment: EnvironmentSnapshot) -> PlayerMotionSnapshot {
         PlayerMotionSnapshot {
             player_id: self.player_id.clone(),
             position: self.position,
@@ -342,6 +343,7 @@ impl Player {
             control_expires_at_simulation_tick: self.control_expires_at_simulation_tick,
             jetpack_enabled: self.jetpack_enabled,
             life_state: self.life_state.clone(),
+            environment: Some(environment),
         }
     }
 }
@@ -935,6 +937,7 @@ impl WorldState {
             })
             .collect::<Vec<_>>();
         grids.sort_by(|left, right| left.grid_id.cmp(&right.grid_id));
+        let primary_environment = self.environment_at(self.player.position);
 
         WorldSnapshot {
             schema_version: self.schema_version,
@@ -945,13 +948,13 @@ impl WorldState {
             simulation_tick: self.simulation_tick,
             fencing_token: self.fencing_token,
             world_hash: self.state_hash(),
-            player: self.player.snapshot(),
+            player: self.player.snapshot(primary_environment.clone()),
             players: self
                 .player
                 .iter()
-                .map(|(_, player)| player.snapshot())
+                .map(|(_, player)| player.snapshot(self.environment_at(player.position)))
                 .collect(),
-            environment: self.environment_at(self.player.position),
+            environment: primary_environment,
             voxels: self.voxels.snapshot(),
             grids,
             inventories: self
@@ -984,15 +987,16 @@ impl WorldState {
     }
 
     pub fn motion_snapshot(&self) -> MotionSnapshot {
+        let primary_environment = self.environment_at(self.player.position);
         MotionSnapshot {
             event_sequence: self.event_sequence,
             simulation_tick: self.simulation_tick,
             world_hash: self.state_hash(),
-            player: self.player.motion_snapshot(),
+            player: self.player.motion_snapshot(primary_environment),
             players: self
                 .player
                 .iter()
-                .map(|(_, player)| player.motion_snapshot())
+                .map(|(_, player)| player.motion_snapshot(self.environment_at(player.position)))
                 .collect(),
             grids: self
                 .grids

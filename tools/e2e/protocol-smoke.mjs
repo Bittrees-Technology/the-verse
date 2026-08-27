@@ -373,6 +373,22 @@ async function run() {
   assert.ok(world.environment.gravity_m_s2 < 1.0);
   assert.ok(world.environment.altitude_m > 3_000.0);
   assert.equal(world.environment.atmosphere_density, 0.0);
+  for (const player of world.players) {
+    assert.equal(
+      player.environment.celestial_body_id,
+      "khepri-prime",
+      `${player.player_id} receives location-specific celestial context`,
+    );
+    assert.ok(
+      Number.isFinite(player.environment.altitude_m),
+      `${player.player_id} receives a finite authoritative altitude`,
+    );
+  }
+  assert.deepEqual(
+    world.player.environment,
+    world.environment,
+    "the compatibility environment remains the primary pilot environment",
+  );
   assert.equal(world.player.suit_oxygen_milli, 1_000);
   assert.equal(world.player.critical_oxygen_milli, 200);
   assert.deepEqual(world.player.life_state, { kind: "alive" });
