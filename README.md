@@ -15,6 +15,15 @@ tools/dev/run-local.sh
 
 The bootstrap downloads the pinned Godot 4.7.2 editor from the official release and verifies its checksum. The launcher starts the authoritative server and native client. While the server is running, the browser command center is available at <http://127.0.0.1:7777>.
 
+To create the portable Apple Silicon development package used by release testing:
+
+```bash
+tools/release/install-godot-export-templates.sh
+tools/release/package-native.sh
+```
+
+The generated archive under `artifacts/release` contains the native app, authoritative server, one-click launcher, license notices, exact version record, and checksums. It is an unsigned development build; public signing, notarization, and an automatic updater remain later release work.
+
 You begin in the Khepri Prime orbital sector beside a powered 25-block salvage skiff and an independent mineable asteroid. The planet surface is more than three kilometers away; the starting field is vacuum with weak distant gravity, not a planetary outcrop. The authoritative server consumes sequenced movement controls and owns the character's pose, gravity, collision, and landing contact. The guided contract asks you to extract three voxels, refine ore, fabricate a component, extend the rig, and anchor it into the asteroid. Actions earn persistent career experience and clearance levels.
 
 Native controls are shown in the client:
@@ -44,7 +53,7 @@ To run only the Linux-compatible headless server:
 tools/dev/run-server.sh
 ```
 
-Linux native client packaging and signed direct downloads remain scheduled work. Godot 4.7.2 can already open `apps/native-client` on Linux for development.
+The same packaging command runs on x86_64 Ubuntu and produces a portable Linux archive. Hosted automation builds and smoke-tests both development packages. Signed public downloads remain scheduled work.
 
 ## Verify the build
 
@@ -79,7 +88,7 @@ Start with [the documentation map](docs/README.md), then read:
 
 ## Current status
 
-P0.10 retains durable input-only controls and one atomic Jolt-backed character/grid physics step, while protocol 10 adds jump and magnetic preference without accepting a client transform. A 1.8 m dynamic capsule now owns radial upright alignment, tangent walk/sprint, buffered jump, 50° slope entry with 2° exit hysteresis, bounded 45 cm steps, 18 cm ground snap, magnetic attachment to completed grid blocks, and moving-support velocity inheritance. The native client predicts these modes, presents `EVA`, `FREEFALL`, `GROUND`, and `MAG-LOCK`, and retains the P0.8 oxygen, death-drop, and recovery loop. Local Rust, Godot, protocol, impairment, and exact-recovery gates are green; hosted P0.10 evidence, a native Linux package, and the published Linux performance baseline remain required. Multiplayer, drop recovery/expiry, global streaming, safe zones, accounts, AMMs, and blockchain settlement remain sequenced in the [delivery roadmap](docs/roadmap/roadmap.md).
+P0.10 retains durable input-only controls and one atomic Jolt-backed character/grid physics step, while protocol 10 adds jump and magnetic preference without accepting a client transform. A 1.8 m dynamic capsule now owns radial upright alignment, tangent walk/sprint, buffered jump, 50° slope entry with 2° exit hysteresis, bounded 45 cm steps, 18 cm ground snap, magnetic attachment to completed grid blocks, and moving-support velocity inheritance. The native client predicts these modes, presents `EVA`, `FREEFALL`, `GROUND`, and `MAG-LOCK`, and retains the P0.8 oxygen, death-drop, and recovery loop. Local Rust, Godot, protocol, impairment, exact-recovery, and packaged Apple Silicon gates are green; hosted P0.10 and Linux package evidence plus the published Linux performance baseline remain required. Multiplayer, drop recovery/expiry, global streaming, safe zones, accounts, AMMs, and blockchain settlement remain sequenced in the [delivery roadmap](docs/roadmap/roadmap.md).
 
 ## Licensing
 
