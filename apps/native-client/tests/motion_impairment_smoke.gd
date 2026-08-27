@@ -600,6 +600,25 @@ func _test_private_projection_lifecycle() -> void:
 		String(client.call("_local_inventory_id")) == "inventory-impairment-player",
 		"installed projection exposes only the bound carried inventory"
 	)
+	var decoded_private_state: Variant = JSON.parse_string(JSON.stringify(private_state))
+	_check(
+		decoded_private_state is Dictionary
+		and typeof(decoded_private_state.get("committed_operation_sequence")) == TYPE_FLOAT
+		and bool(client.call("_install_actor_private", decoded_private_state, 0)),
+		"JSON-decoded safe integer frontier installs exactly"
+	)
+	var fractional_frontier := private_state.duplicate(true)
+	fractional_frontier["committed_operation_sequence"] = 0.5
+	_check(
+		not bool(client.call("_install_actor_private", fractional_frontier, 0)),
+		"fractional JSON frontier fails closed"
+	)
+	var unsafe_frontier := private_state.duplicate(true)
+	unsafe_frontier["committed_operation_sequence"] = 9007199254740992.0
+	_check(
+		not bool(client.call("_install_actor_private", unsafe_frontier, 0)),
+		"unsafe JSON frontier fails closed"
+	)
 
 	client.set("selected_cargo_inventory_id", "stale-cargo")
 	_check(
@@ -758,12 +777,29 @@ func _test_mutation_frontier_reconciliation() -> void:
 
 	_check(
 		bool(client.call("_reconcile_operation_frontier", 5)),
-		"committed reconnect frontier completes pending command"
+		"committed reconnect frontier requests exact receipt recovery"
+	)
+	_check(
+		not (client.get("in_flight_mutation") as Dictionary).is_empty()
+		and String(client.get("in_flight_mutation_text")) == exact_text
+		and int(client.get("committed_operation_sequence")) == 4
+		and int(client.get("observed_operation_frontier")) == 5,
+		"frontier completion retains exact bytes until authority confirms identity"
+	)
+	var decoded_receipt: Variant = JSON.parse_string(JSON.stringify({
+		"operation_sequence": 5,
+		"operation_id": "frontier-five",
+		"code": "voxel_mined",
+	}))
+	_check(
+		decoded_receipt is Dictionary
+		and bool(client.call("_handle_intent_accepted", decoded_receipt)),
+		"JSON-decoded accepted receipt confirms the retained command"
 	)
 	_check(
 		(client.get("in_flight_mutation") as Dictionary).is_empty()
 		and int(client.get("committed_operation_sequence")) == 5,
-		"frontier completion clears only the committed command"
+		"exact receipt advances and clears only the confirmed command"
 	)
 	client.call("_clear_actor_private_state")
 	_check(
@@ -782,17 +818,18 @@ func _test_mutation_frontier_reconciliation() -> void:
 		"operation_id": "rejected-six",
 	})
 	client.set("in_flight_mutation_text", "exact-rejected-six")
-	client.call("_handle_intent_rejected", {
+	var decoded_rejection: Variant = JSON.parse_string(JSON.stringify({
 		"type": "intent_rejected",
 		"operation_sequence": 6,
 		"operation_id": "rejected-six",
 		"code": "insufficient_refined_material",
 		"message": "not enough material",
-	})
+	}))
+	client.call("_handle_intent_rejected", decoded_rejection)
 	_check(
 		(client.get("in_flight_mutation") as Dictionary).is_empty()
 		and int(client.get("committed_operation_sequence")) == 5,
-		"gameplay rejection leaves the operation sequence reusable"
+		"JSON-decoded gameplay rejection leaves the operation sequence reusable"
 	)
 
 	client.set("in_flight_mutation_actor_id", "impairment-player")
