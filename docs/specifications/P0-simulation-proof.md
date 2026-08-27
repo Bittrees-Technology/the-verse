@@ -1,6 +1,6 @@
 # P0 specification: simulation proof
 
-**Status:** In implementation; P0.9 authoritative EVA is implemented and verified locally on macOS, with observed Ubuntu evidence pending
+**Status:** In implementation; P0.9 authoritative EVA is verified on macOS and hosted Ubuntu
 
 ## Purpose
 
@@ -278,7 +278,7 @@ Implemented and locally verified evidence:
 
 Still required for cross-platform P0 evidence:
 
-- Observe the same quantized fixed-step tolerance fixtures passing on the Ubuntu reference runner; the workflow is present, but the current checkpoint has only an observed macOS result.
+- Retain the green quantized fixed-step, headless Godot, live-client, and release-container evidence from [hosted Ubuntu run 33047681929](https://github.com/Bittrees-Technology/the-verse/actions/runs/33047681929) as the P0.9 cross-platform checkpoint.
 - Publish the native Linux direct-download artifact and the remaining Ubuntu, network, packaging, and scale evidence required by the overall P0 exit gate.
 
 Walking, jump, and a canonical grounded-locomotion state are explicitly P0.10-or-later work, together with slopes, stairs, ladders, magnetic boots, and moving-platform attachment. Player-to-player collision, ragdolls, impact damage, suit fuel/power, cockpit possession, lag compensation, rollback, authenticated control ownership, production browser spectating, and multiplayer replication also remain later work.
