@@ -17,7 +17,7 @@ The native macOS/Linux client is responsible for:
 
 It is not authoritative for inventory, damage, physics results, voxel changes, production, contracts, or market settlement.
 
-Character clients submit bounded controls with a server-owned movement epoch and monotonic input sequence, never transforms. The cell owns EVA pose, velocity, gravity, Jolt-backed landing/contact, rotation, and the surface-contact result; the native client may predict and reconcile those results under [ADR-0013](../decisions/ADR-0013-input-only-authoritative-character-motion.md). Walking, jump, grounded locomotion, and moving-platform attachment begin no earlier than P0.10.
+Character clients submit bounded controls with a server-owned movement epoch and monotonic input sequence, never transforms. A durable receipt advances the canonical received sequence; it does not claim that physics has consumed the control. The authoritative cell persists a bounded FIFO and consumes at most one transition per fixed substep, advancing a separate processed sequence that the native client uses to discard and replay prediction inputs. Reconnect resumes sequence allocation after the received frontier. The cell owns EVA pose, velocity, gravity, Jolt-backed landing/contact, rotation, and the surface-contact result under [ADR-0013](../decisions/ADR-0013-input-only-authoritative-character-motion.md). Walking, jump, grounded locomotion, and moving-platform attachment begin no earlier than P0.10.
 
 ## Browser command center
 

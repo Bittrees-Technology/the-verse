@@ -1,6 +1,6 @@
 # P0 specification: simulation proof
 
-**Status:** In implementation; P0.7 contact physics and P0.8 survival-death foundations available locally
+**Status:** In implementation; P0.9 authoritative EVA is implemented and verified locally on macOS, with observed Ubuntu evidence pending
 
 ## Purpose
 
@@ -251,35 +251,39 @@ Still required for complete death-drop lifecycle:
 - Powered personal, company, or allied spawn selection and a real capital fallback.
 - Owner/team recovery permissions, 15-minute grace, public salvage, six-hour expiry, outage pausing, cleanup tombstones, and settlement evidence.
 - Combat/impact health, physical loot containers, corpse presentation, multiplayer ownership, and team state.
-- Input-only server-authoritative character motion; the current alive player still proposes bounded positions which the server collision-sweeps.
 
-The complete implemented boundary is [P0.8 survival death foundation](../gameplay/survival-death.md), with transaction and deferral rationale in [ADR-0012](../decisions/ADR-0012-oxygen-incapacitation-and-proof-respawn.md).
+The survival-death boundary is [P0.8 survival death foundation](../gameplay/survival-death.md), with transaction and deferral rationale in [ADR-0012](../decisions/ADR-0012-oxygen-incapacitation-and-proof-respawn.md).
 
-## P0.9 authoritative EVA-physics target
+## P0.9 authoritative EVA-physics checkpoint
 
-Accepted implementation boundary:
+Implemented local boundary:
 
-- Protocol 8 removes client-submitted character positions. `SetPlayerControl` contains only the server-owned `movement_epoch`, monotonic `input_sequence`, bounded local translation/angular input, boost, and dampeners. It has no jump or client transform fields.
+- Protocol 9 removes client-submitted character positions. `SetPlayerControl` contains only the server-owned `movement_epoch`, monotonic `input_sequence`, bounded local translation/angular input, boost, and dampeners. It has no jump or client transform fields. Full and lightweight player snapshots distinguish durable `last_received_input_sequence` from fixed-step `last_processed_input_sequence`.
 - Content `p0.9.0` owns character mass and collision radius, EVA speed and acceleration, boost, linear/angular damping and limits, and an 18-tick control lease at 60 Hz.
-- World schema 11 stores canonical player orientation, linear/angular velocity, movement epoch, last input sequence, current controls, the absolute control-expiry tick, and the current `surface_contact` boolean. It adds no grounded state or jump latch.
-- Event schema 6 persists idempotent `PlayerControlSet` inputs. The existing atomic `PhysicsStepCommitted` outcome gains one optional `PlayerPhysicsOutcome` for the living player under the grid physics 60 Hz phase; there is no separately committed character time domain.
+- World schema 12 stores canonical player orientation, linear/angular velocity, movement epoch, received and processed sequence frontiers, a bounded pending-control FIFO, current controls, the absolute control-expiry tick, and the current `surface_contact` boolean. It adds no grounded state or jump latch.
+- Event schema 7 persists idempotent `PlayerControlSet` inputs under queued-consumption semantics. Durable acceptance advances the received frontier and appends to the FIFO. Each fixed 60 Hz substep retires expired entries, consumes at most one surviving transition, and advances the processed frontier. The existing atomic `PhysicsStepCommitted` outcome carries one optional `PlayerPhysicsOutcome` for the living player; there is no separately committed character time domain.
 - A content-sized dynamic Jolt sphere with `LinearCast` motion quality owns radial gravity, jetpack acceleration, boost, dampening, local-frame torque and rotation, continuous collision detection, contact response, and ballistic landing against the static planet, voxels, and grids.
 - `surface_contact` is true when the final substep's active-contact set contains the player body and false otherwise. Stable contact identity and normals remain in the ordinary physics-contact records. The boolean is collision evidence, not grounded-locomotion authority.
-- Stale controls expire into neutral dampened state; incapacitation clears motion, and respawn advances the movement epoch, resets the input sequence, and starts stationary.
-- The native client predicts from the same content values but reconciles every newer canonical player state by input acknowledgement and replay. Lifecycle, reconnect, large-error, and epoch changes hard-snap.
+- Queued press/release transitions survive worker scheduling phase. Entries whose receipt-time lease expires before consumption retire without motion; stale active controls expire into neutral dampened state. Incapacitation clears active and queued motion, and respawn advances the movement epoch, resets both sequence frontiers and the FIFO, and starts stationary.
+- The native client predicts from the same content values, allocates after the received frontier, and reconciles every newer canonical player state by discarding through the processed frontier and replaying the remainder. Lifecycle, reconnect, history-gap, large-error, and epoch changes hard-snap.
 - Lightweight player-state replication does not rebuild the complete voxel/grid presentation every motion tick. The browser may display this canonical state without a transform-submission path.
 
-Required evidence before implementation status:
+Implemented and locally verified evidence:
 
 - Serialization and adversarial tests prove that clients cannot send pose, velocity, collision results, or elapsed time and cannot use stale, duplicate, non-finite, or excessive controls to mutate or accelerate the player.
-- Fixed-step fixtures prove bounded EVA, boost, drift, dampening, gravity, local pitch/yaw and `Q`/`E` roll, ballistic landing, Jolt `LinearCast` collision response without tunneling, input-lease expiry, and quantized macOS/Linux outcomes.
-- Replay tamper, idempotency, before-write/after-sync, snapshot/journal, death-mid-motion, respawn, disconnect, and reconnect tests preserve exact motion state.
+- Fixed-step fixtures prove bounded EVA, boost, drift, dampening, gravity, local pitch/yaw and `Q`/`E` roll, ballistic landing, Jolt `LinearCast` collision response without tunneling, queued press/release delivery, input-lease expiry, and quantized macOS outcomes. Live and replay validation enforce finite/global velocity limits, conservative fixed-step translation and rotation envelopes, bounded penetration, and stable contact identity; replay does not rerun Jolt or claim exact reconstruction of the forces behind an otherwise valid committed velocity.
+- Replay tamper, idempotency, queue-overflow no-mutation, before-write/after-sync control and physics failpoints, snapshot/journal recovery, death-mid-motion, respawn, disconnect, and reconnect tests preserve exact motion and queue state.
 - The live protocol scenario reaches a voxel by input, completes a range-gated action, survives lifecycle recovery and restart, and retains the exact canonical pose, velocity, controls, and world hash.
-- Native impairment tests cover fixed-step prediction, input acknowledgement, small correction smoothing, large/epoch correction snaps, menu-open gravity continuity, and bounded queues without per-tick world rebuilds.
+- The gated native impairment harness covers received-versus-processed acknowledgement replay, skipped and stale motion messages, small correction smoothing, angular and lifecycle hard snaps, menu-open gravity continuity, bounded production prediction buffers, dead/disconnected gating, and motion-only updates without per-tick world rebuilds.
+
+Still required for cross-platform P0 evidence:
+
+- Observe the same quantized fixed-step tolerance fixtures passing on the Ubuntu reference runner; the workflow is present, but the current checkpoint has only an observed macOS result.
+- Publish the native Linux direct-download artifact and the remaining Ubuntu, network, packaging, and scale evidence required by the overall P0 exit gate.
 
 Walking, jump, and a canonical grounded-locomotion state are explicitly P0.10-or-later work, together with slopes, stairs, ladders, magnetic boots, and moving-platform attachment. Player-to-player collision, ragdolls, impact damage, suit fuel/power, cockpit possession, lag compensation, rollback, authenticated control ownership, production browser spectating, and multiplayer replication also remain later work.
 
-The target contract is [P0.9 authoritative EVA physics](../gameplay/authoritative-character-motion.md), with authority and recovery rationale in [ADR-0013](../decisions/ADR-0013-input-only-authoritative-character-motion.md).
+The implemented contract is [P0.9 authoritative EVA physics](../gameplay/authoritative-character-motion.md), with authority and recovery rationale in [ADR-0013](../decisions/ADR-0013-input-only-authoritative-character-motion.md).
 
 ## Exit decision
 
