@@ -15,6 +15,7 @@ fi
 
 cd "${verse_root}"
 tools/ci/build-native-verifier.sh debug
+"${godot_binary}" --headless --editor --path apps/native-client --quit
 "${godot_binary}" \
   --headless \
   --path apps/native-client \

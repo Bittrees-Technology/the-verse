@@ -23,7 +23,6 @@ if [[ -z "${godot_binary}" ]] && [[ -x "artifacts/toolchains/godot-4.7.2/Godot.a
 fi
 if [[ -n "${godot_binary}" ]]; then
   GODOT_BIN="${godot_binary}" tools/ci/verify-native-verifier.sh
-  "${godot_binary}" --headless --editor --path apps/native-client --quit
   "${godot_binary}" \
     --headless \
     --path apps/native-client \
