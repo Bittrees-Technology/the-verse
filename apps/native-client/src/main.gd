@@ -11,7 +11,7 @@ const PLANET_SHADER: Shader = preload("res://shaders/planet_surface.gdshader")
 const ATMOSPHERE_SHADER: Shader = preload("res://shaders/planet_atmosphere.gdshader")
 const CLOUD_SHADER: Shader = preload("res://shaders/planet_clouds.gdshader")
 const BLOCK_DAMAGE_SHADER: Shader = preload("res://shaders/block_damage.gdshader")
-const PROTOCOL_VERSION := 13
+const PROTOCOL_VERSION := 14
 const PROJECTION_SCHEMA_VERSION := 1
 const DEFAULT_SERVER := "ws://127.0.0.1:7777/ws"
 const DEFAULT_PLAYER_ID := "player-local"
@@ -24,6 +24,9 @@ const CONTROL_SEND_INTERVAL := 0.10
 # JSON's float64 reconstruction without crossing the authoritative unit sphere.
 const CONTROL_INPUT_SAFE_LIMIT := 0.999999
 const PREDICTION_HISTORY_LIMIT := 180
+const MUTATION_QUEUE_LIMIT := 32
+const MUTATION_RETRY_INTERVAL := 1.5
+const MUTATION_RETRY_LIMIT := 3
 const POSITION_SNAP_DISTANCE := 2.0
 const ORIENTATION_SNAP_ANGLE := PI / 3.0
 const CHARACTER_COLLISION_RADIUS := 0.34
@@ -85,6 +88,18 @@ var bound_player_id := ""
 var connected := false
 var handshake_sent := false
 var operation_counter := 0
+var committed_operation_sequence := 0
+var committed_operation_actor_id := ""
+var operation_frontier_observed := false
+var operation_frontier_ready := false
+var mutation_queue: Array[Dictionary] = []
+var mutation_queue_actor_id := ""
+var in_flight_mutation: Dictionary = {}
+var in_flight_mutation_text := ""
+var in_flight_mutation_actor_id := ""
+var mutation_retry_elapsed := 0.0
+var mutation_retry_count := 0
+var mutation_resync_required := false
 var authoritative_player_ready := false
 var awaiting_reconnect_baseline := true
 var control_send_elapsed := 0.0
@@ -233,6 +248,7 @@ func _process(delta: float) -> void:
 	if planet_cloud_layer != null:
 		planet_cloud_layer.rotation.y += delta * 0.0025
 	_poll_socket()
+	_advance_mutation_transport(delta)
 	_update_player_presentation(delta)
 	_update_target()
 	_update_tool_action(delta)
@@ -241,7 +257,12 @@ func _process(delta: float) -> void:
 
 
 func _physics_process(delta: float) -> void:
-	if not connected or not authoritative_player_ready:
+	if (
+		not connected
+		or not authoritative_player_ready
+		or not operation_frontier_ready
+		or mutation_resync_required
+	):
 		return
 	if _local_player_incapacitated():
 		return
@@ -360,7 +381,7 @@ func _input(event: InputEvent) -> void:
 			KEY_V:
 				_transfer_to_or_from_cargo(event.shift_pressed)
 			KEY_P:
-				_send({"type": "request_snapshot"})
+				_send_transport({"type": "request_snapshot"})
 			KEY_Z:
 				desired_dampeners = not desired_dampeners
 				_set_message(
@@ -444,6 +465,7 @@ func _private_inventory_ready() -> bool:
 
 func _clear_actor_private_state() -> void:
 	actor_private_snapshot = {}
+	operation_frontier_ready = false
 	selected_cargo_inventory_id = ""
 	last_targeted_owned_grid_id = ""
 	for button in inventory_transfer_buttons:
@@ -477,7 +499,13 @@ func _actor_private_matches(candidate: Variant, event_sequence: int) -> bool:
 			carried_matches += 1
 	if carried_inventory_id.is_empty() or carried_matches != 1:
 		return false
-	# Protocol 13 nests the overlay in the outer projected snapshot, making the
+	if (
+		not candidate.has("committed_operation_sequence")
+		or typeof(candidate.get("committed_operation_sequence")) != TYPE_INT
+		or int(candidate.get("committed_operation_sequence", -1)) < 0
+	):
+		return false
+	# Protocol 14 nests the overlay in the outer projected snapshot, making the
 	# outer sequence authoritative. Honor a future explicit sequence only when
 	# it agrees, so malformed extensions still fail closed.
 	return (
@@ -491,7 +519,9 @@ func _install_actor_private(candidate: Variant, event_sequence: int) -> bool:
 	if not _actor_private_matches(candidate, event_sequence):
 		return false
 	actor_private_snapshot = (candidate as Dictionary).duplicate(true)
-	return true
+	return _reconcile_operation_frontier(
+		int(actor_private_snapshot.get("committed_operation_sequence", -1))
+	)
 
 
 func _life_support_display_state(player: Dictionary) -> String:
@@ -1585,10 +1615,10 @@ func _poll_socket() -> void:
 		connected = true
 		if not handshake_sent:
 			handshake_sent = true
-			_send({
+			_send_transport({
 				"type": "hello",
 				"protocol_version": PROTOCOL_VERSION,
-				"client_name": "godot-native-p1.2",
+				"client_name": "godot-native-p1.3",
 				"authentication": {
 					"kind": "local_development",
 					"player_id": requested_player_id,
@@ -1628,6 +1658,17 @@ func _handle_server_message(message: Dictionary) -> void:
 				bound_player_id = String(session_role.get("player_id", requested_player_id))
 			else:
 				bound_player_id = ""
+			if not _mutation_actor_matches_session():
+				_clear_mutation_pipeline()
+				mutation_resync_required = true
+				_set_message("PENDING COMMANDS DISCARDED // SESSION ACTOR CHANGED", true)
+			if (
+				not committed_operation_actor_id.is_empty()
+				and committed_operation_actor_id != bound_player_id
+			):
+				committed_operation_sequence = 0
+				committed_operation_actor_id = ""
+				operation_frontier_observed = false
 			_set_message(
 				"Connected to %s // %s"
 				% [message.get("server_name", "The Verse"), _controlled_player_id()]
@@ -1638,26 +1679,28 @@ func _handle_server_message(message: Dictionary) -> void:
 			_apply_motion_state(message.get("motion", {}))
 		"intent_accepted":
 			var receipt: Dictionary = message.get("receipt", {})
-			if receipt.get("code", "") != "player_control_set":
-				_set_message(receipt.get("message", "Intent accepted"))
-			if receipt.get("operation_id", "") == recovery_operation:
-				_set_message("Recovery authorized // awaiting authoritative snapshot")
-			if smoke_test and receipt.get("operation_id", "") == smoke_operation:
-				smoke_receipt_received = true
-				_check_smoke_control_ack(_local_player())
+			if _handle_intent_accepted(receipt):
+				if receipt.get("code", "") != "player_control_set":
+					_set_message(receipt.get("message", "Intent accepted"))
+				if receipt.get("operation_id", "") == recovery_operation:
+					_set_message("Recovery authorized // awaiting authoritative snapshot")
+				if smoke_test and receipt.get("operation_id", "") == smoke_operation:
+					smoke_receipt_received = true
+					_check_smoke_control_ack(_local_player())
 		"intent_rejected":
 			pending_mine_position = null
-			var rejected_operation := String(message.get("operation_id", ""))
-			if message.get("operation_id", "") == recovery_operation:
-				recovery_operation = ""
-			if rejected_operation.begins_with("player-control-"):
-				_begin_player_resync()
-				_send({"type": "request_snapshot"})
-			_set_message(
-				"%s — %s" % [message.get("code", "rejected"), message.get("message", "")],
-				true
-			)
+			if _handle_intent_rejected(message):
+				if message.get("operation_id", "") == recovery_operation:
+					recovery_operation = ""
+				_set_message(
+					"%s — %s"
+					% [message.get("code", "rejected"), message.get("message", "")],
+					true
+				)
 		"fatal":
+			mutation_resync_required = true
+			operation_frontier_ready = false
+			authoritative_player_ready = false
 			_set_message(
 				"FATAL %s — %s" % [message.get("code", ""), message.get("message", "")],
 				true
@@ -1720,6 +1763,7 @@ func _apply_snapshot(authoritative: Dictionary) -> void:
 		String(snapshot.get("world_hash", "")),
 		"snapshot"
 	)
+	_dispatch_next_mutation()
 	if smoke_test and not smoke_visual_ready:
 		if not _run_visual_smoke_assertions():
 			get_tree().quit(1)
@@ -1833,7 +1877,7 @@ func _invalidate_private_motion(event_sequence: int, simulation_tick: int) -> vo
 	last_authoritative_simulation_tick = simulation_tick
 	_set_message("PRIVATE MOTION LINK INVALID // REQUESTING RESYNC", true)
 	if socket.get_ready_state() == WebSocketPeer.STATE_OPEN:
-		_send({"type": "request_snapshot"})
+		_send_transport({"type": "request_snapshot"})
 
 
 func _merge_public_motion_into_private(
@@ -2199,6 +2243,18 @@ func _begin_player_resync() -> void:
 	require_neutral_baseline = true
 	last_authoritative_event_sequence = -1
 	_sync_remote_players([])
+
+
+func _reset_control_prediction_after_rejection() -> void:
+	authoritative_player_ready = false
+	awaiting_reconnect_baseline = true
+	prediction_history.clear()
+	pending_controls.clear()
+	prediction_history_invalid = false
+	last_sent_control = {}
+	control_send_elapsed = 0.0
+	_clear_transient_character_input()
+	require_neutral_baseline = true
 
 
 func _rebuild_voxels(voxels: Array) -> void:
@@ -2791,7 +2847,7 @@ func _send_player_control(control: Dictionary, force: bool) -> bool:
 	var sequence := next_input_sequence
 	var operation_id := "player-control-%d-%d" % [movement_epoch, sequence]
 	var message := _player_control_message(operation_id, movement_epoch, sequence, bounded_control)
-	if not _send(message):
+	if not _queue_mutation(message):
 		return false
 	next_input_sequence += 1
 	current_prediction_input_sequence = sequence
@@ -4208,7 +4264,7 @@ func _mine_target_voxel() -> void:
 		_set_message("Aim at an asteroid voxel within mining range", true)
 		return
 	pending_mine_position = target_voxel
-	_send({
+	_queue_mutation({
 		"type": "mine_voxel",
 		"operation_id": _operation_id("mine"),
 		"coordinate": _protocol_ivec3(target_voxel),
@@ -4220,7 +4276,7 @@ func _damage_target_block() -> void:
 		_set_message("Aim at a grid block to apply test damage", true)
 		return
 	var block: Dictionary = target_block["block"]
-	_send({
+	_queue_mutation({
 		"type": "damage_block",
 		"operation_id": _operation_id("damage"),
 		"grid_id": target_block["grid_id"],
@@ -4236,7 +4292,7 @@ func _build_selected_block() -> void:
 		_report_foreign_grid_access(target_block.get("grid", {}))
 		return
 	var coordinate := _build_coordinate()
-	_send({
+	_queue_mutation({
 		"type": "build_block",
 		"operation_id": _operation_id("build"),
 		"grid_id": target_block["grid_id"],
@@ -4257,7 +4313,7 @@ func _weld_target_block() -> void:
 	if not _block_needs_weld(block):
 		_set_message("Target block is already at full integrity", true)
 		return
-	_send({
+	_queue_mutation({
 		"type": "weld_block",
 		"operation_id": _operation_id("weld"),
 		"grid_id": target_block["grid_id"],
@@ -4283,7 +4339,7 @@ func _toggle_anchor() -> void:
 	var grid_id := _owned_grid_for_command()
 	if grid_id.is_empty():
 		return
-	_send({
+	_queue_mutation({
 		"type": "toggle_grid_anchor",
 		"operation_id": _operation_id("anchor"),
 		"grid_id": grid_id,
@@ -4297,7 +4353,7 @@ func _move_target_grid() -> void:
 	var direction := -camera.global_transform.basis.z.normalized()
 	var grid: Dictionary = grid_lookup.get(grid_id, {})
 	var local_direction := (_grid_basis(grid).inverse() * direction).limit_length(0.999)
-	if _send({
+	if _queue_mutation({
 		"type": "set_grid_control",
 		"operation_id": _operation_id("grid-control"),
 		"grid_id": grid_id,
@@ -4312,7 +4368,7 @@ func _stop_target_grid() -> void:
 	var grid_id := _take_active_grid_control_id()
 	if grid_id.is_empty():
 		return
-	_send({
+	_queue_mutation({
 		"type": "set_grid_control",
 		"operation_id": _operation_id("grid-stop"),
 		"grid_id": grid_id,
@@ -4333,7 +4389,7 @@ func _refine_ore() -> void:
 	if inventory_id.is_empty():
 		_set_message("No authoritative suit inventory is available", true)
 		return
-	_send({
+	_queue_mutation({
 		"type": "refine_ore",
 		"operation_id": _operation_id("refine"),
 		"inventory_id": inventory_id,
@@ -4346,7 +4402,7 @@ func _craft_component() -> void:
 	if inventory_id.is_empty():
 		_set_message("No authoritative suit inventory is available", true)
 		return
-	_send({
+	_queue_mutation({
 		"type": "craft_component",
 		"operation_id": _operation_id("craft"),
 		"inventory_id": inventory_id,
@@ -4363,7 +4419,7 @@ func _transfer_to_or_from_cargo(reverse: bool) -> void:
 	if suit_id.is_empty():
 		_set_message("No authoritative suit inventory is available", true)
 		return
-	_send({
+	_queue_mutation({
 		"type": "transfer_inventory",
 		"operation_id": _operation_id("transfer"),
 		"source_inventory_id": cargo_id if reverse else suit_id,
@@ -4419,7 +4475,7 @@ func _request_recovery() -> void:
 		_set_message("Recovery unavailable while disconnected — press F5", true)
 		return
 	recovery_operation = _operation_id("respawn")
-	if not _send({
+	if not _queue_mutation({
 		"type": "respawn_player",
 		"operation_id": recovery_operation,
 	}):
@@ -4430,7 +4486,7 @@ func _request_recovery() -> void:
 
 func _toggle_jetpack() -> void:
 	var player := _local_player()
-	_send({
+	_queue_mutation({
 		"type": "set_suit_mode",
 		"operation_id": _operation_id("suit"),
 		"helmet_closed": bool(player.get("helmet_closed", true)),
@@ -4442,7 +4498,7 @@ func _toggle_jetpack() -> void:
 func _toggle_magnetic_boots() -> void:
 	var player := _local_player()
 	desired_magnetic_boots = not desired_magnetic_boots
-	_send({
+	_queue_mutation({
 		"type": "set_suit_mode",
 		"operation_id": _operation_id("suit"),
 		"helmet_closed": bool(player.get("helmet_closed", true)),
@@ -4454,7 +4510,7 @@ func _toggle_magnetic_boots() -> void:
 
 func _toggle_helmet() -> void:
 	var player := _local_player()
-	_send({
+	_queue_mutation({
 		"type": "set_suit_mode",
 		"operation_id": _operation_id("suit"),
 		"helmet_closed": not bool(player.get("helmet_closed", true)),
@@ -4480,7 +4536,7 @@ func _transfer_inventory_resource(resource: String, reverse: bool, all: bool) ->
 	if quantity <= 0:
 		_set_message("The selected source stack is empty", true)
 		return
-	_send({
+	_queue_mutation({
 		"type": "transfer_inventory",
 		"operation_id": _operation_id("terminal-transfer"),
 		"source_inventory_id": source_id,
@@ -4655,11 +4711,304 @@ func _report_foreign_grid_access(grid: Dictionary) -> void:
 	_set_message("ACCESS LOCKED // PROPERTY OF %s" % owner, true)
 
 
-func _send(message: Dictionary) -> bool:
+func _mutation_actor_matches_session() -> bool:
+	if mutation_queue_actor_id.is_empty() and in_flight_mutation_actor_id.is_empty():
+		return true
+	if session_role_kind != "player" or bound_player_id.is_empty():
+		return false
+	return (
+		(mutation_queue_actor_id.is_empty() or mutation_queue_actor_id == bound_player_id)
+		and (
+			in_flight_mutation_actor_id.is_empty()
+			or in_flight_mutation_actor_id == bound_player_id
+		)
+	)
+
+
+func _clear_mutation_pipeline() -> void:
+	mutation_queue.clear()
+	mutation_queue_actor_id = ""
+	in_flight_mutation = {}
+	in_flight_mutation_text = ""
+	in_flight_mutation_actor_id = ""
+	mutation_retry_elapsed = 0.0
+	mutation_retry_count = 0
+
+
+func _refresh_mutation_actor_binding() -> void:
+	if mutation_queue.is_empty() and in_flight_mutation.is_empty():
+		mutation_queue_actor_id = ""
+		in_flight_mutation_actor_id = ""
+
+
+func _queue_mutation(message: Dictionary) -> bool:
+	if (
+		not connected
+		or not authoritative_player_ready
+		or not operation_frontier_ready
+		or mutation_resync_required
+		or session_role_kind != "player"
+		or bound_player_id.is_empty()
+	):
+		_set_message("AUTHORITATIVE COMMAND FRONTIER UNAVAILABLE // RESYNC REQUIRED", true)
+		return false
+	if message.has("operation_sequence"):
+		_set_message("CLIENT COMMAND REJECTED // SEQUENCE IS SERVER-RECONCILED", true)
+		return false
+	if mutation_queue_actor_id.is_empty():
+		mutation_queue_actor_id = bound_player_id
+	if mutation_queue_actor_id != bound_player_id:
+		_set_message("CLIENT COMMAND REJECTED // SESSION ACTOR CHANGED", true)
+		return false
+
+	var queued := message.duplicate(true)
+	if String(queued.get("type", "")) == "set_player_control" and _coalesce_queued_control(queued):
+		return true
+	if mutation_queue.size() >= MUTATION_QUEUE_LIMIT:
+		_set_message("COMMAND BUFFER FULL // WAITING FOR AUTHORITY", true)
+		return false
+	mutation_queue.append(queued)
+	_dispatch_next_mutation()
+	return true
+
+
+func _coalesce_queued_control(message: Dictionary) -> bool:
+	if mutation_queue.is_empty():
+		return false
+	var queued: Dictionary = mutation_queue.back()
+	if String(queued.get("type", "")) != "set_player_control":
+		return false
+	var superseded_input_sequence := int(queued.get("input_sequence", 0))
+	mutation_queue[mutation_queue.size() - 1] = message.duplicate(true)
+	var retained_controls: Array[Dictionary] = []
+	for pending in pending_controls:
+		if int(pending.get("input_sequence", 0)) != superseded_input_sequence:
+			retained_controls.append(pending)
+	pending_controls = retained_controls
+	prediction_history_invalid = true
+	return true
+
+
+func _dispatch_next_mutation() -> bool:
+	if (
+		not in_flight_mutation.is_empty()
+		or mutation_queue.is_empty()
+		or not connected
+		or not authoritative_player_ready
+		or not operation_frontier_ready
+		or mutation_resync_required
+		or not _mutation_actor_matches_session()
+	):
+		return false
+	if committed_operation_sequence >= 9223372036854775807:
+		mutation_resync_required = true
+		_set_message("COMMAND SEQUENCE EXHAUSTED // AUTHORITY HALTED", true)
+		return false
+
+	var message: Dictionary = mutation_queue.pop_front()
+	message["operation_sequence"] = committed_operation_sequence + 1
+	in_flight_mutation = message.duplicate(true)
+	in_flight_mutation_text = JSON.stringify(in_flight_mutation)
+	in_flight_mutation_actor_id = bound_player_id
+	mutation_retry_elapsed = 0.0
+	mutation_retry_count = 0
+	if not _send_text_transport(in_flight_mutation_text):
+		operation_frontier_ready = false
+		return false
+	return true
+
+
+func _advance_mutation_transport(delta: float) -> void:
+	if (
+		in_flight_mutation.is_empty()
+		or not connected
+		or not authoritative_player_ready
+		or not operation_frontier_ready
+		or mutation_resync_required
+	):
+		return
+	mutation_retry_elapsed += delta
+	if mutation_retry_elapsed < MUTATION_RETRY_INTERVAL:
+		return
+	if mutation_retry_count >= MUTATION_RETRY_LIMIT:
+		_request_operation_resync("COMMAND RECEIPT TIMEOUT")
+		return
+	mutation_retry_elapsed = 0.0
+	mutation_retry_count += 1
+	if not _send_text_transport(in_flight_mutation_text):
+		operation_frontier_ready = false
+
+
+func _request_operation_resync(reason: String) -> void:
+	mutation_resync_required = true
+	operation_frontier_ready = false
+	authoritative_player_ready = false
+	_set_message("%s // REQUESTING AUTHORITATIVE FRONTIER" % reason, true)
+	if socket.get_ready_state() == WebSocketPeer.STATE_OPEN:
+		_send_transport({"type": "request_snapshot"})
+
+
+func _reconcile_operation_frontier(frontier: int) -> bool:
+	if frontier < 0 or not _mutation_actor_matches_session():
+		mutation_resync_required = true
+		return false
+	if (
+		operation_frontier_observed
+		and committed_operation_actor_id == bound_player_id
+		and frontier < committed_operation_sequence
+	):
+		mutation_resync_required = true
+		return false
+	if (
+		operation_frontier_observed
+		and not committed_operation_actor_id.is_empty()
+		and committed_operation_actor_id != bound_player_id
+	):
+		mutation_resync_required = true
+		return false
+	committed_operation_actor_id = bound_player_id
+	if in_flight_mutation.is_empty():
+		committed_operation_sequence = frontier
+		operation_frontier_observed = true
+		operation_frontier_ready = true
+		mutation_resync_required = false
+		_refresh_mutation_actor_binding()
+		return true
+
+	var pending_sequence := int(in_flight_mutation.get("operation_sequence", 0))
+	if pending_sequence <= 0 or frontier < pending_sequence - 1:
+		mutation_resync_required = true
+		return false
+	if frontier == pending_sequence - 1:
+		committed_operation_sequence = frontier
+		operation_frontier_observed = true
+		operation_frontier_ready = true
+		mutation_resync_required = false
+		mutation_retry_elapsed = MUTATION_RETRY_INTERVAL
+		mutation_retry_count = 0
+		return true
+	if frontier == pending_sequence:
+		committed_operation_sequence = frontier
+		operation_frontier_observed = true
+		in_flight_mutation = {}
+		in_flight_mutation_text = ""
+		in_flight_mutation_actor_id = ""
+		mutation_retry_elapsed = 0.0
+		mutation_retry_count = 0
+		operation_frontier_ready = true
+		mutation_resync_required = false
+		_refresh_mutation_actor_binding()
+		return true
+
+	# Another writer advanced this actor while the local command outcome was
+	# unknown. The pending command is committed, but later queued commands were
+	# authored against an obsolete frontier and must never be guessed forward.
+	committed_operation_sequence = frontier
+	operation_frontier_observed = true
+	_clear_mutation_pipeline()
+	operation_frontier_ready = true
+	mutation_resync_required = false
+	_set_message("COMMAND QUEUE DISCARDED // ACTOR FRONTIER ADVANCED ELSEWHERE", true)
+	return true
+
+
+func _handle_intent_accepted(receipt: Dictionary) -> bool:
+	if (
+		not receipt.has("operation_sequence")
+		or typeof(receipt.get("operation_sequence")) != TYPE_INT
+	):
+		_request_operation_resync("MALFORMED COMMAND RECEIPT")
+		return false
+	var sequence := int(receipt.get("operation_sequence", 0))
+	if sequence <= committed_operation_sequence:
+		return false
+	if in_flight_mutation.is_empty():
+		_request_operation_resync("UNEXPECTED COMMAND RECEIPT")
+		return false
+	if (
+		sequence != int(in_flight_mutation.get("operation_sequence", 0))
+		or String(receipt.get("operation_id", ""))
+		!= String(in_flight_mutation.get("operation_id", ""))
+		or sequence != committed_operation_sequence + 1
+	):
+		_request_operation_resync("COMMAND RECEIPT CONFLICT")
+		return false
+	committed_operation_sequence = sequence
+	committed_operation_actor_id = bound_player_id
+	operation_frontier_observed = true
+	in_flight_mutation = {}
+	in_flight_mutation_text = ""
+	in_flight_mutation_actor_id = ""
+	mutation_retry_elapsed = 0.0
+	mutation_retry_count = 0
+	operation_frontier_ready = true
+	mutation_resync_required = false
+	_refresh_mutation_actor_binding()
+	_dispatch_next_mutation()
+	return true
+
+
+func _handle_intent_rejected(message: Dictionary) -> bool:
+	var sequence_value: Variant = message.get("operation_sequence", null)
+	if sequence_value == null or typeof(sequence_value) != TYPE_INT:
+		_request_operation_resync("UNBOUND COMMAND REJECTION")
+		return false
+	var sequence := int(sequence_value)
+	if sequence <= committed_operation_sequence:
+		return false
+	if in_flight_mutation.is_empty():
+		_request_operation_resync("UNEXPECTED COMMAND REJECTION")
+		return false
+	var response_operation_id := String(message.get("operation_id", ""))
+	if (
+		sequence != int(in_flight_mutation.get("operation_sequence", 0))
+		or response_operation_id.is_empty()
+		or response_operation_id != String(in_flight_mutation.get("operation_id", ""))
+	):
+		_request_operation_resync("COMMAND REJECTION CONFLICT")
+		return false
+	var code := String(message.get("code", ""))
+	if code in [
+		"operation_conflict",
+		"operation_sequence_gap",
+		"operation_already_committed",
+		"operation_history_invalid",
+		"operation_sequence_invalid",
+		"operation_sequence_exhausted",
+	]:
+		_request_operation_resync("AUTHORITATIVE %s" % code.to_upper())
+		return false
+
+	# Gameplay validation did not consume the frontier. Drop only the rejected
+	# command so the next queued command reuses this exact sequence.
+	var rejected_player_control := (
+		String(in_flight_mutation.get("type", "")) == "set_player_control"
+	)
+	in_flight_mutation = {}
+	in_flight_mutation_text = ""
+	in_flight_mutation_actor_id = ""
+	mutation_retry_elapsed = 0.0
+	mutation_retry_count = 0
+	_refresh_mutation_actor_binding()
+	if rejected_player_control:
+		# Do not send anything authored from the stale prediction baseline. The
+		# complete snapshot will reconcile the reusable operation frontier first.
+		_reset_control_prediction_after_rejection()
+		_request_operation_resync("PLAYER CONTROL REJECTED")
+		return true
+	_dispatch_next_mutation()
+	return true
+
+
+func _send_transport(message: Dictionary) -> bool:
+	return _send_text_transport(JSON.stringify(message))
+
+
+func _send_text_transport(encoded_message: String) -> bool:
 	if socket.get_ready_state() != WebSocketPeer.STATE_OPEN:
 		_set_message("No authoritative server connection — press F5", true)
 		return false
-	var error := socket.send_text(JSON.stringify(message))
+	var error := socket.send_text(encoded_message)
 	if error != OK:
 		_set_message("Network send failed: %s" % error_string(error), true)
 		return false

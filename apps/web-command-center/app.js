@@ -13,8 +13,6 @@ const elements = Object.fromEntries(
 
 let socket;
 let world;
-let actorPrivate;
-let operationSequence = 0;
 let selectedGridId = "grid-starter";
 let sessionRole = { kind: "spectator" };
 
@@ -108,14 +106,13 @@ function connect() {
     elements.connection.className = "connection online";
     socket.send(JSON.stringify({
       type: "hello",
-      protocol_version: 13,
-      client_name: "browser-command-center-p1.2",
+      protocol_version: 14,
+      client_name: "browser-command-center-p1.3",
       authentication: { kind: "spectator" },
     }));
   });
   socket.addEventListener("close", () => {
     world = undefined;
-    actorPrivate = undefined;
     sessionRole = { kind: "spectator" };
     elements.connection.textContent = "○ RECONNECTING";
     elements.connection.className = "connection offline";
@@ -136,7 +133,6 @@ function connect() {
         false,
       );
     } else if (message.type === "snapshot") {
-      actorPrivate = undefined;
       world = publicProjection(message.snapshot);
       render();
     } else if (message.type === "motion_state" && world) {
@@ -158,25 +154,6 @@ function publicProjection(projected) {
   if (!projected || typeof projected !== "object") return undefined;
   const { actor_private: _private, ...publicState } = projected;
   return publicState;
-}
-
-function intent(type, payload = {}) {
-  if (!socket || socket.readyState !== WebSocket.OPEN) {
-    activity("No authoritative connection", true);
-    return;
-  }
-  if (sessionRole.kind !== "player") {
-    activity("This public spectator session is read-only", true);
-    return;
-  }
-  operationSequence += 1;
-  socket.send(JSON.stringify({
-    type,
-    operation_id: [
-      "browser", type, Date.now(), operationSequence,
-    ].join("-"),
-    ...payload,
-  }));
 }
 
 function selectedGrid() {
@@ -379,21 +356,8 @@ function start() {
   });
   document.getElementById("refine").disabled = true;
   document.getElementById("craft").disabled = true;
-  document.getElementById("anchor").addEventListener("click", () => {
-    const grid = selectedGrid();
-    if (grid) intent("toggle_grid_anchor", { grid_id: grid.grid_id });
-  });
-  document.getElementById("stop").addEventListener("click", () => {
-    const grid = selectedGrid();
-    if (grid) {
-      intent("set_grid_control", {
-        grid_id: grid.grid_id,
-        linear_input: { x: 0, y: 0, z: 0 },
-        angular_input: { x: 0, y: 0, z: 0 },
-        dampeners: true,
-      });
-    }
-  });
+  document.getElementById("anchor").disabled = true;
+  document.getElementById("stop").disabled = true;
   elements["universe-map"].addEventListener("click", () => {
     if (!world?.grids.length) return;
     const current = world.grids.findIndex(
