@@ -2,7 +2,7 @@
 
 The Verse is an open-source persistent voxel space universe, work-and-economy simulator, and Web3 marketplace.
 
-The repository now contains the **P0.8 survival-death foundation**, built on Orbital Operations and server-authoritative contact physics. It is still a single-player proof—not yet the public multiplayer universe or real-value economy—but realistic orbital separation, six-axis EVA orientation, physical inventory, consequential oxygen, mining, staged construction, and persistent recovery now share one authoritative world.
+The repository now contains the **locally verified P0.9 authoritative-EVA checkpoint**, built on Orbital Operations, server-authoritative contact physics, and the P0.8 survival-death foundation. It is still a single-player proof—not yet the public multiplayer universe or real-value economy—but input-only six-axis EVA, realistic orbital separation, physical inventory, consequential oxygen, mining, staged construction, and persistent recovery now share one authoritative world.
 
 ## Play it on macOS
 
@@ -15,7 +15,7 @@ tools/dev/run-local.sh
 
 The bootstrap downloads the pinned Godot 4.7.2 editor from the official release and verifies its checksum. The launcher starts the authoritative server and native client. While the server is running, the browser command center is available at <http://127.0.0.1:7777>.
 
-You begin in the Khepri Prime orbital sector beside a powered 25-block salvage skiff and an independent mineable asteroid. The planet surface is more than three kilometers away; the starting field is vacuum with weak distant gravity, not a planetary outcrop. The guided contract asks you to extract three voxels, refine ore, fabricate a component, extend the rig, and anchor it into the asteroid. Actions earn persistent career experience and clearance levels.
+You begin in the Khepri Prime orbital sector beside a powered 25-block salvage skiff and an independent mineable asteroid. The planet surface is more than three kilometers away; the starting field is vacuum with weak distant gravity, not a planetary outcrop. The authoritative server consumes sequenced movement controls and owns the character's pose, gravity, collision, and landing contact. The guided contract asks you to extract three voxels, refine ore, fabricate a component, extend the rig, and anchor it into the asteroid. Actions earn persistent career experience and clearance levels.
 
 Native controls are shown in the client:
 
@@ -50,7 +50,7 @@ Linux native client packaging and signed direct downloads remain scheduled work.
 tools/ci/check.sh
 ```
 
-This runs the Rust tests and lints, browser syntax checks, Godot validation, and an end-to-end scenario that restarts the server and proves exact state recovery. See the [Survival Death checkpoint](docs/gameplay/survival-death.md), [Contact Physics checkpoint](docs/gameplay/contact-physics.md), and [P0 implementation guide](docs/architecture/p0-implementation.md) for scope and limitations.
+This runs the Rust tests and lints, browser syntax checks, Godot validation, native motion-impairment coverage, and an input-only end-to-end scenario that restarts the server and proves exact state recovery. See the [Authoritative EVA checkpoint](docs/gameplay/authoritative-character-motion.md), [Survival Death checkpoint](docs/gameplay/survival-death.md), [Contact Physics checkpoint](docs/gameplay/contact-physics.md), and [P0 implementation guide](docs/architecture/p0-implementation.md) for scope and limitations.
 
 ## Product pillars
 
@@ -77,7 +77,7 @@ Start with [the documentation map](docs/README.md), then read:
 
 ## Current status
 
-P0.8 adds atomic oxygen incapacitation, conserved death-drop creation, server-selected free recovery, critical/dead native HUD states, and mutation gating to the existing orbital mining, manufacturing, construction, destruction, inventory, and Jolt contact-physics loop. Inventory text entry now owns printable shortcuts, and jetpack drift follows authoritative environmental gravity in local prediction when dampeners are disabled. Input-only server character motion, planet landing, multiplayer, drop recovery/expiry, global streaming, safe zones, accounts, AMMs, and blockchain settlement remain sequenced in the [delivery roadmap](docs/roadmap/roadmap.md).
+P0.9 replaces client-submitted character positions with durable input-only controls and one atomic Jolt-backed character/grid physics step. Protocol 9 distinguishes a durably received control from one consumed by a fixed substep, so a back-to-back press and release—including tapped `Q`/`E` roll—cannot be overwritten between worker polls. The native client predicts inverse-square gravity and bounded EVA motion, reconciles lightweight authoritative states, and retains the P0.8 oxygen, death-drop, and recovery loop. The complete local verification and dedicated native impairment harness are green on macOS; an observed Ubuntu tolerance run and native Linux package remain required. Walking, jump, multiplayer, drop recovery/expiry, global streaming, safe zones, accounts, AMMs, and blockchain settlement remain sequenced in the [delivery roadmap](docs/roadmap/roadmap.md).
 
 ## Licensing
 
