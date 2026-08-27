@@ -67,12 +67,32 @@ impl AppState {
 
     pub fn advance(&self, delta_millis: u16) -> Result<bool, RuntimeError> {
         let mut runtime = self.runtime.lock();
-        let before_life_state = runtime.state().player.life_state.clone();
-        let before_oxygen = runtime.state().player.suit_oxygen_milli;
+        let before_lifecycle = runtime
+            .state()
+            .player
+            .iter()
+            .map(|(player_id, player)| {
+                (
+                    player_id.clone(),
+                    player.life_state.clone(),
+                    player.suit_oxygen_milli,
+                )
+            })
+            .collect::<Vec<_>>();
         let changed = runtime.advance(delta_millis)?;
         if changed {
-            let lifecycle_changed = runtime.state().player.life_state != before_life_state
-                || runtime.state().player.suit_oxygen_milli != before_oxygen;
+            let lifecycle_changed = runtime
+                .state()
+                .player
+                .iter()
+                .map(|(player_id, player)| {
+                    (
+                        player_id.clone(),
+                        player.life_state.clone(),
+                        player.suit_oxygen_milli,
+                    )
+                })
+                .ne(before_lifecycle);
             let update = if lifecycle_changed {
                 ServerMessage::Snapshot {
                     snapshot: Box::new(runtime.snapshot()),
@@ -343,7 +363,12 @@ async fn complete_handshake(
                     let binding = match authentication {
                         ClientAuthentication::Spectator => SessionBinding::Spectator,
                         ClientAuthentication::LocalDevelopment { player_id } => {
-                            if player_id != state.snapshot().player.player_id {
+                            if !state
+                                .snapshot()
+                                .players
+                                .iter()
+                                .any(|player| player.player_id == player_id)
+                            {
                                 send_fatal_and_close(
                                     sender,
                                     "actor_not_present",
@@ -603,7 +628,11 @@ mod tests {
 
     fn test_state() -> Arc<AppState> {
         let directory = tempdir().expect("tempdir").keep();
-        AppState::new(Runtime::open(directory, 99, 20).expect("runtime"))
+        let mut runtime = Runtime::open(directory, 99, 20).expect("runtime");
+        runtime
+            .admit_development_player("player-remote")
+            .expect("remote development player admits");
+        AppState::new(runtime)
     }
 
     type TestSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
@@ -639,6 +668,19 @@ mod tests {
         }
     }
 
+    async fn receive_until(
+        socket: &mut TestSocket,
+        predicate: impl Fn(&ServerMessage) -> bool,
+    ) -> ServerMessage {
+        for _ in 0..16 {
+            let message = receive_server_message(socket).await;
+            if predicate(&message) {
+                return message;
+            }
+        }
+        panic!("expected server message did not arrive within the bounded queue");
+    }
+
     async fn send_client_message(socket: &mut TestSocket, message: &ClientMessage) {
         socket
             .send(ClientWebSocketMessage::Text(
@@ -650,14 +692,18 @@ mod tests {
             .expect("client message sends");
     }
 
-    fn local_player_hello(client_name: &str) -> ClientMessage {
+    fn player_hello(client_name: &str, player_id: &str) -> ClientMessage {
         ClientMessage::Hello {
             protocol_version: PROTOCOL_VERSION,
             client_name: client_name.into(),
             authentication: ClientAuthentication::LocalDevelopment {
-                player_id: "player-local".into(),
+                player_id: player_id.into(),
             },
         }
+    }
+
+    fn local_player_hello(client_name: &str) -> ClientMessage {
+        player_hello(client_name, "player-local")
     }
 
     async fn assert_socket_closes(socket: &mut TestSocket) {
@@ -837,6 +883,150 @@ mod tests {
         ));
         assert_socket_closes(&mut unknown).await;
         unknown_server.abort();
+    }
+
+    #[tokio::test]
+    async fn two_player_sockets_bind_and_advance_independent_control_frontiers() {
+        let (mut local, state, server) = connect_test_socket().await;
+        send_client_message(&mut local, &local_player_hello("local-two-player-test")).await;
+        assert!(matches!(
+            receive_server_message(&mut local).await,
+            ServerMessage::Welcome {
+                session_role: SessionRole::Player { ref player_id },
+                ..
+            } if player_id == "player-local"
+        ));
+        let ServerMessage::Snapshot {
+            snapshot: local_snapshot,
+        } = receive_server_message(&mut local).await
+        else {
+            panic!("local player receives the shared initial snapshot");
+        };
+
+        let address = match local.get_ref() {
+            MaybeTlsStream::Plain(stream) => stream.peer_addr().expect("server address"),
+            _ => panic!("test connection is plain WebSocket"),
+        };
+        let (mut remote, _) = connect_async(format!("ws://{address}/ws"))
+            .await
+            .expect("remote test websocket connects");
+        send_client_message(
+            &mut remote,
+            &player_hello("remote-two-player-test", "player-remote"),
+        )
+        .await;
+        assert!(matches!(
+            receive_server_message(&mut remote).await,
+            ServerMessage::Welcome {
+                session_role: SessionRole::Player { ref player_id },
+                ..
+            } if player_id == "player-remote"
+        ));
+        let ServerMessage::Snapshot {
+            snapshot: remote_snapshot,
+        } = receive_server_message(&mut remote).await
+        else {
+            panic!("remote player receives the shared initial snapshot");
+        };
+        assert_eq!(local_snapshot.world_hash, remote_snapshot.world_hash);
+        assert_eq!(
+            local_snapshot
+                .players
+                .iter()
+                .map(|player| player.player_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["player-local", "player-remote"]
+        );
+
+        let shared_operation_id = "two-socket-shared-operation";
+        let local_player = local_snapshot
+            .players
+            .iter()
+            .find(|player| player.player_id == "player-local")
+            .expect("local roster member exists");
+        send_client_message(
+            &mut local,
+            &ClientMessage::SetPlayerControl {
+                operation_id: shared_operation_id.into(),
+                movement_epoch: local_player.movement_epoch,
+                input_sequence: 1,
+                linear_input: verse_protocol::Vec3::new(1.0, 0.0, 0.0),
+                angular_input: verse_protocol::Vec3::ZERO,
+                boost: false,
+                jump: false,
+                dampeners: true,
+            },
+        )
+        .await;
+        assert!(matches!(
+            receive_until(&mut local, |message| matches!(
+                message,
+                ServerMessage::IntentAccepted { .. }
+            ))
+            .await,
+            ServerMessage::IntentAccepted { .. }
+        ));
+
+        let remote_player = remote_snapshot
+            .players
+            .iter()
+            .find(|player| player.player_id == "player-remote")
+            .expect("remote roster member exists");
+        send_client_message(
+            &mut remote,
+            &ClientMessage::SetPlayerControl {
+                operation_id: shared_operation_id.into(),
+                movement_epoch: remote_player.movement_epoch,
+                input_sequence: 1,
+                linear_input: verse_protocol::Vec3::new(-1.0, 0.0, 0.0),
+                angular_input: verse_protocol::Vec3::ZERO,
+                boost: false,
+                jump: false,
+                dampeners: true,
+            },
+        )
+        .await;
+        assert!(matches!(
+            receive_until(&mut remote, |message| matches!(
+                message,
+                ServerMessage::IntentAccepted { .. }
+            ))
+            .await,
+            ServerMessage::IntentAccepted { .. }
+        ));
+
+        let shared = state.snapshot();
+        assert_eq!(shared.event_sequence, 2);
+        assert!(shared.players.iter().all(|player| {
+            player.last_received_input_sequence == 1 && player.last_processed_input_sequence == 0
+        }));
+        for socket in [&mut local, &mut remote] {
+            send_client_message(socket, &ClientMessage::RequestSnapshot).await;
+        }
+        let ServerMessage::Snapshot {
+            snapshot: local_final,
+        } = receive_until(&mut local, |message| {
+            matches!(message, ServerMessage::Snapshot { .. })
+        })
+        .await
+        else {
+            unreachable!();
+        };
+        let ServerMessage::Snapshot {
+            snapshot: remote_final,
+        } = receive_until(&mut remote, |message| {
+            matches!(message, ServerMessage::Snapshot { .. })
+        })
+        .await
+        else {
+            unreachable!();
+        };
+        assert_eq!(local_final.world_hash, remote_final.world_hash);
+        assert_eq!(local_final.world_hash, shared.world_hash);
+
+        local.close(None).await.expect("local socket closes");
+        remote.close(None).await.expect("remote socket closes");
+        server.abort();
     }
 
     #[tokio::test]

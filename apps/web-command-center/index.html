@@ -24,6 +24,7 @@
       <section class="notice">
         P1.0 public spectator proof. This screen observes the same authoritative
         cell as the native client. Gameplay mutations require a player-bound session.
+        <strong id="session-status">CONNECTING // READ-ONLY</strong>
       </section>
 
       <section class="metrics" aria-label="Universe metrics">
@@ -63,14 +64,16 @@
             <span><i class="rock"></i>Rock</span>
             <span><i class="ore"></i>Ferrite</span>
             <span><i class="grid"></i>Grid</span>
-            <span><i class="player"></i>Player</span>
+            <span><i class="player"></i>Authoritative player</span>
+            <strong id="active-players">0 AUTHORITATIVE PLAYERS</strong>
           </div>
+          <ol id="player-roster" class="player-roster" aria-label="Active players"></ol>
         </article>
 
         <aside>
           <article class="panel">
-            <p class="eyebrow">PUBLIC PILOT PROFILE</p>
-            <h2 id="profile-rank">SALVAGER // LEVEL 1</h2>
+            <p id="profile-label" class="eyebrow">PRIMARY PILOT PROFILE</p>
+            <h2 id="profile-rank">AWAITING AUTHORITATIVE PILOT</h2>
             <p id="career-progress" class="career-progress">0 / 100 XP</p>
             <dl>
               <div><dt>Ore</dt><dd id="ore">0</dd></div>

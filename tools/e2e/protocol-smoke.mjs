@@ -87,12 +87,19 @@ function applyMotion(world, motion) {
   const movingGrids = new Map(
     motion.grids.map((grid) => [grid.grid_id, grid]),
   );
+  const movingPlayers = new Map(
+    (motion.players ?? [motion.player]).map((player) => [player.player_id, player]),
+  );
   return {
     ...world,
     event_sequence: motion.event_sequence,
     simulation_tick: motion.simulation_tick,
     world_hash: motion.world_hash,
     player: { ...world.player, ...motion.player },
+    players: world.players.map((player) => ({
+      ...player,
+      ...(movingPlayers.get(player.player_id) ?? {}),
+    })),
     grids: world.grids.map((grid) => ({
       ...grid,
       ...(movingGrids.get(grid.grid_id) ?? {}),
@@ -350,6 +357,15 @@ async function run() {
   assert.equal(world.conservation.valid, true);
   assert.equal(world.content_manifest_version, "p0.10.0");
   assert.equal(world.grids.length, 1);
+  assert.deepEqual(
+    world.players.map((player) => player.player_id),
+    ["player-local", "player-remote"],
+  );
+  assert.equal(
+    new Set(world.players.map((player) => player.inventory_id)).size,
+    world.players.length,
+    "each authoritative actor owns a distinct carried inventory",
+  );
   assert.ok(world.voxels.length > 1_000);
   assert.equal(world.environment.celestial_body_name, "Khepri Prime");
   assert.equal(world.environment.breathable, false);

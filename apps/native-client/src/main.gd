@@ -13,7 +13,8 @@ const CLOUD_SHADER: Shader = preload("res://shaders/planet_clouds.gdshader")
 const BLOCK_DAMAGE_SHADER: Shader = preload("res://shaders/block_damage.gdshader")
 const PROTOCOL_VERSION := 11
 const DEFAULT_SERVER := "ws://127.0.0.1:7777/ws"
-const PLAYER_INVENTORY := "inventory-player-local"
+const DEFAULT_PLAYER_ID := "player-local"
+const DEFAULT_PLAYER_INVENTORY := "inventory-player-local"
 const STARTER_GRID := "grid-starter"
 # Clean-room prediction mirrors the protocol-fenced p0.10.0 character content.
 # The server remains authoritative for elapsed time, contacts, and final motion.
@@ -73,6 +74,8 @@ const DENSITY_NEIGHBORS: Array[Vector3i] = [
 
 var socket := WebSocketPeer.new()
 var server_url := DEFAULT_SERVER
+var requested_player_id := DEFAULT_PLAYER_ID
+var bound_player_id := ""
 var connected := false
 var handshake_sent := false
 var operation_counter := 0
@@ -115,6 +118,7 @@ var voxel_coordinate_lookup: Dictionary = {}
 var voxel_chunk_nodes: Dictionary = {}
 var grid_lookup: Dictionary = {}
 var grid_node_lookup: Dictionary = {}
+var remote_player_nodes: Dictionary = {}
 var rendered_voxel_count := -1
 var selected_block_kind := "structural"
 var target_voxel: Variant = null
@@ -153,6 +157,7 @@ var inventory_search_queries := {"suit": "", "cargo": ""}
 var camera: Camera3D
 var asteroid_root: Node3D
 var grids_root: Node3D
+var players_root: Node3D
 var stars_root: Node3D
 var planet_root: Node3D
 var target_highlight: MeshInstance3D
@@ -365,8 +370,31 @@ func _player_is_incapacitated(player: Dictionary) -> bool:
 
 
 func _local_player_incapacitated() -> bool:
-	var player: Dictionary = snapshot.get("player", {})
+	var player := _local_player()
 	return not _player_controls_enabled(player)
+
+
+func _controlled_player_id() -> String:
+	return bound_player_id if not bound_player_id.is_empty() else requested_player_id
+
+
+func _player_from_roster(players: Array, player_id: String) -> Dictionary:
+	for candidate in players:
+		if candidate is Dictionary and String(candidate.get("player_id", "")) == player_id:
+			return candidate
+	return {}
+
+
+func _local_player() -> Dictionary:
+	var players: Array = snapshot.get("players", [])
+	var selected := _player_from_roster(players, _controlled_player_id())
+	if not selected.is_empty():
+		return selected
+	return snapshot.get("player", {})
+
+
+func _local_inventory_id() -> String:
+	return String(_local_player().get("inventory_id", DEFAULT_PLAYER_INVENTORY))
 
 
 func _life_support_display_state(player: Dictionary) -> String:
@@ -387,6 +415,8 @@ func _parse_command_line() -> void:
 	for argument in OS.get_cmdline_user_args():
 		if argument.begins_with("--server="):
 			server_url = argument.trim_prefix("--server=")
+		elif argument.begins_with("--player-id="):
+			requested_player_id = argument.trim_prefix("--player-id=")
 		elif argument == "--smoke-test":
 			smoke_test = true
 
@@ -465,6 +495,9 @@ func _build_environment() -> void:
 	grids_root = Node3D.new()
 	grids_root.name = "AuthoritativeGrids"
 	add_child(grids_root)
+	players_root = Node3D.new()
+	players_root.name = "AuthoritativeRemotePlayers"
+	add_child(players_root)
 	stars_root = Node3D.new()
 	stars_root.name = "Starfield"
 	add_child(stars_root)
@@ -1444,7 +1477,7 @@ func _poll_socket() -> void:
 				"client_name": "godot-native-p1.0",
 				"authentication": {
 					"kind": "local_development",
-					"player_id": "player-local",
+					"player_id": requested_player_id,
 				},
 			})
 		while socket.get_available_packet_count() > 0:
@@ -1474,7 +1507,13 @@ func _poll_socket() -> void:
 func _handle_server_message(message: Dictionary) -> void:
 	match message.get("type", ""):
 		"welcome":
-			_set_message("Connected to %s" % message.get("server_name", "The Verse"))
+			var session_role: Dictionary = message.get("session_role", {})
+			if String(session_role.get("kind", "")) == "player":
+				bound_player_id = String(session_role.get("player_id", requested_player_id))
+			_set_message(
+				"Connected to %s // %s"
+				% [message.get("server_name", "The Verse"), _controlled_player_id()]
+			)
 		"snapshot":
 			_apply_snapshot(message.get("snapshot", {}))
 		"motion_state":
@@ -1487,7 +1526,7 @@ func _handle_server_message(message: Dictionary) -> void:
 				_set_message("Recovery authorized // awaiting authoritative snapshot")
 			if smoke_test and receipt.get("operation_id", "") == smoke_operation:
 				smoke_receipt_received = true
-				_check_smoke_control_ack(snapshot.get("player", {}))
+				_check_smoke_control_ack(_local_player())
 		"intent_rejected":
 			pending_mine_position = null
 			var rejected_operation := String(message.get("operation_id", ""))
@@ -1515,9 +1554,14 @@ func _apply_snapshot(authoritative: Dictionary) -> void:
 		event_sequence, last_authoritative_event_sequence
 	):
 		return
-	_capture_prediction_gravity(authoritative)
-	snapshot = authoritative
-	var player: Dictionary = snapshot.get("player", {})
+	snapshot = authoritative.duplicate(true)
+	var players: Array = snapshot.get("players", [])
+	var player := _player_from_roster(players, _controlled_player_id())
+	if player.is_empty():
+		player = snapshot.get("player", {})
+	snapshot["player"] = player
+	_capture_prediction_gravity(snapshot)
+	_sync_remote_players(players)
 	var level := int(player.get("level", 1))
 	if level > last_level:
 		_set_message("CLEARANCE ADVANCED // SALVAGER LEVEL %d" % level)
@@ -1589,15 +1633,36 @@ func _apply_motion_state(motion: Dictionary) -> void:
 	var event_sequence := int(motion.get("event_sequence", -1))
 	if event_sequence <= last_authoritative_event_sequence:
 		return
-	var player_motion: Dictionary = motion.get("player", {})
-	var merged_player: Dictionary = snapshot.get("player", {}).duplicate(true)
-	for key in player_motion:
-		merged_player[key] = player_motion[key]
+	var existing_players: Array = snapshot.get("players", []).duplicate(true)
+	var motion_players: Array = motion.get("players", [])
+	if motion_players.is_empty() and motion.get("player", {}) is Dictionary:
+		motion_players = [motion.get("player", {})]
+	for player_motion in motion_players:
+		if not player_motion is Dictionary:
+			continue
+		var player_id := String(player_motion.get("player_id", ""))
+		var found := false
+		for index in existing_players.size():
+			if String(existing_players[index].get("player_id", "")) != player_id:
+				continue
+			var merged: Dictionary = existing_players[index].duplicate(true)
+			for key in player_motion:
+				merged[key] = player_motion[key]
+			existing_players[index] = merged
+			found = true
+			break
+		if not found:
+			existing_players.append(player_motion.duplicate(true))
+	snapshot["players"] = existing_players
+	var merged_player := _player_from_roster(existing_players, _controlled_player_id())
+	if merged_player.is_empty():
+		merged_player = snapshot.get("player", {}).duplicate(true)
 	snapshot["player"] = merged_player
 	snapshot["event_sequence"] = event_sequence
 	snapshot["simulation_tick"] = int(motion.get("simulation_tick", 0))
 	snapshot["world_hash"] = String(motion.get("world_hash", ""))
 	_update_grid_motion(motion.get("grids", []))
+	_sync_remote_players(existing_players)
 	_apply_authoritative_player(
 		merged_player,
 		int(motion.get("simulation_tick", 0)),
@@ -1620,6 +1685,116 @@ func _update_grid_motion(grids: Array) -> void:
 		if grid_node != null:
 			grid_node.position = _vec3(grid.get("position", {}))
 			grid_node.quaternion = _grid_quaternion(grid)
+
+
+func _sync_remote_players(players: Array) -> void:
+	if players_root == null:
+		return
+	var visible_ids: Dictionary = {}
+	for player in players:
+		if not player is Dictionary:
+			continue
+		var player_id := String(player.get("player_id", ""))
+		if player_id.is_empty() or player_id == _controlled_player_id():
+			continue
+		visible_ids[player_id] = true
+		var node: Node3D = remote_player_nodes.get(player_id, null)
+		if node == null:
+			node = _build_remote_player_visual(player_id)
+			remote_player_nodes[player_id] = node
+			players_root.add_child(node)
+		node.position = _vec3(player.get("position", {}))
+		node.quaternion = _quat(player.get("orientation", {}))
+		node.visible = true
+	for player_id in remote_player_nodes.keys().duplicate():
+		if visible_ids.has(player_id):
+			continue
+		var stale: Node3D = remote_player_nodes[player_id]
+		remote_player_nodes.erase(player_id)
+		stale.queue_free()
+
+
+func _remote_player_visuals_match(players: Array) -> bool:
+	var expected: Dictionary = {}
+	for player in players:
+		if not player is Dictionary:
+			continue
+		var player_id := String(player.get("player_id", ""))
+		if player_id.is_empty() or player_id == _controlled_player_id():
+			continue
+		expected[player_id] = player
+	if remote_player_nodes.size() != expected.size():
+		return false
+	for player_id in expected:
+		var node: Node3D = remote_player_nodes.get(player_id, null)
+		if node == null or not is_instance_valid(node) or node.get_parent() != players_root:
+			return false
+		var player: Dictionary = expected[player_id]
+		if node.position.distance_to(_vec3(player.get("position", {}))) > 0.001:
+			return false
+		if node.get_node_or_null("PilotLabel") == null:
+			return false
+	return true
+
+
+func _build_remote_player_visual(player_id: String) -> Node3D:
+	var root := Node3D.new()
+	root.name = "RemotePilot_%s" % player_id
+	var suit_material := _armored_material(Color(0.58, 0.66, 0.70), 0.68, 0.54)
+	var joint_material := _material(Color(0.055, 0.075, 0.09), 0.52, 0.66)
+	var visor_material := _glass_material()
+
+	var torso := _box_visual(Vector3(0.58, 0.68, 0.32), suit_material)
+	torso.position = Vector3(0.0, 0.08, 0.0)
+	root.add_child(torso)
+	var chest := _box_visual(Vector3(0.38, 0.20, 0.06), detail_materials["cyan"])
+	chest.position = Vector3(0.0, 0.18, -0.19)
+	root.add_child(chest)
+	var pelvis := _box_visual(Vector3(0.48, 0.22, 0.30), joint_material)
+	pelvis.position = Vector3(0.0, -0.34, 0.0)
+	root.add_child(pelvis)
+	var backpack := _box_visual(Vector3(0.44, 0.54, 0.20), detail_materials["steel"])
+	backpack.position = Vector3(0.0, 0.10, 0.25)
+	root.add_child(backpack)
+
+	var helmet := MeshInstance3D.new()
+	var helmet_mesh := SphereMesh.new()
+	helmet_mesh.radius = 0.25
+	helmet_mesh.height = 0.48
+	helmet_mesh.radial_segments = 24
+	helmet_mesh.rings = 12
+	helmet_mesh.material = suit_material
+	helmet.mesh = helmet_mesh
+	helmet.position = Vector3(0.0, 0.61, 0.0)
+	root.add_child(helmet)
+	var visor := _box_visual(Vector3(0.34, 0.17, 0.035), visor_material)
+	visor.position = Vector3(0.0, 0.63, -0.225)
+	root.add_child(visor)
+
+	for side in [-1.0, 1.0]:
+		var arm := _cylinder_visual(0.105, 0.62, suit_material)
+		arm.position = Vector3(side * 0.39, -0.02, 0.0)
+		root.add_child(arm)
+		var glove := _box_visual(Vector3(0.20, 0.18, 0.19), joint_material)
+		glove.position = Vector3(side * 0.39, -0.39, -0.01)
+		root.add_child(glove)
+		var leg := _cylinder_visual(0.13, 0.66, suit_material)
+		leg.position = Vector3(side * 0.17, -0.69, 0.0)
+		root.add_child(leg)
+		var boot := _box_visual(Vector3(0.25, 0.20, 0.37), joint_material)
+		boot.position = Vector3(side * 0.17, -1.05, -0.07)
+		root.add_child(boot)
+
+	var label := Label3D.new()
+	label.name = "PilotLabel"
+	label.text = player_id
+	label.position = Vector3(0.0, 1.06, 0.0)
+	label.font_size = 28
+	label.outline_size = 8
+	label.modulate = Color(0.48, 0.88, 1.0)
+	label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+	root.add_child(label)
+	return root
 
 
 func _apply_authoritative_player(
@@ -1822,6 +1997,7 @@ func _correction_requires_snap(
 
 func _begin_player_resync() -> void:
 	authoritative_player_ready = false
+	bound_player_id = ""
 	awaiting_reconnect_baseline = true
 	prediction_history.clear()
 	pending_controls.clear()
@@ -1835,6 +2011,7 @@ func _begin_player_resync() -> void:
 	presentation_orientation_offset = Quaternion.IDENTITY
 	require_neutral_baseline = true
 	last_authoritative_event_sequence = -1
+	_sync_remote_players([])
 
 
 func _rebuild_voxels(voxels: Array) -> void:
@@ -2910,6 +3087,9 @@ func _run_visual_smoke_assertions() -> bool:
 	var expected_seed := _stable_unit_seed("smoke-damaged")
 	var life_support_valid := _run_life_support_smoke_assertions()
 	var motion_prediction_valid := _run_motion_prediction_smoke_assertions()
+	var remote_roster_valid := _remote_player_visuals_match(
+		snapshot.get("players", [])
+	)
 	var valid: bool = (
 		frame_visual.get_meta("verse_visual_state", "") == "frame"
 		and frame_visual.get_node_or_null("DamageOverlay") == null
@@ -2957,6 +3137,7 @@ func _run_visual_smoke_assertions() -> bool:
 		) < 0.00001
 		and life_support_valid
 		and motion_prediction_valid
+		and remote_roster_valid
 	)
 	frame_visual.free()
 	damaged_visual.free()
@@ -2965,7 +3146,7 @@ func _run_visual_smoke_assertions() -> bool:
 		printerr("VERSE_VISUAL_STATE_FAILED")
 		return false
 	print(
-		"VERSE_VISUAL_STATE_OK frame=frame damaged=armor_damaged repaired=armor_complete inventory_focus=owned reconnect=global reconciliation=bounded"
+		"VERSE_VISUAL_STATE_OK frame=frame damaged=armor_damaged repaired=armor_complete inventory_focus=owned reconnect=global reconciliation=bounded remote_roster=visible"
 	)
 	print("VERSE_EVA_GRAVITY_OK drift=gravity dampeners=compensating")
 	return true
@@ -3609,7 +3790,7 @@ func _refine_ore() -> void:
 	_send({
 		"type": "refine_ore",
 		"operation_id": _operation_id("refine"),
-		"inventory_id": PLAYER_INVENTORY,
+		"inventory_id": _local_inventory_id(),
 		"batches": 1,
 	})
 
@@ -3618,7 +3799,7 @@ func _craft_component() -> void:
 	_send({
 		"type": "craft_component",
 		"operation_id": _operation_id("craft"),
-		"inventory_id": PLAYER_INVENTORY,
+		"inventory_id": _local_inventory_id(),
 		"quantity": 1,
 	})
 
@@ -3631,8 +3812,8 @@ func _transfer_to_or_from_cargo(reverse: bool) -> void:
 	_send({
 		"type": "transfer_inventory",
 		"operation_id": _operation_id("transfer"),
-		"source_inventory_id": cargo_id if reverse else PLAYER_INVENTORY,
-		"destination_inventory_id": PLAYER_INVENTORY if reverse else cargo_id,
+		"source_inventory_id": cargo_id if reverse else _local_inventory_id(),
+		"destination_inventory_id": _local_inventory_id() if reverse else cargo_id,
 		"resource": "ore",
 		"quantity": 1,
 	})
@@ -3733,8 +3914,8 @@ func _transfer_inventory_resource(resource: String, reverse: bool, all: bool) ->
 	if cargo_id.is_empty():
 		_set_message("No live cargo inventory is available", true)
 		return
-	var source_id := cargo_id if reverse else PLAYER_INVENTORY
-	var destination_id := PLAYER_INVENTORY if reverse else cargo_id
+	var source_id := cargo_id if reverse else _local_inventory_id()
+	var destination_id := _local_inventory_id() if reverse else cargo_id
 	var quantity := 1
 	if all:
 		quantity = _resource_amount(_inventory(source_id).get("contents", {}), resource)
@@ -3910,7 +4091,7 @@ func _update_interface() -> void:
 			String(snapshot.get("world_hash", "—")).left(8),
 		]
 	)
-	var player_inventory := _inventory(PLAYER_INVENTORY)
+	var player_inventory := _inventory(_local_inventory_id())
 	var contents: Dictionary = player_inventory.get("contents", {})
 	var conserved: Dictionary = snapshot.get("conservation", {})
 	inventory_label.text = (
@@ -4010,7 +4191,7 @@ func _update_interface() -> void:
 
 
 func _update_inventory_terminal() -> void:
-	var suit_inventory := _inventory(PLAYER_INVENTORY)
+	var suit_inventory := _inventory(_local_inventory_id())
 	var cargo_inventory := _inventory(_first_cargo_inventory())
 	for side_data in [["suit", suit_inventory], ["cargo", cargo_inventory]]:
 		var side := String(side_data[0])

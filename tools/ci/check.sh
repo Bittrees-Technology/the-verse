@@ -9,6 +9,7 @@ cargo fmt --all -- --check
 cargo test --workspace --locked --no-fail-fast
 cargo clippy --workspace --all-targets --locked -- -D warnings
 node --check apps/web-command-center/app.js
+node --test apps/web-command-center/app.test.mjs
 node --check tools/e2e/protocol-smoke.mjs
 npx --yes markdownlint-cli2 '**/*.md'
 
