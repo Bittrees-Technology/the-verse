@@ -13,7 +13,9 @@ This record covers the direct dependencies and build tools used by P0. Exact Rus
 | Node.js | 25 or compatible | MIT and bundled third-party notices | Node.js distribution |
 | CMake | 3.16 or newer | BSD-3-Clause | CMake project distribution |
 | Clang and libclang | 17 or compatible | Apache-2.0 WITH LLVM-exception | LLVM project distribution |
-| GitHub checkout action | v4 | MIT | `actions/checkout` |
+| GitHub checkout action | v7.0.1 | MIT | `actions/checkout` |
+| GitHub cache action | v6.1.0 | MIT | `actions/cache` |
+| GitHub artifact action | v7.0.1 | MIT | `actions/upload-artifact` |
 
 The macOS and Linux CI scripts pin and verify Godot release archive checksums. The repository contains the required Godot license notice but no copied Godot source or third-party art assets.
 
