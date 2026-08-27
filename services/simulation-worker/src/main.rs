@@ -33,6 +33,10 @@ struct Arguments {
 
     #[arg(long, env = "VERSE_TICK_MS", default_value_t = 100)]
     tick_millis: u16,
+
+    /// Open the authoritative state for recovery inspection without advancing time.
+    #[arg(long, env = "VERSE_PAUSE_SIMULATION", default_value_t = false)]
+    pause_simulation: bool,
 }
 
 #[tokio::main]
@@ -59,19 +63,23 @@ async fn main() -> Result<()> {
         )
     })?;
     let state = AppState::new(runtime);
-    let tick_state = Arc::clone(&state);
-    let tick_millis = arguments.tick_millis.clamp(16, 250);
-    let tick_task = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(u64::from(tick_millis)));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            interval.tick().await;
-            if let Err(source) = tick_state.advance(tick_millis) {
-                error!(%source, "authoritative simulation tick failed");
-                break;
+    let tick_task = if arguments.pause_simulation {
+        None
+    } else {
+        let tick_state = Arc::clone(&state);
+        let tick_millis = arguments.tick_millis.clamp(16, 250);
+        Some(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(u64::from(tick_millis)));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                if let Err(source) = tick_state.advance(tick_millis) {
+                    error!(%source, "authoritative simulation tick failed");
+                    break;
+                }
             }
-        }
-    });
+        }))
+    };
 
     let listener = TcpListener::bind(arguments.bind)
         .await
@@ -79,6 +87,7 @@ async fn main() -> Result<()> {
     info!(
         address = %arguments.bind,
         data = %arguments.data_directory.display(),
+        simulation_paused = arguments.pause_simulation,
         "The Verse local universe is ready"
     );
     axum::serve(listener, router(Arc::clone(&state)))
@@ -86,7 +95,9 @@ async fn main() -> Result<()> {
         .await
         .context("simulation HTTP server failed")?;
 
-    tick_task.abort();
+    if let Some(tick_task) = tick_task {
+        tick_task.abort();
+    }
     state
         .persist_snapshot()
         .context("failed to persist shutdown snapshot")?;

@@ -1237,7 +1237,7 @@ func _poll_socket() -> void:
 			_send({
 				"type": "hello",
 				"protocol_version": PROTOCOL_VERSION,
-				"client_name": "godot-native-p0.6",
+				"client_name": "godot-native-p0.7",
 			})
 		while socket.get_available_packet_count() > 0:
 			var text := socket.get_packet().get_string_from_utf8()
