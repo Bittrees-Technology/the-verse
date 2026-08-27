@@ -1568,6 +1568,9 @@ func _apply_snapshot(authoritative: Dictionary) -> void:
 			true
 		)
 		return
+	var player_environment: Variant = player.get("environment", null)
+	if player_environment is Dictionary and not player_environment.is_empty():
+		snapshot["environment"] = player_environment.duplicate(true)
 	_capture_prediction_gravity(snapshot)
 	var level := int(player.get("level", 1))
 	if level > last_level:
@@ -1675,6 +1678,10 @@ func _apply_motion_state(motion: Dictionary) -> void:
 	snapshot["event_sequence"] = event_sequence
 	snapshot["simulation_tick"] = int(motion.get("simulation_tick", 0))
 	snapshot["world_hash"] = String(motion.get("world_hash", ""))
+	var player_environment: Variant = merged_player.get("environment", null)
+	if player_environment is Dictionary and not player_environment.is_empty():
+		snapshot["environment"] = player_environment.duplicate(true)
+	_capture_prediction_gravity(snapshot)
 	_update_grid_motion(motion.get("grids", []))
 	_sync_remote_players(existing_players)
 	_apply_authoritative_player(
