@@ -4,16 +4,22 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use verse_protocol::{
-    BlockKind, BlockSnapshot, CareerSnapshot, ConservationSnapshot, GridSnapshot, IVec3,
-    InventoryContents, InventoryDomain, InventorySnapshot, PlayerSnapshot, PowerSnapshot, Vec3,
-    VoxelMaterial, VoxelSnapshot, WorldSnapshot,
+    BlockKind, BlockSnapshot, CareerSnapshot, ConservationSnapshot, EnvironmentSnapshot,
+    GridSnapshot, IVec3, InventoryContents, InventoryDomain, InventorySnapshot, PlayerSnapshot,
+    PowerSnapshot, ResourceKind, Vec3, VoxelMaterial, VoxelSnapshot, WorldSnapshot,
 };
 
 use crate::content;
 
-pub const WORLD_SCHEMA_VERSION: u32 = 4;
+pub const WORLD_SCHEMA_VERSION: u32 = 5;
 pub const PLAYER_INVENTORY_ID: &str = "inventory-player-local";
 pub const STARTER_GRID_ID: &str = "grid-starter";
+pub const PLANET_CENTER: Vec3 = Vec3::new(0.0, -98.0, 0.0);
+pub const PLANET_SURFACE_RADIUS_M: f64 = 90.0;
+pub const PLANET_ATMOSPHERE_HEIGHT_M: f64 = 38.0;
+pub const PLANET_SURFACE_GRAVITY_M_S2: f64 = 6.2;
+pub const PLAYER_INVENTORY_CAPACITY_LITERS: u64 = 1_200;
+pub const CARGO_INVENTORY_CAPACITY_LITERS: u64 = 8_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VoxelField {
@@ -149,6 +155,9 @@ pub struct Player {
     pub inventory_id: String,
     pub experience: u64,
     pub career: CareerSnapshot,
+    pub suit_oxygen_milli: u16,
+    pub helmet_closed: bool,
+    pub jetpack_enabled: bool,
 }
 
 impl Player {
@@ -172,6 +181,63 @@ pub struct InventoryRecord {
     pub inventory_id: String,
     pub domain: InventoryDomain,
     pub contents: InventoryContents,
+    pub capacity_liters: u64,
+}
+
+impl InventoryRecord {
+    pub fn used_liters(&self) -> u64 {
+        self.contents
+            .ore
+            .saturating_mul(resource_unit_volume_liters(ResourceKind::Ore))
+            .saturating_add(
+                self.contents
+                    .refined_material
+                    .saturating_mul(resource_unit_volume_liters(ResourceKind::RefinedMaterial)),
+            )
+            .saturating_add(
+                self.contents
+                    .components
+                    .saturating_mul(resource_unit_volume_liters(ResourceKind::Component)),
+            )
+    }
+
+    pub fn mass_grams(&self) -> u64 {
+        self.contents
+            .ore
+            .saturating_mul(resource_unit_mass_grams(ResourceKind::Ore))
+            .saturating_add(
+                self.contents
+                    .refined_material
+                    .saturating_mul(resource_unit_mass_grams(ResourceKind::RefinedMaterial)),
+            )
+            .saturating_add(
+                self.contents
+                    .components
+                    .saturating_mul(resource_unit_mass_grams(ResourceKind::Component)),
+            )
+    }
+
+    pub fn can_add(&self, resource: ResourceKind, quantity: u64) -> bool {
+        self.used_liters()
+            .saturating_add(resource_unit_volume_liters(resource).saturating_mul(quantity))
+            <= self.capacity_liters
+    }
+}
+
+pub const fn resource_unit_volume_liters(resource: ResourceKind) -> u64 {
+    match resource {
+        ResourceKind::Ore => 37,
+        ResourceKind::RefinedMaterial => 15,
+        ResourceKind::Component => 22,
+    }
+}
+
+pub const fn resource_unit_mass_grams(resource: ResourceKind) -> u64 {
+    match resource {
+        ResourceKind::Ore => 3_500,
+        ResourceKind::RefinedMaterial => 2_400,
+        ResourceKind::Component => 4_800,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -332,6 +398,7 @@ impl WorldState {
                 refined_material: 0,
                 components: 24,
             },
+            capacity_liters: PLAYER_INVENTORY_CAPACITY_LITERS,
         };
         let cargo_inventory_id = "inventory-cargo-starter".to_owned();
         let cargo_inventory = InventoryRecord {
@@ -340,6 +407,7 @@ impl WorldState {
                 block_id: "block-cargo".into(),
             },
             contents: InventoryContents::default(),
+            capacity_liters: CARGO_INVENTORY_CAPACITY_LITERS,
         };
 
         let mut blocks = BTreeMap::new();
@@ -416,6 +484,9 @@ impl WorldState {
                 inventory_id: PLAYER_INVENTORY_ID.into(),
                 experience: 0,
                 career: CareerSnapshot::default(),
+                suit_oxygen_milli: 1_000,
+                helmet_closed: true,
+                jetpack_enabled: true,
             },
             voxels: VoxelField::procedural_asteroid(seed, 8),
             grids: BTreeMap::from([(STARTER_GRID_ID.into(), grid)]),
@@ -533,7 +604,11 @@ impl WorldState {
                 level: self.player.level(),
                 next_level_experience: self.player.next_level_experience(),
                 career: self.player.career.clone(),
+                suit_oxygen_milli: self.player.suit_oxygen_milli,
+                helmet_closed: self.player.helmet_closed,
+                jetpack_enabled: self.player.jetpack_enabled,
             },
+            environment: self.environment_at(self.player.position),
             voxels: self.voxels.snapshot(),
             grids,
             inventories: self
@@ -543,9 +618,45 @@ impl WorldState {
                     inventory_id: inventory.inventory_id.clone(),
                     domain: inventory.domain.clone(),
                     contents: inventory.contents.clone(),
+                    capacity_liters: inventory.capacity_liters,
+                    used_liters: inventory.used_liters(),
+                    mass_grams: inventory.mass_grams(),
                 })
                 .collect(),
             conservation: self.conservation(),
+        }
+    }
+
+    pub fn environment_at(&self, position: Vec3) -> EnvironmentSnapshot {
+        let radial = Vec3::new(
+            position.x - PLANET_CENTER.x,
+            position.y - PLANET_CENTER.y,
+            position.z - PLANET_CENTER.z,
+        );
+        let distance = radial.magnitude().max(1.0);
+        let altitude_m = (distance - PLANET_SURFACE_RADIUS_M).max(0.0);
+        let gravity_m_s2 = (PLANET_SURFACE_GRAVITY_M_S2
+            * (PLANET_SURFACE_RADIUS_M / distance).powi(2))
+        .min(PLANET_SURFACE_GRAVITY_M_S2 * 1.25);
+        let gravity = Vec3::new(
+            -radial.x / distance * gravity_m_s2,
+            -radial.y / distance * gravity_m_s2,
+            -radial.z / distance * gravity_m_s2,
+        );
+        let atmosphere_density = (1.0 - altitude_m / PLANET_ATMOSPHERE_HEIGHT_M).clamp(0.0, 1.0);
+        let oxygen_fraction = if atmosphere_density > 0.0 { 0.19 } else { 0.0 };
+
+        EnvironmentSnapshot {
+            celestial_body_id: "khepri-prime".into(),
+            celestial_body_name: "Khepri Prime".into(),
+            planet_center: PLANET_CENTER,
+            surface_radius_m: PLANET_SURFACE_RADIUS_M,
+            altitude_m,
+            gravity,
+            gravity_m_s2,
+            atmosphere_density,
+            oxygen_fraction,
+            breathable: atmosphere_density >= 0.35 && oxygen_fraction >= 0.18,
         }
     }
 }
@@ -587,6 +698,22 @@ mod tests {
             }),
             "ferrite should form readable deposits rather than salt-and-pepper noise"
         );
+    }
+
+    #[test]
+    fn genesis_exposes_breathable_gravity_and_physical_inventory_metrics() {
+        let world = WorldState::genesis(42);
+        let environment = world.environment_at(world.player.position);
+        assert!(environment.breathable);
+        assert!(environment.gravity_m_s2 > 4.0);
+        assert!(environment.altitude_m > 10.0);
+        assert!(environment.atmosphere_density > 0.5);
+
+        let suit = &world.inventories[PLAYER_INVENTORY_ID];
+        assert_eq!(suit.used_liters(), 24 * 22);
+        assert_eq!(suit.mass_grams(), 24 * 4_800);
+        assert!(suit.used_liters() < suit.capacity_liters);
+        assert!(suit.can_add(ResourceKind::Ore, 1));
     }
 
     #[test]

@@ -469,6 +469,39 @@ mod tests {
     }
 
     #[test]
+    fn suit_environment_and_inventory_metrics_recover_exactly() {
+        let directory = tempdir().expect("tempdir");
+        let expected_hash;
+        {
+            let mut runtime = Runtime::open(directory.path(), 37, 100).expect("runtime starts");
+            runtime
+                .execute(&ClientMessage::SetSuitMode {
+                    operation_id: "persistent-suit-mode".into(),
+                    helmet_closed: false,
+                    jetpack_enabled: false,
+                })
+                .expect("suit mode accepted");
+            runtime.persist_snapshot().expect("snapshot persists");
+            expected_hash = runtime.state().state_hash();
+        }
+
+        let recovered = Runtime::open(directory.path(), 37, 100).expect("runtime recovers");
+        let snapshot = recovered.snapshot();
+        assert!(!snapshot.player.helmet_closed);
+        assert!(!snapshot.player.jetpack_enabled);
+        assert_eq!(snapshot.player.suit_oxygen_milli, 1_000);
+        assert!(snapshot.environment.breathable);
+        let suit = snapshot
+            .inventories
+            .iter()
+            .find(|inventory| inventory.inventory_id == "inventory-player-local")
+            .expect("suit inventory snapshot");
+        assert_eq!(suit.used_liters, 528);
+        assert_eq!(suit.mass_grams, 115_200);
+        assert_eq!(recovered.state().state_hash(), expected_hash);
+    }
+
+    #[test]
     fn corrupt_journal_is_detected() {
         let directory = tempdir().expect("tempdir");
         {

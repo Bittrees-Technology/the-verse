@@ -17,6 +17,7 @@ These documents form the initial specification baseline.
 - [P0.2 Salvage Frontier](gameplay/salvage-frontier.md)
 - [P0.3 visual engineering checkpoint](gameplay/engineering-realism.md)
 - [P0.4 Engineering Hands](gameplay/engineering-hands.md)
+- [P0.5 Planetary Logistics](gameplay/planetary-logistics.md)
 
 ## Research
 
@@ -25,7 +26,7 @@ These documents form the initial specification baseline.
 ## Architecture
 
 - [System overview](architecture/system-overview.md)
-- [P0.4 implementation guide](architecture/p0-implementation.md)
+- [P0.5 implementation guide](architecture/p0-implementation.md)
 - [Universe simulation](architecture/universe-simulation.md)
 - [Data and events](architecture/data-and-events.md)
 - [Clients and public APIs](architecture/clients-and-apis.md)

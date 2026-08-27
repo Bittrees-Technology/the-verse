@@ -23,8 +23,8 @@ function connect() {
     elements.connection.className = "connection online";
     socket.send(JSON.stringify({
       type: "hello",
-      protocol_version: 3,
-      client_name: "browser-command-center-p0.4",
+      protocol_version: 4,
+      client_name: "browser-command-center-p0.5",
     }));
   });
   socket.addEventListener("close", () => {
@@ -88,7 +88,10 @@ function render() {
   elements["world-counts"].textContent =
     world.voxels.length.toLocaleString() + " voxels";
   elements["grid-count"].textContent =
-    world.grids.length.toLocaleString() + " grids";
+    world.grids.length.toLocaleString() + " grids • " +
+    world.environment.celestial_body_name + " • " +
+    (world.environment.gravity_m_s2 / 9.80665).toFixed(2) + " g • " +
+    Math.round(world.environment.atmosphere_density * 100) + "% atmosphere";
 
   const inventory = playerInventory()?.contents ?? {};
   const ore = inventory.ore ?? 0;

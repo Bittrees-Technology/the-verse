@@ -11,7 +11,10 @@ use verse_protocol::{
 
 use crate::content;
 use crate::event::{CanonicalEvent, EventPayload};
-use crate::model::{Block, Grid, InventoryRecord, PLAYER_INVENTORY_ID, WorldState};
+use crate::model::{
+    Block, CARGO_INVENTORY_CAPACITY_LITERS, Grid, InventoryRecord, PLANET_CENTER,
+    PLANET_SURFACE_RADIUS_M, PLAYER_INVENTORY_ID, WorldState,
+};
 use crate::persistence::{PersistenceError, Store};
 
 const MAX_PLAYER_MOVE_STEP: f64 = 3.0;
@@ -76,6 +79,7 @@ pub struct Runtime {
     state: WorldState,
     snapshot_every: u64,
     events_since_snapshot: u64,
+    life_support_elapsed_millis: u32,
     halted: bool,
 }
 
@@ -94,6 +98,7 @@ impl Runtime {
             state,
             snapshot_every: snapshot_every.max(1),
             events_since_snapshot: 0,
+            life_support_elapsed_millis: 0,
             halted: false,
         };
         if runtime.state.event_sequence == 0 {
@@ -157,15 +162,49 @@ impl Runtime {
                 && (grid.linear_velocity.magnitude() > f64::EPSILON
                     || grid.angular_velocity.abs() > f64::EPSILON)
         });
-        if !moving {
-            return Ok(false);
+        let delta_millis = delta_millis.clamp(1, 250);
+        let mut changed = false;
+        if moving {
+            self.commit_system_event(EventPayload::SimulationAdvanced { delta_millis })?;
+            changed = true;
         }
 
-        let event = self
-            .state
-            .prepare_system_event(EventPayload::SimulationAdvanced {
-                delta_millis: delta_millis.clamp(1, 250),
-            });
+        self.life_support_elapsed_millis = self
+            .life_support_elapsed_millis
+            .saturating_add(u32::from(delta_millis));
+        if self.life_support_elapsed_millis >= 1_000 {
+            let elapsed_seconds = self.life_support_elapsed_millis / 1_000;
+            self.life_support_elapsed_millis %= 1_000;
+            let previous_oxygen_milli = self.state.player.suit_oxygen_milli;
+            let environment = self.state.environment_at(self.state.player.position);
+            let per_second_delta = if !self.state.player.helmet_closed && environment.breathable {
+                25_i32
+            } else if !self.state.player.helmet_closed {
+                -40_i32
+            } else if environment.breathable {
+                0_i32
+            } else {
+                -5_i32
+            };
+            let new_oxygen_milli = u16::try_from(
+                (i32::from(previous_oxygen_milli)
+                    + per_second_delta * i32::try_from(elapsed_seconds).unwrap_or(i32::MAX))
+                .clamp(0, 1_000),
+            )
+            .expect("clamped suit oxygen always fits u16");
+            if new_oxygen_milli != previous_oxygen_milli {
+                self.commit_system_event(EventPayload::SuitOxygenChanged {
+                    previous_oxygen_milli,
+                    new_oxygen_milli,
+                })?;
+                changed = true;
+            }
+        }
+        Ok(changed)
+    }
+
+    fn commit_system_event(&mut self, payload: EventPayload) -> Result<(), RuntimeError> {
+        let event = self.state.prepare_system_event(payload);
         let mut next_state = self.state.clone();
         next_state.apply_event(&event)?;
         if let Err(source) = self.store.append_event(&event) {
@@ -174,7 +213,7 @@ impl Runtime {
         }
         self.state = next_state;
         self.after_event()?;
-        Ok(true)
+        Ok(())
     }
 
     pub fn persist_snapshot(&mut self) -> Result<(), RuntimeError> {
@@ -229,8 +268,38 @@ impl WorldState {
                         "authoritative player movement exceeded the per-intent limit",
                     ));
                 }
+                let planet_distance = Vec3::new(
+                    position.x - PLANET_CENTER.x,
+                    position.y - PLANET_CENTER.y,
+                    position.z - PLANET_CENTER.z,
+                )
+                .magnitude();
+                if planet_distance < PLANET_SURFACE_RADIUS_M + 0.45 {
+                    return Err(IntentError::rejected(
+                        "movement_below_planet_surface",
+                        "player movement cannot pass through the planetary surface",
+                    ));
+                }
                 EventPayload::PlayerMoved {
                     position: *position,
+                }
+            }
+            ClientMessage::SetSuitMode {
+                helmet_closed,
+                jetpack_enabled,
+                ..
+            } => {
+                if self.player.helmet_closed == *helmet_closed
+                    && self.player.jetpack_enabled == *jetpack_enabled
+                {
+                    return Err(IntentError::rejected(
+                        "suit_mode_no_change",
+                        "helmet and jetpack already match the requested state",
+                    ));
+                }
+                EventPayload::SuitModeChanged {
+                    helmet_closed: *helmet_closed,
+                    jetpack_enabled: *jetpack_enabled,
                 }
             }
             ClientMessage::MineVoxel { coordinate, .. } => {
@@ -250,10 +319,20 @@ impl WorldState {
                         "target voxel is beyond the mining tool range",
                     ));
                 }
+                let ore_yield = content::voxel(material).ore_yield;
+                if !self
+                    .inventory(&self.player.inventory_id)?
+                    .can_add(ResourceKind::Ore, ore_yield)
+                {
+                    return Err(IntentError::rejected(
+                        "inventory_capacity_exceeded",
+                        "the suit inventory has no volume for the mined ore",
+                    ));
+                }
                 EventPayload::VoxelMined {
                     coordinate: *coordinate,
                     material,
-                    ore_yield: content::voxel(material).ore_yield,
+                    ore_yield,
                     inventory_id: self.player.inventory_id.clone(),
                 }
             }
@@ -308,6 +387,26 @@ impl WorldState {
                         format!("crafting requires {refined_required} refined material"),
                     ));
                 }
+                let refined_output = quantity.saturating_mul(
+                    content::manifest()
+                        .recipes
+                        .component_crafting
+                        .component_output,
+                );
+                let used_after = inventory
+                    .used_liters()
+                    .saturating_sub(refined_required.saturating_mul(
+                        crate::model::resource_unit_volume_liters(ResourceKind::RefinedMaterial),
+                    ))
+                    .saturating_add(refined_output.saturating_mul(
+                        crate::model::resource_unit_volume_liters(ResourceKind::Component),
+                    ));
+                if used_after > inventory.capacity_liters {
+                    return Err(IntentError::rejected(
+                        "inventory_capacity_exceeded",
+                        "the inventory has no volume for the fabricated component",
+                    ));
+                }
                 EventPayload::ComponentCrafted {
                     inventory_id: inventory_id.clone(),
                     quantity: *quantity,
@@ -338,6 +437,15 @@ impl WorldState {
                     return Err(IntentError::rejected(
                         "insufficient_inventory",
                         "source inventory does not contain the requested quantity",
+                    ));
+                }
+                if !self
+                    .inventory(destination_inventory_id)?
+                    .can_add(*resource, *quantity)
+                {
+                    return Err(IntentError::rejected(
+                        "inventory_capacity_exceeded",
+                        "destination inventory capacity would be exceeded",
                     ));
                 }
                 EventPayload::InventoryTransferred {
@@ -575,6 +683,27 @@ impl WorldState {
 
         match &event.payload {
             EventPayload::PlayerMoved { position } => self.player.position = *position,
+            EventPayload::SuitModeChanged {
+                helmet_closed,
+                jetpack_enabled,
+            } => {
+                self.player.helmet_closed = *helmet_closed;
+                self.player.jetpack_enabled = *jetpack_enabled;
+            }
+            EventPayload::SuitOxygenChanged {
+                previous_oxygen_milli,
+                new_oxygen_milli,
+            } => {
+                if self.player.suit_oxygen_milli != *previous_oxygen_milli
+                    || *new_oxygen_milli > 1_000
+                {
+                    return Err(IntentError::rejected(
+                        "replay_suit_oxygen_invalid",
+                        "life-support event does not match the authoritative suit state",
+                    ));
+                }
+                self.player.suit_oxygen_milli = *new_oxygen_milli;
+            }
             EventPayload::VoxelMined {
                 coordinate,
                 material,
@@ -649,6 +778,7 @@ impl WorldState {
                                 block_id: block.block_id.clone(),
                             },
                             contents: InventoryContents::default(),
+                            capacity_liters: CARGO_INVENTORY_CAPACITY_LITERS,
                         },
                     );
                 }
@@ -742,6 +872,8 @@ impl WorldState {
                 self.player.career.anchors_engaged += 1;
             }
             EventPayload::PlayerMoved { .. }
+            | EventPayload::SuitModeChanged { .. }
+            | EventPayload::SuitOxygenChanged { .. }
             | EventPayload::InventoryTransferred { .. }
             | EventPayload::BlockBuilt { .. }
             | EventPayload::BlockWelded { .. }
@@ -1132,6 +1264,83 @@ mod tests {
         ));
         assert_eq!(runtime.state().event_sequence, 0);
         assert!(runtime.state().processed_operations.is_empty());
+    }
+
+    #[test]
+    fn planetary_surface_rejects_underground_movement() {
+        let mut runtime = runtime();
+        runtime.state.player.position = Vec3::new(0.0, -7.3, 0.0);
+        let result = runtime.execute(&ClientMessage::MovePlayer {
+            operation_id: "walk-through-ground".into(),
+            position: Vec3::new(0.0, -7.8, 0.0),
+        });
+        assert!(matches!(
+            result,
+            Err(RuntimeError::Intent(IntentError::Rejected { ref code, .. }))
+                if code == "movement_below_planet_surface"
+        ));
+        assert_eq!(runtime.state().event_sequence, 0);
+    }
+
+    #[test]
+    fn suit_modes_and_environment_drive_authoritative_oxygen() {
+        let mut runtime = runtime();
+        runtime.state.player.suit_oxygen_milli = 900;
+        runtime
+            .execute(&ClientMessage::SetSuitMode {
+                operation_id: "open-helmet".into(),
+                helmet_closed: false,
+                jetpack_enabled: true,
+            })
+            .expect("helmet opens in breathable atmosphere");
+        assert!(!runtime.advance(250).expect("life support tick"));
+        assert!(!runtime.advance(250).expect("life support tick"));
+        assert!(!runtime.advance(250).expect("life support tick"));
+        assert!(runtime.advance(250).expect("life support tick"));
+        assert_eq!(runtime.state().player.suit_oxygen_milli, 925);
+
+        runtime.state.player.position = Vec3::new(0.0, 100.0, 0.0);
+        for _ in 0..4 {
+            runtime.advance(250).expect("vacuum life support tick");
+        }
+        assert_eq!(runtime.state().player.suit_oxygen_milli, 885);
+    }
+
+    #[test]
+    fn destination_volume_is_enforced_before_transfer() {
+        let mut runtime = runtime();
+        let cargo_id = runtime
+            .state()
+            .inventories
+            .keys()
+            .find(|id| id.contains("cargo"))
+            .cloned()
+            .expect("cargo inventory");
+        runtime
+            .state
+            .inventories
+            .get_mut(&cargo_id)
+            .expect("cargo")
+            .capacity_liters = 21;
+        let result = runtime.execute(&ClientMessage::TransferInventory {
+            operation_id: "overfill-cargo".into(),
+            source_inventory_id: PLAYER_INVENTORY_ID.into(),
+            destination_inventory_id: cargo_id,
+            resource: ResourceKind::Component,
+            quantity: 1,
+        });
+        assert!(matches!(
+            result,
+            Err(RuntimeError::Intent(IntentError::Rejected { ref code, .. }))
+                if code == "inventory_capacity_exceeded"
+        ));
+        assert_eq!(
+            runtime.state().inventories[PLAYER_INVENTORY_ID]
+                .contents
+                .components,
+            24
+        );
+        assert!(runtime.state().conservation().valid);
     }
 
     #[test]

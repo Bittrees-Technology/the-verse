@@ -12,6 +12,14 @@ pub enum EventPayload {
     PlayerMoved {
         position: Vec3,
     },
+    SuitModeChanged {
+        helmet_closed: bool,
+        jetpack_enabled: bool,
+    },
+    SuitOxygenChanged {
+        previous_oxygen_milli: u16,
+        new_oxygen_milli: u16,
+    },
     VoxelMined {
         coordinate: IVec3,
         material: VoxelMaterial,
@@ -84,6 +92,8 @@ impl EventPayload {
             Self::GridAnchorSet { anchored: true, .. } => 40,
             Self::BlockDamaged { .. } => 3,
             Self::PlayerMoved { .. }
+            | Self::SuitModeChanged { .. }
+            | Self::SuitOxygenChanged { .. }
             | Self::GridMotionSet { .. }
             | Self::GridAnchorSet {
                 anchored: false, ..
@@ -95,6 +105,27 @@ impl EventPayload {
     pub fn receipt(&self) -> (&'static str, String) {
         match self {
             Self::PlayerMoved { .. } => ("player_moved", "Position accepted".into()),
+            Self::SuitModeChanged {
+                helmet_closed,
+                jetpack_enabled,
+            } => (
+                "suit_mode_changed",
+                format!(
+                    "Helmet {} — jetpack {}",
+                    if *helmet_closed { "sealed" } else { "open" },
+                    if *jetpack_enabled {
+                        "online"
+                    } else {
+                        "offline"
+                    }
+                ),
+            ),
+            Self::SuitOxygenChanged {
+                new_oxygen_milli, ..
+            } => (
+                "suit_oxygen_changed",
+                format!("Suit oxygen {}%", u32::from(*new_oxygen_milli) / 10),
+            ),
             Self::VoxelMined { ore_yield, .. } => ("voxel_mined", format!("Mined {ore_yield} ore")),
             Self::OreRefined { batches, .. } => (
                 "ore_refined",
@@ -254,7 +285,7 @@ mod tests {
     fn event_hash_detects_payload_tampering() {
         let mut event = CanonicalEvent::new(
             1,
-            "p0.4.0",
+            "p0.5.0",
             "universe",
             "cell",
             9,
