@@ -10,7 +10,10 @@ use axum::{
         State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    http::{HeaderValue, Method, StatusCode, header::CONTENT_TYPE},
+    http::{
+        HeaderValue, Method, StatusCode,
+        header::{CACHE_CONTROL, CONTENT_TYPE},
+    },
     response::{Html, IntoResponse, Response},
     routing::get,
 };
@@ -25,92 +28,82 @@ use tower_http::{
 use tracing::{error, info, warn};
 use verse_protocol::{
     ClientAuthentication, ClientMessage, IntentReceipt, MotionSnapshot, PROTOCOL_VERSION,
-    ServerMessage, SessionRole, WorldSnapshot,
+    ProjectedMotionSnapshot, ProjectedWorldSnapshot, ServerMessage, SessionRole, WorldSnapshot,
 };
-use verse_simulation::{IntentError, Runtime, RuntimeError};
+use verse_simulation::{IntentError, ProjectionError, Runtime, RuntimeError};
 
 const COMMAND_CENTER_HTML: &str = include_str!("../../../apps/web-command-center/index.html");
 const COMMAND_CENTER_JS: &str = include_str!("../../../apps/web-command-center/app.js");
 const COMMAND_CENTER_CSS: &str = include_str!("../../../apps/web-command-center/styles.css");
 const REPLICATION_PERIOD: Duration = Duration::from_nanos(16_666_667);
+const DYNAMIC_CACHE_CONTROL: &str = "no-store";
+const MAX_CLIENT_NAME_BYTES: usize = 128;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplicationKind {
+    Structural,
+    Motion,
+}
 
 #[derive(Debug, Clone, Default)]
 struct ReplicationFeed {
-    latest_structural: Option<Arc<ServerMessage>>,
-    latest_motion: Option<Arc<ServerMessage>>,
+    latest_structural_sequence: Option<u64>,
+    latest_motion_sequence: Option<u64>,
 }
 
 impl ReplicationFeed {
-    fn publish(&mut self, update: ServerMessage) -> bool {
-        let sequence = replication_event_sequence(&update)
-            .expect("only snapshot replication messages enter the latest-state feed");
-        match update {
-            update @ ServerMessage::Snapshot { .. } => {
+    fn publish(&mut self, kind: ReplicationKind, sequence: u64) -> bool {
+        match kind {
+            ReplicationKind::Structural => {
                 if self
-                    .latest_structural
-                    .as_deref()
-                    .and_then(replication_event_sequence)
+                    .latest_structural_sequence
                     .is_some_and(|current| current >= sequence)
                 {
                     return false;
                 }
-                self.latest_structural = Some(Arc::new(update));
+                self.latest_structural_sequence = Some(sequence);
                 if self
-                    .latest_motion
-                    .as_deref()
-                    .and_then(replication_event_sequence)
+                    .latest_motion_sequence
                     .is_some_and(|current| current <= sequence)
                 {
-                    self.latest_motion = None;
+                    self.latest_motion_sequence = None;
                 }
                 true
             }
-            update @ ServerMessage::MotionState { .. } => {
+            ReplicationKind::Motion => {
                 if self
-                    .latest_structural
-                    .as_deref()
-                    .and_then(replication_event_sequence)
+                    .latest_structural_sequence
                     .is_some_and(|current| current >= sequence)
                     || self
-                        .latest_motion
-                        .as_deref()
-                        .and_then(replication_event_sequence)
+                        .latest_motion_sequence
                         .is_some_and(|current| current >= sequence)
                 {
                     return false;
                 }
-                self.latest_motion = Some(Arc::new(update));
+                self.latest_motion_sequence = Some(sequence);
                 true
             }
-            _ => unreachable!("the replication feed accepts only complete or motion snapshots"),
         }
     }
 
     fn next_after(&self, cursor: ReplicationCursor) -> Option<PendingReplication> {
-        if let Some(structural) = &self.latest_structural {
-            let sequence = replication_event_sequence(structural)
-                .expect("the structural slot contains a complete snapshot");
-            if sequence > cursor.full_snapshot_sequence {
-                if sequence >= cursor.event_sequence {
-                    return Some(PendingReplication::Stored(Arc::clone(structural)));
-                }
-                // This cannot occur while AppState serializes mutation and publication
-                // under the runtime lock. Recover fail-closed with a current complete
-                // snapshot rather than sending a lower sequence or losing structure.
-                return Some(PendingReplication::RefreshSnapshot);
-            }
+        if let Some(sequence) = self.latest_structural_sequence
+            && sequence > cursor.full_snapshot_sequence
+        {
+            // A cursor can be ahead of the retained structural marker after
+            // receiving motion. Re-project the current complete state instead
+            // of rolling the connection back or losing structural changes.
+            return Some(PendingReplication::Structural);
         }
-        self.latest_motion.as_ref().and_then(|motion| {
-            (replication_event_sequence(motion)
-                .expect("the motion slot contains a motion snapshot")
-                > cursor.event_sequence)
-                .then(|| PendingReplication::Stored(Arc::clone(motion)))
-        })
+        self.latest_motion_sequence
+            .filter(|sequence| *sequence > cursor.event_sequence)
+            .map(|_| PendingReplication::Motion)
     }
 
     #[cfg(test)]
     fn retained_update_count(&self) -> usize {
-        usize::from(self.latest_structural.is_some()) + usize::from(self.latest_motion.is_some())
+        usize::from(self.latest_structural_sequence.is_some())
+            + usize::from(self.latest_motion_sequence.is_some())
     }
 }
 
@@ -139,10 +132,10 @@ impl ReplicationCursor {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 enum PendingReplication {
-    Stored(Arc<ServerMessage>),
-    RefreshSnapshot,
+    Structural,
+    Motion,
 }
 
 fn replication_event_sequence(message: &ServerMessage) -> Option<u64> {
@@ -176,6 +169,26 @@ impl AppState {
 
     pub fn motion_snapshot(&self) -> MotionSnapshot {
         self.runtime.lock().motion_snapshot()
+    }
+
+    fn projected_snapshot(
+        &self,
+        actor_player_id: Option<&str>,
+    ) -> Result<ProjectedWorldSnapshot, ProjectionError> {
+        self.runtime
+            .lock()
+            .state()
+            .project_world_snapshot(actor_player_id)
+    }
+
+    fn projected_motion_snapshot(
+        &self,
+        actor_player_id: Option<&str>,
+    ) -> Result<ProjectedMotionSnapshot, ProjectionError> {
+        self.runtime
+            .lock()
+            .state()
+            .project_motion_snapshot(actor_player_id)
     }
 
     pub fn persist_snapshot(&self) -> Result<(), RuntimeError> {
@@ -214,16 +227,12 @@ impl AppState {
                     )
                 })
                 .ne(before_lifecycle);
-            let update = if lifecycle_changed {
-                ServerMessage::Snapshot {
-                    snapshot: Box::new(runtime.snapshot()),
-                }
+            let update_kind = if lifecycle_changed {
+                ReplicationKind::Structural
             } else {
-                ServerMessage::MotionState {
-                    motion: Box::new(runtime.motion_snapshot()),
-                }
+                ReplicationKind::Motion
             };
-            self.publish_update(update);
+            self.publish_update(update_kind, runtime.state().event_sequence);
         }
         Ok(changed)
     }
@@ -239,24 +248,20 @@ impl AppState {
         if runtime.state().event_sequence == before_event_sequence {
             return Ok(receipt);
         }
-        let motion_only = matches!(intent, ClientMessage::SetPlayerControl { .. });
-        let update = if motion_only {
-            ServerMessage::MotionState {
-                motion: Box::new(runtime.motion_snapshot()),
-            }
+        let update_kind = if matches!(intent, ClientMessage::SetPlayerControl { .. }) {
+            ReplicationKind::Motion
         } else {
-            ServerMessage::Snapshot {
-                snapshot: Box::new(runtime.snapshot()),
-            }
+            ReplicationKind::Structural
         };
         // Keep mutation and publication in the same runtime critical section so
         // every subscriber observes structural and motion state in event order.
-        self.publish_update(update);
+        self.publish_update(update_kind, runtime.state().event_sequence);
         Ok(receipt)
     }
 
-    fn publish_update(&self, update: ServerMessage) {
-        self.updates.send_if_modified(|feed| feed.publish(update));
+    fn publish_update(&self, kind: ReplicationKind, event_sequence: u64) {
+        self.updates
+            .send_if_modified(|feed| feed.publish(kind, event_sequence));
     }
 
     fn claim_player(&self, player_id: &str) -> bool {
@@ -354,25 +359,45 @@ async fn health(State(state): State<Arc<AppState>>) -> StatusCode {
     }
 }
 
-async fn status(State(state): State<Arc<AppState>>) -> Json<StatusDocument> {
-    let snapshot = state.snapshot();
-    Json(StatusDocument {
-        service: "verse-simulation-worker",
-        protocol_version: PROTOCOL_VERSION,
-        content_manifest_version: snapshot.content_manifest_version,
-        universe_id: snapshot.universe_id,
-        cell_id: snapshot.cell_id,
-        event_sequence: snapshot.event_sequence,
-        simulation_tick: snapshot.simulation_tick,
-        fencing_token: snapshot.fencing_token,
-        world_hash: snapshot.world_hash,
-        conservation_valid: snapshot.conservation.valid,
-        authoritative_halted: state.is_halted(),
-    })
+fn no_store(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        CACHE_CONTROL,
+        HeaderValue::from_static(DYNAMIC_CACHE_CONTROL),
+    );
+    response
 }
 
-async fn world(State(state): State<Arc<AppState>>) -> Json<WorldSnapshot> {
-    Json(state.snapshot())
+async fn status(State(state): State<Arc<AppState>>) -> Response {
+    let snapshot = state.snapshot();
+    no_store(
+        Json(StatusDocument {
+            service: "verse-simulation-worker",
+            protocol_version: PROTOCOL_VERSION,
+            content_manifest_version: snapshot.content_manifest_version,
+            universe_id: snapshot.universe_id,
+            cell_id: snapshot.cell_id,
+            event_sequence: snapshot.event_sequence,
+            simulation_tick: snapshot.simulation_tick,
+            fencing_token: snapshot.fencing_token,
+            world_hash: snapshot.world_hash,
+            conservation_valid: snapshot.conservation.valid,
+            authoritative_halted: state.is_halted(),
+        })
+        .into_response(),
+    )
+}
+
+async fn world(State(state): State<Arc<AppState>>) -> Response {
+    match state.projected_snapshot(None) {
+        Ok(snapshot) => no_store(Json(snapshot).into_response()),
+        Err(_) => no_store(
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "public world projection is unavailable",
+            )
+                .into_response(),
+        ),
+    }
 }
 
 async fn websocket_upgrade(
@@ -392,6 +417,19 @@ async fn websocket_session(socket: WebSocket, state: Arc<AppState>) {
     };
     info!(%client_name, role = ?binding, "client completed protocol handshake");
 
+    // Subscribe before projecting so a mutation between projection and delivery
+    // is retained as a canonical marker and cannot be missed by this session.
+    let mut updates = state.updates.subscribe();
+    let Ok(initial_message) = projected_snapshot_message(&state, &binding) else {
+        send_projection_failure(&mut sender).await;
+        if let Some(player_id) = binding.player_id() {
+            state.release_player(player_id);
+        }
+        return;
+    };
+    let initial_sequence = replication_event_sequence(&initial_message)
+        .expect("the initial projected snapshot has an event sequence");
+
     if send_server_message(
         &mut sender,
         &ServerMessage::Welcome {
@@ -409,18 +447,10 @@ async fn websocket_session(socket: WebSocket, state: Arc<AppState>) {
         return;
     }
 
-    let mut updates = state.updates.subscribe();
-    let initial_snapshot = state.snapshot();
-    let mut replication_cursor =
-        ReplicationCursor::after_initial_snapshot(initial_snapshot.event_sequence);
-    if send_server_message(
-        &mut sender,
-        &ServerMessage::Snapshot {
-            snapshot: Box::new(initial_snapshot),
-        },
-    )
-    .await
-    .is_err()
+    let mut replication_cursor = ReplicationCursor::after_initial_snapshot(initial_sequence);
+    if send_server_message(&mut sender, &initial_message)
+        .await
+        .is_err()
     {
         if let Some(player_id) = binding.player_id() {
             state.release_player(player_id);
@@ -460,11 +490,9 @@ async fn websocket_session(socket: WebSocket, state: Arc<AppState>) {
                 let Some(pending) = pending else {
                     continue;
                 };
-                let message = match pending {
-                    PendingReplication::Stored(message) => message,
-                    PendingReplication::RefreshSnapshot => Arc::new(ServerMessage::Snapshot {
-                        snapshot: Box::new(state.snapshot()),
-                    }),
+                let Ok(message) = projected_replication_message(&state, &binding, pending) else {
+                    send_projection_failure(&mut sender).await;
+                    break;
                 };
                 if send_server_message(&mut sender, &message).await.is_err() {
                     break;
@@ -476,6 +504,34 @@ async fn websocket_session(socket: WebSocket, state: Arc<AppState>) {
 
     if let Some(player_id) = binding.player_id() {
         state.release_player(player_id);
+    }
+}
+
+fn projected_snapshot_message(
+    state: &AppState,
+    binding: &SessionBinding,
+) -> Result<ServerMessage, ProjectionError> {
+    state
+        .projected_snapshot(binding.player_id())
+        .map(|snapshot| ServerMessage::Snapshot {
+            snapshot: Box::new(snapshot),
+        })
+}
+
+fn projected_replication_message(
+    state: &AppState,
+    binding: &SessionBinding,
+    pending: PendingReplication,
+) -> Result<ServerMessage, ProjectionError> {
+    match pending {
+        PendingReplication::Structural => projected_snapshot_message(state, binding),
+        PendingReplication::Motion => {
+            state
+                .projected_motion_snapshot(binding.player_id())
+                .map(|motion| ServerMessage::MotionState {
+                    motion: Box::new(motion),
+                })
+        }
     }
 }
 
@@ -500,6 +556,15 @@ async fn complete_handshake(
                     client_name,
                     authentication,
                 }) if protocol_version == PROTOCOL_VERSION => {
+                    if !valid_client_name(&client_name) {
+                        send_fatal_and_close(
+                            sender,
+                            "invalid_client_name",
+                            "client name must contain 1-128 printable ASCII bytes",
+                        )
+                        .await;
+                        return None;
+                    }
                     let binding = match authentication {
                         ClientAuthentication::Spectator => SessionBinding::Spectator,
                         ClientAuthentication::LocalDevelopment { player_id } => {
@@ -578,6 +643,14 @@ async fn complete_handshake(
     }
 }
 
+fn valid_client_name(client_name: &str) -> bool {
+    !client_name.is_empty()
+        && client_name.len() <= MAX_CLIENT_NAME_BYTES
+        && client_name
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() || byte == b' ')
+}
+
 async fn handle_client_message(
     message: Message,
     state: &Arc<AppState>,
@@ -615,9 +688,9 @@ async fn handle_client_message(
             false
         }
         ClientMessage::RequestSnapshot => {
-            let snapshot = state.snapshot();
-            let message = ServerMessage::Snapshot {
-                snapshot: Box::new(snapshot),
+            let Ok(message) = projected_snapshot_message(state, binding) else {
+                send_projection_failure(sender).await;
+                return false;
             };
             if send_server_message(sender, &message).await.is_ok() {
                 replication_cursor.record(&message);
@@ -729,6 +802,15 @@ async fn send_fatal_and_close(
     let _ = sender.send(Message::Close(None)).await;
 }
 
+async fn send_projection_failure(sender: &mut futures_util::stream::SplitSink<WebSocket, Message>) {
+    send_fatal_and_close(
+        sender,
+        "projection_unavailable",
+        "authorized state projection is unavailable",
+    )
+    .await;
+}
+
 pub fn internal_error(source: impl std::fmt::Display) -> impl IntoResponse {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -786,6 +868,11 @@ mod tests {
     }
 
     async fn receive_server_message(socket: &mut TestSocket) -> ServerMessage {
+        serde_json::from_value(receive_server_json(socket).await)
+            .expect("server message is valid protocol JSON")
+    }
+
+    async fn receive_server_json(socket: &mut TestSocket) -> serde_json::Value {
         loop {
             let message = tokio::time::timeout(Duration::from_secs(2), socket.next())
                 .await
@@ -793,9 +880,29 @@ mod tests {
                 .expect("websocket remains open")
                 .expect("websocket message is valid");
             if let ClientWebSocketMessage::Text(text) = message {
-                return serde_json::from_str(&text).expect("server message is valid protocol JSON");
+                return serde_json::from_str(&text).expect("server message is valid JSON");
             }
         }
+    }
+
+    async fn receive_json_type(
+        socket: &mut TestSocket,
+        expected_type: &str,
+        forbid_receipt: bool,
+    ) -> serde_json::Value {
+        for _ in 0..16 {
+            let message = receive_server_json(socket).await;
+            if forbid_receipt {
+                assert_ne!(
+                    message["type"], "intent_accepted",
+                    "another session must never receive an actor's intent receipt"
+                );
+            }
+            if message["type"] == expected_type {
+                return message;
+            }
+        }
+        panic!("expected {expected_type} did not arrive within the bounded queue");
     }
 
     async fn receive_until(
@@ -820,6 +927,126 @@ mod tests {
             ))
             .await
             .expect("client message sends");
+    }
+
+    fn server_address(socket: &TestSocket) -> std::net::SocketAddr {
+        match socket.get_ref() {
+            MaybeTlsStream::Plain(stream) => stream.peer_addr().expect("server address"),
+            _ => panic!("test connection is plain WebSocket"),
+        }
+    }
+
+    async fn connect_additional(socket: &TestSocket) -> TestSocket {
+        let (additional, _) = connect_async(format!("ws://{}/ws", server_address(socket)))
+            .await
+            .expect("additional test websocket connects");
+        additional
+    }
+
+    async fn complete_session(socket: &mut TestSocket, hello: &ClientMessage) -> serde_json::Value {
+        send_client_message(socket, hello).await;
+        assert!(matches!(
+            receive_server_message(socket).await,
+            ServerMessage::Welcome { .. }
+        ));
+        receive_json_type(socket, "snapshot", false).await
+    }
+
+    fn assert_public_fields_are_redacted(snapshot: &serde_json::Value) {
+        assert!(snapshot.get("inventories").is_none());
+        assert!(snapshot.get("death_drops").is_none());
+        assert!(snapshot.get("conservation").is_none());
+        for player in snapshot["players"]
+            .as_array()
+            .expect("public player roster")
+        {
+            for private_field in [
+                "inventory_id",
+                "experience",
+                "career",
+                "suit_oxygen_milli",
+                "movement_epoch",
+                "last_received_input_sequence",
+                "control_linear_input",
+            ] {
+                assert!(
+                    player.get(private_field).is_none(),
+                    "public player leaked {private_field}"
+                );
+            }
+        }
+        for grid in snapshot["grids"].as_array().expect("public grid list") {
+            assert!(grid.get("mass_kg").is_none());
+            for block in grid["blocks"].as_array().expect("public block list") {
+                assert!(block.get("inventory_id").is_none());
+            }
+        }
+    }
+
+    fn assert_snapshot_audience(message: &serde_json::Value, expected_actor: Option<&str>) {
+        assert_eq!(message["type"], "snapshot");
+        let snapshot = &message["snapshot"];
+        assert_public_fields_are_redacted(snapshot);
+        let encoded = serde_json::to_string(message).expect("message serializes");
+        match expected_actor {
+            None => {
+                assert!(snapshot.get("actor_private").is_none());
+                for secret in [
+                    "inventory-player-local",
+                    "inventory-player-remote",
+                    "inventory-cargo-starter",
+                    "inventory-drop-player-local",
+                    "death-player-local",
+                ] {
+                    assert!(!encoded.contains(secret), "spectator leaked {secret}");
+                }
+            }
+            Some(player_id) => {
+                let private = snapshot
+                    .get("actor_private")
+                    .expect("player projection contains actor-private state");
+                assert_eq!(private["player"]["player_id"], player_id);
+                assert_eq!(
+                    private["player"]["inventory_id"],
+                    format!("inventory-{player_id}")
+                );
+                if player_id == "player-local" {
+                    assert!(!encoded.contains("inventory-player-remote"));
+                } else {
+                    for secret in [
+                        "inventory-player-local",
+                        "inventory-cargo-starter",
+                        "inventory-drop-player-local",
+                        "death-player-local",
+                    ] {
+                        assert!(!encoded.contains(secret), "foreign actor leaked {secret}");
+                    }
+                }
+            }
+        }
+    }
+
+    fn assert_motion_audience(message: &serde_json::Value, expected_actor: Option<&str>) {
+        assert_eq!(message["type"], "motion_state");
+        let motion = &message["motion"];
+        for player in motion["players"].as_array().expect("public motion roster") {
+            for private_field in [
+                "movement_epoch",
+                "last_received_input_sequence",
+                "last_processed_input_sequence",
+                "control_linear_input",
+                "locomotion",
+            ] {
+                assert!(
+                    player.get(private_field).is_none(),
+                    "public motion leaked {private_field}"
+                );
+            }
+        }
+        match expected_actor {
+            None => assert!(motion.get("actor_private").is_none()),
+            Some(player_id) => assert_eq!(motion["actor_private"]["player_id"], player_id),
+        }
     }
 
     async fn assert_intent_rejected(
@@ -860,6 +1087,21 @@ mod tests {
         player_hello(client_name, "player-local")
     }
 
+    fn actor_player(snapshot: &ProjectedWorldSnapshot) -> &verse_protocol::PlayerSnapshot {
+        &snapshot
+            .actor_private
+            .as_ref()
+            .expect("authenticated player snapshot has an actor-private view")
+            .player
+    }
+
+    fn actor_motion(motion: &ProjectedMotionSnapshot) -> &verse_protocol::PlayerMotionSnapshot {
+        motion
+            .actor_private
+            .as_ref()
+            .expect("authenticated player motion has an actor-private view")
+    }
+
     async fn assert_socket_closes(socket: &mut TestSocket) {
         let next = tokio::time::timeout(Duration::from_secs(2), socket.next())
             .await
@@ -870,42 +1112,19 @@ mod tests {
         ));
     }
 
-    fn snapshot_update_at(state: &AppState, event_sequence: u64) -> ServerMessage {
-        let mut snapshot = state.snapshot();
-        snapshot.event_sequence = event_sequence;
-        snapshot.world_hash = format!("snapshot-{event_sequence}");
-        ServerMessage::Snapshot {
-            snapshot: Box::new(snapshot),
-        }
-    }
-
-    fn motion_update_at(state: &AppState, event_sequence: u64) -> ServerMessage {
-        let mut motion = state.motion_snapshot();
-        motion.event_sequence = event_sequence;
-        motion.world_hash = format!("motion-{event_sequence}");
-        ServerMessage::MotionState {
-            motion: Box::new(motion),
-        }
-    }
-
     #[test]
     fn latest_state_feed_coalesces_a_slow_consumers_motion_backlog() {
-        let state = test_state();
         let mut feed = ReplicationFeed::default();
         for event_sequence in 1..=4_096 {
-            assert!(feed.publish(motion_update_at(&state, event_sequence)));
+            assert!(feed.publish(ReplicationKind::Motion, event_sequence));
         }
 
         assert_eq!(feed.retained_update_count(), 1);
         let cursor = ReplicationCursor::after_initial_snapshot(0);
-        let Some(PendingReplication::Stored(message)) = feed.next_after(cursor) else {
+        let Some(PendingReplication::Motion) = feed.next_after(cursor) else {
             panic!("the slow consumer receives the latest coalesced motion state");
         };
-        assert!(matches!(
-            message.as_ref(),
-            ServerMessage::MotionState { motion }
-                if motion.event_sequence == 4_096 && motion.world_hash == "motion-4096"
-        ));
+        assert_eq!(feed.latest_motion_sequence, Some(4_096));
     }
 
     #[test]
@@ -924,10 +1143,10 @@ mod tests {
             .execute_as("player-local", &intent)
             .expect("the structural operation commits");
         assert!(observer.has_changed().expect("the feed remains open"));
-        assert!(matches!(
-            observer.borrow_and_update().latest_structural.as_deref(),
-            Some(ServerMessage::Snapshot { .. })
-        ));
+        assert_eq!(
+            observer.borrow_and_update().latest_structural_sequence,
+            Some(first.event_sequence)
+        );
 
         let retry = state
             .execute_as("player-local", &intent)
@@ -938,32 +1157,31 @@ mod tests {
 
     #[test]
     fn structural_state_precedes_newer_motion_and_is_never_coalesced_away() {
-        let state = test_state();
         let mut feed = ReplicationFeed::default();
         // Reverse publication exercises the fail-safe ordering independently of
         // the runtime lock that normally serializes these updates.
-        assert!(feed.publish(motion_update_at(&state, 9)));
-        assert!(feed.publish(snapshot_update_at(&state, 7)));
+        assert!(feed.publish(ReplicationKind::Motion, 9));
+        assert!(feed.publish(ReplicationKind::Structural, 7));
         assert_eq!(feed.retained_update_count(), 2);
 
         let mut cursor = ReplicationCursor::after_initial_snapshot(0);
-        let Some(PendingReplication::Stored(structural)) = feed.next_after(cursor) else {
+        let Some(PendingReplication::Structural) = feed.next_after(cursor) else {
             panic!("the required complete snapshot is selected first");
         };
-        assert!(matches!(
-            structural.as_ref(),
-            ServerMessage::Snapshot { snapshot } if snapshot.event_sequence == 7
-        ));
-        cursor.record(&structural);
+        cursor.record(&ServerMessage::Snapshot {
+            snapshot: Box::new(
+                test_state()
+                    .projected_snapshot(None)
+                    .expect("spectator projection"),
+            ),
+        });
+        cursor.event_sequence = 7;
+        cursor.full_snapshot_sequence = 7;
 
-        let Some(PendingReplication::Stored(motion)) = feed.next_after(cursor) else {
+        let Some(PendingReplication::Motion) = feed.next_after(cursor) else {
             panic!("the newer motion state follows the structural snapshot");
         };
-        assert!(matches!(
-            motion.as_ref(),
-            ServerMessage::MotionState { motion } if motion.event_sequence == 9
-        ));
-        cursor.record(&motion);
+        cursor.event_sequence = 9;
         assert!(feed.next_after(cursor).is_none());
         assert_eq!(cursor.event_sequence, 9);
         assert_eq!(cursor.full_snapshot_sequence, 7);
@@ -973,7 +1191,7 @@ mod tests {
     fn replication_cursor_requests_a_fresh_snapshot_instead_of_rolling_back() {
         let state = test_state();
         let mut feed = ReplicationFeed::default();
-        assert!(feed.publish(snapshot_update_at(&state, 10)));
+        assert!(feed.publish(ReplicationKind::Structural, 10));
         let cursor = ReplicationCursor {
             event_sequence: 12,
             full_snapshot_sequence: 4,
@@ -981,8 +1199,28 @@ mod tests {
 
         assert!(matches!(
             feed.next_after(cursor),
-            Some(PendingReplication::RefreshSnapshot)
+            Some(PendingReplication::Structural)
         ));
+        let spectator_refresh = projected_replication_message(
+            &state,
+            &SessionBinding::Spectator,
+            PendingReplication::Structural,
+        )
+        .expect("spectator refresh projects");
+        let local_refresh = projected_replication_message(
+            &state,
+            &SessionBinding::Player("player-local".into()),
+            PendingReplication::Structural,
+        )
+        .expect("actor refresh projects");
+        assert_snapshot_audience(
+            &serde_json::to_value(spectator_refresh).expect("spectator refresh serializes"),
+            None,
+        );
+        assert_snapshot_audience(
+            &serde_json::to_value(local_refresh).expect("local refresh serializes"),
+            Some("player-local"),
+        );
     }
 
     #[test]
@@ -1028,32 +1266,33 @@ mod tests {
 
         let authoritative = state.snapshot();
         let feed = slow_consumer.borrow_and_update().clone();
-        assert_eq!(feed.retained_update_count(), 2);
+        assert!((1..=2).contains(&feed.retained_update_count()));
         let mut delivered = Vec::new();
         for _ in 0..2 {
             let Some(pending) = feed.next_after(cursor) else {
                 break;
             };
-            let message = match pending {
-                PendingReplication::Stored(message) => message,
-                PendingReplication::RefreshSnapshot => Arc::new(ServerMessage::Snapshot {
-                    snapshot: Box::new(state.snapshot()),
-                }),
-            };
+            let message = Arc::new(
+                projected_replication_message(&state, &SessionBinding::Spectator, pending)
+                    .expect("spectator replication projection succeeds"),
+            );
             cursor.record(&message);
             delivered.push(message);
         }
 
-        assert_eq!(delivered.len(), 2);
-        assert!(matches!(
-            delivered.first().map(Arc::as_ref),
-            Some(ServerMessage::Snapshot { .. })
-        ));
-        let Some(ServerMessage::MotionState { motion }) = delivered.last().map(Arc::as_ref) else {
-            panic!("the final coalesced update is authoritative motion");
+        assert!(!delivered.is_empty());
+        assert!(delivered.len() <= 2);
+        let final_message = delivered.last().expect("a final replication exists");
+        assert_eq!(
+            replication_event_sequence(final_message),
+            Some(authoritative.event_sequence)
+        );
+        let final_hash = match final_message.as_ref() {
+            ServerMessage::Snapshot { snapshot } => &snapshot.world_hash,
+            ServerMessage::MotionState { motion } => &motion.world_hash,
+            _ => panic!("the final coalesced message is state replication"),
         };
-        assert_eq!(motion.event_sequence, authoritative.event_sequence);
-        assert_eq!(motion.world_hash, authoritative.world_hash);
+        assert_eq!(final_hash, &authoritative.world_hash);
         assert_eq!(cursor.event_sequence, authoritative.event_sequence);
     }
 
@@ -1157,7 +1396,7 @@ mod tests {
             &mut socket,
             &ClientMessage::SetPlayerControl {
                 operation_id: "spectator-spoof-1".into(),
-                movement_epoch: snapshot.player.movement_epoch,
+                movement_epoch: 1,
                 input_sequence: 1,
                 linear_input: verse_protocol::Vec3::new(0.0, 0.0, -1.0),
                 angular_input: verse_protocol::Vec3::ZERO,
@@ -1285,11 +1524,7 @@ mod tests {
         );
 
         let shared_operation_id = "two-socket-shared-operation";
-        let local_player = local_snapshot
-            .players
-            .iter()
-            .find(|player| player.player_id == "player-local")
-            .expect("local roster member exists");
+        let local_player = actor_player(&local_snapshot);
         send_client_message(
             &mut local,
             &ClientMessage::SetPlayerControl {
@@ -1313,11 +1548,7 @@ mod tests {
             ServerMessage::IntentAccepted { .. }
         ));
 
-        let remote_player = remote_snapshot
-            .players
-            .iter()
-            .find(|player| player.player_id == "player-remote")
-            .expect("remote roster member exists");
+        let remote_player = actor_player(&remote_snapshot);
         send_client_message(
             &mut remote,
             &ClientMessage::SetPlayerControl {
@@ -1391,9 +1622,10 @@ mod tests {
             } if player_id == "player-remote"
         ));
         let ServerMessage::Snapshot { snapshot } = receive_server_message(&mut remote).await else {
-            panic!("remote player receives the canonical initial snapshot");
+            panic!("remote player receives its projected initial snapshot");
         };
-        let before = *snapshot;
+        assert_eq!(actor_player(&snapshot).player_id, "player-remote");
+        let before = state.snapshot();
         let primary = before
             .players
             .iter()
@@ -1511,12 +1743,13 @@ mod tests {
         let ServerMessage::Snapshot { snapshot } = receive_server_message(&mut socket).await else {
             panic!("compatible handshake must receive a full snapshot");
         };
+        let movement_epoch = actor_player(&snapshot).movement_epoch;
         let operation_id = "player-control-1-1";
         send_client_message(
             &mut socket,
             &ClientMessage::SetPlayerControl {
                 operation_id: operation_id.into(),
-                movement_epoch: snapshot.player.movement_epoch,
+                movement_epoch,
                 input_sequence: 1,
                 linear_input: verse_protocol::Vec3::new(0.0, 0.0, -1.0),
                 angular_input: verse_protocol::Vec3::new(0.0, 0.0, 0.5),
@@ -1536,9 +1769,9 @@ mod tests {
             panic!("character control must publish lightweight motion state");
         };
         assert_eq!(motion.event_sequence, receipt.event_sequence);
-        assert_eq!(motion.player.last_received_input_sequence, 1);
-        assert_eq!(motion.player.last_processed_input_sequence, 0);
-        assert_eq!(motion.player.movement_epoch, snapshot.player.movement_epoch);
+        assert_eq!(actor_motion(&motion).last_received_input_sequence, 1);
+        assert_eq!(actor_motion(&motion).last_processed_input_sequence, 0);
+        assert_eq!(actor_motion(&motion).movement_epoch, movement_epoch);
         assert_eq!(motion.grids.len(), snapshot.grids.len());
         assert_eq!(motion.world_hash, state.snapshot().world_hash);
         assert!(state.advance(17).expect("authoritative physics advances"));
@@ -1546,9 +1779,9 @@ mod tests {
         else {
             panic!("consumed character control must publish authoritative motion state");
         };
-        assert_eq!(motion.player.last_received_input_sequence, 1);
-        assert_eq!(motion.player.last_processed_input_sequence, 1);
-        assert!(motion.player.linear_velocity.magnitude() > 0.0);
+        assert_eq!(actor_motion(&motion).last_received_input_sequence, 1);
+        assert_eq!(actor_motion(&motion).last_processed_input_sequence, 1);
+        assert!(actor_motion(&motion).linear_velocity.magnitude() > 0.0);
         socket.close(None).await.expect("test socket closes");
         server.abort();
     }
@@ -1568,12 +1801,13 @@ mod tests {
         let ServerMessage::Snapshot { snapshot } = receive_server_message(&mut socket).await else {
             panic!("compatible handshake must receive a full snapshot");
         };
+        let player = actor_player(&snapshot);
 
         send_client_message(
             &mut socket,
             &ClientMessage::SetSuitMode {
                 operation_id: "arm-boots-and-release-jetpack".into(),
-                helmet_closed: snapshot.player.helmet_closed,
+                helmet_closed: player.helmet_closed,
                 jetpack_enabled: false,
                 magnetic_boots_enabled: true,
             },
@@ -1586,10 +1820,11 @@ mod tests {
         let ServerMessage::Snapshot { snapshot } = receive_server_message(&mut socket).await else {
             panic!("suit-mode intent must publish a complete authoritative snapshot");
         };
-        assert!(!snapshot.player.jetpack_enabled);
-        assert!(snapshot.player.locomotion.magnetic_boots_enabled);
+        let player = actor_player(&snapshot);
+        assert!(!player.jetpack_enabled);
+        assert!(player.locomotion.magnetic_boots_enabled);
         assert_eq!(
-            snapshot.player.locomotion.kind,
+            player.locomotion.kind,
             verse_protocol::LocomotionKind::Airborne
         );
 
@@ -1597,7 +1832,7 @@ mod tests {
             &mut socket,
             &ClientMessage::SetPlayerControl {
                 operation_id: "airborne-jump-edge".into(),
-                movement_epoch: snapshot.player.movement_epoch,
+                movement_epoch: player.movement_epoch,
                 input_sequence: 1,
                 linear_input: verse_protocol::Vec3::ZERO,
                 angular_input: verse_protocol::Vec3::ZERO,
@@ -1615,24 +1850,330 @@ mod tests {
         else {
             panic!("jump input receipt must publish lightweight authoritative motion");
         };
-        assert_eq!(motion.player.last_received_input_sequence, 1);
-        assert_eq!(motion.player.last_processed_input_sequence, 0);
-        assert!(motion.player.locomotion.magnetic_boots_enabled);
+        assert_eq!(actor_motion(&motion).last_received_input_sequence, 1);
+        assert_eq!(actor_motion(&motion).last_processed_input_sequence, 0);
+        assert!(actor_motion(&motion).locomotion.magnetic_boots_enabled);
         assert!(state.advance(17).expect("authoritative jump edge advances"));
         let ServerMessage::MotionState { motion } = receive_server_message(&mut socket).await
         else {
             panic!("processed jump edge must publish authoritative motion");
         };
-        assert_eq!(motion.player.last_processed_input_sequence, 1);
-        assert!(motion.player.locomotion.jump_held);
-        assert!(motion.player.locomotion.magnetic_boots_enabled);
+        assert_eq!(actor_motion(&motion).last_processed_input_sequence, 1);
+        assert!(actor_motion(&motion).locomotion.jump_held);
+        assert!(actor_motion(&motion).locomotion.magnetic_boots_enabled);
         assert_eq!(
-            motion.player.locomotion.kind,
+            actor_motion(&motion).locomotion.kind,
             verse_protocol::LocomotionKind::Airborne
         );
 
         socket.close(None).await.expect("test socket closes");
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn http_world_is_always_a_no_store_spectator_projection_despite_spoofing() {
+        for spoofed in [false, true] {
+            let mut request = Request::builder().uri(if spoofed {
+                "/api/v1/world?player_id=player-local&authentication=local_development"
+            } else {
+                "/api/v1/world"
+            });
+            if spoofed {
+                request = request
+                    .header("authorization", "Bearer forged-player-local")
+                    .header("cookie", "player_id=player-local; role=player")
+                    .header("origin", "http://localhost:3000")
+                    .header("x-player-id", "player-local")
+                    .header("x-forwarded-user", "player-local");
+            }
+            let response = test_app()
+                .oneshot(request.body(Body::empty()).expect("request"))
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers().get(CACHE_CONTROL),
+                Some(&HeaderValue::from_static(DYNAMIC_CACHE_CONTROL))
+            );
+            let body = to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .expect("body");
+            let snapshot: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+            assert_snapshot_audience(
+                &serde_json::json!({ "type": "snapshot", "snapshot": snapshot }),
+                None,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn initial_and_requested_snapshots_are_session_private_and_convergent() {
+        let (mut local, state, server) = connect_test_socket().await;
+        let mut remote = connect_additional(&local).await;
+        let mut spectator = connect_additional(&local).await;
+
+        let local_initial =
+            complete_session(&mut local, &local_player_hello("projection-local-initial")).await;
+        let remote_initial = complete_session(
+            &mut remote,
+            &player_hello("projection-remote-initial", "player-remote"),
+        )
+        .await;
+        let spectator_initial = complete_session(
+            &mut spectator,
+            &ClientMessage::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                client_name: "projection-spectator-initial".into(),
+                authentication: ClientAuthentication::Spectator,
+            },
+        )
+        .await;
+
+        assert_snapshot_audience(&local_initial, Some("player-local"));
+        assert_snapshot_audience(&remote_initial, Some("player-remote"));
+        assert_snapshot_audience(&spectator_initial, None);
+        for candidate in [&remote_initial, &spectator_initial] {
+            assert_eq!(
+                candidate["snapshot"]["event_sequence"],
+                local_initial["snapshot"]["event_sequence"]
+            );
+            assert_eq!(
+                candidate["snapshot"]["world_hash"],
+                local_initial["snapshot"]["world_hash"]
+            );
+        }
+        assert_eq!(
+            local_initial["snapshot"]["world_hash"],
+            state.snapshot().world_hash
+        );
+
+        for socket in [&mut local, &mut remote, &mut spectator] {
+            send_client_message(socket, &ClientMessage::RequestSnapshot).await;
+        }
+        let local_requested = receive_json_type(&mut local, "snapshot", false).await;
+        let remote_requested = receive_json_type(&mut remote, "snapshot", false).await;
+        let spectator_requested = receive_json_type(&mut spectator, "snapshot", false).await;
+        assert_snapshot_audience(&local_requested, Some("player-local"));
+        assert_snapshot_audience(&remote_requested, Some("player-remote"));
+        assert_snapshot_audience(&spectator_requested, None);
+        for candidate in [&remote_requested, &spectator_requested] {
+            assert_eq!(
+                candidate["snapshot"]["event_sequence"],
+                local_requested["snapshot"]["event_sequence"]
+            );
+            assert_eq!(
+                candidate["snapshot"]["world_hash"],
+                local_requested["snapshot"]["world_hash"]
+            );
+        }
+
+        local.close(None).await.expect("local closes");
+        remote.close(None).await.expect("remote closes");
+        spectator.close(None).await.expect("spectator closes");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn live_structural_and_motion_updates_project_per_session_without_receipt_leaks() {
+        let (mut local, state, server) = connect_test_socket().await;
+        let mut remote = connect_additional(&local).await;
+        let mut spectator = connect_additional(&local).await;
+        let local_initial = complete_session(&mut local, &local_player_hello("live-local")).await;
+        let _remote_initial =
+            complete_session(&mut remote, &player_hello("live-remote", "player-remote")).await;
+        let _spectator_initial = complete_session(
+            &mut spectator,
+            &ClientMessage::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                client_name: "live-spectator".into(),
+                authentication: ClientAuthentication::Spectator,
+            },
+        )
+        .await;
+
+        send_client_message(
+            &mut local,
+            &ClientMessage::TransferInventory {
+                operation_id: "private-cargo-transfer".into(),
+                source_inventory_id: "inventory-player-local".into(),
+                destination_inventory_id: "inventory-cargo-starter".into(),
+                resource: ResourceKind::Component,
+                quantity: 7,
+            },
+        )
+        .await;
+        assert!(matches!(
+            receive_until(&mut local, |message| matches!(message, ServerMessage::IntentAccepted { receipt } if receipt.operation_id == "private-cargo-transfer")).await,
+            ServerMessage::IntentAccepted { .. }
+        ));
+        let local_structural = receive_json_type(&mut local, "snapshot", false).await;
+        let remote_structural = receive_json_type(&mut remote, "snapshot", true).await;
+        let spectator_structural = receive_json_type(&mut spectator, "snapshot", true).await;
+        assert_snapshot_audience(&local_structural, Some("player-local"));
+        assert_snapshot_audience(&remote_structural, Some("player-remote"));
+        assert_snapshot_audience(&spectator_structural, None);
+        let local_inventories = local_structural["snapshot"]["actor_private"]["inventories"]
+            .as_array()
+            .expect("local private inventories");
+        let inventory_components = |inventory_id: &str| {
+            local_inventories
+                .iter()
+                .find(|inventory| inventory["inventory_id"] == inventory_id)
+                .unwrap_or_else(|| panic!("missing private inventory {inventory_id}"))["contents"]
+                ["components"]
+                .as_u64()
+                .expect("component quantity")
+        };
+        assert_eq!(inventory_components("inventory-player-local"), 17);
+        assert_eq!(inventory_components("inventory-cargo-starter"), 7);
+        let authoritative = state.snapshot();
+        for candidate in [&local_structural, &remote_structural, &spectator_structural] {
+            assert_eq!(
+                candidate["snapshot"]["event_sequence"],
+                authoritative.event_sequence
+            );
+            assert_eq!(
+                candidate["snapshot"]["world_hash"],
+                authoritative.world_hash
+            );
+        }
+
+        send_client_message(
+            &mut local,
+            &ClientMessage::SetPlayerControl {
+                operation_id: "private-motion-control".into(),
+                movement_epoch:
+                    local_initial["snapshot"]["actor_private"]["player"]["movement_epoch"]
+                        .as_u64()
+                        .expect("movement epoch"),
+                input_sequence: 1,
+                linear_input: Vec3::new(0.0, 0.0, -1.0),
+                angular_input: Vec3::ZERO,
+                boost: false,
+                jump: false,
+                dampeners: true,
+            },
+        )
+        .await;
+        assert!(matches!(
+            receive_until(&mut local, |message| matches!(message, ServerMessage::IntentAccepted { receipt } if receipt.operation_id == "private-motion-control")).await,
+            ServerMessage::IntentAccepted { .. }
+        ));
+        let local_motion = receive_json_type(&mut local, "motion_state", false).await;
+        let remote_motion = receive_json_type(&mut remote, "motion_state", true).await;
+        let spectator_motion = receive_json_type(&mut spectator, "motion_state", true).await;
+        assert_motion_audience(&local_motion, Some("player-local"));
+        assert_motion_audience(&remote_motion, Some("player-remote"));
+        assert_motion_audience(&spectator_motion, None);
+        let authoritative = state.snapshot();
+        for candidate in [&local_motion, &remote_motion, &spectator_motion] {
+            assert_eq!(
+                candidate["motion"]["event_sequence"],
+                authoritative.event_sequence
+            );
+            assert_eq!(candidate["motion"]["world_hash"], authoritative.world_hash);
+        }
+
+        local.close(None).await.expect("local closes");
+        remote.close(None).await.expect("remote closes");
+        spectator.close(None).await.expect("spectator closes");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn death_drop_and_cargo_remain_private_across_sessions_and_reconnect() {
+        let (mut local, state, server) = connect_test_socket().await;
+        state
+            .execute_as(
+                "player-local",
+                &ClientMessage::SetSuitMode {
+                    operation_id: "prepare-private-drop".into(),
+                    helmet_closed: false,
+                    jetpack_enabled: true,
+                    magnetic_boots_enabled: false,
+                },
+            )
+            .expect("helmet opens");
+        for _ in 0..100 {
+            state.advance(250).expect("vacuum life support advances");
+        }
+        let canonical = state.snapshot();
+        assert_eq!(canonical.death_drops.len(), 1);
+        let drop_inventory_id = canonical.death_drops[0].inventory_id.clone();
+        let drop_id = canonical.death_drops[0].drop_id.clone();
+
+        let mut remote = connect_additional(&local).await;
+        let mut spectator = connect_additional(&local).await;
+        let local_initial = complete_session(&mut local, &local_player_hello("drop-local")).await;
+        let remote_initial =
+            complete_session(&mut remote, &player_hello("drop-remote", "player-remote")).await;
+        let spectator_initial = complete_session(
+            &mut spectator,
+            &ClientMessage::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                client_name: "drop-spectator".into(),
+                authentication: ClientAuthentication::Spectator,
+            },
+        )
+        .await;
+        assert_snapshot_audience(&local_initial, Some("player-local"));
+        assert_snapshot_audience(&remote_initial, Some("player-remote"));
+        assert_snapshot_audience(&spectator_initial, None);
+        let private = &local_initial["snapshot"]["actor_private"];
+        assert_eq!(private["death_drops"][0]["drop_id"], drop_id);
+        assert!(
+            private["inventories"]
+                .as_array()
+                .expect("private inventories")
+                .iter()
+                .any(|inventory| inventory["inventory_id"] == drop_inventory_id)
+        );
+        for foreign in [&remote_initial, &spectator_initial] {
+            let encoded = serde_json::to_string(foreign).expect("message serializes");
+            assert!(!encoded.contains(&drop_id));
+            assert!(!encoded.contains(&drop_inventory_id));
+        }
+
+        local.close(None).await.expect("local closes");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let mut reconnected = connect_additional(&remote).await;
+        let reconnect_snapshot = complete_session(
+            &mut reconnected,
+            &local_player_hello("drop-local-reconnect"),
+        )
+        .await;
+        assert_snapshot_audience(&reconnect_snapshot, Some("player-local"));
+        assert_eq!(
+            reconnect_snapshot["snapshot"]["actor_private"]["death_drops"][0]["drop_id"],
+            drop_id
+        );
+
+        reconnected
+            .close(None)
+            .await
+            .expect("reconnected local closes");
+        remote.close(None).await.expect("remote closes");
+        spectator.close(None).await.expect("spectator closes");
+        server.abort();
+    }
+
+    #[test]
+    fn invalid_projection_audience_fails_without_a_canonical_fallback() {
+        let state = test_state();
+        let binding = SessionBinding::Player("player-not-admitted".into());
+        assert!(projected_snapshot_message(&state, &binding).is_err());
+        assert!(
+            projected_replication_message(&state, &binding, PendingReplication::Motion).is_err()
+        );
+    }
+
+    #[test]
+    fn client_names_are_bounded_before_they_reach_connection_logging() {
+        assert!(valid_client_name("native-client"));
+        assert!(!valid_client_name(""));
+        assert!(!valid_client_name(&"x".repeat(MAX_CLIENT_NAME_BYTES + 1)));
+        assert!(!valid_client_name("line\nbreak"));
+        assert!(!valid_client_name("non-ascii-é"));
     }
 
     #[tokio::test]
@@ -1647,6 +2188,10 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(CACHE_CONTROL),
+            Some(&HeaderValue::from_static(DYNAMIC_CACHE_CONTROL))
+        );
         let body = to_bytes(response.into_body(), 1024 * 1024)
             .await
             .expect("body");
