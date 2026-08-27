@@ -22,8 +22,8 @@
 
     <main>
       <section class="notice">
-        P1.0 public spectator proof. This screen observes the same authoritative
-        cell as the native client. Gameplay mutations require a player-bound session.
+        P1.2 public spectator projection. This screen observes public topology
+        only; pilot inventories, progression, and protected drops remain private.
         <strong id="session-status">CONNECTING // READ-ONLY</strong>
       </section>
 
@@ -72,17 +72,17 @@
 
         <aside>
           <article class="panel">
-            <p id="profile-label" class="eyebrow">PRIMARY PILOT PROFILE</p>
+            <p id="profile-label" class="eyebrow">PUBLIC PILOT PROFILE</p>
             <h2 id="profile-rank">AWAITING AUTHORITATIVE PILOT</h2>
-            <p id="career-progress" class="career-progress">0 / 100 XP</p>
+            <p id="career-progress" class="career-progress">PRIVATE TO PILOT</p>
             <dl>
-              <div><dt>Ore</dt><dd id="ore">0</dd></div>
-              <div><dt>Refined</dt><dd id="refined">0</dd></div>
-              <div><dt>Components</dt><dd id="components">0</dd></div>
+              <div><dt>Ore</dt><dd id="ore">PRIVATE</dd></div>
+              <div><dt>Refined</dt><dd id="refined">PRIVATE</dd></div>
+              <div><dt>Components</dt><dd id="components">PRIVATE</dd></div>
             </dl>
             <div class="button-grid">
-              <button id="refine">REFINE 2 ORE</button>
-              <button id="craft">CRAFT COMPONENT</button>
+              <button id="refine" disabled>PRIVATE TO PILOT</button>
+              <button id="craft" disabled>PRIVATE TO PILOT</button>
             </div>
           </article>
 

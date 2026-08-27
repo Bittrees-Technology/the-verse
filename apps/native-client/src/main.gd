@@ -11,7 +11,8 @@ const PLANET_SHADER: Shader = preload("res://shaders/planet_surface.gdshader")
 const ATMOSPHERE_SHADER: Shader = preload("res://shaders/planet_atmosphere.gdshader")
 const CLOUD_SHADER: Shader = preload("res://shaders/planet_clouds.gdshader")
 const BLOCK_DAMAGE_SHADER: Shader = preload("res://shaders/block_damage.gdshader")
-const PROTOCOL_VERSION := 12
+const PROTOCOL_VERSION := 13
+const PROJECTION_SCHEMA_VERSION := 1
 const DEFAULT_SERVER := "ws://127.0.0.1:7777/ws"
 const DEFAULT_PLAYER_ID := "player-local"
 const STARTER_GRID := "grid-starter"
@@ -121,6 +122,8 @@ var require_neutral_baseline := true
 var last_player_id := ""
 var last_player_life_state := ""
 var snapshot: Dictionary = {}
+var actor_private_snapshot: Dictionary = {}
+var session_role_kind := ""
 var voxel_lookup: Dictionary = {}
 var voxel_coordinate_lookup: Dictionary = {}
 var voxel_chunk_nodes: Dictionary = {}
@@ -390,6 +393,8 @@ func _player_life_state(player: Dictionary) -> String:
 	var life_state: Variant = player.get("life_state", {})
 	if life_state is Dictionary:
 		return String(life_state.get("kind", "alive"))
+	if life_state is String:
+		return String(life_state)
 	return "alive"
 
 
@@ -414,15 +419,79 @@ func _player_from_roster(players: Array, player_id: String) -> Dictionary:
 
 
 func _local_player() -> Dictionary:
-	var players: Array = snapshot.get("players", [])
-	var selected := _player_from_roster(players, _controlled_player_id())
-	if not players.is_empty():
-		return selected
-	return snapshot.get("player", {})
+	var player: Variant = actor_private_snapshot.get("player", {})
+	if not player is Dictionary:
+		return {}
+	if String(player.get("player_id", "")) != bound_player_id:
+		return {}
+	return player
 
 
 func _local_inventory_id() -> String:
 	return String(_local_player().get("inventory_id", ""))
+
+
+func _local_environment() -> Dictionary:
+	var player_environment: Variant = _local_player().get("environment", {})
+	if player_environment is Dictionary and not player_environment.is_empty():
+		return player_environment
+	return snapshot.get("environment", {})
+
+
+func _private_inventory_ready() -> bool:
+	return not _local_inventory_id().is_empty()
+
+
+func _clear_actor_private_state() -> void:
+	actor_private_snapshot = {}
+	selected_cargo_inventory_id = ""
+	last_targeted_owned_grid_id = ""
+	for button in inventory_transfer_buttons:
+		if is_instance_valid(button):
+			button.disabled = true
+	var selector: OptionButton = inventory_selectors.get("cargo", null)
+	if selector != null and is_instance_valid(selector):
+		selector.clear()
+		selector.add_item("NO AUTHORIZED CARGO LINK")
+		selector.set_item_metadata(0, "")
+		selector.disabled = true
+
+
+func _actor_private_matches(candidate: Variant, event_sequence: int) -> bool:
+	if not candidate is Dictionary or candidate.is_empty() or bound_player_id.is_empty():
+		return false
+	var player: Variant = candidate.get("player", {})
+	if not player is Dictionary or String(player.get("player_id", "")) != bound_player_id:
+		return false
+	var carried_inventory_id := String(player.get("inventory_id", ""))
+	var carried_matches := 0
+	for inventory_value in candidate.get("inventories", []):
+		if not inventory_value is Dictionary:
+			continue
+		var domain: Dictionary = inventory_value.get("domain", {})
+		if (
+			String(inventory_value.get("inventory_id", "")) == carried_inventory_id
+			and String(domain.get("kind", "")) == "player"
+			and String(domain.get("player_id", "")) == bound_player_id
+		):
+			carried_matches += 1
+	if carried_inventory_id.is_empty() or carried_matches != 1:
+		return false
+	# Protocol 13 nests the overlay in the outer projected snapshot, making the
+	# outer sequence authoritative. Honor a future explicit sequence only when
+	# it agrees, so malformed extensions still fail closed.
+	return (
+		not candidate.has("event_sequence")
+		or int(candidate.get("event_sequence", -1)) == event_sequence
+	)
+
+
+func _install_actor_private(candidate: Variant, event_sequence: int) -> bool:
+	_clear_actor_private_state()
+	if not _actor_private_matches(candidate, event_sequence):
+		return false
+	actor_private_snapshot = (candidate as Dictionary).duplicate(true)
+	return true
 
 
 func _life_support_display_state(player: Dictionary) -> String:
@@ -1519,7 +1588,7 @@ func _poll_socket() -> void:
 			_send({
 				"type": "hello",
 				"protocol_version": PROTOCOL_VERSION,
-				"client_name": "godot-native-p1.1",
+				"client_name": "godot-native-p1.2",
 				"authentication": {
 					"kind": "local_development",
 					"player_id": requested_player_id,
@@ -1553,8 +1622,12 @@ func _handle_server_message(message: Dictionary) -> void:
 	match message.get("type", ""):
 		"welcome":
 			var session_role: Dictionary = message.get("session_role", {})
-			if String(session_role.get("kind", "")) == "player":
+			session_role_kind = String(session_role.get("kind", ""))
+			_clear_actor_private_state()
+			if session_role_kind == "player":
 				bound_player_id = String(session_role.get("player_id", requested_player_id))
+			else:
+				bound_player_id = ""
 			_set_message(
 				"Connected to %s // %s"
 				% [message.get("server_name", "The Verse"), _controlled_player_id()]
@@ -1599,30 +1672,11 @@ func _apply_snapshot(authoritative: Dictionary) -> void:
 		event_sequence, last_authoritative_event_sequence
 	):
 		return
+	var private_candidate: Variant = authoritative.get("actor_private", {})
 	snapshot = authoritative.duplicate(true)
+	snapshot.erase("actor_private")
 	var players: Array = snapshot.get("players", [])
-	var player := _player_from_roster(players, _controlled_player_id())
-	if player.is_empty() and players.is_empty():
-		player = snapshot.get("player", {})
-	snapshot["player"] = player
 	_sync_remote_players(players)
-	if player.is_empty():
-		authoritative_player_ready = false
-		_set_message(
-			"Authoritative roster is missing bound pilot %s"
-			% _controlled_player_id(),
-			true
-		)
-		return
-	var player_environment: Variant = player.get("environment", null)
-	if player_environment is Dictionary and not player_environment.is_empty():
-		snapshot["environment"] = player_environment.duplicate(true)
-	_capture_prediction_gravity(snapshot)
-	var level := int(player.get("level", 1))
-	if level > last_level:
-		_set_message("CLEARANCE ADVANCED // SALVAGER LEVEL %d" % level)
-		tool_kick = 1.0
-	last_level = level
 
 	var voxels: Array = snapshot.get("voxels", [])
 	if voxels.size() != rendered_voxel_count:
@@ -1634,6 +1688,31 @@ func _apply_snapshot(authoritative: Dictionary) -> void:
 				_emit_mining_fragments(Vector3(mined_coordinate))
 				pending_mine_position = null
 	_rebuild_grids(snapshot.get("grids", []))
+
+	var public_player := _player_from_roster(players, bound_player_id)
+	var projection_valid := (
+		int(snapshot.get("projection_schema_version", 0)) == PROJECTION_SCHEMA_VERSION
+		and not public_player.is_empty()
+		and _install_actor_private(private_candidate, event_sequence)
+	)
+	if not projection_valid:
+		_clear_actor_private_state()
+		authoritative_player_ready = false
+		last_authoritative_event_sequence = event_sequence
+		last_authoritative_simulation_tick = int(snapshot.get("simulation_tick", 0))
+		_set_message(
+			"PRIVATE INVENTORY LINK UNAVAILABLE // RESYNC REQUIRED",
+			true
+		)
+		return
+
+	var player := _local_player()
+	_capture_prediction_gravity({"player": player, "environment": _local_environment()})
+	var level := int(player.get("level", 1))
+	if level > last_level:
+		_set_message("CLEARANCE ADVANCED // SALVAGER LEVEL %d" % level)
+		tool_kick = 1.0
+	last_level = level
 	_apply_authoritative_player(
 		player,
 		int(snapshot.get("simulation_tick", 0)),
@@ -1689,10 +1768,19 @@ func _apply_motion_state(motion: Dictionary) -> void:
 	var event_sequence := int(motion.get("event_sequence", -1))
 	if event_sequence <= last_authoritative_event_sequence:
 		return
+	if int(motion.get("projection_schema_version", 0)) != PROJECTION_SCHEMA_VERSION:
+		_invalidate_private_motion(event_sequence, int(motion.get("simulation_tick", 0)))
+		return
+	var has_private_motion := motion.has("actor_private")
+	var private_motion: Variant = motion.get("actor_private", {})
+	if has_private_motion and (
+		not private_motion is Dictionary
+		or String(private_motion.get("player_id", "")) != bound_player_id
+	):
+		_invalidate_private_motion(event_sequence, int(motion.get("simulation_tick", 0)))
+		return
 	var existing_players: Array = snapshot.get("players", []).duplicate(true)
 	var motion_players: Array = motion.get("players", [])
-	if motion_players.is_empty() and motion.get("player", {}) is Dictionary:
-		motion_players = [motion.get("player", {})]
 	for player_motion in motion_players:
 		if not player_motion is Dictionary:
 			continue
@@ -1710,26 +1798,25 @@ func _apply_motion_state(motion: Dictionary) -> void:
 		if not found:
 			existing_players.append(player_motion.duplicate(true))
 	snapshot["players"] = existing_players
-	var merged_player := _player_from_roster(existing_players, _controlled_player_id())
-	if merged_player.is_empty() and existing_players.is_empty():
-		merged_player = snapshot.get("player", {}).duplicate(true)
-	if merged_player.is_empty():
-		authoritative_player_ready = false
-		_set_message(
-			"Motion roster lost bound pilot %s" % _controlled_player_id(),
-			true
-		)
-		return
-	snapshot["player"] = merged_player
 	snapshot["event_sequence"] = event_sequence
 	snapshot["simulation_tick"] = int(motion.get("simulation_tick", 0))
 	snapshot["world_hash"] = String(motion.get("world_hash", ""))
-	var player_environment: Variant = merged_player.get("environment", null)
-	if player_environment is Dictionary and not player_environment.is_empty():
-		snapshot["environment"] = player_environment.duplicate(true)
-	_capture_prediction_gravity(snapshot)
 	_update_grid_motion(motion.get("grids", []))
 	_sync_remote_players(existing_players)
+
+	var merged_player := _local_player().duplicate(true)
+	if merged_player.is_empty():
+		last_authoritative_event_sequence = event_sequence
+		last_authoritative_simulation_tick = int(motion.get("simulation_tick", 0))
+		return
+	if has_private_motion:
+		for key in private_motion:
+			merged_player[key] = private_motion[key]
+	else:
+		var public_motion := _player_from_roster(motion_players, bound_player_id)
+		merged_player = _merge_public_motion_into_private(merged_player, public_motion)
+	actor_private_snapshot["player"] = merged_player
+	_capture_prediction_gravity({"player": merged_player, "environment": _local_environment()})
 	_apply_authoritative_player(
 		merged_player,
 		int(motion.get("simulation_tick", 0)),
@@ -1737,6 +1824,32 @@ func _apply_motion_state(motion: Dictionary) -> void:
 		String(motion.get("world_hash", "")),
 		"motion_state"
 	)
+
+
+func _invalidate_private_motion(event_sequence: int, simulation_tick: int) -> void:
+	_clear_actor_private_state()
+	authoritative_player_ready = false
+	last_authoritative_event_sequence = event_sequence
+	last_authoritative_simulation_tick = simulation_tick
+	_set_message("PRIVATE MOTION LINK INVALID // REQUESTING RESYNC", true)
+	if socket.get_ready_state() == WebSocketPeer.STATE_OPEN:
+		_send({"type": "request_snapshot"})
+
+
+func _merge_public_motion_into_private(
+	private_player: Dictionary, public_motion: Dictionary
+) -> Dictionary:
+	var merged := private_player.duplicate(true)
+	for key in [
+		"position", "orientation", "linear_velocity", "angular_velocity", "surface_contact",
+	]:
+		if public_motion.has(key):
+			merged[key] = public_motion[key]
+	if public_motion.has("locomotion_kind"):
+		var locomotion: Dictionary = merged.get("locomotion", {}).duplicate(true)
+		locomotion["kind"] = public_motion["locomotion_kind"]
+		merged["locomotion"] = locomotion
+	return merged
 
 
 func _update_grid_motion(grids: Array) -> void:
@@ -1871,7 +1984,11 @@ func _apply_authoritative_player(
 	_world_hash: String,
 	source: String
 ) -> void:
-	if player.is_empty() or event_sequence <= last_authoritative_event_sequence:
+	if (
+		player.is_empty()
+		or event_sequence < last_authoritative_event_sequence
+		or (event_sequence == last_authoritative_event_sequence and source != "snapshot")
+	):
 		return
 	var incoming_player_id := String(player.get("player_id", ""))
 	var incoming_life_state := _player_life_state(player)
@@ -2065,8 +2182,9 @@ func _correction_requires_snap(
 func _begin_player_resync() -> void:
 	authoritative_player_ready = false
 	bound_player_id = ""
+	session_role_kind = ""
+	_clear_actor_private_state()
 	active_grid_control_id = ""
-	last_targeted_owned_grid_id = ""
 	awaiting_reconnect_baseline = true
 	prediction_history.clear()
 	pending_controls.clear()
@@ -2562,7 +2680,7 @@ func _sample_player_control() -> Dictionary:
 	if Input.mouse_mode != Input.MOUSE_MODE_CAPTURED or inventory_open:
 		_clear_transient_character_input()
 		return _neutral_player_control()
-	var player: Dictionary = snapshot.get("player", {})
+	var player := _local_player()
 	var jetpack_enabled := bool(player.get("jetpack_enabled", true))
 	var vertical_input := (
 		Input.get_action_strength("move_up") - Input.get_action_strength("move_down")
@@ -2749,7 +2867,7 @@ func _player_control_message(
 
 
 func _predict_player_step(control: Dictionary, delta: float, record_history: bool) -> void:
-	var player: Dictionary = snapshot.get("player", {})
+	var player := _local_player()
 	var locomotion: Dictionary = player.get("locomotion", {})
 	var prediction_control := control.duplicate(true)
 	var jump_held := bool(control.get("jump", false))
@@ -2942,7 +3060,7 @@ func _prediction_support_velocity(locomotion: Dictionary) -> Vector3:
 
 
 func _prediction_gravity(position: Vector3) -> Vector3:
-	var environment: Dictionary = snapshot.get("environment", {})
+	var environment := _local_environment()
 	var fallback := prediction_gravity_fallback
 	if fallback.length_squared() <= 0.0:
 		fallback = _vec3(environment.get("gravity", {}))
@@ -2992,7 +3110,7 @@ func _sweep_player_position(start: Vector3, finish: Vector3) -> Dictionary:
 
 
 func _player_position_is_clear(position: Vector3) -> bool:
-	var environment: Dictionary = snapshot.get("environment", {})
+	var environment := _local_environment()
 	var capsule_up := _camera_up()
 	var surface_radius := float(environment.get("surface_radius_m", 0.0))
 	if surface_radius > 0.0:
@@ -3048,7 +3166,7 @@ func _update_player_presentation(delta: float) -> void:
 	presentation_orientation_offset = _shortest_slerp(
 		presentation_orientation_offset, Quaternion.IDENTITY, blend
 	)
-	var locomotion: Dictionary = snapshot.get("player", {}).get("locomotion", {})
+	var locomotion: Dictionary = _local_player().get("locomotion", {})
 	var view_orientation := _player_view_orientation(predicted_orientation, locomotion)
 	camera.position = predicted_position + presentation_position_offset + _camera_eye_offset()
 	camera.quaternion = (presentation_orientation_offset * view_orientation).normalized()
@@ -3059,7 +3177,7 @@ func _update_player_presentation(delta: float) -> void:
 
 
 func _camera_up() -> Vector3:
-	var player: Dictionary = snapshot.get("player", {})
+	var player := _local_player()
 	var locomotion: Dictionary = player.get("locomotion", {})
 	var kind := String(locomotion.get("kind", "eva"))
 	if kind in ["grounded", "magnetic", "airborne"]:
@@ -3599,7 +3717,7 @@ func _run_life_support_smoke_assertions() -> bool:
 		and recovery_button.text.contains("[ENTER]")
 		and incapacitated_detail_label.text.contains("OXYGEN RESERVE DEPLETED")
 	)
-	var authoritative_player: Dictionary = snapshot.get("player", {})
+	var authoritative_player := _local_player()
 	_update_life_support_interface(authoritative_player)
 
 	var valid := (
@@ -4311,7 +4429,7 @@ func _request_recovery() -> void:
 
 
 func _toggle_jetpack() -> void:
-	var player: Dictionary = snapshot.get("player", {})
+	var player := _local_player()
 	_send({
 		"type": "set_suit_mode",
 		"operation_id": _operation_id("suit"),
@@ -4322,7 +4440,7 @@ func _toggle_jetpack() -> void:
 
 
 func _toggle_magnetic_boots() -> void:
-	var player: Dictionary = snapshot.get("player", {})
+	var player := _local_player()
 	desired_magnetic_boots = not desired_magnetic_boots
 	_send({
 		"type": "set_suit_mode",
@@ -4335,7 +4453,7 @@ func _toggle_magnetic_boots() -> void:
 
 
 func _toggle_helmet() -> void:
-	var player: Dictionary = snapshot.get("player", {})
+	var player := _local_player()
 	_send({
 		"type": "set_suit_mode",
 		"operation_id": _operation_id("suit"),
@@ -4412,7 +4530,7 @@ func _refresh_owned_cargo_selection() -> Array[Dictionary]:
 
 func _owned_cargo_candidates() -> Array[Dictionary]:
 	var candidates: Array[Dictionary] = []
-	for inventory_value in snapshot.get("inventories", []):
+	for inventory_value in actor_private_snapshot.get("inventories", []):
 		if not inventory_value is Dictionary:
 			continue
 		var inventory: Dictionary = inventory_value
@@ -4463,7 +4581,6 @@ func _cargo_inventory_binding(inventory: Dictionary) -> Dictionary:
 			var block: Dictionary = block_value
 			if (
 				String(block.get("block_id", "")) == block_id
-				and String(block.get("inventory_id", "")) == inventory_id
 				and String(block.get("kind", "")) == "cargo"
 			):
 				matches.append({"grid_id": grid_id, "grid": grid, "block": block})
@@ -4560,7 +4677,7 @@ func _update_life_support_interface(player: Dictionary) -> void:
 	incapacitated_overlay.visible = display_state == "incapacitated"
 	if display_state == "critical":
 		var oxygen_percent := int(player.get("suit_oxygen_milli", 0)) / 10
-		var environment: Dictionary = snapshot.get("environment", {})
+		var environment := _local_environment()
 		var helmet_closed := bool(player.get("helmet_closed", true))
 		var breathable := bool(environment.get("breathable", false))
 		var remedy := "SEEK BREATHABLE ATMOSPHERE"
@@ -4598,7 +4715,7 @@ func _owned_death_drop_recorded(player: Dictionary) -> bool:
 	var player_id := String(player.get("player_id", ""))
 	var life_state: Dictionary = player.get("life_state", {})
 	var death_id := String(life_state.get("death_id", ""))
-	for drop in snapshot.get("death_drops", []):
+	for drop in actor_private_snapshot.get("death_drops", []):
 		if (
 			drop is Dictionary
 			and String(drop.get("owner_player_id", "")) == player_id
@@ -4618,7 +4735,7 @@ func _update_interface() -> void:
 		"font_color",
 		Color(0.35, 0.95, 0.62) if connected else Color(1.0, 0.38, 0.25)
 	)
-	var player: Dictionary = snapshot.get("player", {})
+	var player := _local_player()
 	_update_life_support_interface(player)
 	var level := int(player.get("level", 1))
 	var experience := int(player.get("experience", 0))
@@ -4652,7 +4769,7 @@ func _update_interface() -> void:
 		if life_support_state != "normal"
 		else Color(0.64, 0.90, 0.94)
 	)
-	var environment: Dictionary = snapshot.get("environment", {})
+	var environment := _local_environment()
 	var gravity_g := float(environment.get("gravity_m_s2", 0.0)) / 9.80665
 	var atmosphere_percent := roundi(float(environment.get("atmosphere_density", 0.0)) * 100.0)
 	status_label.text = (
@@ -4664,26 +4781,32 @@ func _update_interface() -> void:
 			atmosphere_percent,
 			"BREATHABLE" if environment.get("breathable", false) else "VACUUM",
 			int(snapshot.get("event_sequence", 0)),
-			"CONSERVED" if snapshot.get("conservation", {}).get("valid", false) else "FAULT",
+			"CONSERVED" if snapshot.get("conservation_valid", false) else "FAULT",
 			String(snapshot.get("world_hash", "—")).left(8),
 		]
 	)
 	var player_inventory := _inventory(_local_inventory_id())
 	var contents: Dictionary = player_inventory.get("contents", {})
-	var conserved: Dictionary = snapshot.get("conservation", {})
-	inventory_label.text = (
-		"CARGO HARNESS  //  %d / %d L\nORE  %03d     ALLOY  %03d     PARTS  %03d\n[I] OPEN LOGISTICS TERMINAL"
-	) % [
-		int(player_inventory.get("used_liters", 0)),
-		int(player_inventory.get("capacity_liters", 0)),
-		int(contents.get("ore", 0)),
-		int(contents.get("refined_material", 0)),
-		int(contents.get("components", 0)),
-	]
+	var conservation_valid := bool(snapshot.get("conservation_valid", false))
+	if _private_inventory_ready():
+		inventory_label.text = (
+			"CARGO HARNESS  //  %d / %d L\nORE  %03d     ALLOY  %03d     PARTS  %03d\n[I] OPEN LOGISTICS TERMINAL"
+		) % [
+			int(player_inventory.get("used_liters", 0)),
+			int(player_inventory.get("capacity_liters", 0)),
+			int(contents.get("ore", 0)),
+			int(contents.get("refined_material", 0)),
+			int(contents.get("components", 0)),
+		]
+	else:
+		inventory_label.text = (
+			"PRIVATE INVENTORY LINK UNAVAILABLE\n"
+			+ "REFINE / CRAFT / TRANSFER DISABLED\n[F5] REQUEST AUTHORITATIVE RESYNC"
+		)
 	inventory_label.add_theme_color_override(
 		"font_color",
 		Color(0.95, 0.71, 0.27)
-		if conserved.get("valid", false)
+		if conservation_valid
 		else Color(1.0, 0.18, 0.18)
 	)
 	_update_inventory_terminal()
@@ -4914,7 +5037,7 @@ func _mission_text(career: Dictionary) -> String:
 
 
 func _inventory(inventory_id: String) -> Dictionary:
-	for inventory in snapshot.get("inventories", []):
+	for inventory in actor_private_snapshot.get("inventories", []):
 		if inventory.get("inventory_id", "") == inventory_id:
 			return inventory
 	return {}
