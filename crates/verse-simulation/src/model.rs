@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 use verse_protocol::{
@@ -13,7 +13,7 @@ use verse_protocol::{
 
 use crate::content;
 
-pub const WORLD_SCHEMA_VERSION: u32 = 11;
+pub const WORLD_SCHEMA_VERSION: u32 = 12;
 pub const PLAYER_INVENTORY_ID: &str = "inventory-player-local";
 pub const STARTER_GRID_ID: &str = "grid-starter";
 pub const PLANET_CENTER: Vec3 = Vec3::new(900.0, -2_200.0, -3_800.0);
@@ -160,7 +160,9 @@ pub struct Player {
     pub angular_velocity: Vec3,
     pub surface_contact: bool,
     pub movement_epoch: u64,
+    pub last_received_input_sequence: u64,
     pub last_processed_input_sequence: u64,
+    pub pending_control_frames: VecDeque<PlayerControlFrame>,
     pub control_linear_input: Vec3,
     pub control_angular_input: Vec3,
     pub boost: bool,
@@ -173,6 +175,17 @@ pub struct Player {
     pub helmet_closed: bool,
     pub jetpack_enabled: bool,
     pub life_state: PlayerLifeState,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct PlayerControlFrame {
+    pub input_sequence: u64,
+    pub linear_input: Vec3,
+    pub angular_input: Vec3,
+    pub boost: bool,
+    pub dampeners: bool,
+    pub expires_at_simulation_tick: u64,
 }
 
 impl Player {
@@ -546,7 +559,9 @@ impl WorldState {
                 angular_velocity: Vec3::ZERO,
                 surface_contact: false,
                 movement_epoch: 1,
+                last_received_input_sequence: 0,
                 last_processed_input_sequence: 0,
+                pending_control_frames: VecDeque::new(),
                 control_linear_input: Vec3::ZERO,
                 control_angular_input: Vec3::ZERO,
                 boost: false,
@@ -706,6 +721,7 @@ impl WorldState {
                 angular_velocity: self.player.angular_velocity,
                 surface_contact: self.player.surface_contact,
                 movement_epoch: self.player.movement_epoch,
+                last_received_input_sequence: self.player.last_received_input_sequence,
                 last_processed_input_sequence: self.player.last_processed_input_sequence,
                 control_linear_input: self.player.control_linear_input,
                 control_angular_input: self.player.control_angular_input,
@@ -768,6 +784,7 @@ impl WorldState {
                 angular_velocity: self.player.angular_velocity,
                 surface_contact: self.player.surface_contact,
                 movement_epoch: self.player.movement_epoch,
+                last_received_input_sequence: self.player.last_received_input_sequence,
                 last_processed_input_sequence: self.player.last_processed_input_sequence,
                 control_linear_input: self.player.control_linear_input,
                 control_angular_input: self.player.control_angular_input,

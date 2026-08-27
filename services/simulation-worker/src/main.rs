@@ -67,11 +67,9 @@ async fn main() -> Result<()> {
         None
     } else {
         let tick_state = Arc::clone(&state);
-        // The native client samples controls at 60 Hz. Keeping the worker's
-        // scheduling gap below one client physics frame prevents a valid tap
-        // or mouse impulse from being overwritten by its following neutral
-        // sample before any authoritative substep can observe it.
-        let tick_millis = arguments.tick_millis.clamp(1, 16);
+        // Input transitions are durably queued until fixed-step consumption;
+        // this cadence controls latency, not whether a short input is observed.
+        let tick_millis = arguments.tick_millis.clamp(1, 250);
         Some(tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_millis(u64::from(tick_millis)));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -138,9 +136,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn authoritative_tick_defaults_to_less_than_one_sixty_hz_frame() {
+    fn authoritative_tick_defaults_to_at_most_one_sixty_hz_frame() {
         let arguments = Arguments::parse_from(["verse-simulation-worker"]);
         assert_eq!(arguments.tick_millis, 16);
-        assert!(f64::from(arguments.tick_millis) < 1_000.0 / 60.0);
+        assert!(f64::from(arguments.tick_millis) <= 1_000.0 / 60.0);
     }
 }

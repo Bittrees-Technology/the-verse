@@ -82,6 +82,11 @@ if [[ "${after_fence}" -le "${before_fence}" ]]; then
   echo "Recovery fencing token did not advance" >&2
   exit 1
 fi
+stop_server
+
+# Native control smoke must run against advancing physics so a durably
+# received input can earn its separate fixed-step processed acknowledgement.
+start_server
 
 godot_bin="${GODOT_BIN:-}"
 if [[ -z "${godot_bin}" ]] && [[ -x "artifacts/toolchains/godot-4.7.2/Godot.app/Contents/MacOS/Godot" ]]; then

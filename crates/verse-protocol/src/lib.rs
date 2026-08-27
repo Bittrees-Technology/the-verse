@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 
 /// The only protocol version accepted by this P0 build.
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// A stable integer voxel or block coordinate.
 #[derive(
@@ -276,6 +276,7 @@ pub struct PlayerSnapshot {
     pub angular_velocity: Vec3,
     pub surface_contact: bool,
     pub movement_epoch: u64,
+    pub last_received_input_sequence: u64,
     pub last_processed_input_sequence: u64,
     pub control_linear_input: Vec3,
     pub control_angular_input: Vec3,
@@ -360,6 +361,7 @@ pub struct PlayerMotionSnapshot {
     pub angular_velocity: Vec3,
     pub surface_contact: bool,
     pub movement_epoch: u64,
+    pub last_received_input_sequence: u64,
     pub last_processed_input_sequence: u64,
     pub control_linear_input: Vec3,
     pub control_angular_input: Vec3,
@@ -634,7 +636,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v8_character_control_contains_inputs_but_no_transform_or_time() {
+    fn protocol_v9_character_control_contains_inputs_but_no_transform_or_time() {
         let message = ClientMessage::SetPlayerControl {
             operation_id: "player-control-3-41".into(),
             movement_epoch: 3,
@@ -671,8 +673,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v8_exposes_tagged_life_state_and_death_cause() {
-        assert_eq!(PROTOCOL_VERSION, 8);
+    fn protocol_v9_exposes_tagged_life_state_and_death_cause() {
+        assert_eq!(PROTOCOL_VERSION, 9);
         let life_state = PlayerLifeState::Incapacitated {
             death_id: "death-player-local-42".into(),
             cause: PlayerDeathCause::OxygenDepleted,
@@ -691,7 +693,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v8_snapshot_exposes_motion_oxygen_and_death_drops() {
+    fn protocol_v9_snapshot_exposes_motion_input_oxygen_and_death_drops() {
         let death_drop = DeathDropSnapshot {
             drop_id: "drop-player-local-42".into(),
             death_id: "death-player-local-42".into(),
@@ -709,6 +711,7 @@ mod tests {
             angular_velocity: Vec3::ZERO,
             surface_contact: false,
             movement_epoch: 1,
+            last_received_input_sequence: 0,
             last_processed_input_sequence: 0,
             control_linear_input: Vec3::ZERO,
             control_angular_input: Vec3::ZERO,

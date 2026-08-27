@@ -690,10 +690,19 @@ mod tests {
             panic!("character control must publish lightweight motion state");
         };
         assert_eq!(motion.event_sequence, receipt.event_sequence);
-        assert_eq!(motion.player.last_processed_input_sequence, 1);
+        assert_eq!(motion.player.last_received_input_sequence, 1);
+        assert_eq!(motion.player.last_processed_input_sequence, 0);
         assert_eq!(motion.player.movement_epoch, snapshot.player.movement_epoch);
         assert_eq!(motion.grids.len(), snapshot.grids.len());
         assert_eq!(motion.world_hash, state.snapshot().world_hash);
+        assert!(state.advance(17).expect("authoritative physics advances"));
+        let ServerMessage::MotionState { motion } = receive_server_message(&mut socket).await
+        else {
+            panic!("consumed character control must publish authoritative motion state");
+        };
+        assert_eq!(motion.player.last_received_input_sequence, 1);
+        assert_eq!(motion.player.last_processed_input_sequence, 1);
+        assert!(motion.player.linear_velocity.magnitude() > 0.0);
         socket.close(None).await.expect("test socket closes");
         server.abort();
     }

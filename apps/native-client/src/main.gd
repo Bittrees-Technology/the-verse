@@ -11,7 +11,7 @@ const PLANET_SHADER: Shader = preload("res://shaders/planet_surface.gdshader")
 const ATMOSPHERE_SHADER: Shader = preload("res://shaders/planet_atmosphere.gdshader")
 const CLOUD_SHADER: Shader = preload("res://shaders/planet_clouds.gdshader")
 const BLOCK_DAMAGE_SHADER: Shader = preload("res://shaders/block_damage.gdshader")
-const PROTOCOL_VERSION := 8
+const PROTOCOL_VERSION := 9
 const DEFAULT_SERVER := "ws://127.0.0.1:7777/ws"
 const PLAYER_INVENTORY := "inventory-player-local"
 const STARTER_GRID := "grid-starter"
@@ -1616,6 +1616,7 @@ func _apply_authoritative_player(
 	var incoming_life_state := _player_life_state(player)
 	var incoming_epoch := int(player.get("movement_epoch", 0))
 	var incoming_ack := int(player.get("last_processed_input_sequence", 0))
+	var incoming_received := int(player.get("last_received_input_sequence", incoming_ack))
 	var lifecycle_reset := (
 		not authoritative_player_ready
 		or awaiting_reconnect_baseline
@@ -1647,7 +1648,7 @@ func _apply_authoritative_player(
 	predicted_simulation_tick = simulation_tick
 	movement_epoch = incoming_epoch
 	last_acked_input_sequence = incoming_ack
-	next_input_sequence = maxi(next_input_sequence, incoming_ack + 1)
+	next_input_sequence = maxi(next_input_sequence, incoming_received + 1)
 
 	var remaining_controls: Array[Dictionary] = []
 	for pending in pending_controls:
@@ -1660,7 +1661,7 @@ func _apply_authoritative_player(
 		prediction_history.clear()
 		pending_controls.clear()
 		prediction_history_invalid = false
-		next_input_sequence = incoming_ack + 1
+		next_input_sequence = incoming_received + 1
 		current_prediction_input_sequence = incoming_ack
 		desired_dampeners = bool(player.get("dampeners", true))
 		last_sent_control = {}
