@@ -272,18 +272,50 @@ function combineActorSnapshots(local, remote, description) {
 }
 
 function combineActorMotion(local, remote, description) {
-  assert.deepEqual(
-    publicProjection(local),
-    publicProjection(remote),
-    `${description} exposes identical public motion`,
-  );
   assertActorPrivate(local, "player-local", `${description} local motion`);
   assertActorPrivate(remote, "player-remote", `${description} remote motion`);
+  assert.deepEqual(
+    rosterIds(local),
+    rosterIds(remote),
+    `${description} exposes the same public player membership`,
+  );
+  assert.deepEqual(
+    local.grids.map((grid) => grid.grid_id),
+    remote.grids.map((grid) => grid.grid_id),
+    `${description} exposes the same public grid membership`,
+  );
+  for (const projection of [local, remote]) {
+    const privatePlayer = projection.actor_private;
+    const publicPlayer = projection.players.find(
+      (player) => player.player_id === privatePlayer.player_id,
+    );
+    assert.ok(publicPlayer, `${description} private actor is publicly present`);
+    for (const field of [
+      "position",
+      "orientation",
+      "linear_velocity",
+      "angular_velocity",
+      "surface_contact",
+    ]) {
+      assert.deepEqual(
+        privatePlayer[field],
+        publicPlayer[field],
+        `${description} ${privatePlayer.player_id} ${field} is internally consistent`,
+      );
+    }
+  }
   const privatePlayers = new Map([
     [local.actor_private.player_id, local.actor_private],
     [remote.actor_private.player_id, remote.actor_private],
   ]);
-  const shared = publicProjection(local);
+  // Latest-state coalescing intentionally does not guarantee that two sockets
+  // observe the same intermediate 60 Hz event. Use the newer complete public
+  // projection while retaining each internally consistent actor-private
+  // record. Structural snapshot tests separately prove exact cross-session
+  // hash equality at durable boundaries.
+  const shared = publicProjection(
+    local.event_sequence >= remote.event_sequence ? local : remote,
+  );
   return {
     ...shared,
     player: local.actor_private,
@@ -593,36 +625,7 @@ async function waitForCommonMotion(
     remote.waitFor(motionPredicate, `${description} on remote`, timeoutMillis),
   ]);
 
-  while (
-    localMessage.motion.event_sequence !== remoteMessage.motion.event_sequence
-  ) {
-    if (
-      localMessage.motion.event_sequence < remoteMessage.motion.event_sequence
-    ) {
-      const minimum = remoteMessage.motion.event_sequence;
-      localMessage = await local.waitFor(
-        (message) =>
-          motionPredicate(message) && message.motion.event_sequence >= minimum,
-        `${description} convergence on local`,
-        timeoutMillis,
-      );
-    } else {
-      const minimum = localMessage.motion.event_sequence;
-      remoteMessage = await remote.waitFor(
-        (message) =>
-          motionPredicate(message) && message.motion.event_sequence >= minimum,
-        `${description} convergence on remote`,
-        timeoutMillis,
-      );
-    }
-  }
-
   for (;;) {
-    assert.equal(
-      localMessage.motion.world_hash,
-      remoteMessage.motion.world_hash,
-      `${description} converges on one authoritative hash`,
-    );
     const combined = combineActorMotion(
       localMessage.motion,
       remoteMessage.motion,
@@ -631,46 +634,24 @@ async function waitForCommonMotion(
     assertCanonicalRoster(combined, `${description} combined motion`);
     if (predicate(combined)) return combined;
 
-    const currentSequence = combined.event_sequence;
+    const localSequence = localMessage.motion.event_sequence;
+    const remoteSequence = remoteMessage.motion.event_sequence;
     [localMessage, remoteMessage] = await Promise.all([
       local.waitFor(
         (message) =>
           motionPredicate(message) &&
-          message.motion.event_sequence > currentSequence,
+          message.motion.event_sequence > localSequence,
         `${description} progress on local`,
         timeoutMillis,
       ),
       remote.waitFor(
         (message) =>
           motionPredicate(message) &&
-          message.motion.event_sequence > currentSequence,
+          message.motion.event_sequence > remoteSequence,
         `${description} progress on remote`,
         timeoutMillis,
       ),
     ]);
-    while (
-      localMessage.motion.event_sequence !== remoteMessage.motion.event_sequence
-    ) {
-      if (
-        localMessage.motion.event_sequence < remoteMessage.motion.event_sequence
-      ) {
-        const minimum = remoteMessage.motion.event_sequence;
-        localMessage = await local.waitFor(
-          (message) =>
-            motionPredicate(message) && message.motion.event_sequence >= minimum,
-          `${description} progress convergence on local`,
-          timeoutMillis,
-        );
-      } else {
-        const minimum = localMessage.motion.event_sequence;
-        remoteMessage = await remote.waitFor(
-          (message) =>
-            motionPredicate(message) && message.motion.event_sequence >= minimum,
-          `${description} progress convergence on remote`,
-          timeoutMillis,
-        );
-      }
-    }
   }
 }
 
