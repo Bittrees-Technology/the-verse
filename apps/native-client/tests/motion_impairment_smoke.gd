@@ -8,6 +8,36 @@ const HISTORY_LIMIT := 180
 var failures: Array[String] = []
 
 
+class OutOfRangePresentationVerifier extends RefCounted:
+	var commits := 0
+	var discards := 0
+
+	func stage_server_message(_packet: PackedByteArray) -> Dictionary:
+		return {
+			"ok": true,
+			"token": 7,
+			"kind": "interest_baseline",
+			"sanitized_frame": JSON.stringify({
+				"type": "interest_baseline",
+				"baseline": {
+					"event_sequence": "__VERSE_LOSSLESS_INTEGER__:18446744073709551616",
+				},
+			}),
+		}
+
+	func discard(token: int) -> Dictionary:
+		if token == 7:
+			discards += 1
+		return {"ok": true}
+
+	func commit(_token: int) -> Dictionary:
+		commits += 1
+		return {
+			"ok": true,
+			"acknowledgement": '{"type":"acknowledge_interest"}'.to_utf8_buffer(),
+		}
+
+
 func _initialize() -> void:
 	call_deferred("_run")
 
@@ -24,6 +54,10 @@ func _run() -> void:
 	_test_actor_owned_industry_selection()
 	_test_physical_production_client()
 	_test_mutation_frontier_reconciliation()
+	_test_verified_ack_order_and_presentation_failure()
+	_test_reconnect_policy_and_generation_reset()
+	_test_binary_json_frame_rejected()
+	_test_lossless_verified_presentation()
 	if not failures.is_empty():
 		for failure in failures:
 			printerr("VERSE_NATIVE_IMPAIRMENT_FAILED %s" % failure)
@@ -90,6 +124,124 @@ func _new_client(add_to_tree := false) -> Node3D:
 	return client
 
 
+func _test_lossless_verified_presentation() -> void:
+	var client := _new_client()
+	var presentation: Variant = JSON.parse_string(JSON.stringify({
+		"event_sequence": "__VERSE_LOSSLESS_INTEGER__:9007199254740995",
+		"interest": {"interest_epoch": "__VERSE_LOSSLESS_INTEGER__:9007199254740993"},
+		"inventory": {
+			"quantity": "__VERSE_LOSSLESS_INTEGER__:9007199254741011",
+			"mass_grams": "__VERSE_LOSSLESS_INTEGER__:9007199254741013",
+			"capacity_liters": "__VERSE_LOSSLESS_INTEGER__:9007199254741015",
+		},
+		"job": {
+			"progress_ticks": "__VERSE_LOSSLESS_INTEGER__:9007199254741017",
+			"duration_ticks": "__VERSE_LOSSLESS_INTEGER__:9007199254741019",
+		},
+		"literal": "__VERSE_LOSSLESS_STRING__:__VERSE_LOSSLESS_INTEGER__:7",
+	}))
+	_check(
+		presentation is Dictionary
+		and bool(client.call("_decode_lossless_protocol_integers", presentation)),
+		"verified presentation lossless integers decode",
+	)
+	if presentation is Dictionary:
+		_check(
+			typeof(presentation.get("event_sequence", null)) == TYPE_INT
+			and int(presentation.get("event_sequence", 0)) == 9007199254740995
+			and int(presentation.get("interest", {}).get("interest_epoch", 0))
+			== 9007199254740993
+			and int(presentation.get("inventory", {}).get("quantity", 0))
+			== 9007199254741011
+			and int(presentation.get("inventory", {}).get("mass_grams", 0))
+			== 9007199254741013
+			and int(presentation.get("inventory", {}).get("capacity_liters", 0))
+			== 9007199254741015
+			and int(presentation.get("job", {}).get("progress_ticks", 0))
+			== 9007199254741017
+			and int(presentation.get("job", {}).get("duration_ticks", 0))
+			== 9007199254741019,
+			"verified frontiers, inventory, mass, capacity, and progress stay exact",
+		)
+		_check(
+			String(presentation.get("literal", "")) == "__VERSE_LOSSLESS_INTEGER__:7",
+			"reserved-prefix protocol strings round-trip without reinterpretation",
+		)
+		var exact_player := _base_player()
+		var exact_private := _private_snapshot(exact_player)
+		exact_private["committed_operation_sequence"] = presentation["inventory"]["quantity"]
+		var exact_inventory: Dictionary = exact_private["inventories"][0]
+		exact_inventory["contents"]["ore"] = presentation["inventory"]["quantity"]
+		exact_inventory["capacity_liters"] = presentation["inventory"]["capacity_liters"]
+		exact_inventory["used_liters"] = presentation["inventory"]["quantity"]
+		exact_inventory["mass_grams"] = presentation["inventory"]["mass_grams"]
+		exact_private["production_queues"] = [{
+			"machine_block_id": "machine-exact",
+			"jobs": [{
+				"progress_ticks": presentation["job"]["progress_ticks"],
+				"duration_ticks": presentation["job"]["duration_ticks"],
+			}],
+		}]
+		var exact_world: Dictionary = client.get("snapshot").duplicate(true)
+		exact_world["event_sequence"] = presentation["event_sequence"]
+		exact_world["simulation_tick"] = presentation["event_sequence"]
+		exact_world["actor_private"] = exact_private
+		client.call("_install_verified_interest_model", {
+			"world": exact_world,
+			"entities": {"player": {}, "grid": {}, "voxel_chunk": {}, "death_drop": {}},
+			"origin": {},
+			"session_epoch": "lossless-install",
+			"interest_epoch": presentation["interest"]["interest_epoch"],
+			"baseline_id": "lossless-install",
+			"delta_sequence": 0,
+			"view_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		})
+		var installed_private: Dictionary = client.get("actor_private_snapshot")
+		var installed_inventory: Dictionary = installed_private.get("inventories", [])[0]
+		var installed_job: Dictionary = installed_private.get("production_queues", [])[0].get(
+			"jobs", []
+		)[0]
+		_check(
+			int(client.get("interest_epoch")) == 9007199254740993
+			and int(client.get("committed_operation_sequence")) == 9007199254741011
+			and int(installed_inventory.get("contents", {}).get("ore", 0))
+			== 9007199254741011
+			and int(installed_inventory.get("mass_grams", 0)) == 9007199254741013
+			and int(installed_inventory.get("capacity_liters", 0)) == 9007199254741015
+			and int(installed_job.get("progress_ticks", 0)) == 9007199254741017,
+			"full verified candidate install preserves unsafe frontier, quantity, mass, capacity, and progress",
+		)
+	var unsigned_revision := {
+		"revision": "__VERSE_LOSSLESS_INTEGER__:18446744073709551615"
+	}
+	_check(
+		bool(client.call("_decode_lossless_protocol_integers", unsigned_revision))
+		and typeof(unsigned_revision.get("revision", null)) == TYPE_STRING
+		and String(unsigned_revision.get("revision", "")) == "18446744073709551615"
+		and String(client.call(
+			"_protocol_exact_unsigned_text", unsigned_revision.get("revision", null)
+		)) == "18446744073709551615",
+		"verified u64 identity values above i64 remain exact decimal strings",
+	)
+	var overflow := {"event_sequence": "__VERSE_LOSSLESS_INTEGER__:18446744073709551616"}
+	_check(
+		not bool(client.call("_decode_lossless_protocol_integers", overflow)),
+		"native presentation rejects verified integers outside the protocol u64 range",
+	)
+	var verifier := OutOfRangePresentationVerifier.new()
+	client.set("interest_verifier", verifier)
+	client.set("test_capture_transport", true)
+	client.call("_verify_and_handle_packet", PackedByteArray([123, 125]))
+	_check(
+		client.get("replication_state") == "fatal"
+		and verifier.discards == 1
+		and verifier.commits == 0
+		and (client.get("test_outbound_trace") as Array).is_empty(),
+		"out-of-u64 presentation is discarded before commit and cannot emit an ACK",
+	)
+	client.free()
+
+
 func _base_player() -> Dictionary:
 	return {
 		"player_id": "impairment-player",
@@ -145,6 +297,134 @@ func _private_snapshot(
 		"owned_grid_masses": [],
 		"production_queues": [],
 	}
+
+
+func _test_verified_ack_order_and_presentation_failure() -> void:
+	var client := _new_client()
+	client.set("connected", true)
+	client.set("test_capture_transport", true)
+	client.set("test_fail_interest_presentation", true)
+	client.set("mutation_queue_actor_id", "impairment-player")
+	var queued_mutations: Array[Dictionary] = client.get("mutation_queue")
+	queued_mutations.append({
+		"type": "set_suit_mode",
+		"operation_id": "ordered-after-ack",
+		"helmet_closed": true,
+		"jetpack_enabled": true,
+		"dampeners": true,
+	})
+	client.set("authoritative_player_ready", false)
+	client.set("operation_frontier_ready", false)
+	client.set("mutation_resync_required", true)
+	var world: Dictionary = client.get("snapshot").duplicate(true)
+	world["event_sequence"] = 1
+	world["simulation_tick"] = 1
+	world["world_hash"] = "verified-order-1"
+	world["actor_private"] = client.get("actor_private_snapshot").duplicate(true)
+	var candidate := {
+		"world": world,
+		"entities": {"player": {}, "grid": {}, "voxel_chunk": {}, "death_drop": {}},
+		"origin": {},
+		"session_epoch": "ordered-session",
+		"interest_epoch": 1,
+		"baseline_id": "ordered-baseline",
+		"delta_sequence": 0,
+		"view_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+	}
+	var finalized := bool(client.call(
+		"_finalize_committed_interest", candidate, "{\"type\":\"acknowledge_interest\"}".to_utf8_buffer()
+	))
+	var trace: Array[String] = client.get("test_outbound_trace")
+	_check(
+		finalized
+		and trace == ["interest_ack", "gameplay:set_suit_mode"],
+		"verified ACK is outbound before queued gameplay intent: trace=%s queue=%s inflight=%s connected=%s auth=%s frontier=%s resync=%s actor=%s capture=%s"
+		% [
+			trace, client.get("mutation_queue"), client.get("in_flight_mutation"), client.get("connected"),
+			client.get("authoritative_player_ready"), client.get("operation_frontier_ready"),
+			client.get("mutation_resync_required"), client.call("_mutation_actor_matches_session"),
+			client.get("test_capture_transport"),
+		],
+	)
+	_check(
+		int(client.get("interest_delta_sequence")) == 0
+		and String(client.get("interest_view_hash")) == candidate["view_hash"]
+		and int((client.get("snapshot") as Dictionary).get("event_sequence", -1)) == 1
+		and bool(client.get("authoritative_player_ready"))
+		and String(client.get("replication_state")) == "ready"
+		and String(client.get("replication_detail")).contains("PRESENTATION DEGRADED"),
+		"presentation failure preserves the verified model and ready authority",
+	)
+	client.free()
+
+
+func _test_reconnect_policy_and_generation_reset() -> void:
+	var client := _new_client()
+	var expected := [0.5, 1.0, 2.0, 4.0, 8.0]
+	for index in expected.size():
+		client.set("auto_reconnect_scheduled", false)
+		_check(bool(client.call("_schedule_auto_reconnect")), "bounded reconnect attempt schedules")
+		_check(
+			is_equal_approx(float(client.get("auto_reconnect_elapsed")), expected[index]),
+			"reconnect exponential backoff attempt %d" % (index + 1),
+		)
+	client.set("auto_reconnect_scheduled", false)
+	_check(
+		not bool(client.call("_schedule_auto_reconnect"))
+		and int(client.get("auto_reconnect_attempts")) == 5,
+		"automatic reconnect stops at its attempt bound",
+	)
+	client.set("replication_state", "fatal")
+	client.set("auto_reconnect_attempts", 0)
+	_check(
+		not bool(client.call("_schedule_auto_reconnect")),
+		"fatal replication state never schedules reconnect",
+	)
+
+	client.set("replication_state", "loading")
+	var verifier: Object = ClassDB.instantiate("VerseInterestVerifier")
+	client.set("interest_verifier", verifier)
+	_check(bool(client.call("_reset_interest_verifier")), "generation verifier initializes")
+	var welcome := {
+		"type": "welcome", "protocol_version": 16, "projection_schema_version": 3,
+		"world_schema_version": 18, "event_schema_version": 14,
+		"content_schema_version": 11, "content_manifest_version": "p1.5.0",
+		"celestial_registry_schema_version": 1, "universe_manifest_schema_version": 2,
+		"interest_schema_version": 1, "server_name": "generation-test",
+		"session_role": {"kind": "player", "player_id": "impairment-player"},
+	}
+	var staged: Dictionary = verifier.call(
+		"stage_server_message", JSON.stringify(welcome).to_utf8_buffer()
+	)
+	var old_token := int(staged.get("token", -1))
+	client.set("interest_delta_sequence", 9)
+	client.set("baseline_request_pending", true)
+	client.set("operation_frontier_ready", true)
+	var old_generation := int(client.get("connection_generation"))
+	_check(bool(client.call("_begin_connection_generation")), "new connection generation resets")
+	var stale_commit: Dictionary = verifier.call("commit", old_token)
+	_check(
+		int(client.get("connection_generation")) == old_generation + 1
+		and int(client.get("interest_delta_sequence")) == -1
+		and not bool(client.get("baseline_request_pending"))
+		and not bool(client.get("operation_frontier_ready"))
+		and not bool(stale_commit.get("ok", true))
+		and String(stale_commit.get("error_code", "")) == "invalid_stage_token",
+		"new generation invalidates old stage and every interest frontier",
+	)
+	client.free()
+
+
+func _test_binary_json_frame_rejected() -> void:
+	var client := _new_client()
+	var valid_json_bytes := JSON.stringify({"type": "fatal", "code": "x", "message": "x"}).to_utf8_buffer()
+	_check(
+		not bool(client.call("_accept_server_packet", valid_json_bytes, false))
+		and String(client.get("replication_state")) == "fatal"
+		and String(client.get("replication_detail")) == "BINARY SERVER FRAME REJECTED",
+		"binary WebSocket frame is rejected even when payload is valid JSON",
+	)
+	client.free()
 
 
 func _control(angular_input: Vector3, dampeners := true) -> Dictionary:

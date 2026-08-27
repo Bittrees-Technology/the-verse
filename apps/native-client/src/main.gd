@@ -20,6 +20,10 @@ const CONTENT_MANIFEST_VERSION := "p1.5.0"
 const CELESTIAL_REGISTRY_SCHEMA_VERSION := 1
 const UNIVERSE_MANIFEST_SCHEMA_VERSION := 2
 const INTEREST_SCHEMA_VERSION := 1
+const EXPECTED_UNIVERSE_ID := "the-verse-local"
+const EXPECTED_CELESTIAL_REGISTRY_HASH := "4c367bbfa04218ece14104f0a3a7ec2c7e9fefcc37d4cf78a265df2d711a59da"
+const EXPECTED_UNIVERSE_MANIFEST_HASH := "08f96738abee769d2f9998a9666970ef6cd8474f3270977aec1a50672aad814e"
+const EXPECTED_CONTENT_HASH := "fc61c05b335fb951868010ecf2942a92ec4f03d00d0a75d3acba8c6f5162b6bd"
 const DEFAULT_SERVER := "ws://127.0.0.1:7777/ws"
 const DEFAULT_PLAYER_ID := "player-local"
 const STARTER_GRID := "grid-starter"
@@ -34,7 +38,15 @@ const PREDICTION_HISTORY_LIMIT := 180
 const MUTATION_QUEUE_LIMIT := 32
 const MUTATION_RETRY_INTERVAL := 1.5
 const MUTATION_RETRY_LIMIT := 3
+const AUTO_RECONNECT_ATTEMPT_LIMIT := 5
+const AUTO_RECONNECT_BASE_DELAY := 0.5
+const AUTO_RECONNECT_MAX_DELAY := 8.0
 const JSON_SAFE_INTEGER_MAX := 9007199254740991
+const LOSSLESS_INTEGER_PREFIX := "__VERSE_LOSSLESS_INTEGER__:"
+const LOSSLESS_STRING_PREFIX := "__VERSE_LOSSLESS_STRING__:"
+const I64_MAX_DECIMAL := "9223372036854775807"
+const I64_MIN_MAGNITUDE_DECIMAL := "9223372036854775808"
+const U64_MAX_DECIMAL := "18446744073709551615"
 const POSITION_SNAP_DISTANCE := 2.0
 const ORIENTATION_SNAP_ANGLE := PI / 3.0
 const CHARACTER_COLLISION_RADIUS := 0.34
@@ -108,6 +120,12 @@ var interest_delta_sequence := -1
 var interest_view_hash := ""
 var interest_local_origin: Dictionary = {}
 var baseline_request_pending := false
+var interest_verifier: Object
+var interest_recovery_used := false
+var connection_generation := 0
+var auto_reconnect_attempts := 0
+var auto_reconnect_elapsed := 0.0
+var auto_reconnect_scheduled := false
 var operation_counter := 0
 var committed_operation_sequence := 0
 var committed_operation_actor_id := ""
@@ -181,6 +199,9 @@ var smoke_operation := ""
 var smoke_input_sequence := 0
 var smoke_receipt_received := false
 var smoke_visual_ready := false
+var test_fail_interest_presentation := false
+var test_capture_transport := false
+var test_outbound_trace: Array[String] = []
 var recovery_operation := ""
 var last_socket_state := -1
 var closed_reported := false
@@ -271,6 +292,9 @@ func _ready() -> void:
 	_build_viewmodel()
 	_build_interface()
 	Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
+	if not _initialize_interest_verifier():
+		_client_fatal("NATIVE INTEREST VERIFIER EXTENSION UNAVAILABLE")
+		return
 	_connect_to_server()
 
 
@@ -280,6 +304,7 @@ func _exit_tree() -> void:
 
 func _process(delta: float) -> void:
 	elapsed_time += delta
+	_advance_auto_reconnect(delta)
 	if planet_cloud_layer != null:
 		planet_cloud_layer.rotation.y += delta * 0.0025
 	_poll_socket()
@@ -318,7 +343,7 @@ func _physics_process(delta: float) -> void:
 
 func _input(event: InputEvent) -> void:
 	if event is InputEventKey and _reconnect_shortcut(event):
-		_connect_to_server()
+		_connect_to_server(true)
 		get_viewport().set_input_as_handled()
 		return
 
@@ -527,7 +552,7 @@ func _protocol_nonnegative_integer(value: Variant) -> int:
 	var value_type := typeof(value)
 	if value_type == TYPE_INT:
 		var integer_value := int(value)
-		if integer_value >= 0 and integer_value <= JSON_SAFE_INTEGER_MAX:
+		if integer_value >= 0:
 			return integer_value
 		return -1
 	if value_type != TYPE_FLOAT:
@@ -556,6 +581,93 @@ func _protocol_signed_integer(value: Variant) -> Variant:
 	):
 		return null
 	return int(float_value)
+
+
+func _decode_lossless_protocol_integers(value: Variant) -> bool:
+	if value is Dictionary:
+		var dictionary: Dictionary = value
+		for key in dictionary.keys():
+			var child: Variant = dictionary[key]
+			if child is String:
+				var decoded: Variant = _decode_lossless_integer_string(String(child))
+				if decoded == null and String(child).begins_with(LOSSLESS_INTEGER_PREFIX):
+					return false
+				dictionary[key] = decoded if decoded != null else child
+			elif not _decode_lossless_protocol_integers(child):
+				return false
+		return true
+	if value is Array:
+		var array: Array = value
+		for index in array.size():
+			var child: Variant = array[index]
+			if child is String:
+				var decoded: Variant = _decode_lossless_integer_string(String(child))
+				if decoded == null and String(child).begins_with(LOSSLESS_INTEGER_PREFIX):
+					return false
+				array[index] = decoded if decoded != null else child
+			elif not _decode_lossless_protocol_integers(child):
+				return false
+		return true
+	return true
+
+
+func _decode_lossless_integer_string(value: String) -> Variant:
+	if value.begins_with(LOSSLESS_STRING_PREFIX):
+		return value.substr(LOSSLESS_STRING_PREFIX.length())
+	if not value.begins_with(LOSSLESS_INTEGER_PREFIX):
+		return null
+	var decimal := value.substr(LOSSLESS_INTEGER_PREFIX.length())
+	if decimal.is_empty() or decimal == "-0" or decimal.begins_with("+"):
+		return null
+	var negative := decimal.begins_with("-")
+	var magnitude := decimal.substr(1) if negative else decimal
+	if magnitude.is_empty() or (magnitude.length() > 1 and magnitude.begins_with("0")):
+		return null
+	for index in magnitude.length():
+		var code := magnitude.unicode_at(index)
+		if code < 48 or code > 57:
+			return null
+	if negative:
+		if _decimal_compare(magnitude, I64_MIN_MAGNITUDE_DECIMAL) > 0:
+			return null
+		if magnitude == I64_MIN_MAGNITUDE_DECIMAL:
+			return -9223372036854775807 - 1
+		return -int(magnitude)
+	if _decimal_compare(magnitude, U64_MAX_DECIMAL) > 0:
+		return null
+	if _decimal_compare(magnitude, I64_MAX_DECIMAL) > 0:
+		# Godot Variant integers are signed i64. Preserve the verifier-typed u64
+		# lexeme for identity/fingerprint fields that do not require arithmetic.
+		return decimal
+	return int(magnitude)
+
+
+func _protocol_exact_unsigned_text(value: Variant) -> String:
+	if typeof(value) == TYPE_INT:
+		var integer_value := int(value)
+		return str(integer_value) if integer_value >= 0 else ""
+	if typeof(value) == TYPE_FLOAT:
+		var float_value := float(value)
+		if (
+			is_finite(float_value)
+			and float_value >= 0.0
+			and float_value <= float(JSON_SAFE_INTEGER_MAX)
+			and floor(float_value) == float_value
+		):
+			return str(int(float_value))
+		return ""
+	if value is String:
+		var decimal := String(value)
+		if decimal == "0":
+			return decimal
+		if decimal.is_empty() or decimal.begins_with("0") or decimal.begins_with("-"):
+			return ""
+		for index in decimal.length():
+			var code := decimal.unicode_at(index)
+			if code < 48 or code > 57:
+				return ""
+		return decimal if _decimal_compare(decimal, U64_MAX_DECIMAL) <= 0 else ""
+	return ""
 
 
 func _actor_private_matches(candidate: Variant, event_sequence: int) -> bool:
@@ -1799,13 +1911,19 @@ func _terminal_style(background: Color, border: Color, width: int) -> StyleBoxFl
 	return style
 
 
-func _connect_to_server() -> void:
+func _connect_to_server(manual_retry := false) -> void:
+	if manual_retry:
+		auto_reconnect_attempts = 0
+		auto_reconnect_scheduled = false
+		auto_reconnect_elapsed = 0.0
 	socket.close()
+	if not _begin_connection_generation():
+		_client_fatal("NATIVE INTEREST VERIFIER RESET FAILED")
+		return
 	socket = WebSocketPeer.new()
 	socket.inbound_buffer_size = 8 * 1024 * 1024
 	socket.outbound_buffer_size = 1024 * 1024
 	connected = false
-	_begin_player_resync()
 	recovery_operation = ""
 	handshake_sent = false
 	closed_reported = false
@@ -1815,8 +1933,17 @@ func _connect_to_server() -> void:
 		print("VERSE_SMOKE_CONNECT url=%s result=%d" % [server_url, result])
 	if result != OK:
 		_set_message("Unable to begin connection: %s" % error_string(result), true)
+		_schedule_auto_reconnect()
 	else:
 		_set_message("Connecting to %s" % server_url)
+
+
+func _begin_connection_generation() -> bool:
+	connection_generation += 1
+	if not _reset_interest_verifier():
+		return false
+	_begin_player_resync()
+	return true
 
 
 func _poll_socket() -> void:
@@ -1839,13 +1966,14 @@ func _poll_socket() -> void:
 				},
 			})
 		while socket.get_available_packet_count() > 0:
-			var text := socket.get_packet().get_string_from_utf8()
-			var parsed: Variant = JSON.parse_string(text)
-			if parsed is Dictionary:
-				_handle_server_message(parsed)
+			var packet := socket.get_packet()
+			if not _accept_server_packet(packet, socket.was_string_packet()):
+				return
 	elif state == WebSocketPeer.STATE_CLOSED:
-		if smoke_test and not connected and not closed_reported:
-			closed_reported = true
+		if closed_reported:
+			return
+		closed_reported = true
+		if smoke_test and not connected:
 			print(
 				"VERSE_SMOKE_CLOSED code=%d reason=%s"
 				% [socket.get_close_code(), socket.get_close_reason()]
@@ -1859,8 +1987,162 @@ func _poll_socket() -> void:
 		connected = false
 		if replication_state != "fatal":
 			_begin_player_resync()
+			_schedule_auto_reconnect()
 		recovery_operation = ""
 		handshake_sent = false
+
+
+func _accept_server_packet(packet: PackedByteArray, was_string_packet: bool) -> bool:
+	if not was_string_packet:
+		_client_fatal("BINARY SERVER FRAME REJECTED")
+		return false
+	_verify_and_handle_packet(packet)
+	return replication_state != "fatal"
+
+
+func _reconnect_delay_for_attempt(attempt: int) -> float:
+	if attempt <= 0:
+		return 0.0
+	return minf(
+		AUTO_RECONNECT_BASE_DELAY * pow(2.0, float(attempt - 1)),
+		AUTO_RECONNECT_MAX_DELAY,
+	)
+
+
+func _schedule_auto_reconnect() -> bool:
+	if replication_state == "fatal" or auto_reconnect_attempts >= AUTO_RECONNECT_ATTEMPT_LIMIT:
+		auto_reconnect_scheduled = false
+		return false
+	if auto_reconnect_scheduled:
+		return true
+	auto_reconnect_attempts += 1
+	auto_reconnect_elapsed = _reconnect_delay_for_attempt(auto_reconnect_attempts)
+	auto_reconnect_scheduled = true
+	_set_message(
+		"LINK LOST // RETRY %d/%d IN %.1fs // F5 RETRIES NOW"
+		% [auto_reconnect_attempts, AUTO_RECONNECT_ATTEMPT_LIMIT, auto_reconnect_elapsed],
+		true,
+	)
+	return true
+
+
+func _advance_auto_reconnect(delta: float) -> bool:
+	if not auto_reconnect_scheduled or replication_state == "fatal":
+		return false
+	auto_reconnect_elapsed = maxf(0.0, auto_reconnect_elapsed - maxf(delta, 0.0))
+	if auto_reconnect_elapsed > 0.0:
+		return false
+	auto_reconnect_scheduled = false
+	_connect_to_server(false)
+	return true
+
+
+func _initialize_interest_verifier() -> bool:
+	if not ClassDB.class_exists("VerseInterestVerifier"):
+		interest_verifier = null
+		return false
+	interest_verifier = ClassDB.instantiate("VerseInterestVerifier")
+	return interest_verifier != null and _reset_interest_verifier()
+
+
+func _reset_interest_verifier() -> bool:
+	if interest_verifier == null:
+		return false
+	var reset: Variant = interest_verifier.call(
+		"reset_player",
+		requested_player_id,
+		WORLD_SCHEMA_VERSION,
+		EVENT_SCHEMA_VERSION,
+		CONTENT_SCHEMA_VERSION,
+		CONTENT_MANIFEST_VERSION,
+		EXPECTED_CONTENT_HASH,
+		EXPECTED_UNIVERSE_ID,
+		EXPECTED_CELESTIAL_REGISTRY_HASH,
+		EXPECTED_UNIVERSE_MANIFEST_HASH,
+	)
+	interest_recovery_used = false
+	return reset is Dictionary and bool(reset.get("ok", false))
+
+
+func _verify_and_handle_packet(packet: PackedByteArray) -> void:
+	if interest_verifier == null:
+		_client_fatal("NATIVE INTEREST VERIFIER EXTENSION UNAVAILABLE")
+		return
+	var staged: Variant = interest_verifier.call("stage_server_message", packet)
+	if not staged is Dictionary or not bool(staged.get("ok", false)):
+		var error_code := String(staged.get("error_code", "adapter_failure")) if staged is Dictionary else "adapter_failure"
+		if error_code == "frontier_mismatch" and not interest_recovery_used:
+			interest_recovery_used = true
+			_request_fresh_interest_baseline("VERIFIED INTEREST FRONTIER MISMATCH")
+			return
+		_client_fatal("INTEREST VERIFIER %s" % error_code.to_upper())
+		return
+	var token := int(staged.get("token", -1))
+	var parsed: Variant = JSON.parse_string(String(staged.get("sanitized_frame", "")))
+	if not parsed is Dictionary:
+		_discard_interest_stage(token)
+		_client_fatal("VERIFIER SANITIZED FRAME INVALID")
+		return
+	if not _decode_lossless_protocol_integers(parsed):
+		_discard_interest_stage(token)
+		_client_fatal("VERIFIER PRESENTATION INTEGER OUT OF RANGE")
+		return
+	var message: Dictionary = parsed
+	var candidate: Dictionary = {}
+	match String(message.get("type", "")):
+		"interest_baseline":
+			candidate = _prepare_interest_baseline(message.get("baseline", {}))
+		"interest_delta":
+			candidate = _prepare_interest_delta(message.get("delta", {}))
+	if String(message.get("type", "")) in ["interest_baseline", "interest_delta"] and candidate.is_empty():
+		_discard_interest_stage(token)
+		_client_fatal("VERIFIED FRAME FAILED MODEL STAGING")
+		return
+	var committed: Variant = interest_verifier.call("commit", token)
+	if not committed is Dictionary or not bool(committed.get("ok", false)):
+		_client_fatal("INTEREST VERIFIER COMMIT FAILED")
+		return
+	if candidate.is_empty():
+		_handle_server_message(message)
+		return
+	var acknowledgement: Variant = committed.get("acknowledgement", null)
+	if not acknowledgement is PackedByteArray:
+		_client_fatal("VERIFIER ACKNOWLEDGEMENT MISSING")
+		return
+	_finalize_committed_interest(candidate, acknowledgement)
+
+
+func _finalize_committed_interest(
+	candidate: Dictionary, acknowledgement: PackedByteArray
+) -> bool:
+	_install_verified_interest_model(candidate)
+	if not _send_verifier_acknowledgement(acknowledgement):
+		_client_fatal("VERIFIER ACKNOWLEDGEMENT SEND FAILED")
+		return false
+	replication_state = "ready"
+	replication_detail = "INTEREST VIEW CURRENT"
+	auto_reconnect_attempts = 0
+	auto_reconnect_scheduled = false
+	auto_reconnect_elapsed = 0.0
+	_dispatch_next_mutation()
+	if not _present_verified_interest_model(candidate.get("world", {})):
+		replication_detail = "INTEREST VIEW CURRENT // PRESENTATION DEGRADED"
+		_set_message("VERIFIED MODEL CURRENT // PRESENTATION REFRESH DEFERRED", true)
+	return true
+
+
+func _discard_interest_stage(token: int) -> void:
+	if interest_verifier != null:
+		interest_verifier.call("discard", token)
+
+
+func _send_verifier_acknowledgement(encoded: PackedByteArray) -> bool:
+	if test_capture_transport:
+		test_outbound_trace.append("interest_ack")
+		return true
+	if socket.get_ready_state() != WebSocketPeer.STATE_OPEN:
+		return false
+	return socket.send(encoded, WebSocketPeer.WRITE_MODE_TEXT) == OK
 
 
 func _handle_server_message(message: Dictionary) -> void:
@@ -1906,11 +2188,9 @@ func _handle_server_message(message: Dictionary) -> void:
 			replication_detail = "WAITING FOR INTEREST BASELINE"
 			_set_message("CELESTIAL REGISTRY VERIFIED // WAITING FOR LOCAL VIEW")
 		"interest_baseline":
-			if not _apply_interest_baseline(message.get("baseline", {})):
-				_request_fresh_interest_baseline("BASELINE VALIDATION FAILED")
+			_client_fatal("UNVERIFIED INTEREST BASELINE BYPASSED NATIVE VERIFIER")
 		"interest_delta":
-			if not _apply_interest_delta(message.get("delta", {})):
-				_request_fresh_interest_baseline("INTEREST FRONTIER MISMATCH")
+			_client_fatal("UNVERIFIED INTEREST DELTA BYPASSED NATIVE VERIFIER")
 		"snapshot", "motion_state":
 			_client_fatal("LEGACY REPLICATION FAMILY REJECTED")
 		"intent_accepted":
@@ -1934,14 +2214,8 @@ func _handle_server_message(message: Dictionary) -> void:
 					true
 				)
 		"fatal":
-			mutation_resync_required = true
-			operation_frontier_ready = false
-			authoritative_player_ready = false
-			replication_state = "fatal"
-			replication_detail = "%s // %s" % [message.get("code", ""), message.get("message", "")]
-			_set_message(
-				"FATAL %s — %s" % [message.get("code", ""), message.get("message", "")],
-				true
+			_client_fatal(
+				"SERVER %s — %s" % [message.get("code", ""), message.get("message", "")]
 			)
 		_:
 			_client_fatal("UNKNOWN SERVER MESSAGE TYPE")
@@ -2070,14 +2344,14 @@ func _install_registry(message: Dictionary) -> bool:
 	return true
 
 
-func _apply_interest_baseline(authoritative: Dictionary) -> bool:
+func _prepare_interest_baseline(authoritative: Dictionary) -> Dictionary:
 	if not welcome_received or not registry_received or authoritative.is_empty():
-		return false
+		return {}
 	if not stream_family.is_empty() and stream_family != "interest":
-		return false
+		return {}
 	var interest_value: Variant = authoritative.get("interest", {})
 	if not interest_value is Dictionary:
-		return false
+		return {}
 	var interest: Dictionary = interest_value
 	if (
 		not _interest_outer_bindings_valid(authoritative, interest)
@@ -2092,43 +2366,43 @@ func _apply_interest_baseline(authoritative: Dictionary) -> bool:
 		or not interest.get("replaced", []).is_empty()
 		or not interest.get("removed", []).is_empty()
 	):
-		return false
+		return {}
 	var origin: Dictionary = interest.get("local_origin_address", {})
 	var staged := _empty_interest_entities()
 	if not _apply_interest_operations(staged, interest, origin, true):
-		return false
+		return {}
 	if not _baseline_arrays_match_interest(authoritative, staged):
-		return false
-	var committed := _world_from_interest(authoritative, staged, origin, true)
-	if committed.is_empty() or not _private_projection_candidate_valid(committed):
-		return false
-	_apply_snapshot(committed)
-	if session_role_kind == "player" and not authoritative_player_ready:
-		return false
-	interest_entities = staged
-	interest_session_epoch = String(interest.get("session_epoch", ""))
-	interest_epoch = int(interest.get("interest_epoch", -1))
-	interest_baseline_id = String(interest.get("baseline_id", ""))
-	interest_delta_sequence = 0
-	interest_view_hash = String(interest.get("view_hash", ""))
-	interest_local_origin = origin.duplicate(true)
-	stream_family = "interest"
-	baseline_request_pending = false
-	_rebuild_registered_celestials()
-	_acknowledge_interest()
-	replication_state = "ready"
-	replication_detail = "INTEREST VIEW CURRENT"
-	return true
+		return {}
+	var world := _world_from_interest(authoritative, staged, origin, true)
+	if (
+		world.is_empty()
+		or not _private_projection_candidate_valid(world)
+		or not _full_snapshot_event_is_current(
+			int(authoritative.get("event_sequence", -1)), last_authoritative_event_sequence
+		)
+	):
+		return {}
+	return {
+		"baseline": true,
+		"world": world,
+		"entities": staged,
+		"origin": origin.duplicate(true),
+		"session_epoch": String(interest.get("session_epoch", "")),
+		"interest_epoch": int(interest.get("interest_epoch", -1)),
+		"baseline_id": String(interest.get("baseline_id", "")),
+		"delta_sequence": 0,
+		"view_hash": String(interest.get("view_hash", "")),
+	}
 
 
-func _apply_interest_delta(authoritative: Dictionary) -> bool:
+func _prepare_interest_delta(authoritative: Dictionary) -> Dictionary:
 	if stream_family != "interest" or interest_delta_sequence < 0 or baseline_request_pending:
-		return false
+		return {}
 	if int(authoritative.get("event_sequence", -1)) < last_authoritative_event_sequence:
-		return false
+		return {}
 	var interest_value: Variant = authoritative.get("interest", {})
 	if not interest_value is Dictionary:
-		return false
+		return {}
 	var interest: Dictionary = interest_value
 	if (
 		not _interest_outer_bindings_valid(authoritative, interest)
@@ -2140,28 +2414,60 @@ func _apply_interest_delta(authoritative: Dictionary) -> bool:
 		or String(interest.get("previous_view_hash", "")) != interest_view_hash
 		or not _valid_hash(String(interest.get("view_hash", "")))
 	):
-		return false
+		return {}
 	var origin: Dictionary = interest.get("local_origin_address", {})
 	var staged: Dictionary = interest_entities.duplicate(true)
 	if not _apply_interest_operations(staged, interest, origin, false):
-		return false
+		return {}
 	if not _rehydrate_interest_entities(staged, origin):
-		return false
-	var committed := _world_from_interest(authoritative, staged, origin, false)
-	if committed.is_empty() or not _private_projection_candidate_valid(committed):
-		return false
-	_apply_snapshot(committed)
-	if session_role_kind == "player" and not authoritative_player_ready:
-		return false
-	interest_entities = staged
-	interest_delta_sequence = int(interest.get("delta_sequence", -1))
-	interest_view_hash = String(interest.get("view_hash", ""))
-	interest_local_origin = origin.duplicate(true)
-	_rebuild_registered_celestials()
-	_acknowledge_interest()
-	replication_state = "ready"
-	replication_detail = "INTEREST VIEW CURRENT"
-	return true
+		return {}
+	var world := _world_from_interest(authoritative, staged, origin, false)
+	if world.is_empty() or not _private_projection_candidate_valid(world):
+		return {}
+	return {
+		"baseline": false,
+		"world": world,
+		"entities": staged,
+		"origin": origin.duplicate(true),
+		"session_epoch": interest_session_epoch,
+		"interest_epoch": interest_epoch,
+		"baseline_id": interest_baseline_id,
+		"delta_sequence": int(interest.get("delta_sequence", -1)),
+		"view_hash": String(interest.get("view_hash", "")),
+	}
+
+
+func _install_verified_interest_model(candidate: Dictionary) -> void:
+	var world: Dictionary = candidate.get("world", {}).duplicate(true)
+	var private_candidate: Dictionary = world.get("actor_private", {}).duplicate(true)
+	world.erase("actor_private")
+	snapshot = world
+	actor_private_snapshot = private_candidate
+	if not actor_private_snapshot.get("production_queues", []) is Array:
+		actor_private_snapshot["production_queues"] = []
+	_reconcile_operation_frontier(
+		_protocol_nonnegative_integer(
+			actor_private_snapshot.get("committed_operation_sequence", null)
+		)
+	)
+	interest_entities = candidate.get("entities", {}).duplicate(true)
+	interest_session_epoch = String(candidate.get("session_epoch", ""))
+	interest_epoch = int(candidate.get("interest_epoch", -1))
+	interest_baseline_id = String(candidate.get("baseline_id", ""))
+	interest_delta_sequence = int(candidate.get("delta_sequence", -1))
+	interest_view_hash = String(candidate.get("view_hash", ""))
+	interest_local_origin = candidate.get("origin", {}).duplicate(true)
+	stream_family = "interest"
+	baseline_request_pending = false
+	var player := _local_player()
+	_capture_prediction_gravity({"player": player, "environment": _local_environment()})
+	_apply_authoritative_player(
+		player,
+		int(snapshot.get("simulation_tick", 0)),
+		int(snapshot.get("event_sequence", 0)),
+		String(snapshot.get("world_hash", "")),
+		"snapshot",
+	)
 
 
 func _interest_outer_bindings_valid(authoritative: Dictionary, interest: Dictionary) -> bool:
@@ -2182,7 +2488,6 @@ func _interest_outer_bindings_valid(authoritative: Dictionary, interest: Diction
 		and int(interest.get("canonical_event_sequence", -1)) == int(authoritative.get("event_sequence", -2))
 		and int(interest.get("canonical_tick", -1)) == int(authoritative.get("simulation_tick", -2))
 		and String(interest.get("canonical_world_hash", "")) == String(authoritative.get("world_hash", ""))
-		and _valid_hash(String(authoritative.get("world_hash", "")))
 		and _universe_address_valid(authoritative.get("cell_address", {}), universe_manifest)
 		and authoritative.get("cell_address", {}) == interest.get("cell_address", {})
 		and _universe_address_valid(interest.get("local_origin_address", {}), universe_manifest)
@@ -2407,27 +2712,30 @@ func _private_projection_candidate_valid(world: Dictionary) -> bool:
 	if not _actor_private_matches(candidate, int(world.get("event_sequence", -1))):
 		return false
 	var frontier := _protocol_nonnegative_integer(candidate.get("committed_operation_sequence", null))
+	if not _operation_frontier_candidate_valid(frontier):
+		return false
+	return true
+
+
+func _operation_frontier_candidate_valid(frontier: int) -> bool:
+	if frontier < 0 or not _mutation_actor_matches_session():
+		return false
 	var observed_floor := committed_operation_sequence
 	if operation_frontier_observed:
 		observed_floor = maxi(observed_floor, observed_operation_frontier)
 	if operation_frontier_observed and committed_operation_actor_id == bound_player_id and frontier < observed_floor:
+		return false
+	if (
+		operation_frontier_observed
+		and not committed_operation_actor_id.is_empty()
+		and committed_operation_actor_id != bound_player_id
+	):
 		return false
 	if not in_flight_mutation.is_empty():
 		var pending_sequence := int(in_flight_mutation.get("operation_sequence", 0))
 		if pending_sequence <= 0 or frontier < pending_sequence - 1:
 			return false
 	return true
-
-
-func _acknowledge_interest() -> void:
-	_send_transport({
-		"type": "acknowledge_interest",
-		"session_epoch": interest_session_epoch,
-		"interest_epoch": interest_epoch,
-		"baseline_id": interest_baseline_id,
-		"delta_sequence": interest_delta_sequence,
-		"view_hash": interest_view_hash,
-	})
 
 
 func _request_fresh_interest_baseline(reason: String) -> void:
@@ -2453,22 +2761,20 @@ func _client_fatal(reason: String) -> void:
 	authoritative_player_ready = false
 	operation_frontier_ready = false
 	mutation_resync_required = true
+	auto_reconnect_scheduled = false
+	auto_reconnect_elapsed = 0.0
 	_set_message("FATAL CLIENT PROTOCOL ERROR // %s" % reason, true)
 	if socket.get_ready_state() == WebSocketPeer.STATE_OPEN:
 		socket.close(1002, reason)
+	if smoke_test:
+		get_tree().quit(1)
 
 
-func _apply_snapshot(authoritative: Dictionary) -> void:
-	if authoritative.is_empty():
-		return
+func _present_verified_interest_model(authoritative: Dictionary) -> bool:
+	if test_fail_interest_presentation:
+		return false
+	_rebuild_registered_celestials()
 	var event_sequence := int(authoritative.get("event_sequence", 0))
-	if not _full_snapshot_event_is_current(
-		event_sequence, last_authoritative_event_sequence
-	):
-		return
-	var private_candidate: Variant = authoritative.get("actor_private", {})
-	snapshot = authoritative.duplicate(true)
-	snapshot.erase("actor_private")
 	var players: Array = snapshot.get("players", [])
 	_sync_remote_players(players)
 
@@ -2482,51 +2788,20 @@ func _apply_snapshot(authoritative: Dictionary) -> void:
 	_rebuild_grids(snapshot.get("grids", []))
 	if smoke_test:
 		print("VERSE_SMOKE_STRUCTURAL_READY event=%d" % event_sequence)
-
-	var public_player := _player_from_roster(players, bound_player_id)
-	var projection_valid := (
-		int(snapshot.get("projection_schema_version", 0)) == PROJECTION_SCHEMA_VERSION
-		and not public_player.is_empty()
-		and _install_actor_private(private_candidate, event_sequence)
-	)
-	if not projection_valid:
-		if smoke_test:
-			printerr(
-				"VERSE_SMOKE_PRIVATE_PROJECTION_INVALID actor=%s event=%d"
-				% [bound_player_id, event_sequence]
-			)
-		_clear_actor_private_state()
-		authoritative_player_ready = false
-		last_authoritative_event_sequence = event_sequence
-		last_authoritative_simulation_tick = int(snapshot.get("simulation_tick", 0))
-		_set_message(
-			"PRIVATE INVENTORY LINK UNAVAILABLE // RESYNC REQUIRED",
-			true
-		)
-		return
-
 	var player := _local_player()
-	_capture_prediction_gravity({"player": player, "environment": _local_environment()})
 	var level := int(player.get("level", 1))
 	if level > last_level:
 		_set_message("CLEARANCE ADVANCED // SALVAGER LEVEL %d" % level)
 		tool_kick = 1.0
 	last_level = level
-	_apply_authoritative_player(
-		player,
-		int(snapshot.get("simulation_tick", 0)),
-		event_sequence,
-		String(snapshot.get("world_hash", "")),
-		"snapshot"
-	)
-	_dispatch_next_mutation()
 	if smoke_test and not smoke_visual_ready:
 		print("VERSE_SMOKE_VISUAL_ASSERTIONS_START event=%d" % event_sequence)
 		if not _run_visual_smoke_assertions():
 			get_tree().quit(1)
-			return
+			return false
 		smoke_visual_ready = true
 		print("VERSE_SMOKE_VISUAL_ASSERTIONS_COMPLETE event=%d" % event_sequence)
+	return true
 
 
 func _full_snapshot_event_is_current(incoming_sequence: int, current_sequence: int) -> bool:
@@ -3037,11 +3312,12 @@ func _sync_voxel_projection(chunks: Array, voxels: Array) -> bool:
 			continue
 		var chunk: Dictionary = chunk_value
 		var chunk_id := String(chunk.get("chunk_id", ""))
-		if chunk_id.is_empty():
+		var revision := _protocol_exact_unsigned_text(chunk.get("revision", null))
+		if chunk_id.is_empty() or revision.is_empty():
 			continue
 		next_fingerprints[chunk_id] = "%s|%s|%s" % [
 			String(chunk.get("body_id", "")),
-			str(int(chunk.get("revision", -1))),
+			revision,
 			JSON.stringify(chunk.get("voxels", [])),
 		]
 	# Structural smoke fixtures predating chunked interest snapshots still use
@@ -6012,6 +6288,11 @@ func _send_transport(message: Dictionary) -> bool:
 
 
 func _send_text_transport(encoded_message: String) -> bool:
+	if test_capture_transport:
+		var parsed: Variant = JSON.parse_string(encoded_message)
+		var message_type := String(parsed.get("type", "unknown")) if parsed is Dictionary else "invalid"
+		test_outbound_trace.append("gameplay:%s" % message_type)
+		return true
 	if socket.get_ready_state() != WebSocketPeer.STATE_OPEN:
 		_set_message("No authoritative server connection — press F5", true)
 		return false
