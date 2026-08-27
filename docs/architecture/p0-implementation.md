@@ -1,6 +1,6 @@
 # P0.9 implementation guide
 
-**Status:** Playable local vertical slice; authoritative EVA implemented and verified on macOS, Ubuntu evidence pending
+**Status:** Playable local vertical slice; authoritative EVA verified on macOS and hosted Ubuntu
 
 ## What this milestone proves
 

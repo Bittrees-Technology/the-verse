@@ -1,6 +1,6 @@
 # P0.9 authoritative EVA physics
 
-**Status:** Implemented and locally verified on macOS; observed Ubuntu tolerance evidence pending
+**Status:** Implemented and verified on macOS and hosted Ubuntu
 
 ## Player promise
 
@@ -39,7 +39,7 @@ EVA thrust, six-axis rotation, gravity, dampeners, and landing contact should fe
 
 The macOS local gate is green for protocol serialization and rejection, queued press/release consumption, received-versus-processed acknowledgement, Jolt collision and landing fixtures, conservative replay envelopes, control and physics failpoint recovery, death/respawn clearing, input-only range-gated work, oxygen lifecycle, exact restart hash recovery, and the live native acknowledgement path. Its deterministic Godot impairment harness exercises delayed and skipped motion states, acknowledgement replay, correction smoothing and snaps, menu-open gravity, death/disconnect gating, bounded production prediction buffers, and motion-only updates without structural rebuilds.
 
-The quantized EVA fixture runs in the ordinary Rust test suite and is green on the reference Mac. The same suite is configured for Ubuntu CI, but an observed green Ubuntu result and native Linux artifact remain required before cross-platform P0 evidence is complete.
+The quantized EVA fixture runs in the ordinary Rust test suite and is green on the reference Mac and in [hosted Ubuntu run 33047681929](https://github.com/Bittrees-Technology/the-verse/actions/runs/33047681929). That run also passed the headless Godot impairment and live-client gates plus the release-container smoke. A native Linux direct-download artifact and published Linux performance baseline remain required before the overall P0 exit evidence is complete.
 
 ## Explicit limits
 
