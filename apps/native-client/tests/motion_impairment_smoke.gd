@@ -184,6 +184,28 @@ func _test_bound_player_roster_selection() -> void:
 		client.call("_vec3", merged.get("position", {})).is_equal_approx(Vector3(9.0, 1.0, -2.0)),
 		"bound actor motion merged"
 	)
+	remote["life_state"] = {
+		"kind": "incapacitated",
+		"death_id": "remote-death",
+		"cause": {"kind": "oxygen_depleted"},
+	}
+	roster_snapshot = client.get("snapshot")
+	roster_snapshot["player"] = primary
+	roster_snapshot["players"] = [primary, remote]
+	client.set("snapshot", roster_snapshot)
+	_check(bool(client.call("_local_player_incapacitated")), "bound remote death gates controls")
+	_check(
+		String((client.call("_local_player") as Dictionary).get("player_id", ""))
+		== "player-remote",
+		"primary alive state cannot replace dead bound actor"
+	)
+	client.set("bound_player_id", "player-absent")
+	_check((client.call("_local_player") as Dictionary).is_empty(), "missing bound actor fails closed")
+	_check(
+		not bool(client.call("_player_controls_enabled", {})),
+		"empty actor state cannot enable controls"
+	)
+	_check(String(client.call("_local_inventory_id")).is_empty(), "missing actor has no inventory")
 
 
 func _test_received_vs_processed_reconciliation() -> void:
