@@ -13,7 +13,7 @@ This checkpoint targets F-005, F-006, F-007, and F-010 and the acceptance eviden
 1. Grid clients submit bounded control, tool, and construction intents. They never submit a grid pose, velocity, contact, damage amount, or split result. The current P0 character client still proposes an absolute position that is range-, planet-, voxel-, and grid-collision checked; input-only character simulation remains required.
 2. The server owns collision shapes, mass, inertia, friction, restitution, force application, anchoring, contact damage, and grid separation.
 3. Completed blocks and physical inventory contribute to body mass. Incomplete frames are represented consistently but do not gain completed functional behavior.
-4. Static voxel collision is derived from canonical occupied cells. Content pins 8×8×8-cell collision chunks with Euclidean floor ownership, stable chunk-body and cell-collider identities, and chunk-local child poses. The current physics adapter atomically rebuilds the complete static compound after a voxel edit; [ADR-0011](../decisions/ADR-0011-dirty-voxel-collision-chunks.md) defines the required dirty collision-body replacement.
+4. Static voxel collision is derived from canonical occupied cells. Content pins 8×8×8-cell collision chunks with Euclidean floor ownership, stable chunk-body and cell-collider identities, and chunk-local child poses. Accepted mining atomically replaces only the owning collision body under [ADR-0011](../decisions/ADR-0011-dirty-voxel-collision-chunks.md).
 5. Anchoring converts a valid voxel-connected grid to an immovable body. Removing its final valid anchor returns it to dynamic eligibility without teleporting it.
 6. Player motion is swept or subdivided against authoritative voxel and grid volumes so a series of individually valid intents cannot tunnel through matter.
 
@@ -41,12 +41,13 @@ Implemented and tested:
 - Protocol v6 grid controls, explicit construction-completion state, full grid quaternion snapshots, exact block/cargo-derived mass, authoritative grid–voxel response, swept player–voxel rejection, quantized committed body/contact outcomes, canonical contact lifecycle across rebuild/restart, exact graceful restart, and truncated final-journal recovery.
 - Authoritative runtime evidence for equal-mass grid–grid momentum exchange and exact restart, cargo mass reducing acceleration under the same powered control, a two-second settle plus two-second resting-contact observation, immovable anchored bodies under impact followed by conservative release and restart, and swept player rejection against axis-aligned and rotated grids. The P0 equal-mass head-on tolerance is at most `1 kg m/s` absolute total linear-momentum error after canonical commit quantization. During the resting observation, translation drift is at most `0.1 mm`, linear speed at most `1 mm/s`, and angular speed at most `0.001 rad/s`. Adapter coverage separately proves unequal-density collision response.
 - In-process journal failpoints prove that a returned failure before write preserves the prior physics tick and a returned failure after journal synchronization recovers the complete new tick and resumes from it. Torn final records are truncated. Atomic snapshots synchronize the replacement file and parent directory after rename.
+- Content `p0.7.3` partitions voxel collision into stable 8×8×8 bodies. Mining patches one body exactly once, prunes only the removed collider's active pairs, preserves surviving lifecycle, rejects final anchored support without mutation, and reconstructs identical collision fingerprints across before-write or after-sync recovery. Native staging failure restores the prior body, catalog, and stepable scene.
 - Sparse dirty render chunks, a complete native mining/building/restart scenario, and initial Apple Silicon compound-body measurements.
 
 Still required for P0.7 acceptance:
 
 - A project-owned Jolt/JoltC post-solve callback that exposes applied impulses (including the winning CCD path), followed by server-derived collision damage and atomic damage/split outcomes. The current pairwise estimate is telemetry only.
-- Dirty collision chunk replacement and subprocess crash injection across journal, state-publish, derived-scene rebuild, and snapshot boundaries.
+- Subprocess crash injection across journal, state-publish, derived-scene rebuild, and snapshot boundaries.
 - Repeatable edit-to-remesh, Ubuntu, network, multi-body, and large-grid evidence plus a native Linux artifact.
 
 ## Acceptance scenarios

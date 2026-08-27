@@ -1,11 +1,12 @@
 {
-  "schema_version": 4,
-  "manifest_version": "p0.7.2",
+  "schema_version": 5,
+  "manifest_version": "p0.7.3",
   "license": "AGPL-3.0-or-later",
   "physics": {
     "fixed_step_hz": 60,
     "fixed_delta_seconds": 0.016666667,
     "collision_substeps": 2,
+    "voxel_collision_chunk_edge_cells": 8,
     "control_force_newtons": 16000.0,
     "control_torque_newton_meters": 9000.0,
     "linear_dampener_newtons_per_mps": 4500.0,

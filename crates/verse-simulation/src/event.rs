@@ -326,7 +326,7 @@ mod tests {
     fn event_hash_detects_payload_tampering() {
         let mut event = CanonicalEvent::new(
             1,
-            "p0.7.2",
+            "p0.7.3",
             "universe",
             "cell",
             9,

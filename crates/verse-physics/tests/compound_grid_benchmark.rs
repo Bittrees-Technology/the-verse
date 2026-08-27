@@ -117,3 +117,58 @@ fn starter_grid_against_proof_asteroid_budget() {
         step_elapsed / 120
     );
 }
+
+#[test]
+#[ignore = "focused performance probe; run with --ignored --nocapture"]
+fn dirty_collision_chunk_replacement_distribution() {
+    let mut chunks = Vec::with_capacity(32);
+    for chunk in 0..32 {
+        let mut colliders = Vec::with_capacity(88);
+        for index in 0..88 {
+            colliders.push(BoxColliderSpec {
+                collider_id: format!("voxel-{chunk}-{index}"),
+                local_pose: Pose::new(
+                    Vec3::new(
+                        f64::from(index % 8),
+                        f64::from((index / 8) % 8),
+                        f64::from(index / 64),
+                    ),
+                    Quat::IDENTITY,
+                ),
+                ..BoxColliderSpec::unit_cube("ignored")
+            });
+        }
+        chunks.push(BodySpec::static_body(
+            format!("voxel-chunk-{chunk}-0-0"),
+            Pose::new(Vec3::new(f64::from(chunk * 8), 0.0, 0.0), Quat::IDENTITY),
+            colliders,
+        ));
+    }
+    let target_id = chunks[0].body_id.clone();
+    let untouched_before = chunks[1].clone();
+    let mut replacement = chunks[0].clone();
+    let mut scene = Scene::new(SceneConfig::default()).expect("scene initializes");
+    scene.rebuild(&chunks).expect("chunked asteroid builds");
+
+    let mut samples = Vec::with_capacity(64);
+    for _ in 0..64 {
+        replacement.colliders.pop();
+        let started = Instant::now();
+        scene
+            .replace_body(&target_id, Some(replacement.clone()))
+            .expect("dirty chunk replaces");
+        samples.push(started.elapsed());
+    }
+    samples.sort();
+    let median = samples[samples.len() / 2];
+    let p95 = samples[samples.len() * 95 / 100];
+    let maximum = *samples.last().expect("samples exist");
+    assert_eq!(scene.body_count(), 32);
+    assert!(scene.contains_collider(
+        &untouched_before.body_id,
+        &untouched_before.colliders[0].collider_id
+    ));
+    eprintln!(
+        "32 chunks/2,816 leaves, 64 single-chunk replacements: median={median:?}, p95={p95:?}, max={maximum:?}"
+    );
+}

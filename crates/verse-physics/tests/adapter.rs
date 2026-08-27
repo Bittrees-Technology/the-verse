@@ -383,6 +383,65 @@ fn rebuild_is_atomic_and_controls_are_bounded() {
 }
 
 #[test]
+fn one_body_replacement_preserves_unrelated_bodies_and_can_remove_the_final_chunk() {
+    let mut scene = Scene::new(SceneConfig::default()).expect("scene initializes");
+    let target = BodySpec::static_body(
+        "voxel-chunk-0-0-0",
+        Pose::IDENTITY,
+        vec![
+            BoxColliderSpec::unit_cube("voxel-0-0-0"),
+            BoxColliderSpec {
+                local_pose: pose(1.0, 0.0, 0.0),
+                ..BoxColliderSpec::unit_cube("voxel-1-0-0")
+            },
+        ],
+    );
+    let untouched = BodySpec::static_body(
+        "voxel-chunk-1-0-0",
+        pose(8.0, 0.0, 0.0),
+        vec![BoxColliderSpec::unit_cube("voxel-8-0-0")],
+    );
+    let mut dynamic = BodySpec::dynamic(
+        "moving-grid",
+        pose(4.0, 2.0, 0.0),
+        vec![BoxColliderSpec::unit_cube("moving-block")],
+    );
+    dynamic.linear_velocity = Vec3::new(0.5, -0.25, 0.0);
+    dynamic.allow_sleeping = false;
+    scene
+        .rebuild(&[target.clone(), untouched, dynamic])
+        .expect("chunked scene builds");
+    let before = scene.body_states().expect("body state extracts");
+
+    let replacement = BodySpec::static_body(
+        target.body_id.clone(),
+        target.pose,
+        vec![target.colliders[0].clone()],
+    );
+    scene
+        .replace_body(&target.body_id, Some(replacement))
+        .expect("one chunk replaces");
+    assert_eq!(scene.body_count(), 3);
+    assert!(scene.contains_collider(&target.body_id, "voxel-0-0-0"));
+    assert!(!scene.contains_collider(&target.body_id, "voxel-1-0-0"));
+    assert_eq!(scene.body_states().expect("states remain exact"), before);
+
+    let mut invalid = target.clone();
+    invalid.colliders[0].half_extents.x = -1.0;
+    assert!(scene.replace_body(&target.body_id, Some(invalid)).is_err());
+    assert!(scene.contains_collider(&target.body_id, "voxel-0-0-0"));
+    scene
+        .step(&[])
+        .expect("validation failure keeps scene usable");
+
+    scene
+        .replace_body(&target.body_id, None)
+        .expect("empty final chunk removes its body");
+    assert_eq!(scene.body_count(), 2);
+    assert!(!scene.contains_collider(&target.body_id, "voxel-0-0-0"));
+}
+
+#[test]
 fn world_position_is_double_precision() {
     let mut scene = Scene::new(SceneConfig::default()).expect("scene initializes");
     let position = Vec3::new(1_000_000_000.125, -2_000_000_000.25, 3_000_000_000.5);

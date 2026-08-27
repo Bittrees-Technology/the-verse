@@ -42,6 +42,9 @@ All project-owned unsafe operations are isolated in `src/ffi.rs`. The adapter:
   callbacks;
 - marks a scene as requiring an explicit rebuild after an update or contact
   extraction error, preventing reuse of partially advanced native state;
+- stages and atomically publishes one-body replacement or removal while
+  preserving unrelated native bodies and rolling back the stable contact
+  catalog on pre-publication failure;
 - detaches and releases the callback after the physics system stops using it;
 - permits a scene to move between threads but requires exclusive mutable access
   for rebuild and step operations; and

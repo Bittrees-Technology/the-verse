@@ -350,16 +350,23 @@ impl Grid {
     }
 
     pub fn anchor_touches(&self, voxels: &VoxelField) -> bool {
+        self.anchor_touches_after_removal(voxels, None)
+    }
+
+    pub fn anchor_touches_after_removal(
+        &self,
+        voxels: &VoxelField,
+        removed: Option<IVec3>,
+    ) -> bool {
         self.blocks.values().any(|block| {
             if block.kind != BlockKind::Anchor || !block.is_complete() {
                 return false;
             }
             let world = self.world_coordinate(block.coordinate);
-            voxels.occupied.contains(&world)
-                || world
-                    .neighbors()
-                    .iter()
-                    .any(|neighbor| voxels.occupied.contains(neighbor))
+            let remains_occupied = |coordinate: &IVec3| {
+                Some(*coordinate) != removed && voxels.occupied.contains(coordinate)
+            };
+            remains_occupied(&world) || world.neighbors().iter().any(remains_occupied)
         })
     }
 }
