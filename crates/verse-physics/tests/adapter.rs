@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use verse_physics::{
-    BodyControl, BodySpec, BoxColliderSpec, ContactPhase, ContactSource, PhysicsError, Pose, Quat,
-    Scene, SceneConfig, Vec3,
+    BodyControl, BodySpec, BodyState, BoxColliderSpec, ContactPhase, ContactSource, PhysicsError,
+    Pose, Quat, Scene, SceneConfig, StepOutput, Vec3,
 };
+
+const P0_TOTAL_MOMENTUM_ERROR_KG_MPS: f64 = 1.0;
 
 fn pose(x: f64, y: f64, z: f64) -> Pose {
     Pose::new(Vec3::new(x, y, z), Quat::IDENTITY)
@@ -19,6 +21,14 @@ fn body_y(scene: &mut Scene, body_id: &str) -> f64 {
         .pose
         .position
         .y
+}
+
+fn output_body<'a>(output: &'a StepOutput, body_id: &str) -> &'a BodyState {
+    output
+        .bodies
+        .iter()
+        .find(|body| body.body_id == body_id)
+        .expect("test body exists in step output")
 }
 
 #[test]
@@ -85,6 +95,26 @@ fn falling_box_contacts_static_floor_and_settles() {
         (0.45..=0.55).contains(&body_y(&mut scene, "falling-grid")),
         "Jolt should settle the cube on the floor"
     );
+
+    let mut resting_origin = None;
+    let mut maximum_translation_drift: f64 = 0.0;
+    let mut maximum_speed: f64 = 0.0;
+    for _ in 0..240 {
+        let output = scene.step(&[]).expect("resting stability step succeeds");
+        let body = output_body(&output, "falling-grid");
+        let origin = *resting_origin.get_or_insert(body.pose.position);
+        maximum_translation_drift =
+            maximum_translation_drift.max((body.pose.position - origin).length());
+        maximum_speed = maximum_speed.max(body.linear_velocity.length());
+    }
+    assert!(
+        maximum_translation_drift <= 1.0e-4,
+        "resting grid translation drift exceeded 0.1 mm: {maximum_translation_drift}"
+    );
+    assert!(
+        maximum_speed <= 1.0e-3,
+        "resting grid exceeded 1 mm/s: {maximum_speed}"
+    );
 }
 
 #[test]
@@ -135,6 +165,150 @@ fn moving_dynamic_boxes_collide_and_emit_sorted_stable_ids() {
     assert!(contact.normal.x > 0.9);
     assert!(contact.impact_speed_mps > 7.0);
     assert!(contact.estimated_normal_impulse_ns > 0.0);
+}
+
+#[test]
+fn equal_dynamic_grids_exchange_momentum_within_the_p0_tolerance() {
+    let config = SceneConfig {
+        fixed_delta_seconds: 1.0 / 120.0,
+        collision_substeps: 2,
+        ..SceneConfig::default()
+    };
+    let mut scene = Scene::new(config).expect("scene initializes");
+    let mut alpha = BodySpec::dynamic(
+        "alpha-grid",
+        pose(-2.0, 0.0, 0.0),
+        vec![BoxColliderSpec::unit_cube("alpha-armor")],
+    );
+    alpha.linear_velocity = Vec3::new(4.0, 0.0, 0.0);
+    alpha.friction = 0.62;
+    alpha.restitution = 0.05;
+    alpha.allow_sleeping = false;
+    let mut zeta = BodySpec::dynamic(
+        "zeta-grid",
+        pose(2.0, 0.0, 0.0),
+        vec![BoxColliderSpec::unit_cube("zeta-armor")],
+    );
+    zeta.linear_velocity = Vec3::new(-4.0, 0.0, 0.0);
+    zeta.friction = 0.62;
+    zeta.restitution = 0.05;
+    zeta.allow_sleeping = false;
+    scene.rebuild(&[alpha, zeta]).expect("grids build");
+
+    let collision_output = (0..180)
+        .find_map(|_| {
+            let output = scene.step(&[]).expect("fixed step succeeds");
+            (!output.contacts.is_empty()).then_some(output)
+        })
+        .expect("dynamic grids collide");
+    let alpha = output_body(&collision_output, "alpha-grid");
+    let zeta = output_body(&collision_output, "zeta-grid");
+    assert!(alpha.linear_velocity.x < 0.0, "alpha must recoil");
+    assert!(zeta.linear_velocity.x > 0.0, "zeta must recoil");
+
+    let total_momentum_x = 1_000.0 * alpha.linear_velocity.x + 1_000.0 * zeta.linear_velocity.x;
+    assert!(
+        total_momentum_x.abs() <= P0_TOTAL_MOMENTUM_ERROR_KG_MPS,
+        "total momentum error exceeded the published P0 tolerance: {total_momentum_x} kg m/s"
+    );
+}
+
+#[test]
+fn collider_density_changes_collision_mass_response() {
+    let config = SceneConfig {
+        fixed_delta_seconds: 1.0 / 120.0,
+        collision_substeps: 2,
+        ..SceneConfig::default()
+    };
+    let mut scene = Scene::new(config).expect("scene initializes");
+    let mut light = BodySpec::dynamic(
+        "light-grid",
+        pose(-2.0, 0.0, 0.0),
+        vec![BoxColliderSpec {
+            density_kg_per_m3: 100.0,
+            ..BoxColliderSpec::unit_cube("light-armor")
+        }],
+    );
+    light.linear_velocity = Vec3::new(6.0, 0.0, 0.0);
+    light.friction = 0.0;
+    light.restitution = 1.0;
+    light.allow_sleeping = false;
+    let mut heavy = BodySpec::dynamic(
+        "heavy-grid",
+        pose(2.0, 0.0, 0.0),
+        vec![BoxColliderSpec {
+            density_kg_per_m3: 1_000.0,
+            ..BoxColliderSpec::unit_cube("heavy-armor")
+        }],
+    );
+    heavy.friction = 0.0;
+    heavy.restitution = 1.0;
+    heavy.allow_sleeping = false;
+    scene.rebuild(&[heavy, light]).expect("grids build");
+
+    let collision_output = (0..180)
+        .find_map(|_| {
+            let output = scene.step(&[]).expect("fixed step succeeds");
+            (!output.contacts.is_empty()).then_some(output)
+        })
+        .expect("unequal grids collide");
+    let light = output_body(&collision_output, "light-grid");
+    let heavy = output_body(&collision_output, "heavy-grid");
+    assert!(light.linear_velocity.x < -3.0, "light body must rebound");
+    assert!(
+        (0.5..1.5).contains(&heavy.linear_velocity.x),
+        "heavy body must respond less than the light body: {}",
+        heavy.linear_velocity.x
+    );
+}
+
+#[test]
+fn static_anchor_remains_exact_under_control_and_contact() {
+    let config = SceneConfig {
+        fixed_delta_seconds: 1.0 / 120.0,
+        collision_substeps: 2,
+        ..SceneConfig::default()
+    };
+    let mut scene = Scene::new(config).expect("scene initializes");
+    let anchor = BodySpec::static_body(
+        "anchored-grid",
+        Pose::IDENTITY,
+        vec![BoxColliderSpec::unit_cube("anchor-block")],
+    );
+    let mut striker = BodySpec::dynamic(
+        "striker-grid",
+        pose(-3.0, 0.0, 0.0),
+        vec![BoxColliderSpec::unit_cube("striker-block")],
+    );
+    striker.linear_velocity = Vec3::new(8.0, 0.0, 0.0);
+    striker.allow_sleeping = false;
+    scene.rebuild(&[anchor, striker]).expect("grids build");
+
+    let control_error = scene
+        .step(&[BodyControl {
+            body_id: "anchored-grid".into(),
+            force_newtons: Vec3::new(1.0, 0.0, 0.0),
+            torque_newton_meters: Vec3::ZERO,
+        }])
+        .expect_err("static bodies reject control");
+    assert_eq!(
+        control_error,
+        PhysicsError::ControlBodyStatic("anchored-grid".into())
+    );
+
+    let mut observed_contact = false;
+    let mut latest = None;
+    for _ in 0..240 {
+        let output = scene.step(&[]).expect("impact step succeeds");
+        observed_contact |= !output.contacts.is_empty();
+        latest = Some(output);
+    }
+    assert!(observed_contact, "striker must contact anchored grid");
+    let output = latest.expect("steps produce output");
+    let anchor = output_body(&output, "anchored-grid");
+    assert_eq!(anchor.pose, Pose::IDENTITY);
+    assert_eq!(anchor.linear_velocity, Vec3::ZERO);
+    assert_eq!(anchor.angular_velocity, Vec3::ZERO);
 }
 
 #[test]

@@ -61,6 +61,16 @@ pub enum PersistenceError {
         event_sequence: u64,
         message: String,
     },
+    #[cfg(test)]
+    #[error("injected persistence failure at {0}")]
+    InjectedFailure(&'static str),
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AppendFailpoint {
+    BeforeWrite,
+    AfterSync,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,6 +116,8 @@ pub struct Store {
     journal_file: File,
     fencing_token: u64,
     world_seed: u64,
+    #[cfg(test)]
+    append_failpoint: Option<AppendFailpoint>,
 }
 
 impl Store {
@@ -183,6 +195,8 @@ impl Store {
             journal_file,
             fencing_token,
             world_seed,
+            #[cfg(test)]
+            append_failpoint: None,
         })
     }
 
@@ -285,6 +299,10 @@ impl Store {
 
     pub fn append_event(&mut self, event: &CanonicalEvent) -> Result<(), PersistenceError> {
         self.verify_fencing_token()?;
+        #[cfg(test)]
+        if self.consume_append_failpoint(AppendFailpoint::BeforeWrite) {
+            return Err(PersistenceError::InjectedFailure("before journal write"));
+        }
         let journal_path = self.root.join(JOURNAL_FILE);
         let bytes = serde_json::to_vec(event).map_err(|source| PersistenceError::Json {
             path: journal_path.clone(),
@@ -294,7 +312,12 @@ impl Store {
             .write_all(&bytes)
             .and_then(|()| self.journal_file.write_all(b"\n"))
             .and_then(|()| self.journal_file.sync_data())
-            .map_err(|source| io_error(&journal_path, source))
+            .map_err(|source| io_error(&journal_path, source))?;
+        #[cfg(test)]
+        if self.consume_append_failpoint(AppendFailpoint::AfterSync) {
+            return Err(PersistenceError::InjectedFailure("after journal sync"));
+        }
+        Ok(())
     }
 
     pub fn save_snapshot(&mut self, state: &WorldState) -> Result<(), PersistenceError> {
@@ -320,6 +343,21 @@ impl Store {
                 expected: self.fencing_token,
                 found,
             })
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_append_failpoint(&mut self, failpoint: AppendFailpoint) {
+        self.append_failpoint = Some(failpoint);
+    }
+
+    #[cfg(test)]
+    fn consume_append_failpoint(&mut self, failpoint: AppendFailpoint) -> bool {
+        if self.append_failpoint == Some(failpoint) {
+            self.append_failpoint = None;
+            true
+        } else {
+            false
         }
     }
 }
@@ -395,7 +433,10 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), Persist
         file.write_all(&bytes)
             .and_then(|()| file.sync_all())
             .map_err(|source| io_error(&temp_path, source))?;
-        fs::rename(&temp_path, path).map_err(|source| io_error(path, source))
+        fs::rename(&temp_path, path).map_err(|source| io_error(path, source))?;
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|source| io_error(parent, source))
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temp_path);
