@@ -8,6 +8,7 @@ const buffered = [];
 const waiters = [];
 let operationSequence = 0;
 let authoritativeWorld;
+const PROTOCOL_VERSION = 13;
 const CHARACTER_EYE_OFFSET = 1.62 - 1.8 / 2;
 const CHARACTER_MAXIMUM_ANGULAR_SPEED = 2.5;
 const TOOL_RANGE = 9.0;
@@ -49,6 +50,33 @@ function send(message) {
   socket.send(JSON.stringify(message));
 }
 
+function hydrateActorSnapshot(snapshot) {
+  const privateState = snapshot.actor_private;
+  assert.ok(privateState, "an authenticated pilot receives an actor-private overlay");
+  assert.equal(privateState.player.player_id, "player-local");
+  const privateMasses = new Map(
+    privateState.owned_grid_masses.map((entry) => [entry.grid_id, entry.mass_kg]),
+  );
+  return {
+    ...snapshot,
+    player: privateState.player,
+    players: snapshot.players.map((player) =>
+      player.player_id === privateState.player.player_id
+        ? privateState.player
+        : player,
+    ),
+    grids: snapshot.grids.map((grid) => ({
+      ...grid,
+      ...(privateMasses.has(grid.grid_id)
+        ? { mass_kg: privateMasses.get(grid.grid_id) }
+        : {}),
+    })),
+    inventories: privateState.inventories,
+    death_drops: privateState.death_drops,
+    conservation: { valid: snapshot.conservation_valid },
+  };
+}
+
 async function intent(type, payload) {
   const operation_id = operationId(type);
   send({ type, operation_id, ...payload });
@@ -82,7 +110,7 @@ async function intent(type, payload) {
   );
   authoritativeWorld =
     state.type === "snapshot"
-      ? state.snapshot
+      ? hydrateActorSnapshot(state.snapshot)
       : applyMotion(authoritativeWorld, state.motion);
   assert.equal(authoritativeWorld.conservation.valid, true);
   return authoritativeWorld;
@@ -90,19 +118,19 @@ async function intent(type, payload) {
 
 function applyMotion(world, motion) {
   assert.ok(world, "a full snapshot precedes motion deltas");
+  assert.ok(motion.actor_private, "pilot motion includes its exact private frontier");
+  assert.equal(motion.actor_private.player_id, "player-local");
   const movingGrids = new Map(motion.grids.map((grid) => [grid.grid_id, grid]));
   const movingPlayers = new Map(
-    (motion.players ?? [motion.player]).map((player) => [
-      player.player_id,
-      player,
-    ]),
+    motion.players.map((player) => [player.player_id, player]),
   );
+  movingPlayers.set(motion.actor_private.player_id, motion.actor_private);
   return {
     ...world,
     event_sequence: motion.event_sequence,
     simulation_tick: motion.simulation_tick,
     world_hash: motion.world_hash,
-    player: { ...world.player, ...motion.player },
+    player: { ...world.player, ...motion.actor_private },
     players: world.players.map((player) => ({
       ...player,
       ...(movingPlayers.get(player.player_id) ?? {}),
@@ -155,12 +183,14 @@ async function waitForCanonicalIncapacitation(world) {
       (message) =>
         message.type === "snapshot" &&
         message.snapshot.event_sequence > observedEventSequence &&
-        (message.snapshot.player.life_state.kind === "incapacitated" ||
-          message.snapshot.player.suit_oxygen_milli < observedOxygen),
+        (message.snapshot.actor_private?.player.life_state.kind ===
+          "incapacitated" ||
+          message.snapshot.actor_private?.player.suit_oxygen_milli <
+            observedOxygen),
       "canonical oxygen depletion progress",
       Math.min(8_000, remaining),
     );
-    world = state.snapshot;
+    world = hydrateActorSnapshot(state.snapshot);
     authoritativeWorld = world;
     const depleted = observedOxygen - world.player.suit_oxygen_milli;
     assert.ok(depleted > 0, "each observed oxygen snapshot makes progress");
@@ -679,7 +709,7 @@ async function run() {
 
   send({
     type: "hello",
-    protocol_version: 12,
+    protocol_version: PROTOCOL_VERSION,
     client_name: "node-authoritative-e2e",
     authentication: {
       kind: "local_development",
@@ -690,17 +720,17 @@ async function run() {
     (message) => message.type === "welcome",
     "authenticated welcome",
   );
-  assert.equal(welcome.protocol_version, 12);
+  assert.equal(welcome.protocol_version, PROTOCOL_VERSION);
   assert.deepEqual(welcome.session_role, {
     kind: "player",
     player_id: "player-local",
   });
-  let world = (
+  let world = hydrateActorSnapshot((
     await waitFor(
       (message) => message.type === "snapshot",
       "post-handshake genesis snapshot",
     )
-  ).snapshot;
+  ).snapshot);
   authoritativeWorld = world;
   assert.equal(world.conservation.valid, true);
   assert.equal(world.content_manifest_version, "p1.1.0");
@@ -709,10 +739,12 @@ async function run() {
     world.players.map((player) => player.player_id),
     ["player-local", "player-remote"],
   );
-  assert.equal(
-    new Set(world.players.map((player) => player.inventory_id)).size,
-    world.players.length,
-    "each authoritative actor owns a distinct carried inventory",
+  assert.equal(world.player.inventory_id, "inventory-player-local");
+  assert.ok(
+    world.players
+      .filter((player) => player.player_id !== "player-local")
+      .every((player) => player.inventory_id === undefined),
+    "other players' carried inventory identities stay private",
   );
   assert.ok(world.voxels.length > 1_000);
   assert.equal(world.environment.celestial_body_name, "Khepri Prime");
@@ -722,15 +754,10 @@ async function run() {
   assert.ok(world.environment.altitude_m > 3_000.0);
   assert.equal(world.environment.atmosphere_density, 0.0);
   for (const player of world.players) {
-    assert.equal(
-      player.environment.celestial_body_id,
-      "khepri-prime",
-      `${player.player_id} receives location-specific celestial context`,
-    );
-    assert.ok(
-      Number.isFinite(player.environment.altitude_m),
-      `${player.player_id} receives a finite authoritative altitude`,
-    );
+    if (player.player_id === "player-local") continue;
+    assert.equal(player.environment, undefined);
+    assert.equal(player.experience, undefined);
+    assert.equal(player.suit_oxygen_milli, undefined);
   }
   assert.deepEqual(
     world.player.environment,
@@ -787,7 +814,8 @@ async function run() {
   const pulseState = await waitFor(
     (message) =>
       message.type === "motion_state" &&
-      message.motion.player.last_processed_input_sequence >= pulseSequence + 1,
+      message.motion.actor_private?.last_processed_input_sequence >=
+        pulseSequence + 1,
     "successive authoritative pulse consumption",
   );
   world = applyMotion(world, pulseState.motion);

@@ -13,7 +13,7 @@ const remoteMiningOperation = "two-player-e2e-remote-mining-operation";
 const remoteRefiningOperation = "two-player-e2e-remote-refining-operation";
 const remoteCraftingOperation = "two-player-e2e-remote-crafting-operation";
 const remoteDamageOperation = "two-player-e2e-non-owner-damage-operation";
-const PROTOCOL_VERSION = 12;
+const PROTOCOL_VERSION = 13;
 const CHARACTER_EYE_OFFSET = 1.62 - 1.8 / 2;
 const CHARACTER_MAXIMUM_ANGULAR_SPEED = 2.5;
 const TOOL_RANGE = 9.0;
@@ -26,6 +26,7 @@ class ProtocolClient {
     this.socket = new WebSocket(url);
     this.buffered = [];
     this.waiters = [];
+    this.lastReceiptEventSequence = 0;
     this.socket.addEventListener("message", (event) => {
       this.dispatch(JSON.parse(event.data));
     });
@@ -148,6 +149,97 @@ function assertCanonicalRoster(state, description) {
     [...roster].sort(),
     `${description} roster is canonically sorted`,
   );
+}
+
+function publicProjection(state) {
+  const { actor_private: _privateState, ...shared } = state;
+  return shared;
+}
+
+function assertActorPrivate(state, expectedPlayerId, description) {
+  assert.ok(state.actor_private, `${description} has an actor-private overlay`);
+  assert.equal(
+    state.actor_private.player?.player_id ?? state.actor_private.player_id,
+    expectedPlayerId,
+    `${description} is bound to the authenticated actor`,
+  );
+}
+
+function combineActorSnapshots(local, remote, description) {
+  assert.deepEqual(
+    publicProjection(local),
+    publicProjection(remote),
+    `${description} exposes identical public state`,
+  );
+  assertActorPrivate(local, "player-local", `${description} local projection`);
+  assertActorPrivate(remote, "player-remote", `${description} remote projection`);
+
+  const localInventoryIds = new Set(
+    local.actor_private.inventories.map((inventory) => inventory.inventory_id),
+  );
+  const remoteInventoryIds = new Set(
+    remote.actor_private.inventories.map((inventory) => inventory.inventory_id),
+  );
+  assert.ok(
+    [...localInventoryIds].every((inventoryId) => !remoteInventoryIds.has(inventoryId)),
+    `${description} keeps actor inventory overlays disjoint`,
+  );
+
+  const privatePlayers = new Map([
+    [local.actor_private.player.player_id, local.actor_private.player],
+    [remote.actor_private.player.player_id, remote.actor_private.player],
+  ]);
+  const privateMasses = new Map(
+    [
+      ...local.actor_private.owned_grid_masses,
+      ...remote.actor_private.owned_grid_masses,
+    ].map((entry) => [entry.grid_id, entry.mass_kg]),
+  );
+  const shared = publicProjection(local);
+  return {
+    ...shared,
+    player: local.actor_private.player,
+    players: shared.players.map(
+      (player) => privatePlayers.get(player.player_id) ?? player,
+    ),
+    grids: shared.grids.map((grid) => ({
+      ...grid,
+      ...(privateMasses.has(grid.grid_id)
+        ? { mass_kg: privateMasses.get(grid.grid_id) }
+        : {}),
+    })),
+    inventories: [
+      ...local.actor_private.inventories,
+      ...remote.actor_private.inventories,
+    ].sort((left, right) => left.inventory_id.localeCompare(right.inventory_id)),
+    death_drops: [
+      ...local.actor_private.death_drops,
+      ...remote.actor_private.death_drops,
+    ].sort((left, right) => left.death_id.localeCompare(right.death_id)),
+    conservation: { valid: shared.conservation_valid },
+  };
+}
+
+function combineActorMotion(local, remote, description) {
+  assert.deepEqual(
+    publicProjection(local),
+    publicProjection(remote),
+    `${description} exposes identical public motion`,
+  );
+  assertActorPrivate(local, "player-local", `${description} local motion`);
+  assertActorPrivate(remote, "player-remote", `${description} remote motion`);
+  const privatePlayers = new Map([
+    [local.actor_private.player_id, local.actor_private],
+    [remote.actor_private.player_id, remote.actor_private],
+  ]);
+  const shared = publicProjection(local);
+  return {
+    ...shared,
+    player: local.actor_private,
+    players: shared.players.map(
+      (player) => privatePlayers.get(player.player_id) ?? player,
+    ),
+  };
 }
 
 function playerById(motion, playerId) {
@@ -423,12 +515,11 @@ async function waitForCommonSnapshot(
     remoteMessage.snapshot.world_hash,
     `${description} converges on one structural hash`,
   );
-  assert.deepEqual(
+  return combineActorSnapshots(
     localMessage.snapshot,
     remoteMessage.snapshot,
-    `${description} exposes identical shared state`,
+    description,
   );
-  return localMessage.snapshot;
 }
 
 async function waitForCommonMotion(
@@ -438,10 +529,14 @@ async function waitForCommonMotion(
   description,
   timeoutMillis = 12_000,
 ) {
+  const minimumReceiptSequence = Math.max(
+    local.lastReceiptEventSequence,
+    remote.lastReceiptEventSequence,
+  );
   const motionPredicate = (message) =>
     message.type === "motion_state" &&
     message.motion.players !== undefined &&
-    predicate(message.motion);
+    message.motion.event_sequence >= minimumReceiptSequence;
   let [localMessage, remoteMessage] = await Promise.all([
     local.waitFor(motionPredicate, `${description} on local`, timeoutMillis),
     remote.waitFor(motionPredicate, `${description} on remote`, timeoutMillis),
@@ -471,19 +566,61 @@ async function waitForCommonMotion(
     }
   }
 
-  assert.equal(
-    localMessage.motion.world_hash,
-    remoteMessage.motion.world_hash,
-    `${description} converges on one authoritative hash`,
-  );
-  assert.deepEqual(
-    localMessage.motion.players,
-    remoteMessage.motion.players,
-    `${description} exposes the same player poses and frontiers`,
-  );
-  assertCanonicalRoster(localMessage.motion, `${description} local motion`);
-  assertCanonicalRoster(remoteMessage.motion, `${description} remote motion`);
-  return localMessage.motion;
+  for (;;) {
+    assert.equal(
+      localMessage.motion.world_hash,
+      remoteMessage.motion.world_hash,
+      `${description} converges on one authoritative hash`,
+    );
+    const combined = combineActorMotion(
+      localMessage.motion,
+      remoteMessage.motion,
+      description,
+    );
+    assertCanonicalRoster(combined, `${description} combined motion`);
+    if (predicate(combined)) return combined;
+
+    const currentSequence = combined.event_sequence;
+    [localMessage, remoteMessage] = await Promise.all([
+      local.waitFor(
+        (message) =>
+          motionPredicate(message) &&
+          message.motion.event_sequence > currentSequence,
+        `${description} progress on local`,
+        timeoutMillis,
+      ),
+      remote.waitFor(
+        (message) =>
+          motionPredicate(message) &&
+          message.motion.event_sequence > currentSequence,
+        `${description} progress on remote`,
+        timeoutMillis,
+      ),
+    ]);
+    while (
+      localMessage.motion.event_sequence !== remoteMessage.motion.event_sequence
+    ) {
+      if (
+        localMessage.motion.event_sequence < remoteMessage.motion.event_sequence
+      ) {
+        const minimum = remoteMessage.motion.event_sequence;
+        localMessage = await local.waitFor(
+          (message) =>
+            motionPredicate(message) && message.motion.event_sequence >= minimum,
+          `${description} progress convergence on local`,
+          timeoutMillis,
+        );
+      } else {
+        const minimum = localMessage.motion.event_sequence;
+        remoteMessage = await remote.waitFor(
+          (message) =>
+            motionPredicate(message) && message.motion.event_sequence >= minimum,
+          `${description} progress convergence on remote`,
+          timeoutMillis,
+        );
+      }
+    }
+  }
 }
 
 function applyMotionToSnapshot(state, motion) {
@@ -522,6 +659,10 @@ async function waitForReceipt(client, operationId, description) {
       `${client.playerId} operation rejected: ${message.code}: ${message.message}`,
     );
   }
+  client.lastReceiptEventSequence = Math.max(
+    client.lastReceiptEventSequence,
+    message.receipt.event_sequence,
+  );
   return message.receipt;
 }
 
@@ -716,10 +857,16 @@ async function run() {
   const local = new ProtocolClient("player-local");
   const remote = new ProtocolClient("player-remote");
   try {
-    const [localSnapshot, remoteSnapshot] = await Promise.all([
+    const [localProjection, remoteProjection] = await Promise.all([
       local.connect(),
       remote.connect(),
     ]);
+    const localSnapshot = combineActorSnapshots(
+      localProjection,
+      remoteProjection,
+      "initial snapshot",
+    );
+    const remoteSnapshot = localSnapshot;
     assertCanonicalRoster(localSnapshot, "local initial snapshot");
     assertCanonicalRoster(remoteSnapshot, "remote initial snapshot");
     assert.deepEqual(

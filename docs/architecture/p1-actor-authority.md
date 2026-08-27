@@ -74,10 +74,13 @@ before insertion so a split cannot overwrite a live grid.
 
 ## Replication scope
 
-Owner IDs are public structural state in protocol 12. Complete cell snapshots
-remain a local proof transport and still include all inventories. That is not a
-privacy boundary. Public deployment requires actor-specific projection and
-authorization without changing the canonical hash or mutation rules.
+Owner IDs remain public structural state. Protocol 13 adds projection schema 1:
+spectators receive public world and motion records, while an authenticated
+pilot receives only their complete player record, owned inventories, protected
+drops, and owned-grid masses in a private overlay. The canonical hash and
+mutation rules remain unchanged. See
+[Private player state projection](../gameplay/private-state-projection.md) for
+the disclosure boundary and its documented hash/timing side channels.
 
 See [Actor-owned industry and engineering](../gameplay/actor-owned-industry.md)
 for the player-visible authority matrix, reward contract, acceptance evidence,

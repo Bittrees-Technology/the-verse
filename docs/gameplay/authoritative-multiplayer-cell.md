@@ -1,6 +1,6 @@
 # Authoritative multi-player cell
 
-**Status:** P1.1 local proof verified; public identity, scale, and private projections remain deferred
+**Status:** P1.2 local proof verified; public identity and scale remain deferred
 
 This checkpoint targets F-012, SIM-011, and SIM-012. It converts the P0.10 single-pilot proof into a shared authoritative cell without claiming production universe scale.
 
@@ -66,7 +66,7 @@ Generic knowledge of an inventory or grid ID is never authority.
 
 ## Replication and budgets
 
-Protocol 12 initially sends complete deterministic rosters and inventories so correctness is inspectable. This is not a private-inventory projection. The worker limits message size, accepted input rate, and retained state. A later transport must provide actor-specific private projections, spatial interest sets, and binary deltas without changing canonical state.
+Protocol 13 sends public deterministic rosters and topology to every audience, then adds only the bound pilot's exact player, owned inventory, protected-drop, and owned-grid-mass records as an atomic private overlay. The shared replication feed retains canonical dirty markers rather than session-specific bytes. HTTP and spectator reads cannot select an actor, and dynamic HTTP responses are not cacheable. Spatial interest sets and binary deltas remain later scale work and must not change canonical state.
 
 The serialized P0.10 Linux baseline measured a 0.0298 ms median three-cast grounded query set but a 29.8 ms worst-path naive loop for 1,000 characters. Therefore P1.0 must publish 2, 8, 16, 32, and 64 active-player distributions and set a conservative cell budget; thousands of universe participants require multiple cells and reduced-frequency/background modes.
 
