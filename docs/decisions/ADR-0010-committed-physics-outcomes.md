@@ -12,7 +12,17 @@ Use Jolt Physics behind an isolated Rust adapter for the live authoritative cont
 
 Before a physics batch becomes visible, the worker sorts stable body and collider identifiers, applies server-approved forces, advances a bounded number of fixed single-thread steps, and validates finite bounded output. It then quantizes and records the step count, fractional 60 Hz phase, ordered body poses, linear and angular velocities, and substep-indexed contacts in one canonical `PhysicsStepCommitted` event. A future version of the same atomic outcome bundle will add collision-derived damage and topology after solved contact data is available.
 
-Event replay applies the committed outcomes exactly and does not run Jolt. After snapshot load and journal replay, the worker reconstructs derived Jolt bodies from canonical state. Live commit processing rebuilds or reconciles derived Jolt state at the operation-specific boundary. A content-manifest and schema version pins the mass, collision, material, quantization, and timestep rules used to interpret the event.
+Event replay applies the committed outcomes exactly and does not run Jolt. It
+still rejects implausible contact evidence before mutation. A player contact
+must lie within the bounded swept capsule and counterpart geometry; for
+`LinearCast`, the check admits half of at most one fixed-step maximum-velocity
+speculative separation because the recorded point is the midpoint between the
+two manifold surfaces, then adds only the pinned contact and quantization slop.
+After snapshot load and journal replay, the worker reconstructs derived Jolt
+bodies from canonical state. Live commit processing rebuilds or reconciles
+derived Jolt state at the operation-specific boundary. A content-manifest and
+schema version pins the mass, collision, material, quantization, and timestep
+rules used to interpret the event.
 
 Event schema 4 commits native Jolt manifold identity, canonical began/persisted lifecycle, integer closing speed, exact integer reduced translational mass, and explicitly named pairwise estimated normal impulse. The reduced mass ignores contact direction, lever arm, and rotational inertia and therefore remains non-damage telemetry. World schema 9 persists the active-pair set so reconciling derived Jolt state for each commit cannot manufacture a second canonical onset. Content `p0.7.2` replaces floating block-mass definitions with exact grams.
 

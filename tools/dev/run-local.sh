@@ -20,6 +20,7 @@ if [[ ! -x "${godot_binary}" ]]; then
   tools/dev/bootstrap-macos.sh
 fi
 cargo build -p verse-simulation-worker
+tools/ci/build-native-verifier.sh debug
 mkdir -p artifacts
 target/debug/verse-simulation-worker \
   --data-directory data/local-universe \

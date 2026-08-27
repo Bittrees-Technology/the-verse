@@ -518,7 +518,10 @@ async function movePlayerTo(
   assert.ok(
     finalDistance <= targetDistance,
     `authoritative character control reaches the ${description}; ` +
-      `remaining distance ${finalDistance.toFixed(6)}m exceeds ${targetDistance.toFixed(6)}m`,
+      `remaining distance ${finalDistance.toFixed(6)}m exceeds ${targetDistance.toFixed(6)}m; ` +
+      `player=${JSON.stringify(world.player.position)} ` +
+      `target=${JSON.stringify(finalTarget)} ` +
+      `velocity=${JSON.stringify(world.player.linear_velocity)}`,
   );
   assert.ok(
     vectorMagnitude(world.player.linear_velocity) <= 0.05,
@@ -1081,6 +1084,8 @@ async function run() {
       anchorViewEye,
       scaleVector(playerUp(world.player), CHARACTER_EYE_OFFSET),
     ),
+    "unobstructed asteroid-side anchor work position",
+    0.5,
   );
   const cargoBlock = blockAt(world, { x: -1, y: 0, z: 0 }, "cargo");
   assert.ok(

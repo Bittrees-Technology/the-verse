@@ -19,6 +19,8 @@ RUN apt-get update \
     && mkdir -p /home/verse/data \
     && chown verse:verse /home/verse/data
 COPY --from=builder /source/target/release/verse-simulation-worker /usr/local/bin/
+COPY --from=builder /source/apps/web-command-center/generated /usr/local/share/the-verse/browser-verifier
+ENV VERSE_BROWSER_VERIFIER_ASSET_DIR=/usr/local/share/the-verse/browser-verifier
 USER verse
 WORKDIR /home/verse
 VOLUME ["/home/verse/data"]

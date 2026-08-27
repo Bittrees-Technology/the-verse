@@ -1,6 +1,7 @@
 # ADR-0021: Independent interest-view verification before client apply
 
-**Status:** Accepted for P1.5; implementation evidence required
+**Status:** Implemented, locally verified, and packaged for P1.5; current hosted
+evidence required
 
 ## Context
 
@@ -55,6 +56,12 @@ The compatible welcome tuple and registry/manifest binding are immutable for
 one connection. Protocol-15 complete snapshots and motion messages are rejected
 on a protocol-16 connection. Receipts and fatal messages may be relayed only in
 the phases allowed by the protocol; they never change verified view state.
+Verifier construction also requires trusted expected universe, content,
+celestial-registry, and universe-manifest commitments. A self-consistent
+replacement registry cannot choose its own trust root. The SDK validates
+schema-1 definition ID shape and body-kind structure; exact pinned content,
+registry, and manifest roots remain the definition allowlist authority because
+the Apache verifier does not import the AGPL content catalog.
 
 For a baseline, the verifier stages the complete ordered entity set,
 environment, conservation flag, optional actor-private state, and delivery
@@ -116,6 +123,11 @@ unbounded delta log or more than one pending result. Browser verification runs
 off the rendering thread; a verifier crash or watchdog expiry reconnects
 without acknowledgement.
 
+The P1.5 default bounds one registry message to 512 bodies and 130,816
+pairwise separation comparisons, checked before pair traversal. An unlimited
+universe is expanded through a future versioned paging protocol, not by placing
+an unbounded registry on a browser worker or Godot's main thread.
+
 ## Compatibility boundary
 
 This decision preserves gameplay protocol `16`, projection schema `3`,
@@ -150,6 +162,27 @@ active.
   and the browser while the mining, refining, manufacturing, inventory,
   construction, damage, death-drop, oxygen, and respawn scenario remains green.
 - Deliberate in-flight payload and hash alteration fails closed.
+
+## Current implementation evidence
+
+The Apache verifier core, browser WASM Worker adapter, and native Godot
+GDExtension now share the frozen version-one state machine and portable raw
+corpus. Tests exercise exact signed and unsigned integer boundaries, malformed
+typed input, registry/manifest/content-root substitution, the 512-body and
+130,816-comparison bounds, stage/discard/commit behavior, presentation failure,
+and missing-verifier startup failure. The native presentation keeps protocol
+`u64` values beyond signed `i64` as canonical decimal text where only identity
+and fingerprinting are required, rather than saturating or rounding them.
+
+The live local suite verifies real baselines and deltas through both native
+client identities, a direct browser adapter, and the shipped command-center
+page in a real headless browser. A transparent test proxy alters one isolated
+hash in flight and observes zero applied tampered state and zero tampered
+acknowledgements. The complete mining, refining, manufacturing, transfer,
+construction, damage, death, oxygen, respawn, two-player, and restart scenario
+remains green. The Apple Silicon direct-download package runs the native
+verifier and live client from the assembled archive. A current hosted run must
+still be attached before this revision is called published.
 
 ## Deliberate exclusions
 

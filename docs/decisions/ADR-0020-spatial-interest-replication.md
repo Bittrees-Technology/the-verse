@@ -1,6 +1,7 @@
 # ADR-0020: Server-derived spatial interest replication
 
-**Status:** Accepted for P1.5; implementation evidence required
+**Status:** Implemented and locally verified for P1.5; production scale and
+current hosted evidence required
 
 ## Context
 
@@ -165,10 +166,13 @@ timing, and canonical tick reveal that out-of-view activity may have occurred,
 so P1.5 preserves field confidentiality but does not claim traffic-analysis or
 zero-knowledge secrecy.
 
-The client applies a delta only when every epoch, baseline ID, sequence, and
-previous view hash matches. Otherwise it discards the delta and requests a new
-baseline. It acknowledges the resulting hash, never a claimed gameplay
-outcome. The server never trusts a client hash as authority.
+The client applies a delta only when the independent verifier confirms every
+epoch, baseline ID, sequence, previous view hash, trusted root, and recomputed
+resulting view hash. Otherwise it discards the staged result and requests a new
+baseline or closes the stream according to the bounded error class. Only a
+successful presentation commit releases the verifier's exact acknowledgement.
+It acknowledges the resulting hash, never a claimed gameplay outcome. The
+server never trusts a client hash as authority.
 
 ### Authority and privacy
 

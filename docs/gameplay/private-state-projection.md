@@ -1,7 +1,7 @@
 # Private player state projection
 
-**Status:** P1.5 local interest/private composition implemented and verified;
-independent client hash evidence remains open
+**Status:** P1.5 local interest/private composition and independent
+official-client hash verification implemented and verified
 
 ## Player promise
 
@@ -72,11 +72,13 @@ exact state after its authorized view ends.
 
 ## Client fail-closed behavior
 
-The native client accepts a private overlay only when its player ID matches the
-welcomed player and it is nested in the same complete P1.4 snapshot or P1.5
-interest baseline/delta as the public projection. It then resolves cargo by the
-private cargo domain's globally unique block ID and the public completed block
-on an actor-owned grid.
+The native client accepts a private overlay only after the shared verifier has
+validated its player ID against the welcomed player and reconstructed the same
+P1.5 interest baseline/delta as the public projection. It then stages the
+sanitized presentation candidate and resolves cargo by the private cargo
+domain's globally unique block ID and the public completed block on an
+actor-owned grid. Presentation commit and the verifier-owned acknowledgement
+are one ordered fail-closed boundary.
 
 The client immediately clears inventory data, selected cargo, protected drop
 data, and industry controls when:
@@ -103,7 +105,10 @@ In P1.5 the browser receives a fixed-body registry plus one bounded public
 observer view. Query parameters, cookies, headers, client names, and map clicks
 cannot select a player, increase the radius, attach an actor-private overlay, or
 wake an arbitrary cell. Out-of-interest entities are removed from browser state
-and the document; stale markers cannot retain private or actionable data.
+and the document; stale markers cannot retain private or actionable data. A
+same-origin Worker runs the shared verifier before the page receives sanitized
+state. Worker/WASM failure, a trust-root mismatch, or a hash alteration closes
+the stream with no unverified fallback and no acknowledgement.
 
 ## Acceptance evidence
 

@@ -1,7 +1,8 @@
 # Authoritative multi-player cell
 
-**Status:** P1.5 local interest-managed multiplayer proof implemented and
-verified; production scale gates remain open
+**Status:** P1.5 local interest-managed multiplayer and independent
+official-client view verification implemented; production scale gates remain
+open
 
 This checkpoint targets F-012, SIM-011, and SIM-012. It converts the P0.10 single-pilot proof into a shared authoritative cell without claiming production universe scale. The next delivery contract is [P1.5 fixed celestial registry and interest-managed visibility](celestial-registry-and-interest-management.md); it changes which public entities a session receives without changing actor authority or canonical simulation.
 
@@ -145,8 +146,9 @@ bounded-work slice without claiming active-player or production capacity.
 P1.4 provides physical cargo, conveyors, refinery and assembler queues, power
 gating, conserved escrow, and actor-private production state. Grid control is
 still owner-authorized remotely without a cockpit, terminal, or signal system.
-The implemented P1.5 transport remains JSON and single-cell; independent client
-hash verification and the production binary codec remain open. Cell transfer, public passkey
+The implemented P1.5 transport remains JSON and single-cell. Its independent
+shared verifier now gates native and browser presentation and acknowledgements;
+the production binary codec remains open. Cell transfer, public passkey
 authentication, teams, company permissions, capital safe-zone enforcement,
 offline turret behavior, cleanup scheduling, combat sensor rules, and browser
 gameplay remain later work.
