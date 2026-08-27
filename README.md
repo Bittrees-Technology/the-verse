@@ -2,7 +2,7 @@
 
 The Verse is an open-source persistent voxel space universe, work-and-economy simulator, and Web3 marketplace.
 
-The repository now contains **P0.5: Planetary Logistics**, built on the first-person Salvage Frontier and Engineering Hands loops. It is still a single-player proof—not yet the public multiplayer universe or real-value economy—but inventory volume and mass, suit modes, gravity, atmosphere, oxygen, mining, and staged construction now share one authoritative persistent world.
+The repository now contains **P0.6: Orbital Operations**, built on the first-person Salvage Frontier, Engineering Hands, and Planetary Logistics loops. It is still a single-player proof—not yet the public multiplayer universe or real-value economy—but realistic orbital separation, six-axis EVA orientation, physical inventory, oxygen, mining, and staged construction now share one authoritative persistent world.
 
 ## Play it on macOS
 
@@ -15,20 +15,21 @@ tools/dev/run-local.sh
 
 The bootstrap downloads the pinned Godot 4.7.2 editor from the official release and verifies its checksum. The launcher starts the authoritative server and native client. While the server is running, the browser command center is available at <http://127.0.0.1:7777>.
 
-You begin above the surface of Khepri Prime beside a powered 25-block salvage skiff and a mineable outcrop. The guided contract asks you to extract three voxels, refine ore, fabricate a component, extend the rig, and anchor it into the rock. Turn off the jetpack to fall under planetary gravity and walk; open the helmet in breathable atmosphere to use ambient oxygen. Actions earn persistent career experience and clearance levels.
+You begin in the Khepri Prime orbital sector beside a powered 25-block salvage skiff and an independent mineable asteroid. The planet surface is more than three kilometers away; the starting field is vacuum with weak distant gravity, not a planetary outcrop. The guided contract asks you to extract three voxels, refine ore, fabricate a component, extend the rig, and anchor it into the asteroid. Actions earn persistent career experience and clearance levels.
 
 Native controls are shown in the client:
 
 | Action | Control |
 | --- | --- |
 | EVA thrust / ascend / descend | `WASD` / `Space` / `C` |
+| Roll character left / right | `Q` / `E` |
 | Boost / toggle dampeners | `Shift` / `Z` |
 | Toggle helmet work light | `L` |
 | Toggle jetpack / helmet seal | `J` / `H` |
 | Open engineering inventory terminal | `I` |
 | Mine highlighted voxel | Hold left mouse |
 | Enter construction / choose block | `B` / `1`–`5` |
-| Rotate construction hologram | `Q` / `E` |
+| Rotate construction hologram | `[` / `]` |
 | Weld construction hologram | Hold left mouse |
 | Cut and salvage a block | Hold right mouse |
 | Refine / fabricate / transfer cargo | `R` / `T` / `V` (`Shift+V` reverses transfer) |
@@ -48,7 +49,7 @@ Linux native client packaging and signed direct downloads remain scheduled work.
 tools/ci/check.sh
 ```
 
-This runs the Rust tests and lints, browser syntax checks, Godot validation, and an end-to-end scenario that restarts the server and proves exact state recovery. See the [Planetary Logistics checkpoint](docs/gameplay/planetary-logistics.md), [visual engineering checkpoint](docs/gameplay/engineering-realism.md), and [P0 implementation guide](docs/architecture/p0-implementation.md) for scope and limitations.
+This runs the Rust tests and lints, browser syntax checks, Godot validation, and an end-to-end scenario that restarts the server and proves exact state recovery. See the [Orbital Operations checkpoint](docs/gameplay/orbital-operations.md), [Planetary Logistics checkpoint](docs/gameplay/planetary-logistics.md), and [P0 implementation guide](docs/architecture/p0-implementation.md) for scope and limitations.
 
 ## Product pillars
 
@@ -75,7 +76,7 @@ Start with [the documentation map](docs/README.md), then read:
 
 ## Current status
 
-P0.5 adds a two-sided logistics terminal with exact stack transfers, physical volume and mass, capacity enforcement, a procedurally shaded planetary surface, atmosphere and local gravity telemetry, persistent helmet/jetpack modes, authoritative oxygen changes, gravity-aware walking and jumping, flush one-meter block envelopes, and clearer cargo, reactor, battery, drill, anchor, and control silhouettes. The Khepri surface is an environmental test body rather than a complete editable voxel planet; multiplayer, rigid-grid collision physics, global planetary streaming, safe zones, accounts, AMMs, and blockchain settlement remain sequenced in the [delivery roadmap](docs/roadmap/roadmap.md).
+P0.6 places the authoritative asteroid field in vacuum more than three kilometers above Khepri Prime, adds continuous and tap-controlled `Q`/`E` character roll, remaps block rotation to `[`/`]`, and rebuilds the logistics screen around compact connected-inventory lists, selectors, search, filters, amount/volume/mass columns, row selection, and central transfer actions. Original high-resolution surface maps, triplanar asteroid material, mapped planetary terrain, moving clouds, and limb atmosphere replace the earlier flat visual treatment. Planet landing, multiplayer, rigid-grid collision physics, global streaming, safe zones, accounts, AMMs, and blockchain settlement remain sequenced in the [delivery roadmap](docs/roadmap/roadmap.md).
 
 ## Licensing
 

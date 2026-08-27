@@ -11,7 +11,7 @@ This remains an original clean-room implementation. Publicly observable engineer
 ## Construction contract
 
 1. Construction mode snaps a preview to a face-adjacent coordinate on the targeted grid.
-2. `Q` and `E` rotate the selected block in 90-degree yaw steps before placement.
+2. `[` and `]` rotate the selected block in 90-degree yaw steps before placement; `Q` and `E` remain dedicated to character roll.
 3. Placing a frame consumes the complete registered component cost exactly once.
 4. A new frame begins at 25 percent integrity and is structurally present but nonfunctional.
 5. Each accepted weld advances integrity by another 25 percent, clamped at the block definition's maximum health.

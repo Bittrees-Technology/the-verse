@@ -11,12 +11,12 @@ use verse_protocol::{
 
 use crate::content;
 
-pub const WORLD_SCHEMA_VERSION: u32 = 5;
+pub const WORLD_SCHEMA_VERSION: u32 = 6;
 pub const PLAYER_INVENTORY_ID: &str = "inventory-player-local";
 pub const STARTER_GRID_ID: &str = "grid-starter";
-pub const PLANET_CENTER: Vec3 = Vec3::new(0.0, -98.0, 0.0);
-pub const PLANET_SURFACE_RADIUS_M: f64 = 90.0;
-pub const PLANET_ATMOSPHERE_HEIGHT_M: f64 = 38.0;
+pub const PLANET_CENTER: Vec3 = Vec3::new(900.0, -2_200.0, -3_800.0);
+pub const PLANET_SURFACE_RADIUS_M: f64 = 1_200.0;
+pub const PLANET_ATMOSPHERE_HEIGHT_M: f64 = 180.0;
 pub const PLANET_SURFACE_GRAVITY_M_S2: f64 = 6.2;
 pub const PLAYER_INVENTORY_CAPACITY_LITERS: u64 = 1_200;
 pub const CARGO_INVENTORY_CAPACITY_LITERS: u64 = 8_000;
@@ -701,13 +701,27 @@ mod tests {
     }
 
     #[test]
-    fn genesis_exposes_breathable_gravity_and_physical_inventory_metrics() {
+    fn genesis_exposes_orbital_separation_and_physical_inventory_metrics() {
         let world = WorldState::genesis(42);
         let environment = world.environment_at(world.player.position);
-        assert!(environment.breathable);
-        assert!(environment.gravity_m_s2 > 4.0);
-        assert!(environment.altitude_m > 10.0);
-        assert!(environment.atmosphere_density > 0.5);
+        assert!(!environment.breathable);
+        assert!(environment.gravity_m_s2 > 0.3);
+        assert!(environment.gravity_m_s2 < 1.0);
+        assert!(environment.altitude_m > 3_000.0);
+        assert!(environment.atmosphere_density <= f64::EPSILON);
+        assert!(
+            environment.altitude_m > PLANET_SURFACE_RADIUS_M * 2.5,
+            "the asteroid origin must be visibly and physically separated from the planet"
+        );
+
+        let near_surface = world.environment_at(Vec3::new(
+            PLANET_CENTER.x,
+            PLANET_CENTER.y + PLANET_SURFACE_RADIUS_M + 10.0,
+            PLANET_CENTER.z,
+        ));
+        assert!(near_surface.breathable);
+        assert!(near_surface.gravity_m_s2 > 5.5);
+        assert!(near_surface.atmosphere_density > 0.9);
 
         let suit = &world.inventories[PLAYER_INVENTORY_ID];
         assert_eq!(suit.used_liters(), 24 * 22);

@@ -2,8 +2,14 @@
 extends Node3D
 
 const ARMOR_TEXTURE: Texture2D = preload("res://assets/materials/verse_armor_albedo.png")
+const ASTEROID_TEXTURE: Texture2D = preload(
+	"res://assets/materials/verse_asteroid_regolith_albedo.png"
+)
+const PLANET_TEXTURE: Texture2D = preload("res://assets/materials/khepri_prime_albedo.png")
 const ASTEROID_SHADER: Shader = preload("res://shaders/asteroid_surface.gdshader")
 const PLANET_SHADER: Shader = preload("res://shaders/planet_surface.gdshader")
+const ATMOSPHERE_SHADER: Shader = preload("res://shaders/planet_atmosphere.gdshader")
+const CLOUD_SHADER: Shader = preload("res://shaders/planet_clouds.gdshader")
 const PROTOCOL_VERSION := 4
 const DEFAULT_SERVER := "ws://127.0.0.1:7777/ws"
 const PLAYER_INVENTORY := "inventory-player-local"
@@ -21,7 +27,11 @@ const DAMAGE_DURATION := 0.46
 const WALK_SPEED := 4.4
 const WALK_ACCELERATION := 15.0
 const JUMP_SPEED := 4.2
+const ROLL_SPEED := 1.65
 const PLAYER_SURFACE_CLEARANCE := 1.05
+const PLANET_VISUAL_CENTER := Vector3(900.0, -2200.0, -3800.0)
+const PLANET_VISUAL_RADIUS := 1200.0
+const PLANET_ATMOSPHERE_RADIUS := 1242.0
 const ISO_LEVEL := 0.5
 const MARCHING_CORNERS: Array[Vector3i] = [
 	Vector3i(0, 0, 0), Vector3i(1, 0, 0),
@@ -77,6 +87,11 @@ var inventory_open := false
 var inventory_item_labels: Dictionary = {}
 var inventory_capacity_labels: Dictionary = {}
 var inventory_capacity_bars: Dictionary = {}
+var inventory_rows: Dictionary = {}
+var inventory_selected_resource := "component"
+var inventory_selected_side := "suit"
+var inventory_filters := {"suit": "all", "cargo": "all"}
+var inventory_search_queries := {"suit": "", "cargo": ""}
 
 var camera: Camera3D
 var asteroid_root: Node3D
@@ -107,6 +122,7 @@ var action_sparks: GPUParticles3D
 var mining_fragments: GPUParticles3D
 var suit_light: SpotLight3D
 var inventory_overlay: Control
+var planet_cloud_layer: MeshInstance3D
 
 var rock_material: Material
 var block_materials: Dictionary = {}
@@ -129,6 +145,8 @@ func _exit_tree() -> void:
 
 func _process(delta: float) -> void:
 	elapsed_time += delta
+	if planet_cloud_layer != null:
+		planet_cloud_layer.rotation.y += delta * 0.0025
 	_poll_socket()
 	_update_movement(delta)
 	_update_target()
@@ -139,12 +157,9 @@ func _process(delta: float) -> void:
 
 func _input(event: InputEvent) -> void:
 	if event is InputEventMouseMotion and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
-		camera.rotation.y -= event.relative.x * MOUSE_SENSITIVITY
-		camera.rotation.x = clamp(
-			camera.rotation.x - event.relative.y * MOUSE_SENSITIVITY,
-			-deg_to_rad(89.0),
-			deg_to_rad(89.0)
-		)
+		camera.rotate_object_local(Vector3.UP, -event.relative.x * MOUSE_SENSITIVITY)
+		camera.rotate_object_local(Vector3.RIGHT, -event.relative.y * MOUSE_SENSITIVITY)
+		camera.transform.basis = camera.transform.basis.orthonormalized()
 		return
 
 	if event is InputEventKey and event.pressed and not event.echo:
@@ -183,10 +198,18 @@ func _input(event: InputEvent) -> void:
 				build_mode = not build_mode
 				action_charge = 0.0
 			KEY_Q:
+				if not inventory_open and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
+					camera.rotate_object_local(Vector3.FORWARD, -deg_to_rad(8.0))
+					camera.transform.basis = camera.transform.basis.orthonormalized()
+			KEY_E:
+				if not inventory_open and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
+					camera.rotate_object_local(Vector3.FORWARD, deg_to_rad(8.0))
+					camera.transform.basis = camera.transform.basis.orthonormalized()
+			KEY_BRACKETLEFT:
 				if build_mode:
 					build_rotation_quarters = posmod(build_rotation_quarters - 1, 4)
 					_set_message("Block orientation %d°" % (build_rotation_quarters * 90))
-			KEY_E:
+			KEY_BRACKETRIGHT:
 				if build_mode:
 					build_rotation_quarters = posmod(build_rotation_quarters + 1, 4)
 					_set_message("Block orientation %d°" % (build_rotation_quarters * 90))
@@ -241,6 +264,8 @@ func _register_inputs() -> void:
 	_add_key_action("move_up", KEY_SPACE)
 	_add_key_action("move_down", KEY_C)
 	_add_key_action("move_boost", KEY_SHIFT)
+	_add_key_action("roll_left", KEY_Q)
+	_add_key_action("roll_right", KEY_E)
 
 
 func _add_key_action(action: StringName, keycode: Key) -> void:
@@ -263,7 +288,7 @@ func _build_environment() -> void:
 	environment.fog_enabled = true
 	environment.fog_light_color = Color(0.055, 0.11, 0.16)
 	environment.fog_light_energy = 0.34
-	environment.fog_density = 0.0018
+	environment.fog_density = 0.00004
 	environment.fog_sky_affect = 0.18
 	world_environment.environment = environment
 	add_child(world_environment)
@@ -285,7 +310,7 @@ func _build_environment() -> void:
 	camera.current = true
 	camera.fov = 74.0
 	camera.near = 0.05
-	camera.far = 1500.0
+	camera.far = 12_000.0
 	camera.position = Vector3(12.0, 4.5, 10.0)
 	add_child(camera)
 	camera.look_at(Vector3.ZERO, Vector3.UP)
@@ -314,6 +339,7 @@ func _build_environment() -> void:
 
 	var asteroid_material := ShaderMaterial.new()
 	asteroid_material.shader = ASTEROID_SHADER
+	asteroid_material.set_shader_parameter("albedo_texture", ASTEROID_TEXTURE)
 	rock_material = asteroid_material
 	block_materials = {
 		"structural": _armored_material(Color(0.72, 0.78, 0.80), 0.72, 0.62),
@@ -395,124 +421,58 @@ func _build_distant_world() -> void:
 	var planet := MeshInstance3D.new()
 	planet.name = "KhepriPrimeSurface"
 	var planet_mesh := SphereMesh.new()
-	planet_mesh.radius = 90.0
-	planet_mesh.height = 180.0
-	planet_mesh.radial_segments = 128
-	planet_mesh.rings = 64
+	planet_mesh.radius = PLANET_VISUAL_RADIUS
+	planet_mesh.height = PLANET_VISUAL_RADIUS * 2.0
+	planet_mesh.radial_segments = 192
+	planet_mesh.rings = 96
 	var surface_material := ShaderMaterial.new()
 	surface_material.shader = PLANET_SHADER
+	surface_material.set_shader_parameter("planet_albedo", PLANET_TEXTURE)
 	planet_mesh.material = surface_material
 	planet.mesh = planet_mesh
-	planet.position = Vector3(0.0, -98.0, 0.0)
+	planet.position = PLANET_VISUAL_CENTER
+	planet.rotation_degrees = Vector3(0.0, -32.0, -11.0)
 	planet_root.add_child(planet)
+
+	planet_cloud_layer = MeshInstance3D.new()
+	planet_cloud_layer.name = "KhepriCloudLayer"
+	var cloud_mesh := SphereMesh.new()
+	cloud_mesh.radius = PLANET_VISUAL_RADIUS + 12.0
+	cloud_mesh.height = (PLANET_VISUAL_RADIUS + 12.0) * 2.0
+	cloud_mesh.radial_segments = 160
+	cloud_mesh.rings = 80
+	var cloud_material := ShaderMaterial.new()
+	cloud_material.shader = CLOUD_SHADER
+	cloud_mesh.material = cloud_material
+	planet_cloud_layer.mesh = cloud_mesh
+	planet_cloud_layer.position = PLANET_VISUAL_CENTER
+	planet_cloud_layer.rotation_degrees = Vector3(0.0, -20.0, -11.0)
+	planet_root.add_child(planet_cloud_layer)
 
 	var atmosphere := MeshInstance3D.new()
 	atmosphere.name = "KhepriAtmosphere"
 	var atmosphere_mesh := SphereMesh.new()
-	atmosphere_mesh.radius = 128.0
-	atmosphere_mesh.height = 256.0
-	atmosphere_mesh.radial_segments = 64
-	atmosphere_mesh.rings = 32
-	var atmosphere_material := StandardMaterial3D.new()
-	atmosphere_material.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
-	atmosphere_material.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-	atmosphere_material.cull_mode = BaseMaterial3D.CULL_FRONT
-	atmosphere_material.albedo_color = Color(0.08, 0.34, 0.55, 0.055)
-	atmosphere_material.emission_enabled = true
-	atmosphere_material.emission = Color(0.02, 0.12, 0.22)
-	atmosphere_material.emission_energy_multiplier = 0.32
+	atmosphere_mesh.radius = PLANET_ATMOSPHERE_RADIUS
+	atmosphere_mesh.height = PLANET_ATMOSPHERE_RADIUS * 2.0
+	atmosphere_mesh.radial_segments = 128
+	atmosphere_mesh.rings = 64
+	var atmosphere_material := ShaderMaterial.new()
+	atmosphere_material.shader = ATMOSPHERE_SHADER
 	atmosphere_mesh.material = atmosphere_material
 	atmosphere.mesh = atmosphere_mesh
-	atmosphere.position = Vector3(0.0, -98.0, 0.0)
+	atmosphere.position = PLANET_VISUAL_CENTER
 	planet_root.add_child(atmosphere)
-
-	var horizon_glow := OmniLight3D.new()
-	horizon_glow.light_color = Color(0.20, 0.55, 0.72)
-	horizon_glow.light_energy = 0.42
-	horizon_glow.omni_range = 62.0
-	horizon_glow.position = Vector3(0.0, -3.0, -18.0)
-	planet_root.add_child(horizon_glow)
-	_build_planet_surface_details()
 
 	var moon := MeshInstance3D.new()
 	var moon_mesh := SphereMesh.new()
-	moon_mesh.radius = 3.8
-	moon_mesh.height = 7.6
-	moon_mesh.radial_segments = 16
-	moon_mesh.rings = 8
+	moon_mesh.radius = 84.0
+	moon_mesh.height = 168.0
+	moon_mesh.radial_segments = 48
+	moon_mesh.rings = 24
 	moon_mesh.material = _material(Color(0.22, 0.18, 0.16), 0.98, 0.01)
 	moon.mesh = moon_mesh
-	moon.position = Vector3(64.0, 28.0, -130.0)
+	moon.position = Vector3(2250.0, -730.0, -5100.0)
 	planet_root.add_child(moon)
-
-
-func _build_planet_surface_details() -> void:
-	var random := RandomNumberGenerator.new()
-	random.seed = 7_241_903
-	var ridge_mesh := CylinderMesh.new()
-	ridge_mesh.top_radius = 0.08
-	ridge_mesh.bottom_radius = 0.82
-	ridge_mesh.height = 1.0
-	ridge_mesh.radial_segments = 7
-	ridge_mesh.material = _material(Color(0.10, 0.13, 0.13), 0.96, 0.04)
-	var ridges := MultiMesh.new()
-	ridges.transform_format = MultiMesh.TRANSFORM_3D
-	ridges.mesh = ridge_mesh
-	ridges.instance_count = 48
-	for index in ridges.instance_count:
-		var angle := random.randf_range(0.0, TAU)
-		var distance := random.randf_range(24.0, 68.0)
-		var x := cos(angle) * distance + random.randf_range(-7.0, 7.0)
-		var z := sin(angle) * distance + random.randf_range(-7.0, 7.0)
-		var surface_y := _planet_surface_y(x, z)
-		var height := random.randf_range(2.2, 9.0)
-		var width := random.randf_range(1.2, 4.6)
-		var basis := Basis(Vector3.UP, random.randf_range(0.0, TAU)).scaled(
-			Vector3(width, height, width)
-		)
-		ridges.set_instance_transform(
-			index, Transform3D(basis, Vector3(x, surface_y + height * 0.48, z))
-		)
-	var ridge_instance := MultiMeshInstance3D.new()
-	ridge_instance.name = "ProceduralPlanetRidges"
-	ridge_instance.multimesh = ridges
-	planet_root.add_child(ridge_instance)
-
-	var boulder_mesh := SphereMesh.new()
-	boulder_mesh.radius = 0.5
-	boulder_mesh.height = 1.0
-	boulder_mesh.radial_segments = 8
-	boulder_mesh.rings = 5
-	boulder_mesh.material = _material(Color(0.15, 0.18, 0.17), 0.98, 0.02)
-	var boulders := MultiMesh.new()
-	boulders.transform_format = MultiMesh.TRANSFORM_3D
-	boulders.mesh = boulder_mesh
-	boulders.instance_count = 110
-	for index in boulders.instance_count:
-		var x := random.randf_range(-52.0, 52.0)
-		var z := random.randf_range(-52.0, 52.0)
-		if Vector2(x, z).length() < 13.0:
-			x += 16.0 if x >= 0.0 else -16.0
-		var scale := Vector3(
-			random.randf_range(0.35, 1.6),
-			random.randf_range(0.30, 1.25),
-			random.randf_range(0.35, 1.7)
-		)
-		boulders.set_instance_transform(
-			index,
-			Transform3D(
-				Basis(Vector3.UP, random.randf_range(0.0, TAU)).scaled(scale),
-				Vector3(x, _planet_surface_y(x, z) + scale.y * 0.42, z)
-			)
-		)
-	var boulder_instance := MultiMeshInstance3D.new()
-	boulder_instance.name = "ProceduralPlanetBoulders"
-	boulder_instance.multimesh = boulders
-	planet_root.add_child(boulder_instance)
-
-
-func _planet_surface_y(x: float, z: float) -> float:
-	return -98.0 + sqrt(maxf(90.0 * 90.0 - x * x - z * z, 0.0))
 
 
 func _build_orbital_dust() -> void:
@@ -767,7 +727,7 @@ func _build_interface() -> void:
 	top_bar.add_child(accent)
 
 	var title := Label.new()
-	title.text = "THE VERSE  //  PLANETARY LOGISTICS"
+	title.text = "THE VERSE  //  ORBITAL OPERATIONS"
 	title.position = Vector2(24.0, 13.0)
 	title.add_theme_font_size_override("font_size", 19)
 	title.add_theme_color_override("font_color", Color(0.78, 0.91, 0.98))
@@ -901,63 +861,83 @@ func _build_inventory_terminal(canvas: CanvasLayer) -> void:
 	canvas.add_child(inventory_overlay)
 
 	var blackout := ColorRect.new()
-	blackout.color = Color(0.002, 0.008, 0.014, 0.90)
+	blackout.color = Color(0.001, 0.004, 0.007, 0.84)
 	blackout.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	inventory_overlay.add_child(blackout)
 
 	var terminal := ColorRect.new()
-	terminal.color = Color(0.012, 0.030, 0.043, 0.985)
-	terminal.anchor_left = 0.055
-	terminal.anchor_top = 0.07
-	terminal.anchor_right = 0.945
-	terminal.anchor_bottom = 0.92
+	terminal.color = Color(0.036, 0.045, 0.051, 0.99)
+	terminal.anchor_left = 0.035
+	terminal.anchor_top = 0.045
+	terminal.anchor_right = 0.965
+	terminal.anchor_bottom = 0.95
 	inventory_overlay.add_child(terminal)
 
 	var accent := ColorRect.new()
-	accent.color = Color(0.08, 0.70, 0.92)
+	accent.color = Color(0.34, 0.73, 0.84)
 	accent.anchor_right = 1.0
-	accent.offset_bottom = 3.0
+	accent.offset_bottom = 2.0
 	terminal.add_child(accent)
-	var heading := _hud_label("LOGISTICS // KHEPRI ENGINEERING TERMINAL", Vector2(24.0, 18.0), 21)
-	heading.add_theme_color_override("font_color", Color(0.72, 0.92, 1.0))
+
+	var tabs := ["INVENTORY", "CONTROL PANEL", "PRODUCTION", "INFO"]
+	for tab_index in tabs.size():
+		var tab := Button.new()
+		tab.text = tabs[tab_index]
+		tab.position = Vector2(20.0 + float(tab_index) * 142.0, 12.0)
+		tab.size = Vector2(136.0, 34.0)
+		tab.disabled = tab_index != 0
+		if tab_index == 0:
+			tab.add_theme_color_override("font_color", Color(0.87, 0.96, 1.0))
+			tab.add_theme_stylebox_override(
+				"normal", _terminal_style(Color(0.10, 0.22, 0.27), Color(0.31, 0.70, 0.82), 1)
+			)
+		terminal.add_child(tab)
+
+	var heading := _hud_label("INVENTORY", Vector2(22.0, 58.0), 23)
+	heading.add_theme_color_override("font_color", Color(0.78, 0.90, 0.94))
 	terminal.add_child(heading)
 	var subheading := _hud_label(
-		"PHYSICAL INVENTORIES  //  VOLUME, MASS, AND OWNERSHIP ARE SERVER AUTHORITATIVE",
-		Vector2(25.0, 51.0),
+		"CONNECTED INVENTORIES  //  DRAG-STYLE TWO-PANE LOGISTICS  //  SERVER AUTHORITATIVE",
+		Vector2(160.0, 66.0),
 		11
 	)
-	subheading.add_theme_color_override("font_color", Color(0.38, 0.59, 0.68))
+	subheading.add_theme_color_override("font_color", Color(0.42, 0.62, 0.68))
 	terminal.add_child(subheading)
 
 	var close_button := Button.new()
 	close_button.text = "CLOSE  [I]"
 	close_button.set_anchors_preset(Control.PRESET_TOP_RIGHT)
-	close_button.position = Vector2(-138.0, 18.0)
+	close_button.position = Vector2(-138.0, 14.0)
 	close_button.size = Vector2(112.0, 34.0)
 	close_button.pressed.connect(_set_inventory_open.bind(false))
 	terminal.add_child(close_button)
 
-	var suit_panel := _inventory_column(terminal, 0.025, 0.455, "SUIT // ORPHEUS-7", "PLAYER CARGO HARNESS")
-	var cargo_panel := _inventory_column(terminal, 0.545, 0.975, "GRID // KHEPRI RELAY", "CONNECTED CARGO CONTAINER")
+	var suit_panel := _inventory_column(
+		terminal, 0.018, 0.462, "ORPHEUS-7", "SUIT INVENTORY", "suit"
+	)
+	var cargo_panel := _inventory_column(
+		terminal, 0.538, 0.982, "KHEPRI RELAY", "LARGE CARGO CONTAINER", "cargo"
+	)
 	for resource_data in [
-		["ore", "FERRITE ORE", "RAW", Color(0.91, 0.32, 0.11), "37 L/u  //  3.5 kg/u"],
-		["refined_material", "REGISTERED ALLOY", "INGOT", Color(0.24, 0.76, 0.96), "15 L/u  //  2.4 kg/u"],
-		["component", "CONSTRUCTION PART", "COMP", Color(0.96, 0.70, 0.20), "22 L/u  //  4.8 kg/u"],
+		["ore", "Ferrite Ore", "Ore", Color(0.62, 0.34, 0.18), 37, 3.5],
+		["refined_material", "Registered Alloy", "Ingot", Color(0.42, 0.66, 0.73), 15, 2.4],
+		["component", "Construction Part", "Component", Color(0.71, 0.58, 0.24), 22, 4.8],
 	]:
 		var resource := String(resource_data[0])
 		var index := ["ore", "refined_material", "component"].find(resource)
 		_inventory_resource_row(
 			suit_panel, "suit", resource, String(resource_data[1]), String(resource_data[2]),
-			resource_data[3], String(resource_data[4]), 104.0 + float(index) * 92.0
+			resource_data[3], int(resource_data[4]), float(resource_data[5]), 190.0 + float(index) * 58.0
 		)
 		_inventory_resource_row(
 			cargo_panel, "cargo", resource, String(resource_data[1]), String(resource_data[2]),
-			resource_data[3], String(resource_data[4]), 104.0 + float(index) * 92.0
+			resource_data[3], int(resource_data[4]), float(resource_data[5]), 190.0 + float(index) * 58.0
 		)
-		_add_transfer_controls(terminal, resource, 123.0 + float(index) * 92.0)
+	_add_transfer_controls(terminal)
+	_update_inventory_row_styles()
 
 	var hint := _hud_label(
-		"ONE-UNIT ARROWS SUPPORT PRECISE LOADOUTS  //  DOUBLE ARROWS MOVE THE COMPLETE STACK  //  V REMAINS QUICK TRANSFER",
+		"SELECT AN ITEM, THEN USE THE CENTER ARROWS  //  SINGLE = ONE UNIT  //  DOUBLE = FULL STACK  //  V = QUICK TRANSFER",
 		Vector2(24.0, -34.0),
 		11
 	)
@@ -967,33 +947,63 @@ func _build_inventory_terminal(canvas: CanvasLayer) -> void:
 
 
 func _inventory_column(
-	parent: Control, left: float, right: float, title: String, subtitle: String
+	parent: Control, left: float, right: float, title: String, subtitle: String, side: String
 ) -> ColorRect:
 	var panel := ColorRect.new()
-	panel.color = Color(0.022, 0.052, 0.067, 0.96)
+	panel.color = Color(0.052, 0.063, 0.069, 0.98)
 	panel.anchor_left = left
-	panel.anchor_top = 0.13
+	panel.anchor_top = 0.12
 	panel.anchor_right = right
-	panel.anchor_bottom = 0.91
+	panel.anchor_bottom = 0.92
 	parent.add_child(panel)
-	var title_label := _hud_label(title, Vector2(18.0, 14.0), 17)
-	title_label.add_theme_color_override("font_color", Color(0.78, 0.91, 0.96))
+	var title_label := _hud_label(title, Vector2(16.0, 12.0), 16)
+	title_label.add_theme_color_override("font_color", Color(0.80, 0.89, 0.91))
 	panel.add_child(title_label)
-	var subtitle_label := _hud_label(subtitle, Vector2(18.0, 40.0), 10)
-	subtitle_label.add_theme_color_override("font_color", Color(0.34, 0.62, 0.71))
+	var subtitle_label := _hud_label(subtitle, Vector2(16.0, 36.0), 10)
+	subtitle_label.add_theme_color_override("font_color", Color(0.38, 0.67, 0.74))
 	panel.add_child(subtitle_label)
+
+	var selector := OptionButton.new()
+	selector.position = Vector2(16.0, 60.0)
+	selector.size = Vector2(438.0, 32.0)
+	selector.add_item("%s  /  %s" % [title, subtitle])
+	panel.add_child(selector)
+	var search := LineEdit.new()
+	search.placeholder_text = "Search inventory"
+	search.position = Vector2(16.0, 99.0)
+	search.size = Vector2(438.0, 30.0)
+	search.text_changed.connect(_inventory_search_changed.bind(side))
+	panel.add_child(search)
+
+	for filter_data in [["ALL", "all"], ["ORE", "ore"], ["INGOT", "refined_material"], ["COMP", "component"]]:
+		var filter_button := Button.new()
+		filter_button.text = String(filter_data[0])
+		filter_button.position = Vector2(16.0 + float(inventory_rows.size() % 4) * 77.0, 136.0)
+		filter_button.size = Vector2(72.0, 26.0)
+		filter_button.pressed.connect(_set_inventory_filter.bind(side, String(filter_data[1])))
+		panel.add_child(filter_button)
+		inventory_rows["filter-slot-%s-%s" % [side, filter_data[1]]] = filter_button
+
+	for header_data in [["ITEM", 17.0], ["AMOUNT", 266.0], ["VOL.", 335.0], ["MASS", 391.0]]:
+		var header := _hud_label(String(header_data[0]), Vector2(float(header_data[1]), 169.0), 9)
+		header.add_theme_color_override("font_color", Color(0.46, 0.57, 0.60))
+		panel.add_child(header)
+
 	var capacity_bar := ProgressBar.new()
-	capacity_bar.position = Vector2(18.0, 70.0)
-	capacity_bar.size = Vector2(310.0, 8.0)
+	capacity_bar.set_anchors_preset(Control.PRESET_BOTTOM_LEFT)
+	capacity_bar.position = Vector2(16.0, -41.0)
+	capacity_bar.size = Vector2(438.0, 9.0)
 	capacity_bar.max_value = 1.0
 	capacity_bar.show_percentage = false
-	capacity_bar.add_theme_stylebox_override("background", _bar_style(Color(0.01, 0.02, 0.03)))
-	capacity_bar.add_theme_stylebox_override("fill", _bar_style(Color(0.10, 0.72, 0.92)))
+	capacity_bar.add_theme_stylebox_override("background", _bar_style(Color(0.018, 0.023, 0.026)))
+	capacity_bar.add_theme_stylebox_override("fill", _bar_style(Color(0.27, 0.68, 0.77)))
 	panel.add_child(capacity_bar)
-	var capacity_label := _hud_label("0 / 0 L", Vector2(338.0, 63.0), 11)
-	capacity_label.add_theme_color_override("font_color", Color(0.56, 0.78, 0.84))
+	var capacity_label := _hud_label("0 / 0 L", Vector2(16.0, -66.0), 11)
+	capacity_label.set_anchors_preset(Control.PRESET_BOTTOM_LEFT)
+	capacity_label.size = Vector2(438.0, 22.0)
+	capacity_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
+	capacity_label.add_theme_color_override("font_color", Color(0.57, 0.72, 0.75))
 	panel.add_child(capacity_label)
-	var side := "suit" if left < 0.5 else "cargo"
 	inventory_capacity_bars[side] = capacity_bar
 	inventory_capacity_labels[side] = capacity_label
 	return panel
@@ -1006,51 +1016,138 @@ func _inventory_resource_row(
 	name: String,
 	code: String,
 	color: Color,
-	detail: String,
+	unit_liters: int,
+	unit_mass_kg: float,
 	y: float
 ) -> void:
-	var row := ColorRect.new()
-	row.color = Color(0.015, 0.027, 0.035, 0.94)
-	row.position = Vector2(18.0, y)
-	row.size = Vector2(418.0, 76.0)
+	var row := Button.new()
+	row.text = ""
+	row.position = Vector2(16.0, y)
+	row.size = Vector2(438.0, 52.0)
+	row.focus_mode = Control.FOCUS_NONE
+	row.pressed.connect(_select_inventory_resource.bind(side, resource))
 	parent.add_child(row)
-	var stripe := ColorRect.new()
-	stripe.color = color
-	stripe.size = Vector2(5.0, 76.0)
-	row.add_child(stripe)
-	var code_label := _hud_label(code, Vector2(18.0, 15.0), 13)
-	code_label.add_theme_color_override("font_color", color)
-	row.add_child(code_label)
-	var name_label := _hud_label(name, Vector2(79.0, 10.0), 15)
-	name_label.add_theme_color_override("font_color", Color(0.82, 0.89, 0.91))
+	var icon := ColorRect.new()
+	icon.color = color
+	icon.position = Vector2(7.0, 7.0)
+	icon.size = Vector2(38.0, 38.0)
+	icon.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	row.add_child(icon)
+	var icon_inner := ColorRect.new()
+	icon_inner.color = Color(color, 0.55)
+	icon_inner.position = Vector2(5.0, 5.0)
+	icon_inner.size = Vector2(28.0, 28.0)
+	icon_inner.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	icon.add_child(icon_inner)
+	var name_label := _hud_label(name, Vector2(54.0, 5.0), 13)
+	name_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	name_label.add_theme_color_override("font_color", Color(0.82, 0.87, 0.88))
 	row.add_child(name_label)
-	var detail_label := _hud_label(detail, Vector2(79.0, 39.0), 10)
-	detail_label.add_theme_color_override("font_color", Color(0.37, 0.54, 0.59))
-	row.add_child(detail_label)
-	var quantity_label := _hud_label("000", Vector2(338.0, 18.0), 22)
+	var code_label := _hud_label(code, Vector2(54.0, 27.0), 9)
+	code_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	code_label.add_theme_color_override("font_color", Color(0.43, 0.57, 0.60))
+	row.add_child(code_label)
+	var quantity_label := _hud_label("0", Vector2(248.0, 13.0), 13)
 	quantity_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
-	quantity_label.size = Vector2(62.0, 34.0)
-	quantity_label.add_theme_color_override("font_color", Color(0.95, 0.75, 0.31))
+	quantity_label.size = Vector2(62.0, 25.0)
+	quantity_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	quantity_label.add_theme_color_override("font_color", Color(0.91, 0.91, 0.82))
 	row.add_child(quantity_label)
-	inventory_item_labels["%s:%s" % [side, resource]] = quantity_label
+	var volume_label := _hud_label("0 L", Vector2(318.0, 14.0), 11)
+	volume_label.size = Vector2(54.0, 23.0)
+	volume_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
+	volume_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	row.add_child(volume_label)
+	var mass_label := _hud_label("0 kg", Vector2(373.0, 14.0), 11)
+	mass_label.size = Vector2(57.0, 23.0)
+	mass_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
+	mass_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	row.add_child(mass_label)
+	inventory_item_labels["%s:%s:amount" % [side, resource]] = quantity_label
+	inventory_item_labels["%s:%s:volume" % [side, resource]] = [volume_label, unit_liters]
+	inventory_item_labels["%s:%s:mass" % [side, resource]] = [mass_label, unit_mass_kg]
+	inventory_rows["%s:%s" % [side, resource]] = row
 
 
-func _add_transfer_controls(parent: Control, resource: String, y: float) -> void:
+func _add_transfer_controls(parent: Control) -> void:
+	var selected_hint := _hud_label("SELECT\nITEM", Vector2(-33.0, 170.0), 10)
+	selected_hint.set_anchors_preset(Control.PRESET_CENTER_TOP)
+	selected_hint.size = Vector2(66.0, 42.0)
+	selected_hint.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	selected_hint.add_theme_color_override("font_color", Color(0.42, 0.60, 0.64))
+	parent.add_child(selected_hint)
 	for data in [
-		["→", Vector2(-45.0, y), false, false],
-		["»", Vector2(3.0, y), false, true],
-		["←", Vector2(-45.0, y + 35.0), true, false],
-		["«", Vector2(3.0, y + 35.0), true, true],
+		["→", Vector2(-46.0, 226.0), false, false],
+		["⇒", Vector2(2.0, 226.0), false, true],
+		["←", Vector2(-46.0, 266.0), true, false],
+		["⇐", Vector2(2.0, 266.0), true, true],
 	]:
 		var button := Button.new()
 		button.text = String(data[0])
 		button.set_anchors_preset(Control.PRESET_CENTER_TOP)
 		button.position = data[1]
-		button.size = Vector2(42.0, 30.0)
-		button.pressed.connect(
-			_transfer_inventory_resource.bind(resource, bool(data[2]), bool(data[3]))
-		)
+		button.size = Vector2(44.0, 34.0)
+		button.pressed.connect(_transfer_selected_inventory.bind(bool(data[2]), bool(data[3])))
 		parent.add_child(button)
+
+
+func _transfer_selected_inventory(reverse: bool, all: bool) -> void:
+	_transfer_inventory_resource(inventory_selected_resource, reverse, all)
+
+
+func _select_inventory_resource(side: String, resource: String) -> void:
+	inventory_selected_side = side
+	inventory_selected_resource = resource
+	_update_inventory_row_styles()
+
+
+func _set_inventory_filter(side: String, filter: String) -> void:
+	inventory_filters[side] = filter
+	_apply_inventory_visibility(side)
+
+
+func _inventory_search_changed(query: String, side: String) -> void:
+	inventory_search_queries[side] = query.strip_edges().to_lower()
+	_apply_inventory_visibility(side)
+
+
+func _apply_inventory_visibility(side: String) -> void:
+	var normalized := String(inventory_search_queries.get(side, ""))
+	var filter := String(inventory_filters.get(side, "all"))
+	for resource_data in [
+		["ore", "ferrite ore"],
+		["refined_material", "registered alloy ingot"],
+		["component", "construction part component"],
+	]:
+		var resource := String(resource_data[0])
+		var row: Button = inventory_rows.get("%s:%s" % [side, resource], null)
+		if row != null:
+			row.visible = (
+				(normalized.is_empty() or String(resource_data[1]).contains(normalized))
+				and (filter == "all" or filter == resource)
+			)
+
+
+func _update_inventory_row_styles() -> void:
+	for side in ["suit", "cargo"]:
+		for resource in ["ore", "refined_material", "component"]:
+			var row: Button = inventory_rows.get("%s:%s" % [side, resource], null)
+			if row == null:
+				continue
+			var selected: bool = (
+				side == inventory_selected_side and resource == inventory_selected_resource
+			)
+			row.add_theme_stylebox_override(
+				"normal",
+				_terminal_style(
+					Color(0.10, 0.15, 0.17) if selected else Color(0.035, 0.043, 0.047),
+					Color(0.34, 0.73, 0.84) if selected else Color(0.10, 0.13, 0.14),
+					1
+				)
+			)
+			row.add_theme_stylebox_override(
+				"hover", _terminal_style(Color(0.075, 0.11, 0.12), Color(0.28, 0.55, 0.61), 1)
+			)
 
 
 func _hud_panel(position: Vector2, size: Vector2) -> ColorRect:
@@ -1076,6 +1173,18 @@ func _bar_style(color: Color) -> StyleBoxFlat:
 	style.corner_radius_top_right = 2
 	style.corner_radius_bottom_left = 2
 	style.corner_radius_bottom_right = 2
+	return style
+
+
+func _terminal_style(background: Color, border: Color, width: int) -> StyleBoxFlat:
+	var style := StyleBoxFlat.new()
+	style.bg_color = background
+	style.border_color = border
+	style.set_border_width_all(width)
+	style.corner_radius_top_left = 1
+	style.corner_radius_top_right = 1
+	style.corner_radius_bottom_left = 1
+	style.corner_radius_bottom_right = 1
 	return style
 
 
@@ -1110,7 +1219,7 @@ func _poll_socket() -> void:
 			_send({
 				"type": "hello",
 				"protocol_version": PROTOCOL_VERSION,
-				"client_name": "godot-native-p0.5",
+				"client_name": "godot-native-p0.6",
 			})
 		while socket.get_available_packet_count() > 0:
 			var text := socket.get_packet().get_string_from_utf8()
@@ -1592,6 +1701,12 @@ func _add_construction_frame(root: Node3D, integrity: float) -> void:
 func _update_movement(delta: float) -> void:
 	if Input.mouse_mode != Input.MOUSE_MODE_CAPTURED or inventory_open:
 		return
+	var roll_input := (
+		Input.get_action_strength("roll_right") - Input.get_action_strength("roll_left")
+	)
+	if absf(roll_input) > 0.001:
+		camera.rotate_object_local(Vector3.FORWARD, roll_input * ROLL_SPEED * delta)
+		camera.transform.basis = camera.transform.basis.orthonormalized()
 	var player_state: Dictionary = snapshot.get("player", {})
 	var environment: Dictionary = snapshot.get("environment", {})
 	var jetpack_enabled := bool(player_state.get("jetpack_enabled", true))
@@ -1660,11 +1775,6 @@ func _update_movement(delta: float) -> void:
 		1.0
 	)
 	camera.fov = lerpf(camera.fov, 74.0 + boost_amount * 8.0, minf(delta * 5.0, 1.0))
-	camera.rotation.z = lerpf(
-		camera.rotation.z,
-		-movement_input.x * (0.028 if jetpack_enabled else 0.012),
-		minf(delta * 4.0, 1.0)
-	)
 
 	move_send_elapsed += delta
 	if (
@@ -2218,11 +2328,11 @@ func _update_interface() -> void:
 			if choice[2] == selected_block_kind:
 				text = "▶ " + text + " ◀"
 			hotbar_parts.append(text)
-		hotbar_label.text = "%s     ROT %03d°" % [
+		hotbar_label.text = "%s     ROT %03d°  [ / ]" % [
 			"     ".join(hotbar_parts), build_rotation_quarters * 90
 		]
 	else:
-		hotbar_label.text = "HAND DRILL ACTIVE     [B] CONSTRUCTION     [R] REFINE     [T] FABRICATE     [V] CARGO TRANSFER"
+		hotbar_label.text = "HAND DRILL     [Q/E] ROLL     [B] CONSTRUCTION     [R] REFINE     [T] FABRICATE     [V] CARGO"
 	if target_voxel != null:
 		var voxel: Dictionary = voxel_lookup.get(_coord_key(target_voxel), {})
 		var deposit := (
@@ -2242,7 +2352,7 @@ func _update_interface() -> void:
 					String(block.get("kind", "block")).to_upper(), integrity
 				]
 			else:
-				target_label.text = "%s // INTEGRITY 100%%\nHOLD LMB  //  PLACE %s  //  Q/E ROTATE" % [
+				target_label.text = "%s // INTEGRITY 100%%\nHOLD LMB  //  PLACE %s  //  [ / ] ROTATE" % [
 					String(block.get("kind", "block")).to_upper(),
 					selected_block_kind.to_upper(),
 				]
@@ -2278,11 +2388,24 @@ func _update_inventory_terminal() -> void:
 		var inventory: Dictionary = side_data[1]
 		var contents: Dictionary = inventory.get("contents", {})
 		for resource in ["ore", "refined_material", "component"]:
+			var quantity := _resource_amount(contents, resource)
 			var quantity_label: Label = inventory_item_labels.get(
-				"%s:%s" % [side, resource], null
+				"%s:%s:amount" % [side, resource], null
 			)
 			if quantity_label != null:
-				quantity_label.text = "%03d" % _resource_amount(contents, resource)
+				quantity_label.text = str(quantity)
+			var volume_data: Array = inventory_item_labels.get(
+				"%s:%s:volume" % [side, resource], []
+			)
+			if volume_data.size() == 2:
+				var volume_label: Label = volume_data[0]
+				volume_label.text = "%d L" % (quantity * int(volume_data[1]))
+			var mass_data: Array = inventory_item_labels.get(
+				"%s:%s:mass" % [side, resource], []
+			)
+			if mass_data.size() == 2:
+				var mass_label: Label = mass_data[0]
+				mass_label.text = "%.1f kg" % (float(quantity) * float(mass_data[1]))
 		var capacity := maxi(int(inventory.get("capacity_liters", 0)), 1)
 		var used := int(inventory.get("used_liters", 0))
 		var mass_kg := float(inventory.get("mass_grams", 0)) / 1000.0
@@ -2326,7 +2449,7 @@ func _mission_text(career: Dictionary) -> String:
 			"04 // EXPAND THE RELAY\n"
 			+ "Add a frame, then an anchor toward the rock.\n\n"
 			+ "Blocks constructed  %d / 2\n"
-			+ "Press B, select 1 or 2, rotate with Q/E, then hold LMB to place and weld."
+			+ "Press B, select 1 or 2, rotate with [ or ], then hold LMB to place and weld."
 		) % built
 	if anchored < 1:
 		return (
