@@ -11,25 +11,31 @@ const PLANET_SHADER: Shader = preload("res://shaders/planet_surface.gdshader")
 const ATMOSPHERE_SHADER: Shader = preload("res://shaders/planet_atmosphere.gdshader")
 const CLOUD_SHADER: Shader = preload("res://shaders/planet_clouds.gdshader")
 const BLOCK_DAMAGE_SHADER: Shader = preload("res://shaders/block_damage.gdshader")
-const PROTOCOL_VERSION := 7
+const PROTOCOL_VERSION := 8
 const DEFAULT_SERVER := "ws://127.0.0.1:7777/ws"
 const PLAYER_INVENTORY := "inventory-player-local"
 const STARTER_GRID := "grid-starter"
-const MOVE_SPEED := 7.0
-const BOOST_MULTIPLIER := 2.1
-const MOVE_ACCELERATION := 18.0
-const MOVE_DAMPING := 7.5
-const MOUSE_SENSITIVITY := 0.0022
-const MOVE_SEND_INTERVAL := 0.10
+# Clean-room prediction mirrors the protocol-fenced p0.9.0 character content.
+# The server remains authoritative for elapsed time, contacts, and final motion.
+const CHARACTER_FIXED_DELTA := 1.0 / 60.0
+const CONTROL_SEND_INTERVAL := 0.10
+const PREDICTION_HISTORY_LIMIT := 180
+const POSITION_SNAP_DISTANCE := 2.0
+const CHARACTER_COLLISION_RADIUS := 0.34
+const CHARACTER_THRUST_ACCELERATION := 10.0
+const CHARACTER_BOOST_ACCELERATION := 20.0
+const CHARACTER_LINEAR_DAMPENER_ACCELERATION := 14.0
+const CHARACTER_ANGULAR_ACCELERATION := 5.0
+const CHARACTER_ANGULAR_DAMPENER_ACCELERATION := 7.0
+const CHARACTER_MAXIMUM_SPEED := 12.0
+const CHARACTER_BOOST_MAXIMUM_SPEED := 24.0
+const CHARACTER_MAXIMUM_ANGULAR_SPEED := 2.5
+const PHYSICS_MAXIMUM_LINEAR_SPEED := 32.0
+const MOUSE_ANGULAR_INPUT_PER_PIXEL := 0.12
 const TARGET_RANGE := 9.0
 const MINE_DURATION := 0.72
 const WELD_DURATION := 0.52
 const DAMAGE_DURATION := 0.46
-const WALK_SPEED := 4.4
-const WALK_ACCELERATION := 15.0
-const JUMP_SPEED := 4.2
-const ROLL_SPEED := 1.65
-const PLAYER_SURFACE_CLEARANCE := 1.05
 const PLANET_VISUAL_CENTER := Vector3(900.0, -2200.0, -3800.0)
 const PLANET_VISUAL_RADIUS := 1200.0
 const PLANET_ATMOSPHERE_RADIUS := 1242.0
@@ -57,14 +63,37 @@ var server_url := DEFAULT_SERVER
 var connected := false
 var handshake_sent := false
 var operation_counter := 0
-var move_send_elapsed := 0.0
-var last_sent_position := Vector3.ZERO
-var first_snapshot := true
+var authoritative_player_ready := false
+var awaiting_reconnect_baseline := true
+var control_send_elapsed := 0.0
+var movement_epoch := 0
+var next_input_sequence := 1
+var last_acked_input_sequence := 0
+var last_authoritative_event_sequence := -1
+var last_authoritative_simulation_tick := 0
+var predicted_simulation_tick := 0
+var predicted_position := Vector3.ZERO
+var predicted_orientation := Quaternion.IDENTITY
+var predicted_linear_velocity := Vector3.ZERO
+var predicted_angular_velocity := Vector3.ZERO
+var predicted_surface_contact := false
+var desired_dampeners := true
+var last_sent_control: Dictionary = {}
+var current_prediction_input_sequence := 0
+var prediction_history: Array[Dictionary] = []
+var pending_controls: Array[Dictionary] = []
+var mouse_delta_accumulator := Vector2.ZERO
+var presentation_position_offset := Vector3.ZERO
+var presentation_orientation_offset := Quaternion.IDENTITY
+var require_neutral_baseline := true
+var last_player_id := ""
+var last_player_life_state := ""
 var snapshot: Dictionary = {}
 var voxel_lookup: Dictionary = {}
 var voxel_coordinate_lookup: Dictionary = {}
 var voxel_chunk_nodes: Dictionary = {}
 var grid_lookup: Dictionary = {}
+var grid_node_lookup: Dictionary = {}
 var rendered_voxel_count := -1
 var selected_block_kind := "structural"
 var target_voxel: Variant = null
@@ -73,11 +102,12 @@ var recent_message := "Starting local universe connection…"
 var recent_message_color := Color(0.56, 0.87, 1.0)
 var smoke_test := false
 var smoke_operation := ""
+var smoke_input_sequence := 0
+var smoke_receipt_received := false
+var smoke_visual_ready := false
 var recovery_operation := ""
 var last_socket_state := -1
 var closed_reported := false
-var player_velocity := Vector3.ZERO
-var dampeners_enabled := true
 var suit_light_enabled := true
 var action_charge := 0.0
 var action_target_key := ""
@@ -159,11 +189,27 @@ func _process(delta: float) -> void:
 	if planet_cloud_layer != null:
 		planet_cloud_layer.rotation.y += delta * 0.0025
 	_poll_socket()
-	_update_movement(delta)
+	_update_player_presentation(delta)
 	_update_target()
 	_update_tool_action(delta)
 	_update_viewmodel(delta)
 	_update_interface()
+
+
+func _physics_process(delta: float) -> void:
+	if not connected or not authoritative_player_ready:
+		return
+	if _local_player_incapacitated():
+		return
+	control_send_elapsed += delta
+	var control := _sample_player_control()
+	if require_neutral_baseline:
+		control = _neutral_player_control()
+		if _send_player_control(control, true):
+			require_neutral_baseline = false
+	elif _should_send_player_control(control):
+		_send_player_control(control, false)
+	_predict_player_step(control, CHARACTER_FIXED_DELTA, true)
 
 
 func _input(event: InputEvent) -> void:
@@ -178,9 +224,7 @@ func _input(event: InputEvent) -> void:
 		return
 
 	if event is InputEventMouseMotion and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
-		camera.rotate_object_local(Vector3.UP, -event.relative.x * MOUSE_SENSITIVITY)
-		camera.rotate_object_local(Vector3.RIGHT, -event.relative.y * MOUSE_SENSITIVITY)
-		camera.transform.basis = camera.transform.basis.orthonormalized()
+		mouse_delta_accumulator += event.relative
 		return
 
 	# Inventory text entry owns keyboard input. A held grid-control key still gets
@@ -236,14 +280,6 @@ func _input(event: InputEvent) -> void:
 			KEY_B:
 				build_mode = not build_mode
 				action_charge = 0.0
-			KEY_Q:
-				if not inventory_open and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
-					camera.rotate_object_local(Vector3.FORWARD, -deg_to_rad(8.0))
-					camera.transform.basis = camera.transform.basis.orthonormalized()
-			KEY_E:
-				if not inventory_open and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
-					camera.rotate_object_local(Vector3.FORWARD, deg_to_rad(8.0))
-					camera.transform.basis = camera.transform.basis.orthonormalized()
 			KEY_BRACKETLEFT:
 				if build_mode:
 					build_rotation_quarters = posmod(build_rotation_quarters - 1, 4)
@@ -265,9 +301,9 @@ func _input(event: InputEvent) -> void:
 			KEY_P:
 				_send({"type": "request_snapshot"})
 			KEY_Z:
-				dampeners_enabled = not dampeners_enabled
+				desired_dampeners = not desired_dampeners
 				_set_message(
-					"Inertial dampeners %s" % ("online" if dampeners_enabled else "offline")
+					"Inertial dampeners %s" % ("online" if desired_dampeners else "offline")
 				)
 			KEY_L:
 				suit_light_enabled = not suit_light_enabled
@@ -1352,6 +1388,7 @@ func _connect_to_server() -> void:
 	socket.inbound_buffer_size = 8 * 1024 * 1024
 	socket.outbound_buffer_size = 1024 * 1024
 	connected = false
+	_begin_player_resync()
 	recovery_operation = ""
 	handshake_sent = false
 	closed_reported = false
@@ -1378,7 +1415,7 @@ func _poll_socket() -> void:
 			_send({
 				"type": "hello",
 				"protocol_version": PROTOCOL_VERSION,
-				"client_name": "godot-native-p0.8",
+				"client_name": "godot-native-p0.9",
 			})
 		while socket.get_available_packet_count() > 0:
 			var text := socket.get_packet().get_string_from_utf8()
@@ -1399,6 +1436,7 @@ func _poll_socket() -> void:
 				true
 			)
 		connected = false
+		_begin_player_resync()
 		recovery_operation = ""
 		handshake_sent = false
 
@@ -1409,18 +1447,25 @@ func _handle_server_message(message: Dictionary) -> void:
 			_set_message("Connected to %s" % message.get("server_name", "The Verse"))
 		"snapshot":
 			_apply_snapshot(message.get("snapshot", {}))
+		"motion_state":
+			_apply_motion_state(message.get("motion", {}))
 		"intent_accepted":
 			var receipt: Dictionary = message.get("receipt", {})
-			_set_message(receipt.get("message", "Intent accepted"))
+			if receipt.get("code", "") != "player_control_set":
+				_set_message(receipt.get("message", "Intent accepted"))
 			if receipt.get("operation_id", "") == recovery_operation:
 				_set_message("Recovery authorized // awaiting authoritative snapshot")
 			if smoke_test and receipt.get("operation_id", "") == smoke_operation:
-				print("VERSE_SMOKE_OK event=%d" % int(receipt.get("event_sequence", 0)))
-				get_tree().quit(0)
+				smoke_receipt_received = true
+				_check_smoke_control_ack(snapshot.get("player", {}))
 		"intent_rejected":
 			pending_mine_position = null
+			var rejected_operation := String(message.get("operation_id", ""))
 			if message.get("operation_id", "") == recovery_operation:
 				recovery_operation = ""
+			if rejected_operation.begins_with("player-control-"):
+				_begin_player_resync()
+				_send({"type": "request_snapshot"})
 			_set_message(
 				"%s — %s" % [message.get("code", "rejected"), message.get("message", "")],
 				true
@@ -1435,27 +1480,8 @@ func _handle_server_message(message: Dictionary) -> void:
 func _apply_snapshot(authoritative: Dictionary) -> void:
 	if authoritative.is_empty():
 		return
-	var was_incapacitated := _local_player_incapacitated()
 	snapshot = authoritative
 	var player: Dictionary = snapshot.get("player", {})
-	var is_incapacitated := _player_is_incapacitated(player)
-	if is_incapacitated and not was_incapacitated:
-		_enter_incapacitated_state()
-	elif was_incapacitated and not is_incapacitated:
-		recovery_operation = ""
-		Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
-		_set_message("RECOVERY COMPLETE // EVA SUIT CONTROL RESTORED")
-	var position := _vec3(player.get("position", {}))
-	if first_snapshot or camera.position.distance_to(position) > 2.8:
-		camera.position = position
-		if first_snapshot:
-			var grids: Array = snapshot.get("grids", [])
-			var focus := Vector3.ZERO
-			if not grids.is_empty():
-				focus = _vec3(grids[0].get("position", {}))
-			camera.look_at(focus, Vector3.UP)
-	last_sent_position = position
-	first_snapshot = false
 	var level := int(player.get("level", 1))
 	if level > last_level:
 		_set_message("CLEARANCE ADVANCED // SALVAGER LEVEL %d" % level)
@@ -1472,16 +1498,171 @@ func _apply_snapshot(authoritative: Dictionary) -> void:
 				_emit_mining_fragments(Vector3(mined_coordinate))
 				pending_mine_position = null
 	_rebuild_grids(snapshot.get("grids", []))
-	if smoke_test and smoke_operation.is_empty():
+	_apply_authoritative_player(
+		player,
+		int(snapshot.get("simulation_tick", 0)),
+		int(snapshot.get("event_sequence", 0)),
+		String(snapshot.get("world_hash", "")),
+		"snapshot"
+	)
+	if smoke_test and not smoke_visual_ready:
 		if not _run_visual_smoke_assertions():
 			get_tree().quit(1)
 			return
-		smoke_operation = _operation_id("godot-smoke")
-		_send({
-			"type": "move_player",
-			"operation_id": smoke_operation,
-			"position": _protocol_vec3(position + Vector3(0.01, 0.0, 0.0)),
-		})
+		smoke_visual_ready = true
+
+
+func _apply_motion_state(motion: Dictionary) -> void:
+	if motion.is_empty():
+		return
+	var event_sequence := int(motion.get("event_sequence", -1))
+	if event_sequence <= last_authoritative_event_sequence:
+		return
+	var player_motion: Dictionary = motion.get("player", {})
+	var merged_player: Dictionary = snapshot.get("player", {}).duplicate(true)
+	for key in player_motion:
+		merged_player[key] = player_motion[key]
+	snapshot["player"] = merged_player
+	snapshot["event_sequence"] = event_sequence
+	snapshot["simulation_tick"] = int(motion.get("simulation_tick", 0))
+	snapshot["world_hash"] = String(motion.get("world_hash", ""))
+	_update_grid_motion(motion.get("grids", []))
+	_apply_authoritative_player(
+		merged_player,
+		int(motion.get("simulation_tick", 0)),
+		event_sequence,
+		String(motion.get("world_hash", "")),
+		"motion_state"
+	)
+
+
+func _update_grid_motion(grids: Array) -> void:
+	for motion_grid in grids:
+		var grid_id := String(motion_grid.get("grid_id", ""))
+		if grid_id.is_empty() or not grid_lookup.has(grid_id):
+			continue
+		var grid: Dictionary = grid_lookup[grid_id]
+		for key in ["position", "orientation", "linear_velocity", "angular_velocity"]:
+			grid[key] = motion_grid.get(key, grid.get(key, {}))
+		grid_lookup[grid_id] = grid
+		var grid_node: Node3D = grid_node_lookup.get(grid_id, null)
+		if grid_node != null:
+			grid_node.position = _vec3(grid.get("position", {}))
+			grid_node.quaternion = _grid_quaternion(grid)
+
+
+func _apply_authoritative_player(
+	player: Dictionary,
+	simulation_tick: int,
+	event_sequence: int,
+	_world_hash: String,
+	source: String
+) -> void:
+	if player.is_empty() or event_sequence <= last_authoritative_event_sequence:
+		return
+	var incoming_player_id := String(player.get("player_id", ""))
+	var incoming_life_state := _player_life_state(player)
+	var incoming_epoch := int(player.get("movement_epoch", 0))
+	var incoming_ack := int(player.get("last_processed_input_sequence", 0))
+	var lifecycle_reset := (
+		not authoritative_player_ready
+		or awaiting_reconnect_baseline
+		or incoming_player_id != last_player_id
+		or incoming_life_state != last_player_life_state
+		or incoming_epoch != movement_epoch
+		or source == "reconnect"
+	)
+	var old_present_position := camera.position
+	var old_present_orientation := camera.quaternion
+	var old_history := prediction_history.duplicate(true)
+
+	predicted_position = _vec3(player.get("position", {}))
+	predicted_orientation = _quat(player.get("orientation", {}))
+	predicted_linear_velocity = _vec3(player.get("linear_velocity", {}))
+	predicted_angular_velocity = _vec3(player.get("angular_velocity", {}))
+	predicted_surface_contact = bool(player.get("surface_contact", false))
+	predicted_simulation_tick = simulation_tick
+	movement_epoch = incoming_epoch
+	last_acked_input_sequence = incoming_ack
+	next_input_sequence = maxi(next_input_sequence, incoming_ack + 1)
+
+	var remaining_controls: Array[Dictionary] = []
+	for pending in pending_controls:
+		if int(pending.get("movement_epoch", -1)) == incoming_epoch and int(
+			pending.get("input_sequence", 0)
+		) > incoming_ack:
+			remaining_controls.append(pending)
+	pending_controls = remaining_controls
+	if lifecycle_reset:
+		prediction_history.clear()
+		pending_controls.clear()
+		next_input_sequence = incoming_ack + 1
+		current_prediction_input_sequence = incoming_ack
+		desired_dampeners = bool(player.get("dampeners", true))
+		last_sent_control = {}
+		control_send_elapsed = CONTROL_SEND_INTERVAL
+		mouse_delta_accumulator = Vector2.ZERO
+		require_neutral_baseline = incoming_life_state == "alive"
+	else:
+		prediction_history.clear()
+		var replay_frames: Array[Dictionary] = []
+		for frame in old_history:
+			if (
+				int(frame.get("movement_epoch", -1)) == incoming_epoch
+				and (
+					int(frame.get("simulation_tick", 0)) > simulation_tick
+					or int(frame.get("input_sequence", 0)) > incoming_ack
+				)
+			):
+				replay_frames.append(frame)
+		while replay_frames.size() > PREDICTION_HISTORY_LIMIT:
+			replay_frames.pop_front()
+		for frame in replay_frames:
+			current_prediction_input_sequence = int(frame.get("input_sequence", incoming_ack))
+			_predict_player_step(frame.get("control", _neutral_player_control()), CHARACTER_FIXED_DELTA, true)
+		if pending_controls.is_empty():
+			desired_dampeners = bool(player.get("dampeners", true))
+
+	var correction_distance := old_present_position.distance_to(predicted_position)
+	if lifecycle_reset or correction_distance > POSITION_SNAP_DISTANCE:
+		presentation_position_offset = Vector3.ZERO
+		presentation_orientation_offset = Quaternion.IDENTITY
+		camera.position = predicted_position
+		camera.quaternion = predicted_orientation
+	else:
+		presentation_position_offset = old_present_position - predicted_position
+		presentation_orientation_offset = (
+			old_present_orientation * predicted_orientation.inverse()
+		).normalized()
+
+	authoritative_player_ready = true
+	awaiting_reconnect_baseline = false
+	last_authoritative_event_sequence = event_sequence
+	last_authoritative_simulation_tick = simulation_tick
+	last_player_id = incoming_player_id
+	var previous_life_state := last_player_life_state
+	last_player_life_state = incoming_life_state
+	if incoming_life_state == "incapacitated" and previous_life_state != "incapacitated":
+		_enter_incapacitated_state()
+	elif previous_life_state == "incapacitated" and incoming_life_state == "alive":
+		recovery_operation = ""
+		Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
+		_set_message("RECOVERY COMPLETE // EVA SUIT CONTROL RESTORED")
+	_check_smoke_control_ack(player)
+
+
+func _begin_player_resync() -> void:
+	authoritative_player_ready = false
+	awaiting_reconnect_baseline = true
+	prediction_history.clear()
+	pending_controls.clear()
+	last_sent_control = {}
+	control_send_elapsed = 0.0
+	mouse_delta_accumulator = Vector2.ZERO
+	presentation_position_offset = Vector3.ZERO
+	presentation_orientation_offset = Quaternion.IDENTITY
+	require_neutral_baseline = true
+	last_authoritative_event_sequence = -1
 
 
 func _rebuild_voxels(voxels: Array) -> void:
@@ -1737,6 +1918,7 @@ func _rebuild_grids(grids: Array) -> void:
 	for child in grids_root.get_children():
 		child.queue_free()
 	grid_lookup.clear()
+	grid_node_lookup.clear()
 	for grid in grids:
 		var grid_id: String = grid.get("grid_id", "")
 		grid_lookup[grid_id] = grid
@@ -1763,6 +1945,7 @@ func _rebuild_grids(grids: Array) -> void:
 			work_light.position = Vector3(0.0, 2.2, 0.0)
 			grid_node.add_child(work_light)
 		grids_root.add_child(grid_node)
+		grid_node_lookup[grid_id] = grid_node
 
 
 func _build_block_visual(block: Dictionary) -> Node3D:
@@ -1957,137 +2140,306 @@ func _stable_unit_seed(text: String) -> float:
 	return float(value) / 104729.0
 
 
-func _update_movement(delta: float) -> void:
-	if _local_player_incapacitated():
-		player_velocity = Vector3.ZERO
-		return
+func _sample_player_control() -> Dictionary:
 	if Input.mouse_mode != Input.MOUSE_MODE_CAPTURED or inventory_open:
-		return
-	var roll_input := (
-		Input.get_action_strength("roll_right") - Input.get_action_strength("roll_left")
-	)
-	if absf(roll_input) > 0.001:
-		camera.rotate_object_local(Vector3.FORWARD, roll_input * ROLL_SPEED * delta)
-		camera.transform.basis = camera.transform.basis.orthonormalized()
-	var player_state: Dictionary = snapshot.get("player", {})
-	var environment: Dictionary = snapshot.get("environment", {})
-	var jetpack_enabled := bool(player_state.get("jetpack_enabled", true))
-	var gravity := _vec3(environment.get("gravity", {}))
-	var planet_center := _vec3(environment.get("planet_center", {}))
-	var surface_radius := float(environment.get("surface_radius_m", 0.0))
-	var radial := camera.position - planet_center
-	var world_up := radial.normalized() if radial.length_squared() > 0.001 else Vector3.UP
-	var ground_radius := surface_radius + PLAYER_SURFACE_CLEARANCE
-	var grounded := surface_radius > 0.0 and radial.length() <= ground_radius + 0.12
-	var movement_input := Vector3(
+		mouse_delta_accumulator = Vector2.ZERO
+		return _neutral_player_control()
+	var linear_input := Vector3(
 		Input.get_action_strength("move_right") - Input.get_action_strength("move_left"),
 		Input.get_action_strength("move_up") - Input.get_action_strength("move_down"),
 		Input.get_action_strength("move_backward") - Input.get_action_strength("move_forward")
+	).limit_length(1.0)
+	var roll_input := (
+		Input.get_action_strength("roll_right") - Input.get_action_strength("roll_left")
 	)
-	if jetpack_enabled:
-		var desired_velocity := player_velocity
-		var has_movement_input := movement_input.length_squared() > 0.0
-		if has_movement_input:
-			movement_input = movement_input.normalized()
-			var speed := MOVE_SPEED
-			if Input.is_action_pressed("move_boost"):
-				speed *= BOOST_MULTIPLIER
-			desired_velocity = camera.basis * movement_input * speed
-		player_velocity = _integrate_jetpack_velocity(
-			player_velocity,
-			desired_velocity,
-			gravity,
-			delta,
-			has_movement_input,
-			dampeners_enabled
+	var mouse_delta := mouse_delta_accumulator
+	mouse_delta_accumulator = Vector2.ZERO
+	var angular_input := Vector3(
+		-mouse_delta.y * MOUSE_ANGULAR_INPUT_PER_PIXEL,
+		-mouse_delta.x * MOUSE_ANGULAR_INPUT_PER_PIXEL,
+		-roll_input
+	).limit_length(1.0)
+	return {
+		"linear_input": linear_input,
+		"angular_input": angular_input,
+		"boost": Input.is_action_pressed("move_boost"),
+		"dampeners": desired_dampeners,
+	}
+
+
+func _neutral_player_control() -> Dictionary:
+	return {
+		"linear_input": Vector3.ZERO,
+		"angular_input": Vector3.ZERO,
+		"boost": false,
+		"dampeners": desired_dampeners,
+	}
+
+
+func _controls_equal(first: Dictionary, second: Dictionary) -> bool:
+	if first.is_empty() or second.is_empty():
+		return false
+	return (
+		(first.get("linear_input", Vector3.ZERO) as Vector3).is_equal_approx(
+			second.get("linear_input", Vector3.ZERO) as Vector3
 		)
-	else:
-		var tangent_input := Vector3(movement_input.x, 0.0, movement_input.z)
-		var tangent_velocity := camera.basis * tangent_input
-		tangent_velocity -= world_up * tangent_velocity.dot(world_up)
-		if tangent_velocity.length_squared() > 0.0:
-			tangent_velocity = tangent_velocity.normalized() * WALK_SPEED
-			var vertical_velocity := world_up * player_velocity.dot(world_up)
-			player_velocity = player_velocity.move_toward(
-				tangent_velocity + vertical_velocity, WALK_ACCELERATION * delta
+		and (first.get("angular_input", Vector3.ZERO) as Vector3).is_equal_approx(
+			second.get("angular_input", Vector3.ZERO) as Vector3
+		)
+		and bool(first.get("boost", false)) == bool(second.get("boost", false))
+		and bool(first.get("dampeners", true)) == bool(second.get("dampeners", true))
+	)
+
+
+func _should_send_player_control(control: Dictionary) -> bool:
+	return _control_send_due(control, last_sent_control, control_send_elapsed)
+
+
+func _control_send_due(control: Dictionary, previous: Dictionary, elapsed: float) -> bool:
+	return (
+		previous.is_empty()
+		or not _controls_equal(control, previous)
+		or elapsed >= CONTROL_SEND_INTERVAL
+	)
+
+
+func _send_player_control(control: Dictionary, force: bool) -> bool:
+	if (
+		not connected
+		or not authoritative_player_ready
+		or _local_player_incapacitated()
+		or (not force and not _should_send_player_control(control))
+	):
+		return false
+	var bounded_control := {
+		"linear_input": (control.get("linear_input", Vector3.ZERO) as Vector3).limit_length(1.0),
+		"angular_input": (control.get("angular_input", Vector3.ZERO) as Vector3).limit_length(1.0),
+		"boost": bool(control.get("boost", false)),
+		"dampeners": bool(control.get("dampeners", true)),
+	}
+	var sequence := next_input_sequence
+	var operation_id := "player-control-%d-%d" % [movement_epoch, sequence]
+	var message := _player_control_message(operation_id, movement_epoch, sequence, bounded_control)
+	if not _send(message):
+		return false
+	next_input_sequence += 1
+	current_prediction_input_sequence = sequence
+	last_sent_control = bounded_control.duplicate(true)
+	control_send_elapsed = 0.0
+	pending_controls.append({
+		"movement_epoch": movement_epoch,
+		"input_sequence": sequence,
+		"control": bounded_control.duplicate(true),
+	})
+	while pending_controls.size() > PREDICTION_HISTORY_LIMIT:
+		pending_controls.pop_front()
+	if smoke_test and smoke_visual_ready and smoke_operation.is_empty():
+		smoke_operation = operation_id
+		smoke_input_sequence = sequence
+	return true
+
+
+func _player_control_message(
+	operation_id: String,
+	epoch: int,
+	sequence: int,
+	control: Dictionary
+) -> Dictionary:
+	return {
+		"type": "set_player_control",
+		"operation_id": operation_id,
+		"movement_epoch": epoch,
+		"input_sequence": sequence,
+		"linear_input": _protocol_vec3(control.get("linear_input", Vector3.ZERO)),
+		"angular_input": _protocol_vec3(control.get("angular_input", Vector3.ZERO)),
+		"boost": bool(control.get("boost", false)),
+		"dampeners": bool(control.get("dampeners", true)),
+	}
+
+
+func _predict_player_step(control: Dictionary, delta: float, record_history: bool) -> void:
+	var player: Dictionary = snapshot.get("player", {})
+	var result := _integrate_player_motion(
+		predicted_position,
+		predicted_orientation,
+		predicted_linear_velocity,
+		predicted_angular_velocity,
+		control,
+		_prediction_gravity(predicted_position),
+		bool(player.get("jetpack_enabled", true)),
+		delta
+	)
+	var proposed_position: Vector3 = result.get("position", predicted_position)
+	var sweep := _sweep_player_position(predicted_position, proposed_position)
+	predicted_position = sweep.get("position", proposed_position)
+	predicted_orientation = result.get("orientation", predicted_orientation)
+	predicted_linear_velocity = result.get("linear_velocity", predicted_linear_velocity)
+	predicted_angular_velocity = result.get("angular_velocity", predicted_angular_velocity)
+	predicted_surface_contact = bool(sweep.get("collided", false))
+	if predicted_surface_contact:
+		predicted_linear_velocity *= 0.05
+		tool_kick = max(tool_kick, 0.22)
+	predicted_simulation_tick += 1
+	if record_history:
+		prediction_history.append({
+			"movement_epoch": movement_epoch,
+			"input_sequence": current_prediction_input_sequence,
+			"simulation_tick": predicted_simulation_tick,
+			"control": control.duplicate(true),
+		})
+		while prediction_history.size() > PREDICTION_HISTORY_LIMIT:
+			prediction_history.pop_front()
+
+
+func _integrate_player_motion(
+	position: Vector3,
+	orientation: Quaternion,
+	linear_velocity: Vector3,
+	angular_velocity: Vector3,
+	control: Dictionary,
+	gravity: Vector3,
+	jetpack_enabled: bool,
+	delta: float
+) -> Dictionary:
+	var linear_input := (control.get("linear_input", Vector3.ZERO) as Vector3).limit_length(1.0)
+	var angular_input := (control.get("angular_input", Vector3.ZERO) as Vector3).limit_length(1.0)
+	var boost := bool(control.get("boost", false))
+	var dampeners := bool(control.get("dampeners", true))
+	var body_basis := Basis(orientation)
+	var world_input := body_basis * linear_input
+	var acceleration := gravity
+	if jetpack_enabled:
+		if dampeners:
+			var maximum_speed := (
+				CHARACTER_BOOST_MAXIMUM_SPEED if boost else CHARACTER_MAXIMUM_SPEED
+			)
+			var target_velocity := world_input * maximum_speed
+			var maximum_acceleration := (
+				CHARACTER_BOOST_ACCELERATION
+				if world_input.length() > 0.00001 and boost
+				else CHARACTER_THRUST_ACCELERATION
+				if world_input.length() > 0.00001
+				else CHARACTER_LINEAR_DAMPENER_ACCELERATION
+			)
+			acceleration = ((target_velocity - linear_velocity) / delta).limit_length(
+				maximum_acceleration
 			)
 		else:
-			var vertical_velocity := world_up * player_velocity.dot(world_up)
-			player_velocity = player_velocity.move_toward(
-				vertical_velocity, MOVE_DAMPING * delta
-			)
-		player_velocity += gravity * delta
-		if grounded and Input.is_action_just_pressed("move_up"):
-			player_velocity += world_up * JUMP_SPEED
-
-	var proposed_position := camera.position + player_velocity * delta
-	if surface_radius > 0.0:
-		var proposed_radial := proposed_position - planet_center
-		if proposed_radial.length() < ground_radius:
-			var surface_up := proposed_radial.normalized()
-			proposed_position = planet_center + surface_up * ground_radius
-			var inward_speed := player_velocity.dot(surface_up)
-			if inward_speed < 0.0:
-				player_velocity -= surface_up * inward_speed
-	if _position_is_clear(proposed_position):
-		camera.position = proposed_position
-	else:
-		player_velocity *= 0.18
-		tool_kick = max(tool_kick, 0.22)
-
-	var boost_amount: float = clampf(
-		player_velocity.length() / (MOVE_SPEED * BOOST_MULTIPLIER),
-		0.0,
-		1.0
+			var thrust := CHARACTER_BOOST_ACCELERATION if boost else CHARACTER_THRUST_ACCELERATION
+			acceleration += world_input * thrust
+	linear_velocity = (linear_velocity + acceleration * delta).limit_length(
+		PHYSICS_MAXIMUM_LINEAR_SPEED
 	)
-	camera.fov = lerpf(camera.fov, 74.0 + boost_amount * 8.0, minf(delta * 5.0, 1.0))
 
-	move_send_elapsed += delta
-	if (
-		connected
-		and move_send_elapsed >= MOVE_SEND_INTERVAL
-		and camera.position.distance_squared_to(last_sent_position) > 0.0001
-	):
-		move_send_elapsed = 0.0
-		last_sent_position = camera.position
-		_send({
-			"type": "move_player",
-			"operation_id": _operation_id("move"),
-			"position": _protocol_vec3(camera.position),
-		})
-
-
-func _integrate_jetpack_velocity(
-	current_velocity: Vector3,
-	desired_velocity: Vector3,
-	gravity: Vector3,
-	delta: float,
-	has_movement_input: bool,
-	dampeners: bool
-) -> Vector3:
-	var integrated := current_velocity + gravity * delta
-	if has_movement_input:
-		return integrated.move_toward(desired_velocity, MOVE_ACCELERATION * delta)
+	var world_angular_input := body_basis * angular_input
 	if dampeners:
-		return integrated.move_toward(
-			Vector3.ZERO, (MOVE_DAMPING + gravity.length()) * delta
+		var target_angular_velocity := world_angular_input * CHARACTER_MAXIMUM_ANGULAR_SPEED
+		var angular_acceleration := (
+			CHARACTER_ANGULAR_ACCELERATION
+			if world_angular_input.length() > 0.00001
+			else CHARACTER_ANGULAR_DAMPENER_ACCELERATION
 		)
-	return integrated
+		angular_velocity = angular_velocity.move_toward(
+			target_angular_velocity, angular_acceleration * delta
+		)
+	else:
+		angular_velocity += world_angular_input * CHARACTER_ANGULAR_ACCELERATION * delta
+	angular_velocity = angular_velocity.limit_length(CHARACTER_MAXIMUM_ANGULAR_SPEED)
+	if angular_velocity.length_squared() > 0.00000001:
+		var delta_rotation := Quaternion(
+			angular_velocity.normalized(), angular_velocity.length() * delta
+		)
+		orientation = (delta_rotation * orientation).normalized()
+	position += linear_velocity * delta
+	return {
+		"position": position,
+		"orientation": orientation,
+		"linear_velocity": linear_velocity,
+		"angular_velocity": angular_velocity,
+	}
 
 
-func _position_is_clear(position: Vector3) -> bool:
+func _prediction_gravity(position: Vector3) -> Vector3:
+	var environment: Dictionary = snapshot.get("environment", {})
+	var canonical_gravity := _vec3(environment.get("gravity", {}))
+	var planet_center := _vec3(environment.get("planet_center", {}))
+	var radial := position - planet_center
+	if canonical_gravity.length_squared() <= 0.00000001 or radial.length_squared() <= 0.0001:
+		return canonical_gravity
+	return -radial.normalized() * canonical_gravity.length()
+
+
+func _sweep_player_position(start: Vector3, finish: Vector3) -> Dictionary:
+	var distance := start.distance_to(finish)
+	var steps := maxi(1, ceili(distance / 0.18))
+	var last_clear := start
+	for index in range(1, steps + 1):
+		var sample := start.lerp(finish, float(index) / float(steps))
+		if not _player_position_is_clear(sample):
+			return {"position": last_clear, "collided": true}
+		last_clear = sample
+	return {"position": finish, "collided": false}
+
+
+func _player_position_is_clear(position: Vector3) -> bool:
+	var environment: Dictionary = snapshot.get("environment", {})
+	var surface_radius := float(environment.get("surface_radius_m", 0.0))
+	if surface_radius > 0.0:
+		var planet_center := _vec3(environment.get("planet_center", {}))
+		if position.distance_to(planet_center) < surface_radius + CHARACTER_COLLISION_RADIUS:
+			return false
 	var collision_offsets: Array[Vector3] = [
 		Vector3.ZERO,
-		Vector3(0.32, 0.0, 0.0), Vector3(-0.32, 0.0, 0.0),
-		Vector3(0.0, 0.32, 0.0), Vector3(0.0, -0.32, 0.0),
-		Vector3(0.0, 0.0, 0.32), Vector3(0.0, 0.0, -0.32),
+		Vector3(CHARACTER_COLLISION_RADIUS, 0.0, 0.0),
+		Vector3(-CHARACTER_COLLISION_RADIUS, 0.0, 0.0),
+		Vector3(0.0, CHARACTER_COLLISION_RADIUS, 0.0),
+		Vector3(0.0, -CHARACTER_COLLISION_RADIUS, 0.0),
+		Vector3(0.0, 0.0, CHARACTER_COLLISION_RADIUS),
+		Vector3(0.0, 0.0, -CHARACTER_COLLISION_RADIUS),
 	]
 	for offset in collision_offsets:
 		var sample: Vector3 = position + offset
 		var coordinate := Vector3i(roundi(sample.x), roundi(sample.y), roundi(sample.z))
 		if voxel_lookup.has(_coord_key(coordinate)):
 			return false
+	for grid_id in grid_lookup:
+		var grid: Dictionary = grid_lookup[grid_id]
+		var local_position := _grid_basis(grid).inverse() * (
+			position - _vec3(grid.get("position", {}))
+		)
+		for block in grid.get("blocks", []):
+			var delta := local_position - _coord_vector(block.get("coordinate", {}))
+			var closest := Vector3(
+				clampf(delta.x, -0.5, 0.5),
+				clampf(delta.y, -0.5, 0.5),
+				clampf(delta.z, -0.5, 0.5)
+			)
+			if (delta - closest).length_squared() < CHARACTER_COLLISION_RADIUS * CHARACTER_COLLISION_RADIUS:
+				return false
 	return true
+
+
+func _update_player_presentation(delta: float) -> void:
+	if not authoritative_player_ready:
+		return
+	var blend := clampf(delta * 12.0, 0.0, 1.0)
+	presentation_position_offset = presentation_position_offset.lerp(Vector3.ZERO, blend)
+	presentation_orientation_offset = _shortest_slerp(
+		presentation_orientation_offset, Quaternion.IDENTITY, blend
+	)
+	camera.position = predicted_position + presentation_position_offset
+	camera.quaternion = (presentation_orientation_offset * predicted_orientation).normalized()
+	var boost_amount := clampf(
+		predicted_linear_velocity.length() / CHARACTER_BOOST_MAXIMUM_SPEED, 0.0, 1.0
+	)
+	camera.fov = lerpf(camera.fov, 74.0 + boost_amount * 8.0, minf(delta * 5.0, 1.0))
+
+
+func _shortest_slerp(first: Quaternion, second: Quaternion, weight: float) -> Quaternion:
+	var adjusted_second := second
+	if first.dot(second) < 0.0:
+		adjusted_second = Quaternion(-second.x, -second.y, -second.z, -second.w)
+	return first.slerp(adjusted_second, weight).normalized()
 
 
 func _update_target() -> void:
@@ -2188,17 +2540,8 @@ func _run_visual_smoke_assertions() -> bool:
 	var repaired_visual := _build_block_visual(repaired)
 	var damage_material: ShaderMaterial = _damage_material(damaged_visual)
 	var expected_seed := _stable_unit_seed("smoke-damaged")
-	var gravity_probe := Vector3(0.0, -0.5, 0.0)
-	var drift_velocity := _integrate_jetpack_velocity(
-		Vector3.ZERO, Vector3.ZERO, gravity_probe, 0.25, false, false
-	)
-	var dampened_velocity := _integrate_jetpack_velocity(
-		Vector3.ZERO, Vector3.ZERO, gravity_probe, 0.25, false, true
-	)
-	var zero_gravity_velocity := _integrate_jetpack_velocity(
-		Vector3.ZERO, Vector3.ZERO, Vector3.ZERO, 0.25, false, false
-	)
 	var life_support_valid := _run_life_support_smoke_assertions()
+	var motion_prediction_valid := _run_motion_prediction_smoke_assertions()
 	var valid: bool = (
 		frame_visual.get_meta("verse_visual_state", "") == "frame"
 		and frame_visual.get_node_or_null("DamageOverlay") == null
@@ -2219,10 +2562,8 @@ func _run_visual_smoke_assertions() -> bool:
 		and not _inventory_close_shortcut(inventory_key, true)
 		and _inventory_close_shortcut(inventory_key, false)
 		and _inventory_close_shortcut(escape_key, true)
-		and drift_velocity.is_equal_approx(gravity_probe * 0.25)
-		and dampened_velocity.is_zero_approx()
-		and zero_gravity_velocity.is_zero_approx()
 		and life_support_valid
+		and motion_prediction_valid
 	)
 	frame_visual.free()
 	damaged_visual.free()
@@ -2234,6 +2575,93 @@ func _run_visual_smoke_assertions() -> bool:
 		"VERSE_VISUAL_STATE_OK frame=frame damaged=armor_damaged repaired=armor_complete inventory_focus=owned"
 	)
 	print("VERSE_EVA_GRAVITY_OK drift=gravity dampeners=compensating")
+	return true
+
+
+func _run_motion_prediction_smoke_assertions() -> bool:
+	var drift_control := {
+		"linear_input": Vector3.ZERO,
+		"angular_input": Vector3.ZERO,
+		"boost": false,
+		"dampeners": false,
+	}
+	var dampened_control := drift_control.duplicate(true)
+	dampened_control["dampeners"] = true
+	var thrust_control := dampened_control.duplicate(true)
+	thrust_control["linear_input"] = Vector3(0.0, 0.0, -1.0)
+	var roll_control := dampened_control.duplicate(true)
+	roll_control["angular_input"] = Vector3(0.0, 0.0, -1.0)
+	var gravity_probe := Vector3(0.0, -0.5, 0.0)
+	var drift := _integrate_player_motion(
+		Vector3.ZERO,
+		Quaternion.IDENTITY,
+		Vector3.ZERO,
+		Vector3.ZERO,
+		drift_control,
+		gravity_probe,
+		true,
+		CHARACTER_FIXED_DELTA
+	)
+	var dampened := _integrate_player_motion(
+		Vector3.ZERO,
+		Quaternion.IDENTITY,
+		Vector3.ZERO,
+		Vector3.ZERO,
+		dampened_control,
+		gravity_probe,
+		true,
+		CHARACTER_FIXED_DELTA
+	)
+	var rolled := _integrate_player_motion(
+		Vector3.ZERO,
+		Quaternion.IDENTITY,
+		Vector3.ZERO,
+		Vector3.ZERO,
+		roll_control,
+		Vector3.ZERO,
+		true,
+		CHARACTER_FIXED_DELTA
+	)
+	var message := _player_control_message("player-control-4-9", 4, 9, roll_control)
+	var forbidden_fields := [
+		"position", "orientation", "linear_velocity", "angular_velocity",
+		"surface_contact", "delta", "delta_seconds",
+	]
+	var contains_forbidden_field := false
+	for field in forbidden_fields:
+		contains_forbidden_field = contains_forbidden_field or message.has(field)
+	var rolled_orientation: Quaternion = rolled.get("orientation", Quaternion.IDENTITY)
+	var equivalent_orientation := Quaternion(
+		-rolled_orientation.x,
+		-rolled_orientation.y,
+		-rolled_orientation.z,
+		-rolled_orientation.w
+	)
+	var shortest_orientation := _shortest_slerp(
+		rolled_orientation, equivalent_orientation, 0.5
+	)
+	var valid: bool = (
+		message.get("type", "") == "set_player_control"
+		and int(message.get("movement_epoch", 0)) == 4
+		and int(message.get("input_sequence", 0)) == 9
+		and not contains_forbidden_field
+		and (drift.get("linear_velocity", Vector3.ZERO) as Vector3).is_equal_approx(
+			gravity_probe * CHARACTER_FIXED_DELTA
+		)
+		and (dampened.get("linear_velocity", Vector3.ZERO) as Vector3).is_zero_approx()
+		and float(rolled_orientation.length_squared()) > 0.999
+		and (rolled.get("angular_velocity", Vector3.ZERO) as Vector3).z < 0.0
+		and _controls_equal(dampened_control, dampened_control.duplicate(true))
+		and not _controls_equal(dampened_control, roll_control)
+		and _control_send_due(dampened_control, thrust_control, 0.0)
+		and not _control_send_due(dampened_control, dampened_control, 0.05)
+		and _control_send_due(dampened_control, dampened_control, CONTROL_SEND_INTERVAL)
+		and absf(shortest_orientation.dot(rolled_orientation)) > 0.999
+	)
+	if not valid:
+		printerr("VERSE_CHARACTER_PREDICTION_FAILED")
+		return false
+	print("VERSE_CHARACTER_PREDICTION_OK input_only=true roll=single_path fixed_step=60hz")
 	return true
 
 
@@ -2288,6 +2716,22 @@ func _run_life_support_smoke_assertions() -> bool:
 		return false
 	print("VERSE_LIFE_SUPPORT_UI_OK critical=visible incapacitated=canonical recovery=enter")
 	return true
+
+
+func _check_smoke_control_ack(player: Dictionary) -> void:
+	if (
+		not smoke_test
+		or not smoke_visual_ready
+		or smoke_operation.is_empty()
+		or not smoke_receipt_received
+		or int(player.get("last_processed_input_sequence", 0)) < smoke_input_sequence
+	):
+		return
+	print(
+		"VERSE_SMOKE_OK event=%d input_sequence=%d"
+		% [last_authoritative_event_sequence, smoke_input_sequence]
+	)
+	get_tree().quit(0)
 
 
 func _raymarch_voxel() -> Variant:
@@ -2405,7 +2849,7 @@ func _update_tool_action(delta: float) -> void:
 
 func _update_viewmodel(delta: float) -> void:
 	tool_kick = move_toward(tool_kick, 0.0, delta * 4.2)
-	var motion := clampf(player_velocity.length() / MOVE_SPEED, 0.0, 1.5)
+	var motion := clampf(predicted_linear_velocity.length() / CHARACTER_MAXIMUM_SPEED, 0.0, 1.5)
 	var bob := Vector3(
 		sin(elapsed_time * 3.7) * 0.008 * motion,
 		cos(elapsed_time * 6.2) * 0.007 * motion,
@@ -2617,6 +3061,7 @@ func _set_inventory_open(open: bool) -> void:
 	inventory_overlay.visible = open
 	build_mode = false if open else build_mode
 	action_charge = 0.0
+	mouse_delta_accumulator = Vector2.ZERO
 	Input.mouse_mode = Input.MOUSE_MODE_VISIBLE if open else Input.MOUSE_MODE_CAPTURED
 	_set_message(
 		"Engineering inventory terminal online" if open else "Engineering terminal closed"
@@ -2624,7 +3069,13 @@ func _set_inventory_open(open: bool) -> void:
 
 
 func _enter_incapacitated_state() -> void:
-	player_velocity = Vector3.ZERO
+	predicted_linear_velocity = Vector3.ZERO
+	predicted_angular_velocity = Vector3.ZERO
+	prediction_history.clear()
+	pending_controls.clear()
+	last_sent_control = {}
+	mouse_delta_accumulator = Vector2.ZERO
+	require_neutral_baseline = false
 	action_charge = 0.0
 	action_target_key = ""
 	action_cooldown = 0.0
@@ -2816,13 +3267,14 @@ func _update_interface() -> void:
 	var experience := int(player.get("experience", 0))
 	var next_level := int(player.get("next_level_experience", 100))
 	level_label.text = "SALVAGER // LEVEL %d     REP %d / %d" % [level, experience, next_level]
-	var suit_power := clampi(100 - roundi(player_velocity.length() * 1.4), 72, 100)
+	var suit_power := clampi(100 - roundi(predicted_linear_velocity.length() * 1.4), 72, 100)
 	var oxygen_percent := int(player.get("suit_oxygen_milli", 1000)) / 10
 	var helmet_state := "SEALED" if player.get("helmet_closed", true) else "OPEN"
-	var jetpack_state := "JET" if player.get("jetpack_enabled", true) else "WALK"
-	var dampener_state := "DAMP" if dampeners_enabled else "DRIFT"
-	telemetry_label.text = "O₂ %03d%%   PWR %03d%%   %s   %s   %s" % [
-		oxygen_percent, suit_power, helmet_state, jetpack_state, dampener_state
+	var jetpack_state := "JET" if player.get("jetpack_enabled", true) else "FALL"
+	var dampener_state := "DAMP" if desired_dampeners else "DRIFT"
+	var contact_state := "CONTACT" if predicted_surface_contact else "FREE"
+	telemetry_label.text = "O₂ %03d%%   PWR %03d%%   %s   %s   %s   %s" % [
+		oxygen_percent, suit_power, helmet_state, jetpack_state, dampener_state, contact_state
 	]
 	var life_support_state := _life_support_display_state(player)
 	telemetry_label.add_theme_color_override(
@@ -3080,8 +3532,7 @@ func _vec3(value: Dictionary) -> Vector3:
 	)
 
 
-func _grid_quaternion(grid: Dictionary) -> Quaternion:
-	var value: Dictionary = grid.get("orientation", {})
+func _quat(value: Dictionary) -> Quaternion:
 	var rotation := Quaternion(
 		float(value.get("x", 0.0)),
 		float(value.get("y", 0.0)),
@@ -3089,6 +3540,10 @@ func _grid_quaternion(grid: Dictionary) -> Quaternion:
 		float(value.get("w", 1.0))
 	)
 	return rotation.normalized() if rotation.length_squared() > 0.000001 else Quaternion.IDENTITY
+
+
+func _grid_quaternion(grid: Dictionary) -> Quaternion:
+	return _quat(grid.get("orientation", {}))
 
 
 func _grid_basis(grid: Dictionary) -> Basis:
