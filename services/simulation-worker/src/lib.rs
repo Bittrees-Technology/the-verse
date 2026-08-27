@@ -650,7 +650,7 @@ mod tests {
 
     #[tokio::test]
     async fn character_control_acknowledges_with_lightweight_atomic_motion_state() {
-        let (mut socket, _state, server) = connect_test_socket().await;
+        let (mut socket, state, server) = connect_test_socket().await;
         assert!(matches!(
             receive_server_message(&mut socket).await,
             ServerMessage::Welcome { .. }
@@ -693,7 +693,7 @@ mod tests {
         assert_eq!(motion.player.last_processed_input_sequence, 1);
         assert_eq!(motion.player.movement_epoch, snapshot.player.movement_epoch);
         assert_eq!(motion.grids.len(), snapshot.grids.len());
-        assert_eq!(motion.world_hash, _state.snapshot().world_hash);
+        assert_eq!(motion.world_hash, state.snapshot().world_hash);
         socket.close(None).await.expect("test socket closes");
         server.abort();
     }
