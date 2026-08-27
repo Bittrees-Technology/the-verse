@@ -4,6 +4,8 @@
 
 # Rust
 target/
+apps/native-client/bin/*.dylib
+apps/native-client/bin/*.so
 
 # JavaScript
 node_modules/

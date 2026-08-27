@@ -13,6 +13,10 @@ const indexSource = await readFile(
   new URL("./index.html", import.meta.url),
   "utf8",
 );
+const verifierWorkerSource = await readFile(
+  new URL("./verifier-worker.js", import.meta.url),
+  "utf8",
+);
 const elements = new Map();
 const context = {
   __VERSE_BROWSER_TEST__: true,
@@ -346,6 +350,27 @@ test("exact address projection crosses a sector boundary without JavaScript prec
   assert.equal(api.exactAddressOffsetMeters(tooFar, origin, manifest), undefined);
 });
 
+test("verified presentation JSON preserves unsafe protocol integers exactly", () => {
+  const raw = "{\"safe\":9007199254740991,\"unsafe\":9007199254740992," +
+    "\"negative\":-9007199254740992,\"fraction\":1.25," +
+    "\"escaped\":\"integer 9007199254740993 and \\\"quote\\\"\"}";
+  const parsed = plain(api.parseLosslessVerifiedJson(raw));
+  assert.equal(parsed.safe, 9_007_199_254_740_991);
+  assert.equal(parsed.unsafe, "9007199254740992");
+  assert.equal(parsed.negative, "-9007199254740992");
+  assert.equal(parsed.fraction, 1.25);
+  assert.equal(parsed.escaped, 'integer 9007199254740993 and "quote"');
+  assert.equal(api.exactIntegerEquals(parsed.unsafe, 9_007_199_254_740_992), false);
+  assert.equal(
+    api.exactIntegerIsSuccessor("9007199254740992", 9_007_199_254_740_991),
+    true,
+  );
+  assert.equal(
+    api.exactIntegerCompare("18446744073709551615", "18446744073709551614"),
+    1,
+  );
+});
+
 test("interest baseline materializes only complete operations and strips actor-private data", () => {
   api.setRegistryForTest(celestialRegistry, manifest);
   const state = plain(api.worldFromInterestBaseline(baselineFixture()));
@@ -460,10 +485,107 @@ test("raw spectator UI marks economics private and ships no inventory reader", (
   assert.equal(source.includes("inventory_id"), false);
   assert.match(source, /const PROTOCOL_VERSION = 16/);
   assert.match(source, /interest_baseline/);
-  assert.match(source, /acknowledge_interest/);
-  assert.match(source, /legacy replication family received/);
+  assert.match(source, /new Worker\("\/verifier-worker\.js", \{ type: "module" \}\)/);
+  assert.match(source, /prepare_verified_frame/);
+  assert.equal(source.includes("new WebSocket"), false);
+  assert.equal(source.includes("sendInterestAcknowledgement"), false);
   assert.match(indexSource, /Interactive public universe map/);
   assert.equal(source.includes("operation_id"), false);
   assert.equal(source.includes("operation_sequence"), false);
   assert.equal(source.includes("function intent"), false);
+});
+
+test("browser verifier is pinned to the proof universe commitments", () => {
+  assert.match(source, /expected_universe_id: EXPECTED_UNIVERSE_ID/);
+  assert.match(source, /expected_celestial_registry_hash: EXPECTED_CELESTIAL_REGISTRY_HASH/);
+  assert.match(source, /expected_universe_manifest_hash: EXPECTED_UNIVERSE_MANIFEST_HASH/);
+  assert.match(source, /expected_content_hash: EXPECTED_CONTENT_HASH/);
+  assert.match(source, /4c367bbfa04218ece14104f0a3a7ec2c7e9fefcc37d4cf78a265df2d711a59da/);
+  assert.match(source, /08f96738abee769d2f9998a9666970ef6cd8474f3270977aec1a50672aad814e/);
+  assert.match(source, /fc61c05b335fb951868010ecf2942a92ec4f03d00d0a75d3acba8c6f5162b6bd/);
+});
+
+test("reconnect scheduling coalesces worker error and close recovery", () => {
+  api.resetReconnectForTest();
+  const scheduled = [];
+  let reconnects = 0;
+  const schedule = (callback, delay) => scheduled.push({ callback, delay });
+  const reconnect = () => { reconnects += 1; };
+
+  assert.equal(api.scheduleReconnectForTest(schedule, reconnect), true);
+  assert.equal(api.scheduleReconnectForTest(schedule, reconnect), false);
+  assert.equal(scheduled.length, 1);
+  assert.equal(scheduled[0].delay, 1200);
+  scheduled[0].callback();
+  assert.equal(reconnects, 1);
+
+  assert.equal(api.scheduleReconnectForTest(schedule, reconnect), true);
+  assert.equal(scheduled.length, 2);
+  assert.equal(scheduled[1].delay, 2400);
+  scheduled[1].callback();
+
+  for (const expectedDelay of [4800, 9600, 19200, 30000]) {
+    assert.equal(api.scheduleReconnectForTest(schedule, reconnect), true);
+    assert.equal(scheduled.at(-1).delay, expectedDelay);
+    scheduled.at(-1).callback();
+  }
+  assert.equal(reconnects, 6);
+  assert.equal(api.scheduleReconnectForTest(schedule, reconnect), false);
+});
+
+test("verified state commits before best-effort rendering and survives render failure", () => {
+  const installedWorld = {
+    marker: "verified-world",
+    interest: {
+      session_epoch: "session-render",
+      interest_epoch: 7,
+      baseline_id: "baseline-render",
+      delta_sequence: 9,
+      view_hash: "verified-hash",
+    },
+  };
+  const candidate = { frameId: "render-1", kind: "delta", world: installedWorld };
+  api.commitVerifiedPresentation(candidate);
+  const beforeRender = plain(api.verifiedPresentationStateForTest());
+  assert.equal(beforeRender.connectionPhase, "live");
+  assert.equal(beforeRender.world.marker, "verified-world");
+  assert.equal(beforeRender.interestFrontier.view_hash, "verified-hash");
+
+  const presented = api.presentCommittedPresentation(candidate, {
+    fitCurrentMap() {},
+    render() { throw new Error("synthetic canvas failure"); },
+    activity() {},
+  });
+  assert.equal(presented, false);
+  assert.deepEqual(plain(api.verifiedPresentationStateForTest()), beforeRender);
+
+  const commitAt = source.indexOf("commitVerifiedPresentation(installed)");
+  const confirmAt = source.indexOf('type: "presentation_installed"', commitAt);
+  const renderAt = source.indexOf("presentCommittedPresentation(installed)", confirmAt);
+  assert.ok(commitAt >= 0 && confirmAt > commitAt && renderAt > confirmAt);
+});
+
+test("verified fatal state is terminal and cannot schedule a normal reconnect", () => {
+  const candidate = {
+    frameId: "fatal-1",
+    kind: "fatal",
+    message: "FATAL halted: authoritative stream stopped",
+    error: true,
+  };
+  api.commitVerifiedPresentation(candidate);
+  assert.equal(api.verifiedPresentationStateForTest().connectionPhase, "fatal");
+  assert.match(source, /installed\.kind === "fatal"\) endVerifiedTransport\(worker, false\)/);
+  assert.match(source, /connectionPhase = reconnect \? "disconnected" : "fatal"/);
+});
+
+test("worker initialization, verification, and presentation have hard deadlines", () => {
+  assert.match(source, /VERIFIER_INITIALIZATION_TIMEOUT_MS = 15_000/);
+  assert.match(source, /VERIFIER_OPERATION_TIMEOUT_MS = 10_000/);
+  assert.match(source, /VERIFIED_PRESENTATION_TIMEOUT_MS = 10_000/);
+  assert.match(source, /verified presentation transition timed out/);
+  assert.match(source, /verifier_operation_started/);
+  assert.match(source, /verifier_operation_completed/);
+  assert.match(verifierWorkerSource, /reportVerifierOperation\("stage"/);
+  assert.match(verifierWorkerSource, /reportVerifierOperation\("commit"/);
+  assert.match(verifierWorkerSource, /reportVerifierOperation\("discard"/);
 });

@@ -20,12 +20,33 @@ const WORLD_SCHEMA_VERSION = 18;
 const EVENT_SCHEMA_VERSION = 14;
 const CONTENT_SCHEMA_VERSION = 11;
 const CONTENT_MANIFEST_VERSION = "p1.5.0";
+const EXPECTED_UNIVERSE_ID = "the-verse-local";
+const EXPECTED_CELESTIAL_REGISTRY_HASH =
+  "4c367bbfa04218ece14104f0a3a7ec2c7e9fefcc37d4cf78a265df2d711a59da";
+const EXPECTED_UNIVERSE_MANIFEST_HASH =
+  "08f96738abee769d2f9998a9666970ef6cd8474f3270977aec1a50672aad814e";
+const EXPECTED_CONTENT_HASH =
+  "fc61c05b335fb951868010ecf2942a92ec4f03d00d0a75d3acba8c6f5162b6bd";
 const CELESTIAL_REGISTRY_SCHEMA_VERSION = 1;
 const UNIVERSE_MANIFEST_SCHEMA_VERSION = 2;
 const INTEREST_SCHEMA_VERSION = 1;
 const MAX_RENDER_OFFSET_UM = BigInt(Number.MAX_SAFE_INTEGER);
+const VERIFIER_INITIALIZATION_TIMEOUT_MS = 15_000;
+const VERIFIER_OPERATION_TIMEOUT_MS = 10_000;
+const VERIFIED_PRESENTATION_TIMEOUT_MS = 10_000;
+const MAX_AUTOMATIC_RECONNECT_ATTEMPTS = 6;
+const RECONNECT_BASE_DELAY_MS = 1_200;
+const RECONNECT_MAX_DELAY_MS = 30_000;
+const MIN_SAFE_INTEGER_BIGINT = BigInt(Number.MIN_SAFE_INTEGER);
+const MAX_SAFE_INTEGER_BIGINT = BigInt(Number.MAX_SAFE_INTEGER);
+const MAX_U64_BIGINT = (1n << 64n) - 1n;
 
 let socket;
+let verifierWorker;
+let pendingPresentation;
+let reconnectScheduled = false;
+let reconnectAttempt = 0;
+const verifiedTransportTimers = new Map();
 let world;
 let registry;
 let universeManifest;
@@ -39,6 +60,106 @@ let mapMarkers = [];
 let mapDrag;
 let mapViewInitialized = false;
 let sessionRole = { kind: "spectator" };
+
+function parseLosslessVerifiedJson(raw) {
+  if (typeof raw !== "string") throw new TypeError("verified JSON must be text");
+  let encoded = "";
+  let inString = false;
+  let escaped = false;
+  for (let index = 0; index < raw.length;) {
+    const character = raw[index];
+    if (inString) {
+      encoded += character;
+      index += 1;
+      if (escaped) {
+        escaped = false;
+      } else if (character === "\\") {
+        escaped = true;
+      } else if (character === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (character === '"') {
+      inString = true;
+      encoded += character;
+      index += 1;
+      continue;
+    }
+    if (character !== "-" && (character < "0" || character > "9")) {
+      encoded += character;
+      index += 1;
+      continue;
+    }
+
+    const start = index;
+    if (raw[index] === "-") index += 1;
+    if (raw[index] === "0") {
+      index += 1;
+    } else {
+      while (raw[index] >= "0" && raw[index] <= "9") index += 1;
+    }
+    let integer = true;
+    if (raw[index] === ".") {
+      integer = false;
+      index += 1;
+      while (raw[index] >= "0" && raw[index] <= "9") index += 1;
+    }
+    if (raw[index] === "e" || raw[index] === "E") {
+      integer = false;
+      index += 1;
+      if (raw[index] === "+" || raw[index] === "-") index += 1;
+      while (raw[index] >= "0" && raw[index] <= "9") index += 1;
+    }
+    const token = raw.slice(start, index);
+    if (integer) {
+      const exact = BigInt(token);
+      if (exact < MIN_SAFE_INTEGER_BIGINT || exact > MAX_SAFE_INTEGER_BIGINT) {
+        encoded += JSON.stringify(token);
+        continue;
+      }
+    }
+    encoded += token;
+  }
+  return JSON.parse(encoded);
+}
+
+function exactInteger(value) {
+  if (Number.isSafeInteger(value)) return BigInt(value);
+  if (typeof value !== "string" || !/^(?:0|-?[1-9][0-9]*)$/.test(value)) {
+    return undefined;
+  }
+  try {
+    return BigInt(value);
+  } catch {
+    return undefined;
+  }
+}
+
+function isExactUnsigned(value, minimum = 0n) {
+  const exact = exactInteger(value);
+  return exact !== undefined && exact >= minimum && exact <= MAX_U64_BIGINT;
+}
+
+function exactIntegerEquals(left, right) {
+  const exactLeft = exactInteger(left);
+  const exactRight = exactInteger(right);
+  return exactLeft !== undefined && exactRight !== undefined && exactLeft === exactRight;
+}
+
+function exactIntegerCompare(left, right) {
+  const exactLeft = exactInteger(left);
+  const exactRight = exactInteger(right);
+  if (exactLeft === undefined || exactRight === undefined) return undefined;
+  return exactLeft < exactRight ? -1 : exactLeft > exactRight ? 1 : 0;
+}
+
+function exactIntegerIsSuccessor(value, previous) {
+  const exactValue = exactInteger(value);
+  const exactPrevious = exactInteger(previous);
+  return exactValue !== undefined && exactPrevious !== undefined &&
+    exactValue === exactPrevious + 1n;
+}
 
 function canonicalPlayers(state) {
   const roster = Array.isArray(state?.players) ? state.players : [];
@@ -82,9 +203,8 @@ function registryBindingIsValid(registryValue, manifestValue) {
     manifestValue.content_manifest_version === CONTENT_MANIFEST_VERSION &&
     manifestValue.world_schema_version === WORLD_SCHEMA_VERSION &&
     manifestValue.event_schema_version === EVENT_SCHEMA_VERSION &&
-    Number.isSafeInteger(manifestValue.cell_edge_um) && manifestValue.cell_edge_um > 0 &&
-    Number.isSafeInteger(manifestValue.cells_per_sector_axis) &&
-    manifestValue.cells_per_sector_axis > 0 &&
+    isExactUnsigned(manifestValue.cell_edge_um, 1n) &&
+    isExactUnsigned(manifestValue.cells_per_sector_axis, 1n) &&
     Array.isArray(registryValue.bodies) && registryValue.bodies.every((body) =>
       body.center?.universe_id === registryValue.universe_id &&
       body.content_manifest_version === manifestValue.content_manifest_version &&
@@ -154,17 +274,6 @@ function interestFrontierFrom(value) {
   };
 }
 
-function sendInterestAcknowledgement(value) {
-  socket?.send(JSON.stringify({ type: "acknowledge_interest", ...interestFrontierFrom(value) }));
-}
-
-function requestFreshBaseline(reason) {
-  connectionPhase = "stale";
-  activity(`STATE STALE // ${reason} // requesting a fresh view`, true);
-  if (world) drawMap();
-  socket?.send(JSON.stringify({ type: "request_snapshot" }));
-}
-
 function mergeMotionState(state, motion) {
   const motionRoster = Array.isArray(motion.players) && motion.players.length > 0
     ? motion.players
@@ -202,17 +311,16 @@ function validInterestBinding(frame, expectedKind) {
     frame?.cell_address?.universe_id === universeManifest?.universe_id &&
     frame?.local_origin_address?.universe_id === universeManifest?.universe_id &&
     typeof frame?.session_epoch === "string" && frame.session_epoch.length > 0 &&
-    Number.isSafeInteger(frame?.interest_epoch) && frame.interest_epoch > 0 &&
+    isExactUnsigned(frame?.interest_epoch, 1n) &&
     typeof frame?.baseline_id === "string" && frame.baseline_id.length > 0 &&
-    Number.isSafeInteger(frame?.delta_sequence) && frame.delta_sequence >= 0 &&
+    isExactUnsigned(frame?.delta_sequence) &&
     typeof frame?.view_hash === "string" && frame.view_hash.length > 0;
 }
 
 function addProjectedEntity(entities, projection, origin, requireAbsent) {
   const identity = entityIdentity(projection);
   if (!identity || projection.component_schema_version !== PROJECTION_SCHEMA_VERSION ||
-      !Number.isSafeInteger(projection.projected_revision) ||
-      projection.projected_revision <= 0 ||
+      !isExactUnsigned(projection.projected_revision, 1n) ||
       (requireAbsent && entities.has(identity.key))) return false;
   let value = identity.value;
   if (["player", "grid", "death_drop"].includes(identity.kind)) {
@@ -274,7 +382,7 @@ function entitiesFromWorld(state) {
       if (typeof id !== "string" || id.length === 0) return undefined;
       const key = entityKey(kind, id);
       const projectedRevision = state._entity_revisions?.[key];
-      if (!Number.isSafeInteger(projectedRevision) || projectedRevision <= 0) {
+      if (!isExactUnsigned(projectedRevision, 1n)) {
         return undefined;
       }
       entities.set(key, { kind, id, value, projected_revision: projectedRevision });
@@ -293,7 +401,8 @@ function worldFromInterestBaseline(projected) {
       projected?.universe_id !== universeManifest.universe_id ||
       projected?.universe_manifest_hash !== universeManifest.manifest_hash ||
       projected?.celestial_registry_hash !== registry.registry_hash ||
-      !validInterestBinding(frame, "baseline") || frame.delta_sequence !== 0 ||
+      !validInterestBinding(frame, "baseline") ||
+      !exactIntegerEquals(frame.delta_sequence, 0) ||
       frame.previous_view_hash != null) return undefined;
   const entities = entitiesFromBaseline(frame);
   if (!entities) return undefined;
@@ -320,9 +429,9 @@ function applyInterestDelta(state, delta) {
       delta?.celestial_registry_hash !== registry?.registry_hash ||
       !validInterestBinding(frame, "delta") ||
       frame.session_epoch !== interestFrontier.session_epoch ||
-      frame.interest_epoch !== interestFrontier.interest_epoch ||
+      !exactIntegerEquals(frame.interest_epoch, interestFrontier.interest_epoch) ||
       frame.baseline_id !== interestFrontier.baseline_id ||
-      frame.delta_sequence !== interestFrontier.delta_sequence + 1 ||
+      !exactIntegerIsSuccessor(frame.delta_sequence, interestFrontier.delta_sequence) ||
       frame.previous_view_hash !== interestFrontier.view_hash) return undefined;
   const entities = entitiesFromWorld(state);
   if (!entities) return undefined;
@@ -334,7 +443,10 @@ function applyInterestDelta(state, delta) {
   for (const projection of frame.replaced ?? []) {
     const identity = entityIdentity(projection);
     const prior = identity ? entities.get(identity.key) : undefined;
-    if (!prior || projection.projected_revision <= prior.projected_revision ||
+    if (!prior || exactIntegerCompare(
+      projection.projected_revision,
+      prior.projected_revision,
+    ) !== 1 ||
         !addProjectedEntity(entities, projection, frame.local_origin_address, false)) {
       return undefined;
     }
@@ -403,108 +515,297 @@ function sessionDescription() {
     : "PUBLIC SPECTATOR // READ-ONLY";
 }
 
-function connect() {
-  const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-  socket = new WebSocket(protocol + "//" + location.host + "/ws");
-  socket.addEventListener("open", () => {
-    connectionPhase = "hello";
-    elements.connection.textContent = "● CONNECTED";
-    elements.connection.className = "connection online";
-    socket.send(JSON.stringify({
-      type: "hello",
-      protocol_version: PROTOCOL_VERSION,
-      client_name: "browser-command-center-p1.5",
-      authentication: { kind: "spectator" },
-    }));
-  });
-  socket.addEventListener("close", () => {
-    interestFrontier = undefined;
-    connectionPhase = "disconnected";
-    sessionRole = { kind: "spectator" };
-    elements.connection.textContent = "○ RECONNECTING";
+function scheduleReconnect(schedule, reconnect) {
+  if (reconnectScheduled || reconnectAttempt >= MAX_AUTOMATIC_RECONNECT_ATTEMPTS) {
+    return false;
+  }
+  const delay = Math.min(
+    RECONNECT_MAX_DELAY_MS,
+    RECONNECT_BASE_DELAY_MS * (2 ** reconnectAttempt),
+  );
+  reconnectAttempt += 1;
+  reconnectScheduled = true;
+  schedule(() => {
+    reconnectScheduled = false;
+    reconnect();
+  }, delay);
+  return true;
+}
+
+function endVerifiedTransport(worker, reconnect = true) {
+  if (worker !== verifierWorker) return false;
+  const timers = verifiedTransportTimers.get(worker);
+  if (timers) {
+    clearTimeout(timers.initialization);
+    clearTimeout(timers.presentation);
+    for (const timer of timers.operations.values()) clearTimeout(timer);
+    verifiedTransportTimers.delete(worker);
+  }
+  verifierWorker = undefined;
+  socket = undefined;
+  pendingPresentation = undefined;
+  interestFrontier = undefined;
+  connectionPhase = reconnect ? "disconnected" : "fatal";
+  sessionRole = { kind: "spectator" };
+  worker.terminate();
+  const reconnectQueued = reconnect && scheduleReconnect(
+    (callback, delay) => setTimeout(callback, delay),
+    connect,
+  );
+  try {
+    elements.connection.textContent = reconnectQueued
+      ? `○ RECONNECTING ${reconnectAttempt}/${MAX_AUTOMATIC_RECONNECT_ATTEMPTS}`
+      : "× STREAM HALTED // RELOAD TO RETRY";
     elements.connection.className = "connection offline";
     if (world) drawMap();
-    setTimeout(connect, 1200);
-  });
-  socket.addEventListener("message", ({ data }) => {
-    let message;
+  } catch {
+    // Transport recovery cannot depend on presentation health.
+  }
+  return true;
+}
+
+function connect() {
+  const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+  const worker = new Worker("/verifier-worker.js", { type: "module" });
+  const timers = {
+    initialization: undefined,
+    presentation: undefined,
+    operations: new Map(),
+  };
+  timers.initialization = setTimeout(() => {
     try {
-      message = JSON.parse(data);
+      activity("FATAL browser verifier initialization timed out", true);
     } catch {
-      requestFreshBaseline("malformed server message");
-      return;
+      // Recovery below is independent of presentation health.
     }
-    if (message.type === "welcome") {
-      if (connectionPhase !== "hello" || !protocolTupleMatches(message)) {
-        activity("FATAL incompatible server schema tuple", true);
-        socket.close(1002, "incompatible schema tuple");
+    endVerifiedTransport(worker);
+  }, VERIFIER_INITIALIZATION_TIMEOUT_MS);
+  verifiedTransportTimers.set(worker, timers);
+  verifierWorker = worker;
+  socket = {
+    send(messageJson) {
+      worker.postMessage({ type: "send", messageJson });
+    },
+    close(code, reason) {
+      worker.postMessage({ type: "close", code, reason });
+    },
+  };
+  worker.addEventListener("message", ({ data }) => {
+    if (worker !== verifierWorker) return;
+    if (data?.type === "transport_open") {
+      clearTimeout(timers.initialization);
+      timers.initialization = undefined;
+      connectionPhase = "hello";
+      elements.connection.textContent = "● CONNECTED";
+      elements.connection.className = "connection online";
+    } else if (data?.type === "verifier_operation_started") {
+      if (timers.operations.has(data.operationId)) {
+        endVerifiedTransport(worker);
         return;
       }
-      sessionRole = message.session_role ?? { kind: "spectator" };
-      if (sessionRole.kind !== "spectator") {
-        activity("FATAL browser command center requires a spectator session", true);
-        socket.close(1008, "unexpected session role");
+      const timer = setTimeout(() => {
+        try {
+          activity(`FATAL browser verifier ${data.operation} timed out`, true);
+        } catch {
+          // Recovery below is independent of presentation health.
+        }
+        endVerifiedTransport(worker);
+      }, VERIFIER_OPERATION_TIMEOUT_MS);
+      timers.operations.set(data.operationId, timer);
+    } else if (data?.type === "verifier_operation_completed") {
+      const timer = timers.operations.get(data.operationId);
+      if (timer !== undefined) clearTimeout(timer);
+      timers.operations.delete(data.operationId);
+    } else if (data?.type === "prepare_verified_frame") {
+      if (pendingPresentation || timers.presentation !== undefined) {
+        endVerifiedTransport(worker);
         return;
       }
-      connectionPhase = "welcome";
+      let message;
+      try {
+        message = parseLosslessVerifiedJson(data.messageJson);
+        pendingPresentation = prepareVerifiedPresentation(message, data.frameId);
+      } catch {
+        pendingPresentation = undefined;
+      }
+      if (!pendingPresentation) {
+        worker.postMessage({
+          type: "presentation_rejected",
+          frameId: data.frameId,
+          reason: "verified frame could not be presented safely",
+        });
+        endVerifiedTransport(worker);
+      } else {
+        timers.presentation = setTimeout(() => {
+          try {
+            activity("FATAL verified presentation transition timed out", true);
+          } catch {
+            // Recovery below is independent of presentation health.
+          }
+          endVerifiedTransport(worker);
+        }, VERIFIED_PRESENTATION_TIMEOUT_MS);
+        worker.postMessage({
+          type: "presentation_prepared",
+          frameId: data.frameId,
+        });
+      }
+    } else if (data?.type === "install_verified_frame") {
+      clearTimeout(timers.presentation);
+      timers.presentation = undefined;
+      if (!pendingPresentation || pendingPresentation.frameId !== data.frameId) {
+        worker.postMessage({
+          type: "presentation_rejected",
+          frameId: data.frameId,
+          reason: "presentation candidate was not staged",
+        });
+        endVerifiedTransport(worker);
+        return;
+      }
+      const installed = pendingPresentation;
+      commitVerifiedPresentation(installed);
+      pendingPresentation = undefined;
+      worker.postMessage({
+        type: "presentation_installed",
+        frameId: data.frameId,
+      });
+      presentCommittedPresentation(installed);
+      if (installed.kind === "fatal") endVerifiedTransport(worker, false);
+    } else if (data?.type === "verification_failed") {
+      try {
+        activity(`FATAL verified transport ${data.code}: ${data.detail}`, true);
+      } finally {
+        endVerifiedTransport(worker);
+      }
+    } else if (data?.type === "transport_error") {
+      activity(data.detail, true);
+    } else if (data?.type === "transport_closed") {
+      endVerifiedTransport(worker);
+    }
+  });
+  worker.addEventListener("error", (event) => {
+    event.preventDefault();
+    try {
+      activity("FATAL browser verifier worker runtime failed", true);
+    } catch {
+      // Recovery below is independent of presentation health.
+    }
+    endVerifiedTransport(worker);
+  });
+  worker.postMessage({
+    type: "start",
+    websocketUrl: protocol + "//" + location.host + "/ws",
+    helloJson: JSON.stringify({
+      type: "hello",
+      protocol_version: PROTOCOL_VERSION,
+      client_name: "browser-command-center-p1.5-verified",
+      authentication: { kind: "spectator" },
+    }),
+    verifierConfigJson: JSON.stringify({
+      expected_role: "spectator",
+      expected_universe_id: EXPECTED_UNIVERSE_ID,
+      expected_celestial_registry_hash: EXPECTED_CELESTIAL_REGISTRY_HASH,
+      expected_universe_manifest_hash: EXPECTED_UNIVERSE_MANIFEST_HASH,
+      expected_content_hash: EXPECTED_CONTENT_HASH,
+      world_schema_version: String(WORLD_SCHEMA_VERSION),
+      event_schema_version: String(EVENT_SCHEMA_VERSION),
+      content_schema_version: String(CONTENT_SCHEMA_VERSION),
+      content_manifest_version: CONTENT_MANIFEST_VERSION,
+    }),
+  });
+}
+
+function prepareVerifiedPresentation(message, frameId) {
+  if (message.type === "welcome") {
+    if (connectionPhase !== "hello" || !protocolTupleMatches(message)) {
+      return undefined;
+    }
+    const nextRole = message.session_role ?? { kind: "spectator" };
+    if (nextRole.kind !== "spectator") return undefined;
+    return { frameId, kind: "welcome", sessionRole: nextRole };
+  } else if (message.type === "registry") {
+    if (connectionPhase !== "welcome" ||
+        !registryBindingIsValid(message.registry, message.universe_manifest)) {
+      return undefined;
+    }
+    return {
+      frameId,
+      kind: "registry",
+      registry: JSON.parse(JSON.stringify(message.registry)),
+      universeManifest: JSON.parse(JSON.stringify(message.universe_manifest)),
+    };
+  } else if (message.type === "interest_baseline") {
+    const baseline = worldFromInterestBaseline(message.baseline);
+    return baseline ? { frameId, kind: "baseline", world: baseline } : undefined;
+  } else if (message.type === "interest_delta") {
+    if (connectionPhase !== "live") return undefined;
+    const next = applyInterestDelta(world, message.delta);
+    return next ? { frameId, kind: "delta", world: next } : undefined;
+  } else if (message.type === "intent_accepted") {
+    return { frameId, kind: "activity", message: message.receipt.message, error: false };
+  } else if (message.type === "intent_rejected") {
+    return {
+      frameId,
+      kind: "activity",
+      message: message.code + ": " + message.message,
+      error: true,
+    };
+  } else if (message.type === "fatal") {
+    return {
+      frameId,
+      kind: "fatal",
+      message: "FATAL " + message.code + ": " + message.message,
+      error: true,
+    };
+  }
+  return undefined;
+}
+
+function commitVerifiedPresentation(candidate) {
+  if (candidate.kind === "welcome") {
+    sessionRole = candidate.sessionRole;
+    connectionPhase = "welcome";
+  } else if (candidate.kind === "registry") {
+    registry = candidate.registry;
+    universeManifest = candidate.universeManifest;
+    connectionPhase = "registry";
+  } else if (candidate.kind === "baseline" || candidate.kind === "delta") {
+    world = candidate.world;
+    interestFrontier = interestFrontierFrom(world.interest);
+    connectionPhase = "live";
+    reconnectAttempt = 0;
+  } else if (candidate.kind === "fatal") {
+    connectionPhase = "fatal";
+  }
+}
+
+function presentCommittedPresentation(candidate, effects = {}) {
+  const showActivity = effects.activity ?? activity;
+  const fitMap = effects.fitCurrentMap ?? fitCurrentMap;
+  const showWorld = effects.render ?? render;
+  try {
+    if (candidate.kind === "welcome") {
       elements["session-status"].textContent = sessionDescription();
       elements.connection.textContent = sessionRole.kind === "player"
         ? "● PILOT LINK"
         : "● SPECTATING";
-      activity(
+      showActivity(
         sessionRole.kind === "spectator"
           ? "Public spectator session — gameplay controls are read-only"
           : "Gameplay session bound to " + sessionRole.player_id,
         false,
       );
-    } else if (message.type === "registry") {
-      if (connectionPhase !== "welcome" ||
-          !registryBindingIsValid(message.registry, message.universe_manifest)) {
-        activity("FATAL invalid celestial registry binding", true);
-        socket.close(1002, "invalid registry binding");
-        return;
-      }
-      registry = JSON.parse(JSON.stringify(message.registry));
-      universeManifest = JSON.parse(JSON.stringify(message.universe_manifest));
-      connectionPhase = "registry";
-      activity(`Registry verified // ${registry.bodies.length} fixed bodies`, false);
-    } else if (message.type === "interest_baseline") {
-      const baseline = worldFromInterestBaseline(message.baseline);
-      if (!baseline) {
-        requestFreshBaseline("invalid interest baseline");
-        return;
-      }
-      world = baseline;
-      interestFrontier = interestFrontierFrom(baseline.interest);
-      connectionPhase = "live";
-      if (!mapViewInitialized) fitCurrentMap();
-      sendInterestAcknowledgement(baseline.interest);
-      render();
-    } else if (message.type === "interest_delta") {
-      if (connectionPhase !== "live") {
-        requestFreshBaseline("delta arrived before a baseline");
-        return;
-      }
-      const next = applyInterestDelta(world, message.delta);
-      if (!next) {
-        requestFreshBaseline("interest frontier mismatch");
-        return;
-      }
-      world = next;
-      interestFrontier = interestFrontierFrom(next.interest);
-      sendInterestAcknowledgement(next.interest);
-      render();
-    } else if (message.type === "snapshot" || message.type === "motion_state") {
-      activity("FATAL legacy replication family received on protocol 16", true);
-      socket.close(1002, "mixed replication families");
-    } else if (message.type === "intent_accepted") {
-      activity(message.receipt.message, false);
-    } else if (message.type === "intent_rejected") {
-      activity(message.code + ": " + message.message, true);
-    } else if (message.type === "fatal") {
-      activity("FATAL " + message.code + ": " + message.message, true);
+    } else if (candidate.kind === "registry") {
+      showActivity(`Registry verified // ${registry.bodies.length} fixed bodies`, false);
+    } else if (candidate.kind === "baseline" || candidate.kind === "delta") {
+      if (!mapViewInitialized) fitMap();
+      showWorld();
+    } else if (candidate.kind === "activity" || candidate.kind === "fatal") {
+      showActivity(candidate.message, candidate.error);
     }
-  });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function publicProjection(projected) {
@@ -1017,12 +1318,26 @@ if (globalThis.__VERSE_BROWSER_TEST__) {
     protocolTupleMatches,
     registryBindingIsValid,
     exactAddressOffsetMeters,
+    parseLosslessVerifiedJson,
+    exactIntegerEquals,
+    exactIntegerCompare,
+    exactIntegerIsSuccessor,
     worldFromInterestBaseline,
     applyInterestDelta,
     mapObjectsForState,
     fitMapView,
     projectMapPoint,
     nearestMapMarker,
+    commitVerifiedPresentation,
+    presentCommittedPresentation,
+    scheduleReconnectForTest: scheduleReconnect,
+    resetReconnectForTest() {
+      reconnectScheduled = false;
+      reconnectAttempt = 0;
+    },
+    verifiedPresentationStateForTest() {
+      return { connectionPhase, world, interestFrontier };
+    },
     setRegistryForTest(registryValue, manifestValue, phase = "registry") {
       registry = JSON.parse(JSON.stringify(registryValue));
       universeManifest = JSON.parse(JSON.stringify(manifestValue));

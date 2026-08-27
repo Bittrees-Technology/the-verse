@@ -90,7 +90,7 @@ func _test_registry_and_contiguous_interest_stream() -> void:
 	_check(bool(client.get("registry_received")), "manifest-bound registry is accepted before state")
 
 	var baseline := _baseline()
-	client.call("_handle_server_message", _wire({"type": "interest_baseline", "baseline": baseline}))
+	_check(_install_presentation_frame(client, baseline, true), "valid baseline presentation stages")
 	_check(client.get("replication_state") == "ready", "valid baseline becomes ready")
 	_check(int(client.get("interest_delta_sequence")) == 0, "baseline installs delta frontier zero")
 	var grids: Dictionary = client.get("interest_entities")["grid"]
@@ -132,7 +132,7 @@ func _test_registry_and_contiguous_interest_stream() -> void:
 			"drop_id": "drop-a", "address": _address("0", 500, 4_000_000),
 		}, 1),
 	]
-	client.call("_handle_server_message", _wire({"type": "interest_delta", "delta": delta_one}))
+	_check(_install_presentation_frame(client, delta_one, false), "first delta presentation stages")
 	_check(int(client.get("interest_delta_sequence")) == 1, "first contiguous delta advances frontier")
 	_check(
 		(client.get("grid_node_lookup")["grid-a"] as Node3D).position.is_equal_approx(Vector3(3.0, 0.0, 0.0)),
@@ -176,7 +176,7 @@ func _test_registry_and_contiguous_interest_stream() -> void:
 			"reason": "out_of_interest",
 		},
 	]
-	client.call("_handle_server_message", _wire({"type": "interest_delta", "delta": delta_two}))
+	_check(_install_presentation_frame(client, delta_two, false), "removal delta presentation stages")
 	_check(int(client.get("interest_delta_sequence")) == 2, "second contiguous delta advances frontier")
 	_check(client.get("interest_entities")["grid"].is_empty(), "explicit removal leaves no grid ghost")
 	_check(client.get("grid_node_lookup").is_empty(), "removed grid has no renderer node")
@@ -188,7 +188,7 @@ func _test_registry_and_contiguous_interest_stream() -> void:
 
 	var delta_three := _delta(3, HASH_E, HASH_A)
 	delta_three["interest"]["entered"] = [_projection("grid", "grid-a", _grid(5_000_000), 3)]
-	client.call("_handle_server_message", _wire({"type": "interest_delta", "delta": delta_three}))
+	_check(_install_presentation_frame(client, delta_three, false), "re-entry delta presentation stages")
 	_check(int(client.get("interest_delta_sequence")) == 3, "removed identity may enter again freshly")
 	_check(
 		(client.get("grid_node_lookup")["grid-a"] as Node3D).position.is_equal_approx(Vector3(5.0, 0.0, 0.0)),
@@ -208,7 +208,7 @@ func _test_registry_and_contiguous_interest_stream() -> void:
 	delta_four["interest"]["replaced"] = [
 		_projection("grid", "grid-a", topology_replacement, 4),
 	]
-	client.call("_handle_server_message", _wire({"type": "interest_delta", "delta": delta_four}))
+	_check(_install_presentation_frame(client, delta_four, false), "topology delta presentation stages")
 	_check(int(client.get("interest_delta_sequence")) == 4, "topology delta advances frontier")
 	var rebuilt_grid: Node3D = client.get("grid_node_lookup")["grid-a"]
 	_check(
@@ -232,12 +232,28 @@ func _test_registry_and_contiguous_interest_stream() -> void:
 	var committed_entities: Dictionary = client.get("interest_entities").duplicate(true)
 	var gap := _delta(6, HASH_B, HASH_C)
 	gap["interest"]["entered"] = [_projection("grid", "grid-gap", _grid(9_000_000), 1)]
-	client.call("_handle_server_message", _wire({"type": "interest_delta", "delta": gap}))
+	if not _install_presentation_frame(client, gap, false):
+		client.call("_request_fresh_interest_baseline", "INTEREST FRONTIER MISMATCH")
 	_check(client.get("replication_state") == "stale", "delta gap marks the client stale")
 	_check(bool(client.get("baseline_request_pending")), "delta gap requests a replacement baseline")
 	_check(client.get("interest_entities") == committed_entities, "invalid staged delta is discarded")
 	_check(not bool(client.get("authoritative_player_ready")), "stale frontier freezes authored controls")
 	client.free()
+
+
+func _install_presentation_frame(client: Node3D, authoritative: Dictionary, baseline: bool) -> bool:
+	var candidate: Variant = client.call(
+		"_prepare_interest_baseline" if baseline else "_prepare_interest_delta",
+		_wire(authoritative),
+	)
+	if not candidate is Dictionary or candidate.is_empty():
+		return false
+	client.set("test_capture_transport", true)
+	return bool(client.call(
+		"_finalize_committed_interest",
+		candidate,
+		"{\"type\":\"acknowledge_interest\"}".to_utf8_buffer(),
+	))
 
 
 func _test_legacy_family_fails_closed() -> void:
