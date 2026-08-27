@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 
 /// The only protocol version accepted by this P0 build.
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// A stable integer voxel or block coordinate.
 #[derive(
@@ -267,9 +267,21 @@ pub struct DeathDropSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct PlayerSnapshot {
     pub player_id: String,
     pub position: Vec3,
+    pub orientation: Quat,
+    pub linear_velocity: Vec3,
+    pub angular_velocity: Vec3,
+    pub surface_contact: bool,
+    pub movement_epoch: u64,
+    pub last_processed_input_sequence: u64,
+    pub control_linear_input: Vec3,
+    pub control_angular_input: Vec3,
+    pub boost: bool,
+    pub dampeners: bool,
+    pub control_expires_at_simulation_tick: u64,
     pub inventory_id: String,
     pub experience: u64,
     pub level: u32,
@@ -338,6 +350,44 @@ pub struct GridSnapshot {
     pub blocks: Vec<BlockSnapshot>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct PlayerMotionSnapshot {
+    pub player_id: String,
+    pub position: Vec3,
+    pub orientation: Quat,
+    pub linear_velocity: Vec3,
+    pub angular_velocity: Vec3,
+    pub surface_contact: bool,
+    pub movement_epoch: u64,
+    pub last_processed_input_sequence: u64,
+    pub control_linear_input: Vec3,
+    pub control_angular_input: Vec3,
+    pub boost: bool,
+    pub dampeners: bool,
+    pub control_expires_at_simulation_tick: u64,
+    pub jetpack_enabled: bool,
+    pub life_state: PlayerLifeState,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GridMotionSnapshot {
+    pub grid_id: String,
+    pub position: Vec3,
+    pub orientation: Quat,
+    pub linear_velocity: Vec3,
+    pub angular_velocity: Vec3,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MotionSnapshot {
+    pub event_sequence: u64,
+    pub simulation_tick: u64,
+    pub world_hash: String,
+    pub player: PlayerMotionSnapshot,
+    pub grids: Vec<GridMotionSnapshot>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConservationSnapshot {
     pub ore_sources: u64,
@@ -381,9 +431,14 @@ pub enum ClientMessage {
         client_name: String,
     },
     RequestSnapshot,
-    MovePlayer {
+    SetPlayerControl {
         operation_id: String,
-        position: Vec3,
+        movement_epoch: u64,
+        input_sequence: u64,
+        linear_input: Vec3,
+        angular_input: Vec3,
+        boost: bool,
+        dampeners: bool,
     },
     SetSuitMode {
         operation_id: String,
@@ -448,7 +503,7 @@ impl ClientMessage {
     pub fn operation_id(&self) -> Option<&str> {
         match self {
             Self::Hello { .. } | Self::RequestSnapshot => None,
-            Self::MovePlayer { operation_id, .. }
+            Self::SetPlayerControl { operation_id, .. }
             | Self::SetSuitMode { operation_id, .. }
             | Self::RespawnPlayer { operation_id }
             | Self::MineVoxel { operation_id, .. }
@@ -481,6 +536,9 @@ pub enum ServerMessage {
     },
     Snapshot {
         snapshot: Box<WorldSnapshot>,
+    },
+    MotionState {
+        motion: Box<MotionSnapshot>,
     },
     IntentAccepted {
         receipt: IntentReceipt,
@@ -576,8 +634,45 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v7_exposes_tagged_life_state_and_death_cause() {
-        assert_eq!(PROTOCOL_VERSION, 7);
+    fn protocol_v8_character_control_contains_inputs_but_no_transform_or_time() {
+        let message = ClientMessage::SetPlayerControl {
+            operation_id: "player-control-3-41".into(),
+            movement_epoch: 3,
+            input_sequence: 41,
+            linear_input: Vec3::new(0.0, 0.0, -1.0),
+            angular_input: Vec3::new(0.0, 0.0, 0.5),
+            boost: true,
+            dampeners: false,
+        };
+        let value = serde_json::to_value(&message).expect("control serializes");
+        assert_eq!(value["type"], "set_player_control");
+        assert_eq!(value["movement_epoch"], 3);
+        assert_eq!(value["input_sequence"], 41);
+        assert_eq!(value["linear_input"]["z"], -1.0);
+        assert_eq!(value["angular_input"]["z"], 0.5);
+        for forbidden in [
+            "position",
+            "orientation",
+            "linear_velocity",
+            "angular_velocity",
+            "surface_contact",
+            "delta",
+            "delta_time",
+        ] {
+            assert!(
+                value.get(forbidden).is_none(),
+                "forbidden field {forbidden}"
+            );
+        }
+        assert_eq!(
+            serde_json::from_value::<ClientMessage>(value).expect("control deserializes"),
+            message
+        );
+    }
+
+    #[test]
+    fn protocol_v8_exposes_tagged_life_state_and_death_cause() {
+        assert_eq!(PROTOCOL_VERSION, 8);
         let life_state = PlayerLifeState::Incapacitated {
             death_id: "death-player-local-42".into(),
             cause: PlayerDeathCause::OxygenDepleted,
@@ -596,7 +691,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v7_snapshot_exposes_critical_oxygen_and_death_drops() {
+    fn protocol_v8_snapshot_exposes_motion_oxygen_and_death_drops() {
         let death_drop = DeathDropSnapshot {
             drop_id: "drop-player-local-42".into(),
             death_id: "death-player-local-42".into(),
@@ -609,6 +704,17 @@ mod tests {
         let player = PlayerSnapshot {
             player_id: "player-local".into(),
             position: death_drop.position,
+            orientation: Quat::IDENTITY,
+            linear_velocity: Vec3::ZERO,
+            angular_velocity: Vec3::ZERO,
+            surface_contact: false,
+            movement_epoch: 1,
+            last_processed_input_sequence: 0,
+            control_linear_input: Vec3::ZERO,
+            control_angular_input: Vec3::ZERO,
+            boost: false,
+            dampeners: true,
+            control_expires_at_simulation_tick: 0,
             inventory_id: "inventory-player-local".into(),
             experience: 0,
             level: 1,
@@ -624,8 +730,8 @@ mod tests {
             jetpack_enabled: false,
         };
         let world = WorldSnapshot {
-            schema_version: 10,
-            content_manifest_version: "p0.8.0".into(),
+            schema_version: 11,
+            content_manifest_version: "p0.9.0".into(),
             universe_id: "the-verse-local".into(),
             cell_id: "cell-origin".into(),
             event_sequence: 42,

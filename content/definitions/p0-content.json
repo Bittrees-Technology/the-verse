@@ -1,6 +1,6 @@
 {
-  "schema_version": 6,
-  "manifest_version": "p0.8.0",
+  "schema_version": 7,
+  "manifest_version": "p0.9.0",
   "license": "AGPL-3.0-or-later",
   "physics": {
     "fixed_step_hz": 60,
@@ -13,6 +13,19 @@
     "angular_dampener_newton_meters_per_radian": 3200.0,
     "friction": 0.62,
     "restitution": 0.05
+  },
+  "character": {
+    "mass_kg": 90.0,
+    "collision_radius_m": 0.34,
+    "control_lease_ticks": 18,
+    "thrust_acceleration_m_s2": 10.0,
+    "boost_acceleration_m_s2": 20.0,
+    "linear_dampener_acceleration_m_s2": 14.0,
+    "angular_acceleration_radians_per_second_squared": 5.0,
+    "angular_dampener_acceleration_radians_per_second_squared": 7.0,
+    "maximum_speed_m_s": 12.0,
+    "boost_maximum_speed_m_s": 24.0,
+    "maximum_angular_speed_radians_per_second": 2.5
   },
   "survival": {
     "suit_oxygen_capacity_milli": 1000,

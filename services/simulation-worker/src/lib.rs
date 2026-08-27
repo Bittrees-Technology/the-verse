@@ -21,7 +21,9 @@ use tower_http::{
     trace::{DefaultMakeSpan, TraceLayer},
 };
 use tracing::{error, info, warn};
-use verse_protocol::{ClientMessage, PROTOCOL_VERSION, ServerMessage, WorldSnapshot};
+use verse_protocol::{
+    ClientMessage, MotionSnapshot, PROTOCOL_VERSION, ServerMessage, WorldSnapshot,
+};
 use verse_simulation::{IntentError, Runtime, RuntimeError};
 
 const COMMAND_CENTER_HTML: &str = include_str!("../../../apps/web-command-center/index.html");
@@ -47,6 +49,10 @@ impl AppState {
         self.runtime.lock().snapshot()
     }
 
+    pub fn motion_snapshot(&self) -> MotionSnapshot {
+        self.runtime.lock().motion_snapshot()
+    }
+
     pub fn persist_snapshot(&self) -> Result<(), RuntimeError> {
         self.runtime.lock().persist_snapshot()
     }
@@ -57,11 +63,22 @@ impl AppState {
 
     pub fn advance(&self, delta_millis: u16) -> Result<bool, RuntimeError> {
         let mut runtime = self.runtime.lock();
+        let before_life_state = runtime.state().player.life_state.clone();
+        let before_oxygen = runtime.state().player.suit_oxygen_milli;
         let changed = runtime.advance(delta_millis)?;
         if changed {
-            let _ = self.updates.send(ServerMessage::Snapshot {
-                snapshot: Box::new(runtime.snapshot()),
-            });
+            let lifecycle_changed = runtime.state().player.life_state != before_life_state
+                || runtime.state().player.suit_oxygen_milli != before_oxygen;
+            let update = if lifecycle_changed {
+                ServerMessage::Snapshot {
+                    snapshot: Box::new(runtime.snapshot()),
+                }
+            } else {
+                ServerMessage::MotionState {
+                    motion: Box::new(runtime.motion_snapshot()),
+                }
+            };
+            let _ = self.updates.send(update);
         }
         Ok(changed)
     }
@@ -217,11 +234,16 @@ async fn websocket_session(socket: WebSocket, state: Arc<AppState>) {
             update = updates.recv() => {
                 match update {
                     Ok(message) => {
-                        if let ServerMessage::Snapshot { snapshot } = &message {
-                            if snapshot.event_sequence <= last_sent_event_sequence {
+                        let event_sequence = match &message {
+                            ServerMessage::Snapshot { snapshot } => Some(snapshot.event_sequence),
+                            ServerMessage::MotionState { motion } => Some(motion.event_sequence),
+                            _ => None,
+                        };
+                        if let Some(event_sequence) = event_sequence {
+                            if event_sequence <= last_sent_event_sequence {
                                 continue;
                             }
-                            last_sent_event_sequence = snapshot.event_sequence;
+                            last_sent_event_sequence = event_sequence;
                         }
                         if send_server_message(&mut sender, &message).await.is_err() {
                             break;
@@ -361,6 +383,7 @@ async fn handle_client_message(
             .is_ok()
         }
         intent => {
+            let player_control = matches!(&intent, ClientMessage::SetPlayerControl { .. });
             let result = state.runtime.lock().execute(&intent);
             match result {
                 Ok(receipt) => {
@@ -370,9 +393,16 @@ async fn handle_client_message(
                     {
                         return false;
                     }
-                    let _ = state.updates.send(ServerMessage::Snapshot {
-                        snapshot: Box::new(state.snapshot()),
-                    });
+                    let update = if player_control {
+                        ServerMessage::MotionState {
+                            motion: Box::new(state.motion_snapshot()),
+                        }
+                    } else {
+                        ServerMessage::Snapshot {
+                            snapshot: Box::new(state.snapshot()),
+                        }
+                    };
+                    let _ = state.updates.send(update);
                     true
                 }
                 Err(RuntimeError::Intent(source)) => {
@@ -548,9 +578,14 @@ mod tests {
         ));
         send_client_message(
             &mut socket,
-            &ClientMessage::MovePlayer {
+            &ClientMessage::SetPlayerControl {
                 operation_id: "pre-handshake-mutation".into(),
-                position: verse_protocol::Vec3::new(12.1, 4.5, 10.0),
+                movement_epoch: 1,
+                input_sequence: 1,
+                linear_input: verse_protocol::Vec3::ZERO,
+                angular_input: verse_protocol::Vec3::ZERO,
+                boost: false,
+                dampeners: true,
             },
         )
         .await;
