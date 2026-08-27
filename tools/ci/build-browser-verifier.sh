@@ -18,8 +18,12 @@ if [[ "$(wasm-bindgen --version)" != "wasm-bindgen 0.2.127" ]]; then
   echo "wasm-bindgen CLI must be exactly 0.2.127" >&2
   exit 1
 fi
+if [[ -n "${RUSTFLAGS:-}" || -n "${CARGO_ENCODED_RUSTFLAGS:-}" ]]; then
+  echo "browser verifier generation requires unset RUSTFLAGS and CARGO_ENCODED_RUSTFLAGS" >&2
+  exit 1
+fi
 
-cargo build \
+CARGO_ENCODED_RUSTFLAGS="--remap-path-prefix=${repository_root}=/the-verse" cargo build \
   --locked \
   --release \
   --target wasm32-unknown-unknown \
