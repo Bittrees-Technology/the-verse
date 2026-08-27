@@ -6,7 +6,7 @@ use std::ops::{Deref, DerefMut};
 use serde::{Deserialize, Serialize};
 use verse_protocol::{
     BlockKind, BlockSnapshot, CareerSnapshot, ConservationSnapshot, DeathDropSnapshot,
-    EnvironmentSnapshot, GridMotionSnapshot, GridSnapshot, IVec3, InventoryContents,
+    EnvironmentSnapshot, GridMotionSnapshot, GridSnapshot, IVec3, IntentReceipt, InventoryContents,
     InventoryDomain, InventorySnapshot, LocomotionKind, MotionSnapshot, PlayerDeathCause,
     PlayerLifeState, PlayerLocomotionSnapshot, PlayerMotionSnapshot, PlayerSnapshot, PowerSnapshot,
     Quat, ResourceKind, Vec3, VoxelMaterial, VoxelSnapshot, WorldSnapshot,
@@ -14,7 +14,10 @@ use verse_protocol::{
 
 use crate::content;
 
-pub const WORLD_SCHEMA_VERSION: u32 = 15;
+pub const WORLD_SCHEMA_VERSION: u32 = 16;
+pub const PROCESSED_OPERATION_RETENTION_LIMIT: usize = 128;
+pub const PROCESSED_OPERATION_RETAINED_BYTES_LIMIT: usize = 131_072;
+pub const PROCESSED_OPERATION_RECORD_BYTES_LIMIT: usize = 4_096;
 pub const PLAYER_INVENTORY_ID: &str = "inventory-player-local";
 pub const STARTER_GRID_ID: &str = "grid-starter";
 pub const PLANET_CENTER: Vec3 = Vec3::new(900.0, -2_200.0, -3_800.0);
@@ -30,6 +33,13 @@ pub fn valid_player_id(player_id: &str) -> bool {
         && player_id
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+pub fn valid_blake3_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 pub fn radial_up(position: Vec3) -> Vec3 {
@@ -589,6 +599,36 @@ pub struct ContactPairKey {
     pub collider_b: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessedOperationRecord {
+    pub operation_id: String,
+    pub intent_fingerprint: String,
+    pub receipt: IntentReceipt,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActorOperationHistory {
+    pub committed_through: u64,
+    pub compacted_through: u64,
+    pub compacted_history_hash: String,
+    pub retained: BTreeMap<u64, ProcessedOperationRecord>,
+}
+
+impl ActorOperationHistory {
+    pub const fn last_sequence(&self) -> u64 {
+        self.committed_through
+    }
+}
+
+#[derive(Serialize)]
+struct OperationCompactionMaterial<'a> {
+    domain: &'static str,
+    prior_hash: &'a str,
+    operation_sequence: u64,
+    intent_fingerprint: &'a str,
+    receipt: &'a IntentReceipt,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorldState {
     pub schema_version: u32,
@@ -609,18 +649,89 @@ pub struct WorldState {
     pub inventories: BTreeMap<String, InventoryRecord>,
     pub death_drops: BTreeMap<String, DeathDrop>,
     pub ledger: Ledger,
-    pub processed_operations: BTreeMap<String, BTreeMap<String, verse_protocol::IntentReceipt>>,
+    pub processed_operations: BTreeMap<String, ActorOperationHistory>,
 }
 
 impl WorldState {
+    pub fn processed_operation_record(
+        &self,
+        actor_player_id: &str,
+        operation_sequence: u64,
+    ) -> Option<&ProcessedOperationRecord> {
+        self.processed_operations
+            .get(actor_player_id)
+            .and_then(|history| history.retained.get(&operation_sequence))
+    }
+
+    /// Diagnostic compatibility lookup over the bounded retained suffix.
+    /// Ordering and idempotency authority always use operation sequence.
     pub fn processed_operation(
         &self,
         actor_player_id: &str,
         operation_id: &str,
-    ) -> Option<&verse_protocol::IntentReceipt> {
+    ) -> Option<&IntentReceipt> {
+        self.processed_operations
+            .get(actor_player_id)?
+            .retained
+            .values()
+            .find(|record| record.operation_id == operation_id)
+            .map(|record| &record.receipt)
+    }
+
+    pub fn last_operation_sequence(&self, actor_player_id: &str) -> u64 {
         self.processed_operations
             .get(actor_player_id)
-            .and_then(|operations| operations.get(operation_id))
+            .map_or(0, ActorOperationHistory::last_sequence)
+    }
+
+    pub fn record_processed_operation(
+        &mut self,
+        actor_player_id: &str,
+        record: ProcessedOperationRecord,
+    ) -> Result<(), String> {
+        if record.operation_id.trim().is_empty()
+            || record.operation_id.len() > 128
+            || !valid_blake3_hex(&record.intent_fingerprint)
+            || record.receipt.operation_id != record.operation_id
+            || record.receipt.code.trim().is_empty()
+        {
+            return Err("processed operation record identity is invalid".into());
+        }
+        let history = self
+            .processed_operations
+            .entry(actor_player_id.to_owned())
+            .or_default();
+        let expected = history
+            .committed_through
+            .checked_add(1)
+            .ok_or_else(|| "operation sequence space is exhausted".to_owned())?;
+        if record.receipt.operation_sequence != expected {
+            return Err(format!(
+                "operation sequence {} does not match expected {expected}",
+                record.receipt.operation_sequence
+            ));
+        }
+        history.committed_through = expected;
+        history.retained.insert(expected, record);
+        while operation_history_crosses_retention_bound(history) {
+            let (&sequence, compacted) = history
+                .retained
+                .first_key_value()
+                .expect("an over-limit operation history is nonempty");
+            let material = OperationCompactionMaterial {
+                domain: "the-verse-operation-compaction-v1",
+                prior_hash: &history.compacted_history_hash,
+                operation_sequence: sequence,
+                intent_fingerprint: &compacted.intent_fingerprint,
+                receipt: &compacted.receipt,
+            };
+            let bytes = serde_json::to_vec(&material)
+                .expect("canonical operation compaction material serializes");
+            history.compacted_history_hash = blake3::hash(&bytes).to_hex().to_string();
+            history.retained.remove(&sequence);
+            history.compacted_through = sequence;
+        }
+        Ok(())
     }
 
     pub fn validate_player_roster(&self) -> Result<(), String> {
@@ -866,22 +977,50 @@ impl WorldState {
             }
         }
 
-        for (actor_player_id, operations) in &self.processed_operations {
-            if !valid_player_id(actor_player_id) {
-                return Err(
-                    "operation namespaces require syntactically valid player actors".into(),
-                );
+        for (actor_player_id, history) in &self.processed_operations {
+            if !valid_player_id(actor_player_id) || self.player.get(actor_player_id).is_none() {
+                return Err("operation namespaces require present canonical player actors".into());
             }
-            for (operation_id, receipt) in operations {
-                if operation_id.trim().is_empty()
-                    || operation_id.len() > 128
-                    || receipt.operation_id != *operation_id
-                    || receipt.event_sequence > self.event_sequence
+            let retained_bytes = history
+                .retained
+                .values()
+                .map(processed_operation_record_bytes)
+                .fold(0_usize, usize::saturating_add);
+            if history.committed_through == 0
+                || history.compacted_through > history.committed_through
+                || history.retained.len() > PROCESSED_OPERATION_RETENTION_LIMIT
+                || retained_bytes > PROCESSED_OPERATION_RETAINED_BYTES_LIMIT
+                || (history.compacted_through == 0 && !history.compacted_history_hash.is_empty())
+                || (history.compacted_through > 0
+                    && !valid_blake3_hex(&history.compacted_history_hash))
+            {
+                return Err("operation history bounds and commitment must remain canonical".into());
+            }
+            let mut last_seen = history.compacted_through;
+            for (operation_sequence, record) in &history.retained {
+                let expected_sequence = last_seen
+                    .checked_add(1)
+                    .ok_or_else(|| "operation history cannot advance beyond u64::MAX".to_owned())?;
+                if *operation_sequence != expected_sequence
+                    || record.operation_id.trim().is_empty()
+                    || record.operation_id.len() > 128
+                    || !valid_blake3_hex(&record.intent_fingerprint)
+                    || processed_operation_record_bytes(record)
+                        > PROCESSED_OPERATION_RECORD_BYTES_LIMIT
+                    || record.receipt.operation_sequence != *operation_sequence
+                    || record.receipt.operation_id != record.operation_id
+                    || record.receipt.event_sequence > self.event_sequence
+                    || record.receipt.code.trim().is_empty()
                 {
-                    return Err(
-                        "processed operation receipts must retain canonical identity".into(),
-                    );
+                    return Err("processed operations must form one bounded contiguous suffix with canonical receipts and fingerprints".into());
                 }
+                last_seen = *operation_sequence;
+            }
+            if last_seen != history.committed_through {
+                return Err(
+                    "retained operation history must cover the contiguous uncompacted suffix"
+                        .into(),
+                );
             }
         }
         Ok(())
@@ -1295,9 +1434,130 @@ impl WorldState {
     }
 }
 
+fn processed_operation_record_bytes(record: &ProcessedOperationRecord) -> usize {
+    serde_json::to_vec(record)
+        .expect("canonical processed operation record serializes")
+        .len()
+}
+
+fn operation_history_crosses_retention_bound(history: &ActorOperationHistory) -> bool {
+    history.retained.len() > PROCESSED_OPERATION_RETENTION_LIMIT
+        || history
+            .retained
+            .values()
+            .map(processed_operation_record_bytes)
+            .fold(0_usize, usize::saturating_add)
+            > PROCESSED_OPERATION_RETAINED_BYTES_LIMIT
+        || history.retained.values().any(|record| {
+            processed_operation_record_bytes(record) > PROCESSED_OPERATION_RECORD_BYTES_LIMIT
+        })
+}
+
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
+
+    fn synthetic_operation_record(operation_sequence: u64) -> ProcessedOperationRecord {
+        let operation_id = format!("synthetic-{operation_sequence}");
+        ProcessedOperationRecord {
+            operation_id: operation_id.clone(),
+            intent_fingerprint: blake3::hash(operation_id.as_bytes()).to_hex().to_string(),
+            receipt: IntentReceipt {
+                operation_sequence,
+                operation_id,
+                event_sequence: operation_sequence,
+                code: "synthetic_committed".into(),
+                message: "synthetic bounded-history receipt".into(),
+            },
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(16))]
+
+        #[test]
+        fn operation_compaction_preserves_a_deterministic_bounded_suffix(
+            operation_count in 129_u16..400,
+        ) {
+            let operation_count = u64::from(operation_count);
+            let mut first = WorldState::genesis(97);
+            let mut second = first.clone();
+            first.event_sequence = operation_count;
+            second.event_sequence = operation_count;
+
+            for operation_sequence in 1..=operation_count {
+                first
+                    .record_processed_operation(
+                        "player-local",
+                        synthetic_operation_record(operation_sequence),
+                    )
+                    .expect("synthetic operation records contiguously");
+                second
+                    .record_processed_operation(
+                        "player-local",
+                        synthetic_operation_record(operation_sequence),
+                    )
+                    .expect("the duplicate campaign records contiguously");
+            }
+
+            let first_history = &first.processed_operations["player-local"];
+            let second_history = &second.processed_operations["player-local"];
+            prop_assert_eq!(first_history, second_history);
+            prop_assert_eq!(first_history.committed_through, operation_count);
+            prop_assert!(first_history.retained.len() <= PROCESSED_OPERATION_RETENTION_LIMIT);
+            prop_assert!(
+                first_history
+                    .retained
+                    .values()
+                    .map(processed_operation_record_bytes)
+                    .fold(0_usize, usize::saturating_add)
+                    <= PROCESSED_OPERATION_RETAINED_BYTES_LIMIT
+            );
+            let all_records_bounded = first_history.retained.values().all(|record| {
+                processed_operation_record_bytes(record)
+                    <= PROCESSED_OPERATION_RECORD_BYTES_LIMIT
+            });
+            prop_assert!(all_records_bounded);
+            prop_assert_eq!(
+                first_history.compacted_through
+                    + u64::try_from(first_history.retained.len()).expect("retained bound fits u64"),
+                operation_count
+            );
+            prop_assert!(first.validate_player_roster().is_ok());
+        }
+    }
+
+    #[test]
+    fn oversized_operation_record_is_committed_only_into_the_rolling_hash() {
+        let mut world = WorldState::genesis(101);
+        world.event_sequence = 1;
+        let operation_id = "oversized-record".to_owned();
+        world
+            .record_processed_operation(
+                "player-local",
+                ProcessedOperationRecord {
+                    operation_id: operation_id.clone(),
+                    intent_fingerprint: blake3::hash(b"oversized").to_hex().to_string(),
+                    receipt: IntentReceipt {
+                        operation_sequence: 1,
+                        operation_id,
+                        event_sequence: 1,
+                        code: "oversized_committed".into(),
+                        message: "x".repeat(PROCESSED_OPERATION_RECORD_BYTES_LIMIT + 1),
+                    },
+                },
+            )
+            .expect("a large durable receipt is immediately compacted");
+
+        let history = &world.processed_operations["player-local"];
+        assert_eq!(history.committed_through, 1);
+        assert_eq!(history.compacted_through, 1);
+        assert!(history.retained.is_empty());
+        assert!(valid_blake3_hex(&history.compacted_history_hash));
+        assert!(world.validate_player_roster().is_ok());
+    }
 
     #[test]
     fn procedural_asteroid_is_deterministic() {

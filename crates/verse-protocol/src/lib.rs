@@ -9,10 +9,11 @@
 use serde::{Deserialize, Serialize};
 
 /// The only protocol version accepted by this build.
-pub const PROTOCOL_VERSION: u32 = 13;
+pub const PROTOCOL_VERSION: u32 = 14;
 
 /// The actor-aware public/private projection contract carried by protocol 13.
 pub const PROJECTION_SCHEMA_VERSION: u32 = 1;
+pub const INTENT_FINGERPRINT_SCHEMA_VERSION: u32 = 1;
 
 /// A stable integer voxel or block coordinate.
 #[derive(
@@ -546,6 +547,7 @@ pub struct OwnedGridMassSnapshot {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ActorPrivateSnapshot {
     pub player: PlayerSnapshot,
+    pub committed_operation_sequence: u64,
     pub inventories: Vec<InventorySnapshot>,
     pub death_drops: Vec<DeathDropSnapshot>,
     pub owned_grid_masses: Vec<OwnedGridMassSnapshot>,
@@ -634,8 +636,8 @@ pub enum SessionRole {
     Player { player_id: String },
 }
 
-/// Commands sent by all P0 clients. Every mutating command carries an operation
-/// ID so retrying a packet returns the original result.
+/// Commands sent by all P0 clients. Every mutating command carries a contiguous
+/// actor-local operation sequence for durable idempotency plus a diagnostic ID.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
@@ -646,6 +648,7 @@ pub enum ClientMessage {
     },
     RequestSnapshot,
     SetPlayerControl {
+        operation_sequence: u64,
         operation_id: String,
         movement_epoch: u64,
         input_sequence: u64,
@@ -656,29 +659,35 @@ pub enum ClientMessage {
         jump: bool,
     },
     SetSuitMode {
+        operation_sequence: u64,
         operation_id: String,
         helmet_closed: bool,
         jetpack_enabled: bool,
         magnetic_boots_enabled: bool,
     },
     RespawnPlayer {
+        operation_sequence: u64,
         operation_id: String,
     },
     MineVoxel {
+        operation_sequence: u64,
         operation_id: String,
         coordinate: IVec3,
     },
     RefineOre {
+        operation_sequence: u64,
         operation_id: String,
         inventory_id: String,
         batches: u64,
     },
     CraftComponent {
+        operation_sequence: u64,
         operation_id: String,
         inventory_id: String,
         quantity: u64,
     },
     TransferInventory {
+        operation_sequence: u64,
         operation_id: String,
         source_inventory_id: String,
         destination_inventory_id: String,
@@ -686,6 +695,7 @@ pub enum ClientMessage {
         quantity: u64,
     },
     BuildBlock {
+        operation_sequence: u64,
         operation_id: String,
         grid_id: String,
         coordinate: IVec3,
@@ -693,11 +703,13 @@ pub enum ClientMessage {
         orientation: u8,
     },
     WeldBlock {
+        operation_sequence: u64,
         operation_id: String,
         grid_id: String,
         block_id: String,
     },
     SetGridControl {
+        operation_sequence: u64,
         operation_id: String,
         grid_id: String,
         linear_input: Vec3,
@@ -705,10 +717,12 @@ pub enum ClientMessage {
         dampeners: bool,
     },
     ToggleGridAnchor {
+        operation_sequence: u64,
         operation_id: String,
         grid_id: String,
     },
     DamageBlock {
+        operation_sequence: u64,
         operation_id: String,
         grid_id: String,
         block_id: String,
@@ -716,12 +730,99 @@ pub enum ClientMessage {
 }
 
 impl ClientMessage {
+    pub fn set_operation_sequence(&mut self, sequence: u64) -> bool {
+        match self {
+            Self::Hello { .. } | Self::RequestSnapshot => false,
+            Self::SetPlayerControl {
+                operation_sequence, ..
+            }
+            | Self::SetSuitMode {
+                operation_sequence, ..
+            }
+            | Self::RespawnPlayer {
+                operation_sequence, ..
+            }
+            | Self::MineVoxel {
+                operation_sequence, ..
+            }
+            | Self::RefineOre {
+                operation_sequence, ..
+            }
+            | Self::CraftComponent {
+                operation_sequence, ..
+            }
+            | Self::TransferInventory {
+                operation_sequence, ..
+            }
+            | Self::BuildBlock {
+                operation_sequence, ..
+            }
+            | Self::WeldBlock {
+                operation_sequence, ..
+            }
+            | Self::SetGridControl {
+                operation_sequence, ..
+            }
+            | Self::ToggleGridAnchor {
+                operation_sequence, ..
+            }
+            | Self::DamageBlock {
+                operation_sequence, ..
+            } => {
+                *operation_sequence = sequence;
+                true
+            }
+        }
+    }
+
+    pub fn operation_sequence(&self) -> Option<u64> {
+        match self {
+            Self::Hello { .. } | Self::RequestSnapshot => None,
+            Self::SetPlayerControl {
+                operation_sequence, ..
+            }
+            | Self::SetSuitMode {
+                operation_sequence, ..
+            }
+            | Self::RespawnPlayer {
+                operation_sequence, ..
+            }
+            | Self::MineVoxel {
+                operation_sequence, ..
+            }
+            | Self::RefineOre {
+                operation_sequence, ..
+            }
+            | Self::CraftComponent {
+                operation_sequence, ..
+            }
+            | Self::TransferInventory {
+                operation_sequence, ..
+            }
+            | Self::BuildBlock {
+                operation_sequence, ..
+            }
+            | Self::WeldBlock {
+                operation_sequence, ..
+            }
+            | Self::SetGridControl {
+                operation_sequence, ..
+            }
+            | Self::ToggleGridAnchor {
+                operation_sequence, ..
+            }
+            | Self::DamageBlock {
+                operation_sequence, ..
+            } => Some(*operation_sequence),
+        }
+    }
+
     pub fn operation_id(&self) -> Option<&str> {
         match self {
             Self::Hello { .. } | Self::RequestSnapshot => None,
             Self::SetPlayerControl { operation_id, .. }
             | Self::SetSuitMode { operation_id, .. }
-            | Self::RespawnPlayer { operation_id }
+            | Self::RespawnPlayer { operation_id, .. }
             | Self::MineVoxel { operation_id, .. }
             | Self::RefineOre { operation_id, .. }
             | Self::CraftComponent { operation_id, .. }
@@ -737,6 +838,7 @@ impl ClientMessage {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IntentReceipt {
+    pub operation_sequence: u64,
     pub operation_id: String,
     pub event_sequence: u64,
     pub code: String,
@@ -761,6 +863,7 @@ pub enum ServerMessage {
         receipt: IntentReceipt,
     },
     IntentRejected {
+        operation_sequence: Option<u64>,
         operation_id: Option<String>,
         code: String,
         message: String,
@@ -778,6 +881,7 @@ mod tests {
     #[test]
     fn client_messages_use_stable_tagged_json() {
         let message = ClientMessage::MineVoxel {
+            operation_sequence: 1,
             operation_id: "op-1".into(),
             coordinate: IVec3::new(1, 2, 3),
         };
@@ -796,6 +900,7 @@ mod tests {
     #[test]
     fn construction_messages_preserve_orientation_and_weld_identity() {
         let frame = serde_json::to_value(ClientMessage::BuildBlock {
+            operation_sequence: 2,
             operation_id: "frame-1".into(),
             grid_id: "grid".into(),
             coordinate: IVec3::new(4, 5, 6),
@@ -807,6 +912,7 @@ mod tests {
         assert_eq!(frame["orientation"], 3);
 
         let weld = serde_json::to_value(ClientMessage::WeldBlock {
+            operation_sequence: 3,
             operation_id: "weld-1".into(),
             grid_id: "grid".into(),
             block_id: "block-9".into(),
@@ -840,6 +946,7 @@ mod tests {
     #[test]
     fn suit_mode_message_is_explicit_and_idempotent() {
         let value = serde_json::to_value(ClientMessage::SetSuitMode {
+            operation_sequence: 4,
             operation_id: "suit-1".into(),
             helmet_closed: false,
             jetpack_enabled: true,
@@ -855,6 +962,7 @@ mod tests {
     #[test]
     fn protocol_v12_character_control_contains_jump_but_no_transform_or_time() {
         let message = ClientMessage::SetPlayerControl {
+            operation_sequence: 5,
             operation_id: "player-control-3-41".into(),
             movement_epoch: 3,
             input_sequence: 41,
@@ -892,8 +1000,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v13_preserves_tagged_life_state_and_death_cause() {
-        assert_eq!(PROTOCOL_VERSION, 13);
+    fn protocol_v14_preserves_tagged_life_state_and_death_cause() {
+        assert_eq!(PROTOCOL_VERSION, 14);
         assert_eq!(PROJECTION_SCHEMA_VERSION, 1);
         let life_state = PlayerLifeState::Incapacitated {
             death_id: "death-player-local-42".into(),
@@ -1150,8 +1258,9 @@ mod tests {
     }
 
     #[test]
-    fn respawn_message_carries_only_an_operation_id() {
+    fn respawn_message_carries_sequence_and_diagnostic_id() {
         let message = ClientMessage::RespawnPlayer {
+            operation_sequence: 6,
             operation_id: "respawn-1".into(),
         };
         let value = serde_json::to_value(&message).expect("respawn intent serializes");
@@ -1159,9 +1268,11 @@ mod tests {
             value,
             serde_json::json!({
                 "type": "respawn_player",
+                "operation_sequence": 6,
                 "operation_id": "respawn-1"
             })
         );
+        assert_eq!(message.operation_sequence(), Some(6));
         assert_eq!(message.operation_id(), Some("respawn-1"));
         assert_eq!(
             serde_json::from_value::<ClientMessage>(value).expect("respawn intent deserializes"),
@@ -1172,6 +1283,7 @@ mod tests {
     #[test]
     fn grid_control_carries_inputs_instead_of_client_owned_velocity() {
         let value = serde_json::to_value(ClientMessage::SetGridControl {
+            operation_sequence: 7,
             operation_id: "control-1".into(),
             grid_id: "grid-starter".into(),
             linear_input: Vec3::new(0.0, 0.0, 0.75),
@@ -1183,5 +1295,125 @@ mod tests {
         assert!(value.get("linear_velocity").is_none());
         assert!(value.get("position").is_none());
         assert_eq!(value["dampeners"], true);
+    }
+
+    #[test]
+    fn protocol_v14_sequences_every_mutating_variant_and_echoes_results() {
+        let messages = vec![
+            ClientMessage::SetPlayerControl {
+                operation_sequence: 1,
+                operation_id: "control".into(),
+                movement_epoch: 1,
+                input_sequence: 1,
+                linear_input: Vec3::ZERO,
+                angular_input: Vec3::ZERO,
+                boost: false,
+                dampeners: true,
+                jump: false,
+            },
+            ClientMessage::SetSuitMode {
+                operation_sequence: 2,
+                operation_id: "suit".into(),
+                helmet_closed: true,
+                jetpack_enabled: true,
+                magnetic_boots_enabled: false,
+            },
+            ClientMessage::RespawnPlayer {
+                operation_sequence: 3,
+                operation_id: "respawn".into(),
+            },
+            ClientMessage::MineVoxel {
+                operation_sequence: 4,
+                operation_id: "mine".into(),
+                coordinate: IVec3::ZERO,
+            },
+            ClientMessage::RefineOre {
+                operation_sequence: 5,
+                operation_id: "refine".into(),
+                inventory_id: "inventory".into(),
+                batches: 1,
+            },
+            ClientMessage::CraftComponent {
+                operation_sequence: 6,
+                operation_id: "craft".into(),
+                inventory_id: "inventory".into(),
+                quantity: 1,
+            },
+            ClientMessage::TransferInventory {
+                operation_sequence: 7,
+                operation_id: "transfer".into(),
+                source_inventory_id: "source".into(),
+                destination_inventory_id: "destination".into(),
+                resource: ResourceKind::Ore,
+                quantity: 1,
+            },
+            ClientMessage::BuildBlock {
+                operation_sequence: 8,
+                operation_id: "build".into(),
+                grid_id: "grid".into(),
+                coordinate: IVec3::ZERO,
+                kind: BlockKind::Structural,
+                orientation: 0,
+            },
+            ClientMessage::WeldBlock {
+                operation_sequence: 9,
+                operation_id: "weld".into(),
+                grid_id: "grid".into(),
+                block_id: "block".into(),
+            },
+            ClientMessage::SetGridControl {
+                operation_sequence: 10,
+                operation_id: "grid-control".into(),
+                grid_id: "grid".into(),
+                linear_input: Vec3::ZERO,
+                angular_input: Vec3::ZERO,
+                dampeners: true,
+            },
+            ClientMessage::ToggleGridAnchor {
+                operation_sequence: 11,
+                operation_id: "anchor".into(),
+                grid_id: "grid".into(),
+            },
+            ClientMessage::DamageBlock {
+                operation_sequence: 12,
+                operation_id: "damage".into(),
+                grid_id: "grid".into(),
+                block_id: "block".into(),
+            },
+        ];
+        for (index, message) in messages.iter().enumerate() {
+            let expected = u64::try_from(index + 1).expect("fixture sequence fits");
+            assert_eq!(message.operation_sequence(), Some(expected));
+            assert_eq!(
+                serde_json::to_value(message).expect("mutation serializes")["operation_sequence"],
+                expected
+            );
+            let mut renumbered = message.clone();
+            assert!(renumbered.set_operation_sequence(expected + 100));
+            assert_eq!(renumbered.operation_sequence(), Some(expected + 100));
+        }
+
+        let receipt = IntentReceipt {
+            operation_sequence: 12,
+            operation_id: "damage".into(),
+            event_sequence: 44,
+            code: "block_damaged".into(),
+            message: "Damage applied".into(),
+        };
+        let value = serde_json::to_value(ServerMessage::IntentAccepted { receipt })
+            .expect("accepted result serializes");
+        assert_eq!(value["receipt"]["operation_sequence"], 12);
+        let value = serde_json::to_value(ServerMessage::IntentRejected {
+            operation_sequence: Some(13),
+            operation_id: Some("rejected".into()),
+            code: "operation_sequence_gap".into(),
+            message: "resynchronize".into(),
+        })
+        .expect("rejected result serializes");
+        assert_eq!(value["operation_sequence"], 13);
+
+        let mut request = ClientMessage::RequestSnapshot;
+        assert!(!request.set_operation_sequence(1));
+        assert_eq!(request.operation_sequence(), None);
     }
 }
