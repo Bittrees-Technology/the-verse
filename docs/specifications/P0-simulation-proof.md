@@ -1,6 +1,6 @@
 # P0 specification: simulation proof
 
-**Status:** In implementation; P0.6 Orbital Operations available and P0.7 contact physics in progress
+**Status:** In implementation; P0.7 contact physics and P0.8 survival-death foundations available locally
 
 ## Purpose
 
@@ -232,6 +232,28 @@ Still required for checkpoint acceptance:
 - Subprocess crash-boundary, edit-remesh, Ubuntu, Linux-artifact, network, and scaling evidence.
 
 The complete contract is [P0.7 server-authoritative contact physics](../gameplay/contact-physics.md), with recovery rationale in [ADR-0010](../decisions/ADR-0010-committed-physics-outcomes.md) and dirty-collision rules in [ADR-0011](../decisions/ADR-0011-dirty-voxel-collision-chunks.md).
+
+## P0.8 survival-death foundation
+
+Implemented foundation:
+
+- Server-owned, content-versioned oxygen capacity, critical threshold, atmosphere/helmet rates, and proof recovery defaults.
+- One canonical oxygen-depletion transition with no playable `alive + zero oxygen` intermediate state.
+- Atomic carried-inventory movement into a stable death drop, an empty retained suit inventory, unchanged career/ledger values, and conservation after death.
+- Canonical incapacitation that disables the jetpack, clears latched grid controls, rejects every player mutation except respawn, and survives restart.
+- Location-free, server-selected, free, idempotent proof respawn with unchanged drop and progression state.
+- Generic crafting, refining, and transfer rejection for dropped inventories until explicit recovery and salvage authority exists.
+- Before-write and after-sync death/respawn failpoints proving exact complete-state recovery, plus replay tamper rejection and protocol/content/schema version fencing.
+- Native critical oxygen feedback, canonical incapacitation overlay, local control gating, death-drop confirmation, and a recovery action that submits no position.
+
+Still required for complete death-drop lifecycle:
+
+- Powered personal, company, or allied spawn selection and a real capital fallback.
+- Owner/team recovery permissions, 15-minute grace, public salvage, six-hour expiry, outage pausing, cleanup tombstones, and settlement evidence.
+- Combat/impact health, physical loot containers, corpse presentation, multiplayer ownership, and team state.
+- Input-only server-authoritative character motion; the current alive player still proposes bounded positions which the server collision-sweeps.
+
+The complete implemented boundary is [P0.8 survival death foundation](../gameplay/survival-death.md), with transaction and deferral rationale in [ADR-0012](../decisions/ADR-0012-oxygen-incapacitation-and-proof-respawn.md).
 
 ## Exit decision
 

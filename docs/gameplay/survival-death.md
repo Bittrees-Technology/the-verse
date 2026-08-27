@@ -1,6 +1,6 @@
 # P0.8 survival death foundation
 
-**Status:** Accepted implementation target
+**Status:** Implemented local proof
 
 ## Player promise
 
@@ -9,6 +9,7 @@ Suit oxygen must be a survival system rather than decorative telemetry. If life 
 ## Acceptance behavior
 
 1. Suit oxygen, helmet state, breathability, and all oxygen rates remain server-owned.
+   The P0 worker advances life support continuously; connecting, disconnecting, or changing a client name cannot reset it.
 2. Below the content-defined critical threshold, the native client shows a persistent critical warning and the action needed to preserve oxygen.
 3. Reaching zero oxygen atomically changes the canonical player state from alive to incapacitated. There is no playable zero-oxygen state.
 4. Movement, suit toggles, mining, refining, fabrication, inventory transfer, construction, welding, grid control, anchoring, and damage intents are rejected while incapacitated.
@@ -16,7 +17,7 @@ Suit oxygen must be a survival system rather than decorative telemetry. If life 
 6. An empty suit creates no empty drop. Death does not change experience, career progress, or the material ledger.
 7. The incapacitated state and drop survive disconnect, process restart, snapshot, and journal replay.
 8. The client presents a centered life-support failure state, disables local movement and tools, and sends a location-free respawn request.
-9. Respawn is free and server-selected. P0.8 uses a named proof recovery point, restores configured suit oxygen and modes, preserves progression and the existing drop, and remains idempotent on retry.
+9. Respawn is free and server-selected. P0.8 uses a named proof recovery origin plus a deterministic clear-point fallback corridor, restores configured suit oxygen and modes, preserves progression and the existing drop, and remains idempotent on retry.
 10. Dropped inventory is visible in authoritative snapshots but cannot be refined, crafted, or remotely transferred through generic inventory actions.
 
 ## Authority and failure boundary

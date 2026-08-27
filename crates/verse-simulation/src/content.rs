@@ -3,7 +3,7 @@
 use std::sync::OnceLock;
 
 use serde::Deserialize;
-use verse_protocol::{BlockKind, VoxelMaterial};
+use verse_protocol::{BlockKind, Vec3, VoxelMaterial};
 
 const P0_CONTENT: &str = include_str!("../../../content/definitions/p0-content.json");
 
@@ -16,6 +16,7 @@ pub struct ContentManifest {
     pub blocks: Vec<BlockDefinition>,
     pub recipes: Recipes,
     pub physics: PhysicsDefinition,
+    pub survival: SurvivalDefinition,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -50,6 +51,20 @@ pub struct PhysicsDefinition {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct SurvivalDefinition {
+    pub suit_oxygen_capacity_milli: u16,
+    pub critical_oxygen_milli: u16,
+    pub open_breathable_delta_milli_per_second: i16,
+    pub open_vacuum_delta_milli_per_second: i16,
+    pub sealed_breathable_delta_milli_per_second: i16,
+    pub sealed_vacuum_delta_milli_per_second: i16,
+    pub respawn_oxygen_milli: u16,
+    pub respawn_helmet_closed: bool,
+    pub respawn_jetpack_enabled: bool,
+    pub proof_recovery_position: Vec3,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct Recipes {
     pub refining: RefiningRecipe,
     pub component_crafting: ComponentRecipe,
@@ -76,12 +91,55 @@ fn validate_voxel_collision_chunk_edge_cells(edge_cells: u16) -> Result<(), &'st
     }
 }
 
+fn validate_survival(definition: &SurvivalDefinition) -> Result<(), &'static str> {
+    let capacity = definition.suit_oxygen_capacity_milli;
+    if capacity == 0 {
+        return Err("suit oxygen capacity must be positive");
+    }
+    if definition.critical_oxygen_milli == 0 || definition.critical_oxygen_milli >= capacity {
+        return Err("critical oxygen must be positive and below suit capacity");
+    }
+    if definition.respawn_oxygen_milli <= definition.critical_oxygen_milli
+        || definition.respawn_oxygen_milli > capacity
+    {
+        return Err("respawn oxygen must be above critical and at most suit capacity");
+    }
+    if !definition.proof_recovery_position.x.is_finite()
+        || !definition.proof_recovery_position.y.is_finite()
+        || !definition.proof_recovery_position.z.is_finite()
+    {
+        return Err("proof recovery position must be finite");
+    }
+
+    let capacity = i32::from(capacity);
+    let open_breathable = i32::from(definition.open_breathable_delta_milli_per_second);
+    let open_vacuum = i32::from(definition.open_vacuum_delta_milli_per_second);
+    let sealed_breathable = i32::from(definition.sealed_breathable_delta_milli_per_second);
+    let sealed_vacuum = i32::from(definition.sealed_vacuum_delta_milli_per_second);
+    if !(1..=capacity).contains(&open_breathable) {
+        return Err("open-helmet breathable oxygen rate must be positive and bounded by capacity");
+    }
+    if !(-capacity..=-1).contains(&open_vacuum) {
+        return Err("open-helmet vacuum oxygen rate must be negative and bounded by capacity");
+    }
+    if sealed_breathable != 0 {
+        return Err("sealed-helmet breathable oxygen rate must be zero");
+    }
+    if !(-capacity..=-1).contains(&sealed_vacuum) {
+        return Err("sealed-helmet vacuum oxygen rate must be negative and bounded by capacity");
+    }
+    if sealed_vacuum <= open_vacuum {
+        return Err("sealed-helmet vacuum oxygen loss must be slower than open-helmet loss");
+    }
+    Ok(())
+}
+
 pub fn manifest() -> &'static ContentManifest {
     static MANIFEST: OnceLock<ContentManifest> = OnceLock::new();
     MANIFEST.get_or_init(|| {
         let parsed: ContentManifest =
             serde_json::from_str(P0_CONTENT).expect("embedded P0 content must be valid JSON");
-        assert_eq!(parsed.schema_version, 5, "unsupported P0 content schema");
+        assert_eq!(parsed.schema_version, 6, "unsupported P0 content schema");
         assert_eq!(
             parsed.license, "AGPL-3.0-or-later",
             "content definition license must be explicit"
@@ -91,6 +149,7 @@ pub fn manifest() -> &'static ContentManifest {
         assert!((1..=16).contains(&parsed.physics.collision_substeps));
         validate_voxel_collision_chunk_edge_cells(parsed.physics.voxel_collision_chunk_edge_cells)
             .unwrap_or_else(|message| panic!("{message}"));
+        validate_survival(&parsed.survival).unwrap_or_else(|message| panic!("{message}"));
         assert!(parsed.physics.control_force_newtons > 0.0);
         assert!(parsed.physics.control_torque_newton_meters > 0.0);
         assert!((0.0..=1.0).contains(&parsed.physics.friction));
@@ -145,9 +204,22 @@ mod tests {
             .map(|definition| format!("{:?}", definition.kind))
             .collect::<BTreeSet<_>>();
         assert_eq!(block_kinds.len(), content.blocks.len());
-        assert_eq!(content.schema_version, 5);
-        assert_eq!(content.manifest_version, "p0.7.3");
+        assert_eq!(content.schema_version, 6);
+        assert_eq!(content.manifest_version, "p0.8.0");
         assert_eq!(content.physics.voxel_collision_chunk_edge_cells, 8);
+        assert_eq!(content.survival.suit_oxygen_capacity_milli, 1_000);
+        assert_eq!(content.survival.critical_oxygen_milli, 200);
+        assert_eq!(content.survival.open_breathable_delta_milli_per_second, 25);
+        assert_eq!(content.survival.open_vacuum_delta_milli_per_second, -40);
+        assert_eq!(content.survival.sealed_breathable_delta_milli_per_second, 0);
+        assert_eq!(content.survival.sealed_vacuum_delta_milli_per_second, -5);
+        assert_eq!(content.survival.respawn_oxygen_milli, 1_000);
+        assert!(content.survival.respawn_helmet_closed);
+        assert!(content.survival.respawn_jetpack_enabled);
+        assert_eq!(
+            content.survival.proof_recovery_position,
+            Vec3::new(12.0, 4.5, 10.0)
+        );
         assert!(content.blocks.iter().all(|definition| {
             definition.max_health > 0 && definition.component_cost > 0 && definition.mass_grams > 0
         }));
@@ -170,5 +242,75 @@ mod tests {
             .expect("physics is an object")
             .remove("voxel_collision_chunk_edge_cells");
         assert!(serde_json::from_value::<ContentManifest>(json).is_err());
+    }
+
+    #[test]
+    fn survival_threshold_and_capacity_are_validated() {
+        let mut survival = manifest().survival.clone();
+        survival.suit_oxygen_capacity_milli = 0;
+        assert!(validate_survival(&survival).is_err());
+
+        let mut survival = manifest().survival.clone();
+        survival.critical_oxygen_milli = 0;
+        assert!(validate_survival(&survival).is_err());
+
+        let mut survival = manifest().survival.clone();
+        survival.critical_oxygen_milli = survival.suit_oxygen_capacity_milli;
+        assert!(validate_survival(&survival).is_err());
+    }
+
+    #[test]
+    fn survival_recovery_position_must_be_finite() {
+        for position in [
+            Vec3::new(f64::NAN, 4.5, 10.0),
+            Vec3::new(12.0, f64::INFINITY, 10.0),
+            Vec3::new(12.0, 4.5, f64::NEG_INFINITY),
+        ] {
+            let mut survival = manifest().survival.clone();
+            survival.proof_recovery_position = position;
+            assert!(validate_survival(&survival).is_err());
+        }
+    }
+
+    #[test]
+    fn survival_respawn_bounds_and_oxygen_rates_are_validated() {
+        for respawn_oxygen_milli in [
+            0,
+            manifest().survival.critical_oxygen_milli,
+            manifest().survival.suit_oxygen_capacity_milli + 1,
+        ] {
+            let mut survival = manifest().survival.clone();
+            survival.respawn_oxygen_milli = respawn_oxygen_milli;
+            assert!(validate_survival(&survival).is_err());
+        }
+
+        let mut invalid_rates = Vec::new();
+        let mut survival = manifest().survival.clone();
+        survival.open_breathable_delta_milli_per_second = 0;
+        invalid_rates.push(survival);
+        let mut survival = manifest().survival.clone();
+        survival.open_vacuum_delta_milli_per_second = 0;
+        invalid_rates.push(survival);
+        let mut survival = manifest().survival.clone();
+        survival.sealed_breathable_delta_milli_per_second = 1;
+        invalid_rates.push(survival);
+        let mut survival = manifest().survival.clone();
+        survival.sealed_vacuum_delta_milli_per_second = 0;
+        invalid_rates.push(survival);
+        let mut survival = manifest().survival.clone();
+        survival.sealed_vacuum_delta_milli_per_second = -41;
+        invalid_rates.push(survival);
+        let mut survival = manifest().survival.clone();
+        survival.open_breathable_delta_milli_per_second = 1_001;
+        invalid_rates.push(survival);
+        let mut survival = manifest().survival.clone();
+        survival.open_vacuum_delta_milli_per_second = -1_001;
+        invalid_rates.push(survival);
+
+        assert!(
+            invalid_rates
+                .iter()
+                .all(|survival| validate_survival(survival).is_err())
+        );
     }
 }

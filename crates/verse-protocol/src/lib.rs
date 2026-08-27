@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 
 /// The only protocol version accepted by this P0 build.
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// A stable integer voxel or block coordinate.
 #[derive(
@@ -239,6 +239,33 @@ pub struct InventorySnapshot {
     pub mass_grams: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PlayerDeathCause {
+    OxygenDepleted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PlayerLifeState {
+    Alive,
+    Incapacitated {
+        death_id: String,
+        cause: PlayerDeathCause,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeathDropSnapshot {
+    pub drop_id: String,
+    pub death_id: String,
+    pub inventory_id: String,
+    pub owner_player_id: String,
+    pub position: Vec3,
+    pub created_event_sequence: u64,
+    pub cause: PlayerDeathCause,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PlayerSnapshot {
     pub player_id: String,
@@ -248,7 +275,9 @@ pub struct PlayerSnapshot {
     pub level: u32,
     pub next_level_experience: u64,
     pub career: CareerSnapshot,
+    pub life_state: PlayerLifeState,
     pub suit_oxygen_milli: u16,
+    pub critical_oxygen_milli: u16,
     pub helmet_closed: bool,
     pub jetpack_enabled: bool,
 }
@@ -338,6 +367,7 @@ pub struct WorldSnapshot {
     pub voxels: Vec<VoxelSnapshot>,
     pub grids: Vec<GridSnapshot>,
     pub inventories: Vec<InventorySnapshot>,
+    pub death_drops: Vec<DeathDropSnapshot>,
     pub conservation: ConservationSnapshot,
 }
 
@@ -359,6 +389,9 @@ pub enum ClientMessage {
         operation_id: String,
         helmet_closed: bool,
         jetpack_enabled: bool,
+    },
+    RespawnPlayer {
+        operation_id: String,
     },
     MineVoxel {
         operation_id: String,
@@ -417,6 +450,7 @@ impl ClientMessage {
             Self::Hello { .. } | Self::RequestSnapshot => None,
             Self::MovePlayer { operation_id, .. }
             | Self::SetSuitMode { operation_id, .. }
+            | Self::RespawnPlayer { operation_id }
             | Self::MineVoxel { operation_id, .. }
             | Self::RefineOre { operation_id, .. }
             | Self::CraftComponent { operation_id, .. }
@@ -508,7 +542,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v6_requires_explicit_construction_completion_state() {
+    fn protocol_requires_explicit_construction_completion_state() {
         let block = BlockSnapshot {
             block_id: "block-frame".into(),
             coordinate: IVec3::new(1, 2, 3),
@@ -539,6 +573,112 @@ mod tests {
         assert_eq!(value["type"], "set_suit_mode");
         assert_eq!(value["helmet_closed"], false);
         assert_eq!(value["jetpack_enabled"], true);
+    }
+
+    #[test]
+    fn protocol_v7_exposes_tagged_life_state_and_death_cause() {
+        assert_eq!(PROTOCOL_VERSION, 7);
+        let life_state = PlayerLifeState::Incapacitated {
+            death_id: "death-player-local-42".into(),
+            cause: PlayerDeathCause::OxygenDepleted,
+        };
+        let value = serde_json::to_value(&life_state).expect("life state serializes");
+        assert_eq!(value["kind"], "incapacitated");
+        assert_eq!(value["death_id"], "death-player-local-42");
+        assert_eq!(value["cause"]["kind"], "oxygen_depleted");
+        assert_eq!(
+            serde_json::from_value::<PlayerLifeState>(value).expect("life state deserializes"),
+            life_state
+        );
+
+        let alive = serde_json::to_value(PlayerLifeState::Alive).expect("alive state serializes");
+        assert_eq!(alive, serde_json::json!({ "kind": "alive" }));
+    }
+
+    #[test]
+    fn protocol_v7_snapshot_exposes_critical_oxygen_and_death_drops() {
+        let death_drop = DeathDropSnapshot {
+            drop_id: "drop-player-local-42".into(),
+            death_id: "death-player-local-42".into(),
+            inventory_id: "inventory-drop-player-local-42".into(),
+            owner_player_id: "player-local".into(),
+            position: Vec3::new(1.0, 2.0, 3.0),
+            created_event_sequence: 42,
+            cause: PlayerDeathCause::OxygenDepleted,
+        };
+        let player = PlayerSnapshot {
+            player_id: "player-local".into(),
+            position: death_drop.position,
+            inventory_id: "inventory-player-local".into(),
+            experience: 0,
+            level: 1,
+            next_level_experience: 100,
+            career: CareerSnapshot::default(),
+            life_state: PlayerLifeState::Incapacitated {
+                death_id: "death-player-local-42".into(),
+                cause: PlayerDeathCause::OxygenDepleted,
+            },
+            suit_oxygen_milli: 0,
+            critical_oxygen_milli: 100,
+            helmet_closed: true,
+            jetpack_enabled: false,
+        };
+        let world = WorldSnapshot {
+            schema_version: 10,
+            content_manifest_version: "p0.8.0".into(),
+            universe_id: "the-verse-local".into(),
+            cell_id: "cell-origin".into(),
+            event_sequence: 42,
+            simulation_tick: 0,
+            fencing_token: 1,
+            world_hash: "hash".into(),
+            player,
+            environment: EnvironmentSnapshot {
+                celestial_body_id: "khepri-prime".into(),
+                celestial_body_name: "Khepri Prime".into(),
+                planet_center: Vec3::ZERO,
+                surface_radius_m: 1_200.0,
+                altitude_m: 3_000.0,
+                gravity: Vec3::ZERO,
+                gravity_m_s2: 0.0,
+                atmosphere_density: 0.0,
+                oxygen_fraction: 0.0,
+                breathable: false,
+            },
+            voxels: Vec::new(),
+            grids: Vec::new(),
+            inventories: Vec::new(),
+            death_drops: vec![death_drop.clone()],
+            conservation: ConservationSnapshot::default(),
+        };
+        let value = serde_json::to_value(&world).expect("world snapshot serializes");
+        assert_eq!(value["player"]["critical_oxygen_milli"], 100);
+        assert_eq!(value["death_drops"][0]["drop_id"], death_drop.drop_id);
+        assert_eq!(value["death_drops"][0]["cause"]["kind"], "oxygen_depleted");
+        assert_eq!(
+            serde_json::from_value::<WorldSnapshot>(value).expect("world snapshot deserializes"),
+            world
+        );
+    }
+
+    #[test]
+    fn respawn_message_carries_only_an_operation_id() {
+        let message = ClientMessage::RespawnPlayer {
+            operation_id: "respawn-1".into(),
+        };
+        let value = serde_json::to_value(&message).expect("respawn intent serializes");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "respawn_player",
+                "operation_id": "respawn-1"
+            })
+        );
+        assert_eq!(message.operation_id(), Some("respawn-1"));
+        assert_eq!(
+            serde_json::from_value::<ClientMessage>(value).expect("respawn intent deserializes"),
+            message
+        );
     }
 
     #[test]

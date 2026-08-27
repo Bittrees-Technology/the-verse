@@ -11,7 +11,7 @@ const PLANET_SHADER: Shader = preload("res://shaders/planet_surface.gdshader")
 const ATMOSPHERE_SHADER: Shader = preload("res://shaders/planet_atmosphere.gdshader")
 const CLOUD_SHADER: Shader = preload("res://shaders/planet_clouds.gdshader")
 const BLOCK_DAMAGE_SHADER: Shader = preload("res://shaders/block_damage.gdshader")
-const PROTOCOL_VERSION := 6
+const PROTOCOL_VERSION := 7
 const DEFAULT_SERVER := "ws://127.0.0.1:7777/ws"
 const PLAYER_INVENTORY := "inventory-player-local"
 const STARTER_GRID := "grid-starter"
@@ -73,6 +73,7 @@ var recent_message := "Starting local universe connection…"
 var recent_message_color := Color(0.56, 0.87, 1.0)
 var smoke_test := false
 var smoke_operation := ""
+var recovery_operation := ""
 var last_socket_state := -1
 var closed_reported := false
 var player_velocity := Vector3.ZERO
@@ -128,6 +129,11 @@ var mining_fragments: GPUParticles3D
 var suit_light: SpotLight3D
 var inventory_overlay: Control
 var planet_cloud_layer: MeshInstance3D
+var critical_oxygen_panel: ColorRect
+var critical_oxygen_label: Label
+var incapacitated_overlay: Control
+var incapacitated_detail_label: Label
+var recovery_button: Button
 
 var rock_material: Material
 var block_materials: Dictionary = {}
@@ -161,6 +167,16 @@ func _process(delta: float) -> void:
 
 
 func _input(event: InputEvent) -> void:
+	if _local_player_incapacitated():
+		if event is InputEventKey and event.pressed and not event.echo:
+			if event.keycode in [KEY_ENTER, KEY_KP_ENTER]:
+				_request_recovery()
+				get_viewport().set_input_as_handled()
+			elif event.keycode == KEY_F5:
+				_connect_to_server()
+				get_viewport().set_input_as_handled()
+		return
+
 	if event is InputEventMouseMotion and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
 		camera.rotate_object_local(Vector3.UP, -event.relative.x * MOUSE_SENSITIVITY)
 		camera.rotate_object_local(Vector3.RIGHT, -event.relative.y * MOUSE_SENSITIVITY)
@@ -273,6 +289,36 @@ func _inventory_close_shortcut(event: InputEventKey, text_entry_focused: bool) -
 	if not event.pressed or event.echo:
 		return false
 	return event.keycode == KEY_ESCAPE or (event.keycode == KEY_I and not text_entry_focused)
+
+
+func _player_life_state(player: Dictionary) -> String:
+	var life_state: Variant = player.get("life_state", {})
+	if life_state is Dictionary:
+		return String(life_state.get("kind", "alive"))
+	return "alive"
+
+
+func _player_is_incapacitated(player: Dictionary) -> bool:
+	return _player_life_state(player) == "incapacitated"
+
+
+func _local_player_incapacitated() -> bool:
+	var player: Dictionary = snapshot.get("player", {})
+	return not _player_controls_enabled(player)
+
+
+func _life_support_display_state(player: Dictionary) -> String:
+	if _player_is_incapacitated(player):
+		return "incapacitated"
+	var critical_threshold := int(player.get("critical_oxygen_milli", 0))
+	var oxygen := int(player.get("suit_oxygen_milli", 0))
+	if critical_threshold > 0 and oxygen < critical_threshold:
+		return "critical"
+	return "normal"
+
+
+func _player_controls_enabled(player: Dictionary) -> bool:
+	return not _player_is_incapacitated(player)
 
 
 func _parse_command_line() -> void:
@@ -877,6 +923,91 @@ func _build_interface() -> void:
 	message_label.add_theme_font_size_override("font_size", 12)
 	bottom_bar.add_child(message_label)
 	_build_inventory_terminal(canvas)
+	_build_life_support_interface(canvas)
+
+
+func _build_life_support_interface(canvas: CanvasLayer) -> void:
+	critical_oxygen_panel = ColorRect.new()
+	critical_oxygen_panel.name = "CriticalOxygenWarning"
+	critical_oxygen_panel.anchor_left = 0.5
+	critical_oxygen_panel.anchor_right = 0.5
+	critical_oxygen_panel.offset_left = -260.0
+	critical_oxygen_panel.offset_top = 48.0
+	critical_oxygen_panel.offset_right = 260.0
+	critical_oxygen_panel.offset_bottom = 92.0
+	critical_oxygen_panel.color = Color(0.38, 0.025, 0.018, 0.94)
+	critical_oxygen_panel.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	critical_oxygen_panel.visible = false
+	canvas.add_child(critical_oxygen_panel)
+
+	critical_oxygen_label = Label.new()
+	critical_oxygen_label.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	critical_oxygen_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	critical_oxygen_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	critical_oxygen_label.add_theme_font_size_override("font_size", 15)
+	critical_oxygen_label.add_theme_color_override("font_color", Color(1.0, 0.73, 0.48))
+	critical_oxygen_panel.add_child(critical_oxygen_label)
+
+	incapacitated_overlay = Control.new()
+	incapacitated_overlay.name = "IncapacitatedOverlay"
+	incapacitated_overlay.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	incapacitated_overlay.mouse_filter = Control.MOUSE_FILTER_STOP
+	incapacitated_overlay.visible = false
+	canvas.add_child(incapacitated_overlay)
+
+	var blackout := ColorRect.new()
+	blackout.color = Color(0.015, 0.002, 0.002, 0.91)
+	blackout.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	blackout.mouse_filter = Control.MOUSE_FILTER_STOP
+	incapacitated_overlay.add_child(blackout)
+
+	var failure_panel := ColorRect.new()
+	failure_panel.anchor_left = 0.5
+	failure_panel.anchor_top = 0.5
+	failure_panel.anchor_right = 0.5
+	failure_panel.anchor_bottom = 0.5
+	failure_panel.offset_left = -310.0
+	failure_panel.offset_top = -170.0
+	failure_panel.offset_right = 310.0
+	failure_panel.offset_bottom = 170.0
+	failure_panel.color = Color(0.055, 0.012, 0.014, 0.98)
+	incapacitated_overlay.add_child(failure_panel)
+
+	var failure_accent := ColorRect.new()
+	failure_accent.color = Color(1.0, 0.16, 0.07)
+	failure_accent.anchor_right = 1.0
+	failure_accent.offset_bottom = 3.0
+	failure_panel.add_child(failure_accent)
+
+	var failure_title := Label.new()
+	failure_title.text = "EVA LIFE SUPPORT FAILURE"
+	failure_title.position = Vector2(24.0, 32.0)
+	failure_title.size = Vector2(572.0, 42.0)
+	failure_title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	failure_title.add_theme_font_size_override("font_size", 27)
+	failure_title.add_theme_color_override("font_color", Color(1.0, 0.34, 0.20))
+	failure_panel.add_child(failure_title)
+
+	incapacitated_detail_label = Label.new()
+	incapacitated_detail_label.position = Vector2(34.0, 94.0)
+	incapacitated_detail_label.size = Vector2(552.0, 100.0)
+	incapacitated_detail_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	incapacitated_detail_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	incapacitated_detail_label.add_theme_font_size_override("font_size", 14)
+	incapacitated_detail_label.add_theme_color_override("font_color", Color(0.82, 0.84, 0.85))
+	failure_panel.add_child(incapacitated_detail_label)
+
+	recovery_button = Button.new()
+	recovery_button.text = "[ENTER]  REQUEST RECOVERY"
+	recovery_button.position = Vector2(155.0, 230.0)
+	recovery_button.size = Vector2(310.0, 56.0)
+	recovery_button.add_theme_font_size_override("font_size", 16)
+	recovery_button.add_theme_color_override("font_color", Color(0.88, 0.96, 1.0))
+	recovery_button.add_theme_stylebox_override(
+		"normal", _terminal_style(Color(0.08, 0.20, 0.24), Color(0.34, 0.76, 0.88), 2)
+	)
+	recovery_button.pressed.connect(_request_recovery)
+	failure_panel.add_child(recovery_button)
 
 
 func _build_inventory_terminal(canvas: CanvasLayer) -> void:
@@ -1221,6 +1352,7 @@ func _connect_to_server() -> void:
 	socket.inbound_buffer_size = 8 * 1024 * 1024
 	socket.outbound_buffer_size = 1024 * 1024
 	connected = false
+	recovery_operation = ""
 	handshake_sent = false
 	closed_reported = false
 	last_socket_state = -1
@@ -1246,7 +1378,7 @@ func _poll_socket() -> void:
 			_send({
 				"type": "hello",
 				"protocol_version": PROTOCOL_VERSION,
-				"client_name": "godot-native-p0.7",
+				"client_name": "godot-native-p0.8",
 			})
 		while socket.get_available_packet_count() > 0:
 			var text := socket.get_packet().get_string_from_utf8()
@@ -1267,6 +1399,7 @@ func _poll_socket() -> void:
 				true
 			)
 		connected = false
+		recovery_operation = ""
 		handshake_sent = false
 
 
@@ -1279,11 +1412,15 @@ func _handle_server_message(message: Dictionary) -> void:
 		"intent_accepted":
 			var receipt: Dictionary = message.get("receipt", {})
 			_set_message(receipt.get("message", "Intent accepted"))
+			if receipt.get("operation_id", "") == recovery_operation:
+				_set_message("Recovery authorized // awaiting authoritative snapshot")
 			if smoke_test and receipt.get("operation_id", "") == smoke_operation:
 				print("VERSE_SMOKE_OK event=%d" % int(receipt.get("event_sequence", 0)))
 				get_tree().quit(0)
 		"intent_rejected":
 			pending_mine_position = null
+			if message.get("operation_id", "") == recovery_operation:
+				recovery_operation = ""
 			_set_message(
 				"%s — %s" % [message.get("code", "rejected"), message.get("message", "")],
 				true
@@ -1298,8 +1435,16 @@ func _handle_server_message(message: Dictionary) -> void:
 func _apply_snapshot(authoritative: Dictionary) -> void:
 	if authoritative.is_empty():
 		return
+	var was_incapacitated := _local_player_incapacitated()
 	snapshot = authoritative
 	var player: Dictionary = snapshot.get("player", {})
+	var is_incapacitated := _player_is_incapacitated(player)
+	if is_incapacitated and not was_incapacitated:
+		_enter_incapacitated_state()
+	elif was_incapacitated and not is_incapacitated:
+		recovery_operation = ""
+		Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
+		_set_message("RECOVERY COMPLETE // EVA SUIT CONTROL RESTORED")
 	var position := _vec3(player.get("position", {}))
 	if first_snapshot or camera.position.distance_to(position) > 2.8:
 		camera.position = position
@@ -1813,6 +1958,9 @@ func _stable_unit_seed(text: String) -> float:
 
 
 func _update_movement(delta: float) -> void:
+	if _local_player_incapacitated():
+		player_velocity = Vector3.ZERO
+		return
 	if Input.mouse_mode != Input.MOUSE_MODE_CAPTURED or inventory_open:
 		return
 	var roll_input := (
@@ -1943,6 +2091,12 @@ func _position_is_clear(position: Vector3) -> bool:
 
 
 func _update_target() -> void:
+	if _local_player_incapacitated():
+		target_voxel = null
+		target_block = {}
+		target_highlight.visible = false
+		build_preview.visible = false
+		return
 	target_voxel = _raymarch_voxel()
 	target_block = _ray_target_block()
 	build_preview.visible = false
@@ -2044,6 +2198,7 @@ func _run_visual_smoke_assertions() -> bool:
 	var zero_gravity_velocity := _integrate_jetpack_velocity(
 		Vector3.ZERO, Vector3.ZERO, Vector3.ZERO, 0.25, false, false
 	)
+	var life_support_valid := _run_life_support_smoke_assertions()
 	var valid: bool = (
 		frame_visual.get_meta("verse_visual_state", "") == "frame"
 		and frame_visual.get_node_or_null("DamageOverlay") == null
@@ -2067,6 +2222,7 @@ func _run_visual_smoke_assertions() -> bool:
 		and drift_velocity.is_equal_approx(gravity_probe * 0.25)
 		and dampened_velocity.is_zero_approx()
 		and zero_gravity_velocity.is_zero_approx()
+		and life_support_valid
 	)
 	frame_visual.free()
 	damaged_visual.free()
@@ -2078,6 +2234,59 @@ func _run_visual_smoke_assertions() -> bool:
 		"VERSE_VISUAL_STATE_OK frame=frame damaged=armor_damaged repaired=armor_complete inventory_focus=owned"
 	)
 	print("VERSE_EVA_GRAVITY_OK drift=gravity dampeners=compensating")
+	return true
+
+
+func _run_life_support_smoke_assertions() -> bool:
+	var threshold_player := {
+		"player_id": "smoke-player",
+		"life_state": {"kind": "alive"},
+		"suit_oxygen_milli": 200,
+		"critical_oxygen_milli": 200,
+		"helmet_closed": true,
+	}
+	var critical_player := threshold_player.duplicate(true)
+	critical_player["suit_oxygen_milli"] = 199
+	var zero_but_alive_player := threshold_player.duplicate(true)
+	zero_but_alive_player["suit_oxygen_milli"] = 0
+	var incapacitated_player := threshold_player.duplicate(true)
+	incapacitated_player["suit_oxygen_milli"] = 0
+	incapacitated_player["life_state"] = {
+		"kind": "incapacitated",
+		"death_id": "death-smoke-oxygen",
+		"cause": {"kind": "oxygen_depleted"},
+	}
+
+	_update_life_support_interface(critical_player)
+	var critical_ui_visible := (
+		critical_oxygen_panel.visible
+		and not incapacitated_overlay.visible
+		and critical_oxygen_label.text.contains("O₂ CRITICAL")
+	)
+	_update_life_support_interface(incapacitated_player)
+	var incapacitated_ui_visible := (
+		incapacitated_overlay.visible
+		and not critical_oxygen_panel.visible
+		and recovery_button.text.contains("[ENTER]")
+		and incapacitated_detail_label.text.contains("OXYGEN RESERVE DEPLETED")
+	)
+	var authoritative_player: Dictionary = snapshot.get("player", {})
+	_update_life_support_interface(authoritative_player)
+
+	var valid := (
+		_life_support_display_state(threshold_player) == "normal"
+		and _life_support_display_state(critical_player) == "critical"
+		and _life_support_display_state(zero_but_alive_player) == "critical"
+		and _player_controls_enabled(zero_but_alive_player)
+		and _life_support_display_state(incapacitated_player) == "incapacitated"
+		and not _player_controls_enabled(incapacitated_player)
+		and critical_ui_visible
+		and incapacitated_ui_visible
+	)
+	if not valid:
+		printerr("VERSE_LIFE_SUPPORT_STATE_FAILED")
+		return false
+	print("VERSE_LIFE_SUPPORT_UI_OK critical=visible incapacitated=canonical recovery=enter")
 	return true
 
 
@@ -2129,7 +2338,7 @@ func _ray_target_block() -> Dictionary:
 
 
 func _update_tool_action(delta: float) -> void:
-	if inventory_open:
+	if inventory_open or _local_player_incapacitated():
 		action_charge = 0.0
 		action_target_key = ""
 		action_progress.value = 0.0
@@ -2402,6 +2611,8 @@ func _transfer_to_or_from_cargo(reverse: bool) -> void:
 
 
 func _set_inventory_open(open: bool) -> void:
+	if open and _local_player_incapacitated():
+		return
 	inventory_open = open
 	inventory_overlay.visible = open
 	build_mode = false if open else build_mode
@@ -2410,6 +2621,41 @@ func _set_inventory_open(open: bool) -> void:
 	_set_message(
 		"Engineering inventory terminal online" if open else "Engineering terminal closed"
 	)
+
+
+func _enter_incapacitated_state() -> void:
+	player_velocity = Vector3.ZERO
+	action_charge = 0.0
+	action_target_key = ""
+	action_cooldown = 0.0
+	build_mode = false
+	grid_control_active = false
+	recovery_operation = ""
+	if inventory_open:
+		inventory_open = false
+		inventory_overlay.visible = false
+	get_viewport().gui_release_focus()
+	Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
+	_set_message("LIFE SUPPORT FAILURE // AWAITING RECOVERY REQUEST", true)
+
+
+func _request_recovery() -> void:
+	if not _local_player_incapacitated():
+		return
+	if not recovery_operation.is_empty():
+		_set_message("Recovery request pending authoritative response")
+		return
+	if socket.get_ready_state() != WebSocketPeer.STATE_OPEN:
+		_set_message("Recovery unavailable while disconnected — press F5", true)
+		return
+	recovery_operation = _operation_id("respawn")
+	if not _send({
+		"type": "respawn_player",
+		"operation_id": recovery_operation,
+	}):
+		recovery_operation = ""
+		return
+	_set_message("Recovery requested // awaiting authoritative spawn")
 
 
 func _toggle_jetpack() -> void:
@@ -2484,18 +2730,74 @@ func _target_or_starter_grid() -> String:
 	return STARTER_GRID
 
 
-func _send(message: Dictionary) -> void:
+func _send(message: Dictionary) -> bool:
 	if socket.get_ready_state() != WebSocketPeer.STATE_OPEN:
 		_set_message("No authoritative server connection — press F5", true)
-		return
+		return false
 	var error := socket.send_text(JSON.stringify(message))
 	if error != OK:
 		_set_message("Network send failed: %s" % error_string(error), true)
+		return false
+	return true
 
 
 func _operation_id(prefix: String) -> String:
 	operation_counter += 1
 	return "%s-%d-%d" % [prefix, Time.get_ticks_usec(), operation_counter]
+
+
+func _update_life_support_interface(player: Dictionary) -> void:
+	var display_state := _life_support_display_state(player)
+	critical_oxygen_panel.visible = display_state == "critical"
+	incapacitated_overlay.visible = display_state == "incapacitated"
+	if display_state == "critical":
+		var oxygen_percent := int(player.get("suit_oxygen_milli", 0)) / 10
+		var environment: Dictionary = snapshot.get("environment", {})
+		var helmet_closed := bool(player.get("helmet_closed", true))
+		var breathable := bool(environment.get("breathable", false))
+		var remedy := "SEEK BREATHABLE ATMOSPHERE"
+		if not helmet_closed and not breathable:
+			remedy = "SEAL HELMET [H]"
+		elif not helmet_closed and breathable:
+			remedy = "SUIT RESERVE RECHARGING"
+		critical_oxygen_label.text = "⚠ O₂ CRITICAL // %d%% // %s" % [oxygen_percent, remedy]
+	if display_state == "incapacitated":
+		var life_state: Dictionary = player.get("life_state", {})
+		var cause: Dictionary = life_state.get("cause", {})
+		var cause_text := (
+			"OXYGEN RESERVE DEPLETED"
+			if cause.get("kind", "") == "oxygen_depleted"
+			else "SUIT FAILURE RECORDED"
+		)
+		var death_id := String(life_state.get("death_id", "unavailable"))
+		var drop_text := (
+			"CARRIED INVENTORY DROP RECORDED AT FAILURE SITE"
+			if _owned_death_drop_recorded(player)
+			else "NO CARRIED INVENTORY DROP RECORDED"
+		)
+		incapacitated_detail_label.text = "%s\n%s\nDEATH RECORD // %s" % [
+			cause_text, drop_text, death_id
+		]
+		recovery_button.disabled = not connected or not recovery_operation.is_empty()
+		recovery_button.text = (
+			"RECOVERY REQUESTED…"
+			if not recovery_operation.is_empty()
+			else "[ENTER]  REQUEST RECOVERY"
+		)
+
+
+func _owned_death_drop_recorded(player: Dictionary) -> bool:
+	var player_id := String(player.get("player_id", ""))
+	var life_state: Dictionary = player.get("life_state", {})
+	var death_id := String(life_state.get("death_id", ""))
+	for drop in snapshot.get("death_drops", []):
+		if (
+			drop is Dictionary
+			and String(drop.get("owner_player_id", "")) == player_id
+			and String(drop.get("death_id", "")) == death_id
+		):
+			return true
+	return false
 
 
 func _update_interface() -> void:
@@ -2509,6 +2811,7 @@ func _update_interface() -> void:
 		Color(0.35, 0.95, 0.62) if connected else Color(1.0, 0.38, 0.25)
 	)
 	var player: Dictionary = snapshot.get("player", {})
+	_update_life_support_interface(player)
 	var level := int(player.get("level", 1))
 	var experience := int(player.get("experience", 0))
 	var next_level := int(player.get("next_level_experience", 100))
@@ -2521,8 +2824,12 @@ func _update_interface() -> void:
 	telemetry_label.text = "O₂ %03d%%   PWR %03d%%   %s   %s   %s" % [
 		oxygen_percent, suit_power, helmet_state, jetpack_state, dampener_state
 	]
+	var life_support_state := _life_support_display_state(player)
 	telemetry_label.add_theme_color_override(
-		"font_color", Color(1.0, 0.32, 0.18) if oxygen_percent < 20 else Color(0.64, 0.90, 0.94)
+		"font_color",
+		Color(1.0, 0.32, 0.18)
+		if life_support_state != "normal"
+		else Color(0.64, 0.90, 0.94)
 	)
 	var environment: Dictionary = snapshot.get("environment", {})
 	var gravity_g := float(environment.get("gravity_m_s2", 0.0)) / 9.80665
@@ -2629,7 +2936,11 @@ func _update_interface() -> void:
 			]
 			if build_mode
 			else "INDUSTRIAL HAND DRILL // READY"
-		)
+			)
+	if _player_is_incapacitated(player):
+		hotbar_label.text = "EVA CONTROL OFFLINE     [ENTER] REQUEST RECOVERY"
+		target_label.text = "CANONICAL PLAYER STATE // INCAPACITATED"
+		mode_label.text = "ALL MOVEMENT AND WORK CONTROLS LOCKED"
 	action_progress.visible = action_charge > 0.0
 	message_label.text = recent_message
 	message_label.add_theme_color_override("font_color", recent_message_color)

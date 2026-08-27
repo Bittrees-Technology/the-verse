@@ -870,13 +870,13 @@ mod tests {
     }
 
     #[test]
-    fn p0_7_2_content_manifest_is_rejected_before_replay() {
+    fn p0_7_3_content_manifest_is_rejected_before_replay() {
         let directory = tempdir().expect("tempdir");
         drop(Store::open(directory.path(), 41).expect("store"));
         let manifest_path = directory.path().join(MANIFEST_FILE);
         let mut manifest: serde_json::Value =
             read_json(&manifest_path).expect("manifest JSON reads");
-        manifest["content_manifest_version"] = serde_json::json!("p0.7.2");
+        manifest["content_manifest_version"] = serde_json::json!("p0.7.3");
         fs::write(
             &manifest_path,
             serde_json::to_vec_pretty(&manifest).expect("manifest serializes"),
@@ -886,7 +886,7 @@ mod tests {
         assert!(matches!(
             Store::open(directory.path(), 41),
             Err(PersistenceError::ContentManifestMismatch { stored, runtime })
-                if stored == "p0.7.2" && runtime == "p0.7.3"
+                if stored == "p0.7.3" && runtime == "p0.8.0"
         ));
     }
 

@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use axum::{
     Json, Router,
@@ -33,7 +32,6 @@ const COMMAND_CENTER_CSS: &str = include_str!("../../../apps/web-command-center/
 pub struct AppState {
     runtime: Mutex<Runtime>,
     updates: broadcast::Sender<ServerMessage>,
-    active_player_sessions: AtomicUsize,
 }
 
 impl AppState {
@@ -42,7 +40,6 @@ impl AppState {
         Arc::new(Self {
             runtime: Mutex::new(runtime),
             updates,
-            active_player_sessions: AtomicUsize::new(0),
         })
     }
 
@@ -60,8 +57,7 @@ impl AppState {
 
     pub fn advance(&self, delta_millis: u16) -> Result<bool, RuntimeError> {
         let mut runtime = self.runtime.lock();
-        let player_active = self.active_player_sessions.load(Ordering::Relaxed) > 0;
-        let changed = runtime.advance_with_player_presence(delta_millis, player_active)?;
+        let changed = runtime.advance(delta_millis)?;
         if changed {
             let _ = self.updates.send(ServerMessage::Snapshot {
                 snapshot: Box::new(runtime.snapshot()),
@@ -180,10 +176,6 @@ async fn websocket_session(socket: WebSocket, state: Arc<AppState>) {
     let Some(client_name) = complete_handshake(&mut receiver, &mut sender).await else {
         return;
     };
-    let gameplay_session = client_name.starts_with("godot-native-");
-    if gameplay_session {
-        state.active_player_sessions.fetch_add(1, Ordering::Relaxed);
-    }
     info!(%client_name, "client completed protocol handshake");
 
     let mut updates = state.updates.subscribe();
@@ -198,9 +190,6 @@ async fn websocket_session(socket: WebSocket, state: Arc<AppState>) {
     .await
     .is_err()
     {
-        if gameplay_session {
-            state.active_player_sessions.fetch_sub(1, Ordering::Relaxed);
-        }
         return;
     }
 
@@ -255,9 +244,6 @@ async fn websocket_session(socket: WebSocket, state: Arc<AppState>) {
                 }
             }
         }
-    }
-    if gameplay_session {
-        state.active_player_sessions.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -662,13 +648,13 @@ mod tests {
     }
 
     #[test]
-    fn offline_player_life_support_does_not_drain() {
+    fn life_support_progress_is_independent_of_spoofable_client_names() {
         let directory = tempdir().expect("tempdir");
         let state = AppState::new(Runtime::open(directory.path(), 99, 20).expect("runtime"));
         for _ in 0..8 {
-            assert!(!state.advance(250).expect("offline tick"));
+            state.advance(250).expect("authoritative tick");
         }
-        assert_eq!(state.snapshot().player.suit_oxygen_milli, 1_000);
+        assert_eq!(state.snapshot().player.suit_oxygen_milli, 990);
     }
 
     #[tokio::test]

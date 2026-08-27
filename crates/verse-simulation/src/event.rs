@@ -2,12 +2,12 @@
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use verse_protocol::{IVec3, Quat, ResourceKind, Vec3, VoxelMaterial};
+use verse_protocol::{IVec3, PlayerDeathCause, Quat, ResourceKind, Vec3, VoxelMaterial};
 
-use crate::model::{Block, ContactPairKey};
+use crate::model::{Block, ContactPairKey, DeathDrop, InventoryRecord};
 
 pub const EVENT_SCHEMA_NAME: &str = "verse.world_event";
-pub const EVENT_SCHEMA_VERSION: u32 = 4;
+pub const EVENT_SCHEMA_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event_type", rename_all = "snake_case")]
@@ -22,6 +22,21 @@ pub enum EventPayload {
     SuitOxygenChanged {
         previous_oxygen_milli: u16,
         new_oxygen_milli: u16,
+    },
+    PlayerIncapacitated {
+        death_id: String,
+        cause: PlayerDeathCause,
+        position: Vec3,
+        previous_oxygen_milli: u16,
+        dropped_inventory: Option<InventoryRecord>,
+        death_drop: Option<DeathDrop>,
+    },
+    PlayerRespawned {
+        death_id: String,
+        position: Vec3,
+        suit_oxygen_milli: u16,
+        helmet_closed: bool,
+        jetpack_enabled: bool,
     },
     VoxelMined {
         coordinate: IVec3,
@@ -135,6 +150,8 @@ impl EventPayload {
             Self::PlayerMoved { .. }
             | Self::SuitModeChanged { .. }
             | Self::SuitOxygenChanged { .. }
+            | Self::PlayerIncapacitated { .. }
+            | Self::PlayerRespawned { .. }
             | Self::GridControlSet { .. }
             | Self::GridAnchorSet {
                 anchored: false, ..
@@ -166,6 +183,14 @@ impl EventPayload {
             } => (
                 "suit_oxygen_changed",
                 format!("Suit oxygen {}%", u32::from(*new_oxygen_milli) / 10),
+            ),
+            Self::PlayerIncapacitated { .. } => (
+                "player_incapacitated",
+                "Life support failed — recovery required".into(),
+            ),
+            Self::PlayerRespawned { .. } => (
+                "player_respawned",
+                "Recovery complete — suit inventory is empty".into(),
             ),
             Self::VoxelMined { ore_yield, .. } => ("voxel_mined", format!("Mined {ore_yield} ore")),
             Self::OreRefined { batches, .. } => (
@@ -326,7 +351,7 @@ mod tests {
     fn event_hash_detects_payload_tampering() {
         let mut event = CanonicalEvent::new(
             1,
-            "p0.7.3",
+            "p0.8.0",
             "universe",
             "cell",
             9,
