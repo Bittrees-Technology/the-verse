@@ -3057,6 +3057,115 @@ mod tests {
     }
 
     #[test]
+    fn replay_rejects_tampered_player_physics_outcomes_before_mutation() {
+        let runtime = runtime();
+        let state = runtime.state();
+        let bodies = state
+            .grids
+            .values()
+            .map(|grid| PhysicsBodyOutcome {
+                grid_id: grid.grid_id.clone(),
+                position: grid.position,
+                orientation: grid.orientation,
+                linear_velocity: grid.linear_velocity,
+                angular_velocity: grid.angular_velocity,
+            })
+            .collect::<Vec<_>>();
+        let canonical = EventPayload::PhysicsStepCommitted {
+            fixed_step_hz: content::manifest().physics.fixed_step_hz,
+            step_count: 1,
+            remaining_step_phase: 0,
+            bodies,
+            player: stationary_player_outcome(state, 1),
+            contacts: Vec::new(),
+            active_contacts_after: Vec::new(),
+        };
+        let before_hash = state.state_hash();
+        let reject = |payload: EventPayload, expected_code: &str| {
+            let event = state.prepare_system_event(payload);
+            let mut replay = state.clone();
+            let error = replay
+                .apply_event(&event)
+                .expect_err("tampered player physics must reject");
+            assert_eq!(error.code(), expected_code);
+            assert_eq!(replay.state_hash(), before_hash);
+        };
+
+        let mut missing = canonical.clone();
+        let EventPayload::PhysicsStepCommitted { player, .. } = &mut missing else {
+            unreachable!();
+        };
+        *player = None;
+        reject(missing, "replay_player_physics_presence_invalid");
+
+        let mut wrong_id = canonical.clone();
+        let EventPayload::PhysicsStepCommitted {
+            player: Some(player),
+            ..
+        } = &mut wrong_id
+        else {
+            unreachable!();
+        };
+        player.player_id.push_str("-forged");
+        reject(wrong_id, "replay_player_physics_identity_invalid");
+
+        let mut non_finite = canonical.clone();
+        let EventPayload::PhysicsStepCommitted {
+            player: Some(player),
+            ..
+        } = &mut non_finite
+        else {
+            unreachable!();
+        };
+        player.position.x = f64::NAN;
+        reject(non_finite, "invalid_vector");
+
+        let mut zero_rotation = canonical.clone();
+        let EventPayload::PhysicsStepCommitted {
+            player: Some(player),
+            ..
+        } = &mut zero_rotation
+        else {
+            unreachable!();
+        };
+        player.orientation = Quat::new(0.0, 0.0, 0.0, 0.0);
+        reject(zero_rotation, "replay_player_physics_rotation_invalid");
+
+        let mut over_speed = canonical.clone();
+        let EventPayload::PhysicsStepCommitted {
+            player: Some(player),
+            ..
+        } = &mut over_speed
+        else {
+            unreachable!();
+        };
+        player.linear_velocity = Vec3::new(32.000_001, 0.0, 0.0);
+        reject(over_speed, "replay_player_physics_velocity_invalid");
+
+        let mut wrong_control = canonical.clone();
+        let EventPayload::PhysicsStepCommitted {
+            player: Some(player),
+            ..
+        } = &mut wrong_control
+        else {
+            unreachable!();
+        };
+        player.boost = true;
+        reject(wrong_control, "replay_player_physics_control_invalid");
+
+        let mut wrong_contact = canonical;
+        let EventPayload::PhysicsStepCommitted {
+            player: Some(player),
+            ..
+        } = &mut wrong_contact
+        else {
+            unreachable!();
+        };
+        player.surface_contact = true;
+        reject(wrong_contact, "replay_player_surface_contact_invalid");
+    }
+
+    #[test]
     fn replay_rejects_a_full_integrity_no_op_weld_without_awarding_experience() {
         let runtime = runtime();
         let mut state = runtime.state().clone();

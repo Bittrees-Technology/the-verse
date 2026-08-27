@@ -649,6 +649,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn character_control_acknowledges_with_lightweight_atomic_motion_state() {
+        let (mut socket, _state, server) = connect_test_socket().await;
+        assert!(matches!(
+            receive_server_message(&mut socket).await,
+            ServerMessage::Welcome { .. }
+        ));
+        send_client_message(
+            &mut socket,
+            &ClientMessage::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                client_name: "motion-state-test-client".into(),
+            },
+        )
+        .await;
+        let ServerMessage::Snapshot { snapshot } = receive_server_message(&mut socket).await else {
+            panic!("compatible handshake must receive a full snapshot");
+        };
+        let operation_id = "player-control-1-1";
+        send_client_message(
+            &mut socket,
+            &ClientMessage::SetPlayerControl {
+                operation_id: operation_id.into(),
+                movement_epoch: snapshot.player.movement_epoch,
+                input_sequence: 1,
+                linear_input: verse_protocol::Vec3::new(0.0, 0.0, -1.0),
+                angular_input: verse_protocol::Vec3::new(0.0, 0.0, 0.5),
+                boost: false,
+                dampeners: true,
+            },
+        )
+        .await;
+        let ServerMessage::IntentAccepted { receipt } = receive_server_message(&mut socket).await
+        else {
+            panic!("accepted character control must receive a receipt");
+        };
+        assert_eq!(receipt.operation_id, operation_id);
+        let ServerMessage::MotionState { motion } = receive_server_message(&mut socket).await
+        else {
+            panic!("character control must publish lightweight motion state");
+        };
+        assert_eq!(motion.event_sequence, receipt.event_sequence);
+        assert_eq!(motion.player.last_processed_input_sequence, 1);
+        assert_eq!(motion.player.movement_epoch, snapshot.player.movement_epoch);
+        assert_eq!(motion.grids.len(), snapshot.grids.len());
+        assert_eq!(motion.world_hash, _state.snapshot().world_hash);
+        socket.close(None).await.expect("test socket closes");
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn status_reports_conserved_genesis() {
         let response = test_app()
             .oneshot(
