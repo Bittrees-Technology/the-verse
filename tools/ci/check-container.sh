@@ -8,7 +8,7 @@ container_name="verse-p0-ci-${GITHUB_RUN_ID:-$$}"
 host_port="${VERSE_CONTAINER_TEST_PORT:-17999}"
 
 cleanup() {
-  docker stop "${container_name}" >/dev/null 2>&1 || true
+  docker rm --force "${container_name}" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -18,11 +18,12 @@ docker build \
   --tag "${image_name}" \
   .
 docker run \
-  --rm \
   --detach \
   --name "${container_name}" \
-  --publish "127.0.0.1:${host_port}:7777" \
-  "${image_name}" >/dev/null
+  --network host \
+  "${image_name}" \
+  --bind "127.0.0.1:${host_port}" \
+  --data-directory /home/verse/data >/dev/null
 
 for _ in {1..200}; do
   if curl --fail --silent "http://127.0.0.1:${host_port}/healthz" >/dev/null; then
