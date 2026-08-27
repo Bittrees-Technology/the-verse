@@ -11,18 +11,17 @@ The bNOTE acquisition interface and Base BIT/bridge deployment manifest are inte
 ## Active P1 sequencing
 
 The [P1.4 physical-industry slice](../gameplay/physical-industry.md) is
-implemented and locally verified in the current authoritative cell before full
-interest management. Its queues and escrow are actor-private and do not depend
-on public-scale replication. Hosted CI remains its evidence gate. Interest
-management must next include visible machine state without exposing private
-queue or inventory fields.
+implemented and verified in the current authoritative cell. Its queues and
+escrow remain actor-private under the implemented P1.5 interest projection;
+visible machines expose only their permitted public structure and operating
+state.
 
 The first P1.4 slice advances production only in an active cell. Dynamic cell
 scheduling must reuse the same integer-tick production event before the project
 claims sleeping-cell, background, or offline production. This ordering improves
 the playable work loop without inventing a second production state machine.
 
-P1.5 is the fixed-celestial and interest-management correctness slice. It pins
+P1.5 is the active fixed-celestial and interest-management correctness slice. It pins
 the current planet and asteroid to immutable hierarchical universe addresses,
 validates a versioned proof separation threshold, and replaces whole-cell
 fanout with deterministic server-derived interest baselines and deltas. Player
@@ -30,6 +29,18 @@ views follow authoritative position. The browser receives a bounded public
 spectator view. Visible machines may expose only coarse operating state; actor
 inventories, production queues, job details, progress, cargo handles, and
 escrow remain private.
+
+The local implementation now builds immutable public projection material once
+on first demand for each authoritative revision, uses exact-address spatial
+buckets for per-session candidate queries, and projects outside the runtime
+lock. The local distribution harness has admitted and resynchronized `2`, `8`,
+`16`, `32`, and `64` simultaneous public spectators with 25 visible entities
+per session. A synthetic regression adds 2,048 irrelevant far entities and
+proves the queried bucket count, visited candidate count, selected identities,
+and resulting view remain unchanged. These are local correctness and bounded-
+work results, not a production-capacity claim. Active-player load, independent
+client view-hash verification, hosted evidence for the latest revision, and the
+partitioned thousand-participant envelope remain open gates.
 
 P1.5 deliberately remains inside one active authoritative cell. It does not
 materialize frontier sectors, allocate workers dynamically, hand entities

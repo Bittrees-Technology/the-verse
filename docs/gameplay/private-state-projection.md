@@ -1,6 +1,7 @@
 # Private player state projection
 
-**Status:** P1.4 local proof implemented; P1.5 interest composition specified
+**Status:** P1.5 local interest/private composition implemented and verified;
+independent client hash evidence remains open
 
 ## Player promise
 
@@ -10,11 +11,11 @@ player receives their own suit inventory, cargo on grids they own, and their
 protected death drops through a private session overlay. Another player and a
 spectator receive none of those records.
 
-P1.4 sessions still receive the same complete public proof cell: player and
+Protocol-16 sessions receive an authorized public interest view of player and
 ship positions, visible life state, grid owners, blocks, voxels, and canonical
-event sequence. P1.5 narrows those records to an authorized public interest
-view. Privacy and interest change presentation, not canonical simulation or
-mutation authority.
+frontiers. The bound player receives a separately derived private overlay tied
+to that same view revision. Privacy and interest change presentation, not
+canonical simulation or mutation authority.
 
 ## Visibility matrix
 

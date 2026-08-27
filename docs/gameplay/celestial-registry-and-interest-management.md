@@ -64,6 +64,33 @@ separation, cruise speeds, and journey-duration ranges remain governed by
 OQ-010. A configurable proof fixture may validate separation mechanics without
 claiming that its numeric distance is final.
 
+## Current implementation evidence
+
+The local proof implements the exact registry and manifest bindings, immutable
+fixed-body addresses, protocol-16 baselines and deltas, per-kind hysteresis and
+cadence, actor-private composition, public spectator projection, browser maps,
+and stable native streamed-entity lifecycle. Structural changes bypass a lower
+motion cadence, so a mined voxel, block construction/damage transition, death
+drop, or life-state change cannot remain stale indefinitely.
+
+The worker lazily builds one immutable, exact-address spatial source per
+authoritative revision and shares it across session projections outside the
+runtime lock. The local scale harness admits and resynchronizes `2`, `8`, `16`,
+`32`, and `64` simultaneous public-origin spectators. Every session receives
+the same bounded 25-entity view; the measured 64-session run completed without
+failed sessions and explicitly records `production_readiness_claim: false`.
+A separate regression adds 2,048 irrelevant far entities and proves they do not
+increase intersecting bucket lookups, visited candidates, query identities, or
+selected view membership.
+
+The full local playable scenario passes two-player mining and control,
+refining, manufacturing, inventory transfer, construction, welding, damage,
+grid splitting, death-drop, oxygen, respawn, exact recovery, and both native
+client identities. Still open are independent client-side view-hash
+verification, active-player rather than spectator load distributions, hosted
+evidence for the latest revision, WAN/failure/soak testing, partitioned
+thousand-participant evidence, and the production binary codec.
+
 ## Scope
 
 ### Included
