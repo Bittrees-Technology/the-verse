@@ -96,22 +96,25 @@ if [[ -z "${godot_bin}" ]] && [[ -x "artifacts/toolchains/godot-4.7.2/Godot.app/
   godot_bin="artifacts/toolchains/godot-4.7.2/Godot.app/Contents/MacOS/Godot"
 fi
 if [[ -n "${godot_bin}" ]]; then
-  echo "VERSE_GODOT_SMOKE_START bin=${godot_bin}"
-  set +e
-  "${godot_bin}" \
-    --verbose \
-    --headless \
-    --path apps/native-client \
-    -- \
-    "--server=ws://127.0.0.1:${verse_port}/ws" \
-    --smoke-test
-  godot_status="$?"
-  set -e
-  if [[ "${godot_status}" -ne 0 ]]; then
-    echo "Godot native smoke failed with status ${godot_status}" >&2
-    sed -n '1,240p' "${verse_test_dir}/server.log" >&2
-    exit "${godot_status}"
-  fi
+  for player_id in player-local player-remote; do
+    echo "VERSE_GODOT_SMOKE_START bin=${godot_bin} player=${player_id}"
+    set +e
+    "${godot_bin}" \
+      --verbose \
+      --headless \
+      --path apps/native-client \
+      -- \
+      "--server=ws://127.0.0.1:${verse_port}/ws" \
+      "--player-id=${player_id}" \
+      --smoke-test
+    godot_status="$?"
+    set -e
+    if [[ "${godot_status}" -ne 0 ]]; then
+      echo "Godot native smoke failed for ${player_id} with status ${godot_status}" >&2
+      sed -n '1,240p' "${verse_test_dir}/server.log" >&2
+      exit "${godot_status}"
+    fi
+  done
 else
   echo "Godot smoke skipped: set GODOT_BIN to a Godot 4.7.2 executable"
 fi

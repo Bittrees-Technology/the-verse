@@ -10,9 +10,9 @@ use verse_physics::{
     SphereColliderSpec, Vec3 as PhysicsVec3,
 };
 use verse_protocol::{
-    BlockKind, ClientMessage, IVec3, IntentReceipt, InventoryContents, InventoryDomain,
-    LocomotionKind, LocomotionSupportSnapshot, MotionSnapshot, PlayerDeathCause, PlayerLifeState,
-    PlayerLocomotionSnapshot, Quat, ResourceKind, Vec3, WorldSnapshot,
+    BlockKind, CareerSnapshot, ClientMessage, IVec3, IntentReceipt, InventoryContents,
+    InventoryDomain, LocomotionKind, LocomotionSupportSnapshot, MotionSnapshot, PlayerDeathCause,
+    PlayerLifeState, PlayerLocomotionSnapshot, Quat, ResourceKind, Vec3, WorldSnapshot,
 };
 
 use crate::content;
@@ -166,6 +166,97 @@ impl Runtime {
 
     pub const fn state(&self) -> &WorldState {
         &self.state
+    }
+
+    /// Adds a deterministic loopback-development actor before the first
+    /// canonical event. This is a server-authorized fixture, never a gameplay
+    /// hello side effect, and cannot rewrite an active universe history.
+    pub fn admit_development_player(&mut self, player_id: &str) -> Result<bool, RuntimeError> {
+        if self.halted {
+            return Err(RuntimeError::Halted);
+        }
+        if self.state.player.by_id.contains_key(player_id) {
+            return Ok(false);
+        }
+        if self.state.event_sequence != 0 {
+            return Err(IntentError::rejected(
+                "development_admission_requires_fresh_world",
+                "development players can be pre-admitted only before the first canonical event",
+            )
+            .into());
+        }
+
+        let mut next_state = self.state.clone();
+        let inventory_id = format!("inventory-{player_id}");
+        if next_state.inventories.contains_key(&inventory_id) {
+            return Err(IntentError::rejected(
+                "development_admission_inventory_conflict",
+                "development player inventory identity already exists",
+            )
+            .into());
+        }
+        let mut player = next_state.player.primary().clone();
+        player_id.clone_into(&mut player.player_id);
+        let roster_offset =
+            u32::try_from(next_state.player.by_id.len()).map_or(f64::from(u32::MAX), f64::from);
+        player.position.x += 4.0 * roster_offset;
+        player.orientation = Quat::IDENTITY;
+        player.linear_velocity = Vec3::ZERO;
+        player.angular_velocity = Vec3::ZERO;
+        player.surface_contact = false;
+        player.locomotion.kind = LocomotionKind::Eva;
+        player.locomotion.up = radial_up(player.position);
+        player.locomotion.view_pitch_radians = 0.0;
+        player.locomotion.support = None;
+        player.locomotion.jump_held = false;
+        player.locomotion.jump_buffer_expires_at_simulation_tick = 0;
+        player.locomotion.support_grace_expires_at_simulation_tick = 0;
+        player.locomotion.magnetic_boots_enabled = false;
+        player.locomotion.magnetic_reattach_after_simulation_tick = 0;
+        player.movement_epoch = 1;
+        player.last_received_input_sequence = 0;
+        player.last_processed_input_sequence = 0;
+        player.pending_control_frames.clear();
+        player.control_linear_input = Vec3::ZERO;
+        player.control_angular_input = Vec3::ZERO;
+        player.boost = false;
+        player.dampeners = true;
+        player.jump = false;
+        player.control_expires_at_simulation_tick = 0;
+        player.inventory_id.clone_from(&inventory_id);
+        player.experience = 0;
+        player.career = CareerSnapshot::default();
+        player.suit_oxygen_milli = 1_000;
+        player.helmet_closed = true;
+        player.jetpack_enabled = true;
+        player.life_state = PlayerLifeState::Alive;
+        next_state.player.by_id.insert(player_id.to_owned(), player);
+        next_state.inventories.insert(
+            inventory_id.clone(),
+            InventoryRecord {
+                inventory_id,
+                domain: InventoryDomain::Player {
+                    player_id: player_id.to_owned(),
+                },
+                contents: InventoryContents::default(),
+                capacity_liters: crate::model::PLAYER_INVENTORY_CAPACITY_LITERS,
+            },
+        );
+        next_state
+            .validate_player_roster()
+            .map_err(|message| IntentError::rejected("development_admission_invalid", message))?;
+        if !next_state.conservation().valid {
+            return Err(IntentError::ConservationViolation {
+                event_sequence: next_state.event_sequence,
+            }
+            .into());
+        }
+        let mut next_physics = Scene::new(physics_scene_config())?;
+        next_physics.rebuild(&physics_body_specs(&next_state))?;
+        self.store.save_snapshot(&next_state)?;
+        self.state = next_state;
+        self.physics = next_physics;
+        Ok(true)
     }
 
     #[cfg(test)]
@@ -4448,27 +4539,15 @@ mod tests {
     }
 
     fn add_remote_player(runtime: &mut Runtime) {
-        let mut remote = runtime.state.player.primary().clone();
-        remote.player_id = "player-remote".into();
-        remote.inventory_id = "inventory-player-remote".into();
-        remote.position.x += 4.0;
-        remote.linear_velocity = Vec3::new(0.25, 0.0, 0.0);
+        runtime
+            .admit_development_player("player-remote")
+            .expect("remote development player admits");
         runtime
             .state
             .player
-            .by_id
-            .insert(remote.player_id.clone(), remote);
-        runtime.state.inventories.insert(
-            "inventory-player-remote".into(),
-            InventoryRecord {
-                inventory_id: "inventory-player-remote".into(),
-                domain: InventoryDomain::Player {
-                    player_id: "player-remote".into(),
-                },
-                contents: InventoryContents::default(),
-                capacity_liters: crate::model::PLAYER_INVENTORY_CAPACITY_LITERS,
-            },
-        );
+            .get_mut("player-remote")
+            .expect("remote development player exists")
+            .linear_velocity = Vec3::new(0.25, 0.0, 0.0);
         runtime
             .physics
             .rebuild(&physics_body_specs(&runtime.state))

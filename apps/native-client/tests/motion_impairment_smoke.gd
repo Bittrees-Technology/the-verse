@@ -17,6 +17,7 @@ func _run() -> void:
 	_test_ordering_corrections_and_motion_only_updates()
 	_test_menu_dead_disconnect_and_bounds()
 	_test_life_state_reset()
+	_test_bound_player_roster_selection()
 	if not failures.is_empty():
 		for failure in failures:
 			printerr("VERSE_NATIVE_IMPAIRMENT_FAILED %s" % failure)
@@ -47,6 +48,7 @@ func _new_client(add_to_tree := false) -> Node3D:
 		"simulation_tick": 0,
 		"world_hash": "impairment-0",
 		"player": player,
+		"players": [player],
 		"environment": {
 			"planet_center": _protocol_vec3(Vector3.ZERO),
 			"surface_radius_m": 1200.0,
@@ -55,6 +57,8 @@ func _new_client(add_to_tree := false) -> Node3D:
 		"voxels": [],
 		"grids": [],
 	})
+	client.set("requested_player_id", "impairment-player")
+	client.set("bound_player_id", "impairment-player")
 	client.set("authoritative_player_ready", true)
 	client.set("awaiting_reconnect_baseline", false)
 	client.set("last_player_id", "impairment-player")
@@ -76,6 +80,7 @@ func _new_client(add_to_tree := false) -> Node3D:
 func _base_player() -> Dictionary:
 	return {
 		"player_id": "impairment-player",
+		"inventory_id": "inventory-impairment-player",
 		"position": _protocol_vec3(Vector3.ZERO),
 		"orientation": _protocol_quat(Quaternion.IDENTITY),
 		"linear_velocity": _protocol_vec3(Vector3.ZERO),
@@ -139,8 +144,46 @@ func _motion_message(
 		"simulation_tick": simulation_tick,
 		"world_hash": "impairment-%d" % event_sequence,
 		"player": player,
+		"players": [player],
 		"grids": grids,
 	}
+
+
+func _test_bound_player_roster_selection() -> void:
+	var client := _new_client()
+	var primary := _base_player()
+	primary["player_id"] = "player-local"
+	primary["inventory_id"] = "inventory-player-local"
+	var remote := _base_player()
+	remote["player_id"] = "player-remote"
+	remote["inventory_id"] = "inventory-player-remote"
+	remote["position"] = _protocol_vec3(Vector3(4.0, 0.0, 0.0))
+	client.set("bound_player_id", "player-remote")
+	var roster_snapshot: Dictionary = client.get("snapshot")
+	roster_snapshot["player"] = primary
+	roster_snapshot["players"] = [primary, remote]
+	client.set("snapshot", roster_snapshot)
+	var selected: Dictionary = client.call("_local_player")
+	_check(String(selected.get("player_id", "")) == "player-remote", "bound actor selected")
+	_check(
+		String(client.call("_local_inventory_id")) == "inventory-player-remote",
+		"bound actor inventory selected"
+	)
+	remote["position"] = _protocol_vec3(Vector3(9.0, 1.0, -2.0))
+	client.call("_apply_motion_state", {
+		"event_sequence": 1,
+		"simulation_tick": 1,
+		"world_hash": "impairment-roster-1",
+		"player": primary,
+		"players": [primary, remote],
+		"grids": [],
+	})
+	var merged: Dictionary = client.call("_local_player")
+	_check(String(merged.get("player_id", "")) == "player-remote", "motion keeps bound actor")
+	_check(
+		client.call("_vec3", merged.get("position", {})).is_equal_approx(Vector3(9.0, 1.0, -2.0)),
+		"bound actor motion merged"
+	)
 
 
 func _test_received_vs_processed_reconciliation() -> void:
@@ -357,6 +400,7 @@ func _test_menu_dead_disconnect_and_bounds() -> void:
 	var dead_player: Dictionary = dead_snapshot.get("player", {}).duplicate(true)
 	dead_player["life_state"] = {"kind": "incapacitated"}
 	dead_snapshot["player"] = dead_player
+	dead_snapshot["players"] = [dead_player]
 	client.set("snapshot", dead_snapshot)
 	client.call("_physics_process", FIXED_DELTA)
 	_check(int(client.get("predicted_simulation_tick")) == disconnected_tick, "dead prediction stopped")
