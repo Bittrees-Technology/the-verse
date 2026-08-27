@@ -67,6 +67,7 @@ pub struct CharacterDefinition {
     pub boost_maximum_speed_m_s: f64,
     pub maximum_angular_speed_radians_per_second: f64,
     pub maximum_view_pitch_degrees: f64,
+    pub upright_alignment_acceleration_radians_per_second_squared: f64,
     pub walk_speed_m_s: f64,
     pub sprint_speed_m_s: f64,
     pub ground_acceleration_m_s2: f64,
@@ -192,6 +193,13 @@ fn validate_character(definition: &CharacterDefinition) -> Result<(), &'static s
         || !(1.0..89.0).contains(&definition.maximum_view_pitch_degrees)
     {
         return Err("character view pitch limit must be finite and between 1 and 89 degrees");
+    }
+    if !definition
+        .upright_alignment_acceleration_radians_per_second_squared
+        .is_finite()
+        || definition.upright_alignment_acceleration_radians_per_second_squared <= 0.0
+    {
+        return Err("character upright alignment acceleration must be finite and positive");
     }
     if !definition.walk_speed_m_s.is_finite()
         || definition.walk_speed_m_s <= 0.0
@@ -483,6 +491,12 @@ mod tests {
                     character.angular_dampener_acceleration_radians_per_second_squared = invalid;
                 },
                 "character angular dampener acceleration must be finite and positive",
+            );
+            assert_character_rejected(
+                |character| {
+                    character.upright_alignment_acceleration_radians_per_second_squared = invalid;
+                },
+                "character upright alignment acceleration must be finite and positive",
             );
             assert_character_rejected(
                 |character| character.maximum_angular_speed_radians_per_second = invalid,

@@ -1,6 +1,6 @@
 # P0 specification: simulation proof
 
-**Status:** In implementation; P0.9 authoritative EVA is verified on macOS and hosted Ubuntu
+**Status:** In implementation; P0.9 authoritative EVA is verified on macOS and hosted Ubuntu, and P0.10 grounded locomotion is locally verified
 
 ## Purpose
 
@@ -287,7 +287,7 @@ The implemented contract is [P0.9 authoritative EVA physics](../gameplay/authori
 
 ## P0.10 authoritative grounded-locomotion checkpoint
 
-Accepted implementation boundary:
+Implemented local boundary:
 
 - Extend the P0.9 input FIFO rather than adding a client transform or a second character clock.
 - Use protocol 10, world schema 13, event schema 8, content schema 8, and manifest `p0.10.0` for the incompatible locomotion state.
@@ -296,6 +296,8 @@ Accepted implementation boundary:
 - Add false-to-true jump buffering, radial upright orientation, walk/sprint motors, slope hysteresis, bounded step and ground-snap queries, grid-relative support anchors, exact support-point velocity inheritance, and magnetic attachment to completed grid colliders.
 - Keep grids and the player in one atomic `PhysicsStepCommitted` time domain; replay validates committed support-aware envelopes without rerunning Jolt.
 - Reconcile native prediction relative to a stable support and expose original `EVA`, `FREEFALL`, `GROUND`, `MAG-LOCK`, and `BOOTS ARMED` feedback.
+
+Locally verified evidence now covers the true capsule collider and stable casts; walk/sprint/brake; buffered edge-triggered jump; 50° entry and 52° exit slope thresholds; bounded clear-step acceptance and over-height rejection; ground snap; radial upright alignment on all six planet axes and continuous pole-neighborhood traversal without quaternion flips; completed-block-only magnetic eligibility; translating-grid support velocity; rotating-grid local-anchor retention; destruction-driven detach without teleportation; collider-identity rebind after a grid split; full-capsule respawn and construction exclusion; client-side radial-upright prediction; persistence replay; and real client/server restart recovery. Hosted Ubuntu, Linux packaging, and release performance evidence remain required before P0.10 publication.
 
 The complete contract and acceptance matrix are [P0.10 authoritative grounded and magnetic locomotion](../gameplay/authoritative-grounded-locomotion.md), with the authority decision in [ADR-0014](../decisions/ADR-0014-authoritative-grounded-and-magnetic-locomotion.md). Ladders, crouching, ragdolls, character-to-character collision, impact damage, suit power, artificial gravity, cockpit possession, and production multiplayer remain later checkpoints.
 

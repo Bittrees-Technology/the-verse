@@ -20,21 +20,21 @@ use joltc_sys::{
     JPC_BodyInterface_DestroyBody, JPC_BodyInterface_GetAngularVelocity,
     JPC_BodyInterface_GetLinearVelocity, JPC_BodyInterface_GetPosition,
     JPC_BodyInterface_GetRotation, JPC_BodyInterface_GetShape, JPC_BodyInterface_IsActive,
-    JPC_BodyInterface_RemoveBody, JPC_BoxShapeSettings, JPC_BoxShapeSettings_Create,
-    JPC_CapsuleShapeSettings, JPC_CapsuleShapeSettings_Create, JPC_CollideShapeResult,
-    JPC_CollisionEstimationResult, JPC_ContactListener as JpcContactListener,
-    JPC_ContactListener_delete, JPC_ContactListener_new, JPC_ContactListenerFns,
-    JPC_ContactManifold, JPC_ContactSettings, JPC_EstimateCollisionResponse,
-    JPC_JobSystemThreadPool, JPC_JobSystemThreadPool_delete, JPC_JobSystemThreadPool_new3,
-    JPC_MOTION_QUALITY_DISCRETE, JPC_MOTION_QUALITY_LINEAR_CAST, JPC_MOTION_TYPE_DYNAMIC,
-    JPC_MOTION_TYPE_STATIC, JPC_PHYSICS_UPDATE_ERROR_NONE, JPC_PhysicsSystem_GetBodyInterface,
-    JPC_PhysicsSystem_SetContactListener, JPC_PhysicsSystem_Update, JPC_Quat, JPC_RVec3, JPC_Shape,
-    JPC_Shape_GetSubShapeUserData, JPC_Shape_Release, JPC_SphereShapeSettings,
-    JPC_SphereShapeSettings_Create, JPC_StaticCompoundShapeSettings,
-    JPC_StaticCompoundShapeSettings_Create, JPC_String, JPC_String_c_str, JPC_String_delete,
-    JPC_SubShapeIDPair, JPC_SubShapeSettings, JPC_TempAllocatorImpl, JPC_TempAllocatorImpl_delete,
-    JPC_TempAllocatorImpl_new, JPC_VALIDATE_RESULT_ACCEPT_ALL_CONTACTS, JPC_ValidateResult,
-    JPC_Vec3, JPC_Vec4,
+    JPC_BodyInterface_RemoveBody, JPC_BodyInterface_SetPosition, JPC_BoxShapeSettings,
+    JPC_BoxShapeSettings_Create, JPC_CapsuleShapeSettings, JPC_CapsuleShapeSettings_Create,
+    JPC_CollideShapeResult, JPC_CollisionEstimationResult,
+    JPC_ContactListener as JpcContactListener, JPC_ContactListener_delete, JPC_ContactListener_new,
+    JPC_ContactListenerFns, JPC_ContactManifold, JPC_ContactSettings,
+    JPC_EstimateCollisionResponse, JPC_JobSystemThreadPool, JPC_JobSystemThreadPool_delete,
+    JPC_JobSystemThreadPool_new3, JPC_MOTION_QUALITY_DISCRETE, JPC_MOTION_QUALITY_LINEAR_CAST,
+    JPC_MOTION_TYPE_DYNAMIC, JPC_MOTION_TYPE_STATIC, JPC_PHYSICS_UPDATE_ERROR_NONE,
+    JPC_PhysicsSystem_GetBodyInterface, JPC_PhysicsSystem_SetContactListener,
+    JPC_PhysicsSystem_Update, JPC_Quat, JPC_RVec3, JPC_Shape, JPC_Shape_GetSubShapeUserData,
+    JPC_Shape_Release, JPC_SphereShapeSettings, JPC_SphereShapeSettings_Create,
+    JPC_StaticCompoundShapeSettings, JPC_StaticCompoundShapeSettings_Create, JPC_String,
+    JPC_String_c_str, JPC_String_delete, JPC_SubShapeIDPair, JPC_SubShapeSettings,
+    JPC_TempAllocatorImpl, JPC_TempAllocatorImpl_delete, JPC_TempAllocatorImpl_new,
+    JPC_VALIDATE_RESULT_ACCEPT_ALL_CONTACTS, JPC_ValidateResult, JPC_Vec3, JPC_Vec4,
 };
 use rolt::{
     Body as RoltBody, BodyFilter, BodyFilterImpl, BodyId as RoltBodyId, BroadPhaseLayer,
@@ -813,6 +813,23 @@ impl NativeScene {
         }
     }
 
+    pub(crate) fn translate_body(&mut self, body_id: &str, displacement: Vec3) {
+        let interface = self.body_interface();
+        let body = self.bodies[body_id];
+        // SAFETY: Safe-adapter validation guarantees this ID is a live dynamic
+        // body and the bounded displacement is finite. The getter and setter
+        // copy values synchronously and retain no pointers.
+        unsafe {
+            let position = from_world_vec3(JPC_BodyInterface_GetPosition(interface, body.id));
+            JPC_BodyInterface_SetPosition(
+                interface,
+                body.id,
+                world_vec3(position + displacement),
+                JPC_ACTIVATION_ACTIVATE,
+            );
+        }
+    }
+
     pub(crate) fn step(&mut self, config: &SceneConfig) -> Result<(), PhysicsError> {
         let mut contact_buffer = self.contact_listener_state.buffer.lock().map_err(|_| {
             PhysicsError::Initialization("native contact buffer lock was poisoned".into())
@@ -955,8 +972,10 @@ impl NativeScene {
             .as_ref()
             .expect("live native scene owns physics system");
         let narrow_phase = physics.narrow_phase_query();
-        let mut settings = joltc_sys::JPC_ShapeCastSettings::default();
-        settings.ReturnDeepestPoint = true;
+        let settings = joltc_sys::JPC_ShapeCastSettings {
+            ReturnDeepestPoint: true,
+            ..joltc_sys::JPC_ShapeCastSettings::default()
+        };
         // SAFETY: The temporary shape, collector bridge, filter bridge, and
         // physics query all remain live for this synchronous read-only cast.
         // Query validation bounds every scalar before the f32 conversion.

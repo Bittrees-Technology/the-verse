@@ -29,6 +29,7 @@
     "boost_maximum_speed_m_s": 24.0,
     "maximum_angular_speed_radians_per_second": 2.5,
     "maximum_view_pitch_degrees": 85.0,
+    "upright_alignment_acceleration_radians_per_second_squared": 28.0,
     "walk_speed_m_s": 4.5,
     "sprint_speed_m_s": 7.5,
     "ground_acceleration_m_s2": 18.0,

@@ -108,6 +108,9 @@ pub enum EventPayload {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+// These independent booleans are explicit fields in the versioned event
+// schema; combining them into an enum would remove valid input combinations.
+#[allow(clippy::struct_excessive_bools)]
 pub struct PlayerPhysicsOutcome {
     pub player_id: String,
     pub position: Vec3,

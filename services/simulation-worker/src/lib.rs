@@ -710,6 +710,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn websocket_carries_magnetic_preference_and_jump_through_authoritative_motion() {
+        let (mut socket, state, server) = connect_test_socket().await;
+        assert!(matches!(
+            receive_server_message(&mut socket).await,
+            ServerMessage::Welcome { .. }
+        ));
+        send_client_message(
+            &mut socket,
+            &ClientMessage::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                client_name: "p0.10-locomotion-test-client".into(),
+            },
+        )
+        .await;
+        let ServerMessage::Snapshot { snapshot } = receive_server_message(&mut socket).await else {
+            panic!("compatible handshake must receive a full snapshot");
+        };
+
+        send_client_message(
+            &mut socket,
+            &ClientMessage::SetSuitMode {
+                operation_id: "arm-boots-and-release-jetpack".into(),
+                helmet_closed: snapshot.player.helmet_closed,
+                jetpack_enabled: false,
+                magnetic_boots_enabled: true,
+            },
+        )
+        .await;
+        assert!(matches!(
+            receive_server_message(&mut socket).await,
+            ServerMessage::IntentAccepted { .. }
+        ));
+        let ServerMessage::Snapshot { snapshot } = receive_server_message(&mut socket).await else {
+            panic!("suit-mode intent must publish a complete authoritative snapshot");
+        };
+        assert!(!snapshot.player.jetpack_enabled);
+        assert!(snapshot.player.locomotion.magnetic_boots_enabled);
+        assert_eq!(
+            snapshot.player.locomotion.kind,
+            verse_protocol::LocomotionKind::Airborne
+        );
+
+        send_client_message(
+            &mut socket,
+            &ClientMessage::SetPlayerControl {
+                operation_id: "airborne-jump-edge".into(),
+                movement_epoch: snapshot.player.movement_epoch,
+                input_sequence: 1,
+                linear_input: verse_protocol::Vec3::ZERO,
+                angular_input: verse_protocol::Vec3::ZERO,
+                boost: false,
+                jump: true,
+                dampeners: true,
+            },
+        )
+        .await;
+        assert!(matches!(
+            receive_server_message(&mut socket).await,
+            ServerMessage::IntentAccepted { .. }
+        ));
+        let ServerMessage::MotionState { motion } = receive_server_message(&mut socket).await
+        else {
+            panic!("jump input receipt must publish lightweight authoritative motion");
+        };
+        assert_eq!(motion.player.last_received_input_sequence, 1);
+        assert_eq!(motion.player.last_processed_input_sequence, 0);
+        assert!(motion.player.locomotion.magnetic_boots_enabled);
+        assert!(state.advance(17).expect("authoritative jump edge advances"));
+        let ServerMessage::MotionState { motion } = receive_server_message(&mut socket).await
+        else {
+            panic!("processed jump edge must publish authoritative motion");
+        };
+        assert_eq!(motion.player.last_processed_input_sequence, 1);
+        assert!(motion.player.locomotion.jump_held);
+        assert!(motion.player.locomotion.magnetic_boots_enabled);
+        assert_eq!(
+            motion.player.locomotion.kind,
+            verse_protocol::LocomotionKind::Airborne
+        );
+
+        socket.close(None).await.expect("test socket closes");
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn status_reports_conserved_genesis() {
         let response = test_app()
             .oneshot(

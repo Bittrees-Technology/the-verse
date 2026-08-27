@@ -1,6 +1,6 @@
 # P0.10 authoritative grounded and magnetic locomotion
 
-**Status:** Specification accepted; implementation in progress
+**Status:** Local implementation verified; remaining acceptance and hosted release evidence in progress
 
 ## Player promise
 
@@ -37,9 +37,9 @@ Opening inventory or another modal view sends a neutral transition, but authorit
 
 ## Initial content values
 
-The first implementation uses a 1.80 m standing capsule with 0.34 m radius and a 1.62 m eye height. Walk speed is 4.5 m/s, sprint speed 7.5 m/s, ground acceleration 18 m/s², braking 24 m/s², and jump launch speed 5.0 m/s. A 50-degree slope is walkable with two degrees of exit hysteresis. Step-up is limited to 0.45 m and ground snap to 0.18 m. Jump buffering and coyote time each last six 60 Hz ticks.
+The first implementation uses a 1.80 m standing capsule with 0.34 m radius and a 1.62 m eye height. Walk speed is 4.5 m/s, sprint speed 7.5 m/s, ground acceleration 18 m/s², braking 24 m/s², upright-alignment acceleration 28 rad/s², and jump launch speed 5.0 m/s. A 50-degree slope is walkable with two degrees of exit hysteresis. Step-up is limited to 0.45 m and ground snap to 0.18 m. Jump buffering and coyote time each last six 60 Hz ticks.
 
-All values are server-owned content, not native-client constants. The checked-in values are tuning baselines and may change only through a new content manifest.
+All authoritative values are server-owned content. The native client mirrors the same checked-in values only for prediction and presentation; it cannot use them to choose a canonical outcome. These are tuning baselines and may change only through a new content manifest.
 
 ## Support and movement rules
 
@@ -72,13 +72,11 @@ The server persists received controls before acknowledging them, consumes at mos
 - Impairment: delay, loss, reordering, reconnect, and menu state cannot roll locomotion backward or duplicate jump.
 - Recovery: pending jump, support, magnetic preference, and moving-deck attachment recover with the exact canonical hash.
 
-## Current implementation order
+## Implementation state
 
-1. Add and validate capsule bodies and bounded support/clearance casts in the physics adapter.
-2. Add versioned canonical locomotion state and jump/magnetic intents.
-3. Integrate the grounded motor, radial orientation, slopes, steps, jump, and moving support in the shared authoritative step.
-4. Add native support-relative prediction, controls, HUD states, and an original comfort camera.
-5. Gate deterministic fixtures, failure recovery, impaired-network behavior, live-client playability, and hosted macOS/Linux evidence.
+Implemented and locally gated: capsule bodies and stable casts; versioned locomotion state and input-only intents, including cross-process jump and magnetic-preference delivery; walk/sprint/brake; jump; radial upright alignment on all six planet axes and continuous pole-neighborhood traversal; slope hysteresis; bounded steps and snap; completed-grid-only magnetic support; translating and rotating support retention; deterministic detach when a bound block is destroyed; collider-identity rebind after a grid split; complete-capsule construction and respawn exclusion; native controls, prediction, camera, and HUD; impaired-network behavior; real client/server playability; and exact restart recovery.
+
+Still required before publication: hosted Ubuntu evidence for this version, Linux packaging, and the P0 performance envelope.
 
 ## Explicit limits
 

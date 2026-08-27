@@ -22,6 +22,7 @@ These documents form the initial specification baseline.
 - [P0.7 Server-Authoritative Contact Physics](gameplay/contact-physics.md)
 - [P0.8 Survival Death Foundation](gameplay/survival-death.md)
 - [P0.9 Authoritative EVA Physics](gameplay/authoritative-character-motion.md)
+- [P0.10 Authoritative Grounded and Magnetic Locomotion](gameplay/authoritative-grounded-locomotion.md)
 
 ## Research
 
