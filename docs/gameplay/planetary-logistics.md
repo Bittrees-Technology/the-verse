@@ -2,6 +2,8 @@
 
 **Status:** Implemented local proof
 
+P0.6 supersedes the original near-surface spawn with a physically separate orbital asteroid field. The inventory capacity and suit contracts below remain active; current spatial and interface behavior is specified in [Orbital Operations](orbital-operations.md).
+
 ## Player promise
 
 The engineering loop must read as physical survival work rather than counters over disconnected cubes. Inventory has volume, mass, ownership, and deliberate transfers. Adjacent completed blocks share a sealed one-meter envelope. The nearby celestial body supplies visible terrain, local gravity, atmospheric density, and oxygen rules that affect suit operation.

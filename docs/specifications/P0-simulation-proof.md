@@ -1,6 +1,6 @@
 # P0 specification: simulation proof
 
-**Status:** In implementation; P0.5 Planetary Logistics checkpoint available
+**Status:** In implementation; P0.6 Orbital Operations checkpoint available
 
 ## Purpose
 
@@ -195,6 +195,17 @@ Implemented and continuously verified:
 - Authoritative altitude, local gravity, atmosphere density, oxygen fraction, and breathability snapshots.
 - Persistent helmet seal, jetpack mode, suit oxygen, planetary-surface validation, and gravity-aware client prediction.
 - Protocol, persistence, live-interface, restart, and recovery checks for the new environment and logistics state.
+
+## P0.6 orbital operations checkpoint
+
+Implemented and continuously verified:
+
+- An orbital asteroid origin separated by more than three kilometers from the modeled Khepri surface.
+- Vacuum, weak orbital gravity, and near-surface atmosphere assertions from the same authoritative environment model.
+- Local-axis mouse orientation plus continuous and tapped `Q`/`E` character roll.
+- `[`/`]` construction yaw so flight orientation remains available during build mode and on compact keyboards.
+- A compact connected-inventory interface with container selection, search, category filters, tabular item metrics, selection, and central transfers.
+- Original CC BY-SA geological maps, triplanar asteroid mapping, displaced planet terrain, moving clouds, and atmospheric limb rendering.
 
 ## Exit decision
 

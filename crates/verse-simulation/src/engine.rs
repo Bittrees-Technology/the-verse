@@ -1269,10 +1269,18 @@ mod tests {
     #[test]
     fn planetary_surface_rejects_underground_movement() {
         let mut runtime = runtime();
-        runtime.state.player.position = Vec3::new(0.0, -7.3, 0.0);
+        runtime.state.player.position = Vec3::new(
+            PLANET_CENTER.x,
+            PLANET_CENTER.y + PLANET_SURFACE_RADIUS_M + 0.7,
+            PLANET_CENTER.z,
+        );
         let result = runtime.execute(&ClientMessage::MovePlayer {
             operation_id: "walk-through-ground".into(),
-            position: Vec3::new(0.0, -7.8, 0.0),
+            position: Vec3::new(
+                PLANET_CENTER.x,
+                PLANET_CENTER.y + PLANET_SURFACE_RADIUS_M + 0.2,
+                PLANET_CENTER.z,
+            ),
         });
         assert!(matches!(
             result,
@@ -1285,6 +1293,11 @@ mod tests {
     #[test]
     fn suit_modes_and_environment_drive_authoritative_oxygen() {
         let mut runtime = runtime();
+        runtime.state.player.position = Vec3::new(
+            PLANET_CENTER.x,
+            PLANET_CENTER.y + PLANET_SURFACE_RADIUS_M + 10.0,
+            PLANET_CENTER.z,
+        );
         runtime.state.player.suit_oxygen_milli = 900;
         runtime
             .execute(&ClientMessage::SetSuitMode {
@@ -1299,7 +1312,7 @@ mod tests {
         assert!(runtime.advance(250).expect("life support tick"));
         assert_eq!(runtime.state().player.suit_oxygen_milli, 925);
 
-        runtime.state.player.position = Vec3::new(0.0, 100.0, 0.0);
+        runtime.state.player.position = Vec3::ZERO;
         for _ in 0..4 {
             runtime.advance(250).expect("vacuum life support tick");
         }

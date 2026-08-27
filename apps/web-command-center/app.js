@@ -24,7 +24,7 @@ function connect() {
     socket.send(JSON.stringify({
       type: "hello",
       protocol_version: 4,
-      client_name: "browser-command-center-p0.5",
+      client_name: "browser-command-center-p0.6",
     }));
   });
   socket.addEventListener("close", () => {

@@ -179,13 +179,15 @@ async function run() {
     client_name: "node-authoritative-e2e",
   });
   assert.equal(world.conservation.valid, true);
-  assert.equal(world.content_manifest_version, "p0.5.0");
+  assert.equal(world.content_manifest_version, "p0.6.0");
   assert.equal(world.grids.length, 1);
   assert.ok(world.voxels.length > 1_000);
   assert.equal(world.environment.celestial_body_name, "Khepri Prime");
-  assert.equal(world.environment.breathable, true);
-  assert.ok(world.environment.gravity_m_s2 > 4.0);
-  assert.ok(world.environment.atmosphere_density > 0.5);
+  assert.equal(world.environment.breathable, false);
+  assert.ok(world.environment.gravity_m_s2 > 0.3);
+  assert.ok(world.environment.gravity_m_s2 < 1.0);
+  assert.ok(world.environment.altitude_m > 3_000.0);
+  assert.equal(world.environment.atmosphere_density, 0.0);
   assert.equal(world.player.suit_oxygen_milli, 1_000);
   assert.equal(world.player.helmet_closed, true);
   assert.equal(world.player.jetpack_enabled, true);

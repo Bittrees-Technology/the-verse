@@ -490,7 +490,8 @@ mod tests {
         assert!(!snapshot.player.helmet_closed);
         assert!(!snapshot.player.jetpack_enabled);
         assert_eq!(snapshot.player.suit_oxygen_milli, 1_000);
-        assert!(snapshot.environment.breathable);
+        assert!(!snapshot.environment.breathable);
+        assert!(snapshot.environment.altitude_m > 3_000.0);
         let suit = snapshot
             .inventories
             .iter()

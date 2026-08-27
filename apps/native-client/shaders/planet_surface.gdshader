@@ -1,6 +1,8 @@
 shader_type spatial;
 render_mode diffuse_burley, specular_schlick_ggx, cull_back, depth_draw_opaque;
 
+uniform sampler2D planet_albedo : source_color, repeat_enable, filter_linear_mipmap_anisotropic;
+
 varying vec3 terrain_position;
 
 float hash31(vec3 point) {
@@ -35,24 +37,20 @@ void vertex() {
 	vec3 radial = normalize(VERTEX);
 	float broad = terrain_noise(radial * 5.2);
 	float ridges = abs(terrain_noise(radial * 19.0) - 0.5) * 2.0;
-	float displacement = (broad - 0.50) * 1.45 + ridges * 0.26;
+	float displacement = (broad - 0.50) * 18.0 + ridges * 3.2;
 	VERTEX += radial * displacement;
 	terrain_position = VERTEX;
 }
 
 void fragment() {
 	vec3 radial = normalize(terrain_position);
-	float broad = terrain_noise(radial * 5.2);
 	float detail = terrain_noise(radial * 34.0);
 	float mineral = terrain_noise(radial * 76.0 + vec3(8.0, 2.0, 11.0));
-	vec3 basalt = vec3(0.075, 0.105, 0.115);
-	vec3 iron_sand = vec3(0.25, 0.16, 0.105);
-	vec3 lichen = vec3(0.12, 0.22, 0.18);
-	vec3 ice_dust = vec3(0.34, 0.42, 0.43);
-	vec3 surface = mix(basalt, iron_sand, smoothstep(0.43, 0.72, broad));
-	surface = mix(surface, lichen, smoothstep(0.63, 0.86, detail) * 0.48);
-	surface = mix(surface, ice_dust, smoothstep(0.82, 0.96, mineral) * 0.42);
-	ALBEDO = surface * mix(0.78, 1.18, detail);
+	vec3 mapped_surface = texture(planet_albedo, UV).rgb;
+	vec3 mineral_tint = mix(vec3(0.78, 0.88, 0.90), vec3(0.72, 0.48, 0.31), mineral);
+	vec3 finished_surface = mapped_surface * mineral_tint * mix(0.92, 1.20, detail);
+	ALBEDO = finished_surface * 1.18;
+	EMISSION = finished_surface * 0.055;
 	ROUGHNESS = mix(0.96, 0.72, mineral);
-	METALLIC = smoothstep(0.88, 0.98, mineral) * 0.16;
+	METALLIC = smoothstep(0.90, 0.99, mineral) * 0.10;
 }
