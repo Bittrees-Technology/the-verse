@@ -22,8 +22,8 @@
 
     <main>
       <section class="notice">
-        P1.2 public spectator projection. This screen observes public topology
-        only; pilot inventories, progression, and protected drops remain private.
+        P1.5 bounded public spectator projection. This screen observes approved
+        topology only; pilot inventories, progression, and protected drops remain private.
         <strong id="session-status">CONNECTING // READ-ONLY</strong>
       </section>
 
@@ -55,11 +55,25 @@
           <div class="panel-heading">
             <div>
               <p class="eyebrow">PUBLIC SPECTATOR FEED</p>
-              <h2>ORIGIN CELL // TOP-DOWN</h2>
+              <h2 id="map-title">ORIGIN CELL // TOP-DOWN</h2>
             </div>
-            <button id="resync">RESYNC</button>
+            <div class="map-toolbar" aria-label="Map controls">
+              <button id="map-mode-local" aria-pressed="true">LOCAL</button>
+              <button id="map-mode-universe" aria-pressed="false">UNIVERSE</button>
+              <button id="map-zoom-out" aria-label="Zoom out">−</button>
+              <button id="map-zoom-in" aria-label="Zoom in">+</button>
+              <button id="map-fit">FIT</button>
+              <button id="resync">RESYNC</button>
+            </div>
           </div>
-          <canvas id="universe-map" width="900" height="560"></canvas>
+          <canvas id="universe-map" width="900" height="560" tabindex="0"
+            aria-label="Interactive public universe map; drag to pan, scroll to zoom, and select markers"></canvas>
+          <div class="layer-controls" aria-label="Map layers">
+            <label><input id="layer-players" type="checkbox" checked /> Pilots</label>
+            <label><input id="layer-grids" type="checkbox" checked /> Constructs</label>
+            <label><input id="layer-voxels" type="checkbox" checked /> Voxels</label>
+            <span id="map-scale">—</span>
+          </div>
           <div class="legend">
             <span><i class="rock"></i>Rock</span>
             <span><i class="ore"></i>Ferrite</span>
@@ -87,8 +101,8 @@
           </article>
 
           <article class="panel">
-            <p class="eyebrow">SELECTED CONSTRUCT</p>
-            <h2 id="selected-grid">NO GRID</h2>
+            <p class="eyebrow">SELECTED PUBLIC OBJECT</p>
+            <h2 id="selected-grid">NO SELECTION</h2>
             <div id="grid-details" class="details">Awaiting replication.</div>
             <div class="button-grid">
               <button id="anchor">ANCHOR / RELEASE</button>

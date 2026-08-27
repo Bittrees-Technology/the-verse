@@ -4,7 +4,7 @@ set -euo pipefail
 
 verse_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 godot_binary="${GODOT_BIN:-}"
-release_version="${VERSE_RELEASE_VERSION:-p0.10.0-dev}"
+release_version="${VERSE_RELEASE_VERSION:-p1.5.0-dev}"
 release_root="${verse_root}/artifacts/release"
 staging_root="${release_root}/staging"
 
@@ -99,10 +99,15 @@ cp tools/release/runtime/README.txt "${staging_directory}/README.txt"
 printf '%s\n' \
   "The Verse ${release_version}" \
   "Source revision: ${source_revision}" \
-  "Content manifest: p0.10.0" \
-  "Protocol: 10" \
-  "World schema: 13" \
-  "Event schema: 8" \
+  "Content manifest: p1.5.0" \
+  "Content schema: 11" \
+  "Protocol: 16" \
+  "Projection schema: 3" \
+  "World schema: 18" \
+  "Event schema: 14" \
+  "Celestial registry schema: 1" \
+  "Universe manifest schema: 2" \
+  "Interest schema: 1" \
   "Package: ${release_platform}" \
   "Channel: development" \
   > "${staging_directory}/VERSION.txt"

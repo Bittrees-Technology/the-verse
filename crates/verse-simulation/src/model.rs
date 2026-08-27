@@ -9,13 +9,13 @@ use verse_protocol::{
     EnvironmentSnapshot, GridMotionSnapshot, GridSnapshot, IVec3, IntentReceipt, InventoryContents,
     InventoryDomain, InventorySnapshot, LocomotionKind, MotionSnapshot, PlayerDeathCause,
     PlayerLifeState, PlayerLocomotionSnapshot, PlayerMotionSnapshot, PlayerSnapshot, PowerSnapshot,
-    ProductionJobStatus, ProductionRecipeKind, Quat, ResourceKind, Vec3, VoxelMaterial,
-    VoxelSnapshot, WorldSnapshot,
+    ProductionJobStatus, ProductionRecipeKind, Quat, ResourceKind, UniverseAddress, Vec3,
+    VoxelMaterial, VoxelSnapshot, WorldSnapshot,
 };
 
-use crate::content;
+use crate::{celestial, content};
 
-pub const WORLD_SCHEMA_VERSION: u32 = 17;
+pub const WORLD_SCHEMA_VERSION: u32 = 18;
 pub const PROCESSED_OPERATION_RETENTION_LIMIT: usize = 128;
 pub const PROCESSED_OPERATION_RETAINED_BYTES_LIMIT: usize = 131_072;
 pub const PROCESSED_OPERATION_RECORD_BYTES_LIMIT: usize = 4_096;
@@ -23,12 +23,24 @@ pub const PLAYER_INVENTORY_ID: &str = "inventory-player-local";
 pub const STARTER_GRID_ID: &str = "grid-starter";
 pub const STARTER_INDUSTRY_GRID_ID: &str = "grid-industry-starter";
 pub const STARTER_INDUSTRY_CARGO_INVENTORY_ID: &str = "inventory-cargo-industry-starter";
-pub const PLANET_CENTER: Vec3 = Vec3::new(900.0, -2_200.0, -3_800.0);
-pub const PLANET_SURFACE_RADIUS_M: f64 = 1_200.0;
-pub const PLANET_ATMOSPHERE_HEIGHT_M: f64 = 180.0;
-pub const PLANET_SURFACE_GRAVITY_M_S2: f64 = 6.2;
 pub const PLAYER_INVENTORY_CAPACITY_LITERS: u64 = 1_200;
 pub const CARGO_INVENTORY_CAPACITY_LITERS: u64 = 8_000;
+
+pub fn planet_center() -> Vec3 {
+    celestial::body_center_m(celestial::GRAVITY_BODY_ID)
+}
+
+pub fn planet_surface_radius_m() -> f64 {
+    celestial::body_surface_radius_m(celestial::GRAVITY_BODY_ID)
+}
+
+pub fn planet_atmosphere_height_m() -> f64 {
+    celestial::body_atmosphere_height_m(celestial::GRAVITY_BODY_ID)
+}
+
+pub fn planet_surface_gravity_m_s2() -> f64 {
+    celestial::body_surface_gravity_m_s2(celestial::GRAVITY_BODY_ID)
+}
 
 pub fn valid_player_id(player_id: &str) -> bool {
     !player_id.is_empty()
@@ -46,7 +58,7 @@ pub fn valid_blake3_hex(value: &str) -> bool {
 }
 
 pub fn radial_up(position: Vec3) -> Vec3 {
-    let radial = position - PLANET_CENTER;
+    let radial = position - planet_center();
     let magnitude = radial.magnitude();
     if magnitude > 1.0e-9 && magnitude.is_finite() {
         radial * (1.0 / magnitude)
@@ -183,9 +195,13 @@ fn fixed_lerp(left: i64, right: i64, fraction: i32) -> i64 {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct Player {
     pub player_id: String,
+    pub address: UniverseAddress,
+    /// Bounded active-cell physics pose derived from `address`.
+    #[serde(skip, default)]
     pub position: Vec3,
     pub orientation: Quat,
     pub linear_velocity: Vec3,
@@ -315,6 +331,7 @@ impl Player {
     fn snapshot(&self, environment: EnvironmentSnapshot) -> PlayerSnapshot {
         PlayerSnapshot {
             player_id: self.player_id.clone(),
+            address: self.address.clone(),
             position: self.position,
             orientation: self.orientation,
             linear_velocity: self.linear_velocity,
@@ -347,6 +364,7 @@ impl Player {
     fn motion_snapshot(&self, environment: EnvironmentSnapshot) -> PlayerMotionSnapshot {
         PlayerMotionSnapshot {
             player_id: self.player_id.clone(),
+            address: self.address.clone(),
             position: self.position,
             orientation: self.orientation,
             linear_velocity: self.linear_velocity,
@@ -399,11 +417,15 @@ pub struct ProductionJob {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeathDrop {
     pub drop_id: String,
     pub death_id: String,
     pub inventory_id: String,
     pub owner_player_id: String,
+    pub address: UniverseAddress,
+    /// Bounded active-cell presentation pose derived from `address`.
+    #[serde(skip, default)]
     pub position: Vec3,
     pub created_event_sequence: u64,
     pub cause: PlayerDeathCause,
@@ -581,6 +603,7 @@ impl Block {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Grid {
     pub grid_id: String,
     pub owner_player_id: String,
@@ -588,6 +611,9 @@ pub struct Grid {
     /// successful anchor engagement. A split may preserve this only on its
     /// deterministic primary fragment.
     pub anchor_reward_eligible: bool,
+    pub address: UniverseAddress,
+    /// Bounded active-cell physics pose derived from `address`.
+    #[serde(skip, default)]
     pub position: Vec3,
     pub orientation: Quat,
     pub linear_velocity: Vec3,
@@ -733,11 +759,17 @@ struct OperationCompactionMaterial<'a> {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorldState {
     pub schema_version: u32,
     pub content_manifest_version: String,
     pub universe_id: String,
     pub cell_id: String,
+    pub universe_manifest_hash: String,
+    pub celestial_registry_hash: String,
+    pub cell_address: UniverseAddress,
+    pub gravity_body_id: String,
+    pub voxel_body_id: String,
     pub world_seed: u64,
     pub event_sequence: u64,
     pub simulation_tick: u64,
@@ -757,6 +789,49 @@ pub struct WorldState {
 }
 
 impl WorldState {
+    pub fn address_for_active_position(&self, position: Vec3) -> Result<UniverseAddress, String> {
+        celestial::address_from_local_position(&self.cell_address, position)
+            .map_err(|source| format!("active-cell position cannot be canonicalized: {source}"))
+    }
+
+    pub fn active_position_for_address(&self, address: &UniverseAddress) -> Result<Vec3, String> {
+        celestial::local_position_from_address(&self.cell_address, address)
+            .map_err(|source| format!("canonical address cannot enter active physics: {source}"))
+    }
+
+    /// Restores disposable active-cell poses after persistence deserialization.
+    /// Exact addresses remain the sole persisted spatial authority.
+    pub fn hydrate_spatial_poses(&mut self) -> Result<(), String> {
+        celestial::validate_universe_address(&self.cell_address, &self.universe_id)
+            .map_err(|source| format!("world cell address is invalid: {source}"))?;
+        let origin = self.cell_address.clone();
+        for player in self.player.by_id.values_mut() {
+            player.position = celestial::local_position_from_address(&origin, &player.address)
+                .map_err(|source| {
+                    format!(
+                        "player {} address cannot be hydrated: {source}",
+                        player.player_id
+                    )
+                })?;
+        }
+        for grid in self.grids.values_mut() {
+            grid.position = celestial::local_position_from_address(&origin, &grid.address)
+                .map_err(|source| {
+                    format!("grid {} address cannot be hydrated: {source}", grid.grid_id)
+                })?;
+        }
+        for drop in self.death_drops.values_mut() {
+            drop.position = celestial::local_position_from_address(&origin, &drop.address)
+                .map_err(|source| {
+                    format!(
+                        "death drop {} address cannot be hydrated: {source}",
+                        drop.drop_id
+                    )
+                })?;
+        }
+        Ok(())
+    }
+
     pub fn processed_operation_record(
         &self,
         actor_player_id: &str,
@@ -860,6 +935,34 @@ impl WorldState {
         if self.content_manifest_version != content::manifest().manifest_version {
             return Err("world content manifest does not match the active rules".into());
         }
+        let registry = celestial::registry_snapshot(self.world_seed)
+            .map_err(|source| format!("world celestial registry is invalid: {source}"))?;
+        let universe_manifest = celestial::universe_manifest(
+            self.world_seed,
+            WORLD_SCHEMA_VERSION,
+            crate::event::EVENT_SCHEMA_VERSION,
+        )
+        .map_err(|source| format!("world universe manifest is invalid: {source}"))?;
+        if self.universe_id != registry.universe_id
+            || self.universe_manifest_hash != universe_manifest.manifest_hash
+            || self.celestial_registry_hash != registry.registry_hash
+            || self.cell_address != celestial::cell_origin_address()
+            || self.gravity_body_id != celestial::GRAVITY_BODY_ID
+            || self.voxel_body_id != celestial::VOXEL_BODY_ID
+            || !registry
+                .bodies
+                .iter()
+                .any(|body| body.body_id == self.gravity_body_id)
+            || !registry
+                .bodies
+                .iter()
+                .any(|body| body.body_id == self.voxel_body_id && body.voxel_field_id.is_some())
+        {
+            return Err(
+                "world identity must match the immutable universe manifest and celestial registry"
+                    .into(),
+            );
+        }
         self.player.validate().map_err(str::to_owned)?;
         let mut inventory_ids = BTreeSet::new();
         let finite_vec =
@@ -885,6 +988,9 @@ impl WorldState {
                 ),
             );
             if !finite_vec(player.position)
+                || celestial::validate_universe_address(&player.address, &self.universe_id).is_err()
+                || !celestial::local_position_from_address(&self.cell_address, &player.address)
+                    .is_ok_and(|position| position == player.position)
                 || !finite_vec(player.linear_velocity)
                 || !finite_vec(player.angular_velocity)
                 || !player.orientation.is_finite()
@@ -951,6 +1057,9 @@ impl WorldState {
                 return Err("every grid must retain one syntactically valid player owner".into());
             }
             if !finite_vec(grid.position)
+                || celestial::validate_universe_address(&grid.address, &self.universe_id).is_err()
+                || !celestial::local_position_from_address(&self.cell_address, &grid.address)
+                    .is_ok_and(|position| position == grid.position)
                 || !finite_vec(grid.linear_velocity)
                 || !finite_vec(grid.angular_velocity)
                 || !finite_vec(grid.control_linear_input)
@@ -1143,6 +1252,9 @@ impl WorldState {
                 || drop.death_id.trim().is_empty()
                 || !valid_player_id(&drop.owner_player_id)
                 || !finite_vec(drop.position)
+                || celestial::validate_universe_address(&drop.address, &self.universe_id).is_err()
+                || !celestial::local_position_from_address(&self.cell_address, &drop.address)
+                    .is_ok_and(|position| position == drop.position)
                 || drop.created_event_sequence > self.event_sequence
                 || !dropped_inventory_ids.insert(drop.inventory_id.as_str())
             {
@@ -1345,6 +1457,19 @@ impl WorldState {
     }
 
     pub fn genesis(seed: u64) -> Self {
+        let registry = celestial::registry_snapshot(seed)
+            .expect("the embedded celestial registry is valid for the world seed");
+        let universe_manifest = celestial::universe_manifest(
+            seed,
+            WORLD_SCHEMA_VERSION,
+            crate::event::EVENT_SCHEMA_VERSION,
+        )
+        .expect("the embedded universe manifest is valid for the world seed");
+        let cell_address = celestial::cell_origin_address();
+        let canonical_address = |position| {
+            celestial::address_from_local_position(&cell_address, position)
+                .expect("genesis position fits the active-cell address")
+        };
         let player_position = Vec3::new(12.0, 4.5, 10.0);
         let player_inventory = InventoryRecord {
             inventory_id: PLAYER_INVENTORY_ID.into(),
@@ -1420,6 +1545,7 @@ impl WorldState {
             grid_id: STARTER_GRID_ID.into(),
             owner_player_id: "player-local".into(),
             anchor_reward_eligible: true,
+            address: canonical_address(Vec3::new(11.0, 0.0, 0.0)),
             position: Vec3::new(11.0, 0.0, 0.0),
             orientation: Quat::IDENTITY,
             linear_velocity: Vec3::ZERO,
@@ -1479,6 +1605,7 @@ impl WorldState {
             grid_id: STARTER_INDUSTRY_GRID_ID.into(),
             owner_player_id: "player-local".into(),
             anchor_reward_eligible: false,
+            address: canonical_address(Vec3::new(60.0, 0.0, 0.0)),
             position: Vec3::new(60.0, 0.0, 0.0),
             orientation: Quat::IDENTITY,
             linear_velocity: Vec3::ZERO,
@@ -1489,12 +1616,18 @@ impl WorldState {
             anchored: false,
             blocks: industry_blocks,
         };
+        let player_address = canonical_address(player_position);
 
         Self {
             schema_version: WORLD_SCHEMA_VERSION,
             content_manifest_version: content::manifest().manifest_version.clone(),
-            universe_id: "the-verse-local".into(),
-            cell_id: "cell-origin".into(),
+            universe_id: registry.universe_id,
+            cell_id: celestial::ACTIVE_CELL_ID.into(),
+            universe_manifest_hash: universe_manifest.manifest_hash,
+            celestial_registry_hash: registry.registry_hash,
+            cell_address,
+            gravity_body_id: celestial::GRAVITY_BODY_ID.into(),
+            voxel_body_id: celestial::VOXEL_BODY_ID.into(),
             world_seed: seed,
             event_sequence: 0,
             simulation_tick: 0,
@@ -1504,6 +1637,7 @@ impl WorldState {
             last_event_hash: String::new(),
             player: PlayerRoster::from_primary(Player {
                 player_id: "player-local".into(),
+                address: player_address,
                 position: player_position,
                 orientation: Quat::IDENTITY,
                 linear_velocity: Vec3::ZERO,
@@ -1677,6 +1811,7 @@ impl WorldState {
             .map(|grid| GridSnapshot {
                 grid_id: grid.grid_id.clone(),
                 owner_player_id: grid.owner_player_id.clone(),
+                address: grid.address.clone(),
                 position: grid.position,
                 orientation: grid.orientation,
                 linear_velocity: grid.linear_velocity,
@@ -1708,6 +1843,11 @@ impl WorldState {
             content_manifest_version: self.content_manifest_version.clone(),
             universe_id: self.universe_id.clone(),
             cell_id: self.cell_id.clone(),
+            universe_manifest_hash: self.universe_manifest_hash.clone(),
+            celestial_registry_hash: self.celestial_registry_hash.clone(),
+            cell_address: self.cell_address.clone(),
+            gravity_body_id: self.gravity_body_id.clone(),
+            voxel_body_id: self.voxel_body_id.clone(),
             event_sequence: self.event_sequence,
             simulation_tick: self.simulation_tick,
             fencing_token: self.fencing_token,
@@ -1741,6 +1881,7 @@ impl WorldState {
                     death_id: drop.death_id.clone(),
                     inventory_id: drop.inventory_id.clone(),
                     owner_player_id: drop.owner_player_id.clone(),
+                    address: drop.address.clone(),
                     position: drop.position,
                     created_event_sequence: drop.created_event_sequence,
                     cause: drop.cause,
@@ -1753,6 +1894,9 @@ impl WorldState {
     pub fn motion_snapshot(&self) -> MotionSnapshot {
         let primary_environment = self.environment_at(self.player.position);
         MotionSnapshot {
+            universe_manifest_hash: self.universe_manifest_hash.clone(),
+            celestial_registry_hash: self.celestial_registry_hash.clone(),
+            cell_address: self.cell_address.clone(),
             event_sequence: self.event_sequence,
             simulation_tick: self.simulation_tick,
             world_hash: self.state_hash(),
@@ -1767,6 +1911,7 @@ impl WorldState {
                 .values()
                 .map(|grid| GridMotionSnapshot {
                     grid_id: grid.grid_id.clone(),
+                    address: grid.address.clone(),
                     position: grid.position,
                     orientation: grid.orientation,
                     linear_velocity: grid.linear_velocity,
@@ -1777,29 +1922,55 @@ impl WorldState {
     }
 
     pub fn environment_at(&self, position: Vec3) -> EnvironmentSnapshot {
+        let gravity_body = celestial::body_snapshot(self.world_seed, &self.gravity_body_id);
+        let registry = celestial::registry_snapshot(self.world_seed)
+            .expect("the world-bound celestial registry remains valid");
+        let nearest_body = registry
+            .bodies
+            .iter()
+            .filter(|body| body.kind != verse_protocol::CelestialBodyKind::AsteroidField)
+            .min_by(|left, right| {
+                let left_center = celestial::body_center_m(&left.body_id);
+                let right_center = celestial::body_center_m(&right.body_id);
+                let left_distance = (position - left_center).magnitude()
+                    - left.surface_radius_um as f64 / 1_000_000.0;
+                let right_distance = (position - right_center).magnitude()
+                    - right.surface_radius_um as f64 / 1_000_000.0;
+                left_distance.total_cmp(&right_distance)
+            })
+            .expect("the registry always contains the proof bodies");
         let radial = Vec3::new(
-            position.x - PLANET_CENTER.x,
-            position.y - PLANET_CENTER.y,
-            position.z - PLANET_CENTER.z,
+            position.x - planet_center().x,
+            position.y - planet_center().y,
+            position.z - planet_center().z,
         );
         let distance = radial.magnitude().max(1.0);
-        let altitude_m = (distance - PLANET_SURFACE_RADIUS_M).max(0.0);
-        let gravity_m_s2 = (PLANET_SURFACE_GRAVITY_M_S2
-            * (PLANET_SURFACE_RADIUS_M / distance).powi(2))
-        .min(PLANET_SURFACE_GRAVITY_M_S2 * 1.25);
+        let altitude_m = (distance - planet_surface_radius_m()).max(0.0);
+        let gravity_m_s2 = (planet_surface_gravity_m_s2()
+            * (planet_surface_radius_m() / distance).powi(2))
+        .min(planet_surface_gravity_m_s2() * 1.25);
         let gravity = Vec3::new(
             -radial.x / distance * gravity_m_s2,
             -radial.y / distance * gravity_m_s2,
             -radial.z / distance * gravity_m_s2,
         );
-        let atmosphere_density = (1.0 - altitude_m / PLANET_ATMOSPHERE_HEIGHT_M).clamp(0.0, 1.0);
-        let oxygen_fraction = if atmosphere_density > 0.0 { 0.19 } else { 0.0 };
+        let atmosphere_density = (1.0 - altitude_m / planet_atmosphere_height_m()).clamp(0.0, 1.0);
+        let oxygen_fraction = if atmosphere_density > 0.0 {
+            f64::from(gravity_body.oxygen_parts_per_million) / 1_000_000.0
+        } else {
+            0.0
+        };
 
         EnvironmentSnapshot {
-            celestial_body_id: "khepri-prime".into(),
-            celestial_body_name: "Khepri Prime".into(),
-            planet_center: PLANET_CENTER,
-            surface_radius_m: PLANET_SURFACE_RADIUS_M,
+            celestial_body_id: gravity_body.body_id,
+            celestial_body_name: gravity_body.display_name,
+            celestial_scale_class: gravity_body.scale_class,
+            nearest_body_id: nearest_body.body_id.clone(),
+            nearest_body_name: nearest_body.display_name.clone(),
+            planet_center: planet_center(),
+            surface_radius_m: planet_surface_radius_m(),
+            distance_to_center_m: distance,
+            distance_to_surface_m: distance - planet_surface_radius_m(),
             altitude_m,
             gravity,
             gravity_m_s2,
@@ -1839,6 +2010,186 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
+
+    #[test]
+    fn genesis_binds_the_exact_registry_manifest_and_active_cell() {
+        let world = WorldState::genesis(127);
+        let registry = celestial::registry_snapshot(127).expect("registry builds");
+        let manifest = celestial::universe_manifest(
+            127,
+            WORLD_SCHEMA_VERSION,
+            crate::event::EVENT_SCHEMA_VERSION,
+        )
+        .expect("universe manifest builds");
+
+        assert_eq!(world.universe_manifest_hash, manifest.manifest_hash);
+        assert_eq!(world.celestial_registry_hash, registry.registry_hash);
+        assert_eq!(world.cell_address, celestial::cell_origin_address());
+        assert_eq!(world.gravity_body_id, celestial::GRAVITY_BODY_ID);
+        assert_eq!(world.voxel_body_id, celestial::VOXEL_BODY_ID);
+        assert!(world.validate_player_roster().is_ok());
+    }
+
+    fn world_with_exact_death_drop(seed: u64) -> WorldState {
+        let mut world = WorldState::genesis(seed);
+        world.event_sequence = 1;
+        let inventory_id = "inventory-drop-spatial-test".to_owned();
+        world.inventories.insert(
+            inventory_id.clone(),
+            InventoryRecord {
+                inventory_id: inventory_id.clone(),
+                domain: InventoryDomain::Dropped {
+                    reason: "spatial_persistence_test".into(),
+                    owner_player_id: world.player.player_id.clone(),
+                },
+                contents: InventoryContents::default(),
+                capacity_liters: PLAYER_INVENTORY_CAPACITY_LITERS,
+            },
+        );
+        world.death_drops.insert(
+            "drop-spatial-test".into(),
+            DeathDrop {
+                drop_id: "drop-spatial-test".into(),
+                death_id: "death-spatial-test".into(),
+                inventory_id,
+                owner_player_id: world.player.player_id.clone(),
+                address: world.player.address.clone(),
+                position: world.player.position,
+                created_event_sequence: 1,
+                cause: PlayerDeathCause::OxygenDepleted,
+            },
+        );
+        world
+    }
+
+    #[test]
+    fn canonical_world_json_persists_exact_addresses_but_not_derived_poses() {
+        let world = world_with_exact_death_drop(128);
+        assert!(world.validate_player_roster().is_ok());
+        let expected_hash = world.state_hash();
+        let value = serde_json::to_value(&world).expect("world serializes");
+        let player = &value["players"]["by_id"]["player-local"];
+        let grid = &value["grids"][STARTER_GRID_ID];
+        let drop = &value["death_drops"]["drop-spatial-test"];
+        for spatial in [player, grid, drop] {
+            assert!(spatial.get("address").is_some());
+            assert!(spatial.get("position").is_none());
+        }
+
+        let mut decoded = serde_json::from_value::<WorldState>(value.clone())
+            .expect("exact world JSON deserializes");
+        assert_eq!(decoded.player.position, Vec3::ZERO);
+        assert_eq!(decoded.grids[STARTER_GRID_ID].position, Vec3::ZERO);
+        assert_eq!(
+            decoded.death_drops["drop-spatial-test"].position,
+            Vec3::ZERO
+        );
+        assert_eq!(decoded.state_hash(), expected_hash);
+        decoded
+            .hydrate_spatial_poses()
+            .expect("exact addresses hydrate bounded poses");
+        assert_eq!(decoded.player.address, world.player.address);
+        assert_eq!(decoded.player.position, world.player.position);
+        assert_eq!(
+            decoded.grids[STARTER_GRID_ID].address,
+            world.grids[STARTER_GRID_ID].address
+        );
+        assert_eq!(
+            decoded.death_drops["drop-spatial-test"].address,
+            world.death_drops["drop-spatial-test"].address
+        );
+        assert_eq!(decoded.state_hash(), expected_hash);
+        assert!(decoded.validate_player_roster().is_ok());
+    }
+
+    #[test]
+    fn exact_spatial_persistence_rejects_unknown_and_stale_inputs() {
+        let world = WorldState::genesis(129);
+        let mut unknown_world = serde_json::to_value(&world).expect("world serializes");
+        unknown_world
+            .as_object_mut()
+            .expect("world is an object")
+            .insert("unexpected_world_field".into(), serde_json::json!(true));
+        assert!(serde_json::from_value::<WorldState>(unknown_world).is_err());
+
+        let mut unknown_player = serde_json::to_value(&world).expect("world serializes");
+        unknown_player["players"]["by_id"]["player-local"]
+            .as_object_mut()
+            .expect("player is an object")
+            .insert("unexpected_spatial_field".into(), serde_json::json!(true));
+        assert!(serde_json::from_value::<WorldState>(unknown_player).is_err());
+
+        let mut stale_pose = world.clone();
+        stale_pose.player.position.x += 0.000_000_4;
+        assert!(stale_pose.validate_player_roster().is_err());
+
+        let mut stale_address = world;
+        stale_address
+            .grids
+            .get_mut(STARTER_GRID_ID)
+            .expect("starter grid exists")
+            .address
+            .local_um
+            .x += 1;
+        assert!(stale_address.validate_player_roster().is_err());
+
+        let mut wrong_universe = WorldState::genesis(129);
+        wrong_universe.player.address.universe_id = "another-universe".into();
+        assert!(wrong_universe.validate_player_roster().is_err());
+
+        let mut noncanonical = WorldState::genesis(129);
+        noncanonical.player.address.local_um.x =
+            i64::try_from(celestial::CELL_EDGE_UM / 2).expect("half-cell fits i64");
+        assert!(noncanonical.validate_player_roster().is_err());
+
+        let mut unsafe_distance = WorldState::genesis(129);
+        unsafe_distance.player.address.sector.x = i128::MAX.to_string();
+        assert!(unsafe_distance.hydrate_spatial_poses().is_err());
+    }
+
+    #[test]
+    fn environment_uses_registered_gravity_and_nearest_body_identity() {
+        let world = WorldState::genesis(131);
+        let environment = world.environment_at(Vec3::new(12.0, 4.5, 10.0));
+
+        assert_eq!(environment.celestial_body_id, celestial::GRAVITY_BODY_ID);
+        assert_eq!(environment.celestial_body_name, "Khepri Prime");
+        assert_eq!(
+            environment.celestial_scale_class,
+            verse_protocol::CelestialScaleClass::Proof
+        );
+        assert_eq!(environment.nearest_body_id, celestial::VOXEL_BODY_ID);
+        assert_eq!(environment.nearest_body_name, "Origin Ferrite Asteroid");
+        assert!((environment.surface_radius_m - 1_200.0).abs() <= f64::EPSILON);
+        assert!(environment.distance_to_center_m > environment.surface_radius_m);
+        assert!(
+            (environment.distance_to_surface_m
+                - (environment.distance_to_center_m - environment.surface_radius_m))
+                .abs()
+                <= f64::EPSILON
+        );
+        assert!(!environment.breathable);
+    }
+
+    #[test]
+    fn validation_fails_closed_on_registry_or_manifest_substitution() {
+        let mut registry_substitution = WorldState::genesis(137);
+        registry_substitution.celestial_registry_hash = "0".repeat(64);
+        assert!(
+            registry_substitution
+                .validate_player_roster()
+                .expect_err("registry substitution fails closed")
+                .contains("immutable universe manifest")
+        );
+
+        let mut manifest_substitution = WorldState::genesis(139);
+        manifest_substitution.universe_manifest_hash = "f".repeat(64);
+        assert!(manifest_substitution.validate_player_roster().is_err());
+
+        let mut body_substitution = WorldState::genesis(149);
+        body_substitution.voxel_body_id = celestial::GRAVITY_BODY_ID.into();
+        assert!(body_substitution.validate_player_roster().is_err());
+    }
 
     fn synthetic_operation_record(operation_sequence: u64) -> ProcessedOperationRecord {
         let operation_id = format!("synthetic-{operation_sequence}");
@@ -2092,14 +2443,14 @@ mod tests {
         assert!(environment.altitude_m > 3_000.0);
         assert!(environment.atmosphere_density <= f64::EPSILON);
         assert!(
-            environment.altitude_m > PLANET_SURFACE_RADIUS_M * 2.5,
+            environment.altitude_m > planet_surface_radius_m() * 2.5,
             "the asteroid origin must be visibly and physically separated from the planet"
         );
 
         let near_surface = world.environment_at(Vec3::new(
-            PLANET_CENTER.x,
-            PLANET_CENTER.y + PLANET_SURFACE_RADIUS_M + 10.0,
-            PLANET_CENTER.z,
+            planet_center().x,
+            planet_center().y + planet_surface_radius_m() + 10.0,
+            planet_center().z,
         ));
         assert!(near_surface.breathable);
         assert!(near_surface.gravity_m_s2 > 5.5);
@@ -2165,6 +2516,9 @@ mod tests {
         let mut second = duplicate.grids[STARTER_GRID_ID].clone();
         second.grid_id = "grid-duplicate".into();
         second.position = Vec3::new(100.0, 0.0, 0.0);
+        second.address = duplicate
+            .address_for_active_position(second.position)
+            .expect("duplicate grid position canonicalizes");
         second.blocks = BTreeMap::from([(block.block_id.clone(), block)]);
         duplicate.grids.insert(second.grid_id.clone(), second);
         assert_eq!(

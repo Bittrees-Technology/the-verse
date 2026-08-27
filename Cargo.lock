@@ -1513,6 +1513,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "blake3",
  "clap",
  "futures-util",
  "http",
@@ -1526,6 +1527,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "verse-protocol",
  "verse-simulation",
 ]

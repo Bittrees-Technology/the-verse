@@ -8,10 +8,11 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
+use verse_protocol::UniverseManifestSnapshot;
 
-use crate::content;
 use crate::event::{CanonicalEvent, EVENT_SCHEMA_NAME, EVENT_SCHEMA_VERSION};
 use crate::model::{WORLD_SCHEMA_VERSION, WorldState};
+use crate::{celestial, content};
 
 const MANIFEST_FILE: &str = "universe-manifest.json";
 const SNAPSHOT_FILE: &str = "world-snapshot.json";
@@ -38,6 +39,17 @@ pub enum PersistenceError {
     SeedMismatch { stored: u64, requested: u64 },
     #[error("content manifest mismatch: stored {stored}, runtime {runtime}")]
     ContentManifestMismatch { stored: String, runtime: String },
+    #[error("runtime universe manifest is invalid: {0}")]
+    InvalidRuntimeUniverseManifest(String),
+    #[error("universe manifest mismatch: stored hash {stored_hash}, runtime hash {runtime_hash}")]
+    UniverseManifestMismatch {
+        stored_hash: String,
+        runtime_hash: String,
+    },
+    #[error("world state does not match the opened universe manifest")]
+    WorldUniverseBindingMismatch,
+    #[error("event universe binding mismatch at {context}")]
+    EventUniverseBindingMismatch { context: String },
     #[error("snapshot schema {found} is unsupported; expected {expected}")]
     SnapshotSchema { found: u32, expected: u32 },
     #[error("snapshot content hash is invalid")]
@@ -76,14 +88,7 @@ pub(crate) enum AppendFailpoint {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct UniverseManifest {
-    schema_version: u32,
-    universe_id: String,
-    world_seed: u64,
-    content_manifest_version: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SnapshotDocument {
     schema_version: u32,
     state_hash: String,
@@ -102,6 +107,14 @@ struct EventHeader {
     schema_name: String,
     schema_version: u32,
     event_sequence: u64,
+    #[serde(default)]
+    content_manifest_version: Option<String>,
+    #[serde(default)]
+    universe_id: Option<String>,
+    #[serde(default)]
+    universe_manifest_hash: Option<String>,
+    #[serde(default)]
+    celestial_registry_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,6 +131,7 @@ pub struct Store {
     journal_file: File,
     fencing_token: u64,
     world_seed: u64,
+    universe_manifest: UniverseManifestSnapshot,
     #[cfg(test)]
     append_failpoint: Option<AppendFailpoint>,
 }
@@ -156,32 +170,50 @@ impl Store {
         write_json_to_file(&mut lock_file, &lock_path, &lease)?;
 
         let manifest_path = root.join(MANIFEST_FILE);
-        let world_seed = if manifest_path.exists() {
-            let manifest: UniverseManifest = read_json(&manifest_path)?;
-            if manifest.world_seed != requested_seed {
+        let runtime_manifest = celestial::universe_manifest(
+            requested_seed,
+            WORLD_SCHEMA_VERSION,
+            EVENT_SCHEMA_VERSION,
+        )
+        .map_err(|source| PersistenceError::InvalidRuntimeUniverseManifest(source.to_string()))?;
+        if manifest_path.exists() {
+            let stored_value: serde_json::Value = read_json(&manifest_path)?;
+            let stored: UniverseManifestSnapshot = serde_json::from_value(stored_value.clone())
+                .map_err(|source| PersistenceError::Json {
+                    path: manifest_path.clone(),
+                    source,
+                })?;
+            let requested_seed_text = requested_seed.to_string();
+            if stored.world_seed != requested_seed_text {
+                let stored_seed = stored.world_seed.parse::<u64>().map_err(|_| {
+                    PersistenceError::UniverseManifestMismatch {
+                        stored_hash: stored.manifest_hash.clone(),
+                        runtime_hash: runtime_manifest.manifest_hash.clone(),
+                    }
+                })?;
                 return Err(PersistenceError::SeedMismatch {
-                    stored: manifest.world_seed,
+                    stored: stored_seed,
                     requested: requested_seed,
                 });
             }
             let runtime_content = &content::manifest().manifest_version;
-            if manifest.content_manifest_version != *runtime_content {
+            if stored.content_manifest_version != *runtime_content {
                 return Err(PersistenceError::ContentManifestMismatch {
-                    stored: manifest.content_manifest_version,
+                    stored: stored.content_manifest_version,
                     runtime: runtime_content.clone(),
                 });
             }
-            manifest.world_seed
+            let runtime_value = serde_json::to_value(&runtime_manifest)
+                .expect("protocol universe manifest serializes");
+            if stored != runtime_manifest || stored_value != runtime_value {
+                return Err(PersistenceError::UniverseManifestMismatch {
+                    stored_hash: stored.manifest_hash,
+                    runtime_hash: runtime_manifest.manifest_hash.clone(),
+                });
+            }
         } else {
-            let manifest = UniverseManifest {
-                schema_version: 1,
-                universe_id: "the-verse-local".into(),
-                world_seed: requested_seed,
-                content_manifest_version: content::manifest().manifest_version.clone(),
-            };
-            write_json_atomic(&manifest_path, &manifest)?;
-            requested_seed
-        };
+            write_json_atomic(&manifest_path, &runtime_manifest)?;
+        }
 
         let journal_path = root.join(JOURNAL_FILE);
         let journal_file = OpenOptions::new()
@@ -196,7 +228,8 @@ impl Store {
             lock_file,
             journal_file,
             fencing_token,
-            world_seed,
+            world_seed: requested_seed,
+            universe_manifest: runtime_manifest,
             #[cfg(test)]
             append_failpoint: None,
         })
@@ -216,7 +249,14 @@ impl Store {
                     expected: WORLD_SCHEMA_VERSION,
                 });
             }
-            let snapshot: SnapshotDocument = read_json(&snapshot_path)?;
+            let mut snapshot: SnapshotDocument = read_json(&snapshot_path)?;
+            snapshot
+                .state
+                .hydrate_spatial_poses()
+                .map_err(PersistenceError::InvalidPlayerRoster)?;
+            if !self.world_binding_matches(&snapshot.state) {
+                return Err(PersistenceError::WorldUniverseBindingMismatch);
+            }
             snapshot
                 .state
                 .validate_player_roster()
@@ -229,7 +269,11 @@ impl Store {
             }
             snapshot.state
         } else {
-            WorldState::genesis(self.world_seed)
+            let state = WorldState::genesis(self.world_seed);
+            if !self.world_binding_matches(&state) {
+                return Err(PersistenceError::WorldUniverseBindingMismatch);
+            }
+            state
         };
 
         let journal_path = self.root.join(JOURNAL_FILE);
@@ -274,9 +318,6 @@ impl Store {
                     line: index + 1,
                     message: source.to_string(),
                 })?;
-            if header.event_sequence <= state.event_sequence {
-                continue;
-            }
             if header.schema_name != EVENT_SCHEMA_NAME
                 || header.schema_version != EVENT_SCHEMA_VERSION
             {
@@ -287,6 +328,14 @@ impl Store {
                     expected_name: EVENT_SCHEMA_NAME,
                     expected_version: EVENT_SCHEMA_VERSION,
                 });
+            }
+            if !self.event_header_binding_matches(&header) {
+                return Err(PersistenceError::EventUniverseBindingMismatch {
+                    context: format!("journal line {}", index + 1),
+                });
+            }
+            if header.event_sequence <= state.event_sequence {
+                continue;
             }
             let event: CanonicalEvent =
                 serde_json::from_str(line).map_err(|source| PersistenceError::CorruptJournal {
@@ -303,11 +352,19 @@ impl Store {
         state
             .validate_player_roster()
             .map_err(PersistenceError::InvalidPlayerRoster)?;
+        if !self.world_binding_matches(&state) {
+            return Err(PersistenceError::WorldUniverseBindingMismatch);
+        }
         Ok(state)
     }
 
     pub fn append_event(&mut self, event: &CanonicalEvent) -> Result<(), PersistenceError> {
         self.verify_fencing_token()?;
+        if !self.event_binding_matches(event) {
+            return Err(PersistenceError::EventUniverseBindingMismatch {
+                context: "append".into(),
+            });
+        }
         #[cfg(test)]
         if self.consume_append_failpoint(AppendFailpoint::BeforeWrite) {
             return Err(PersistenceError::InjectedFailure("before journal write"));
@@ -331,6 +388,9 @@ impl Store {
 
     pub fn save_snapshot(&mut self, state: &WorldState) -> Result<(), PersistenceError> {
         self.verify_fencing_token()?;
+        if !self.world_binding_matches(state) {
+            return Err(PersistenceError::WorldUniverseBindingMismatch);
+        }
         state
             .validate_player_roster()
             .map_err(PersistenceError::InvalidPlayerRoster)?;
@@ -342,6 +402,31 @@ impl Store {
             state: state.clone(),
         };
         write_json_atomic(&self.root.join(SNAPSHOT_FILE), &snapshot)
+    }
+
+    fn world_binding_matches(&self, state: &WorldState) -> bool {
+        state.world_seed == self.world_seed
+            && state.universe_id == self.universe_manifest.universe_id
+            && state.content_manifest_version == self.universe_manifest.content_manifest_version
+            && state.universe_manifest_hash == self.universe_manifest.manifest_hash
+            && state.celestial_registry_hash == self.universe_manifest.celestial_registry_hash
+    }
+
+    fn event_header_binding_matches(&self, header: &EventHeader) -> bool {
+        header.content_manifest_version.as_deref()
+            == Some(self.universe_manifest.content_manifest_version.as_str())
+            && header.universe_id.as_deref() == Some(self.universe_manifest.universe_id.as_str())
+            && header.universe_manifest_hash.as_deref()
+                == Some(self.universe_manifest.manifest_hash.as_str())
+            && header.celestial_registry_hash.as_deref()
+                == Some(self.universe_manifest.celestial_registry_hash.as_str())
+    }
+
+    fn event_binding_matches(&self, event: &CanonicalEvent) -> bool {
+        event.content_manifest_version == self.universe_manifest.content_manifest_version
+            && event.universe_id == self.universe_manifest.universe_id
+            && event.universe_manifest_hash == self.universe_manifest.manifest_hash
+            && event.celestial_registry_hash == self.universe_manifest.celestial_registry_hash
     }
 
     fn verify_fencing_token(&mut self) -> Result<(), PersistenceError> {
@@ -499,10 +584,159 @@ mod tests {
     }
 
     #[test]
+    fn persisted_universe_manifest_matches_the_protocol_snapshot_exactly() {
+        let directory = tempdir().expect("tempdir");
+        drop(Store::open(directory.path(), 13).expect("store opens"));
+        let stored: UniverseManifestSnapshot =
+            read_json(&directory.path().join(MANIFEST_FILE)).expect("manifest reads");
+        let expected = celestial::universe_manifest(13, WORLD_SCHEMA_VERSION, EVENT_SCHEMA_VERSION)
+            .expect("runtime universe manifest is valid");
+        assert_eq!(stored, expected);
+        assert_eq!(stored.schema_version, 2);
+        assert_eq!(stored.event_schema_version, 14);
+    }
+
+    #[test]
+    fn store_open_rejects_any_exact_manifest_or_hash_substitution() {
+        for (field, replacement) in [
+            ("celestial_registry_hash", serde_json::json!("0".repeat(64))),
+            ("manifest_hash", serde_json::json!("0".repeat(64))),
+            (
+                "frontier_policy_version",
+                serde_json::json!("tampered-frontier-policy"),
+            ),
+            ("unexpected_field", serde_json::json!("must fail closed")),
+        ] {
+            let directory = tempdir().expect("tempdir");
+            drop(Store::open(directory.path(), 17).expect("store opens"));
+            let manifest_path = directory.path().join(MANIFEST_FILE);
+            let mut manifest: serde_json::Value =
+                read_json(&manifest_path).expect("manifest JSON reads");
+            manifest[field] = replacement;
+            fs::write(
+                &manifest_path,
+                serde_json::to_vec_pretty(&manifest).expect("tampered manifest serializes"),
+            )
+            .expect("tampered manifest writes");
+
+            let result = Store::open(directory.path(), 17);
+            if field == "unexpected_field" {
+                assert!(matches!(
+                    result,
+                    Err(PersistenceError::Json { ref path, .. }) if path == &manifest_path
+                ));
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(PersistenceError::UniverseManifestMismatch { .. })
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_private_universe_manifest_is_rejected_fail_closed() {
+        let directory = tempdir().expect("tempdir");
+        drop(Store::open(directory.path(), 17).expect("store opens"));
+        let manifest_path = directory.path().join(MANIFEST_FILE);
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": 1,
+                "universe_id": "the-verse-local",
+                "world_seed": 17,
+                "content_manifest_version": "p1.4.0",
+            }))
+            .expect("legacy manifest serializes"),
+        )
+        .expect("legacy manifest writes");
+
+        assert!(matches!(
+            Store::open(directory.path(), 17),
+            Err(PersistenceError::Json { ref path, .. }) if path == &manifest_path
+        ));
+    }
+
+    #[test]
+    fn append_and_replay_reject_wrong_event_universe_bindings() {
+        let directory = tempdir().expect("tempdir");
+        let mut store = Store::open(directory.path(), 18).expect("store opens");
+        let manifest = store.universe_manifest.clone();
+        let mut event = CanonicalEvent::new(
+            1,
+            manifest.content_manifest_version.clone(),
+            manifest.manifest_hash.clone(),
+            manifest.celestial_registry_hash.clone(),
+            manifest.universe_id.clone(),
+            "cell-origin",
+            store.fencing_token(),
+            None,
+            "system",
+            None,
+            None,
+            None,
+            "",
+            EventPayload::SuitOxygenChanged {
+                player_id: "player-local".into(),
+                previous_oxygen_milli: 1_000,
+                new_oxygen_milli: 995,
+            },
+        );
+        event.celestial_registry_hash = "0".repeat(64);
+        event.event_hash = event.calculate_hash();
+        assert!(matches!(
+            store.append_event(&event),
+            Err(PersistenceError::EventUniverseBindingMismatch { ref context })
+                if context == "append"
+        ));
+        drop(store);
+
+        fs::write(
+            directory.path().join(JOURNAL_FILE),
+            format!(
+                "{}\n",
+                serde_json::to_string(&event).expect("event serializes")
+            ),
+        )
+        .expect("mismatched journal writes");
+        let mut reopened = Store::open(directory.path(), 18).expect("manifest remains valid");
+        assert!(matches!(
+            reopened.load_world(),
+            Err(PersistenceError::EventUniverseBindingMismatch { ref context })
+                if context == "journal line 1"
+        ));
+    }
+
+    #[test]
+    fn snapshot_recovery_rejects_wrong_registry_binding_before_hash_replay() {
+        let directory = tempdir().expect("tempdir");
+        {
+            let mut store = Store::open(directory.path(), 21).expect("store opens");
+            let world = WorldState::genesis(21);
+            store.save_snapshot(&world).expect("snapshot persists");
+        }
+        let snapshot_path = directory.path().join(SNAPSHOT_FILE);
+        let mut snapshot: SnapshotDocument =
+            read_json(&snapshot_path).expect("snapshot document reads");
+        snapshot.state.celestial_registry_hash = "0".repeat(64);
+        snapshot.state_hash = snapshot.state.state_hash();
+        write_json_atomic(&snapshot_path, &snapshot).expect("tampered snapshot writes");
+
+        let mut reopened = Store::open(directory.path(), 21).expect("manifest remains valid");
+        assert!(matches!(
+            reopened.load_world(),
+            Err(PersistenceError::WorldUniverseBindingMismatch)
+        ));
+    }
+
+    #[test]
     fn snapshot_and_journal_recover_identical_world_hash() {
         let directory = tempdir().expect("tempdir");
         let target;
         let expected_hash;
+        let expected_player_address;
+        let expected_player_position;
+        let expected_grid_addresses;
         {
             let mut runtime = Runtime::open(directory.path(), 19, 100).expect("runtime starts");
             target = runtime
@@ -531,11 +765,33 @@ mod tests {
                     coordinate: target,
                 })
                 .expect("mine succeeds");
+            runtime
+                .advance(17)
+                .expect("one exact-address physics outcome commits");
             expected_hash = runtime.state().state_hash();
+            expected_player_address = runtime.state().player.address.clone();
+            expected_player_position = runtime.state().player.position;
+            expected_grid_addresses = runtime
+                .state()
+                .grids
+                .iter()
+                .map(|(grid_id, grid)| (grid_id.clone(), grid.address.clone()))
+                .collect::<Vec<_>>();
         }
 
         let recovered = Runtime::open(directory.path(), 19, 100).expect("runtime recovers");
         assert_eq!(recovered.state().state_hash(), expected_hash);
+        assert_eq!(recovered.state().player.address, expected_player_address);
+        assert_eq!(recovered.state().player.position, expected_player_position);
+        assert_eq!(
+            recovered
+                .state()
+                .grids
+                .iter()
+                .map(|(grid_id, grid)| (grid_id.clone(), grid.address.clone()))
+                .collect::<Vec<_>>(),
+            expected_grid_addresses
+        );
         assert!(!recovered.state().voxels.occupied.contains(&target));
     }
 
@@ -873,8 +1129,12 @@ mod tests {
         let snapshot_path = directory.path().join(SNAPSHOT_FILE);
         let mut snapshot: serde_json::Value =
             read_json(&snapshot_path).expect("snapshot JSON reads");
-        snapshot["state"]["players"]["by_id"]["player-local"]["position"]["x"] =
-            serde_json::json!(999.0);
+        let local_x = snapshot["state"]["players"]["by_id"]["player-local"]["address"]["local_um"]
+            ["x"]
+            .as_i64()
+            .expect("player local x is an integer");
+        snapshot["state"]["players"]["by_id"]["player-local"]["address"]["local_um"]["x"] =
+            serde_json::json!(local_x + 1);
         fs::write(
             &snapshot_path,
             serde_json::to_vec_pretty(&snapshot).expect("snapshot serializes"),
@@ -914,7 +1174,8 @@ mod tests {
     }
 
     #[test]
-    fn pre_p1_1_content_manifests_are_rejected_before_replay() {
+    fn incompatible_content_manifests_are_rejected_before_replay() {
+        let runtime_version = content::manifest().manifest_version.clone();
         for stored_version in ["p0.8.0", "p0.9.0", "p0.10.0"] {
             let directory = tempdir().expect("tempdir");
             drop(Store::open(directory.path(), 41).expect("store"));
@@ -931,7 +1192,7 @@ mod tests {
             assert!(matches!(
                 Store::open(directory.path(), 41),
                 Err(PersistenceError::ContentManifestMismatch { stored, runtime })
-                    if stored == stored_version && runtime == "p1.4.0"
+                    if stored == stored_version && runtime == runtime_version
             ));
         }
     }
