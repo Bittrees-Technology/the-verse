@@ -13,16 +13,13 @@ const elements = Object.fromEntries(
 
 let socket;
 let world;
+let actorPrivate;
 let operationSequence = 0;
 let selectedGridId = "grid-starter";
 let sessionRole = { kind: "spectator" };
 
 function canonicalPlayers(state) {
-  const roster = Array.isArray(state?.players) && state.players.length > 0
-    ? state.players
-    : state?.player
-      ? [state.player]
-      : [];
+  const roster = Array.isArray(state?.players) ? state.players : [];
   return [...roster].sort((left, right) =>
     left.player_id.localeCompare(right.player_id),
   );
@@ -36,8 +33,7 @@ function selectedPlayer(state = world) {
     );
     if (boundPlayer) return boundPlayer;
   }
-  const primaryId = state?.player?.player_id;
-  return players.find((player) => player.player_id === primaryId) ?? players[0];
+  return players[0];
 }
 
 function mergeMotionState(state, motion) {
@@ -53,9 +49,6 @@ function mergeMotionState(state, motion) {
     ...player,
     ...(motionById.get(player.player_id) ?? {}),
   }));
-  const primaryId = state.player?.player_id;
-  const primaryPlayer = players.find((player) => player.player_id === primaryId) ??
-    (motion.player ? { ...state.player, ...motion.player } : state.player);
   const gridMotion = new Map(
     motion.grids.map((grid) => [grid.grid_id, grid]),
   );
@@ -64,7 +57,6 @@ function mergeMotionState(state, motion) {
     event_sequence: motion.event_sequence,
     simulation_tick: motion.simulation_tick,
     world_hash: motion.world_hash,
-    player: primaryPlayer,
     players,
     grids: state.grids.map((grid) => ({
       ...grid,
@@ -85,20 +77,17 @@ function playerColor(playerId, rosterIndex = 0) {
 }
 
 function playerPresentations(state, role = sessionRole) {
-  const primaryId = state?.player?.player_id;
   return canonicalPlayers(state).map((player, rosterIndex) => {
     const isBound = role.kind === "player" &&
       player.player_id === role.player_id;
-    const isPrimary = player.player_id === primaryId;
     const tags = [];
-    if (isPrimary) tags.push("PRIMARY");
     if (isBound) tags.push("BOUND");
-    tags.push((player.life_state?.kind ?? "unknown").toUpperCase());
+    tags.push(String(player.life_state ?? "unknown").toUpperCase());
     return {
       player,
       color: playerColor(player.player_id, rosterIndex),
       isBound,
-      isPrimary,
+      isPrimary: false,
       label: player.player_id + (isBound ? " [YOU]" : ""),
       status: tags.join(" // "),
     };
@@ -119,12 +108,15 @@ function connect() {
     elements.connection.className = "connection online";
     socket.send(JSON.stringify({
       type: "hello",
-      protocol_version: 11,
-      client_name: "browser-command-center-p1.0",
+      protocol_version: 13,
+      client_name: "browser-command-center-p1.2",
       authentication: { kind: "spectator" },
     }));
   });
   socket.addEventListener("close", () => {
+    world = undefined;
+    actorPrivate = undefined;
+    sessionRole = { kind: "spectator" };
     elements.connection.textContent = "○ RECONNECTING";
     elements.connection.className = "connection offline";
     setTimeout(connect, 1200);
@@ -144,7 +136,8 @@ function connect() {
         false,
       );
     } else if (message.type === "snapshot") {
-      world = message.snapshot;
+      actorPrivate = undefined;
+      world = publicProjection(message.snapshot);
       render();
     } else if (message.type === "motion_state" && world) {
       const motion = message.motion;
@@ -159,6 +152,12 @@ function connect() {
       activity("FATAL " + message.code + ": " + message.message, true);
     }
   });
+}
+
+function publicProjection(projected) {
+  if (!projected || typeof projected !== "object") return undefined;
+  const { actor_private: _private, ...publicState } = projected;
+  return publicState;
 }
 
 function intent(type, payload = {}) {
@@ -180,13 +179,6 @@ function intent(type, payload = {}) {
   }));
 }
 
-function playerInventory() {
-  const profile = selectedPlayer();
-  return world?.inventories.find(
-    (inventory) => inventory.inventory_id === profile?.inventory_id,
-  );
-}
-
 function selectedGrid() {
   const preferred = world?.grids.find((grid) => grid.grid_id === selectedGridId);
   return preferred ?? world?.grids[0];
@@ -197,7 +189,7 @@ function environmentForPlayer(state, player = selectedPlayer(state)) {
 }
 
 function render() {
-  const canMutate = sessionRole.kind === "player";
+  const canMutate = false;
   const players = canonicalPlayers(world);
   const profile = selectedPlayer();
   const environment = environmentForPlayer(world, profile);
@@ -207,8 +199,8 @@ function render() {
     world.event_sequence.toLocaleString() + " / " +
     world.simulation_tick.toLocaleString();
   elements["world-hash"].textContent = "hash " + world.world_hash.slice(0, 16);
-  elements.conservation.textContent = world.conservation.valid ? "VALID" : "INVALID";
-  elements.conservation.style.color = world.conservation.valid
+  elements.conservation.textContent = world.conservation_valid ? "VALID" : "INVALID";
+  elements.conservation.style.color = world.conservation_valid
     ? "var(--green)"
     : "var(--red)";
   elements.fence.textContent = "fence " + world.fencing_token;
@@ -224,28 +216,15 @@ function render() {
     (players.length === 1 ? " AUTHORITATIVE PLAYER" : " AUTHORITATIVE PLAYERS");
   elements["session-status"].textContent = sessionDescription();
 
-  const inventory = playerInventory()?.contents ?? {};
-  const ore = inventory.ore ?? 0;
-  const refined = inventory.refined_material ?? 0;
-  elements.ore.textContent = (inventory.ore ?? 0).toLocaleString();
-  elements.refined.textContent =
-    (inventory.refined_material ?? 0).toLocaleString();
-  elements.components.textContent =
-    (inventory.components ?? 0).toLocaleString();
-  const career = profile?.career ?? {};
-  elements["profile-label"].textContent = sessionRole.kind === "player"
-    ? "BOUND PILOT PROFILE"
-    : "PRIMARY PILOT PROFILE";
+  elements.ore.textContent = "PRIVATE";
+  elements.refined.textContent = "PRIVATE";
+  elements.components.textContent = "PRIVATE";
+  elements["profile-label"].textContent = "PUBLIC PILOT PROFILE";
   elements["profile-rank"].textContent =
-    (profile?.player_id ?? "NO ACTIVE PILOT").toUpperCase() +
-    " // LEVEL " + (profile?.level ?? 1);
-  elements["career-progress"].textContent =
-    (profile?.experience ?? 0).toLocaleString() + " / " +
-    (profile?.next_level_experience ?? 100).toLocaleString() + " XP • " +
-    (career.voxels_mined ?? 0).toLocaleString() + " VOXELS • " +
-    (career.blocks_built ?? 0).toLocaleString() + " BLOCKS";
-  elements.refine.disabled = !canMutate || ore < 2;
-  elements.craft.disabled = !canMutate || refined < 1;
+    (profile?.player_id ?? "NO ACTIVE PILOT").toUpperCase();
+  elements["career-progress"].textContent = "PRIVATE TO PILOT";
+  elements.refine.disabled = true;
+  elements.craft.disabled = true;
 
   const grid = selectedGrid();
   if (grid) {
@@ -398,18 +377,8 @@ function start() {
   document.getElementById("resync").addEventListener("click", () => {
     socket?.send(JSON.stringify({ type: "request_snapshot" }));
   });
-  document.getElementById("refine").addEventListener("click", () => {
-    intent("refine_ore", {
-      inventory_id: selectedPlayer()?.inventory_id,
-      batches: 1,
-    });
-  });
-  document.getElementById("craft").addEventListener("click", () => {
-    intent("craft_component", {
-      inventory_id: selectedPlayer()?.inventory_id,
-      quantity: 1,
-    });
-  });
+  document.getElementById("refine").disabled = true;
+  document.getElementById("craft").disabled = true;
   document.getElementById("anchor").addEventListener("click", () => {
     const grid = selectedGrid();
     if (grid) intent("toggle_grid_anchor", { grid_id: grid.grid_id });
@@ -440,6 +409,7 @@ if (globalThis.__VERSE_BROWSER_TEST__) {
   globalThis.__VERSE_BROWSER_TEST_API__ = {
     canonicalPlayers,
     mergeMotionState,
+    publicProjection,
     playerColor,
     playerPresentations,
     environmentForPlayer,
