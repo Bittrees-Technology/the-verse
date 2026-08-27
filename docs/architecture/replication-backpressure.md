@@ -1,51 +1,169 @@
-# P1 latest-state replication backpressure
+# P1 replication and backpressure
 
-**Status:** Implemented local correctness transport; production binary interest management remains required
+**Status:** P1.4 latest-state transport implemented; P1.5 interest contract accepted with implementation evidence pending
 
 ## Failure being prevented
 
-The original worker used a 64-message broadcast ring for complete and motion snapshots. A slow WebSocket receiver lost its cursor, interpreted the loss as a need for a complete world snapshot, and then continued behind the same high-rate stream while serializing and sending that larger snapshot. Repeated lag therefore amplified disposable motion into repeated full-world work.
+The original worker used a 64-message broadcast ring for complete and motion
+snapshots. A slow receiver lost its cursor, requested another complete world,
+and remained behind while serializing that larger response. Disposable motion
+therefore amplified into repeated full-world work.
 
-Motion snapshots are absolute current player and grid state, not deltas. Sending every intermediate motion state to a receiver that is already behind adds latency and cannot improve convergence. Complete structural snapshots are also absolute. A newer complete snapshot subsumes an unsent older complete snapshot, but the client must receive the newest required structure before any newer motion-only state.
+P1.4 fixed that local failure by retaining one complete structural snapshot
+and one newer absolute motion snapshot. It proved bounded coalescing and
+structural-before-motion ordering, but every session still receives the whole
+cell. That transport is not a production scale or privacy boundary.
 
-## Worker contract
+## P1.5 view contract
 
-The worker owns one cell-wide latest-state feed with exactly two optional retained entries:
+[ADR-0020](../decisions/ADR-0020-spatial-interest-replication.md) defines
+protocol `16`, projection schema `3`, and interest schema `1`. The server
+derives each audience's visible set from its immutable actor binding or
+authorized spectator grant, normalized canonical addresses, deterministic
+integer distance bands, dependency rules, and hysteresis. A client cannot
+select its authority or widen interest.
 
-- the newest complete structural snapshot;
-- the newest motion snapshot whose sequence is later than the retained structural snapshot.
+Interest is derived network state. Coalescing, congestion, disconnect, or view
+membership never changes the canonical journal, physics scene, intent
+validation, ownership, inventory, production, or economic state.
 
-Publication occurs while the authoritative runtime lock still orders the mutation. A client cursor separately records its newest state sequence and newest complete-snapshot sequence. On each 60 Hz replication period the connection sends at most one message:
+## Baseline and delta frontier
 
-1. Send an unseen complete structural snapshot first.
-2. Otherwise send only the newest motion snapshot later than the cursor.
-3. Otherwise send nothing.
+Each connection owns:
 
-A slow receiver therefore consumes no per-client state backlog. Missed timer periods use skip semantics. At quiescence it needs at most one complete snapshot and one motion snapshot to reach the current world hash, irrespective of the number of updates produced while it was blocked. Handshake snapshots, direct snapshot requests, and intent receipts remain outside this periodic budget because they are explicit protocol responses.
+- one opaque session epoch;
+- one interest epoch;
+- one baseline ID and acknowledged view hash;
+- one next contiguous delta sequence;
+- one coalesced structural target; and
+- one newest absolute motion target.
 
-The normal lock-order invariant prevents a structural snapshot from appearing behind a motion sequence already sent to the same cursor. If that invariant is ever violated, the worker requests a fresh current complete snapshot instead of sending a lower sequence. This fail-safe prevents stale rollback and preserves structural convergence.
+An `InterestBaseline` is complete for the session's authorized view, not for
+the cell. An `InterestDelta` references that baseline, its contiguous sequence,
+and the previous view hash. It contains ordered complete enters, absolute
+versioned component replacements, and removals only for previously visible
+entities. Every removal has exactly one reason: `out_of_interest`, `destroyed`,
+or `transferred`. It carries no destination, owner, attacker, inventory, cause,
+coordinate, or hidden metadata.
 
-## Full-snapshot boundary
+The baseline and delta retain the canonical event/tick frontier and global
+canonical world commitment used by authoritative reconciliation. Their
+separate deterministic `view_hash` covers only the complete resulting
+audience-authorized projection. Subset clients use the view hash to converge
+their representation and never interpret the global commitment as a listing or
+hash of visible entities.
 
-A complete snapshot is sent for handshake, an explicit client request, or an accepted/system transition whose state is absent from the motion schema. Current examples include inventory, voxel, construction, suit oxygen, and life-state changes. Character control and physics-only progression publish motion snapshots. A repeated idempotent operation at an already-published sequence does not create another retained update.
+The client applies a delta only when session epoch, interest epoch, baseline
+ID, sequence, and previous view hash all match. A mismatch discards the delta
+and requests a current baseline. A client acknowledgement is flow-control
+evidence only and cannot attest to or mutate canonical gameplay.
 
-Motion congestion alone is never a reason to send a complete snapshot.
+## Per-session retention
 
-## Persistence and idle activity
+State publication remains ordered under the runtime's authoritative mutation
+lock, but audience projection happens for the exact connection. Shared state
+may retain canonical dirty markers or wholly public registry data; it may not
+retain an actor-private serialized message under a cell-wide sequence key.
 
-Replication coalescing does not alter the canonical journal. The simulation runtime appends a physics event only while a grid moves or a living player's velocity, input, pending control, control lease, dampener setting, or jetpack-off locomotion keeps physics active. A client that repeatedly renews an unchanged neutral control lease can therefore cause otherwise idle fixed-step journal growth before replication sees the result. The safe fix is to stop redundant neutral control renewal at the input producer or change the canonical control/physics contract with replay evidence; the worker must not silently discard an authoritative active lease.
+For each connection:
 
-Independent one-second oxygen/life-support transitions remain intentional structural journal events.
+1. Structural changes, enters, and removals are folded into one latest target
+   relative to the acknowledged view.
+2. Superseded motion is discarded.
+3. Required structure is sent before later motion that assumes it.
+4. At most one bounded state message is emitted per replication period.
+5. Missed timer periods skip rather than queue.
 
-## Evidence
+The worker may recompute one cumulative delta from the acknowledged view to
+the latest target. It must not retain or concatenate an unbounded series of
+intermediate deltas. A removal cannot be dropped merely because a newer motion
+state exists.
 
-Worker tests cover:
+## Budget and recovery limits
 
-- 4,096 superseded motion updates collapsing to one retained motion state;
-- structural-before-motion ordering even when publication order is adversarial;
-- fresh-snapshot recovery instead of a lower-sequence rollback;
-- an authoritative burst exceeding the removed 64-message ring converging through at most one retained structural and one retained motion message;
-- a per-connection periodic state-send ceiling of 60 Hz;
-- existing handshake, spectator, two-player, control, locomotion, and lifecycle WebSocket behavior.
+Configuration sets explicit maximums for retained bytes, visible entities,
+serialization time, unacknowledged age, delta size, and baseline size. Content
+manifest `p1.5.0` pins gameplay-visible interest bands and cadences; an
+operator cannot secretly widen an audience through a congestion setting.
 
-This is a bounded JSON correctness transport. It is not interest management, a binary delta codec, regional subscription, congestion telemetry, or the final thousand-player transport.
+When a bound is exceeded, a hash or epoch mismatches, the policy or anchor
+changes discontinuously, or the receiver falls behind the retained frontier,
+the worker:
+
+1. discards pending state for the old frontier;
+2. increments the applicable interest epoch when required;
+3. projects one current audience-safe baseline; and
+4. resumes deltas only after that baseline is acknowledged.
+
+It never replays historical baselines in a loop. If the receiver cannot accept
+the bounded baseline, the worker closes the connection. Receipts, handshake,
+fatal errors, and session revocation use separate bounded control queues so a
+motion flood cannot starve them.
+
+Backpressure may lower motion frequency or a versioned presentation-detail
+class. It cannot omit authority-relevant state, expose hidden state, expand
+interest, alter a canonical tick, or tell the simulation to destroy an entity.
+
+## Structural boundary
+
+The following require a structural component replacement, enter or removal,
+or fresh baseline before dependent motion:
+
+- inventory, production queue, escrow, voxel, construction, damage, split, and
+  destruction state;
+- suit oxygen, life-state, spawn, support, docking, and constraint transitions;
+- interest membership and audience-overlay changes; and
+- registry, universe-manifest, policy, or epoch changes.
+
+Pure pose and velocity advancement may use motion replacement. A transition
+that contains both motion and structural state is structural. An idempotent
+retry at an already represented result creates no new state publication.
+
+## Privacy and caching
+
+The P1.5 view hash excludes the global world hash, global event sequence,
+hidden entity counts and IDs, and every other actor's private state. The global
+frontier and commitment remain separately visible and are a documented
+aggregate-activity side channel; P1.5 does not promise traffic-analysis or
+zero-knowledge secrecy. An unseen entity creates no ID, removal, count, or
+per-entity rejection. Newly visible entities receive only their current
+permitted projection, not hidden history.
+
+Dynamic HTTP and WebSocket state is non-cacheable outside the correctly keyed
+session pipeline. Session-projected cache keys include audience, session epoch,
+interest epoch, baseline, projection version, registry hash, and universe
+manifest hash. Projection failure closes with a generic error and never falls
+back to canonical state.
+
+## Persistence and upgrade
+
+Replication state is not canonical and is never stored in world schema `18`
+or event schema `14`. Restart and reconnect create a new session epoch and
+baseline. Upgrade drains protocol `15` sessions before protocol `16` state is
+enabled. Rollback drains protocol `16`; packets, baselines, and acknowledgements
+are never reinterpreted across versions.
+
+The coordinated P1.5 boundary is protocol `16`, projection schema `3`, world
+schema `18`, event schema `14`, content schema `11`, content manifest
+`p1.5.0`, registry schema `1`, universe manifest schema `2`, and interest
+schema `1`.
+
+## Evidence gates
+
+Existing P1.4 tests cover 4,096-motion coalescing, structural ordering,
+fresh-snapshot recovery, bounded bursts, a 60 Hz send ceiling, and actor-private
+projection. P1.5 additionally requires:
+
+- exact enter/exit/hysteresis and negative-coordinate membership vectors;
+- delay, loss, duplicate, reorder, stale epoch, and hash mismatch recovery;
+- no hidden IDs, counts, projected hashes, tombstones, or private overlays
+  across two players and one spectator, apart from the documented global
+  commitment side channel;
+- bounded messages, bytes, work, and baseline rate for a slow consumer;
+- structural enter/removal before dependent motion; and
+- published Mac and hosted-Linux distributions for `2`, `8`, `16`, `32`, and
+  `64` active players plus synthetic nearby entities.
+
+This is still a local-cell scale slice. A final binary codec, multi-process
+cell scheduler, cross-cell handoff, and thousand-participant production result
+remain separate evidence gates.

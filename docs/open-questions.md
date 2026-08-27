@@ -72,7 +72,7 @@ Choose:
 
 **Status:** Requires economic simulation and ADR.
 
-## Critical before gameplay implementation
+## Critical before later gameplay and economy rollout
 
 ### OQ-008 — Registration pricing
 
@@ -92,13 +92,22 @@ Define when a free grid transitions from ordinary single-cell physics into a par
 
 ### OQ-010 — Planet separation and travel speed
 
-Set initial numeric ranges for:
+P1.5 resolves the architecture needed for fixed bodies: a universe manifest
+selects a positive minimum-separation threshold, registry validation applies it
+deterministically, and the proof threshold is versioned without being presented
+as production geography or route balance.
+
+Before multi-day routes or frontier materialization, set production ranges for:
 
 - Minimum planet separation.
 - Ship cruise speeds.
 - Fuel costs.
 - Interception windows.
 - Journey duration targets.
+
+**Status:** Partially resolved. The configurable validation rule and P1.5 proof
+threshold do not block the fixed-registry implementation. Production numbers
+remain required before F-015 frontier materialization and F-016 route rollout.
 
 ## Governance and deployment
 

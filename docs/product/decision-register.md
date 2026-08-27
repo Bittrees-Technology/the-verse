@@ -9,9 +9,9 @@ This register reconciles the planning conversations into explicit project decisi
 | D-001 | Build an original Space Engineers-like voxel industrial universe | Qualified: mechanics and genre goals accepted; code/assets/distinctive expression cannot be copied | Vision, OSS-004/005 |
 | D-002 | Native macOS first | Accepted | PLAT-001 |
 | D-003 | Native Linux and Linux servers | Accepted; Ubuntu 26.04 LTS initial target | PLAT-002/003 |
-| D-004 | Browser management, spectating, Web3 apps, optional cloud streaming | Accepted | PLAT-004/005/007 |
+| D-004 | Browser management, spectating, Web3 apps, optional cloud streaming | Accepted; P1 provides bounded public-cell viewing, while production delayed/permissioned/global spectating remains later | PLAT-004/005/007, F-017/041 |
 | D-005 | One public universe with fixed planets and asteroids | Accepted | WORLD-001/002 |
-| D-006 | Planets widely separated; asteroids may cluster | Accepted; numeric separation unresolved | WORLD-003/004, OQ-010 |
+| D-006 | Planets widely separated; asteroids may cluster | Accepted; P1.5 uses a versioned proof threshold, while production separation and travel tuning remain unresolved | WORLD-003/004, OQ-010 |
 | D-007 | Thousands of concurrent participants | Accepted through partitioned simulation | WORLD-008, ADR-0002 |
 | D-008 | Real-world days of travel without jumping | Accepted | WORLD-006/007 |
 | D-009 | Detailed physics, destruction, PvP, and PvE | Accepted | SIM-007, PVP-001, PVE-001 |
@@ -26,7 +26,7 @@ This register reconciles the planning conversations into explicit project decisi
 | D-018 | Character death has no currency/experience charge | Accepted | LIFE-003 |
 | D-019 | Carried inventory drops, is owner/team-only for 15 minutes, becomes public, and expires after six hours | Accepted | LIFE-006/007/013 |
 | D-020 | Capital empty-state respawn always available | Accepted | LIFE-005 |
-| D-021 | Universe expands through new asteroid fields and frontier sectors | Accepted | WORLD-005 |
+| D-021 | Universe expands through new asteroid fields and frontier sectors | Accepted; P1.5 establishes the address and immutable registry, while frontier materialization begins in P4 | WORLD-005/009, F-014/015 |
 | D-022 | No reachable practical boundary in any direction | Qualified through hierarchical 128-bit procedural space | Universe simulation |
 | D-023 | BIT is the primary base pair | Accepted | MKT-001 |
 | D-024 | Only deposited/exported assets require direct on-chain representation | Accepted | CHAIN-001/002 |
@@ -62,6 +62,7 @@ This register reconciles the planning conversations into explicit project decisi
 | D-054 | The Open Metaverse is the governing framework | Accepted with the meaning and mandatory-rights boundary in Section 13 of the Bittrees Bounties Terms effective 2026-08-12 | GOV-006/007, governance framework |
 | D-055 | The Verse DAO deploys official AMMs and provides initial capital-market liquidity | Accepted; exact pools, curves, fees, and reserve sizes require simulation and public governance parameters | MKT-010, OQ-004 |
 | D-056 | bNOTE and Base BIT/bridge details wait until gameplay, voxel mining, and the internal economy are validated | Accepted sequencing decision; required before P3 testnet integration | CHAIN-008, OQ-002/003 |
+| D-057 | P1.5 combines a fixed canonical celestial registry with deterministic single-cell spatial interest | Accepted as a bounded correctness slice; dynamic cells, handoff, frontier materialization, and production scale remain later | WORLD-009, SIM-013/014, F-014/059 |
 
 ## Amendment rule
 
