@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
   "crates/verse-protocol",
+  "crates/verse-interest-verifier",
   "crates/verse-physics",
   "crates/verse-simulation",
   "services/simulation-worker",

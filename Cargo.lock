@@ -1475,6 +1475,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
+name = "verse-interest-verifier"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "serde",
+ "serde_json",
+ "verse-protocol",
+]
+
+[[package]]
 name = "verse-physics"
 version = "0.1.0"
 dependencies = [
@@ -1503,6 +1513,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "uuid",
+ "verse-interest-verifier",
  "verse-physics",
  "verse-protocol",
 ]

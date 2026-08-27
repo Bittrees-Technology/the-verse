@@ -2348,8 +2348,11 @@ impl SerializeStructVariant for FiniteCompound {
 mod tests {
     use std::collections::BTreeMap;
 
+    use verse_interest_verifier::{ErrorCode, InterestVerifier, StageKind, VerifierConfig};
     use verse_protocol::{
-        BlockKind, IVec3, InventoryContents, InventoryDomain, PlayerDeathCause, Quat,
+        BlockKind, CELESTIAL_REGISTRY_SCHEMA_VERSION, IVec3, InventoryContents, InventoryDomain,
+        PROTOCOL_VERSION, PlayerDeathCause, Quat, ServerMessage, SessionRole,
+        UNIVERSE_MANIFEST_SCHEMA_VERSION,
     };
 
     use super::*;
@@ -2381,6 +2384,66 @@ mod tests {
         let drop = world.death_drops.get_mut(drop_id).expect("fixture drop");
         drop.address = exact;
         drop.position = Vec3::new(x, 0.0, 0.0);
+    }
+
+    fn verifier_for(role: SessionRole) -> InterestVerifier {
+        let manifest = content::manifest();
+        InterestVerifier::new(VerifierConfig::new(
+            role,
+            crate::WORLD_SCHEMA_VERSION,
+            crate::EVENT_SCHEMA_VERSION,
+            manifest.schema_version,
+            &manifest.manifest_version,
+        ))
+        .expect("verifier config")
+    }
+
+    fn commit_wire(verifier: &mut InterestVerifier, message: &ServerMessage) -> StageKind {
+        let raw = serde_json::to_vec(message).expect("wire frame serializes");
+        let token = verifier.stage(&raw).expect("server frame verifies");
+        let kind = verifier.pending_kind().expect("pending kind");
+        let raw_value: serde_json::Value =
+            serde_json::from_slice(&raw).expect("raw message parses as JSON");
+        let sanitized_value: serde_json::Value = serde_json::from_str(
+            verifier
+                .pending_sanitized_json()
+                .expect("pending sanitized message"),
+        )
+        .expect("sanitized message parses as JSON");
+        assert_eq!(sanitized_value, raw_value);
+        let outcome = verifier.commit(token).expect("verified frame commits");
+        assert_eq!(outcome.kind, kind);
+        kind
+    }
+
+    fn establish_verifier(verifier: &mut InterestVerifier, world: &WorldState, role: SessionRole) {
+        let manifest = content::manifest();
+        let welcome = ServerMessage::Welcome {
+            protocol_version: PROTOCOL_VERSION,
+            projection_schema_version: PROJECTION_SCHEMA_VERSION,
+            world_schema_version: crate::WORLD_SCHEMA_VERSION,
+            event_schema_version: crate::EVENT_SCHEMA_VERSION,
+            content_schema_version: manifest.schema_version,
+            content_manifest_version: manifest.manifest_version.clone(),
+            celestial_registry_schema_version: CELESTIAL_REGISTRY_SCHEMA_VERSION,
+            universe_manifest_schema_version: UNIVERSE_MANIFEST_SCHEMA_VERSION,
+            interest_schema_version: INTEREST_SCHEMA_VERSION,
+            server_name: "projection parity test".into(),
+            session_role: role,
+        };
+        assert_eq!(commit_wire(verifier, &welcome), StageKind::Welcome);
+        let registry = ServerMessage::Registry {
+            registry: Box::new(crate::registry_snapshot(world.world_seed).expect("registry")),
+            universe_manifest: Box::new(
+                crate::universe_manifest(
+                    world.world_seed,
+                    crate::WORLD_SCHEMA_VERSION,
+                    crate::EVENT_SCHEMA_VERSION,
+                )
+                .expect("universe manifest"),
+            ),
+        };
+        assert_eq!(commit_wire(verifier, &registry), StageKind::Registry);
     }
 
     fn world_with_two_actors() -> WorldState {
@@ -2481,6 +2544,135 @@ mod tests {
             .find(|value| value.entity_id == id)
             .expect("expected removal")
             .reason
+    }
+
+    #[test]
+    fn independent_verifier_accepts_real_player_baseline_motion_rebase_and_receipt() {
+        let mut world = world_with_two_actors();
+        let role = SessionRole::Player {
+            player_id: "player-local".into(),
+        };
+        let mut verifier = verifier_for(role.clone());
+        establish_verifier(&mut verifier, &world, role);
+
+        let mut cursor =
+            InterestProjectionState::bound_player("independent-player-session", "player-local");
+        let baseline = world
+            .project_interest_baseline(&mut cursor)
+            .expect("real player baseline");
+        assert_eq!(
+            commit_wire(
+                &mut verifier,
+                &ServerMessage::InterestBaseline {
+                    baseline: Box::new(baseline),
+                },
+            ),
+            StageKind::Baseline
+        );
+        let first = verifier.committed_view().expect("baseline view");
+        assert!(first.has_actor_private);
+
+        place_player(&mut world, "player-local", 1.25);
+        world
+            .player
+            .get_mut("player-local")
+            .expect("local player")
+            .linear_velocity = Vec3::new(1.0, 0.0, 0.0);
+        let delta = world
+            .project_interest_delta(&mut cursor, &BTreeMap::new())
+            .expect("real motion/rebase delta");
+        assert_ne!(
+            delta.interest.local_origin_address, delta.cell_address,
+            "the player-local origin should be a body-local rebase rather than the cell address"
+        );
+        assert_eq!(
+            commit_wire(
+                &mut verifier,
+                &ServerMessage::InterestDelta {
+                    delta: Box::new(delta),
+                },
+            ),
+            StageKind::Delta
+        );
+        assert_eq!(
+            verifier
+                .committed_view()
+                .expect("delta view")
+                .delta_sequence,
+            first.delta_sequence + 1
+        );
+
+        let receipt = ServerMessage::IntentAccepted {
+            receipt: verse_protocol::IntentReceipt {
+                operation_sequence: 9_007_199_254_740_993,
+                operation_id: "receipt-over-js-safe-integer".into(),
+                event_sequence: world.event_sequence,
+                code: "projection_parity".into(),
+                message: "typed receipt remains exact".into(),
+            },
+        };
+        assert_eq!(
+            commit_wire(&mut verifier, &receipt),
+            StageKind::IntentAccepted
+        );
+    }
+
+    #[test]
+    fn independent_verifier_rejects_tampering_and_accepts_a_real_recovery_baseline() {
+        let world = world_with_two_actors();
+        let role = SessionRole::Spectator;
+        let mut verifier = verifier_for(role.clone());
+        establish_verifier(&mut verifier, &world, role);
+        let mut cursor =
+            InterestProjectionState::public_origin_spectator("independent-spectator-session");
+        let baseline = world
+            .project_interest_baseline(&mut cursor)
+            .expect("real spectator baseline");
+
+        let mut tampered = baseline.clone();
+        tampered.environment.altitude_m += 1.0;
+        let error = verifier
+            .stage(
+                &serde_json::to_vec(&ServerMessage::InterestBaseline {
+                    baseline: Box::new(tampered),
+                })
+                .expect("tampered frame serializes"),
+            )
+            .expect_err("included-field tampering is rejected");
+        assert_eq!(error.code(), ErrorCode::HashMismatch);
+        assert!(verifier.committed_view().is_none());
+
+        let mut side_channel_only = baseline.clone();
+        side_channel_only.world_hash = "excluded-global-world-hash".into();
+        side_channel_only.interest.canonical_world_hash = side_channel_only.world_hash.clone();
+        assert_eq!(
+            commit_wire(
+                &mut verifier,
+                &ServerMessage::InterestBaseline {
+                    baseline: Box::new(side_channel_only),
+                },
+            ),
+            StageKind::Baseline,
+            "documented global side channels are not projected-view hash input"
+        );
+        let first = verifier.committed_view().expect("first committed view");
+
+        cursor.fresh_baseline().expect("fresh recovery cursor");
+        let recovery = world
+            .project_interest_baseline(&mut cursor)
+            .expect("real recovery baseline");
+        assert_eq!(recovery.interest.session_epoch, first.session_epoch);
+        assert!(recovery.interest.interest_epoch > first.interest_epoch);
+        assert_ne!(recovery.interest.baseline_id, first.baseline_id);
+        assert_eq!(
+            commit_wire(
+                &mut verifier,
+                &ServerMessage::InterestBaseline {
+                    baseline: Box::new(recovery),
+                },
+            ),
+            StageKind::Baseline
+        );
     }
 
     #[test]
