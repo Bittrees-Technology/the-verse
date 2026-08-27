@@ -7,7 +7,7 @@ use verse_protocol::{IVec3, PlayerDeathCause, Quat, ResourceKind, Vec3, VoxelMat
 use crate::model::{Block, ContactPairKey, DeathDrop, InventoryRecord};
 
 pub const EVENT_SCHEMA_NAME: &str = "verse.world_event";
-pub const EVENT_SCHEMA_VERSION: u32 = 6;
+pub const EVENT_SCHEMA_VERSION: u32 = 7;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event_type", rename_all = "snake_case")]

@@ -23,7 +23,7 @@ function connect() {
     elements.connection.className = "connection online";
     socket.send(JSON.stringify({
       type: "hello",
-      protocol_version: 8,
+      protocol_version: 9,
       client_name: "browser-command-center-p0.9",
     }));
   });

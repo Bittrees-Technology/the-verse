@@ -113,6 +113,43 @@ async function waitForMotionAfter(simulationTick, description) {
   return authoritativeWorld;
 }
 
+async function waitForCanonicalIncapacitation(world) {
+  const startingOxygen = world.player.suit_oxygen_milli;
+  const wallDeadline = Date.now() + 90_000;
+  let observedOxygen = startingOxygen;
+  let observedEventSequence = world.event_sequence;
+  while (Date.now() < wallDeadline) {
+    const remaining = wallDeadline - Date.now();
+    const state = await waitFor(
+      (message) =>
+        (message.type === "snapshot" &&
+          message.snapshot.event_sequence > observedEventSequence &&
+          (message.snapshot.player.life_state.kind === "incapacitated" ||
+            message.snapshot.player.suit_oxygen_milli < observedOxygen)),
+      "canonical oxygen depletion progress",
+      Math.min(8_000, remaining),
+    );
+    world = state.snapshot;
+    authoritativeWorld = world;
+    const depleted = observedOxygen - world.player.suit_oxygen_milli;
+    assert.ok(depleted > 0, "each observed oxygen snapshot makes progress");
+    if (world.player.life_state.kind === "incapacitated") {
+      assert.equal(world.player.suit_oxygen_milli, 0);
+      assert.equal(depleted, observedOxygen);
+    } else {
+      assert.equal(
+        depleted % 40,
+        0,
+        "open-vacuum oxygen depletion remains an exact multiple of 40 milli",
+      );
+    }
+    observedOxygen = world.player.suit_oxygen_milli;
+    observedEventSequence = world.event_sequence;
+    if (world.player.life_state.kind === "incapacitated") return world;
+  }
+  throw new Error("timed out while authoritative oxygen depletion was progressing");
+}
+
 function playerInventory(world) {
   return world.inventories.find(
     (inventory) => inventory.inventory_id === "inventory-player-local",
@@ -144,6 +181,16 @@ function rotateVector(quaternion, vector) {
       quaternion.w * tz +
       (quaternion.x * ty - quaternion.y * tx),
   };
+}
+
+function quaternionAngularDistance(left, right) {
+  const dot = Math.abs(
+    left.x * right.x +
+      left.y * right.y +
+      left.z * right.z +
+      left.w * right.w,
+  );
+  return 2 * Math.acos(Math.min(1, Math.max(0, dot)));
 }
 
 function coordinateKey(coordinate) {
@@ -217,7 +264,7 @@ async function movePlayerTo(world, target) {
       y: rotatedLocalDirection.y / localScale,
       z: rotatedLocalDirection.z / localScale,
     };
-    const inputSequence = world.player.last_processed_input_sequence + 1;
+    const inputSequence = world.player.last_received_input_sequence + 1;
     const tick = world.simulation_tick;
     world = await intent("set_player_control", {
       movement_epoch: world.player.movement_epoch,
@@ -236,7 +283,7 @@ async function movePlayerTo(world, target) {
   const tick = world.simulation_tick;
   world = await intent("set_player_control", {
     movement_epoch: world.player.movement_epoch,
-    input_sequence: world.player.last_processed_input_sequence + 1,
+    input_sequence: world.player.last_received_input_sequence + 1,
     linear_input: { x: 0, y: 0, z: 0 },
     angular_input: { x: 0, y: 0, z: 0 },
     boost: false,
@@ -277,10 +324,10 @@ async function run() {
     (message) => message.type === "welcome",
     "welcome",
   );
-  assert.equal(welcome.protocol_version, 8);
+  assert.equal(welcome.protocol_version, 9);
   send({
     type: "hello",
-    protocol_version: 8,
+    protocol_version: 9,
     client_name: "node-authoritative-e2e",
   });
   let world = (
@@ -309,6 +356,55 @@ async function run() {
   assert.ok(playerInventory(world).capacity_liters > 0);
   assert.ok(playerInventory(world).used_liters > 0);
   assert.ok(playerInventory(world).mass_grams > 0);
+
+  const pulseStartOrientation = world.player.orientation;
+  const pulseSequence = world.player.last_received_input_sequence + 1;
+  const pulseOperation = operationId("character-angular-pulse");
+  const releaseOperation = operationId("character-angular-release");
+  send({
+    type: "set_player_control",
+    operation_id: pulseOperation,
+    movement_epoch: world.player.movement_epoch,
+    input_sequence: pulseSequence,
+    linear_input: { x: 0, y: 0, z: 0 },
+    angular_input: { x: 0, y: 0, z: 1 },
+    boost: false,
+    dampeners: true,
+  });
+  send({
+    type: "set_player_control",
+    operation_id: releaseOperation,
+    movement_epoch: world.player.movement_epoch,
+    input_sequence: pulseSequence + 1,
+    linear_input: { x: 0, y: 0, z: 0 },
+    angular_input: { x: 0, y: 0, z: 0 },
+    boost: false,
+    dampeners: true,
+  });
+  for (const operationId of [pulseOperation, releaseOperation]) {
+    const receipt = await waitFor(
+      (message) =>
+        message.type === "intent_accepted" &&
+        message.receipt.operation_id === operationId,
+      operationId + " receipt",
+    );
+    assert.ok(receipt.receipt.event_sequence > world.event_sequence);
+  }
+  const pulseState = await waitFor(
+    (message) =>
+      message.type === "motion_state" &&
+      message.motion.player.last_processed_input_sequence >= pulseSequence + 1,
+    "successive authoritative pulse consumption",
+  );
+  world = applyMotion(world, pulseState.motion);
+  authoritativeWorld = world;
+  assert.equal(world.player.last_received_input_sequence, pulseSequence + 1);
+  assert.equal(world.player.last_processed_input_sequence, pulseSequence + 1);
+  assert.ok(
+    quaternionAngularDistance(pulseStartOrientation, world.player.orientation) >
+      0.000_001,
+    "a back-to-back angular press and release rotates the canonical player",
+  );
 
   const mined = new Set();
   while (playerInventory(world).contents.ore < 4 || mined.size < 3) {
@@ -370,14 +466,20 @@ async function run() {
   assert.equal(world.grids[0].anchored, false);
 
   const tickBeforeMotion = world.simulation_tick;
+  const gridZBeforeMotion = world.grids[0].position.z;
   world = await intent("set_grid_control", {
     grid_id: "grid-starter",
     linear_input: { x: 0.0, y: 0.0, z: 0.5 },
     angular_input: { x: 0.0, y: 0.1, z: 0.0 },
     dampeners: true,
   });
-  world = await waitForMotionAfter(tickBeforeMotion, "integrated grid motion");
-  assert.ok(world.grids[0].position.z > 0.0);
+  while (world.simulation_tick < tickBeforeMotion + 6) {
+    world = await waitForMotionAfter(
+      world.simulation_tick,
+      "integrated grid motion",
+    );
+  }
+  assert.ok(world.grids[0].position.z > gridZBeforeMotion);
   world = await intent("set_grid_control", {
     grid_id: "grid-starter",
     linear_input: { x: 0.0, y: 0.0, z: 0.0 },
@@ -443,15 +545,7 @@ async function run() {
     helmet_closed: false,
     jetpack_enabled: true,
   });
-  world = (
-    await waitFor(
-      (message) =>
-        message.type === "snapshot" &&
-        message.snapshot.player.life_state.kind === "incapacitated",
-      "canonical oxygen incapacitation",
-      30_000,
-    )
-  ).snapshot;
+  world = await waitForCanonicalIncapacitation(world);
   assert.equal(world.player.suit_oxygen_milli, 0);
   assert.equal(world.player.jetpack_enabled, false);
   assert.equal(playerInventory(world).used_liters, 0);
