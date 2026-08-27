@@ -9,7 +9,7 @@ const waiters = [];
 let operationSequence = 0;
 let committedOperationSequence = 0;
 let authoritativeWorld;
-const PROTOCOL_VERSION = 14;
+const PROTOCOL_VERSION = 15;
 const CHARACTER_EYE_OFFSET = 1.62 - 1.8 / 2;
 const CHARACTER_MAXIMUM_ANGULAR_SPEED = 2.5;
 const TOOL_RANGE = 9.0;
@@ -84,8 +84,28 @@ function hydrateActorSnapshot(snapshot) {
     })),
     inventories: privateState.inventories,
     death_drops: privateState.death_drops,
+    production_queues: privateState.production_queues ?? [],
     conservation: { valid: snapshot.conservation_valid },
   };
+}
+
+async function waitForWorld(predicate, description, timeoutMillis = 12_000) {
+  const deadline = Date.now() + timeoutMillis;
+  while (Date.now() < deadline) {
+    const state = await waitFor(
+      (message) =>
+        message.type === "snapshot" &&
+        message.snapshot.event_sequence >=
+          (authoritativeWorld?.event_sequence ?? 0) &&
+        message.snapshot.actor_private?.committed_operation_sequence >=
+          committedOperationSequence,
+      description,
+      Math.max(1, deadline - Date.now()),
+    );
+    authoritativeWorld = hydrateActorSnapshot(state.snapshot);
+    if (predicate(authoritativeWorld)) return authoritativeWorld;
+  }
+  throw new Error("timed out waiting for " + description);
 }
 
 async function intent(type, payload) {
@@ -754,8 +774,8 @@ async function run() {
   ).snapshot);
   authoritativeWorld = world;
   assert.equal(world.conservation.valid, true);
-  assert.equal(world.content_manifest_version, "p1.1.0");
-  assert.equal(world.grids.length, 1);
+  assert.equal(world.content_manifest_version, "p1.4.0");
+  assert.equal(world.grids.length, 2);
   assert.deepEqual(
     world.players.map((player) => player.player_id),
     ["player-local", "player-remote"],
@@ -936,12 +956,57 @@ async function run() {
     );
   }
 
-  world = await intent("refine_ore", {
-    inventory_id: "inventory-player-local",
-    batches: 1,
+  const industryCargoId = "inventory-cargo-industry-starter";
+  world = await intent("transfer_inventory", {
+    source_inventory_id: "inventory-player-local",
+    destination_inventory_id: industryCargoId,
+    resource: "ore",
+    quantity: 2,
   });
-  world = await intent("craft_component", {
-    inventory_id: "inventory-player-local",
+  world = await intent("queue_production", {
+    machine_block_id: "block-refinery",
+    recipe: "refining",
+    batches: 1,
+    source_inventory_id: industryCargoId,
+    destination_inventory_id: industryCargoId,
+  });
+  assert.ok(
+    world.production_queues.some(
+      (queue) => queue.machine_block_id === "block-refinery",
+    ),
+    "refinery work exists only in the authoritative private queue",
+  );
+  world = await waitForWorld(
+    (state) =>
+      !state.production_queues.some(
+        (queue) => queue.machine_block_id === "block-refinery",
+      ) &&
+      state.inventories.find(
+        (inventory) => inventory.inventory_id === industryCargoId,
+      )?.contents.refined_material >= 1,
+    "physical refinery completion",
+  );
+  world = await intent("queue_production", {
+    machine_block_id: "block-assembler",
+    recipe: "component",
+    batches: 1,
+    source_inventory_id: industryCargoId,
+    destination_inventory_id: industryCargoId,
+  });
+  world = await waitForWorld(
+    (state) =>
+      !state.production_queues.some(
+        (queue) => queue.machine_block_id === "block-assembler",
+      ) &&
+      state.inventories.find(
+        (inventory) => inventory.inventory_id === industryCargoId,
+      )?.contents.components >= 1,
+    "physical assembler completion",
+  );
+  world = await intent("transfer_inventory", {
+    source_inventory_id: industryCargoId,
+    destination_inventory_id: "inventory-player-local",
+    resource: "component",
     quantity: 1,
   });
   const cargo = world.inventories.find(
@@ -1028,12 +1093,20 @@ async function run() {
   anchor = blockAt(world, anchorCoordinate, "anchor");
   assert.equal(anchor.block.construction_complete, true);
   world = await intent("toggle_grid_anchor", { grid_id: "grid-starter" });
-  assert.equal(world.grids[0].anchored, true);
+  assert.equal(
+    world.grids.find((grid) => grid.grid_id === "grid-starter").anchored,
+    true,
+  );
   world = await intent("toggle_grid_anchor", { grid_id: "grid-starter" });
-  assert.equal(world.grids[0].anchored, false);
+  assert.equal(
+    world.grids.find((grid) => grid.grid_id === "grid-starter").anchored,
+    false,
+  );
 
   const tickBeforeMotion = world.simulation_tick;
-  const gridZBeforeMotion = world.grids[0].position.z;
+  const gridZBeforeMotion = world.grids.find(
+    (grid) => grid.grid_id === "grid-starter",
+  ).position.z;
   world = await intent("set_grid_control", {
     grid_id: "grid-starter",
     linear_input: { x: 0.0, y: 0.0, z: 0.5 },
@@ -1046,7 +1119,10 @@ async function run() {
       "integrated grid motion",
     );
   }
-  assert.ok(world.grids[0].position.z > gridZBeforeMotion);
+  assert.ok(
+    world.grids.find((grid) => grid.grid_id === "grid-starter").position.z >
+      gridZBeforeMotion,
+  );
   world = await intent("set_grid_control", {
     grid_id: "grid-starter",
     linear_input: { x: 0.0, y: 0.0, z: 0.0 },
@@ -1215,7 +1291,7 @@ async function run() {
   assert.ok(survivingTop, "completed armor survives on the detached grid");
   assert.equal(survivingTop.block.construction_complete, true);
 
-  assert.equal(world.grids.length, 2);
+  assert.equal(world.grids.length, 3);
   assert.equal(world.conservation.valid, true);
   assert.ok(
     world.player.level >= 2,

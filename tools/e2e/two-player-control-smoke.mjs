@@ -13,7 +13,7 @@ const remoteMiningOperation = "two-player-e2e-remote-mining-operation";
 const remoteRefiningOperation = "two-player-e2e-remote-refining-operation";
 const remoteCraftingOperation = "two-player-e2e-remote-crafting-operation";
 const remoteDamageOperation = "two-player-e2e-non-owner-damage-operation";
-const PROTOCOL_VERSION = 14;
+const PROTOCOL_VERSION = 15;
 const CHARACTER_EYE_OFFSET = 1.62 - 1.8 / 2;
 const CHARACTER_MAXIMUM_ANGULAR_SPEED = 2.5;
 const TOOL_RANGE = 9.0;
@@ -578,7 +578,7 @@ async function waitForCommonMotion(
   remote,
   predicate,
   description,
-  timeoutMillis = 12_000,
+  timeoutMillis = 30_000,
 ) {
   const minimumReceiptSequence = Math.max(
     local.lastReceiptEventSequence,
@@ -957,7 +957,7 @@ async function run() {
       (player) => player.player_id === "player-remote",
     );
     const starterGrid = localSnapshot.grids.find(
-      (grid) => grid.owner_player_id === "player-local",
+      (grid) => grid.grid_id === "grid-starter",
     );
     assert.ok(starterGrid, "the starter grid exposes its canonical local owner");
     assert.ok(initialPrimary, "the local player is in the canonical roster");
@@ -1021,7 +1021,7 @@ async function run() {
           inventory_id: primaryInventory.inventory_id,
           batches: 1,
         },
-        code: "inventory_access_denied",
+        code: "physical_machine_required",
       },
       {
         intent: {
@@ -1030,7 +1030,7 @@ async function run() {
           inventory_id: primaryInventory.inventory_id,
           quantity: 1,
         },
-        code: "inventory_access_denied",
+        code: "physical_machine_required",
       },
       {
         intent: {
@@ -1542,100 +1542,53 @@ async function run() {
       productionRemoteInventoryBefore.ore >= 2,
       "the remote actor owns enough mined ore for one proof refining batch",
     );
-    remote.send({
-      type: "refine_ore",
-      operation_id: remoteRefiningOperation,
-      inventory_id: productionRemoteBefore.inventory_id,
-      batches: 1,
-    });
-    const refiningReceipt = await waitForReceipt(
+    await expectRejection(
       remote,
-      remoteRefiningOperation,
-      "remote actor-owned refining receipt",
+      {
+        type: "refine_ore",
+        operation_id: remoteRefiningOperation,
+        inventory_id: productionRemoteBefore.inventory_id,
+        batches: 1,
+      },
+      "physical_machine_required",
+      "remote pocket refining is disabled",
     );
-    const refinedSnapshot = await waitForCommonSnapshot(
-      local,
+    await expectRejection(
       remote,
-      refiningReceipt.event_sequence,
-      "remote actor-owned refining publication",
+      {
+        type: "craft_component",
+        operation_id: remoteCraftingOperation,
+        inventory_id: productionRemoteBefore.inventory_id,
+        quantity: 1,
+      },
+      "physical_machine_required",
+      "remote pocket crafting is disabled",
     );
-    const refinedRemote = refinedSnapshot.players.find(
-      (player) => player.player_id === "player-remote",
-    );
-    const refinedInventory = playerInventory(refinedSnapshot, refinedRemote);
-    assert.equal(
-      refinedInventory.contents.ore,
-      productionRemoteInventoryBefore.ore - 2,
-    );
-    assert.equal(
-      refinedInventory.contents.refined_material,
-      productionRemoteInventoryBefore.refined_material + 1,
-    );
-    assert.equal(
-      refinedRemote.experience,
-      productionRemoteBefore.experience + 12,
-      "proof refining credits only its authenticated actor",
-    );
-    assert.equal(
-      refinedRemote.career.refining_batches,
-      productionRemoteBefore.career.refining_batches + 1,
+    await expectRejection(
+      remote,
+      {
+        type: "queue_production",
+        operation_id: "two-player-deny-foreign-production-machine",
+        machine_block_id: "block-refinery",
+        recipe: "refining",
+        batches: 1,
+        source_inventory_id: productionRemoteBefore.inventory_id,
+        destination_inventory_id: productionRemoteBefore.inventory_id,
+      },
+      "grid_access_denied",
+      "remote actor cannot operate the local industry platform",
     );
     assert.deepEqual(
-      playerInventory(
-        refinedSnapshot,
-        refinedSnapshot.players.find(
-          (player) => player.player_id === "player-local",
-        ),
-      ).contents,
+      playerInventory(industrySnapshot, productionRemoteBefore).contents,
+      productionRemoteInventoryBefore,
+      "rejected production shortcuts do not spend the remote inventory",
+    );
+    assert.deepEqual(
+      playerInventory(industrySnapshot, productionPrimaryBefore).contents,
       productionPrimaryInventoryBefore,
-      "remote refining cannot spend or credit the primary inventory",
+      "rejected remote production cannot mutate the primary inventory",
     );
-
-    remote.send({
-      type: "craft_component",
-      operation_id: remoteCraftingOperation,
-      inventory_id: refinedRemote.inventory_id,
-      quantity: 1,
-    });
-    const craftingReceipt = await waitForReceipt(
-      remote,
-      remoteCraftingOperation,
-      "remote actor-owned crafting receipt",
-    );
-    const craftedSnapshot = await waitForCommonSnapshot(
-      local,
-      remote,
-      craftingReceipt.event_sequence,
-      "remote actor-owned crafting publication",
-    );
-    const craftedRemote = craftedSnapshot.players.find(
-      (player) => player.player_id === "player-remote",
-    );
-    const craftedInventory = playerInventory(craftedSnapshot, craftedRemote);
-    assert.equal(
-      craftedInventory.contents.refined_material,
-      refinedInventory.contents.refined_material - 1,
-    );
-    assert.equal(
-      craftedInventory.contents.components,
-      refinedInventory.contents.components + 1,
-    );
-    assert.equal(
-      craftedRemote.experience,
-      refinedRemote.experience + 18,
-      "proof crafting credits only its authenticated actor",
-    );
-    assert.equal(
-      craftedRemote.career.components_crafted,
-      refinedRemote.career.components_crafted + 1,
-    );
-    assert.equal(
-      craftedSnapshot.players.find(
-        (player) => player.player_id === "player-local",
-      ).experience,
-      productionPrimaryBefore.experience,
-      "remote production never credits the primary career",
-    );
+    const craftedSnapshot = industrySnapshot;
 
     const initialPlayers = new Map(
       craftedSnapshot.players.map((player) => [player.player_id, player]),

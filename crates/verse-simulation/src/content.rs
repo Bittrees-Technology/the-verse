@@ -3,7 +3,7 @@
 use std::sync::OnceLock;
 
 use serde::Deserialize;
-use verse_protocol::{BlockKind, Vec3, VoxelMaterial};
+use verse_protocol::{BlockKind, ProductionRecipeKind, Vec3, VoxelMaterial};
 
 const P0_CONTENT: &str = include_str!("../../../content/definitions/p0-content.json");
 
@@ -15,6 +15,7 @@ pub struct ContentManifest {
     pub voxel_materials: Vec<VoxelDefinition>,
     pub blocks: Vec<BlockDefinition>,
     pub recipes: Recipes,
+    pub production: ProductionDefinition,
     pub physics: PhysicsDefinition,
     pub character: CharacterDefinition,
     pub survival: SurvivalDefinition,
@@ -30,6 +31,7 @@ pub struct VoxelDefinition {
 #[derive(Debug, Clone, Deserialize)]
 pub struct BlockDefinition {
     pub kind: BlockKind,
+    pub conveyor_ports: u8,
     pub max_health: u16,
     pub power_production: f64,
     pub power_requirement: f64,
@@ -125,12 +127,102 @@ pub struct RefiningRecipe {
     pub ore_input: u64,
     pub refined_output: u64,
     pub defined_loss: u64,
+    pub duration_ticks_per_batch: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ComponentRecipe {
     pub refined_input: u64,
     pub component_output: u64,
+    pub duration_ticks_per_batch: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProductionDefinition {
+    pub scheduler_interval_millis: u64,
+    pub queue_limit_per_machine: usize,
+}
+
+const ALL_CONVEYOR_PORTS: u8 = 0b11_1111;
+const P1_4_BLOCK_KINDS: [BlockKind; 11] = [
+    BlockKind::Structural,
+    BlockKind::ControlCore,
+    BlockKind::PowerSource,
+    BlockKind::Battery,
+    BlockKind::Cargo,
+    BlockKind::Drill,
+    BlockKind::Anchor,
+    BlockKind::DamageTest,
+    BlockKind::Conveyor,
+    BlockKind::Refinery,
+    BlockKind::Assembler,
+];
+
+pub const fn production_machine_kind(recipe: ProductionRecipeKind) -> BlockKind {
+    match recipe {
+        ProductionRecipeKind::Refining => BlockKind::Refinery,
+        ProductionRecipeKind::Component => BlockKind::Assembler,
+    }
+}
+
+pub fn machine_supports_recipe(machine_kind: BlockKind, recipe: ProductionRecipeKind) -> bool {
+    machine_kind == production_machine_kind(recipe)
+}
+
+fn validate_production(content: &ContentManifest) -> Result<(), &'static str> {
+    if content.production.scheduler_interval_millis != 1_000 {
+        return Err("P1.4 production scheduler interval must be exactly one second");
+    }
+    if content.production.queue_limit_per_machine != 32 {
+        return Err("P1.4 production queues must contain at most 32 jobs");
+    }
+    if content.recipes.refining.duration_ticks_per_batch == 0
+        || content.recipes.component_crafting.duration_ticks_per_batch == 0
+    {
+        return Err("production recipe durations must be positive");
+    }
+
+    if P1_4_BLOCK_KINDS.iter().any(|kind| {
+        content
+            .blocks
+            .iter()
+            .filter(|definition| definition.kind == *kind)
+            .count()
+            != 1
+    }) {
+        return Err("every P1.4 block kind must have exactly one definition");
+    }
+
+    for definition in &content.blocks {
+        if definition.conveyor_ports & !ALL_CONVEYOR_PORTS != 0 {
+            return Err("block conveyor ports may use only the six canonical face bits");
+        }
+        let expected_ports = match definition.kind {
+            BlockKind::Cargo | BlockKind::Conveyor | BlockKind::Refinery | BlockKind::Assembler => {
+                ALL_CONVEYOR_PORTS
+            }
+            BlockKind::Structural
+            | BlockKind::ControlCore
+            | BlockKind::PowerSource
+            | BlockKind::Battery
+            | BlockKind::Drill
+            | BlockKind::Anchor
+            | BlockKind::DamageTest => 0,
+        };
+        if definition.conveyor_ports != expected_ports {
+            return Err("block conveyor ports do not match the P1.4 topology contract");
+        }
+    }
+
+    if !machine_supports_recipe(BlockKind::Refinery, ProductionRecipeKind::Refining)
+        || !machine_supports_recipe(BlockKind::Assembler, ProductionRecipeKind::Component)
+        || machine_supports_recipe(BlockKind::Refinery, ProductionRecipeKind::Component)
+        || machine_supports_recipe(BlockKind::Assembler, ProductionRecipeKind::Refining)
+    {
+        return Err("production recipes must resolve to exactly one matching machine kind");
+    }
+
+    Ok(())
 }
 
 fn validate_voxel_collision_chunk_edge_cells(edge_cells: u16) -> Result<(), &'static str> {
@@ -317,7 +409,7 @@ pub fn manifest() -> &'static ContentManifest {
     MANIFEST.get_or_init(|| {
         let parsed: ContentManifest =
             serde_json::from_str(P0_CONTENT).expect("embedded P0 content must be valid JSON");
-        assert_eq!(parsed.schema_version, 9, "unsupported P1.1 content schema");
+        assert_eq!(parsed.schema_version, 10, "unsupported P1.4 content schema");
         assert_eq!(
             parsed.license, "AGPL-3.0-or-later",
             "content definition license must be explicit"
@@ -333,7 +425,8 @@ pub fn manifest() -> &'static ContentManifest {
         assert!((0.0..=1.0).contains(&parsed.physics.friction));
         assert!((0.0..=1.0).contains(&parsed.physics.restitution));
         validate_character(&parsed.character).unwrap_or_else(|message| panic!("{message}"));
-        assert_eq!(parsed.blocks.len(), 8, "every P0 block must be defined");
+        validate_production(&parsed).unwrap_or_else(|message| panic!("{message}"));
+        assert_eq!(parsed.blocks.len(), 11, "every P1.4 block must be defined");
         assert_eq!(
             parsed.voxel_materials.len(),
             2,
@@ -383,8 +476,8 @@ mod tests {
             .map(|definition| format!("{:?}", definition.kind))
             .collect::<BTreeSet<_>>();
         assert_eq!(block_kinds.len(), content.blocks.len());
-        assert_eq!(content.schema_version, 9);
-        assert_eq!(content.manifest_version, "p1.1.0");
+        assert_eq!(content.schema_version, 10);
+        assert_eq!(content.manifest_version, "p1.4.0");
         assert_eq!(content.physics.voxel_collision_chunk_edge_cells, 8);
         assert_eq!(content.survival.suit_oxygen_capacity_milli, 1_000);
         assert_eq!(content.survival.critical_oxygen_milli, 200);
@@ -395,6 +488,13 @@ mod tests {
         assert_eq!(content.survival.respawn_oxygen_milli, 1_000);
         assert!(content.survival.respawn_helmet_closed);
         assert!(content.survival.respawn_jetpack_enabled);
+        assert_eq!(content.production.scheduler_interval_millis, 1_000);
+        assert_eq!(content.production.queue_limit_per_machine, 32);
+        assert_eq!(content.recipes.refining.duration_ticks_per_batch, 120);
+        assert_eq!(
+            content.recipes.component_crafting.duration_ticks_per_batch,
+            90
+        );
         assert_eq!(
             content.survival.proof_recovery_position,
             Vec3::new(12.0, 4.5, 10.0)
@@ -415,6 +515,99 @@ mod tests {
         assert_eq!(content.experience_rewards.inventory_transfer, 0);
         assert_eq!(content.experience_rewards.first_anchor_engagement, 40);
         assert_eq!(content.experience_rewards.block_damage, 0);
+    }
+
+    #[test]
+    fn production_machine_pairing_and_conveyor_ports_are_pinned() {
+        assert!(machine_supports_recipe(
+            BlockKind::Refinery,
+            ProductionRecipeKind::Refining
+        ));
+        assert!(machine_supports_recipe(
+            BlockKind::Assembler,
+            ProductionRecipeKind::Component
+        ));
+        for invalid in [
+            (BlockKind::Refinery, ProductionRecipeKind::Component),
+            (BlockKind::Assembler, ProductionRecipeKind::Refining),
+            (BlockKind::Conveyor, ProductionRecipeKind::Refining),
+            (BlockKind::Cargo, ProductionRecipeKind::Component),
+        ] {
+            assert!(!machine_supports_recipe(invalid.0, invalid.1));
+        }
+
+        for kind in [
+            BlockKind::Cargo,
+            BlockKind::Conveyor,
+            BlockKind::Refinery,
+            BlockKind::Assembler,
+        ] {
+            assert_eq!(block(kind).conveyor_ports, ALL_CONVEYOR_PORTS);
+        }
+        for kind in [
+            BlockKind::Structural,
+            BlockKind::ControlCore,
+            BlockKind::PowerSource,
+            BlockKind::Battery,
+            BlockKind::Drill,
+            BlockKind::Anchor,
+            BlockKind::DamageTest,
+        ] {
+            assert_eq!(block(kind).conveyor_ports, 0);
+        }
+    }
+
+    #[test]
+    fn production_scheduler_queue_duration_and_port_bounds_are_validated() {
+        let mut content = manifest().clone();
+        content.production.scheduler_interval_millis = 999;
+        assert!(validate_production(&content).is_err());
+
+        let mut content = manifest().clone();
+        content.production.queue_limit_per_machine = 31;
+        assert!(validate_production(&content).is_err());
+
+        let mut content = manifest().clone();
+        content.recipes.refining.duration_ticks_per_batch = 0;
+        assert!(validate_production(&content).is_err());
+
+        let mut content = manifest().clone();
+        content.recipes.component_crafting.duration_ticks_per_batch = 0;
+        assert!(validate_production(&content).is_err());
+
+        let mut content = manifest().clone();
+        content
+            .blocks
+            .iter_mut()
+            .find(|definition| definition.kind == BlockKind::Conveyor)
+            .expect("conveyor definition exists")
+            .conveyor_ports = 0b100_0000;
+        assert!(validate_production(&content).is_err());
+
+        let mut content = manifest().clone();
+        content
+            .blocks
+            .iter_mut()
+            .find(|definition| definition.kind == BlockKind::Structural)
+            .expect("structural definition exists")
+            .conveyor_ports = 1;
+        assert!(validate_production(&content).is_err());
+
+        let mut content = manifest().clone();
+        let duplicate = content
+            .blocks
+            .iter()
+            .find(|definition| definition.kind == BlockKind::Conveyor)
+            .expect("conveyor definition exists")
+            .clone();
+        content.blocks.push(duplicate);
+        assert!(validate_production(&content).is_err());
+
+        let mut content = manifest().clone();
+        content
+            .blocks
+            .retain(|definition| definition.kind != BlockKind::Assembler);
+        assert!(validate_production(&content).is_err());
     }
 
     #[test]

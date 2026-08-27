@@ -850,7 +850,7 @@ mod tests {
     use tokio_tungstenite::tungstenite::Message as ClientWebSocketMessage;
     use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
     use tower::ServiceExt;
-    use verse_protocol::{BlockKind, ResourceKind, Vec3};
+    use verse_protocol::{BlockKind, ProductionRecipeKind, ResourceKind, Vec3};
 
     use super::*;
 
@@ -1025,6 +1025,7 @@ mod tests {
                 for secret in [
                     "inventory-player-local",
                     "inventory-player-remote",
+                    "inventory-cargo-industry-starter",
                     "inventory-cargo-starter",
                     "inventory-drop-player-local",
                     "death-player-local",
@@ -1047,6 +1048,7 @@ mod tests {
                 } else {
                     for secret in [
                         "inventory-player-local",
+                        "inventory-cargo-industry-starter",
                         "inventory-cargo-starter",
                         "inventory-drop-player-local",
                         "death-player-local",
@@ -1753,53 +1755,83 @@ mod tests {
             .expect("starter grid has canonical cargo");
 
         let denied_inventory_intents = [
-            ClientMessage::RefineOre {
-                operation_sequence: 1,
-                operation_id: "deny-remote-refine-primary".into(),
-                inventory_id: primary.inventory_id.clone(),
-                batches: 1,
-            },
-            ClientMessage::CraftComponent {
-                operation_sequence: 1,
-                operation_id: "deny-remote-craft-primary".into(),
-                inventory_id: primary.inventory_id.clone(),
-                quantity: 1,
-            },
-            ClientMessage::TransferInventory {
-                operation_sequence: 1,
-                operation_id: "deny-remote-withdraw-primary".into(),
-                source_inventory_id: primary.inventory_id.clone(),
-                destination_inventory_id: remote_player.inventory_id.clone(),
-                resource: ResourceKind::Component,
-                quantity: 1,
-            },
-            ClientMessage::TransferInventory {
-                operation_sequence: 1,
-                operation_id: "deny-remote-deposit-primary".into(),
-                source_inventory_id: remote_player.inventory_id.clone(),
-                destination_inventory_id: primary.inventory_id.clone(),
-                resource: ResourceKind::Ore,
-                quantity: 1,
-            },
-            ClientMessage::TransferInventory {
-                operation_sequence: 1,
-                operation_id: "deny-remote-withdraw-cargo".into(),
-                source_inventory_id: cargo_inventory_id.into(),
-                destination_inventory_id: remote_player.inventory_id.clone(),
-                resource: ResourceKind::Component,
-                quantity: 1,
-            },
-            ClientMessage::TransferInventory {
-                operation_sequence: 1,
-                operation_id: "deny-remote-deposit-cargo".into(),
-                source_inventory_id: remote_player.inventory_id.clone(),
-                destination_inventory_id: cargo_inventory_id.into(),
-                resource: ResourceKind::Ore,
-                quantity: 1,
-            },
+            (
+                ClientMessage::RefineOre {
+                    operation_sequence: 1,
+                    operation_id: "deny-remote-refine-primary".into(),
+                    inventory_id: primary.inventory_id.clone(),
+                    batches: 1,
+                },
+                "physical_machine_required",
+            ),
+            (
+                ClientMessage::CraftComponent {
+                    operation_sequence: 1,
+                    operation_id: "deny-remote-craft-primary".into(),
+                    inventory_id: primary.inventory_id.clone(),
+                    quantity: 1,
+                },
+                "physical_machine_required",
+            ),
+            (
+                ClientMessage::QueueProduction {
+                    operation_sequence: 1,
+                    operation_id: "deny-remote-queue-primary".into(),
+                    machine_block_id: "block-refinery".into(),
+                    recipe: ProductionRecipeKind::Refining,
+                    batches: 1,
+                    source_inventory_id: cargo_inventory_id.into(),
+                    destination_inventory_id: cargo_inventory_id.into(),
+                },
+                "grid_access_denied",
+            ),
+            (
+                ClientMessage::TransferInventory {
+                    operation_sequence: 1,
+                    operation_id: "deny-remote-withdraw-primary".into(),
+                    source_inventory_id: primary.inventory_id.clone(),
+                    destination_inventory_id: remote_player.inventory_id.clone(),
+                    resource: ResourceKind::Component,
+                    quantity: 1,
+                },
+                "inventory_access_denied",
+            ),
+            (
+                ClientMessage::TransferInventory {
+                    operation_sequence: 1,
+                    operation_id: "deny-remote-deposit-primary".into(),
+                    source_inventory_id: remote_player.inventory_id.clone(),
+                    destination_inventory_id: primary.inventory_id.clone(),
+                    resource: ResourceKind::Ore,
+                    quantity: 1,
+                },
+                "inventory_access_denied",
+            ),
+            (
+                ClientMessage::TransferInventory {
+                    operation_sequence: 1,
+                    operation_id: "deny-remote-withdraw-cargo".into(),
+                    source_inventory_id: cargo_inventory_id.into(),
+                    destination_inventory_id: remote_player.inventory_id.clone(),
+                    resource: ResourceKind::Component,
+                    quantity: 1,
+                },
+                "inventory_access_denied",
+            ),
+            (
+                ClientMessage::TransferInventory {
+                    operation_sequence: 1,
+                    operation_id: "deny-remote-deposit-cargo".into(),
+                    source_inventory_id: remote_player.inventory_id.clone(),
+                    destination_inventory_id: cargo_inventory_id.into(),
+                    resource: ResourceKind::Ore,
+                    quantity: 1,
+                },
+                "inventory_access_denied",
+            ),
         ];
-        for intent in denied_inventory_intents {
-            assert_intent_rejected(&mut remote, intent, "inventory_access_denied").await;
+        for (intent, expected_code) in denied_inventory_intents {
+            assert_intent_rejected(&mut remote, intent, expected_code).await;
         }
 
         let denied_grid_intents = [

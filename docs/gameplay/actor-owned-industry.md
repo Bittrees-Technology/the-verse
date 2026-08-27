@@ -86,11 +86,18 @@ not by silently turning ownership into invulnerability.
 
 ## Proof production
 
-Refining and component crafting remain immediate proof transformations inside
-an actor-authorized inventory. They do not yet require a refinery, assembler,
-conveyor path, power draw, queue, production duration, operator terminal, or
-physical proximity. These commands prove actor isolation, exact recipes,
-capacity, conservation, idempotency, persistence, and recovery only.
+At the historical P1.1 checkpoint, refining and component crafting were
+immediate proof transformations inside an actor-authorized inventory. They did
+not require a refinery, assembler, conveyor path, power draw, queue, production
+duration, operator terminal, or physical proximity. Those commands proved actor
+isolation, exact recipes, capacity, conservation, idempotency, persistence, and
+recovery only.
+
+The implemented [P1.4 physical-industry slice](physical-industry.md)
+supersedes this interaction for protocol-15 canonical worlds. The native and
+end-to-end clients use machine queues; direct refine and craft wire shapes
+remain diagnostic legacy inputs that reject with
+`physical_machine_required`; they cannot mutate a P1.4 world.
 
 Grid control is likewise owner-authorized remote control for this checkpoint.
 The owner does not yet need to occupy a cockpit or stand at a control terminal.

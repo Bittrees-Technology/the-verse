@@ -9,17 +9,20 @@ use verse_protocol::{
     EnvironmentSnapshot, GridMotionSnapshot, GridSnapshot, IVec3, IntentReceipt, InventoryContents,
     InventoryDomain, InventorySnapshot, LocomotionKind, MotionSnapshot, PlayerDeathCause,
     PlayerLifeState, PlayerLocomotionSnapshot, PlayerMotionSnapshot, PlayerSnapshot, PowerSnapshot,
-    Quat, ResourceKind, Vec3, VoxelMaterial, VoxelSnapshot, WorldSnapshot,
+    ProductionJobStatus, ProductionRecipeKind, Quat, ResourceKind, Vec3, VoxelMaterial,
+    VoxelSnapshot, WorldSnapshot,
 };
 
 use crate::content;
 
-pub const WORLD_SCHEMA_VERSION: u32 = 16;
+pub const WORLD_SCHEMA_VERSION: u32 = 17;
 pub const PROCESSED_OPERATION_RETENTION_LIMIT: usize = 128;
 pub const PROCESSED_OPERATION_RETAINED_BYTES_LIMIT: usize = 131_072;
 pub const PROCESSED_OPERATION_RECORD_BYTES_LIMIT: usize = 4_096;
 pub const PLAYER_INVENTORY_ID: &str = "inventory-player-local";
 pub const STARTER_GRID_ID: &str = "grid-starter";
+pub const STARTER_INDUSTRY_GRID_ID: &str = "grid-industry-starter";
+pub const STARTER_INDUSTRY_CARGO_INVENTORY_ID: &str = "inventory-cargo-industry-starter";
 pub const PLANET_CENTER: Vec3 = Vec3::new(900.0, -2_200.0, -3_800.0);
 pub const PLANET_SURFACE_RADIUS_M: f64 = 1_200.0;
 pub const PLANET_ATMOSPHERE_HEIGHT_M: f64 = 180.0;
@@ -374,6 +377,27 @@ pub struct InventoryRecord {
     pub capacity_liters: u64,
 }
 
+/// Canonical machine work. Inputs leave ordinary inventory at enqueue and
+/// remain here until the registered transformation completes. Completed output
+/// remains here only while its destination is unavailable or full.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProductionJob {
+    pub job_id: String,
+    pub operation_id: String,
+    pub owner_player_id: String,
+    pub machine_block_id: String,
+    pub recipe: ProductionRecipeKind,
+    pub content_manifest_version: String,
+    pub batches: u64,
+    pub source_inventory_id: String,
+    pub destination_inventory_id: String,
+    pub progress_ticks: u64,
+    pub duration_ticks: u64,
+    pub reserved_inputs: InventoryContents,
+    pub pending_outputs: InventoryContents,
+    pub queued_event_sequence: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DeathDrop {
     pub drop_id: String,
@@ -439,6 +463,85 @@ pub const fn resource_unit_mass_grams(resource: ResourceKind) -> u64 {
         ResourceKind::RefinedMaterial => 2_400,
         ResourceKind::Component => 4_800,
     }
+}
+
+pub fn production_recipe_quantities(
+    recipe: ProductionRecipeKind,
+    batches: u64,
+) -> Option<(InventoryContents, InventoryContents, u64)> {
+    if batches == 0 {
+        return None;
+    }
+    match recipe {
+        ProductionRecipeKind::Refining => {
+            let definition = &content::manifest().recipes.refining;
+            Some((
+                InventoryContents {
+                    ore: batches.checked_mul(definition.ore_input)?,
+                    ..InventoryContents::default()
+                },
+                InventoryContents {
+                    refined_material: batches.checked_mul(definition.refined_output)?,
+                    ..InventoryContents::default()
+                },
+                batches.checked_mul(definition.duration_ticks_per_batch)?,
+            ))
+        }
+        ProductionRecipeKind::Component => {
+            let definition = &content::manifest().recipes.component_crafting;
+            Some((
+                InventoryContents {
+                    refined_material: batches.checked_mul(definition.refined_input)?,
+                    ..InventoryContents::default()
+                },
+                InventoryContents {
+                    components: batches.checked_mul(definition.component_output)?,
+                    ..InventoryContents::default()
+                },
+                batches.checked_mul(definition.duration_ticks_per_batch)?,
+            ))
+        }
+    }
+}
+
+pub fn contents_mass_grams(contents: &InventoryContents) -> u64 {
+    contents
+        .ore
+        .saturating_mul(resource_unit_mass_grams(ResourceKind::Ore))
+        .saturating_add(
+            contents
+                .refined_material
+                .saturating_mul(resource_unit_mass_grams(ResourceKind::RefinedMaterial)),
+        )
+        .saturating_add(
+            contents
+                .components
+                .saturating_mul(resource_unit_mass_grams(ResourceKind::Component)),
+        )
+}
+
+pub fn inventory_can_add_contents(
+    inventory: &InventoryRecord,
+    contents: &InventoryContents,
+) -> bool {
+    let added_liters = contents
+        .ore
+        .checked_mul(resource_unit_volume_liters(ResourceKind::Ore))
+        .and_then(|value| {
+            contents
+                .refined_material
+                .checked_mul(resource_unit_volume_liters(ResourceKind::RefinedMaterial))
+                .and_then(|refined| value.checked_add(refined))
+        })
+        .and_then(|value| {
+            contents
+                .components
+                .checked_mul(resource_unit_volume_liters(ResourceKind::Component))
+                .and_then(|components| value.checked_add(components))
+        });
+    added_liters
+        .and_then(|added| inventory.used_liters().checked_add(added))
+        .is_some_and(|used| used <= inventory.capacity_liters)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -647,6 +750,7 @@ pub struct WorldState {
     pub voxels: VoxelField,
     pub grids: BTreeMap<String, Grid>,
     pub inventories: BTreeMap<String, InventoryRecord>,
+    pub production_queues: BTreeMap<String, VecDeque<ProductionJob>>,
     pub death_drops: BTreeMap<String, DeathDrop>,
     pub ledger: Ledger,
     pub processed_operations: BTreeMap<String, ActorOperationHistory>,
@@ -960,6 +1064,78 @@ impl WorldState {
             }
         }
 
+        let mut production_job_ids = BTreeSet::new();
+        for (machine_block_id, queue) in &self.production_queues {
+            if queue.is_empty()
+                || queue.len() > content::manifest().production.queue_limit_per_machine
+            {
+                return Err(
+                    "production queues must contain between one and the registered maximum jobs"
+                        .into(),
+                );
+            }
+            let (machine_grid, machine) = self.block_grid(machine_block_id).ok_or_else(|| {
+                "every production queue must reference one live machine".to_owned()
+            })?;
+            if !machine.is_complete()
+                || !matches!(machine.kind, BlockKind::Refinery | BlockKind::Assembler)
+            {
+                return Err("production queues require a completed refinery or assembler".into());
+            }
+
+            for (queue_index, job) in queue.iter().enumerate() {
+                if job.job_id.trim().is_empty()
+                    || !production_job_ids.insert(job.job_id.as_str())
+                    || job.operation_id.trim().is_empty()
+                    || job.owner_player_id != machine_grid.owner_player_id
+                    || job.machine_block_id != *machine_block_id
+                    || job.content_manifest_version != self.content_manifest_version
+                    || !content::machine_supports_recipe(machine.kind, job.recipe)
+                    || job.batches == 0
+                    || job.queued_event_sequence == 0
+                    || job.queued_event_sequence > self.event_sequence
+                    || job.progress_ticks > job.duration_ticks
+                    || (queue_index > 0 && job.progress_ticks != 0)
+                {
+                    return Err("production job identity, ownership, recipe, order, and progress must remain canonical".into());
+                }
+
+                let (expected_inputs, expected_outputs, expected_duration) =
+                    production_recipe_quantities(job.recipe, job.batches)
+                        .ok_or_else(|| "production job quantities overflowed".to_owned())?;
+                if job.duration_ticks != expected_duration {
+                    return Err(
+                        "production job duration must match its pinned registered recipe".into(),
+                    );
+                }
+                if job.progress_ticks < job.duration_ticks {
+                    if job.reserved_inputs != expected_inputs
+                        || job.pending_outputs != InventoryContents::default()
+                    {
+                        return Err(
+                            "unfinished production jobs must retain exact reserved input only"
+                                .into(),
+                        );
+                    }
+                } else if job.reserved_inputs != InventoryContents::default()
+                    || job.pending_outputs != expected_outputs
+                {
+                    return Err(
+                        "completed blocked jobs must retain exact pending output only".into(),
+                    );
+                }
+
+                for inventory_id in [&job.source_inventory_id, &job.destination_inventory_id] {
+                    if self.inventory_owner_player_id(inventory_id)? != job.owner_player_id {
+                        return Err(
+                            "production endpoints must preserve the machine owner's authority"
+                                .into(),
+                        );
+                    }
+                }
+            }
+        }
+
         let mut dropped_inventory_ids = BTreeSet::new();
         for (drop_id, drop) in &self.death_drops {
             if drop_id != &drop.drop_id
@@ -1075,6 +1251,99 @@ impl WorldState {
         }
     }
 
+    pub fn block_grid(&self, block_id: &str) -> Option<(&Grid, &Block)> {
+        self.grids
+            .values()
+            .find_map(|grid| grid.blocks.get(block_id).map(|block| (grid, block)))
+    }
+
+    pub fn cargo_block_for_inventory(&self, inventory_id: &str) -> Option<(&Grid, &Block)> {
+        let inventory = self.inventories.get(inventory_id)?;
+        let InventoryDomain::Cargo { block_id } = &inventory.domain else {
+            return None;
+        };
+        let (grid, block) = self.block_grid(block_id)?;
+        (block.kind == BlockKind::Cargo
+            && block.is_complete()
+            && block.inventory_id.as_deref() == Some(inventory_id))
+        .then_some((grid, block))
+    }
+
+    /// Resolves the canonical completed full-face conveyor graph. World-space
+    /// proximity, diagonals, corners, and separate grids never connect.
+    pub fn production_route_exists(&self, machine_block_id: &str, inventory_id: &str) -> bool {
+        let Some((machine_grid, machine)) = self.block_grid(machine_block_id) else {
+            return false;
+        };
+        let Some((cargo_grid, cargo)) = self.cargo_block_for_inventory(inventory_id) else {
+            return false;
+        };
+        if machine_grid.grid_id != cargo_grid.grid_id
+            || !machine.is_complete()
+            || content::block(machine.kind).conveyor_ports == 0
+        {
+            return false;
+        }
+
+        let mut frontier = VecDeque::from([machine.block_id.as_str()]);
+        let mut visited = BTreeSet::from([machine.block_id.as_str()]);
+        while let Some(block_id) = frontier.pop_front() {
+            if block_id == cargo.block_id {
+                return true;
+            }
+            let block = &machine_grid.blocks[block_id];
+            for neighbor in machine_grid.blocks.values() {
+                if !neighbor.is_complete()
+                    || content::block(neighbor.kind).conveyor_ports == 0
+                    || block.coordinate.manhattan_distance(neighbor.coordinate) != 1
+                    || !visited.insert(neighbor.block_id.as_str())
+                {
+                    continue;
+                }
+                frontier.push_back(neighbor.block_id.as_str());
+            }
+        }
+        false
+    }
+
+    pub fn production_job_status(
+        &self,
+        machine_block_id: &str,
+        queue_index: usize,
+    ) -> ProductionJobStatus {
+        let Some(queue) = self.production_queues.get(machine_block_id) else {
+            return ProductionJobStatus::PausedRoute;
+        };
+        let Some(job) = queue.get(queue_index) else {
+            return ProductionJobStatus::PausedRoute;
+        };
+        if queue_index > 0 {
+            return ProductionJobStatus::Queued;
+        }
+        let routes_valid = self.production_route_exists(machine_block_id, &job.source_inventory_id)
+            && self.production_route_exists(machine_block_id, &job.destination_inventory_id);
+        if !routes_valid {
+            return ProductionJobStatus::PausedRoute;
+        }
+        let Some((grid, _)) = self.block_grid(machine_block_id) else {
+            return ProductionJobStatus::PausedRoute;
+        };
+        if !grid.power().online {
+            return ProductionJobStatus::PausedPower;
+        }
+        if job.progress_ticks == job.duration_ticks
+            && self
+                .inventories
+                .get(&job.destination_inventory_id)
+                .is_none_or(|inventory| {
+                    !inventory_can_add_contents(inventory, &job.pending_outputs)
+                })
+        {
+            return ProductionJobStatus::OutputBlocked;
+        }
+        ProductionJobStatus::Running
+    }
+
     pub fn genesis(seed: u64) -> Self {
         let player_position = Vec3::new(12.0, 4.5, 10.0);
         let player_inventory = InventoryRecord {
@@ -1162,6 +1431,65 @@ impl WorldState {
             blocks,
         };
 
+        let industry_cargo_inventory = InventoryRecord {
+            inventory_id: STARTER_INDUSTRY_CARGO_INVENTORY_ID.into(),
+            domain: InventoryDomain::Cargo {
+                block_id: "block-industry-cargo".into(),
+            },
+            contents: InventoryContents::default(),
+            capacity_liters: CARGO_INVENTORY_CAPACITY_LITERS,
+        };
+        let mut industry_blocks = BTreeMap::new();
+        industry_blocks.insert(
+            "block-industry-core".into(),
+            Block::new(
+                "block-industry-core",
+                IVec3::new(1, 1, 0),
+                BlockKind::ControlCore,
+            ),
+        );
+        industry_blocks.insert(
+            "block-industry-power".into(),
+            Block::new(
+                "block-industry-power",
+                IVec3::new(0, 1, 0),
+                BlockKind::PowerSource,
+            ),
+        );
+        let mut industry_cargo = Block::new(
+            "block-industry-cargo",
+            IVec3::new(1, 0, 0),
+            BlockKind::Cargo,
+        );
+        industry_cargo.inventory_id = Some(STARTER_INDUSTRY_CARGO_INVENTORY_ID.into());
+        industry_blocks.insert(industry_cargo.block_id.clone(), industry_cargo);
+        industry_blocks.insert(
+            "block-conveyor".into(),
+            Block::new("block-conveyor", IVec3::new(2, 0, 0), BlockKind::Conveyor),
+        );
+        industry_blocks.insert(
+            "block-refinery".into(),
+            Block::new("block-refinery", IVec3::new(3, 0, 0), BlockKind::Refinery),
+        );
+        industry_blocks.insert(
+            "block-assembler".into(),
+            Block::new("block-assembler", IVec3::new(4, 0, 0), BlockKind::Assembler),
+        );
+        let industry_grid = Grid {
+            grid_id: STARTER_INDUSTRY_GRID_ID.into(),
+            owner_player_id: "player-local".into(),
+            anchor_reward_eligible: false,
+            position: Vec3::new(60.0, 0.0, 0.0),
+            orientation: Quat::IDENTITY,
+            linear_velocity: Vec3::ZERO,
+            angular_velocity: Vec3::ZERO,
+            control_linear_input: Vec3::ZERO,
+            control_angular_input: Vec3::ZERO,
+            dampeners: true,
+            anchored: false,
+            blocks: industry_blocks,
+        };
+
         Self {
             schema_version: WORLD_SCHEMA_VERSION,
             content_manifest_version: content::manifest().manifest_version.clone(),
@@ -1211,15 +1539,23 @@ impl WorldState {
                 life_state: PlayerLifeState::Alive,
             }),
             voxels: VoxelField::procedural_asteroid(seed, 8),
-            grids: BTreeMap::from([(STARTER_GRID_ID.into(), grid)]),
+            grids: BTreeMap::from([
+                (STARTER_GRID_ID.into(), grid),
+                (STARTER_INDUSTRY_GRID_ID.into(), industry_grid),
+            ]),
             inventories: BTreeMap::from([
                 (PLAYER_INVENTORY_ID.into(), player_inventory),
                 (cargo_inventory_id, cargo_inventory),
+                (
+                    STARTER_INDUSTRY_CARGO_INVENTORY_ID.into(),
+                    industry_cargo_inventory,
+                ),
             ]),
+            production_queues: BTreeMap::new(),
             death_drops: BTreeMap::new(),
             ledger: Ledger {
                 genesis_components: 24,
-                genesis_installed_components: 25,
+                genesis_installed_components: 37,
                 ..Ledger::default()
             },
             processed_operations: BTreeMap::new(),
@@ -1237,7 +1573,7 @@ impl WorldState {
     }
 
     pub fn conservation(&self) -> ConservationSnapshot {
-        let (ore_live, refined_live, components_live) = self.inventories.values().fold(
+        let (mut ore_live, mut refined_live, mut components_live) = self.inventories.values().fold(
             (0_u64, 0_u64, 0_u64),
             |(ore, refined, components), inventory| {
                 (
@@ -1247,6 +1583,17 @@ impl WorldState {
                 )
             },
         );
+        for job in self.production_queues.values().flatten() {
+            ore_live = ore_live
+                .saturating_add(job.reserved_inputs.ore)
+                .saturating_add(job.pending_outputs.ore);
+            refined_live = refined_live
+                .saturating_add(job.reserved_inputs.refined_material)
+                .saturating_add(job.pending_outputs.refined_material);
+            components_live = components_live
+                .saturating_add(job.reserved_inputs.components)
+                .saturating_add(job.pending_outputs.components);
+        }
         let live_blocks = self
             .grids
             .values()
@@ -1301,7 +1648,22 @@ impl WorldState {
             .filter_map(|inventory_id| self.inventories.get(inventory_id))
             .map(|inventory| u128::from(inventory.mass_grams()))
             .sum::<u128>();
-        u64::try_from(block_mass.saturating_add(inventory_mass)).unwrap_or(u64::MAX)
+        let production_mass = grid
+            .blocks
+            .keys()
+            .filter_map(|block_id| self.production_queues.get(block_id))
+            .flatten()
+            .map(|job| {
+                u128::from(contents_mass_grams(&job.reserved_inputs))
+                    + u128::from(contents_mass_grams(&job.pending_outputs))
+            })
+            .sum::<u128>();
+        u64::try_from(
+            block_mass
+                .saturating_add(inventory_mass)
+                .saturating_add(production_mass),
+        )
+        .unwrap_or(u64::MAX)
     }
 
     pub fn grid_mass_kg(&self, grid: &Grid) -> f64 {
