@@ -34,7 +34,7 @@ Priorities:
 | F-020 | Death drop, 15-minute recovery grace, and six-hour cleanup | P1 | Lifecycle scheduler |
 | F-021 | Unpowered derelict, 24-hour public salvage, and 36-hour cleanup | P1 | Power, scheduler |
 | F-022 | Registered-station cleanup exception | P2 | BIT contract |
-| F-023 | Mining/refining/manufacturing graph | P1 | Inventory ledger |
+| F-023 | Physical mining/refining/manufacturing graph and queues | P1 | F-006, F-008–F-012 |
 | F-024 | Work and delivery contracts | P2 | Escrow |
 | F-025 | Company roles and assets | P2 | Identity |
 | F-026 | Company DAO registry | P2 | Chain adapter |
@@ -70,6 +70,20 @@ Priorities:
 | F-056 | Direct-download updater for macOS/Linux | P1 | Release signing |
 | F-057 | Server-authoritative EVA, landing, and rotation | P0 | F-002, F-004, F-006 |
 | F-058 | Server-authoritative grounded and magnetic locomotion | P0 | F-057, F-006, SIM-010 |
+
+## Current implementation readiness
+
+F-023 is implemented and locally verified for the P1.4 active-cell milestone.
+Its accepted [gameplay specification](../gameplay/physical-industry.md) defines
+the player outcome, state authority, trust boundary, queue and escrow lifecycle,
+failure and recovery behavior, persistence versions, observability, acceptance
+criteria, and rollout. [ADR-0018](../decisions/ADR-0018-authoritative-physical-industry.md)
+records the durable conveyor, scheduler, power, privacy, split, and destruction
+choices. Hosted CI remains the milestone evidence gate.
+
+Offline/background production remains dependent on dynamic cell scheduling,
+and public-scale replication remains dependent on interest management. Neither
+deferred system changes the P1.4 canonical production-event contract.
 
 ## Definition of specification-ready
 

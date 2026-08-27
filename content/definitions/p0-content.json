@@ -1,6 +1,6 @@
 {
-  "schema_version": 9,
-  "manifest_version": "p1.1.0",
+  "schema_version": 10,
+  "manifest_version": "p1.4.0",
   "license": "AGPL-3.0-or-later",
   "physics": {
     "fixed_step_hz": 60,
@@ -63,6 +63,10 @@
       "z": 10.0
     }
   },
+  "production": {
+    "scheduler_interval_millis": 1000,
+    "queue_limit_per_machine": 32
+  },
   "experience_rewards": {
     "mined_ore_unit": 5,
     "refining_batch": 12,
@@ -87,6 +91,7 @@
   "blocks": [
     {
       "kind": "structural",
+      "conveyor_ports": 0,
       "max_health": 100,
       "power_production": 0.0,
       "power_requirement": 0.0,
@@ -96,6 +101,7 @@
     },
     {
       "kind": "control_core",
+      "conveyor_ports": 0,
       "max_health": 180,
       "power_production": 0.0,
       "power_requirement": 2.0,
@@ -105,6 +111,7 @@
     },
     {
       "kind": "power_source",
+      "conveyor_ports": 0,
       "max_health": 140,
       "power_production": 12.0,
       "power_requirement": 0.0,
@@ -114,6 +121,7 @@
     },
     {
       "kind": "battery",
+      "conveyor_ports": 0,
       "max_health": 120,
       "power_production": 2.0,
       "power_requirement": 0.0,
@@ -123,6 +131,7 @@
     },
     {
       "kind": "cargo",
+      "conveyor_ports": 63,
       "max_health": 110,
       "power_production": 0.0,
       "power_requirement": 0.25,
@@ -132,6 +141,7 @@
     },
     {
       "kind": "drill",
+      "conveyor_ports": 0,
       "max_health": 100,
       "power_production": 0.0,
       "power_requirement": 4.0,
@@ -141,6 +151,7 @@
     },
     {
       "kind": "anchor",
+      "conveyor_ports": 0,
       "max_health": 160,
       "power_production": 0.0,
       "power_requirement": 1.0,
@@ -150,23 +161,56 @@
     },
     {
       "kind": "damage_test",
+      "conveyor_ports": 0,
       "max_health": 60,
       "power_production": 0.0,
       "power_requirement": 0.0,
       "stored_power": 0.0,
       "component_cost": 1,
       "mass_grams": 250000
+    },
+    {
+      "kind": "conveyor",
+      "conveyor_ports": 63,
+      "max_health": 90,
+      "power_production": 0.0,
+      "power_requirement": 0.1,
+      "stored_power": 0.0,
+      "component_cost": 1,
+      "mass_grams": 180000
+    },
+    {
+      "kind": "refinery",
+      "conveyor_ports": 63,
+      "max_health": 180,
+      "power_production": 0.0,
+      "power_requirement": 5.0,
+      "stored_power": 0.0,
+      "component_cost": 4,
+      "mass_grams": 900000
+    },
+    {
+      "kind": "assembler",
+      "conveyor_ports": 63,
+      "max_health": 160,
+      "power_production": 0.0,
+      "power_requirement": 4.0,
+      "stored_power": 0.0,
+      "component_cost": 4,
+      "mass_grams": 800000
     }
   ],
   "recipes": {
     "refining": {
       "ore_input": 2,
       "refined_output": 1,
-      "defined_loss": 1
+      "defined_loss": 1,
+      "duration_ticks_per_batch": 120
     },
     "component_crafting": {
       "refined_input": 1,
-      "component_output": 1
+      "component_output": 1,
+      "duration_ticks_per_batch": 90
     }
   }
 }

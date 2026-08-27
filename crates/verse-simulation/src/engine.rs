@@ -14,7 +14,7 @@ use verse_protocol::{
     BlockKind, CareerSnapshot, ClientMessage, INTENT_FINGERPRINT_SCHEMA_VERSION, IVec3,
     IntentReceipt, InventoryContents, InventoryDomain, LocomotionKind, LocomotionSupportSnapshot,
     MotionSnapshot, PROTOCOL_VERSION, PlayerDeathCause, PlayerLifeState, PlayerLocomotionSnapshot,
-    Quat, ResourceKind, Vec3, WorldSnapshot,
+    ProductionRecipeKind, Quat, ResourceKind, Vec3, WorldSnapshot,
 };
 
 use crate::content;
@@ -27,7 +27,8 @@ use crate::model::PLAYER_INVENTORY_ID;
 use crate::model::{
     Block, CARGO_INVENTORY_CAPACITY_LITERS, ContactPairKey, DeathDrop, Grid, InventoryRecord,
     PLANET_CENTER, PLANET_SURFACE_RADIUS_M, Player, PlayerControlFrame, ProcessedOperationRecord,
-    WORLD_SCHEMA_VERSION, WorldState, radial_up, valid_blake3_hex,
+    ProductionJob, WORLD_SCHEMA_VERSION, WorldState, inventory_can_add_contents,
+    production_recipe_quantities, radial_up, valid_blake3_hex,
 };
 use crate::persistence::{PersistenceError, Store};
 #[cfg(test)]
@@ -107,6 +108,7 @@ fn client_message_floats_are_finite(message: &ClientMessage) -> bool {
         | ClientMessage::MineVoxel { .. }
         | ClientMessage::RefineOre { .. }
         | ClientMessage::CraftComponent { .. }
+        | ClientMessage::QueueProduction { .. }
         | ClientMessage::TransferInventory { .. }
         | ClientMessage::BuildBlock { .. }
         | ClientMessage::WeldBlock { .. }
@@ -206,6 +208,7 @@ pub struct Runtime {
     snapshot_every: u64,
     events_since_snapshot: u64,
     life_support_elapsed_millis_by_player: BTreeMap<String, u32>,
+    production_elapsed_millis: u32,
     physics_step_phase: u64,
     physics: Scene,
     halted: bool,
@@ -240,6 +243,7 @@ impl Runtime {
             snapshot_every: snapshot_every.max(1),
             events_since_snapshot: 0,
             life_support_elapsed_millis_by_player,
+            production_elapsed_millis: 0,
             physics_step_phase,
             physics,
             halted: false,
@@ -817,6 +821,30 @@ impl Runtime {
                 changed = true;
             }
         }
+
+        self.production_elapsed_millis = self
+            .production_elapsed_millis
+            .saturating_add(u32::from(delta_millis));
+        let production_seconds = self.production_elapsed_millis / 1_000;
+        self.production_elapsed_millis %= 1_000;
+        for _ in 0..production_seconds {
+            let machine_ids = self
+                .state
+                .production_queues
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>();
+            for machine_block_id in machine_ids {
+                let Some(payload) = self
+                    .state
+                    .production_payload_after_one_second(&machine_block_id)?
+                else {
+                    continue;
+                };
+                self.commit_system_event(payload)?;
+                changed = true;
+            }
+        }
         Ok(changed)
     }
 
@@ -862,6 +890,73 @@ impl Runtime {
 }
 
 impl WorldState {
+    fn production_payload_after_one_second(
+        &self,
+        machine_block_id: &str,
+    ) -> Result<Option<EventPayload>, IntentError> {
+        let Some(job) = self
+            .production_queues
+            .get(machine_block_id)
+            .and_then(|queue| queue.front())
+        else {
+            return Ok(None);
+        };
+        let Some((grid, machine)) = self.block_grid(machine_block_id) else {
+            return Err(IntentError::rejected(
+                "production_machine_missing",
+                "a queued production machine is missing from canonical state",
+            ));
+        };
+        if !machine.is_complete()
+            || !content::machine_supports_recipe(machine.kind, job.recipe)
+            || !grid.power().online
+            || !self.production_route_exists(machine_block_id, &job.source_inventory_id)
+            || !self.production_route_exists(machine_block_id, &job.destination_inventory_id)
+        {
+            return Ok(None);
+        }
+
+        if job.progress_ticks == job.duration_ticks {
+            let destination = self.inventory(&job.destination_inventory_id)?;
+            if !inventory_can_add_contents(destination, &job.pending_outputs) {
+                return Ok(None);
+            }
+            return Ok(Some(EventPayload::ProductionOutputDelivered {
+                machine_block_id: machine_block_id.to_owned(),
+                job_id: job.job_id.clone(),
+                destination_inventory_id: job.destination_inventory_id.clone(),
+                outputs: job.pending_outputs.clone(),
+            }));
+        }
+
+        let elapsed_ticks = u64::from(content::manifest().physics.fixed_step_hz);
+        let new_progress_ticks = job
+            .progress_ticks
+            .saturating_add(elapsed_ticks)
+            .min(job.duration_ticks);
+        let completed = new_progress_ticks == job.duration_ticks;
+        let output_delivered = if completed {
+            let (_, outputs, _) = production_recipe_quantities(job.recipe, job.batches)
+                .ok_or_else(|| {
+                    IntentError::rejected(
+                        "production_job_invalid",
+                        "queued production quantities no longer match registered content",
+                    )
+                })?;
+            inventory_can_add_contents(self.inventory(&job.destination_inventory_id)?, &outputs)
+        } else {
+            false
+        };
+        Ok(Some(EventPayload::ProductionAdvanced {
+            machine_block_id: machine_block_id.to_owned(),
+            job_id: job.job_id.clone(),
+            previous_progress_ticks: job.progress_ticks,
+            new_progress_ticks,
+            completed,
+            output_delivered,
+        }))
+    }
+
     fn next_suit_oxygen_after_one_second_for(&self, player_id: &str) -> Result<u16, IntentError> {
         let player = self.player.get(player_id).ok_or_else(|| {
             IntentError::rejected(
@@ -1235,6 +1330,15 @@ impl WorldState {
                 inventory_id: inventory_id.clone(),
                 quantity: *quantity,
             },
+            EventPayload::ProductionQueued { job } => ClientMessage::QueueProduction {
+                operation_sequence,
+                operation_id,
+                machine_block_id: job.machine_block_id.clone(),
+                recipe: job.recipe,
+                batches: job.batches,
+                source_inventory_id: job.source_inventory_id.clone(),
+                destination_inventory_id: job.destination_inventory_id.clone(),
+            },
             EventPayload::InventoryTransferred {
                 source_inventory_id,
                 destination_inventory_id,
@@ -1300,6 +1404,13 @@ impl WorldState {
                 return Err(IntentError::rejected(
                     "replay_physics_envelope_invalid",
                     "physics payload cannot use a human client envelope",
+                ));
+            }
+            EventPayload::ProductionAdvanced { .. }
+            | EventPayload::ProductionOutputDelivered { .. } => {
+                return Err(IntentError::rejected(
+                    "replay_production_envelope_invalid",
+                    "automatic production payload cannot use a human client envelope",
                 ));
             }
         };
@@ -1377,6 +1488,15 @@ impl WorldState {
             return Err(IntentError::rejected(
                 "player_incapacitated",
                 "life support has failed; request recovery before performing work",
+            ));
+        }
+        if matches!(
+            message,
+            ClientMessage::RefineOre { .. } | ClientMessage::CraftComponent { .. }
+        ) {
+            return Err(IntentError::rejected(
+                "physical_machine_required",
+                "protocol 15 production must be queued on a connected physical machine",
             ));
         }
 
@@ -1592,6 +1712,95 @@ impl WorldState {
                 EventPayload::ComponentCrafted {
                     inventory_id: inventory_id.clone(),
                     quantity: *quantity,
+                }
+            }
+            ClientMessage::QueueProduction {
+                machine_block_id,
+                recipe,
+                batches,
+                source_inventory_id,
+                destination_inventory_id,
+                ..
+            } => {
+                let (grid, machine) = self.block_grid(machine_block_id).ok_or_else(|| {
+                    IntentError::rejected(
+                        "production_machine_missing",
+                        "the selected production machine does not exist",
+                    )
+                })?;
+                self.ensure_actor_owns_grid(actor_player_id, &grid.grid_id)?;
+                if !machine.is_complete() {
+                    return Err(IntentError::rejected(
+                        "production_machine_incomplete",
+                        "finish welding the selected production machine before queueing work",
+                    ));
+                }
+                if !content::machine_supports_recipe(machine.kind, *recipe) {
+                    return Err(IntentError::rejected(
+                        "production_recipe_mismatch",
+                        "the selected recipe is not registered for this machine",
+                    ));
+                }
+                if self
+                    .production_queues
+                    .get(machine_block_id)
+                    .map_or(0, VecDeque::len)
+                    >= content::manifest().production.queue_limit_per_machine
+                {
+                    return Err(IntentError::rejected(
+                        "production_queue_full",
+                        "this machine already has the maximum 32 queued jobs",
+                    ));
+                }
+                for inventory_id in [source_inventory_id, destination_inventory_id] {
+                    self.ensure_actor_owns_inventory(actor_player_id, inventory_id)?;
+                    if self.cargo_block_for_inventory(inventory_id).is_none() {
+                        return Err(IntentError::rejected(
+                            "production_cargo_required",
+                            "production source and destination must be completed cargo inventories",
+                        ));
+                    }
+                    if !self.production_route_exists(machine_block_id, inventory_id) {
+                        return Err(IntentError::rejected(
+                            "production_route_missing",
+                            "the machine and both cargo endpoints require one completed same-grid conveyor route",
+                        ));
+                    }
+                }
+                let (reserved_inputs, _outputs, duration_ticks) =
+                    production_recipe_quantities(*recipe, *batches).ok_or_else(|| {
+                        IntentError::rejected(
+                            "production_quantity_invalid",
+                            "production batches must be positive and fit canonical bounds",
+                        )
+                    })?;
+                let source = self.inventory(source_inventory_id)?;
+                if source.contents.ore < reserved_inputs.ore
+                    || source.contents.refined_material < reserved_inputs.refined_material
+                    || source.contents.components < reserved_inputs.components
+                {
+                    return Err(IntentError::rejected(
+                        "production_input_insufficient",
+                        "source cargo does not contain the recipe's registered input",
+                    ));
+                }
+                EventPayload::ProductionQueued {
+                    job: ProductionJob {
+                        job_id: format!("production-job-{}", self.event_sequence + 1),
+                        operation_id: operation_id.to_owned(),
+                        owner_player_id: actor_player_id.to_owned(),
+                        machine_block_id: machine_block_id.clone(),
+                        recipe: *recipe,
+                        content_manifest_version: self.content_manifest_version.clone(),
+                        batches: *batches,
+                        source_inventory_id: source_inventory_id.clone(),
+                        destination_inventory_id: destination_inventory_id.clone(),
+                        progress_ticks: 0,
+                        duration_ticks,
+                        reserved_inputs,
+                        pending_outputs: InventoryContents::default(),
+                        queued_event_sequence: self.event_sequence + 1,
+                    },
                 }
             }
             ClientMessage::TransferInventory {
@@ -2055,8 +2264,13 @@ impl WorldState {
                     "voxel mining requires the authoritative player actor and an operation ID",
                 ));
             }
-            EventPayload::OreRefined { .. }
-            | EventPayload::ComponentCrafted { .. }
+            EventPayload::OreRefined { .. } | EventPayload::ComponentCrafted { .. } => {
+                return Err(IntentError::rejected(
+                    "replay_physical_machine_required",
+                    "event schema 13 rejects direct inventory refining and crafting",
+                ));
+            }
+            EventPayload::ProductionQueued { .. }
             | EventPayload::InventoryTransferred { .. }
             | EventPayload::BlockBuilt { .. }
             | EventPayload::BlockWelded { .. }
@@ -2070,6 +2284,17 @@ impl WorldState {
                 return Err(IntentError::rejected(
                     "replay_hand_tool_envelope_invalid",
                     "industry, construction, grid control, anchoring, and hand-tool damage require an authenticated player actor and operation ID",
+                ));
+            }
+            EventPayload::ProductionAdvanced { .. }
+            | EventPayload::ProductionOutputDelivered { .. }
+                if event.actor_player_id.is_some()
+                    || event.actor_type != "system"
+                    || event.operation_id.is_some() =>
+            {
+                return Err(IntentError::rejected(
+                    "replay_production_envelope_invalid",
+                    "production advancement and delivery require the system actor and no operation ID",
                 ));
             }
             EventPayload::PhysicsStepCommitted { .. }
@@ -2412,6 +2637,227 @@ impl WorldState {
                     !((pair.body_a == body_id && pair.collider_a == collider_id)
                         || (pair.body_b == body_id && pair.collider_b == collider_id))
                 });
+            }
+            EventPayload::ProductionQueued { job } => {
+                let actor_player_id = event
+                    .actor_player_id
+                    .as_deref()
+                    .expect("validated production enqueue has a human actor");
+                let operation_id = event
+                    .operation_id
+                    .as_deref()
+                    .expect("validated production enqueue has an operation ID");
+                let (grid, machine) = self.block_grid(&job.machine_block_id).ok_or_else(|| {
+                    IntentError::rejected(
+                        "replay_production_machine_missing",
+                        "queued production machine is not present",
+                    )
+                })?;
+                if job.job_id != format!("production-job-{}", event.event_sequence)
+                    || job.queued_event_sequence != event.event_sequence
+                    || job.operation_id != operation_id
+                    || job.owner_player_id != actor_player_id
+                    || grid.owner_player_id != actor_player_id
+                    || !machine.is_complete()
+                    || !content::machine_supports_recipe(machine.kind, job.recipe)
+                    || job.content_manifest_version != self.content_manifest_version
+                    || job.progress_ticks != 0
+                    || job.pending_outputs != InventoryContents::default()
+                    || self
+                        .production_queues
+                        .values()
+                        .flatten()
+                        .any(|prior| prior.job_id == job.job_id)
+                {
+                    return Err(IntentError::rejected(
+                        "replay_production_job_invalid",
+                        "queued production identity, owner, machine, manifest, or initial state is not canonical",
+                    ));
+                }
+                if self
+                    .production_queues
+                    .get(&job.machine_block_id)
+                    .map_or(0, VecDeque::len)
+                    >= content::manifest().production.queue_limit_per_machine
+                {
+                    return Err(IntentError::rejected(
+                        "replay_production_queue_full",
+                        "queued production exceeds the canonical machine queue bound",
+                    ));
+                }
+                let (expected_inputs, _, expected_duration) =
+                    production_recipe_quantities(job.recipe, job.batches).ok_or_else(|| {
+                        IntentError::rejected(
+                            "replay_production_quantity_invalid",
+                            "queued production quantities overflow registered bounds",
+                        )
+                    })?;
+                if job.reserved_inputs != expected_inputs || job.duration_ticks != expected_duration
+                {
+                    return Err(IntentError::rejected(
+                        "replay_production_recipe_invalid",
+                        "queued production escrow or duration does not match registered content",
+                    ));
+                }
+                for inventory_id in [&job.source_inventory_id, &job.destination_inventory_id] {
+                    self.ensure_actor_owns_inventory(actor_player_id, inventory_id)?;
+                    if self.cargo_block_for_inventory(inventory_id).is_none()
+                        || !self.production_route_exists(&job.machine_block_id, inventory_id)
+                    {
+                        return Err(IntentError::rejected(
+                            "replay_production_route_invalid",
+                            "queued production endpoints do not share a completed conveyor route",
+                        ));
+                    }
+                }
+                let mut source = self.inventory(&job.source_inventory_id)?.clone();
+                subtract_contents(&mut source.contents, &job.reserved_inputs).map_err(|()| {
+                    IntentError::rejected(
+                        "replay_production_input_invalid",
+                        "queued production exceeds its source cargo contents",
+                    )
+                })?;
+                self.inventory_mut(&job.source_inventory_id)?.contents = source.contents;
+                self.production_queues
+                    .entry(job.machine_block_id.clone())
+                    .or_default()
+                    .push_back(job.clone());
+            }
+            EventPayload::ProductionAdvanced {
+                machine_block_id,
+                new_progress_ticks,
+                completed,
+                output_delivered,
+                ..
+            } => {
+                let expected = self.production_payload_after_one_second(machine_block_id)?;
+                if expected.as_ref() != Some(&event.payload) {
+                    return Err(IntentError::rejected(
+                        "replay_production_advance_invalid",
+                        "production advance does not match the exact authoritative one-second outcome",
+                    ));
+                }
+                let job = self.production_queues[machine_block_id]
+                    .front()
+                    .expect("validated production advance has a queue head")
+                    .clone();
+                if *completed {
+                    let (_, outputs, _) = production_recipe_quantities(job.recipe, job.batches)
+                        .expect("validated production job quantities remain registered");
+                    match job.recipe {
+                        ProductionRecipeKind::Refining => {
+                            self.ledger.refine_batches = self
+                                .ledger
+                                .refine_batches
+                                .checked_add(job.batches)
+                                .ok_or_else(|| {
+                                    IntentError::rejected(
+                                        "replay_production_ledger_invalid",
+                                        "refining completion overflows the canonical ledger",
+                                    )
+                                })?;
+                        }
+                        ProductionRecipeKind::Component => {
+                            self.ledger.crafted_components = self
+                                .ledger
+                                .crafted_components
+                                .checked_add(job.batches)
+                                .ok_or_else(|| {
+                                    IntentError::rejected(
+                                        "replay_production_ledger_invalid",
+                                        "component completion overflows the canonical ledger",
+                                    )
+                                })?;
+                        }
+                    }
+                    let (experience_reward, refining_batches, components_crafted) = match job.recipe
+                    {
+                        ProductionRecipeKind::Refining => (
+                            job.batches.saturating_mul(
+                                content::manifest().experience_rewards.refining_batch,
+                            ),
+                            job.batches,
+                            0,
+                        ),
+                        ProductionRecipeKind::Component => (
+                            job.batches.saturating_mul(
+                                content::manifest().experience_rewards.crafted_component,
+                            ),
+                            0,
+                            job.batches,
+                        ),
+                    };
+                    let owner = self.player.get_mut(&job.owner_player_id).ok_or_else(|| {
+                        IntentError::rejected(
+                            "replay_production_owner_missing",
+                            "production completion owner is not present in the canonical roster",
+                        )
+                    })?;
+                    owner.experience = owner.experience.saturating_add(experience_reward);
+                    owner.career.refining_batches = owner
+                        .career
+                        .refining_batches
+                        .saturating_add(refining_batches);
+                    owner.career.components_crafted = owner
+                        .career
+                        .components_crafted
+                        .saturating_add(components_crafted);
+                    if *output_delivered {
+                        add_contents(
+                            &mut self.inventory_mut(&job.destination_inventory_id)?.contents,
+                            &outputs,
+                        )?;
+                        let queue = self
+                            .production_queues
+                            .get_mut(machine_block_id)
+                            .expect("queue exists");
+                        queue.pop_front();
+                        if queue.is_empty() {
+                            self.production_queues.remove(machine_block_id);
+                        }
+                    } else {
+                        let head = self
+                            .production_queues
+                            .get_mut(machine_block_id)
+                            .and_then(|queue| queue.front_mut())
+                            .expect("validated production queue head exists");
+                        head.progress_ticks = *new_progress_ticks;
+                        head.reserved_inputs = InventoryContents::default();
+                        head.pending_outputs = outputs;
+                    }
+                } else {
+                    self.production_queues
+                        .get_mut(machine_block_id)
+                        .and_then(|queue| queue.front_mut())
+                        .expect("validated production queue head exists")
+                        .progress_ticks = *new_progress_ticks;
+                }
+            }
+            EventPayload::ProductionOutputDelivered {
+                machine_block_id,
+                destination_inventory_id,
+                outputs,
+                ..
+            } => {
+                let expected = self.production_payload_after_one_second(machine_block_id)?;
+                if expected.as_ref() != Some(&event.payload) {
+                    return Err(IntentError::rejected(
+                        "replay_production_delivery_invalid",
+                        "production output delivery does not match authoritative route and capacity",
+                    ));
+                }
+                add_contents(
+                    &mut self.inventory_mut(destination_inventory_id)?.contents,
+                    outputs,
+                )?;
+                let queue = self
+                    .production_queues
+                    .get_mut(machine_block_id)
+                    .expect("queue exists");
+                queue.pop_front();
+                if queue.is_empty() {
+                    self.production_queues.remove(machine_block_id);
+                }
             }
             EventPayload::OreRefined {
                 inventory_id,
@@ -3380,6 +3826,9 @@ impl WorldState {
             | EventPayload::SuitOxygenChanged { .. }
             | EventPayload::PlayerIncapacitated { .. }
             | EventPayload::PlayerRespawned { .. }
+            | EventPayload::ProductionQueued { .. }
+            | EventPayload::ProductionAdvanced { .. }
+            | EventPayload::ProductionOutputDelivered { .. }
             | EventPayload::InventoryTransferred { .. }
             | EventPayload::BlockBuilt { .. }
             | EventPayload::BlockWelded { .. }
@@ -3463,8 +3912,34 @@ impl WorldState {
         {
             inventory.domain = InventoryDomain::Dropped {
                 reason: "cargo_block_destroyed".into(),
-                owner_player_id: grid_owner_player_id,
+                owner_player_id: grid_owner_player_id.clone(),
             };
+        }
+        if let Some(queue) = self.production_queues.remove(block_id) {
+            let mut contents = InventoryContents::default();
+            for job in queue {
+                add_contents(&mut contents, &job.reserved_inputs)?;
+                add_contents(&mut contents, &job.pending_outputs)?;
+            }
+            let inventory_id = format!("inventory-production-drop-{event_sequence}-{block_id}");
+            if self.inventories.contains_key(&inventory_id) {
+                return Err(IntentError::rejected(
+                    "replay_production_drop_identity_duplicate",
+                    "deterministic machine-destruction drop identity is already in use",
+                ));
+            }
+            self.inventories.insert(
+                inventory_id.clone(),
+                InventoryRecord {
+                    inventory_id,
+                    domain: InventoryDomain::Dropped {
+                        reason: "production_machine_destroyed".into(),
+                        owner_player_id: grid_owner_player_id,
+                    },
+                    contents,
+                    capacity_liters: u64::MAX,
+                },
+            );
         }
         self.split_disconnected_grid(grid_id, event_sequence)?;
         Ok(())
@@ -4374,6 +4849,9 @@ fn event_changes_physics_scene(payload: &EventPayload) -> bool {
         EventPayload::PlayerControlSet { .. }
             | EventPayload::SuitModeChanged { .. }
             | EventPayload::SuitOxygenChanged { .. }
+            | EventPayload::ProductionQueued { .. }
+            | EventPayload::ProductionAdvanced { .. }
+            | EventPayload::ProductionOutputDelivered { .. }
             | EventPayload::GridControlSet { .. }
             | EventPayload::PhysicsStepCommitted { .. }
     )
@@ -5704,6 +6182,50 @@ fn mutate_resource(
     }
 }
 
+fn subtract_contents(
+    contents: &mut InventoryContents,
+    removed: &InventoryContents,
+) -> Result<(), ()> {
+    contents.ore = contents.ore.checked_sub(removed.ore).ok_or(())?;
+    contents.refined_material = contents
+        .refined_material
+        .checked_sub(removed.refined_material)
+        .ok_or(())?;
+    contents.components = contents
+        .components
+        .checked_sub(removed.components)
+        .ok_or(())?;
+    Ok(())
+}
+
+fn add_contents(
+    contents: &mut InventoryContents,
+    added: &InventoryContents,
+) -> Result<(), IntentError> {
+    contents.ore = contents.ore.checked_add(added.ore).ok_or_else(|| {
+        IntentError::rejected("production_output_overflow", "ore output overflowed cargo")
+    })?;
+    contents.refined_material = contents
+        .refined_material
+        .checked_add(added.refined_material)
+        .ok_or_else(|| {
+            IntentError::rejected(
+                "production_output_overflow",
+                "refined material output overflowed cargo",
+            )
+        })?;
+    contents.components = contents
+        .components
+        .checked_add(added.components)
+        .ok_or_else(|| {
+            IntentError::rejected(
+                "production_output_overflow",
+                "component output overflowed cargo",
+            )
+        })?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -5714,12 +6236,714 @@ mod tests {
 
     use super::*;
     use crate::model::{
-        ActorOperationHistory, PROCESSED_OPERATION_RETENTION_LIMIT, STARTER_GRID_ID, VoxelField,
+        ActorOperationHistory, PROCESSED_OPERATION_RETENTION_LIMIT, STARTER_GRID_ID,
+        STARTER_INDUSTRY_CARGO_INVENTORY_ID, STARTER_INDUSTRY_GRID_ID, VoxelField,
     };
     use crate::persistence::AppendFailpoint;
 
     fn runtime() -> Runtime {
         Runtime::open(tempdir().expect("tempdir").keep(), 42, 5).expect("runtime opens")
+    }
+
+    fn seed_industry_cargo(runtime: &mut Runtime, contents: InventoryContents) {
+        let ore = contents.ore;
+        let refined_material = contents.refined_material;
+        let components = contents.components;
+        runtime
+            .state
+            .inventories
+            .get_mut(STARTER_INDUSTRY_CARGO_INVENTORY_ID)
+            .expect("starter industry cargo exists")
+            .contents = contents;
+        runtime.state.ledger.genesis_ore = runtime.state.ledger.genesis_ore.saturating_add(ore);
+        runtime.state.ledger.genesis_refined = runtime
+            .state
+            .ledger
+            .genesis_refined
+            .saturating_add(refined_material);
+        runtime.state.ledger.genesis_components = runtime
+            .state
+            .ledger
+            .genesis_components
+            .saturating_add(components);
+        assert!(runtime.state.conservation().valid);
+        runtime
+            .persist_snapshot()
+            .expect("industry fixture persists");
+    }
+
+    fn production_intent(
+        operation_id: &str,
+        machine_block_id: &str,
+        recipe: ProductionRecipeKind,
+        batches: u64,
+    ) -> ClientMessage {
+        ClientMessage::QueueProduction {
+            operation_sequence: 0,
+            operation_id: operation_id.into(),
+            machine_block_id: machine_block_id.into(),
+            recipe,
+            batches,
+            source_inventory_id: STARTER_INDUSTRY_CARGO_INVENTORY_ID.into(),
+            destination_inventory_id: STARTER_INDUSTRY_CARGO_INVENTORY_ID.into(),
+        }
+    }
+
+    fn advance_whole_seconds(runtime: &mut Runtime, seconds: usize) {
+        for _ in 0..seconds * 4 {
+            runtime.advance(250).expect("authoritative second advances");
+        }
+    }
+
+    #[test]
+    fn physical_industry_reserves_advances_completes_and_recovers_exactly() {
+        let directory = tempdir().expect("tempdir");
+        let expected_hash;
+        {
+            let mut runtime = Runtime::open(directory.path(), 501, 100).expect("runtime opens");
+            runtime
+                .admit_development_player("player-remote")
+                .expect("projection actor admits");
+            seed_industry_cargo(
+                &mut runtime,
+                InventoryContents {
+                    ore: 2,
+                    ..InventoryContents::default()
+                },
+            );
+            let refine = production_intent(
+                "physical-refine-1",
+                "block-refinery",
+                ProductionRecipeKind::Refining,
+                1,
+            );
+            let first = runtime
+                .execute_next_for_fixture(&refine)
+                .expect("connected refinery enqueue accepts");
+            let retry = runtime
+                .execute_next_for_fixture(&refine)
+                .expect("exact enqueue retry returns its durable receipt");
+            assert_eq!(first, retry);
+            assert_eq!(
+                runtime.state().inventories[STARTER_INDUSTRY_CARGO_INVENTORY_ID]
+                    .contents
+                    .ore,
+                0
+            );
+            assert_eq!(runtime.state().production_queues["block-refinery"].len(), 1);
+            assert_eq!(runtime.state().ledger.refine_batches, 0);
+            assert_eq!(runtime.state().player.career.refining_batches, 0);
+            assert!(runtime.state().conservation().valid);
+
+            let local = runtime
+                .state()
+                .project_world_snapshot(Some("player-local"))
+                .expect("local production projection");
+            assert_eq!(
+                local
+                    .actor_private
+                    .expect("local private state")
+                    .production_queues
+                    .len(),
+                1
+            );
+            let remote = runtime
+                .state()
+                .project_world_snapshot(Some("player-remote"))
+                .expect("remote production projection");
+            assert!(
+                remote
+                    .actor_private
+                    .expect("remote private state")
+                    .production_queues
+                    .is_empty()
+            );
+            assert!(
+                runtime
+                    .state()
+                    .project_world_snapshot(None)
+                    .expect("spectator projection")
+                    .actor_private
+                    .is_none()
+            );
+
+            advance_whole_seconds(&mut runtime, 1);
+            let refining = runtime.state().production_queues["block-refinery"]
+                .front()
+                .expect("refining remains queued");
+            assert_eq!(refining.progress_ticks, 60);
+            assert_eq!(refining.duration_ticks, 120);
+            assert_eq!(runtime.state().ledger.refine_batches, 0);
+            assert_eq!(
+                runtime.state().inventories[STARTER_INDUSTRY_CARGO_INVENTORY_ID]
+                    .contents
+                    .refined_material,
+                0
+            );
+
+            advance_whole_seconds(&mut runtime, 1);
+            assert!(
+                !runtime
+                    .state()
+                    .production_queues
+                    .contains_key("block-refinery")
+            );
+            assert_eq!(runtime.state().ledger.refine_batches, 1);
+            assert_eq!(runtime.state().player.career.refining_batches, 1);
+            assert_eq!(
+                runtime.state().inventories[STARTER_INDUSTRY_CARGO_INVENTORY_ID]
+                    .contents
+                    .refined_material,
+                1
+            );
+
+            runtime
+                .execute_next_for_fixture(&production_intent(
+                    "physical-component-1",
+                    "block-assembler",
+                    ProductionRecipeKind::Component,
+                    1,
+                ))
+                .expect("connected assembler enqueue accepts");
+            advance_whole_seconds(&mut runtime, 1);
+            assert_eq!(
+                runtime.state().production_queues["block-assembler"]
+                    .front()
+                    .expect("assembler remains queued")
+                    .progress_ticks,
+                60
+            );
+            advance_whole_seconds(&mut runtime, 1);
+            assert!(
+                !runtime
+                    .state()
+                    .production_queues
+                    .contains_key("block-assembler")
+            );
+            assert_eq!(runtime.state().ledger.crafted_components, 1);
+            assert_eq!(runtime.state().player.career.components_crafted, 1);
+            assert_eq!(
+                runtime.state().inventories[STARTER_INDUSTRY_CARGO_INVENTORY_ID].contents,
+                InventoryContents {
+                    components: 1,
+                    ..InventoryContents::default()
+                }
+            );
+            assert!(runtime.state().conservation().valid);
+            runtime
+                .persist_snapshot()
+                .expect("completed industry persists");
+            expected_hash = runtime.state().state_hash();
+        }
+        let recovered = Runtime::open(directory.path(), 501, 100).expect("industry recovers");
+        assert_eq!(recovered.state().state_hash(), expected_hash);
+        assert_eq!(
+            recovered.state().inventories[STARTER_INDUSTRY_CARGO_INVENTORY_ID]
+                .contents
+                .components,
+            1
+        );
+    }
+
+    #[test]
+    fn production_pauses_for_power_and_route_and_delivers_blocked_output_once() {
+        let directory = tempdir().expect("tempdir");
+        let mut runtime = Runtime::open(directory.path(), 502, 100).expect("runtime opens");
+        seed_industry_cargo(
+            &mut runtime,
+            InventoryContents {
+                ore: 2,
+                ..InventoryContents::default()
+            },
+        );
+        runtime
+            .execute_next_for_fixture(&production_intent(
+                "paused-refine-1",
+                "block-refinery",
+                ProductionRecipeKind::Refining,
+                1,
+            ))
+            .expect("refinery enqueue accepts");
+
+        runtime
+            .state
+            .grids
+            .get_mut(STARTER_INDUSTRY_GRID_ID)
+            .expect("industry grid")
+            .blocks
+            .get_mut("block-industry-power")
+            .expect("industry power block")
+            .construction_complete = false;
+        advance_whole_seconds(&mut runtime, 1);
+        assert_eq!(
+            runtime.state().production_queues["block-refinery"][0].progress_ticks,
+            0
+        );
+        assert_eq!(
+            runtime.state().production_job_status("block-refinery", 0),
+            verse_protocol::ProductionJobStatus::PausedPower
+        );
+
+        runtime
+            .state
+            .grids
+            .get_mut(STARTER_INDUSTRY_GRID_ID)
+            .expect("industry grid")
+            .blocks
+            .get_mut("block-industry-power")
+            .expect("industry power block")
+            .construction_complete = true;
+        runtime
+            .state
+            .grids
+            .get_mut(STARTER_INDUSTRY_GRID_ID)
+            .expect("industry grid")
+            .blocks
+            .get_mut("block-conveyor")
+            .expect("industry conveyor")
+            .construction_complete = false;
+        advance_whole_seconds(&mut runtime, 1);
+        assert_eq!(
+            runtime.state().production_queues["block-refinery"][0].progress_ticks,
+            0
+        );
+        assert_eq!(
+            runtime.state().production_job_status("block-refinery", 0),
+            verse_protocol::ProductionJobStatus::PausedRoute
+        );
+
+        runtime
+            .state
+            .grids
+            .get_mut(STARTER_INDUSTRY_GRID_ID)
+            .expect("industry grid")
+            .blocks
+            .get_mut("block-conveyor")
+            .expect("industry conveyor")
+            .construction_complete = true;
+        runtime
+            .state
+            .inventories
+            .get_mut(STARTER_INDUSTRY_CARGO_INVENTORY_ID)
+            .expect("industry cargo")
+            .capacity_liters = 1;
+        advance_whole_seconds(&mut runtime, 2);
+        let blocked = runtime.state().production_queues["block-refinery"]
+            .front()
+            .expect("blocked output remains in machine escrow");
+        assert_eq!(blocked.progress_ticks, blocked.duration_ticks);
+        assert_eq!(blocked.reserved_inputs, InventoryContents::default());
+        assert_eq!(blocked.pending_outputs.refined_material, 1);
+        assert_eq!(runtime.state().ledger.refine_batches, 1);
+        assert_eq!(runtime.state().player.career.refining_batches, 1);
+        assert_eq!(
+            runtime.state().production_job_status("block-refinery", 0),
+            verse_protocol::ProductionJobStatus::OutputBlocked
+        );
+        let experience_after_completion = runtime.state().player.experience;
+        assert!(runtime.state().conservation().valid);
+        runtime.persist_snapshot().expect("blocked output persists");
+        let blocked_hash = runtime.state().state_hash();
+        drop(runtime);
+
+        let mut recovered =
+            Runtime::open(directory.path(), 502, 100).expect("blocked job recovers");
+        assert_eq!(recovered.state().state_hash(), blocked_hash);
+        recovered
+            .state
+            .inventories
+            .get_mut(STARTER_INDUSTRY_CARGO_INVENTORY_ID)
+            .expect("industry cargo")
+            .capacity_liters = CARGO_INVENTORY_CAPACITY_LITERS;
+        advance_whole_seconds(&mut recovered, 1);
+        assert!(
+            !recovered
+                .state()
+                .production_queues
+                .contains_key("block-refinery")
+        );
+        assert_eq!(
+            recovered.state().inventories[STARTER_INDUSTRY_CARGO_INVENTORY_ID]
+                .contents
+                .refined_material,
+            1
+        );
+        assert_eq!(
+            recovered.state().player.experience,
+            experience_after_completion
+        );
+        assert_eq!(recovered.state().ledger.refine_batches, 1);
+        assert!(recovered.state().conservation().valid);
+    }
+
+    #[test]
+    fn destroying_a_production_machine_drops_every_escrowed_asset_once() {
+        let directory = tempdir().expect("tempdir");
+        let expected_hash;
+        {
+            let mut runtime = Runtime::open(directory.path(), 503, 100).expect("runtime opens");
+            seed_industry_cargo(
+                &mut runtime,
+                InventoryContents {
+                    ore: 4,
+                    ..InventoryContents::default()
+                },
+            );
+            runtime
+                .execute_next_for_fixture(&production_intent(
+                    "destroyed-machine-refine",
+                    "block-refinery",
+                    ProductionRecipeKind::Refining,
+                    2,
+                ))
+                .expect("refinery work reserves input");
+            assert_eq!(
+                runtime.state().production_queues["block-refinery"][0]
+                    .reserved_inputs
+                    .ore,
+                4
+            );
+            aim_player_at_block(&mut runtime, STARTER_INDUSTRY_GRID_ID, "block-refinery");
+            runtime.persist_snapshot().expect("damage pose persists");
+            for strike in 0..6 {
+                runtime
+                    .execute_next_for_fixture(&ClientMessage::DamageBlock {
+                        operation_sequence: 0,
+                        operation_id: format!("destroy-refinery-{strike}"),
+                        grid_id: STARTER_INDUSTRY_GRID_ID.into(),
+                        block_id: "block-refinery".into(),
+                    })
+                    .expect("authoritative damage applies");
+            }
+            assert!(runtime.state().block_grid("block-refinery").is_none());
+            assert!(
+                !runtime
+                    .state()
+                    .production_queues
+                    .contains_key("block-refinery")
+            );
+            let drops = runtime
+                .state()
+                .inventories
+                .values()
+                .filter(|inventory| {
+                    matches!(
+                        &inventory.domain,
+                        InventoryDomain::Dropped { reason, .. }
+                            if reason == "production_machine_destroyed"
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(drops.len(), 1);
+            assert_eq!(
+                drops[0].contents,
+                InventoryContents {
+                    ore: 4,
+                    ..InventoryContents::default()
+                }
+            );
+            assert_eq!(runtime.state().ledger.refine_batches, 0);
+            assert!(runtime.state().conservation().valid);
+            expected_hash = runtime.state().state_hash();
+        }
+        let recovered = Runtime::open(directory.path(), 503, 100).expect("drop recovers");
+        assert_eq!(recovered.state().state_hash(), expected_hash);
+        assert_eq!(
+            recovered
+                .state()
+                .inventories
+                .values()
+                .filter(|inventory| matches!(
+                    &inventory.domain,
+                    InventoryDomain::Dropped { reason, .. }
+                        if reason == "production_machine_destroyed"
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn grid_split_retains_machine_queue_once_and_pauses_the_broken_route() {
+        let directory = tempdir().expect("tempdir");
+        let expected_hash;
+        let progress_before_split;
+        {
+            let mut runtime = Runtime::open(directory.path(), 504, 100).expect("runtime opens");
+            seed_industry_cargo(
+                &mut runtime,
+                InventoryContents {
+                    ore: 4,
+                    ..InventoryContents::default()
+                },
+            );
+            runtime
+                .execute_next_for_fixture(&production_intent(
+                    "split-machine-refine",
+                    "block-refinery",
+                    ProductionRecipeKind::Refining,
+                    2,
+                ))
+                .expect("refinery work reserves input");
+            advance_whole_seconds(&mut runtime, 1);
+            progress_before_split =
+                runtime.state().production_queues["block-refinery"][0].progress_ticks;
+
+            aim_player_at_block(&mut runtime, STARTER_INDUSTRY_GRID_ID, "block-conveyor");
+            runtime.persist_snapshot().expect("damage pose persists");
+            for strike in 0..3 {
+                runtime
+                    .execute_next_for_fixture(&ClientMessage::DamageBlock {
+                        operation_sequence: 0,
+                        operation_id: format!("split-industry-conveyor-{strike}"),
+                        grid_id: STARTER_INDUSTRY_GRID_ID.into(),
+                        block_id: "block-conveyor".into(),
+                    })
+                    .expect("authoritative conveyor damage applies");
+            }
+
+            assert!(runtime.state().block_grid("block-conveyor").is_none());
+            let (machine_grid, _) = runtime
+                .state()
+                .block_grid("block-refinery")
+                .expect("refinery survives on one split fragment");
+            assert_ne!(machine_grid.grid_id, STARTER_INDUSTRY_GRID_ID);
+            assert_eq!(runtime.state().production_queues["block-refinery"].len(), 1);
+            assert_eq!(
+                runtime.state().production_queues["block-refinery"][0].progress_ticks,
+                progress_before_split
+            );
+            assert_eq!(
+                runtime.state().production_job_status("block-refinery", 0),
+                verse_protocol::ProductionJobStatus::PausedRoute
+            );
+            assert_eq!(
+                runtime
+                    .state()
+                    .inventories
+                    .values()
+                    .filter(|inventory| matches!(
+                        &inventory.domain,
+                        InventoryDomain::Dropped { reason, .. }
+                            if reason == "production_machine_destroyed"
+                    ))
+                    .count(),
+                0
+            );
+
+            advance_whole_seconds(&mut runtime, 2);
+            assert_eq!(
+                runtime.state().production_queues["block-refinery"][0].progress_ticks,
+                progress_before_split
+            );
+            assert!(runtime.state().conservation().valid);
+            runtime.persist_snapshot().expect("split queue persists");
+            expected_hash = runtime.state().state_hash();
+        }
+
+        let recovered = Runtime::open(directory.path(), 504, 100).expect("split queue recovers");
+        assert_eq!(recovered.state().state_hash(), expected_hash);
+        assert_eq!(
+            recovered.state().production_queues["block-refinery"][0].progress_ticks,
+            progress_before_split
+        );
+        assert_eq!(
+            recovered.state().production_job_status("block-refinery", 0),
+            verse_protocol::ProductionJobStatus::PausedRoute
+        );
+        assert!(recovered.state().conservation().valid);
+    }
+
+    #[test]
+    fn production_queue_bound_rejects_the_thirty_third_job_without_reserving_input() {
+        let mut runtime = runtime();
+        seed_industry_cargo(
+            &mut runtime,
+            InventoryContents {
+                ore: 66,
+                ..InventoryContents::default()
+            },
+        );
+        for index in 0..content::manifest().production.queue_limit_per_machine {
+            runtime
+                .execute_next_for_fixture(&production_intent(
+                    &format!("bounded-refinery-{index}"),
+                    "block-refinery",
+                    ProductionRecipeKind::Refining,
+                    1,
+                ))
+                .expect("job within the queue bound accepts");
+        }
+        let queue = &runtime.state().production_queues["block-refinery"];
+        assert_eq!(
+            queue.len(),
+            content::manifest().production.queue_limit_per_machine
+        );
+        assert!(
+            queue
+                .iter()
+                .map(|job| job.queued_event_sequence)
+                .is_sorted()
+        );
+        assert_eq!(
+            runtime.state().inventories[STARTER_INDUSTRY_CARGO_INVENTORY_ID]
+                .contents
+                .ore,
+            2
+        );
+
+        let before_hash = runtime.state().state_hash();
+        let before_sequence = runtime.state().event_sequence;
+        let error = runtime
+            .execute_next_for_fixture(&production_intent(
+                "bounded-refinery-overflow",
+                "block-refinery",
+                ProductionRecipeKind::Refining,
+                1,
+            ))
+            .expect_err("the thirty-third job rejects");
+        assert!(matches!(
+            error,
+            RuntimeError::Intent(IntentError::Rejected { ref code, .. })
+                if code == "production_queue_full"
+        ));
+        assert_eq!(runtime.state().state_hash(), before_hash);
+        assert_eq!(runtime.state().event_sequence, before_sequence);
+        assert_eq!(
+            runtime.state().inventories[STARTER_INDUSTRY_CARGO_INVENTORY_ID]
+                .contents
+                .ore,
+            2
+        );
+        assert!(runtime.state().conservation().valid);
+    }
+
+    #[test]
+    fn production_admission_rejects_shortcuts_wrong_authority_and_broken_routes_without_mutation() {
+        let mut runtime = runtime();
+        runtime
+            .admit_development_player("player-remote")
+            .expect("remote actor admits");
+        seed_industry_cargo(
+            &mut runtime,
+            InventoryContents {
+                ore: 2,
+                ..InventoryContents::default()
+            },
+        );
+
+        let cases = [
+            (
+                "player-local",
+                ClientMessage::RefineOre {
+                    operation_sequence: 0,
+                    operation_id: "legacy-pocket-refine".into(),
+                    inventory_id: STARTER_INDUSTRY_CARGO_INVENTORY_ID.into(),
+                    batches: 1,
+                },
+                "physical_machine_required",
+            ),
+            (
+                "player-remote",
+                production_intent(
+                    "foreign-machine",
+                    "block-refinery",
+                    ProductionRecipeKind::Refining,
+                    1,
+                ),
+                "grid_access_denied",
+            ),
+            (
+                "player-local",
+                production_intent(
+                    "wrong-recipe",
+                    "block-refinery",
+                    ProductionRecipeKind::Component,
+                    1,
+                ),
+                "production_recipe_mismatch",
+            ),
+            (
+                "player-local",
+                ClientMessage::QueueProduction {
+                    operation_sequence: 0,
+                    operation_id: "suit-endpoint".into(),
+                    machine_block_id: "block-refinery".into(),
+                    recipe: ProductionRecipeKind::Refining,
+                    batches: 1,
+                    source_inventory_id: PLAYER_INVENTORY_ID.into(),
+                    destination_inventory_id: STARTER_INDUSTRY_CARGO_INVENTORY_ID.into(),
+                },
+                "production_cargo_required",
+            ),
+            (
+                "player-local",
+                ClientMessage::QueueProduction {
+                    operation_sequence: 0,
+                    operation_id: "cross-grid-route".into(),
+                    machine_block_id: "block-refinery".into(),
+                    recipe: ProductionRecipeKind::Refining,
+                    batches: 1,
+                    source_inventory_id: STARTER_INDUSTRY_CARGO_INVENTORY_ID.into(),
+                    destination_inventory_id: "inventory-cargo-starter".into(),
+                },
+                "production_route_missing",
+            ),
+            (
+                "player-local",
+                production_intent(
+                    "zero-batches",
+                    "block-refinery",
+                    ProductionRecipeKind::Refining,
+                    0,
+                ),
+                "production_quantity_invalid",
+            ),
+        ];
+        for (actor, message, expected_code) in cases {
+            let before_hash = runtime.state().state_hash();
+            let before_sequence = runtime.state().event_sequence;
+            let error = runtime
+                .execute_next_as_for_fixture(actor, &message)
+                .expect_err("invalid production admission rejects");
+            assert!(matches!(
+                error,
+                RuntimeError::Intent(IntentError::Rejected { ref code, .. })
+                    if code == expected_code
+            ));
+            assert_eq!(runtime.state().state_hash(), before_hash);
+            assert_eq!(runtime.state().event_sequence, before_sequence);
+        }
+        assert!(runtime.state().production_queues.is_empty());
+
+        runtime
+            .state
+            .grids
+            .get_mut(STARTER_INDUSTRY_GRID_ID)
+            .expect("industry grid")
+            .blocks
+            .get_mut("block-conveyor")
+            .expect("industry conveyor")
+            .construction_complete = false;
+        let before_hash = runtime.state().state_hash();
+        let before_sequence = runtime.state().event_sequence;
+        let error = runtime
+            .execute_next_for_fixture(&production_intent(
+                "unfinished-conveyor-route",
+                "block-refinery",
+                ProductionRecipeKind::Refining,
+                1,
+            ))
+            .expect_err("an unfinished conveyor cannot route production");
+        assert!(matches!(
+            error,
+            RuntimeError::Intent(IntentError::Rejected { ref code, .. })
+                if code == "production_route_missing"
+        ));
+        assert_eq!(runtime.state().state_hash(), before_hash);
+        assert_eq!(runtime.state().event_sequence, before_sequence);
+        assert!(runtime.state().production_queues.is_empty());
+        assert!(runtime.state().conservation().valid);
     }
 
     #[test]
@@ -6504,6 +7728,12 @@ mod tests {
                 .owner_player_id = "player-remote".into();
             runtime
                 .state
+                .grids
+                .get_mut(STARTER_INDUSTRY_GRID_ID)
+                .expect("starter industry grid exists")
+                .owner_player_id = "player-remote".into();
+            runtime
+                .state
                 .inventories
                 .get_mut(PLAYER_INVENTORY_ID)
                 .expect("primary inventory exists")
@@ -6534,7 +7764,7 @@ mod tests {
                         inventory_id: PLAYER_INVENTORY_ID.into(),
                         batches: 1,
                     },
-                    "inventory_access_denied",
+                    "physical_machine_required",
                 ),
                 (
                     ClientMessage::CraftComponent {
@@ -6543,7 +7773,7 @@ mod tests {
                         inventory_id: PLAYER_INVENTORY_ID.into(),
                         quantity: 1,
                     },
-                    "inventory_access_denied",
+                    "physical_machine_required",
                 ),
                 (
                     ClientMessage::TransferInventory {
@@ -6626,25 +7856,50 @@ mod tests {
             runtime
                 .execute_next_as_for_fixture(
                     "player-remote",
-                    &ClientMessage::RefineOre {
+                    &ClientMessage::TransferInventory {
                         operation_sequence: 0,
-                        operation_id: "remote-refine-owned".into(),
-                        inventory_id: "inventory-player-remote".into(),
-                        batches: 1,
+                        operation_id: "remote-haul-ore-to-cargo".into(),
+                        source_inventory_id: "inventory-player-remote".into(),
+                        destination_inventory_id: STARTER_INDUSTRY_CARGO_INVENTORY_ID.into(),
+                        resource: ResourceKind::Ore,
+                        quantity: 2,
                     },
                 )
-                .expect("secondary actor refines its carried ore");
+                .expect("secondary actor hauls ore into its production cargo");
             runtime
                 .execute_next_as_for_fixture(
                     "player-remote",
-                    &ClientMessage::CraftComponent {
+                    &ClientMessage::QueueProduction {
                         operation_sequence: 0,
-                        operation_id: "remote-craft-owned".into(),
-                        inventory_id: "inventory-player-remote".into(),
-                        quantity: 1,
+                        operation_id: "remote-refine-owned".into(),
+                        machine_block_id: "block-refinery".into(),
+                        recipe: ProductionRecipeKind::Refining,
+                        batches: 1,
+                        source_inventory_id: STARTER_INDUSTRY_CARGO_INVENTORY_ID.into(),
+                        destination_inventory_id: STARTER_INDUSTRY_CARGO_INVENTORY_ID.into(),
                     },
                 )
-                .expect("secondary actor crafts in its carried inventory");
+                .expect("secondary actor queues its connected refinery");
+            for _ in 0..8 {
+                runtime.advance(250).expect("refinery advances");
+            }
+            runtime
+                .execute_next_as_for_fixture(
+                    "player-remote",
+                    &ClientMessage::QueueProduction {
+                        operation_sequence: 0,
+                        operation_id: "remote-craft-owned".into(),
+                        machine_block_id: "block-assembler".into(),
+                        recipe: ProductionRecipeKind::Component,
+                        batches: 1,
+                        source_inventory_id: STARTER_INDUSTRY_CARGO_INVENTORY_ID.into(),
+                        destination_inventory_id: STARTER_INDUSTRY_CARGO_INVENTORY_ID.into(),
+                    },
+                )
+                .expect("secondary actor queues its connected assembler");
+            for _ in 0..8 {
+                runtime.advance(250).expect("assembler advances");
+            }
             runtime
                 .execute_next_as_for_fixture(
                     "player-remote",
@@ -9949,40 +11204,52 @@ mod tests {
         assert!(runtime.state().conservation().valid);
 
         let sealed_intents = [
-            ClientMessage::RefineOre {
-                operation_sequence: 0,
-                operation_id: "drop-refine".into(),
-                inventory_id: drop_inventory_id.clone(),
-                batches: 1,
-            },
-            ClientMessage::CraftComponent {
-                operation_sequence: 0,
-                operation_id: "drop-craft".into(),
-                inventory_id: drop_inventory_id.clone(),
-                quantity: 1,
-            },
-            ClientMessage::TransferInventory {
-                operation_sequence: 0,
-                operation_id: "drop-transfer-source".into(),
-                source_inventory_id: drop_inventory_id.clone(),
-                destination_inventory_id: PLAYER_INVENTORY_ID.into(),
-                resource: ResourceKind::Component,
-                quantity: 1,
-            },
-            ClientMessage::TransferInventory {
-                operation_sequence: 0,
-                operation_id: "drop-transfer-destination".into(),
-                source_inventory_id: PLAYER_INVENTORY_ID.into(),
-                destination_inventory_id: drop_inventory_id.clone(),
-                resource: ResourceKind::Component,
-                quantity: 1,
-            },
+            (
+                ClientMessage::RefineOre {
+                    operation_sequence: 0,
+                    operation_id: "drop-refine".into(),
+                    inventory_id: drop_inventory_id.clone(),
+                    batches: 1,
+                },
+                "physical_machine_required",
+            ),
+            (
+                ClientMessage::CraftComponent {
+                    operation_sequence: 0,
+                    operation_id: "drop-craft".into(),
+                    inventory_id: drop_inventory_id.clone(),
+                    quantity: 1,
+                },
+                "physical_machine_required",
+            ),
+            (
+                ClientMessage::TransferInventory {
+                    operation_sequence: 0,
+                    operation_id: "drop-transfer-source".into(),
+                    source_inventory_id: drop_inventory_id.clone(),
+                    destination_inventory_id: PLAYER_INVENTORY_ID.into(),
+                    resource: ResourceKind::Component,
+                    quantity: 1,
+                },
+                "dropped_inventory_sealed",
+            ),
+            (
+                ClientMessage::TransferInventory {
+                    operation_sequence: 0,
+                    operation_id: "drop-transfer-destination".into(),
+                    source_inventory_id: PLAYER_INVENTORY_ID.into(),
+                    destination_inventory_id: drop_inventory_id.clone(),
+                    resource: ResourceKind::Component,
+                    quantity: 1,
+                },
+                "dropped_inventory_sealed",
+            ),
         ];
-        for intent in sealed_intents {
+        for (intent, expected_code) in sealed_intents {
             assert!(matches!(
                 runtime.execute_next_for_fixture(&intent),
                 Err(RuntimeError::Intent(IntentError::Rejected { ref code, .. }))
-                    if code == "dropped_inventory_sealed"
+                    if code == expected_code
             ));
         }
 
@@ -10009,6 +11276,14 @@ mod tests {
             },
         ];
         for (index, payload) in replay_payloads.into_iter().enumerate() {
+            let expected_code = if matches!(
+                payload,
+                EventPayload::OreRefined { .. } | EventPayload::ComponentCrafted { .. }
+            ) {
+                "replay_physical_machine_required"
+            } else {
+                "dropped_inventory_sealed"
+            };
             let event = runtime.state().new_test_human_event(
                 "player-local",
                 format!("forged-drop-operation-{index}"),
@@ -10018,7 +11293,7 @@ mod tests {
             let before = candidate.state_hash();
             assert!(matches!(
                 candidate.apply_event(&event),
-                Err(IntentError::Rejected { ref code, .. }) if code == "dropped_inventory_sealed"
+                Err(IntentError::Rejected { ref code, .. }) if code == expected_code
             ));
             assert_eq!(candidate.state_hash(), before);
         }
@@ -10046,7 +11321,7 @@ mod tests {
             PlayerLifeState::Incapacitated { .. }
         ));
         assert!(runtime.state().death_drops.is_empty());
-        assert_eq!(runtime.state().inventories.len(), 2);
+        assert_eq!(runtime.state().inventories.len(), 3);
         assert!(runtime.state().conservation().valid);
     }
 
@@ -10618,13 +11893,21 @@ mod tests {
         ];
 
         for payload in payloads {
+            let expected_code = if matches!(
+                payload,
+                EventPayload::OreRefined { .. } | EventPayload::ComponentCrafted { .. }
+            ) {
+                "replay_physical_machine_required"
+            } else {
+                "replay_hand_tool_envelope_invalid"
+            };
             let event = state.prepare_system_event(payload);
             let mut candidate = state.clone();
             let before = candidate.state_hash();
             let error = candidate
                 .apply_event(&event)
                 .expect_err("client work with a system envelope rejects");
-            assert_eq!(error.code(), "replay_hand_tool_envelope_invalid");
+            assert_eq!(error.code(), expected_code);
             assert_eq!(candidate.state_hash(), before);
         }
     }
@@ -12628,7 +13911,7 @@ mod tests {
             block_ids.len(),
             block_ids.iter().collect::<BTreeSet<_>>().len()
         );
-        assert_eq!(runtime.state().grids.len(), 2);
+        assert_eq!(runtime.state().grids.len(), 3);
         assert!(runtime.state().grids.values().all(|grid| {
             grid.owner_player_id == "player-local"
                 && grid.control_linear_input == Vec3::ZERO
@@ -12852,13 +14135,7 @@ mod tests {
 
         let heavy_directory = tempdir().expect("tempdir");
         let mut heavy = Runtime::open(heavy_directory.path(), 97, 100).expect("heavy runtime");
-        let cargo_id = heavy
-            .state()
-            .inventories
-            .keys()
-            .find(|inventory_id| inventory_id.contains("cargo"))
-            .cloned()
-            .expect("starter cargo exists");
+        let cargo_id = "inventory-cargo-starter".to_owned();
         heavy
             .execute_next_for_fixture(&ClientMessage::TransferInventory {
                 operation_sequence: 0,

@@ -13,9 +13,9 @@ use thiserror::Error;
 use verse_protocol::{
     ActorPrivateSnapshot, BlockSnapshot, GridMotionSnapshot, GridSnapshot, InventorySnapshot,
     OwnedGridMassSnapshot, PROJECTION_SCHEMA_VERSION, PlayerLifeState, PlayerMotionSnapshot,
-    PlayerSnapshot, ProjectedMotionSnapshot, ProjectedWorldSnapshot, PublicBlockSnapshot,
-    PublicGridMotionSnapshot, PublicGridSnapshot, PublicPlayerLifeState,
-    PublicPlayerMotionSnapshot, PublicPlayerSnapshot,
+    PlayerSnapshot, ProductionJobSnapshot, ProductionQueueSnapshot, ProjectedMotionSnapshot,
+    ProjectedWorldSnapshot, PublicBlockSnapshot, PublicGridMotionSnapshot, PublicGridSnapshot,
+    PublicPlayerLifeState, PublicPlayerMotionSnapshot, PublicPlayerSnapshot,
 };
 
 use crate::model::WorldState;
@@ -94,12 +94,44 @@ impl WorldState {
                     .collect::<Vec<_>>();
                 owned_grid_masses.sort_by(|left, right| left.grid_id.cmp(&right.grid_id));
 
+                let production_queues = self
+                    .production_queues
+                    .iter()
+                    .filter(|(_, queue)| {
+                        queue
+                            .front()
+                            .is_some_and(|job| job.owner_player_id == actor)
+                    })
+                    .map(|(machine_block_id, queue)| ProductionQueueSnapshot {
+                        machine_block_id: machine_block_id.clone(),
+                        jobs: queue
+                            .iter()
+                            .enumerate()
+                            .map(|(queue_index, job)| ProductionJobSnapshot {
+                                job_id: job.job_id.clone(),
+                                owner_player_id: job.owner_player_id.clone(),
+                                machine_block_id: job.machine_block_id.clone(),
+                                recipe: job.recipe,
+                                batches: job.batches,
+                                source_inventory_id: job.source_inventory_id.clone(),
+                                destination_inventory_id: job.destination_inventory_id.clone(),
+                                progress_ticks: job.progress_ticks,
+                                duration_ticks: job.duration_ticks,
+                                status: self.production_job_status(machine_block_id, queue_index),
+                                reserved_inputs: job.reserved_inputs.clone(),
+                                pending_outputs: job.pending_outputs.clone(),
+                            })
+                            .collect(),
+                    })
+                    .collect();
+
                 Ok(ActorPrivateSnapshot {
                     player,
                     committed_operation_sequence: self.last_operation_sequence(actor),
                     inventories,
                     death_drops,
                     owned_grid_masses,
+                    production_queues,
                 })
             })
             .transpose()?;
@@ -480,6 +512,7 @@ mod tests {
         assert_eq!(
             local_inventory_ids,
             [
+                "inventory-cargo-industry-starter",
                 "inventory-cargo-starter",
                 "inventory-drop-local",
                 "inventory-player-local"
@@ -491,7 +524,12 @@ mod tests {
         );
         assert_eq!(local_private.death_drops[0].drop_id, "drop-local");
         assert_eq!(remote_private.death_drops[0].drop_id, "drop-remote");
-        assert_eq!(local_private.owned_grid_masses[0].grid_id, "grid-starter");
+        assert_eq!(local_private.owned_grid_masses.len(), 2);
+        assert_eq!(
+            local_private.owned_grid_masses[0].grid_id,
+            "grid-industry-starter"
+        );
+        assert_eq!(local_private.owned_grid_masses[1].grid_id, "grid-starter");
         assert_eq!(remote_private.owned_grid_masses[0].grid_id, "grid-remote");
     }
 
