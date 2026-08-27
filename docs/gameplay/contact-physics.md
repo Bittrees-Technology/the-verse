@@ -38,12 +38,14 @@ Implemented and tested:
 
 - An isolated, pinned, license-recorded Jolt 5.3 adapter with static/dynamic compound bodies, stable leaf identities, bounded raw manifold capture, bounded forces/torques, and single-thread fixed stepping.
 - Protocol v6 grid controls, explicit construction-completion state, full grid quaternion snapshots, exact block/cargo-derived mass, authoritative grid–voxel response, swept player–voxel rejection, quantized committed body/contact outcomes, canonical contact lifecycle across rebuild/restart, exact graceful restart, and truncated final-journal recovery.
+- Authoritative runtime evidence for equal-mass grid–grid momentum exchange and exact restart, cargo mass reducing acceleration under the same powered control, a two-second settle plus two-second resting-contact observation, immovable anchored bodies under impact followed by conservative release and restart, and swept player rejection against axis-aligned and rotated grids. The P0 equal-mass head-on tolerance is at most `1 kg m/s` absolute total linear-momentum error after canonical commit quantization. During the resting observation, translation drift is at most `0.1 mm`, linear speed at most `1 mm/s`, and angular speed at most `0.001 rad/s`. Adapter coverage separately proves unequal-density collision response.
+- In-process journal failpoints prove that a returned failure before write preserves the prior physics tick and a returned failure after journal synchronization recovers the complete new tick and resumes from it. Torn final records are truncated. Atomic snapshots synchronize the replacement file and parent directory after rename.
 - Sparse dirty render chunks, a complete native mining/building/restart scenario, and initial Apple Silicon compound-body measurements.
 
 Still required for P0.7 acceptance:
 
 - A project-owned Jolt/JoltC post-solve callback that exposes applied impulses (including the winning CCD path), followed by server-derived collision damage and atomic damage/split outcomes. The current pairwise estimate is telemetry only.
-- Dirty collision chunk replacement, runtime grid–grid momentum tolerance, anchor/contact stability, mass-response, player–grid, and persistence failpoint tests.
+- Dirty collision chunk replacement and subprocess crash injection across journal, state-publish, derived-scene rebuild, and snapshot boundaries.
 - Repeatable edit-to-remesh, Ubuntu, network, multi-body, and large-grid evidence plus a native Linux artifact.
 
 ## Acceptance scenarios

@@ -1932,7 +1932,8 @@ mod tests {
     use verse_protocol::IVec3;
 
     use super::*;
-    use crate::model::STARTER_GRID_ID;
+    use crate::model::{STARTER_GRID_ID, VoxelField};
+    use crate::persistence::AppendFailpoint;
 
     fn runtime() -> Runtime {
         Runtime::open(tempdir().expect("tempdir").keep(), 42, 5).expect("runtime opens")
@@ -1973,6 +1974,65 @@ mod tests {
                 })
                 .expect("weld stage accepted");
         }
+    }
+
+    fn test_grid(
+        grid_id: &str,
+        position: Vec3,
+        linear_velocity: Vec3,
+        blocks: impl IntoIterator<Item = Block>,
+    ) -> Grid {
+        Grid {
+            grid_id: grid_id.into(),
+            position,
+            orientation: Quat::IDENTITY,
+            linear_velocity,
+            angular_velocity: Vec3::ZERO,
+            control_linear_input: Vec3::ZERO,
+            control_angular_input: Vec3::ZERO,
+            dampeners: false,
+            anchored: false,
+            blocks: blocks
+                .into_iter()
+                .map(|block| (block.block_id.clone(), block))
+                .collect(),
+        }
+    }
+
+    fn replace_with_physics_fixture(
+        runtime: &mut Runtime,
+        grids: impl IntoIterator<Item = Grid>,
+        voxels: VoxelField,
+    ) {
+        runtime.state.grids = grids
+            .into_iter()
+            .map(|grid| (grid.grid_id.clone(), grid))
+            .collect();
+        runtime.state.voxels = voxels;
+        runtime.state.active_contact_pairs.clear();
+        runtime.state.simulation_tick = 0;
+        runtime.state.physics_step_phase = 0;
+        runtime.physics_step_phase = 0;
+        runtime
+            .state
+            .inventories
+            .retain(|inventory_id, _| inventory_id == PLAYER_INVENTORY_ID);
+        runtime.state.ledger.genesis_installed_components = runtime
+            .state
+            .grids
+            .values()
+            .flat_map(|grid| grid.blocks.values())
+            .map(|block| block.component_cost)
+            .sum();
+        runtime.state.ledger.destroyed_components = 0;
+        assert!(runtime.state.conservation().valid);
+        runtime
+            .physics
+            .rebuild(&physics_body_specs(&runtime.state))
+            .expect("fixture physics rebuilds");
+        runtime
+            .persist_snapshot()
+            .expect("fixture snapshot persists");
     }
 
     #[test]
@@ -2390,6 +2450,25 @@ mod tests {
                 if code == "movement_hits_voxel"
         ));
         assert_eq!(runtime.state().event_sequence, 0);
+    }
+
+    #[test]
+    fn untrusted_player_cannot_tunnel_through_a_grid_between_valid_endpoints() {
+        let mut runtime = runtime();
+        runtime.state.player.position = Vec3::new(11.0, 1.2, 0.0);
+
+        let result = runtime.execute(&ClientMessage::MovePlayer {
+            operation_id: "tunnel-through-grid".into(),
+            position: Vec3::new(11.0, -1.2, 0.0),
+        });
+
+        assert!(matches!(
+            result,
+            Err(RuntimeError::Intent(IntentError::Rejected { ref code, .. }))
+                if code == "movement_hits_grid"
+        ));
+        assert_eq!(runtime.state().event_sequence, 0);
+        assert_eq!(runtime.state().player.position, Vec3::new(11.0, 1.2, 0.0));
     }
 
     #[test]
@@ -2865,6 +2944,147 @@ mod tests {
     }
 
     #[test]
+    fn swept_player_collision_tracks_a_rotated_grid_without_blocking_clear_motion() {
+        let mut runtime = runtime();
+        let half_sqrt = std::f32::consts::FRAC_1_SQRT_2;
+        runtime
+            .state
+            .grids
+            .get_mut(STARTER_GRID_ID)
+            .unwrap()
+            .orientation = Quat::new(0.0, half_sqrt, 0.0, half_sqrt);
+        let drill_position =
+            runtime.state.grids[STARTER_GRID_ID].world_position(IVec3::new(2, 0, 0));
+        let start = drill_position + Vec3::new(0.0, 1.2, 0.0);
+        runtime.state.player.position = start;
+        let before_hash = runtime.state().state_hash();
+
+        let blocked = runtime.execute(&ClientMessage::MovePlayer {
+            operation_id: "cross-rotated-grid".into(),
+            position: drill_position + Vec3::new(0.0, -1.2, 0.0),
+        });
+        assert!(matches!(
+            blocked,
+            Err(RuntimeError::Intent(IntentError::Rejected { ref code, .. }))
+                if code == "movement_hits_grid"
+        ));
+        assert_eq!(runtime.state().state_hash(), before_hash);
+        assert_eq!(runtime.state().player.position, start);
+
+        runtime
+            .execute(&ClientMessage::MovePlayer {
+                operation_id: "clear-above-rotated-grid".into(),
+                position: start + Vec3::new(0.0, 0.1, 0.0),
+            })
+            .expect("nearby clear motion remains available");
+        assert_eq!(
+            runtime.state().player.position,
+            start + Vec3::new(0.0, 0.1, 0.0)
+        );
+    }
+
+    #[test]
+    fn physics_commit_failpoints_recover_the_complete_prior_or_durable_tick() {
+        let before_directory = tempdir().expect("tempdir");
+        let prior_hash;
+        let prior_sequence;
+        {
+            let mut runtime = Runtime::open(before_directory.path(), 79, 100)
+                .expect("runtime starts for pre-write failure");
+            runtime
+                .execute(&ClientMessage::SetGridControl {
+                    operation_id: "pre-write-control".into(),
+                    grid_id: STARTER_GRID_ID.into(),
+                    linear_input: Vec3::new(0.0, 0.0, -1.0),
+                    angular_input: Vec3::ZERO,
+                    dampeners: false,
+                })
+                .expect("control is durable");
+            prior_hash = runtime.state().state_hash();
+            prior_sequence = runtime.state().event_sequence;
+            runtime
+                .store
+                .set_append_failpoint(AppendFailpoint::BeforeWrite);
+            assert!(matches!(
+                runtime.advance(17),
+                Err(RuntimeError::Persistence(
+                    PersistenceError::InjectedFailure("before journal write")
+                ))
+            ));
+            assert!(runtime.is_halted());
+            assert_eq!(runtime.state().state_hash(), prior_hash);
+            assert_eq!(runtime.state().event_sequence, prior_sequence);
+            assert_eq!(runtime.state().simulation_tick, 0);
+        }
+        let recovered =
+            Runtime::open(before_directory.path(), 79, 100).expect("pre-write failure recovers");
+        assert_eq!(recovered.state().state_hash(), prior_hash);
+        assert_eq!(recovered.state().event_sequence, prior_sequence);
+        assert_eq!(recovered.state().simulation_tick, 0);
+
+        let after_directory = tempdir().expect("tempdir");
+        let durable_sequence;
+        let before_durable_hash;
+        let expected_durable_state;
+        {
+            let mut runtime = Runtime::open(after_directory.path(), 83, 100)
+                .expect("runtime starts for post-sync failure");
+            runtime
+                .execute(&ClientMessage::SetGridControl {
+                    operation_id: "post-sync-control".into(),
+                    grid_id: STARTER_GRID_ID.into(),
+                    linear_input: Vec3::new(0.0, 0.0, -1.0),
+                    angular_input: Vec3::ZERO,
+                    dampeners: false,
+                })
+                .expect("control is durable");
+            durable_sequence = runtime.state().event_sequence + 1;
+            before_durable_hash = runtime.state().state_hash();
+            runtime
+                .store
+                .set_append_failpoint(AppendFailpoint::AfterSync);
+            assert!(matches!(
+                runtime.advance(17),
+                Err(RuntimeError::Persistence(
+                    PersistenceError::InjectedFailure("after journal sync")
+                ))
+            ));
+            assert!(runtime.is_halted());
+            assert_eq!(runtime.state().event_sequence + 1, durable_sequence);
+            assert_eq!(runtime.state().simulation_tick, 0);
+            assert_eq!(runtime.state().state_hash(), before_durable_hash);
+
+            let journal = fs::read_to_string(after_directory.path().join("events.ndjson"))
+                .expect("durable journal reads after injected sync failure");
+            let durable_event = serde_json::from_str::<CanonicalEvent>(
+                journal.lines().last().expect("durable event exists"),
+            )
+            .expect("durable event parses");
+            let mut expected = runtime.state().clone();
+            expected
+                .apply_event(&durable_event)
+                .expect("durable physics event applies to the complete prior state");
+            expected_durable_state = expected;
+        }
+        let mut recovered =
+            Runtime::open(after_directory.path(), 83, 100).expect("post-sync failure recovers");
+        assert_eq!(recovered.state().event_sequence, durable_sequence);
+        assert_eq!(recovered.state().simulation_tick, 1);
+        assert_ne!(recovered.state().state_hash(), before_durable_hash);
+        assert_eq!(
+            recovered.state().state_hash(),
+            expected_durable_state.state_hash(),
+            "recovery must expose the exact complete state represented by the synced event"
+        );
+        let mut recovered_without_new_lease = recovered.state().clone();
+        recovered_without_new_lease.fencing_token = expected_durable_state.fencing_token;
+        assert_eq!(recovered_without_new_lease, expected_durable_state);
+        assert!(recovered.advance(17).expect("recovered solver resumes"));
+        assert_eq!(recovered.state().simulation_tick, 2);
+        assert!(recovered.state().conservation().valid);
+    }
+
+    #[test]
     fn disconnected_damage_splits_grid_without_duplicating_blocks() {
         let mut runtime = runtime();
         move_player_near_grid(&mut runtime);
@@ -2939,6 +3159,428 @@ mod tests {
         );
         assert!(grid.linear_velocity.x > -0.25);
         assert!(runtime.state().simulation_tick >= 24);
+    }
+
+    #[test]
+    fn runtime_equal_mass_grid_collision_commits_and_recovers_within_tolerance() {
+        const MOMENTUM_TOLERANCE_KG_MPS: f64 = 1.0;
+
+        let directory = tempdir().expect("tempdir");
+        let expected_hash;
+        let expected_sequence;
+        let expected_tick;
+        let expected_contacts;
+        {
+            let mut runtime =
+                Runtime::open(directory.path(), 89, 100).expect("collision fixture runtime opens");
+            let alpha = test_grid(
+                "alpha-grid",
+                Vec3::new(-2.0, 0.0, 0.0),
+                Vec3::new(4.0, 0.0, 0.0),
+                [Block::new(
+                    "alpha-armor",
+                    IVec3::ZERO,
+                    BlockKind::Structural,
+                )],
+            );
+            let zeta = test_grid(
+                "zeta-grid",
+                Vec3::new(2.0, 0.0, 0.0),
+                Vec3::new(-4.0, 0.0, 0.0),
+                [Block::new("zeta-armor", IVec3::ZERO, BlockKind::Structural)],
+            );
+            replace_with_physics_fixture(
+                &mut runtime,
+                [zeta, alpha],
+                VoxelField {
+                    occupied: BTreeSet::new(),
+                    ferrite_ore: BTreeSet::new(),
+                },
+            );
+            let initial_mass_grams = runtime
+                .state()
+                .grid_mass_grams(&runtime.state().grids["alpha-grid"]);
+            assert_eq!(
+                initial_mass_grams,
+                runtime
+                    .state()
+                    .grid_mass_grams(&runtime.state().grids["zeta-grid"])
+            );
+            let initial_mass = runtime
+                .state()
+                .grid_mass_kg(&runtime.state().grids["alpha-grid"]);
+
+            let contacted = (0..90).any(|_| {
+                runtime.advance(17).expect("runtime physics advances");
+                runtime
+                    .state()
+                    .active_contact_pairs
+                    .iter()
+                    .any(|pair| pair.body_a == "alpha-grid" && pair.body_b == "zeta-grid")
+            });
+            assert!(
+                contacted,
+                "authoritative grids must produce a canonical contact"
+            );
+            let alpha = &runtime.state().grids["alpha-grid"];
+            let zeta = &runtime.state().grids["zeta-grid"];
+            assert!(
+                alpha.position.x < zeta.position.x,
+                "grids cannot pass through"
+            );
+            assert!(alpha.linear_velocity.x < 0.0, "alpha grid must recoil");
+            assert!(zeta.linear_velocity.x > 0.0, "zeta grid must recoil");
+            let total_momentum =
+                alpha.linear_velocity * initial_mass + zeta.linear_velocity * initial_mass;
+            assert!(
+                total_momentum.magnitude() <= MOMENTUM_TOLERANCE_KG_MPS,
+                "committed vector momentum error exceeded {MOMENTUM_TOLERANCE_KG_MPS} kg m/s: {total_momentum:?}"
+            );
+            assert!(runtime.state().conservation().valid);
+            expected_hash = runtime.state().state_hash();
+            expected_sequence = runtime.state().event_sequence;
+            expected_tick = runtime.state().simulation_tick;
+            expected_contacts = runtime.state().active_contact_pairs.clone();
+        }
+
+        let recovered =
+            Runtime::open(directory.path(), 89, 100).expect("committed collision runtime recovers");
+        assert_eq!(recovered.state().state_hash(), expected_hash);
+        assert_eq!(recovered.state().event_sequence, expected_sequence);
+        assert_eq!(recovered.state().simulation_tick, expected_tick);
+        assert_eq!(recovered.state().active_contact_pairs, expected_contacts);
+        assert!(recovered.state().conservation().valid);
+    }
+
+    #[test]
+    fn runtime_cargo_mass_reduces_acceleration_under_the_same_force() {
+        fn accelerate(runtime: &mut Runtime, operation_prefix: &str) -> f64 {
+            runtime
+                .execute(&ClientMessage::SetGridControl {
+                    operation_id: format!("{operation_prefix}-control"),
+                    grid_id: STARTER_GRID_ID.into(),
+                    linear_input: Vec3::new(1.0, 0.0, 0.0),
+                    angular_input: Vec3::ZERO,
+                    dampeners: false,
+                })
+                .expect("powered control is accepted");
+            for _ in 0..10 {
+                runtime.advance(17).expect("runtime physics advances");
+            }
+            runtime.state().grids[STARTER_GRID_ID].linear_velocity.x
+        }
+
+        let light_directory = tempdir().expect("tempdir");
+        let mut light = Runtime::open(light_directory.path(), 97, 100).expect("light runtime");
+        let light_mass = light
+            .state()
+            .grid_mass_grams(&light.state().grids[STARTER_GRID_ID]);
+        let light_velocity = accelerate(&mut light, "light");
+
+        let heavy_directory = tempdir().expect("tempdir");
+        let mut heavy = Runtime::open(heavy_directory.path(), 97, 100).expect("heavy runtime");
+        let cargo_id = heavy
+            .state()
+            .inventories
+            .keys()
+            .find(|inventory_id| inventory_id.contains("cargo"))
+            .cloned()
+            .expect("starter cargo exists");
+        heavy
+            .execute(&ClientMessage::TransferInventory {
+                operation_id: "load-physical-cargo".into(),
+                source_inventory_id: PLAYER_INVENTORY_ID.into(),
+                destination_inventory_id: cargo_id.clone(),
+                resource: ResourceKind::Component,
+                quantity: 24,
+            })
+            .expect("cargo transfer is accepted");
+        let cargo_mass = heavy.state().inventories[&cargo_id].mass_grams();
+        let heavy_mass = heavy
+            .state()
+            .grid_mass_grams(&heavy.state().grids[STARTER_GRID_ID]);
+        assert_eq!(heavy_mass - light_mass, cargo_mass);
+        let heavy_velocity = accelerate(&mut heavy, "heavy");
+
+        assert!(light_velocity > 0.0);
+        assert!(heavy_velocity > 0.0);
+        assert!(
+            heavy_velocity < light_velocity,
+            "loaded grid must accelerate less: loaded={heavy_velocity} empty={light_velocity}"
+        );
+        assert!(light.state().conservation().valid);
+        assert!(heavy.state().conservation().valid);
+    }
+
+    #[test]
+    fn runtime_powered_resting_contact_stays_within_the_published_interval_bounds() {
+        const SETTLE_TICKS: u64 = 120;
+        const OBSERVATION_TICKS: u64 = 120;
+
+        let directory = tempdir().expect("tempdir");
+        let mut runtime =
+            Runtime::open(directory.path(), 101, 1_000).expect("resting fixture runtime opens");
+        let mut floor = test_grid(
+            "floor-grid",
+            Vec3::new(0.0, -1.0, 0.0),
+            Vec3::ZERO,
+            [
+                Block::new("floor-anchor", IVec3::ZERO, BlockKind::Anchor),
+                Block::new("floor-battery", IVec3::new(1, 0, 0), BlockKind::Battery),
+            ],
+        );
+        floor.anchored = true;
+        let resting = test_grid(
+            "resting-grid",
+            Vec3::ZERO,
+            Vec3::ZERO,
+            [Block::new(
+                "resting-battery",
+                IVec3::ZERO,
+                BlockKind::Battery,
+            )],
+        );
+        replace_with_physics_fixture(
+            &mut runtime,
+            [resting, floor],
+            VoxelField {
+                occupied: BTreeSet::from([IVec3::new(0, -2, 0)]),
+                ferrite_ore: BTreeSet::new(),
+            },
+        );
+        assert!(runtime.state().grids["floor-grid"].anchor_touches(&runtime.state().voxels));
+        assert!(runtime.state().grids["floor-grid"].power().online);
+        runtime
+            .execute(&ClientMessage::SetGridControl {
+                operation_id: "press-grid-onto-floor".into(),
+                grid_id: "resting-grid".into(),
+                linear_input: Vec3::new(0.0, -0.2, 0.0),
+                angular_input: Vec3::ZERO,
+                dampeners: true,
+            })
+            .expect("powered settling force is accepted");
+
+        let target_tick = SETTLE_TICKS + OBSERVATION_TICKS;
+        let mut observation_samples = 0_u64;
+        let mut observation_contact_samples = 0_u64;
+        let mut resting_origin = None;
+        let mut maximum_translation_drift: f64 = 0.0;
+        let mut maximum_linear_speed: f64 = 0.0;
+        let mut maximum_angular_speed: f64 = 0.0;
+        while runtime.state().simulation_tick < target_tick {
+            runtime.advance(17).expect("resting physics advances");
+            if runtime.state().simulation_tick > SETTLE_TICKS {
+                observation_samples += 1;
+                if runtime
+                    .state()
+                    .active_contact_pairs
+                    .iter()
+                    .any(|pair| pair.body_a == "floor-grid" && pair.body_b == "resting-grid")
+                {
+                    observation_contact_samples += 1;
+                }
+                let grid = &runtime.state().grids["resting-grid"];
+                let origin = *resting_origin.get_or_insert(grid.position);
+                maximum_translation_drift =
+                    maximum_translation_drift.max(grid.position.squared_distance(origin).sqrt());
+                maximum_linear_speed = maximum_linear_speed.max(grid.linear_velocity.magnitude());
+                maximum_angular_speed =
+                    maximum_angular_speed.max(grid.angular_velocity.magnitude());
+            }
+        }
+        assert_eq!(
+            observation_contact_samples, observation_samples,
+            "resting grid must retain canonical floor contact throughout observation"
+        );
+        assert!(observation_samples > 0);
+        assert!(
+            maximum_translation_drift <= 1.0e-4,
+            "two-second committed translation drift exceeded 0.1 mm: {maximum_translation_drift}"
+        );
+        assert!(
+            maximum_linear_speed <= 1.0e-3,
+            "committed resting speed exceeded 1 mm/s: {maximum_linear_speed}"
+        );
+        assert!(
+            maximum_angular_speed <= 1.0e-3,
+            "committed resting angular speed exceeded 0.001 rad/s: {maximum_angular_speed}"
+        );
+        assert!(runtime.state().conservation().valid);
+    }
+
+    #[test]
+    fn runtime_valid_anchor_survives_impact_then_unanchors_without_asset_change() {
+        let directory = tempdir().expect("tempdir");
+        let expected_hash;
+        {
+            let mut runtime =
+                Runtime::open(directory.path(), 103, 1_000).expect("anchor fixture runtime opens");
+            let mut anchored = test_grid(
+                "anchored-grid",
+                Vec3::new(1.0, 0.0, 0.0),
+                Vec3::ZERO,
+                [
+                    Block::new("anchor-block", IVec3::ZERO, BlockKind::Anchor),
+                    Block::new("anchor-battery", IVec3::new(1, 0, 0), BlockKind::Battery),
+                    {
+                        let mut cargo =
+                            Block::new("anchor-cargo", IVec3::new(0, 1, 0), BlockKind::Cargo);
+                        cargo.inventory_id = Some("inventory-anchor-cargo".into());
+                        cargo
+                    },
+                ],
+            );
+            anchored.anchored = true;
+            let striker = test_grid(
+                "striker-grid",
+                Vec3::new(4.0, 0.0, 0.0),
+                Vec3::new(-8.0, 0.0, 0.0),
+                [Block::new(
+                    "striker-armor",
+                    IVec3::ZERO,
+                    BlockKind::Structural,
+                )],
+            );
+            replace_with_physics_fixture(
+                &mut runtime,
+                [striker, anchored],
+                VoxelField {
+                    occupied: BTreeSet::from([IVec3::ZERO]),
+                    ferrite_ore: BTreeSet::new(),
+                },
+            );
+            runtime
+                .state
+                .inventories
+                .get_mut(PLAYER_INVENTORY_ID)
+                .expect("player inventory exists")
+                .contents
+                .components -= 4;
+            runtime.state.inventories.insert(
+                "inventory-anchor-cargo".into(),
+                InventoryRecord {
+                    inventory_id: "inventory-anchor-cargo".into(),
+                    domain: InventoryDomain::Cargo {
+                        block_id: "anchor-cargo".into(),
+                    },
+                    contents: InventoryContents {
+                        ore: 0,
+                        refined_material: 0,
+                        components: 4,
+                    },
+                    capacity_liters: CARGO_INVENTORY_CAPACITY_LITERS,
+                },
+            );
+            assert!(runtime.state().conservation().valid);
+            runtime
+                .physics
+                .rebuild(&physics_body_specs(&runtime.state))
+                .expect("cargo-bearing anchor fixture physics rebuilds");
+            runtime
+                .persist_snapshot()
+                .expect("cargo-bearing anchor fixture snapshot persists");
+            assert!(runtime.state().grids["anchored-grid"].anchor_touches(&runtime.state().voxels));
+            assert!(runtime.state().grids["anchored-grid"].power().online);
+            assert_eq!(
+                runtime.state().inventories["inventory-anchor-cargo"]
+                    .contents
+                    .components,
+                4
+            );
+            assert_eq!(
+                runtime.state().grids["anchored-grid"].blocks["anchor-cargo"].inventory_id,
+                Some("inventory-anchor-cargo".into())
+            );
+            let before_rejected_control = runtime.state().state_hash();
+            assert!(matches!(
+                runtime.execute(&ClientMessage::SetGridControl {
+                    operation_id: "reject-anchored-control".into(),
+                    grid_id: "anchored-grid".into(),
+                    linear_input: Vec3::new(1.0, 0.0, 0.0),
+                    angular_input: Vec3::ZERO,
+                    dampeners: false,
+                }),
+                Err(RuntimeError::Intent(IntentError::Rejected { ref code, .. }))
+                    if code == "grid_is_anchored"
+            ));
+            assert_eq!(runtime.state().state_hash(), before_rejected_control);
+            let initial_pose = (
+                runtime.state().grids["anchored-grid"].position,
+                runtime.state().grids["anchored-grid"].orientation,
+            );
+            let mut observed_impact = false;
+            for _ in 0..120 {
+                runtime.advance(17).expect("impact physics advances");
+                observed_impact |=
+                    runtime.state().active_contact_pairs.iter().any(|pair| {
+                        pair.body_a == "anchored-grid" && pair.body_b == "striker-grid"
+                    });
+                let anchor = &runtime.state().grids["anchored-grid"];
+                assert_eq!((anchor.position, anchor.orientation), initial_pose);
+                assert_eq!(anchor.linear_velocity, Vec3::ZERO);
+                assert_eq!(anchor.angular_velocity, Vec3::ZERO);
+            }
+            assert!(observed_impact, "striker must contact the anchored grid");
+
+            let blocks_before = runtime.state().grids["anchored-grid"].blocks.clone();
+            let inventories_before = runtime.state().inventories.clone();
+            let mass_before = runtime
+                .state()
+                .grid_mass_grams(&runtime.state().grids["anchored-grid"]);
+            runtime
+                .execute(&ClientMessage::ToggleGridAnchor {
+                    operation_id: "release-final-anchor".into(),
+                    grid_id: "anchored-grid".into(),
+                })
+                .expect("last anchor releases");
+            let released = &runtime.state().grids["anchored-grid"];
+            assert!(!released.anchored);
+            assert_eq!((released.position, released.orientation), initial_pose);
+            assert_eq!(released.blocks, blocks_before);
+            assert_eq!(runtime.state().inventories, inventories_before);
+            assert_eq!(
+                runtime.state().inventories["inventory-anchor-cargo"]
+                    .contents
+                    .components,
+                4
+            );
+            assert_eq!(
+                released.blocks["anchor-cargo"].inventory_id,
+                Some("inventory-anchor-cargo".into())
+            );
+            assert_eq!(runtime.state().grid_mass_grams(released), mass_before);
+            assert!(runtime.state().conservation().valid);
+
+            runtime
+                .execute(&ClientMessage::SetGridControl {
+                    operation_id: "move-released-anchor".into(),
+                    grid_id: "anchored-grid".into(),
+                    linear_input: Vec3::new(1.0, 0.0, 0.0),
+                    angular_input: Vec3::ZERO,
+                    dampeners: false,
+                })
+                .expect("released powered grid accepts control");
+            for _ in 0..10 {
+                runtime.advance(17).expect("released grid physics advances");
+            }
+            assert!(runtime.state().grids["anchored-grid"].position.x > initial_pose.0.x);
+            expected_hash = runtime.state().state_hash();
+        }
+        let recovered =
+            Runtime::open(directory.path(), 103, 1_000).expect("released anchor runtime recovers");
+        assert_eq!(recovered.state().state_hash(), expected_hash);
+        assert!(!recovered.state().grids["anchored-grid"].anchored);
+        assert_eq!(
+            recovered.state().inventories["inventory-anchor-cargo"]
+                .contents
+                .components,
+            4
+        );
+        assert_eq!(
+            recovered.state().grids["anchored-grid"].blocks["anchor-cargo"].inventory_id,
+            Some("inventory-anchor-cargo".into())
+        );
+        assert!(recovered.state().conservation().valid);
     }
 
     #[test]
