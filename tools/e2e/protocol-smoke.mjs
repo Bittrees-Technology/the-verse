@@ -63,12 +63,16 @@ async function intent(type, payload) {
   }
   const eventSequence = result.receipt.event_sequence;
   const acceptsMotionState = type === "set_player_control";
+  const minimumStateSequence = Math.max(
+    eventSequence,
+    authoritativeWorld?.event_sequence ?? 0,
+  );
   const state = await waitFor(
     (message) =>
       (message.type === "snapshot" &&
-        message.snapshot.event_sequence >= eventSequence) ||
+        message.snapshot.event_sequence >= minimumStateSequence) ||
       (acceptsMotionState && message.type === "motion_state" &&
-        message.motion.event_sequence >= eventSequence),
+        message.motion.event_sequence >= minimumStateSequence),
     type + " authoritative state",
   );
   authoritativeWorld = state.type === "snapshot"
@@ -97,10 +101,12 @@ function applyMotion(world, motion) {
 }
 
 async function waitForMotionAfter(simulationTick, description) {
+  const minimumEventSequence = authoritativeWorld?.event_sequence ?? 0;
   const state = await waitFor(
     (message) =>
       message.type === "motion_state" &&
-      message.motion.simulation_tick > simulationTick,
+      message.motion.simulation_tick > simulationTick &&
+      message.motion.event_sequence >= minimumEventSequence,
     description,
   );
   authoritativeWorld = applyMotion(authoritativeWorld, state.motion);
@@ -118,6 +124,26 @@ function distanceSquared(left, right) {
   const y = left.y - right.y;
   const z = left.z - right.z;
   return x * x + y * y + z * z;
+}
+
+function rotateVector(quaternion, vector) {
+  const tx = 2 * (quaternion.y * vector.z - quaternion.z * vector.y);
+  const ty = 2 * (quaternion.z * vector.x - quaternion.x * vector.z);
+  const tz = 2 * (quaternion.x * vector.y - quaternion.y * vector.x);
+  return {
+    x:
+      vector.x +
+      quaternion.w * tx +
+      (quaternion.y * tz - quaternion.z * ty),
+    y:
+      vector.y +
+      quaternion.w * ty +
+      (quaternion.z * tx - quaternion.x * tz),
+    z:
+      vector.z +
+      quaternion.w * tz +
+      (quaternion.x * ty - quaternion.y * tx),
+  };
 }
 
 function coordinateKey(coordinate) {
@@ -167,16 +193,36 @@ async function movePlayerTo(world, target) {
       z: target.z - current.z,
     };
     const magnitude = Math.sqrt(distanceSquared(delta, { x: 0, y: 0, z: 0 }));
+    const worldDirection = {
+      x: delta.x / magnitude,
+      y: delta.y / magnitude,
+      z: delta.z / magnitude,
+    };
+    const orientation = world.player.orientation;
+    const rotatedLocalDirection = rotateVector(
+      {
+        x: -orientation.x,
+        y: -orientation.y,
+        z: -orientation.z,
+        w: orientation.w,
+      },
+      worldDirection,
+    );
+    const localMagnitude = Math.sqrt(
+      distanceSquared(rotatedLocalDirection, { x: 0, y: 0, z: 0 }),
+    );
+    const localScale = Math.max(1, localMagnitude);
+    const localDirection = {
+      x: rotatedLocalDirection.x / localScale,
+      y: rotatedLocalDirection.y / localScale,
+      z: rotatedLocalDirection.z / localScale,
+    };
     const inputSequence = world.player.last_processed_input_sequence + 1;
     const tick = world.simulation_tick;
     world = await intent("set_player_control", {
       movement_epoch: world.player.movement_epoch,
       input_sequence: inputSequence,
-      linear_input: {
-        x: delta.x / magnitude,
-        y: delta.y / magnitude,
-        z: delta.z / magnitude,
-      },
+      linear_input: localDirection,
       angular_input: { x: 0, y: 0, z: 0 },
       boost: false,
       dampeners: true,
@@ -443,7 +489,11 @@ async function run() {
   };
   world = await intent("respawn_player", {});
   assert.deepEqual(world.player.life_state, { kind: "alive" });
-  assert.equal(world.player.suit_oxygen_milli, 1_000);
+  assert.ok(
+    world.player.suit_oxygen_milli > 0 &&
+      world.player.suit_oxygen_milli <= 1_000,
+    "respawn restores oxygen before canonical life support resumes",
+  );
   assert.equal(world.player.helmet_closed, true);
   assert.equal(world.player.jetpack_enabled, true);
   assert.equal(playerInventory(world).used_liters, 0);

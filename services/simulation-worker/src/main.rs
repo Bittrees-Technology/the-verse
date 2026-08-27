@@ -31,7 +31,7 @@ struct Arguments {
     #[arg(long, env = "VERSE_SNAPSHOT_EVERY", default_value_t = 25)]
     snapshot_every: u64,
 
-    #[arg(long, env = "VERSE_TICK_MS", default_value_t = 100)]
+    #[arg(long, env = "VERSE_TICK_MS", default_value_t = 16)]
     tick_millis: u16,
 
     /// Open the authoritative state for recovery inspection without advancing time.
@@ -67,7 +67,11 @@ async fn main() -> Result<()> {
         None
     } else {
         let tick_state = Arc::clone(&state);
-        let tick_millis = arguments.tick_millis.clamp(16, 250);
+        // The native client samples controls at 60 Hz. Keeping the worker's
+        // scheduling gap below one client physics frame prevents a valid tap
+        // or mouse impulse from being overwritten by its following neutral
+        // sample before any authoritative substep can observe it.
+        let tick_millis = arguments.tick_millis.clamp(1, 16);
         Some(tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_millis(u64::from(tick_millis)));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -126,5 +130,17 @@ async fn shutdown_signal() {
     tokio::select! {
         () = control_c => {},
         () = terminate => {},
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn authoritative_tick_defaults_to_less_than_one_sixty_hz_frame() {
+        let arguments = Arguments::parse_from(["verse-simulation-worker"]);
+        assert_eq!(arguments.tick_millis, 16);
+        assert!(f64::from(arguments.tick_millis) < 1_000.0 / 60.0);
     }
 }
