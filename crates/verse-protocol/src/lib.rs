@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 
 /// The only protocol version accepted by this P0 build.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// A stable integer voxel or block coordinate.
 #[derive(
@@ -284,6 +284,7 @@ pub struct BlockSnapshot {
     pub orientation: u8,
     pub health: u16,
     pub max_health: u16,
+    pub construction_complete: bool,
     pub inventory_id: Option<String>,
 }
 
@@ -504,6 +505,27 @@ mod tests {
         .expect("weld intent serializes");
         assert_eq!(weld["type"], "weld_block");
         assert_eq!(weld["block_id"], "block-9");
+    }
+
+    #[test]
+    fn protocol_v6_requires_explicit_construction_completion_state() {
+        let block = BlockSnapshot {
+            block_id: "block-frame".into(),
+            coordinate: IVec3::new(1, 2, 3),
+            kind: BlockKind::Structural,
+            orientation: 0,
+            health: 65,
+            max_health: 100,
+            construction_complete: true,
+            inventory_id: None,
+        };
+        let mut value = serde_json::to_value(&block).expect("block snapshot serializes");
+        assert_eq!(value["construction_complete"], true);
+        value
+            .as_object_mut()
+            .expect("block snapshot is an object")
+            .remove("construction_complete");
+        assert!(serde_json::from_value::<BlockSnapshot>(value).is_err());
     }
 
     #[test]

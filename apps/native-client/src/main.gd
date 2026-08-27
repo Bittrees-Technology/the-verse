@@ -10,7 +10,8 @@ const ASTEROID_SHADER: Shader = preload("res://shaders/asteroid_surface.gdshader
 const PLANET_SHADER: Shader = preload("res://shaders/planet_surface.gdshader")
 const ATMOSPHERE_SHADER: Shader = preload("res://shaders/planet_atmosphere.gdshader")
 const CLOUD_SHADER: Shader = preload("res://shaders/planet_clouds.gdshader")
-const PROTOCOL_VERSION := 5
+const BLOCK_DAMAGE_SHADER: Shader = preload("res://shaders/block_damage.gdshader")
+const PROTOCOL_VERSION := 6
 const DEFAULT_SERVER := "ws://127.0.0.1:7777/ws"
 const PLAYER_INVENTORY := "inventory-player-local"
 const STARTER_GRID := "grid-starter"
@@ -1319,6 +1320,9 @@ func _apply_snapshot(authoritative: Dictionary) -> void:
 				pending_mine_position = null
 	_rebuild_grids(snapshot.get("grids", []))
 	if smoke_test and smoke_operation.is_empty():
+		if not _run_visual_smoke_assertions():
+			get_tree().quit(1)
+			return
 		smoke_operation = _operation_id("godot-smoke")
 		_send({
 			"type": "move_player",
@@ -1615,13 +1619,16 @@ func _build_block_visual(block: Dictionary) -> Node3D:
 	var health := int(block.get("health", 1))
 	var max_health := maxi(int(block.get("max_health", health)), 1)
 	var integrity := clampf(float(health) / float(max_health), 0.0, 1.0)
-	if integrity < 1.0:
+	var construction_complete := bool(block.get("construction_complete", integrity >= 1.0))
+	if not construction_complete:
+		root.set_meta("verse_visual_state", "frame")
 		var frame_core := _box_visual(
 			Vector3.ONE * lerpf(0.38, 0.72, integrity), detail_materials["construction"]
 		)
 		root.add_child(frame_core)
 		_add_construction_frame(root, integrity)
 		return root
+	root.set_meta("verse_visual_state", "armor_damaged" if integrity < 1.0 else "armor_complete")
 	var base := _box_visual(
 		Vector3.ONE * 1.01,
 		block_materials.get(kind, block_materials["structural"])
@@ -1734,6 +1741,8 @@ func _build_block_visual(block: Dictionary) -> Node3D:
 				warning.position = Vector3(offset, 0.0, -0.51)
 				warning.rotation_degrees.z = 22.0
 				root.add_child(warning)
+	if integrity < 1.0:
+		_add_damage_overlay(root, integrity, String(block.get("block_id", "block")))
 	return root
 
 
@@ -1771,6 +1780,28 @@ func _add_construction_frame(root: Node3D, integrity: float) -> void:
 		var plate := _box_visual(Vector3(0.22, 0.22, 0.035), detail_materials["amber"])
 		plate.position = Vector3(-0.27 + float(index) * 0.27, -0.25, -0.49)
 		root.add_child(plate)
+
+
+func _add_damage_overlay(root: Node3D, integrity: float, block_id: String) -> void:
+	var overlay := MeshInstance3D.new()
+	overlay.name = "DamageOverlay"
+	var shell := BoxMesh.new()
+	shell.size = Vector3.ONE * 1.018
+	var damage_material := ShaderMaterial.new()
+	damage_material.shader = BLOCK_DAMAGE_SHADER
+	damage_material.set_shader_parameter("severity", clampf(1.0 - integrity, 0.0, 1.0))
+	damage_material.set_shader_parameter("pattern_seed", _stable_unit_seed(block_id))
+	shell.material = damage_material
+	overlay.mesh = shell
+	overlay.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	root.add_child(overlay)
+
+
+func _stable_unit_seed(text: String) -> float:
+	var value := 0
+	for index in text.length():
+		value = (value * 131 + text.unicode_at(index)) % 104729
+	return float(value) / 104729.0
 
 
 func _update_movement(delta: float) -> void:
@@ -1911,6 +1942,90 @@ func _block_needs_weld(block: Dictionary) -> bool:
 	return health < max_health
 
 
+func _block_condition_label(block: Dictionary) -> String:
+	if not bool(block.get("construction_complete", false)):
+		return "FRAME"
+	if _block_needs_weld(block):
+		return "DAMAGED"
+	return ""
+
+
+func _weld_action_name(block: Dictionary) -> String:
+	var integrity := (
+		int(block.get("health", 0)) * 100 / maxi(int(block.get("max_health", 1)), 1)
+	)
+	return (
+		"REPAIRING ARMOR // %d%%" % integrity
+		if bool(block.get("construction_complete", false))
+		else "WELDING FRAME // %d%%" % integrity
+	)
+
+
+func _damage_material(root: Node3D) -> ShaderMaterial:
+	var overlay := root.get_node_or_null("DamageOverlay") as MeshInstance3D
+	if overlay == null:
+		return null
+	var shell := overlay.mesh as BoxMesh
+	if shell == null:
+		return null
+	return shell.material as ShaderMaterial
+
+
+func _run_visual_smoke_assertions() -> bool:
+	var frame := {
+		"block_id": "smoke-frame",
+		"kind": "structural",
+		"health": 25,
+		"max_health": 100,
+		"construction_complete": false,
+	}
+	var damaged := {
+		"block_id": "smoke-damaged",
+		"kind": "structural",
+		"health": 65,
+		"max_health": 100,
+		"construction_complete": true,
+	}
+	var repaired := {
+		"block_id": "smoke-repaired",
+		"kind": "structural",
+		"health": 100,
+		"max_health": 100,
+		"construction_complete": true,
+	}
+	var frame_visual := _build_block_visual(frame)
+	var damaged_visual := _build_block_visual(damaged)
+	var repaired_visual := _build_block_visual(repaired)
+	var damage_material: ShaderMaterial = _damage_material(damaged_visual)
+	var expected_seed := _stable_unit_seed("smoke-damaged")
+	var valid: bool = (
+		frame_visual.get_meta("verse_visual_state", "") == "frame"
+		and frame_visual.get_node_or_null("DamageOverlay") == null
+		and damaged_visual.get_meta("verse_visual_state", "") == "armor_damaged"
+		and damaged_visual.get_node_or_null("DamageOverlay") != null
+		and damage_material != null
+		and damage_material.shader == BLOCK_DAMAGE_SHADER
+		and is_equal_approx(float(damage_material.get_shader_parameter("severity")), 0.35)
+		and is_equal_approx(
+			float(damage_material.get_shader_parameter("pattern_seed")), expected_seed
+		)
+		and repaired_visual.get_meta("verse_visual_state", "") == "armor_complete"
+		and repaired_visual.get_node_or_null("DamageOverlay") == null
+		and _block_condition_label(frame) == "FRAME"
+		and _block_condition_label(damaged) == "DAMAGED"
+		and _weld_action_name(frame).begins_with("WELDING FRAME")
+		and _weld_action_name(damaged).begins_with("REPAIRING ARMOR")
+	)
+	frame_visual.free()
+	damaged_visual.free()
+	repaired_visual.free()
+	if not valid:
+		printerr("VERSE_VISUAL_STATE_FAILED")
+		return false
+	print("VERSE_VISUAL_STATE_OK frame=frame damaged=armor_damaged repaired=armor_complete")
+	return true
+
+
 func _raymarch_voxel() -> Variant:
 	var origin := camera.global_position
 	var direction := -camera.global_transform.basis.z.normalized()
@@ -1980,11 +2095,7 @@ func _update_tool_action(delta: float) -> void:
 		if _block_needs_weld(construction_target):
 			action_key = "weld:%s" % construction_target.get("block_id", "")
 			duration = WELD_DURATION
-			var integrity := (
-				int(construction_target.get("health", 0)) * 100
-				/ maxi(int(construction_target.get("max_health", 1)), 1)
-			)
-			action_name = "WELDING FRAME // %d%%" % integrity
+			action_name = _weld_action_name(construction_target)
 		else:
 			action_key = "build:%s:%s:%d" % [
 				target_block.get("grid_id", ""),
@@ -2130,7 +2241,7 @@ func _build_selected_block() -> void:
 
 func _weld_target_block() -> void:
 	if target_block.is_empty():
-		_set_message("Aim at an unfinished construction frame", true)
+		_set_message("Aim at an unfinished frame or damaged block", true)
 		return
 	var block: Dictionary = target_block["block"]
 	if not _block_needs_weld(block):
@@ -2428,18 +2539,24 @@ func _update_interface() -> void:
 		var integrity := health * 100 / max_health
 		if build_mode:
 			if health < max_health:
-				target_label.text = "%s FRAME // INTEGRITY %d%%\nHOLD LMB  //  CONTINUE WELD" % [
-					String(block.get("kind", "block")).to_upper(), integrity
-				]
+				if bool(block.get("construction_complete", false)):
+					target_label.text = "%s DAMAGED // INTEGRITY %d%%\nHOLD LMB  //  REPAIR" % [
+						String(block.get("kind", "block")).to_upper(), integrity
+					]
+				else:
+					target_label.text = "%s FRAME // INTEGRITY %d%%\nHOLD LMB  //  CONTINUE WELD" % [
+						String(block.get("kind", "block")).to_upper(), integrity
+					]
 			else:
 				target_label.text = "%s // INTEGRITY 100%%\nHOLD LMB  //  PLACE %s  //  [ / ] ROTATE" % [
 					String(block.get("kind", "block")).to_upper(),
 					selected_block_kind.to_upper(),
 				]
 		else:
-			target_label.text = "%s // INTEGRITY %d%%\nHOLD RMB  //  CUT AND SALVAGE" % [
-				String(block.get("kind", "block")).to_upper(),
-				integrity,
+			var condition := _block_condition_label(block)
+			var target_state := "" if condition.is_empty() else " " + condition
+			target_label.text = "%s%s // INTEGRITY %d%%\nHOLD RMB  //  CUT AND SALVAGE" % [
+				String(block.get("kind", "block")).to_upper(), target_state, integrity
 			]
 	else:
 		target_label.text = (

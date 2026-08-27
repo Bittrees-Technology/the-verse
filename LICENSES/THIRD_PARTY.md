@@ -28,10 +28,10 @@ The macOS and Linux CI scripts pin and verify Godot release archive checksums. T
 | futures-util | MIT OR Apache-2.0 |
 | fs2 | MIT OR Apache-2.0 |
 | http | MIT OR Apache-2.0 |
-| joltc-sys 0.3.1+Jolt-5.0.0 | MIT OR Apache-2.0 |
+| joltc-sys 0.3.1+Jolt-5.0.0 package metadata, git revision below | MIT OR Apache-2.0 |
 | parking_lot | MIT OR Apache-2.0 |
 | proptest | MIT OR Apache-2.0 |
-| rolt 0.3.1+Jolt-5.0.0 | MIT OR Apache-2.0 |
+| rolt 0.3.1+Jolt-5.0.0 package metadata, git revision below | MIT OR Apache-2.0 |
 | serde | MIT OR Apache-2.0 |
 | serde_json | MIT OR Apache-2.0 |
 | tempfile | MIT OR Apache-2.0 |
@@ -47,12 +47,14 @@ The macOS and Linux CI scripts pin and verify Godot release archive checksums. T
 
 | Component | Version | License | Source |
 | --- | --- | --- | --- |
-| `rolt` | 0.3.1+Jolt-5.0.0 | MIT OR Apache-2.0 | [SecondHalfGames/jolt-rust](https://github.com/SecondHalfGames/jolt-rust) |
-| `joltc-sys` | 0.3.1+Jolt-5.0.0 | MIT OR Apache-2.0 | [SecondHalfGames/jolt-rust](https://github.com/SecondHalfGames/jolt-rust) |
-| JoltC | bundled with `joltc-sys` 0.3.1 | MIT OR Apache-2.0 | [SecondHalfGames/JoltC](https://github.com/SecondHalfGames/JoltC) |
-| Jolt Physics | 5.0.0, bundled with `joltc-sys` | MIT | [jrouwe/JoltPhysics](https://github.com/jrouwe/JoltPhysics) |
+| `rolt` | git `72ac0cb1acc2037c72dc29865da6f52a5483dadc` | MIT OR Apache-2.0 | [SecondHalfGames/jolt-rust](https://github.com/SecondHalfGames/jolt-rust) |
+| `joltc-sys` | git `72ac0cb1acc2037c72dc29865da6f52a5483dadc` | MIT OR Apache-2.0 | [SecondHalfGames/jolt-rust](https://github.com/SecondHalfGames/jolt-rust) |
+| JoltC | `2982004387a9e36ca89525a87d983709d3666da7` | MIT OR Apache-2.0 | [SecondHalfGames/JoltC](https://github.com/SecondHalfGames/JoltC) |
+| Jolt Physics | 5.3 source at `0373ec0dd762e4bc2f6acdb08371ee84fa23c6db` | MIT | [jrouwe/JoltPhysics](https://github.com/jrouwe/JoltPhysics) |
 
-The Rust bindings are pinned to package version 0.3.1 in `Cargo.toml` and to
-the exact `0.3.1+Jolt-5.0.0` registry artifacts in `Cargo.lock`.
+The Rust packages retain upstream's older `0.3.1+Jolt-5.0.0` metadata, but the
+repository pins the immutable git revision shown above. The embedded submodule
+commits, rather than that package label, identify the native source actually
+compiled by this checkpoint.
 
 No JavaScript package is shipped in the browser command center. The end-to-end runner uses the WebSocket implementation bundled with Node.js.

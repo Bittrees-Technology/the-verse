@@ -28,7 +28,7 @@ This checkpoint targets F-005, F-006, F-007, and F-010 and the acceptance eviden
 
 ## Recovery contract
 
-The live solver is derived state. Each accepted tick currently records ordered, quantized transforms, velocities, and contact telemetry. Recovery applies those committed outcomes rather than attempting to reproduce an earlier floating-point collision. After every live commit and after recovery, the server rebuilds Jolt bodies from the recovered canonical snapshot. Collision-driven damage and topology outcomes require a later event-schema revision after solved contact data is available.
+The live solver is derived state. Each accepted tick records ordered, quantized transforms, velocities, native manifold telemetry, canonical contact lifecycle, exact integer reduced translational mass, and an explicitly labeled pairwise estimated impulse. Reduced translational mass ignores contact direction, lever arm, and rotational inertia; it is not damage evidence. Recovery applies committed outcomes rather than attempting to reproduce an earlier floating-point collision. After every live commit and after recovery, the server rebuilds Jolt bodies from the recovered canonical snapshot. World schema 9 preserves active pairs across that rebuild. Collision-driven damage and topology outcomes require a later event-schema revision after applied post-solver impulse data is available.
 
 An interruption before the journal commit retains the prior state. An interruption after the durable commit recovers the new state. Neither path may duplicate damage, blocks, inventory, or grid identities.
 
@@ -36,13 +36,13 @@ An interruption before the journal commit retains the prior state. An interrupti
 
 Implemented and tested:
 
-- An isolated, pinned, license-recorded Jolt 5 adapter with static/dynamic compound bodies, stable identifiers, bounded forces/torques, and single-thread fixed stepping.
-- Protocol v5 grid controls, full grid quaternion snapshots, block/cargo-derived mass, authoritative grid–voxel response, swept player–voxel rejection, quantized committed body/contact outcomes, exact graceful restart, and truncated final-journal recovery.
+- An isolated, pinned, license-recorded Jolt 5.3 adapter with static/dynamic compound bodies, stable leaf identities, bounded raw manifold capture, bounded forces/torques, and single-thread fixed stepping.
+- Protocol v6 grid controls, explicit construction-completion state, full grid quaternion snapshots, exact block/cargo-derived mass, authoritative grid–voxel response, swept player–voxel rejection, quantized committed body/contact outcomes, canonical contact lifecycle across rebuild/restart, exact graceful restart, and truncated final-journal recovery.
 - Sparse dirty render chunks, a complete native mining/building/restart scenario, and initial Apple Silicon compound-body measurements.
 
 Still required for P0.7 acceptance:
 
-- Solved-manifold or impulse telemetry suitable for server-derived collision damage, plus atomic damage/split outcomes.
+- A project-owned Jolt/JoltC post-solve callback that exposes applied impulses (including the winning CCD path), followed by server-derived collision damage and atomic damage/split outcomes. The current pairwise estimate is telemetry only.
 - Dirty collision chunk replacement, runtime grid–grid momentum tolerance, anchor/contact stability, mass-response, player–grid, and persistence failpoint tests.
 - Repeatable edit-to-remesh, Ubuntu, network, multi-body, and large-grid evidence plus a native Linux artifact.
 

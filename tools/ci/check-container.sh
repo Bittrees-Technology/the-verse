@@ -27,7 +27,7 @@ docker run \
 for _ in {1..200}; do
   if curl --fail --silent "http://127.0.0.1:${host_port}/healthz" >/dev/null; then
     status="$(curl --fail --silent "http://127.0.0.1:${host_port}/api/v1/status")"
-    [[ "$(jq -r '.content_manifest_version' <<<"${status}")" == "p0.7.1" ]]
+    [[ "$(jq -r '.content_manifest_version' <<<"${status}")" == "p0.7.2" ]]
     [[ "$(jq -r '.conservation_valid' <<<"${status}")" == "true" ]]
     echo "VERSE_CONTAINER_CHECK_OK"
     exit 0

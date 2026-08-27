@@ -1,10 +1,11 @@
 {
-  "schema_version": 3,
-  "manifest_version": "p0.7.1",
+  "schema_version": 4,
+  "manifest_version": "p0.7.2",
   "license": "AGPL-3.0-or-later",
   "physics": {
     "fixed_step_hz": 60,
     "fixed_delta_seconds": 0.016666667,
+    "collision_substeps": 2,
     "control_force_newtons": 16000.0,
     "control_torque_newton_meters": 9000.0,
     "linear_dampener_newtons_per_mps": 4500.0,
@@ -30,7 +31,7 @@
       "power_requirement": 0.0,
       "stored_power": 0.0,
       "component_cost": 1,
-      "mass_kg": 250.0
+      "mass_grams": 250000
     },
     {
       "kind": "control_core",
@@ -39,7 +40,7 @@
       "power_requirement": 2.0,
       "stored_power": 0.0,
       "component_cost": 1,
-      "mass_kg": 480.0
+      "mass_grams": 480000
     },
     {
       "kind": "power_source",
@@ -48,7 +49,7 @@
       "power_requirement": 0.0,
       "stored_power": 0.0,
       "component_cost": 1,
-      "mass_kg": 550.0
+      "mass_grams": 550000
     },
     {
       "kind": "battery",
@@ -57,7 +58,7 @@
       "power_requirement": 0.0,
       "stored_power": 20.0,
       "component_cost": 1,
-      "mass_kg": 700.0
+      "mass_grams": 700000
     },
     {
       "kind": "cargo",
@@ -66,7 +67,7 @@
       "power_requirement": 0.25,
       "stored_power": 0.0,
       "component_cost": 1,
-      "mass_kg": 350.0
+      "mass_grams": 350000
     },
     {
       "kind": "drill",
@@ -75,7 +76,7 @@
       "power_requirement": 4.0,
       "stored_power": 0.0,
       "component_cost": 1,
-      "mass_kg": 600.0
+      "mass_grams": 600000
     },
     {
       "kind": "anchor",
@@ -84,7 +85,7 @@
       "power_requirement": 1.0,
       "stored_power": 0.0,
       "component_cost": 1,
-      "mass_kg": 420.0
+      "mass_grams": 420000
     },
     {
       "kind": "damage_test",
@@ -93,7 +94,7 @@
       "power_requirement": 0.0,
       "stored_power": 0.0,
       "component_cost": 1,
-      "mass_kg": 250.0
+      "mass_grams": 250000
     }
   ],
   "recipes": {

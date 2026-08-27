@@ -16,10 +16,10 @@ use verse_protocol::{
 use crate::content;
 use crate::event::{
     CanonicalEvent, EVENT_SCHEMA_NAME, EVENT_SCHEMA_VERSION, EventPayload, PhysicsBodyOutcome,
-    PhysicsContactOutcome,
+    PhysicsContactOutcome, PhysicsContactPhase,
 };
 use crate::model::{
-    Block, CARGO_INVENTORY_CAPACITY_LITERS, Grid, InventoryRecord, PLANET_CENTER,
+    Block, CARGO_INVENTORY_CAPACITY_LITERS, ContactPairKey, Grid, InventoryRecord, PLANET_CENTER,
     PLANET_SURFACE_RADIUS_M, PLAYER_INVENTORY_ID, WorldState,
 };
 use crate::persistence::{PersistenceError, Store};
@@ -216,6 +216,7 @@ impl Runtime {
                 let controls = physics_controls(&self.state);
                 let mut output = None;
                 let mut contacts = Vec::new();
+                let mut active_contacts = self.state.active_contact_pairs.clone();
                 for substep_index in 0..step_count {
                     let step = match self.physics.step(&controls) {
                         Ok(step) => step,
@@ -226,11 +227,21 @@ impl Runtime {
                     };
                     let substep_index =
                         u8::try_from(substep_index).expect("bounded physics substep index fits u8");
-                    contacts.extend(
-                        step.contacts
-                            .iter()
-                            .map(|contact| physics_contact_outcome(contact, substep_index)),
-                    );
+                    let current_contacts = step
+                        .contacts
+                        .iter()
+                        .map(contact_pair_key)
+                        .collect::<BTreeSet<_>>();
+                    contacts.extend(step.contacts.iter().map(|contact| {
+                        let key = contact_pair_key(contact);
+                        let phase = if active_contacts.contains(&key) {
+                            PhysicsContactPhase::Persisted
+                        } else {
+                            PhysicsContactPhase::Began
+                        };
+                        physics_contact_outcome(&self.state, contact, substep_index, phase)
+                    }));
+                    active_contacts = current_contacts;
                     output = Some(step);
                 }
                 let output = output.expect("positive physics step count produces output");
@@ -247,6 +258,7 @@ impl Runtime {
                         .map(physics_body_outcome)
                         .collect(),
                     contacts,
+                    active_contacts_after: active_contacts.into_iter().collect(),
                 };
                 if let Err(source) = self.commit_system_event(payload) {
                     self.halted = true;
@@ -457,6 +469,7 @@ impl WorldState {
                     .ok_or_else(|| {
                         IntentError::rejected("quantity_overflow", "refining quantity is too large")
                     })?;
+                self.ensure_inventory_functional(inventory_id)?;
                 let inventory = self.inventory(inventory_id)?;
                 if inventory.contents.ore < ore_required {
                     return Err(IntentError::rejected(
@@ -480,6 +493,7 @@ impl WorldState {
                         "crafting requires at least one component",
                     ));
                 }
+                self.ensure_inventory_functional(inventory_id)?;
                 let inventory = self.inventory(inventory_id)?;
                 let refined_required = quantity
                     .checked_mul(content::manifest().recipes.component_crafting.refined_input)
@@ -536,6 +550,8 @@ impl WorldState {
                         "transfer quantity must be positive",
                     ));
                 }
+                self.ensure_inventory_functional(source_inventory_id)?;
+                self.ensure_inventory_functional(destination_inventory_id)?;
                 let source = self.inventory(source_inventory_id)?;
                 self.inventory(destination_inventory_id)?;
                 if source.contents.amount(*resource) < *quantity {
@@ -611,6 +627,7 @@ impl WorldState {
                 let mut block = Block::new(block_id.clone(), *coordinate, *kind);
                 block.orientation = *orientation;
                 block.health = block.max_health().div_ceil(4);
+                block.construction_complete = false;
                 if *kind == BlockKind::Cargo {
                     block.inventory_id = Some(format!("inventory-{block_id}"));
                 }
@@ -634,15 +651,18 @@ impl WorldState {
                         "the targeted block is already at full integrity",
                     ));
                 }
+                let new_health = block
+                    .health
+                    .saturating_add(max_health.div_ceil(4))
+                    .min(max_health);
                 EventPayload::BlockWelded {
                     grid_id: grid_id.clone(),
                     block_id: block_id.clone(),
                     previous_health: block.health,
-                    new_health: block
-                        .health
-                        .saturating_add(max_health.div_ceil(4))
-                        .min(max_health),
+                    new_health,
                     max_health,
+                    completed_construction: !block.construction_complete
+                        && new_health == max_health,
                 }
             }
             ClientMessage::SetGridControl {
@@ -835,7 +855,25 @@ impl WorldState {
                 batches,
             } => {
                 let recipe = &content::manifest().recipes.refining;
-                let ore_required = batches * recipe.ore_input;
+                if *batches == 0 {
+                    return Err(IntentError::rejected(
+                        "replay_refining_quantity_invalid",
+                        "refining event must contain at least one batch",
+                    ));
+                }
+                let ore_required = batches.checked_mul(recipe.ore_input).ok_or_else(|| {
+                    IntentError::rejected(
+                        "replay_refining_quantity_invalid",
+                        "refining event quantity overflowed",
+                    )
+                })?;
+                self.ensure_inventory_functional(inventory_id)?;
+                if self.inventory(inventory_id)?.contents.ore < ore_required {
+                    return Err(IntentError::rejected(
+                        "replay_refining_inventory_invalid",
+                        "refining event exceeds the authoritative ore inventory",
+                    ));
+                }
                 let inventory = self.inventory_mut(inventory_id)?;
                 inventory.contents.ore -= ore_required;
                 inventory.contents.refined_material += batches * recipe.refined_output;
@@ -846,8 +884,28 @@ impl WorldState {
                 quantity,
             } => {
                 let recipe = &content::manifest().recipes.component_crafting;
+                if *quantity == 0 {
+                    return Err(IntentError::rejected(
+                        "replay_crafting_quantity_invalid",
+                        "crafting event must contain at least one component",
+                    ));
+                }
+                let refined_required =
+                    quantity.checked_mul(recipe.refined_input).ok_or_else(|| {
+                        IntentError::rejected(
+                            "replay_crafting_quantity_invalid",
+                            "crafting event quantity overflowed",
+                        )
+                    })?;
+                self.ensure_inventory_functional(inventory_id)?;
+                if self.inventory(inventory_id)?.contents.refined_material < refined_required {
+                    return Err(IntentError::rejected(
+                        "replay_crafting_inventory_invalid",
+                        "crafting event exceeds the authoritative refined inventory",
+                    ));
+                }
                 let inventory = self.inventory_mut(inventory_id)?;
-                inventory.contents.refined_material -= quantity * recipe.refined_input;
+                inventory.contents.refined_material -= refined_required;
                 inventory.contents.components += quantity * recipe.component_output;
                 self.ledger.crafted_components += quantity;
             }
@@ -857,6 +915,28 @@ impl WorldState {
                 resource,
                 quantity,
             } => {
+                if source_inventory_id == destination_inventory_id || *quantity == 0 {
+                    return Err(IntentError::rejected(
+                        "replay_inventory_transfer_invalid",
+                        "inventory transfer must use distinct inventories and a positive quantity",
+                    ));
+                }
+                self.ensure_inventory_functional(source_inventory_id)?;
+                self.ensure_inventory_functional(destination_inventory_id)?;
+                if self
+                    .inventory(source_inventory_id)?
+                    .contents
+                    .amount(*resource)
+                    < *quantity
+                    || !self
+                        .inventory(destination_inventory_id)?
+                        .can_add(*resource, *quantity)
+                {
+                    return Err(IntentError::rejected(
+                        "replay_inventory_transfer_invalid",
+                        "inventory transfer exceeds authoritative contents or capacity",
+                    ));
+                }
                 mutate_resource(
                     &mut self.inventory_mut(source_inventory_id)?.contents,
                     *resource,
@@ -869,10 +949,58 @@ impl WorldState {
                 );
             }
             EventPayload::BlockBuilt { grid_id, block } => {
-                if block.orientation > 3 || block.health != block.max_health().div_ceil(4) {
+                let definition = content::block(block.kind);
+                let expected_block_id = format!("block-{}", event.event_sequence);
+                let expected_inventory_id = (block.kind == BlockKind::Cargo)
+                    .then(|| format!("inventory-{}", block.block_id));
+                if block.orientation > 3
+                    || block.health != block.max_health().div_ceil(4)
+                    || block.construction_complete
+                    || block.component_cost != definition.component_cost
+                    || block.block_id != expected_block_id
+                    || block.inventory_id != expected_inventory_id
+                {
                     return Err(IntentError::rejected(
                         "replay_construction_frame_invalid",
-                        "placed frame does not match canonical orientation or integrity",
+                        "placed frame does not match canonical identity, cost, linkage, orientation, or integrity",
+                    ));
+                }
+                if self
+                    .grids
+                    .values()
+                    .any(|grid| grid.blocks.contains_key(&block.block_id))
+                    || block
+                        .inventory_id
+                        .as_ref()
+                        .is_some_and(|inventory_id| self.inventories.contains_key(inventory_id))
+                {
+                    return Err(IntentError::rejected(
+                        "replay_construction_identity_duplicate",
+                        "placed frame reuses an authoritative block or inventory identity",
+                    ));
+                }
+                let grid = self.grid(grid_id)?;
+                if grid.blocks.len() >= MAX_GRID_BLOCKS_P0
+                    || grid.block_at(block.coordinate).is_some()
+                    || (!grid.blocks.is_empty()
+                        && !grid.blocks.values().any(|existing| {
+                            existing.coordinate.manhattan_distance(block.coordinate) == 1
+                        }))
+                {
+                    return Err(IntentError::rejected(
+                        "replay_construction_location_invalid",
+                        "placed frame exceeds the grid budget or is not at a free face-connected coordinate",
+                    ));
+                }
+                self.ensure_hand_tool_range(
+                    grid,
+                    block.coordinate,
+                    "replay_construction_out_of_range",
+                )?;
+                if self.inventory(PLAYER_INVENTORY_ID)?.contents.components < block.component_cost {
+                    return Err(IntentError::rejected(
+                        "replay_construction_components_invalid",
+                        "placed frame exceeds the authoritative component inventory",
                     ));
                 }
                 self.inventory_mut(PLAYER_INVENTORY_ID)?.contents.components -=
@@ -901,6 +1029,7 @@ impl WorldState {
                 previous_health,
                 new_health,
                 max_health,
+                completed_construction,
             } => {
                 let block = self
                     .grid_mut(grid_id)?
@@ -915,6 +1044,12 @@ impl WorldState {
                         "weld event does not match the block integrity state",
                     ));
                 }
+                if *previous_health >= *max_health {
+                    return Err(IntentError::rejected(
+                        "replay_weld_no_change",
+                        "weld event cannot target a block already at full integrity",
+                    ));
+                }
                 let expected_health = previous_health
                     .saturating_add(max_health.div_ceil(4))
                     .min(*max_health);
@@ -924,7 +1059,16 @@ impl WorldState {
                         "weld event does not match the canonical integrity increment",
                     ));
                 }
+                let expected_completion =
+                    !block.construction_complete && *new_health == *max_health;
+                if *completed_construction != expected_completion {
+                    return Err(IntentError::rejected(
+                        "replay_construction_completion_invalid",
+                        "weld event completion does not match construction state",
+                    ));
+                }
                 block.health = *new_health;
+                block.construction_complete |= *completed_construction;
             }
             EventPayload::GridControlSet {
                 grid_id,
@@ -958,6 +1102,7 @@ impl WorldState {
                 remaining_step_phase,
                 bodies,
                 contacts,
+                active_contacts_after,
             } => {
                 let expected_fixed_step_hz = content::manifest().physics.fixed_step_hz;
                 if *fixed_step_hz != expected_fixed_step_hz
@@ -976,6 +1121,7 @@ impl WorldState {
                         "physics outcome must contain every authoritative grid exactly once",
                     ));
                 }
+                let physics_limits = physics_scene_config();
                 let mut seen = BTreeSet::new();
                 for body in bodies {
                     if !seen.insert(body.grid_id.as_str()) {
@@ -987,18 +1133,58 @@ impl WorldState {
                     ensure_finite(body.position, "replayed grid position")?;
                     ensure_finite(body.linear_velocity, "replayed grid velocity")?;
                     ensure_finite(body.angular_velocity, "replayed grid angular velocity")?;
-                    if !body.orientation.is_finite() {
+                    let orientation_length_squared = f64::from(body.orientation.x).mul_add(
+                        f64::from(body.orientation.x),
+                        f64::from(body.orientation.y).mul_add(
+                            f64::from(body.orientation.y),
+                            f64::from(body.orientation.z).mul_add(
+                                f64::from(body.orientation.z),
+                                f64::from(body.orientation.w) * f64::from(body.orientation.w),
+                            ),
+                        ),
+                    );
+                    if !body.orientation.is_finite()
+                        || (orientation_length_squared - 1.0).abs() > 1.0e-3
+                    {
                         return Err(IntentError::rejected(
                             "replay_physics_rotation_invalid",
-                            "physics outcome contains a non-finite rotation",
+                            "physics outcome rotation must be finite and unit length",
                         ));
                     }
-                    let grid = self.grid_mut(&body.grid_id)?;
-                    grid.position = body.position;
-                    grid.orientation = body.orientation;
-                    grid.linear_velocity = body.linear_velocity;
-                    grid.angular_velocity = body.angular_velocity;
+                    if body.linear_velocity.magnitude()
+                        > f64::from(physics_limits.max_linear_velocity_mps)
+                        || body.angular_velocity.magnitude()
+                            > f64::from(physics_limits.max_angular_velocity_radians_per_second)
+                    {
+                        return Err(IntentError::rejected(
+                            "replay_physics_body_velocity_invalid",
+                            "physics outcome velocity exceeds the authoritative solver limit",
+                        ));
+                    }
+                    let Some(grid) = self.grids.get(&body.grid_id) else {
+                        return Err(IntentError::rejected(
+                            "replay_physics_body_identity_invalid",
+                            "physics outcome must identify an authoritative grid",
+                        ));
+                    };
+                    let orientation_dot = f64::from(body.orientation.x)
+                        * f64::from(grid.orientation.x)
+                        + f64::from(body.orientation.y) * f64::from(grid.orientation.y)
+                        + f64::from(body.orientation.z) * f64::from(grid.orientation.z)
+                        + f64::from(body.orientation.w) * f64::from(grid.orientation.w);
+                    if grid.anchored
+                        && (body.position != grid.position
+                            || (orientation_dot.abs() - 1.0).abs() > 1.0e-3
+                            || body.linear_velocity != Vec3::ZERO
+                            || body.angular_velocity != Vec3::ZERO)
+                    {
+                        return Err(IntentError::rejected(
+                            "replay_physics_anchored_body_invalid",
+                            "anchored grid pose must remain unchanged and its velocity must remain zero",
+                        ));
+                    }
                 }
+                let mut contacts_by_substep = vec![Vec::new(); usize::from(*step_count)];
                 for contact in contacts {
                     if contact.substep_index >= *step_count {
                         return Err(IntentError::rejected(
@@ -1008,17 +1194,93 @@ impl WorldState {
                     }
                     ensure_finite(contact.point, "replayed contact point")?;
                     ensure_finite(contact.normal, "replayed contact normal")?;
-                    if !contact.penetration_m.is_finite()
-                        || !contact.impact_speed_mps.is_finite()
-                        || contact.penetration_m < 0.0
-                        || contact.impact_speed_mps < 0.0
-                    {
+                    let normal_length_squared = contact.normal.x * contact.normal.x
+                        + contact.normal.y * contact.normal.y
+                        + contact.normal.z * contact.normal.z;
+                    if (normal_length_squared - 1.0).abs() > 0.000_01 {
+                        return Err(IntentError::rejected(
+                            "replay_physics_contact_normal_invalid",
+                            "physics contact normal must have unit length",
+                        ));
+                    }
+                    if !contact.penetration_m.is_finite() || contact.penetration_m < 0.0 {
                         return Err(IntentError::rejected(
                             "replay_physics_contact_invalid",
                             "physics contact values must be finite and non-negative",
                         ));
                     }
+                    let key = ContactPairKey {
+                        body_a: contact.body_a_id.clone(),
+                        collider_a: contact.collider_a_id.clone(),
+                        body_b: contact.body_b_id.clone(),
+                        collider_b: contact.collider_b_id.clone(),
+                    };
+                    if (&key.body_b, &key.collider_b) < (&key.body_a, &key.collider_a)
+                        || !self.physics_collider_exists(&key.body_a, &key.collider_a)
+                        || !self.physics_collider_exists(&key.body_b, &key.collider_b)
+                    {
+                        return Err(IntentError::rejected(
+                            "replay_physics_contact_identity_invalid",
+                            "physics contact identities must be canonical live colliders",
+                        ));
+                    }
+                    if contact.reduced_translational_mass_grams
+                        != reduced_translational_contact_mass_grams(
+                            self,
+                            &contact.body_a_id,
+                            &contact.body_b_id,
+                        )
+                    {
+                        return Err(IntentError::rejected(
+                            "replay_physics_contact_mass_invalid",
+                            "physics contact reduced translational mass does not match canonical content",
+                        ));
+                    }
+                    contacts_by_substep[usize::from(contact.substep_index)].push((key, contact));
                 }
+                let mut active = self.active_contact_pairs.clone();
+                for substep in contacts_by_substep {
+                    let mut current = BTreeSet::new();
+                    for (key, contact) in substep {
+                        if !current.insert(key.clone()) {
+                            return Err(IntentError::rejected(
+                                "replay_physics_contact_duplicate",
+                                "physics outcome contains a duplicate contact pair",
+                            ));
+                        }
+                        let expected_phase = if active.contains(&key) {
+                            PhysicsContactPhase::Persisted
+                        } else {
+                            PhysicsContactPhase::Began
+                        };
+                        if contact.phase != expected_phase {
+                            return Err(IntentError::rejected(
+                                "replay_physics_contact_phase_invalid",
+                                "physics contact lifecycle does not match canonical state",
+                            ));
+                        }
+                    }
+                    active = current;
+                }
+                if active_contacts_after.as_slice()
+                    != active.iter().cloned().collect::<Vec<_>>().as_slice()
+                {
+                    return Err(IntentError::rejected(
+                        "replay_physics_active_contacts_invalid",
+                        "physics active-contact outcome does not match the final substep",
+                    ));
+                }
+                for body in bodies {
+                    let grid = self
+                        .grids
+                        .get_mut(&body.grid_id)
+                        .expect("validated physics body identifies a live grid");
+                    grid.position = body.position;
+                    grid.orientation = body.orientation;
+                    grid.linear_velocity = body.linear_velocity;
+                    grid.angular_velocity = body.angular_velocity;
+                }
+                self.active_contact_pairs = active;
                 self.physics_step_phase = u64::from(*remaining_step_phase);
                 self.simulation_tick = self.simulation_tick.saturating_add(u64::from(*step_count));
             }
@@ -1037,10 +1299,9 @@ impl WorldState {
                 self.player.career.components_crafted += quantity;
             }
             EventPayload::BlockWelded {
-                new_health,
-                max_health,
+                completed_construction: true,
                 ..
-            } if new_health == max_health => self.player.career.blocks_built += 1,
+            } => self.player.career.blocks_built += 1,
             EventPayload::GridAnchorSet { anchored: true, .. } => {
                 self.player.career.anchors_engaged += 1;
             }
@@ -1194,6 +1455,21 @@ impl WorldState {
         Ok(())
     }
 
+    fn physics_collider_exists(&self, body_id: &str, collider_id: &str) -> bool {
+        if let Some(grid) = self.grids.get(body_id) {
+            return grid.blocks.contains_key(collider_id);
+        }
+        body_id == "voxel-field-origin"
+            && self.voxels.occupied.iter().any(|coordinate| {
+                format!(
+                    "voxel-{x}-{y}-{z}",
+                    x = coordinate.x,
+                    y = coordinate.y,
+                    z = coordinate.z
+                ) == collider_id
+            })
+    }
+
     fn inventory(&self, inventory_id: &str) -> Result<&InventoryRecord, IntentError> {
         self.inventories.get(inventory_id).ok_or_else(|| {
             IntentError::rejected(
@@ -1201,6 +1477,31 @@ impl WorldState {
                 format!("inventory {inventory_id} does not exist"),
             )
         })
+    }
+
+    fn ensure_inventory_functional(&self, inventory_id: &str) -> Result<(), IntentError> {
+        let inventory = self.inventory(inventory_id)?;
+        let InventoryDomain::Cargo { block_id } = &inventory.domain else {
+            return Ok(());
+        };
+        let block = self
+            .grids
+            .values()
+            .find_map(|grid| grid.blocks.get(block_id))
+            .ok_or_else(|| {
+                IntentError::rejected(
+                    "inventory_owner_missing",
+                    format!("cargo inventory {inventory_id} has no live owner block"),
+                )
+            })?;
+        if block.construction_complete {
+            Ok(())
+        } else {
+            Err(IntentError::rejected(
+                "inventory_block_incomplete",
+                "cargo inventory remains sealed until its block finishes construction",
+            ))
+        }
     }
 
     fn inventory_mut(&mut self, inventory_id: &str) -> Result<&mut InventoryRecord, IntentError> {
@@ -1311,6 +1612,7 @@ fn movement_samples(start: Vec3, end: Vec3) -> Vec<Vec3> {
 fn physics_scene_config() -> SceneConfig {
     SceneConfig {
         fixed_delta_seconds: content::manifest().physics.fixed_delta_seconds,
+        collision_substeps: content::manifest().physics.collision_substeps,
         max_colliders_per_body: 8_192,
         max_linear_velocity_mps: 32.0,
         max_angular_velocity_radians_per_second: 8.0,
@@ -1385,7 +1687,8 @@ fn physics_body_specs(state: &WorldState) -> Vec<BodySpec> {
                         PhysicsQuat::IDENTITY,
                     ),
                     half_extents: PhysicsVec3::new(0.5, 0.5, 0.5),
-                    density_kg_per_m3: (definition.mass_kg as f32 * integrity.max(0.1)
+                    density_kg_per_m3: (definition.mass_grams as f32 / 1_000.0
+                        * integrity.max(0.1)
                         + inventory_mass)
                         .max(1.0),
                 }
@@ -1458,8 +1761,10 @@ fn physics_body_outcome(body: &verse_physics::BodyState) -> PhysicsBodyOutcome {
 }
 
 fn physics_contact_outcome(
+    state: &WorldState,
     contact: &verse_physics::ContactRecord,
     substep_index: u8,
+    phase: PhysicsContactPhase,
 ) -> PhysicsContactOutcome {
     PhysicsContactOutcome {
         substep_index,
@@ -1470,7 +1775,47 @@ fn physics_contact_outcome(
         point: from_physics_vec3(contact.point),
         normal: from_physics_vec3(contact.normal),
         penetration_m: quantize_f64(contact.penetration_m),
-        impact_speed_mps: quantize_f64(contact.impact_speed_mps),
+        closing_speed_mm_per_second: quantize_nonnegative_u64(contact.impact_speed_mps, 1_000.0),
+        estimated_normal_impulse_millinewton_seconds: quantize_nonnegative_u64(
+            contact.estimated_normal_impulse_ns,
+            1_000.0,
+        ),
+        reduced_translational_mass_grams: reduced_translational_contact_mass_grams(
+            state,
+            &contact.body_a_id,
+            &contact.body_b_id,
+        ),
+        phase,
+    }
+}
+
+fn contact_pair_key(contact: &verse_physics::ContactRecord) -> ContactPairKey {
+    ContactPairKey {
+        body_a: contact.body_a_id.clone(),
+        collider_a: contact.collider_a_id.clone(),
+        body_b: contact.body_b_id.clone(),
+        collider_b: contact.collider_b_id.clone(),
+    }
+}
+
+fn reduced_translational_contact_mass_grams(
+    state: &WorldState,
+    left_body: &str,
+    right_body: &str,
+) -> u64 {
+    fn mass(state: &WorldState, body_id: &str) -> Option<u64> {
+        let grid = state.grids.get(body_id)?;
+        (!grid.anchored).then(|| state.grid_mass_grams(grid))
+    }
+
+    match (mass(state, left_body), mass(state, right_body)) {
+        (Some(left), Some(right)) => {
+            let numerator = u128::from(left) * u128::from(right);
+            let denominator = u128::from(left).saturating_add(u128::from(right));
+            u64::try_from(numerator.checked_div(denominator).unwrap_or(0)).unwrap_or(u64::MAX)
+        }
+        (Some(dynamic), None) | (None, Some(dynamic)) => dynamic,
+        (None, None) => 0,
     }
 }
 
@@ -1522,6 +1867,19 @@ fn normalize_quat(value: Quat) -> Quat {
 
 fn quantize_f64(value: f64) -> f64 {
     (value * 1_000_000.0).round() / 1_000_000.0
+}
+
+fn quantize_nonnegative_u64(value: f64, scale: f64) -> u64 {
+    if !value.is_finite() || value <= 0.0 {
+        0
+    } else {
+        // The explicit finite-positive check and clamp establish the cast's
+        // complete u64 range before conversion.
+        #[allow(clippy::cast_sign_loss)]
+        {
+            (value * scale).round().clamp(0.0, u64::MAX as f64) as u64
+        }
+    }
 }
 
 fn quantize_f32(value: f32) -> f32 {
@@ -1634,6 +1992,243 @@ mod tests {
             Err(IntentError::Rejected { ref code, .. }) if code == "event_schema_mismatch"
         ));
         assert_eq!(state.event_sequence, 0);
+    }
+
+    #[test]
+    fn replay_rejects_tampered_contact_mass_and_lifecycle() {
+        let runtime = runtime();
+        let state = runtime.state();
+        let voxel = state.voxels.occupied.iter().next().expect("voxel exists");
+        let voxel_collider = format!("voxel-{}-{}-{}", voxel.x, voxel.y, voxel.z);
+        let key = ContactPairKey {
+            body_a: STARTER_GRID_ID.into(),
+            collider_a: "block-core".into(),
+            body_b: "voxel-field-origin".into(),
+            collider_b: voxel_collider.clone(),
+        };
+        let bodies = state
+            .grids
+            .values()
+            .map(|grid| PhysicsBodyOutcome {
+                grid_id: grid.grid_id.clone(),
+                position: grid.position,
+                orientation: grid.orientation,
+                linear_velocity: grid.linear_velocity,
+                angular_velocity: grid.angular_velocity,
+            })
+            .collect::<Vec<_>>();
+        let payload = EventPayload::PhysicsStepCommitted {
+            fixed_step_hz: content::manifest().physics.fixed_step_hz,
+            step_count: 1,
+            remaining_step_phase: 0,
+            bodies,
+            contacts: vec![PhysicsContactOutcome {
+                substep_index: 0,
+                body_a_id: STARTER_GRID_ID.into(),
+                collider_a_id: "block-core".into(),
+                body_b_id: "voxel-field-origin".into(),
+                collider_b_id: voxel_collider,
+                point: Vec3::ZERO,
+                normal: Vec3::new(-1.0, 0.0, 0.0),
+                penetration_m: 0.01,
+                closing_speed_mm_per_second: 1_000,
+                estimated_normal_impulse_millinewton_seconds: 5_000,
+                reduced_translational_mass_grams: reduced_translational_contact_mass_grams(
+                    state,
+                    STARTER_GRID_ID,
+                    "voxel-field-origin",
+                ),
+                phase: PhysicsContactPhase::Began,
+            }],
+            active_contacts_after: vec![key],
+        };
+
+        let mut wrong_mass = state.prepare_system_event(payload.clone());
+        if let EventPayload::PhysicsStepCommitted { contacts, .. } = &mut wrong_mass.payload {
+            contacts[0].reduced_translational_mass_grams += 1;
+        }
+        wrong_mass.event_hash = wrong_mass.calculate_hash();
+        let error = state
+            .clone()
+            .apply_event(&wrong_mass)
+            .expect_err("tampered reduced translational mass is rejected");
+        assert_eq!(error.code(), "replay_physics_contact_mass_invalid");
+
+        let mut wrong_normal = state.prepare_system_event(payload.clone());
+        if let EventPayload::PhysicsStepCommitted { contacts, .. } = &mut wrong_normal.payload {
+            contacts[0].normal = Vec3::ZERO;
+        }
+        wrong_normal.event_hash = wrong_normal.calculate_hash();
+        let error = state
+            .clone()
+            .apply_event(&wrong_normal)
+            .expect_err("tampered contact normal is rejected");
+        assert_eq!(error.code(), "replay_physics_contact_normal_invalid");
+
+        let mut wrong_phase = state.prepare_system_event(payload);
+        if let EventPayload::PhysicsStepCommitted { contacts, .. } = &mut wrong_phase.payload {
+            contacts[0].phase = PhysicsContactPhase::Persisted;
+        }
+        wrong_phase.event_hash = wrong_phase.calculate_hash();
+        let error = state
+            .clone()
+            .apply_event(&wrong_phase)
+            .expect_err("tampered contact phase is rejected");
+        assert_eq!(error.code(), "replay_physics_contact_phase_invalid");
+    }
+
+    #[test]
+    fn replay_rejects_unrebuildable_body_outcomes_before_mutation() {
+        let runtime = runtime();
+        let mut state = runtime.state().clone();
+        state
+            .grids
+            .get_mut(STARTER_GRID_ID)
+            .expect("starter grid exists")
+            .anchored = true;
+        assert!(state.grids[STARTER_GRID_ID].anchored);
+        let bodies = state
+            .grids
+            .values()
+            .map(|grid| PhysicsBodyOutcome {
+                grid_id: grid.grid_id.clone(),
+                position: grid.position,
+                orientation: grid.orientation,
+                linear_velocity: grid.linear_velocity,
+                angular_velocity: grid.angular_velocity,
+            })
+            .collect::<Vec<_>>();
+        let payload = EventPayload::PhysicsStepCommitted {
+            fixed_step_hz: content::manifest().physics.fixed_step_hz,
+            step_count: 1,
+            remaining_step_phase: 0,
+            bodies,
+            contacts: Vec::new(),
+            active_contacts_after: Vec::new(),
+        };
+        let before_hash = state.state_hash();
+
+        let mut zero_rotation = state.prepare_system_event(payload.clone());
+        if let EventPayload::PhysicsStepCommitted { bodies, .. } = &mut zero_rotation.payload {
+            bodies[0].orientation = Quat::new(0.0, 0.0, 0.0, 0.0);
+        }
+        zero_rotation.event_hash = zero_rotation.calculate_hash();
+        let mut replay = state.clone();
+        let error = replay
+            .apply_event(&zero_rotation)
+            .expect_err("zero body rotation is rejected");
+        assert_eq!(error.code(), "replay_physics_rotation_invalid");
+        assert_eq!(replay.state_hash(), before_hash);
+
+        let mut over_speed = state.prepare_system_event(payload.clone());
+        if let EventPayload::PhysicsStepCommitted { bodies, .. } = &mut over_speed.payload {
+            bodies[0].linear_velocity = Vec3::new(32.000_001, 0.0, 0.0);
+        }
+        over_speed.event_hash = over_speed.calculate_hash();
+        let mut replay = state.clone();
+        let error = replay
+            .apply_event(&over_speed)
+            .expect_err("over-limit body velocity is rejected");
+        assert_eq!(error.code(), "replay_physics_body_velocity_invalid");
+        assert_eq!(replay.state_hash(), before_hash);
+
+        let mut moved_anchor = state.prepare_system_event(payload);
+        if let EventPayload::PhysicsStepCommitted { bodies, .. } = &mut moved_anchor.payload {
+            let body = bodies
+                .iter_mut()
+                .find(|body| body.grid_id == STARTER_GRID_ID)
+                .expect("starter grid outcome exists");
+            body.position.x += 1.0;
+        }
+        moved_anchor.event_hash = moved_anchor.calculate_hash();
+        let mut replay = state.clone();
+        let error = replay
+            .apply_event(&moved_anchor)
+            .expect_err("anchored grid movement is rejected");
+        assert_eq!(error.code(), "replay_physics_anchored_body_invalid");
+        assert_eq!(replay.state_hash(), before_hash);
+    }
+
+    #[test]
+    fn replay_rejects_a_full_integrity_no_op_weld_without_awarding_experience() {
+        let runtime = runtime();
+        let mut state = runtime.state().clone();
+        let before_hash = state.state_hash();
+        let max_health = state.grids[STARTER_GRID_ID].blocks["block-core"].max_health();
+        let event = state.prepare_system_event(EventPayload::BlockWelded {
+            grid_id: STARTER_GRID_ID.into(),
+            block_id: "block-core".into(),
+            previous_health: max_health,
+            new_health: max_health,
+            max_health,
+            completed_construction: false,
+        });
+
+        let error = state
+            .apply_event(&event)
+            .expect_err("a no-op weld must not replay");
+        assert_eq!(error.code(), "replay_weld_no_change");
+        assert_eq!(state.state_hash(), before_hash);
+        assert_eq!(state.player.experience, 0);
+    }
+
+    #[test]
+    fn replay_rejects_noncanonical_construction_fields_before_mutation() {
+        let mut runtime = runtime();
+        move_player_near_grid(&mut runtime);
+        let state = runtime.state().clone();
+        let canonical = state
+            .prepare_client_event(&ClientMessage::BuildBlock {
+                operation_id: "canonical-replay-frame".into(),
+                grid_id: STARTER_GRID_ID.into(),
+                coordinate: IVec3::new(0, 1, 0),
+                kind: BlockKind::Cargo,
+                orientation: 1,
+            })
+            .expect("canonical frame event prepares");
+
+        for (label, mutate) in [
+            (
+                "component cost",
+                (|block: &mut Block| block.component_cost = 0) as fn(&mut Block),
+            ),
+            (
+                "cargo linkage",
+                (|block: &mut Block| block.inventory_id = None) as fn(&mut Block),
+            ),
+            (
+                "occupied coordinate",
+                (|block: &mut Block| block.coordinate = IVec3::ZERO) as fn(&mut Block),
+            ),
+        ] {
+            let mut event = canonical.clone();
+            let EventPayload::BlockBuilt { block, .. } = &mut event.payload else {
+                unreachable!("prepared construction event has block payload");
+            };
+            mutate(block);
+            event.event_hash = event.calculate_hash();
+            let mut candidate = state.clone();
+            let before_hash = candidate.state_hash();
+            assert!(
+                candidate.apply_event(&event).is_err(),
+                "tampered {label} must be rejected"
+            );
+            assert_eq!(candidate.state_hash(), before_hash);
+        }
+
+        let mut insufficient = state.clone();
+        insufficient
+            .inventories
+            .get_mut(PLAYER_INVENTORY_ID)
+            .expect("player inventory")
+            .contents
+            .components = 0;
+        let before_hash = insufficient.state_hash();
+        let error = insufficient
+            .apply_event(&canonical)
+            .expect_err("construction cannot underflow components during replay");
+        assert_eq!(error.code(), "replay_construction_components_invalid");
+        assert_eq!(insufficient.state_hash(), before_hash);
     }
 
     #[test]
@@ -1929,6 +2524,7 @@ mod tests {
             .expect("construction frame exists");
         assert_eq!(frame.health, 25);
         assert_eq!(frame.orientation, 2);
+        assert!(!frame.construction_complete);
         assert_eq!(runtime.state().player.career.blocks_built, 0);
         assert!(runtime.state().conservation().valid);
     }
@@ -1963,8 +2559,31 @@ mod tests {
             runtime.state().grids[STARTER_GRID_ID].blocks[&block_id].health,
             50
         );
-        weld_to_completion(&mut runtime, IVec3::new(0, 1, 0), "finish-frame");
+        runtime
+            .execute(&ClientMessage::WeldBlock {
+                operation_id: "weld-middle".into(),
+                grid_id: STARTER_GRID_ID.into(),
+                block_id: block_id.clone(),
+            })
+            .expect("middle weld accepted");
+        let final_weld = ClientMessage::WeldBlock {
+            operation_id: "weld-final".into(),
+            grid_id: STARTER_GRID_ID.into(),
+            block_id: block_id.clone(),
+        };
+        let final_receipt = runtime.execute(&final_weld).expect("final weld accepted");
+        let final_retry = runtime
+            .execute(&final_weld)
+            .expect("final weld retry accepted");
+        assert_eq!(final_receipt, final_retry);
+        assert!(
+            runtime.state().grids[STARTER_GRID_ID]
+                .block_at(IVec3::new(0, 1, 0))
+                .expect("completed block exists")
+                .construction_complete
+        );
         assert_eq!(runtime.state().player.career.blocks_built, 1);
+        assert_eq!(runtime.state().player.experience, 37);
         let sequence = runtime.state().event_sequence;
         let completed = runtime.execute(&ClientMessage::WeldBlock {
             operation_id: "over-weld".into(),
@@ -1978,6 +2597,138 @@ mod tests {
         ));
         assert_eq!(runtime.state().event_sequence, sequence);
         assert!(runtime.state().conservation().valid);
+    }
+
+    #[test]
+    fn unfinished_cargo_inventory_is_sealed_until_final_weld() {
+        let mut runtime = runtime();
+        move_player_near_grid(&mut runtime);
+        runtime
+            .execute(&ClientMessage::BuildBlock {
+                operation_id: "place-cargo-frame".into(),
+                grid_id: STARTER_GRID_ID.into(),
+                coordinate: IVec3::new(0, 1, 0),
+                kind: BlockKind::Cargo,
+                orientation: 0,
+            })
+            .expect("cargo frame placement accepted");
+        let cargo_block = runtime.state().grids[STARTER_GRID_ID]
+            .block_at(IVec3::new(0, 1, 0))
+            .expect("cargo frame exists")
+            .clone();
+        let cargo_inventory_id = cargo_block
+            .inventory_id
+            .clone()
+            .expect("cargo identity exists");
+        let sealed = runtime.execute(&ClientMessage::TransferInventory {
+            operation_id: "transfer-into-sealed-cargo".into(),
+            source_inventory_id: PLAYER_INVENTORY_ID.into(),
+            destination_inventory_id: cargo_inventory_id.clone(),
+            resource: ResourceKind::Component,
+            quantity: 1,
+        });
+        assert!(matches!(
+            sealed,
+            Err(RuntimeError::Intent(IntentError::Rejected { ref code, .. }))
+                if code == "inventory_block_incomplete"
+        ));
+        assert_eq!(
+            runtime.state().inventories[&cargo_inventory_id]
+                .contents
+                .components,
+            0
+        );
+
+        weld_to_completion(&mut runtime, IVec3::new(0, 1, 0), "complete-cargo");
+        runtime
+            .execute(&ClientMessage::TransferInventory {
+                operation_id: "transfer-into-complete-cargo".into(),
+                source_inventory_id: PLAYER_INVENTORY_ID.into(),
+                destination_inventory_id: cargo_inventory_id.clone(),
+                resource: ResourceKind::Component,
+                quantity: 1,
+            })
+            .expect("completed cargo accepts inventory");
+        runtime
+            .execute(&ClientMessage::TransferInventory {
+                operation_id: "transfer-out-of-complete-cargo".into(),
+                source_inventory_id: cargo_inventory_id.clone(),
+                destination_inventory_id: PLAYER_INVENTORY_ID.into(),
+                resource: ResourceKind::Component,
+                quantity: 1,
+            })
+            .expect("completed cargo releases inventory");
+        assert_eq!(
+            runtime.state().inventories[&cargo_inventory_id]
+                .contents
+                .components,
+            0
+        );
+        assert!(runtime.state().conservation().valid);
+    }
+
+    #[test]
+    fn repairing_completed_damage_preserves_armor_state_and_build_credit() {
+        let directory = tempdir().expect("tempdir");
+        let expected_hash;
+        {
+            let mut runtime = Runtime::open(directory.path(), 43, 100).expect("runtime starts");
+            move_player_near_grid(&mut runtime);
+            let block_id = "block-deck-e".to_owned();
+            let original = runtime.state().grids[STARTER_GRID_ID].blocks[&block_id].clone();
+            assert!(original.construction_complete);
+            assert_eq!(runtime.state().player.career.blocks_built, 0);
+
+            runtime
+                .execute(&ClientMessage::DamageBlock {
+                    operation_id: "damage-completed-armor".into(),
+                    grid_id: STARTER_GRID_ID.into(),
+                    block_id: block_id.clone(),
+                })
+                .expect("completed armor can be damaged");
+            let damaged = &runtime.state().grids[STARTER_GRID_ID].blocks[&block_id];
+            assert_eq!(damaged.health, original.health - 35);
+            assert!(damaged.construction_complete);
+            let snapshot = runtime.state().snapshot();
+            let damaged_snapshot = snapshot
+                .grids
+                .iter()
+                .flat_map(|grid| &grid.blocks)
+                .find(|block| block.block_id == block_id)
+                .expect("damaged block appears in the snapshot");
+            assert!(damaged_snapshot.construction_complete);
+            assert_eq!(runtime.state().player.career.blocks_built, 0);
+            assert_eq!(runtime.state().player.experience, 3);
+
+            let mut weld_index = 0_u32;
+            while runtime.state().grids[STARTER_GRID_ID].blocks[&block_id].health
+                < original.max_health()
+            {
+                runtime
+                    .execute(&ClientMessage::WeldBlock {
+                        operation_id: format!("repair-completed-armor-{weld_index}"),
+                        grid_id: STARTER_GRID_ID.into(),
+                        block_id: block_id.clone(),
+                    })
+                    .expect("completed armor can be repaired");
+                weld_index += 1;
+            }
+            let repaired = &runtime.state().grids[STARTER_GRID_ID].blocks[&block_id];
+            assert_eq!(repaired.health, repaired.max_health());
+            assert!(repaired.construction_complete);
+            assert_eq!(runtime.state().player.career.blocks_built, 0);
+            assert_eq!(runtime.state().player.experience, 15);
+            assert!(runtime.state().conservation().valid);
+            runtime.persist_snapshot().expect("snapshot persists");
+            expected_hash = runtime.state().state_hash();
+        }
+
+        let recovered = Runtime::open(directory.path(), 43, 100).expect("runtime recovers");
+        let repaired = &recovered.state().grids[STARTER_GRID_ID].blocks["block-deck-e"];
+        assert_eq!(repaired.health, repaired.max_health());
+        assert!(repaired.construction_complete);
+        assert_eq!(recovered.state().player.career.blocks_built, 0);
+        assert_eq!(recovered.state().state_hash(), expected_hash);
     }
 
     #[test]
@@ -2188,6 +2939,87 @@ mod tests {
         );
         assert!(grid.linear_velocity.x > -0.25);
         assert!(runtime.state().simulation_tick >= 24);
+    }
+
+    #[test]
+    fn canonical_contact_lifecycle_and_estimate_survive_scene_rebuild_and_restart() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut runtime = Runtime::open(directory.path(), 42, 1).expect("runtime opens");
+        runtime
+            .execute(&ClientMessage::SetGridControl {
+                operation_id: "contact-lifecycle-thrust".into(),
+                grid_id: STARTER_GRID_ID.into(),
+                linear_input: Vec3::new(-1.0, 0.0, 0.0),
+                angular_input: Vec3::ZERO,
+                dampeners: false,
+            })
+            .expect("control accepted");
+
+        let mut first_pairs = BTreeSet::new();
+        for _ in 0..120 {
+            runtime.advance(17).expect("physics advances");
+            if !runtime.state().active_contact_pairs.is_empty() {
+                first_pairs = runtime.state().active_contact_pairs.clone();
+                break;
+            }
+        }
+        assert!(!first_pairs.is_empty(), "grid must reach the asteroid");
+
+        let events = fs::read_to_string(directory.path().join("events.ndjson"))
+            .expect("journal reads")
+            .lines()
+            .map(|line| serde_json::from_str::<CanonicalEvent>(line).expect("event parses"))
+            .collect::<Vec<_>>();
+        let first_contact = events
+            .iter()
+            .rev()
+            .find_map(|event| match &event.payload {
+                EventPayload::PhysicsStepCommitted { contacts, .. } if !contacts.is_empty() => {
+                    Some(contacts)
+                }
+                _ => None,
+            })
+            .expect("contact commit exists");
+        assert!(
+            first_contact
+                .iter()
+                .any(|contact| contact.phase == PhysicsContactPhase::Began)
+        );
+        assert!(first_contact.iter().any(|contact| {
+            contact.closing_speed_mm_per_second > 0
+                && contact.estimated_normal_impulse_millinewton_seconds > 0
+                && contact.reduced_translational_mass_grams > 0
+        }));
+
+        let mut persisted = false;
+        for _ in 0..12 {
+            runtime.advance(17).expect("continued contact advances");
+            let events =
+                fs::read_to_string(directory.path().join("events.ndjson")).expect("journal reads");
+            let event: CanonicalEvent =
+                serde_json::from_str(events.lines().last().expect("latest event exists"))
+                    .expect("latest event parses");
+            if let EventPayload::PhysicsStepCommitted { contacts, .. } = event.payload
+                && contacts.iter().any(|contact| {
+                    contact.phase == PhysicsContactPhase::Persisted
+                        && first_pairs.contains(&ContactPairKey {
+                            body_a: contact.body_a_id.clone(),
+                            collider_a: contact.collider_a_id.clone(),
+                            body_b: contact.body_b_id.clone(),
+                            collider_b: contact.collider_b_id.clone(),
+                        })
+                })
+            {
+                persisted = true;
+                break;
+            }
+        }
+        assert!(persisted, "scene rebuild must not recreate canonical onset");
+
+        let before_restart = runtime.state().active_contact_pairs.clone();
+        drop(runtime);
+        let recovered = Runtime::open(directory.path(), 42, 1).expect("runtime recovers");
+        assert_eq!(recovered.state().active_contact_pairs, before_restart);
     }
 
     #[test]

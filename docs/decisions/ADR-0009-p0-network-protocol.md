@@ -10,6 +10,8 @@ P0 needs one understandable protocol shared by the native client, browser client
 
 Use a versioned, tagged JSON protocol over WebSocket for P0. Every mutating client intent carries a caller-generated operation ID. The server returns a durable receipt and publishes a complete authoritative snapshot after accepted operations and simulation ticks.
 
+The server may announce its protocol version in `welcome`, but it does not disclose world state, subscribe the connection to updates, or accept any intent until the client sends one compatible `hello`. A missing or incompatible handshake receives a fatal response and the connection closes.
+
 The server rejects unknown or invalid messages, incompatible protocol versions, non-finite motion, movement outside the allowed step, mining outside tool range, and client-supplied outcomes. Content-manifest versions are included in snapshots and canonical event hashes.
 
 HTTP provides readiness, status, and a public read-only world snapshot. The same server hosts the zero-build browser command center.

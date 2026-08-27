@@ -11,7 +11,7 @@ use verse_protocol::{
 
 use crate::content;
 
-pub const WORLD_SCHEMA_VERSION: u32 = 8;
+pub const WORLD_SCHEMA_VERSION: u32 = 9;
 pub const PLAYER_INVENTORY_ID: &str = "inventory-player-local";
 pub const STARTER_GRID_ID: &str = "grid-starter";
 pub const PLANET_CENTER: Vec3 = Vec3::new(900.0, -2_200.0, -3_800.0);
@@ -247,6 +247,7 @@ pub struct Block {
     pub kind: BlockKind,
     pub orientation: u8,
     pub health: u16,
+    pub construction_complete: bool,
     pub component_cost: u64,
     pub inventory_id: Option<String>,
 }
@@ -260,6 +261,7 @@ impl Block {
             kind,
             orientation: 0,
             health: definition.max_health,
+            construction_complete: true,
             component_cost: definition.component_cost,
             inventory_id: None,
         }
@@ -270,7 +272,7 @@ impl Block {
     }
 
     pub fn is_complete(&self) -> bool {
-        self.health == self.max_health()
+        self.construction_complete
     }
 }
 
@@ -376,6 +378,14 @@ pub struct Ledger {
     pub destroyed_components: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ContactPairKey {
+    pub body_a: String,
+    pub collider_a: String,
+    pub body_b: String,
+    pub collider_b: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorldState {
     pub schema_version: u32,
@@ -386,6 +396,7 @@ pub struct WorldState {
     pub event_sequence: u64,
     pub simulation_tick: u64,
     pub physics_step_phase: u64,
+    pub active_contact_pairs: BTreeSet<ContactPairKey>,
     pub fencing_token: u64,
     pub last_event_hash: String,
     pub player: Player,
@@ -490,6 +501,7 @@ impl WorldState {
             event_sequence: 0,
             simulation_tick: 0,
             physics_step_phase: 0,
+            active_contact_pairs: BTreeSet::new(),
             fencing_token: 0,
             last_event_hash: String::new(),
             player: Player {
@@ -572,24 +584,31 @@ impl WorldState {
         }
     }
 
-    pub fn grid_mass_kg(&self, grid: &Grid) -> f64 {
+    pub fn grid_mass_grams(&self, grid: &Grid) -> u64 {
         let block_mass = grid
             .blocks
             .values()
             .map(|block| {
                 let definition = content::block(block.kind);
-                let integrity = f64::from(block.health) / f64::from(block.max_health());
-                definition.mass_kg * integrity.max(0.1)
+                let max_health = u64::from(block.max_health());
+                let minimum_health = max_health.div_ceil(10);
+                let effective_health = u64::from(block.health).max(minimum_health);
+                u128::from(definition.mass_grams) * u128::from(effective_health)
+                    / u128::from(max_health)
             })
-            .sum::<f64>();
+            .sum::<u128>();
         let inventory_mass = grid
             .blocks
             .values()
             .filter_map(|block| block.inventory_id.as_ref())
             .filter_map(|inventory_id| self.inventories.get(inventory_id))
-            .map(|inventory| inventory.mass_grams() as f64 / 1_000.0)
-            .sum::<f64>();
-        block_mass + inventory_mass
+            .map(|inventory| u128::from(inventory.mass_grams()))
+            .sum::<u128>();
+        u64::try_from(block_mass.saturating_add(inventory_mass)).unwrap_or(u64::MAX)
+    }
+
+    pub fn grid_mass_kg(&self, grid: &Grid) -> f64 {
+        self.grid_mass_grams(grid) as f64 / 1_000.0
     }
 
     pub fn snapshot(&self) -> WorldSnapshot {
@@ -615,6 +634,7 @@ impl WorldState {
                         orientation: block.orientation,
                         health: block.health,
                         max_health: block.max_health(),
+                        construction_complete: block.construction_complete,
                         inventory_id: block.inventory_id.clone(),
                     })
                     .collect(),

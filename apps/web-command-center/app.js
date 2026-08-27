@@ -23,7 +23,7 @@ function connect() {
     elements.connection.className = "connection online";
     socket.send(JSON.stringify({
       type: "hello",
-      protocol_version: 5,
+      protocol_version: 6,
       client_name: "browser-command-center-p0.7",
     }));
   });
@@ -115,13 +115,16 @@ function render() {
   const grid = selectedGrid();
   if (grid) {
     selectedGridId = grid.grid_id;
-    const unfinished = grid.blocks.filter(
-      (block) => block.health < block.max_health,
+    const frames = grid.blocks.filter(
+      (block) => !block.construction_complete,
+    ).length;
+    const damaged = grid.blocks.filter(
+      (block) => block.construction_complete && block.health < block.max_health,
     ).length;
     elements["selected-grid"].textContent = grid.grid_id.toUpperCase();
     elements["grid-details"].textContent =
       grid.blocks.length + " blocks • " +
-      unfinished + " unfinished • " +
+      frames + " frames • " + damaged + " damaged • " +
       (grid.anchored ? "ANCHORED" : "DYNAMIC") + "\n" +
       "Power " + grid.power.produced.toFixed(1) + " / " +
       grid.power.required.toFixed(1) + " • " +
@@ -129,7 +132,7 @@ function render() {
       "Position " + grid.position.x.toFixed(1) + ", " +
       grid.position.y.toFixed(1) + ", " + grid.position.z.toFixed(1);
     const hasAnchor = grid.blocks.some(
-      (block) => block.kind === "anchor" && block.health === block.max_health,
+      (block) => block.kind === "anchor" && block.construction_complete,
     );
     elements.anchor.disabled = !grid.anchored && (!hasAnchor || !grid.power.online);
     elements.stop.disabled = grid.anchored || (

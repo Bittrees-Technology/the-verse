@@ -4,10 +4,10 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use verse_protocol::{IVec3, Quat, ResourceKind, Vec3, VoxelMaterial};
 
-use crate::model::Block;
+use crate::model::{Block, ContactPairKey};
 
 pub const EVENT_SCHEMA_NAME: &str = "verse.world_event";
-pub const EVENT_SCHEMA_VERSION: u32 = 3;
+pub const EVENT_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event_type", rename_all = "snake_case")]
@@ -53,6 +53,7 @@ pub enum EventPayload {
         previous_health: u16,
         new_health: u16,
         max_health: u16,
+        completed_construction: bool,
     },
     GridControlSet {
         grid_id: String,
@@ -75,6 +76,7 @@ pub enum EventPayload {
         remaining_step_phase: u32,
         bodies: Vec<PhysicsBodyOutcome>,
         contacts: Vec<PhysicsContactOutcome>,
+        active_contacts_after: Vec<ContactPairKey>,
     },
 }
 
@@ -97,7 +99,17 @@ pub struct PhysicsContactOutcome {
     pub point: Vec3,
     pub normal: Vec3,
     pub penetration_m: f64,
-    pub impact_speed_mps: f64,
+    pub closing_speed_mm_per_second: u64,
+    pub estimated_normal_impulse_millinewton_seconds: u64,
+    pub reduced_translational_mass_grams: u64,
+    pub phase: PhysicsContactPhase,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PhysicsContactPhase {
+    Began,
+    Persisted,
 }
 
 impl EventPayload {
@@ -109,11 +121,10 @@ impl EventPayload {
             Self::InventoryTransferred { .. } => 2,
             Self::BlockBuilt { .. } => 5,
             Self::BlockWelded {
-                new_health,
-                max_health,
+                completed_construction,
                 ..
             } => {
-                if new_health == max_health {
+                if *completed_construction {
                     20
                 } else {
                     6
@@ -315,7 +326,7 @@ mod tests {
     fn event_hash_detects_payload_tampering() {
         let mut event = CanonicalEvent::new(
             1,
-            "p0.7.1",
+            "p0.7.2",
             "universe",
             "cell",
             9,

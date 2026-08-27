@@ -1,17 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use verse_physics::{
-    BodyControl, BodySpec, BoxColliderSpec, ContactSource, PhysicsError, Pose, Quat, Scene,
-    SceneConfig, Vec3,
+    BodyControl, BodySpec, BoxColliderSpec, ContactPhase, ContactSource, PhysicsError, Pose, Quat,
+    Scene, SceneConfig, Vec3,
 };
 
 fn pose(x: f64, y: f64, z: f64) -> Pose {
     Pose::new(Vec3::new(x, y, z), Quat::IDENTITY)
 }
 
-fn body_y(scene: &Scene, body_id: &str) -> f64 {
+fn body_y(scene: &mut Scene, body_id: &str) -> f64 {
     scene
         .body_states()
+        .expect("native body states are valid")
         .into_iter()
         .find(|body| body.body_id == body_id)
         .expect("test body exists")
@@ -72,12 +73,16 @@ fn falling_box_contacts_static_floor_and_settles() {
     assert_eq!(contact.collider_a_id, "armor-block");
     assert_eq!(contact.body_b_id, "floor");
     assert_eq!(contact.collider_b_id, "floor-panel");
-    assert_eq!(contact.source, ContactSource::GeometricFallback);
+    assert_eq!(contact.source, ContactSource::JoltEstimatedResponse);
     assert!(contact.normal.y < -0.9, "normal points from box to floor");
     assert!(contact.point.is_finite());
     assert!(contact.penetration_m >= 0.0);
+    assert!(matches!(
+        contact.phase,
+        ContactPhase::Began | ContactPhase::Persisted
+    ));
     assert!(
-        (0.45..=0.55).contains(&body_y(&scene, "falling-grid")),
+        (0.45..=0.55).contains(&body_y(&mut scene, "falling-grid")),
         "Jolt should settle the cube on the floor"
     );
 }
@@ -129,6 +134,7 @@ fn moving_dynamic_boxes_collide_and_emit_sorted_stable_ids() {
     );
     assert!(contact.normal.x > 0.9);
     assert!(contact.impact_speed_mps > 7.0);
+    assert!(contact.estimated_normal_impulse_ns > 0.0);
 }
 
 #[test]
@@ -212,5 +218,10 @@ fn world_position_is_double_precision() {
         vec![BoxColliderSpec::unit_cube("far-block")],
     );
     scene.rebuild(&[body]).expect("far body builds");
-    assert_eq!(scene.body_states()[0].pose.position, position);
+    assert_eq!(
+        scene.body_states().expect("native body state is valid")[0]
+            .pose
+            .position,
+        position
+    );
 }

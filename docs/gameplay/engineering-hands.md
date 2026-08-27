@@ -18,6 +18,8 @@ This remains an original clean-room implementation. Publicly observable engineer
 6. Power production, power demand, stored power, and voxel anchoring ignore unfinished blocks.
 7. Completing the final weld advances the authoritative blocks-built career counter exactly once.
 8. Placement and welding must be within the server-owned hand-tool range.
+9. Construction completion is durable historical state. Later damage lowers integrity but never turns completed armor back into a frame, and repair never grants completion credit again.
+10. Cargo identity may exist on a placed frame, but its inventory remains sealed until the final weld completes construction.
 
 ## Mining contract
 
@@ -33,9 +35,9 @@ This remains an original clean-room implementation. Publicly observable engineer
 - Invalid orientation values and out-of-range placement are rejected without mutation.
 - Three weld operations complete a 25-percent frame; a weld retry does not add integrity twice.
 - An unfinished anchor cannot lock a grid even when its coordinate touches voxels.
-- Orientation, current health, and maximum health survive snapshots and restart recovery.
+- Orientation, current health, maximum health, durable completion state, and career credit survive journal and snapshot recovery.
 - The cross-process scenario records every mined coordinate, proves each is absent, completes three staged blocks, and still proves deterministic grid splitting and recovery.
-- Godot parses, connects with protocol version 3, shows rotated holograms and construction frames, and remeshes after accepted mining.
+- Godot parses, completes the protocol-v6 handshake before receiving state, shows rotated holograms, distinct construction frames and damaged armor, and remeshes after accepted mining.
 
 ## Deferred
 

@@ -23,9 +23,9 @@ flowchart LR
 
 Clients choose targets and request actions; they never choose yields, damage, health, power, production outputs, oxygen outcomes, capacity, grid velocity, grid contacts, or grid transforms. The P0 character client still proposes bounded absolute positions, which the server sweeps against voxel and grid volumes and checks against the planet surface. Input-only authoritative character motion remains later closure work. A conservation proof runs after every accepted event. If ore, refined material, components, installed blocks, or destroyed blocks do not reconcile, the event is rejected.
 
-The content manifest `p0.7.1` identifies the contact-physics rule set. Voxel yields, recipes, block health, component costs, construction integrity, power behavior, inventory capacity, resource volume and mass, block mass, control force, torque, dampening, friction, restitution, and environment constants are server owned. The manifest version is stored in universe manifests and snapshots and included in every canonical event hash. Opening a universe under a different rule version fails explicitly.
+The content manifest `p0.7.2` identifies the contact-physics rule set. Voxel yields, recipes, block health, component costs, construction integrity, power behavior, inventory capacity, resource volume and mass, exact integer block mass, control force, torque, dampening, friction, restitution, and environment constants are server owned. The manifest version is stored in universe manifests and snapshots and included in every canonical event hash. Opening a universe under a different rule version fails explicitly.
 
-The save schema is version 7, the canonical event schema is version 2, and the client protocol is version 5. They introduce full grid quaternions, three-axis angular velocity, force/torque controls, physical mass, and committed body/contact outcomes. A version mismatch fails explicitly; the runtime never guesses how to reinterpret an older save.
+The save schema is version 9, the canonical event schema is version 4, and the client protocol is version 6. They include explicit construction completion, full grid quaternions, three-axis angular velocity, force/torque controls, exact physical mass inputs, native manifold telemetry, persisted contact lifecycle, and committed body/contact outcomes. A client receives no world state and can submit no intent until a compatible `hello`; mismatch is fatal and closes the socket. Save and event headers are checked before version-specific payloads are deserialized, so older formats fail explicitly instead of being guessed.
 
 ## Local operation
 
@@ -59,7 +59,7 @@ Its local interfaces are:
 
 The scenario proves:
 
-1. Authoritative environment, suit mode, inventory capacity, mining, refining, crafting, transfer, building, anchoring, force/torque motion, grid–voxel collision, tool damage, tool-driven split, experience, and contract progression.
+1. Authoritative environment, suit mode, inventory capacity, mining, refining, crafting, transfer, sealed unfinished cargo, durable construction completion, repair, anchoring, force/torque motion, grid–voxel collision, tool damage, tool-driven split, experience, and contract progression.
 2. Conservation after every mutation.
 3. Exact world-hash recovery after graceful restart.
 4. A higher writer-fencing token after authority changes.
@@ -67,10 +67,10 @@ The scenario proves:
 
 ## Deliberate limits
 
-This slice has one local player, one orbital asteroid, one 25-block salvage skiff, one distant planet representation, and one five-stage contract. Individual block placement orientation is limited to four local yaw rotations, while grid bodies have full three-axis orientation. The pinned Jolt C surface does not expose solver manifolds, so contact telemetry currently uses a conservative geometric fallback and is not yet suitable for impulse-derived production damage. The planet is a gravity, atmosphere, and rendering proof, not a globally streamed editable voxel sphere or current landing destination. Complete JSON snapshots are not intended for production bandwidth. Accounts, safe zones, offline cleanup, multiplayer partitioning, pressurized-room graphs, real markets, token custody, and smart contracts remain roadmap work, not implied capabilities of P0.7.
+This slice has one local player, one orbital asteroid, one 25-block salvage skiff, one distant planet representation, and one five-stage contract. Individual block placement orientation is limited to four local yaw rotations, while grid bodies have full three-axis orientation. Native Jolt manifolds now replace geometric fallback telemetry, but the public callback exposes only a pre-solver pairwise impulse estimate, not the applied solver impulse required for production collision damage. The planet is a gravity, atmosphere, and rendering proof, not a globally streamed editable voxel sphere or current landing destination. Complete JSON snapshots are not intended for production bandwidth. Accounts, safe zones, offline cleanup, multiplayer partitioning, pressurized-room graphs, real markets, token custody, and smart contracts remain roadmap work, not implied capabilities of P0.7.
 
 ## Migration and rollback
 
-P0.7 has no deployed predecessor to migrate. It rejects save schemas 1 through 7 because their player, inventory, environment, block, or physics contracts differ. A universe also records content manifest `p0.7.1` and refuses to open under another rule set. Local testers can use `tools/dev/reset-local-world.sh` to move an incompatible world into a recoverable backup before creating a new one.
+P0.7 has no deployed predecessor to migrate. It rejects save schemas 1 through 8 because their player, inventory, environment, block, or physics contracts differ. A universe also records content manifest `p0.7.2` and refuses to open under another rule set. Local testers can use `tools/dev/reset-local-world.sh` to move an incompatible world into a recoverable backup before creating a new one.
 
 Rollback is operational only: stop the worker, preserve its data directory, and return to the prior repository revision. No P0.7 action reaches a blockchain or changes external custody. A future content migration must be explicit, versioned, tested against a copy, and documented before the runtime will accept it.

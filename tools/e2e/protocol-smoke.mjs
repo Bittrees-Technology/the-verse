@@ -169,17 +169,24 @@ async function run() {
     );
   });
 
-  await waitFor((message) => message.type === "welcome", "welcome");
-  let world = (
-    await waitFor((message) => message.type === "snapshot", "genesis snapshot")
-  ).snapshot;
+  const welcome = await waitFor(
+    (message) => message.type === "welcome",
+    "welcome",
+  );
+  assert.equal(welcome.protocol_version, 6);
   send({
     type: "hello",
-    protocol_version: 5,
+    protocol_version: 6,
     client_name: "node-authoritative-e2e",
   });
+  let world = (
+    await waitFor(
+      (message) => message.type === "snapshot",
+      "post-handshake genesis snapshot",
+    )
+  ).snapshot;
   assert.equal(world.conservation.valid, true);
-  assert.equal(world.content_manifest_version, "p0.7.1");
+  assert.equal(world.content_manifest_version, "p0.7.2");
   assert.equal(world.grids.length, 1);
   assert.ok(world.voxels.length > 1_000);
   assert.equal(world.environment.celestial_body_name, "Khepri Prime");
@@ -245,7 +252,10 @@ async function run() {
   assert.ok(anchor, "anchor construction frame was placed");
   assert.equal(anchor.block.orientation, 3);
   assert.ok(anchor.block.health < anchor.block.max_health);
+  assert.equal(anchor.block.construction_complete, false);
   world = await completeBlock(world, { x: -2, y: 0, z: 0 }, "anchor");
+  anchor = blockAt(world, { x: -2, y: 0, z: 0 }, "anchor");
+  assert.equal(anchor.block.construction_complete, true);
   world = await intent("toggle_grid_anchor", { grid_id: "grid-starter" });
   assert.equal(world.grids[0].anchored, true);
   world = await intent("toggle_grid_anchor", { grid_id: "grid-starter" });
@@ -290,14 +300,27 @@ async function run() {
   world = await completeBlock(world, { x: 0, y: 2, z: 0 }, "structural");
   const bridge = blockAt(world, { x: 0, y: 1, z: 0 }, "damage_test");
   assert.ok(bridge, "damage bridge was created");
+  assert.equal(bridge.block.construction_complete, true);
   world = await intent("damage_block", {
     grid_id: bridge.grid.grid_id,
     block_id: bridge.block.block_id,
   });
+  const damagedBridge = blockAt(
+    world,
+    { x: 0, y: 1, z: 0 },
+    "damage_test",
+  );
+  assert.ok(damagedBridge, "damaged completed armor remains installed");
+  assert.ok(damagedBridge.block.health < damagedBridge.block.max_health);
+  assert.equal(damagedBridge.block.construction_complete, true);
   world = await intent("damage_block", {
     grid_id: bridge.grid.grid_id,
     block_id: bridge.block.block_id,
   });
+
+  const survivingTop = blockAt(world, { x: 0, y: 2, z: 0 }, "structural");
+  assert.ok(survivingTop, "completed armor survives on the detached grid");
+  assert.equal(survivingTop.block.construction_complete, true);
 
   assert.equal(world.grids.length, 2);
   assert.equal(world.conservation.valid, true);
