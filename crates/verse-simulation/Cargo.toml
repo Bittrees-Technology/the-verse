@@ -16,6 +16,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 verse-protocol = { path = "../verse-protocol" }
+verse-physics = { path = "../verse-physics" }
 
 [dev-dependencies]
 proptest.workspace = true

@@ -1,7 +1,17 @@
 {
-  "schema_version": 1,
-  "manifest_version": "p0.6.0",
+  "schema_version": 3,
+  "manifest_version": "p0.7.1",
   "license": "AGPL-3.0-or-later",
+  "physics": {
+    "fixed_step_hz": 60,
+    "fixed_delta_seconds": 0.016666667,
+    "control_force_newtons": 16000.0,
+    "control_torque_newton_meters": 9000.0,
+    "linear_dampener_newtons_per_mps": 4500.0,
+    "angular_dampener_newton_meters_per_radian": 3200.0,
+    "friction": 0.62,
+    "restitution": 0.05
+  },
   "voxel_materials": [
     {
       "material": "rock",
@@ -19,7 +29,8 @@
       "power_production": 0.0,
       "power_requirement": 0.0,
       "stored_power": 0.0,
-      "component_cost": 1
+      "component_cost": 1,
+      "mass_kg": 250.0
     },
     {
       "kind": "control_core",
@@ -27,7 +38,8 @@
       "power_production": 0.0,
       "power_requirement": 2.0,
       "stored_power": 0.0,
-      "component_cost": 1
+      "component_cost": 1,
+      "mass_kg": 480.0
     },
     {
       "kind": "power_source",
@@ -35,7 +47,8 @@
       "power_production": 12.0,
       "power_requirement": 0.0,
       "stored_power": 0.0,
-      "component_cost": 1
+      "component_cost": 1,
+      "mass_kg": 550.0
     },
     {
       "kind": "battery",
@@ -43,7 +56,8 @@
       "power_production": 2.0,
       "power_requirement": 0.0,
       "stored_power": 20.0,
-      "component_cost": 1
+      "component_cost": 1,
+      "mass_kg": 700.0
     },
     {
       "kind": "cargo",
@@ -51,7 +65,8 @@
       "power_production": 0.0,
       "power_requirement": 0.25,
       "stored_power": 0.0,
-      "component_cost": 1
+      "component_cost": 1,
+      "mass_kg": 350.0
     },
     {
       "kind": "drill",
@@ -59,7 +74,8 @@
       "power_production": 0.0,
       "power_requirement": 4.0,
       "stored_power": 0.0,
-      "component_cost": 1
+      "component_cost": 1,
+      "mass_kg": 600.0
     },
     {
       "kind": "anchor",
@@ -67,7 +83,8 @@
       "power_production": 0.0,
       "power_requirement": 1.0,
       "stored_power": 0.0,
-      "component_cost": 1
+      "component_cost": 1,
+      "mass_kg": 420.0
     },
     {
       "kind": "damage_test",
@@ -75,7 +92,8 @@
       "power_production": 0.0,
       "power_requirement": 0.0,
       "stored_power": 0.0,
-      "component_cost": 1
+      "component_cost": 1,
+      "mass_kg": 250.0
     }
   ],
   "recipes": {

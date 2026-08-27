@@ -1,10 +1,10 @@
-# P0.6 implementation guide
+# P0.7 implementation guide
 
-**Status:** Playable local vertical slice
+**Status:** Playable local vertical slice; contact-physics integration in validation
 
 ## What this milestone proves
 
-P0.6 connects a first-person Godot client and a browser command center to one Rust authoritative simulation. A player begins in vacuum beside a powered salvage skiff and an independent orbital asteroid more than three kilometers from Khepri Prime's modeled surface. The player uses six-axis EVA roll, manages physical inventory through a compact connected-inventory terminal, controls the helmet seal and oxygen reserve, then mines, manufactures, places oriented frames, welds them through persistent integrity stages, and operates or destroys the resulting grid. The server persists each accepted event before acknowledging it and reconstructs the same world after restart.
+P0.7 connects a first-person Godot client and a browser command center to one Rust authoritative simulation. A player begins in vacuum beside a powered salvage skiff and an independent orbital asteroid more than three kilometers from Khepri Prime's modeled surface. The player uses six-axis EVA roll, manages physical inventory through a compact connected-inventory terminal, controls the helmet seal and oxygen reserve, then mines, manufactures, places oriented frames, welds them through persistent integrity stages, and operates or destroys the resulting grid. A server-owned Jolt scene integrates force and torque controls against compound grid and voxel bodies. The server persists accepted inputs and quantized physics outcomes before publishing them and reconstructs the same world after restart without rerunning earlier collisions.
 
 ```mermaid
 flowchart LR
@@ -12,6 +12,7 @@ flowchart LR
     Browser["Browser command center"] -->|"intent only"| Worker
     Worker --> Rules["Versioned content rules"]
     Worker --> Kernel["Authoritative world kernel"]
+    Kernel --> Jolt["Derived Jolt contact scene"]
     Kernel --> Journal["Hash-chained event journal"]
     Kernel --> Snapshot["Atomic world snapshot"]
     Worker -->|"receipts and snapshots"| Native
@@ -20,11 +21,11 @@ flowchart LR
 
 ## Authority and conservation
 
-Clients choose targets and request actions; they never choose yields, damage, health, power, production outputs, oxygen outcomes, capacity, or final transforms. The simulation checks distance, adjacency, inventory volume, power, planetary surface penetration, motion budgets, and anchor contact. A conservation proof runs after every accepted event. If ore, refined material, components, installed blocks, or destroyed blocks do not reconcile, the event is rejected.
+Clients choose targets and request actions; they never choose yields, damage, health, power, production outputs, oxygen outcomes, capacity, grid velocity, grid contacts, or grid transforms. The P0 character client still proposes bounded absolute positions, which the server sweeps against voxel and grid volumes and checks against the planet surface. Input-only authoritative character motion remains later closure work. A conservation proof runs after every accepted event. If ore, refined material, components, installed blocks, or destroyed blocks do not reconcile, the event is rejected.
 
-The content manifest `p0.6.0` identifies the orbital-operations rule set. Voxel yields, recipes, block health, component costs, construction integrity, power behavior, inventory capacity, resource volume and mass, and environment constants are server owned. The manifest version is stored in universe manifests and snapshots and included in every canonical event hash. Opening a universe under a different rule version fails explicitly.
+The content manifest `p0.7.1` identifies the contact-physics rule set. Voxel yields, recipes, block health, component costs, construction integrity, power behavior, inventory capacity, resource volume and mass, block mass, control force, torque, dampening, friction, restitution, and environment constants are server owned. The manifest version is stored in universe manifests and snapshots and included in every canonical event hash. Opening a universe under a different rule version fails explicitly.
 
-The save schema is version 6 and the client protocol is version 4. Save version 6 establishes the separated Khepri orbital coordinate model; the protocol shape remains compatible with the environment, physical inventory, and suit state introduced in version 4. A version mismatch fails explicitly; the runtime never guesses how to reinterpret an older save.
+The save schema is version 7, the canonical event schema is version 2, and the client protocol is version 5. They introduce full grid quaternions, three-axis angular velocity, force/torque controls, physical mass, and committed body/contact outcomes. A version mismatch fails explicitly; the runtime never guesses how to reinterpret an older save.
 
 ## Local operation
 
@@ -58,7 +59,7 @@ Its local interfaces are:
 
 The scenario proves:
 
-1. Authoritative environment, suit mode, inventory capacity, mining, refining, crafting, transfer, building, anchoring, motion, damage, split, experience, and contract progression.
+1. Authoritative environment, suit mode, inventory capacity, mining, refining, crafting, transfer, building, anchoring, force/torque motion, grid–voxel collision, tool damage, tool-driven split, experience, and contract progression.
 2. Conservation after every mutation.
 3. Exact world-hash recovery after graceful restart.
 4. A higher writer-fencing token after authority changes.
@@ -66,10 +67,10 @@ The scenario proves:
 
 ## Deliberate limits
 
-This slice has one local player, one orbital asteroid, one 25-block salvage skiff, one distant planet representation, and one five-stage contract. Block orientation is limited to four yaw rotations, and one registered component is consumed entirely when its frame is placed. Grid motion is deterministic kinematic integration, not rigid-body collision physics. The planet is a gravity, atmosphere, and rendering proof, not a globally streamed editable voxel sphere or current landing destination. Complete JSON snapshots are not intended for production bandwidth. Accounts, safe zones, offline cleanup, multiplayer partitioning, pressurized-room graphs, real markets, token custody, and smart contracts remain roadmap work, not implied capabilities of P0.6.
+This slice has one local player, one orbital asteroid, one 25-block salvage skiff, one distant planet representation, and one five-stage contract. Individual block placement orientation is limited to four local yaw rotations, while grid bodies have full three-axis orientation. The pinned Jolt C surface does not expose solver manifolds, so contact telemetry currently uses a conservative geometric fallback and is not yet suitable for impulse-derived production damage. The planet is a gravity, atmosphere, and rendering proof, not a globally streamed editable voxel sphere or current landing destination. Complete JSON snapshots are not intended for production bandwidth. Accounts, safe zones, offline cleanup, multiplayer partitioning, pressurized-room graphs, real markets, token custody, and smart contracts remain roadmap work, not implied capabilities of P0.7.
 
 ## Migration and rollback
 
-P0.6 has no deployed predecessor to migrate. It rejects save schemas 1 through 5 because their player, inventory, environment, block, or spatial contracts differ. A universe also records content manifest `p0.6.0` and refuses to open under another rule set. Local testers can use `tools/dev/reset-local-world.sh` to move an incompatible world into a recoverable backup before creating a new one.
+P0.7 has no deployed predecessor to migrate. It rejects save schemas 1 through 7 because their player, inventory, environment, block, or physics contracts differ. A universe also records content manifest `p0.7.1` and refuses to open under another rule set. Local testers can use `tools/dev/reset-local-world.sh` to move an incompatible world into a recoverable backup before creating a new one.
 
-Rollback is operational only: stop the worker, preserve its data directory, and return to the prior repository revision. No P0.6 action reaches a blockchain or changes external custody. A future content migration must be explicit, versioned, tested against a copy, and documented before the runtime will accept it.
+Rollback is operational only: stop the worker, preserve its data directory, and return to the prior repository revision. No P0.7 action reaches a blockchain or changes external custody. A future content migration must be explicit, versioned, tested against a copy, and documented before the runtime will accept it.

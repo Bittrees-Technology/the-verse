@@ -19,6 +19,7 @@ These documents form the initial specification baseline.
 - [P0.4 Engineering Hands](gameplay/engineering-hands.md)
 - [P0.5 Planetary Logistics](gameplay/planetary-logistics.md)
 - [P0.6 Orbital Operations](gameplay/orbital-operations.md)
+- [P0.7 Server-Authoritative Contact Physics](gameplay/contact-physics.md)
 
 ## Research
 
@@ -27,7 +28,7 @@ These documents form the initial specification baseline.
 ## Architecture
 
 - [System overview](architecture/system-overview.md)
-- [P0.6 implementation guide](architecture/p0-implementation.md)
+- [Current P0 implementation guide](architecture/p0-implementation.md)
 - [Universe simulation](architecture/universe-simulation.md)
 - [Data and events](architecture/data-and-events.md)
 - [Clients and public APIs](architecture/clients-and-apis.md)
@@ -53,6 +54,7 @@ These documents form the initial specification baseline.
 - [Core protocol invariants](specifications/core-invariants.md)
 - [P0 simulation proof](specifications/P0-simulation-proof.md)
 - [P0.1 Apple Silicon benchmark](benchmarks/P0.1-apple-silicon.md)
+- [P0.7 Apple Silicon contact-physics benchmark](benchmarks/P0.7-contact-physics-apple-silicon.md)
 - [Architecture decision records](decisions/README.md)
 - [Open questions](open-questions.md)
 

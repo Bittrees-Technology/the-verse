@@ -2,9 +2,12 @@
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use verse_protocol::{IVec3, ResourceKind, Vec3, VoxelMaterial};
+use verse_protocol::{IVec3, Quat, ResourceKind, Vec3, VoxelMaterial};
 
 use crate::model::Block;
+
+pub const EVENT_SCHEMA_NAME: &str = "verse.world_event";
+pub const EVENT_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event_type", rename_all = "snake_case")]
@@ -51,10 +54,11 @@ pub enum EventPayload {
         new_health: u16,
         max_health: u16,
     },
-    GridMotionSet {
+    GridControlSet {
         grid_id: String,
-        linear_velocity: Vec3,
-        angular_velocity: f64,
+        linear_input: Vec3,
+        angular_input: Vec3,
+        dampeners: bool,
     },
     GridAnchorSet {
         grid_id: String,
@@ -65,9 +69,35 @@ pub enum EventPayload {
         block_id: String,
         damage: u16,
     },
-    SimulationAdvanced {
-        delta_millis: u16,
+    PhysicsStepCommitted {
+        fixed_step_hz: u16,
+        step_count: u8,
+        remaining_step_phase: u32,
+        bodies: Vec<PhysicsBodyOutcome>,
+        contacts: Vec<PhysicsContactOutcome>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PhysicsBodyOutcome {
+    pub grid_id: String,
+    pub position: Vec3,
+    pub orientation: Quat,
+    pub linear_velocity: Vec3,
+    pub angular_velocity: Vec3,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PhysicsContactOutcome {
+    pub substep_index: u8,
+    pub body_a_id: String,
+    pub collider_a_id: String,
+    pub body_b_id: String,
+    pub collider_b_id: String,
+    pub point: Vec3,
+    pub normal: Vec3,
+    pub penetration_m: f64,
+    pub impact_speed_mps: f64,
 }
 
 impl EventPayload {
@@ -94,11 +124,11 @@ impl EventPayload {
             Self::PlayerMoved { .. }
             | Self::SuitModeChanged { .. }
             | Self::SuitOxygenChanged { .. }
-            | Self::GridMotionSet { .. }
+            | Self::GridControlSet { .. }
             | Self::GridAnchorSet {
                 anchored: false, ..
             }
-            | Self::SimulationAdvanced { .. } => 0,
+            | Self::PhysicsStepCommitted { .. } => 0,
         }
     }
 
@@ -156,7 +186,7 @@ impl EventPayload {
                     format!("Welded block to {percent}% integrity"),
                 )
             }
-            Self::GridMotionSet { .. } => ("grid_motion_set", "Grid motion accepted".into()),
+            Self::GridControlSet { .. } => ("grid_control_set", "Grid control accepted".into()),
             Self::GridAnchorSet { anchored, .. } => (
                 "grid_anchor_set",
                 if *anchored {
@@ -166,8 +196,8 @@ impl EventPayload {
                 },
             ),
             Self::BlockDamaged { .. } => ("block_damaged", "Damage applied".into()),
-            Self::SimulationAdvanced { .. } => {
-                ("simulation_advanced", "Simulation advanced".into())
+            Self::PhysicsStepCommitted { .. } => {
+                ("physics_step_committed", "Physics step committed".into())
             }
         }
     }
@@ -231,8 +261,8 @@ impl CanonicalEvent {
             .try_into()
             .unwrap_or(u64::MAX);
         let mut event = Self {
-            schema_name: "verse.world_event".into(),
-            schema_version: 1,
+            schema_name: EVENT_SCHEMA_NAME.into(),
+            schema_version: EVENT_SCHEMA_VERSION,
             content_manifest_version: content_manifest_version.into(),
             event_id: Uuid::new_v4().to_string(),
             event_sequence,
@@ -285,7 +315,7 @@ mod tests {
     fn event_hash_detects_payload_tampering() {
         let mut event = CanonicalEvent::new(
             1,
-            "p0.6.0",
+            "p0.7.1",
             "universe",
             "cell",
             9,

@@ -4,13 +4,20 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 
 use thiserror::Error;
+use verse_physics::{
+    BodyControl, BodySpec, BoxColliderSpec, PhysicsError, Pose as PhysicsPose, Quat as PhysicsQuat,
+    Scene, SceneConfig, Vec3 as PhysicsVec3,
+};
 use verse_protocol::{
-    BlockKind, ClientMessage, IntentReceipt, InventoryContents, InventoryDomain, ResourceKind,
-    Vec3, WorldSnapshot,
+    BlockKind, ClientMessage, IVec3, IntentReceipt, InventoryContents, InventoryDomain, Quat,
+    ResourceKind, Vec3, WorldSnapshot,
 };
 
 use crate::content;
-use crate::event::{CanonicalEvent, EventPayload};
+use crate::event::{
+    CanonicalEvent, EVENT_SCHEMA_NAME, EVENT_SCHEMA_VERSION, EventPayload, PhysicsBodyOutcome,
+    PhysicsContactOutcome,
+};
 use crate::model::{
     Block, CARGO_INVENTORY_CAPACITY_LITERS, Grid, InventoryRecord, PLANET_CENTER,
     PLANET_SURFACE_RADIUS_M, PLAYER_INVENTORY_ID, WorldState,
@@ -18,10 +25,11 @@ use crate::model::{
 use crate::persistence::{PersistenceError, Store};
 
 const MAX_PLAYER_MOVE_STEP: f64 = 3.0;
+const PLAYER_COLLISION_RADIUS: f64 = 0.32;
 const MINING_RANGE: f64 = 8.5;
 const HAND_TOOL_RANGE: f64 = 9.0;
-const MAX_GRID_SPEED: f64 = 8.0;
-const MAX_GRID_ANGULAR_SPEED: f64 = 1.5;
+const MAX_GRID_CONTROL_INPUT: f64 = 1.0;
+const CONTROL_INPUT_EPSILON: f64 = 1.0e-9;
 const MAX_GRID_BLOCKS_P0: usize = 2_048;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -61,6 +69,13 @@ impl IntentError {
             Self::ConservationViolation { .. } => "conservation_violation",
         }
     }
+
+    pub fn message(&self) -> String {
+        match self {
+            Self::Rejected { message, .. } => message.clone(),
+            _ => self.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -69,6 +84,8 @@ pub enum RuntimeError {
     Persistence(#[from] PersistenceError),
     #[error(transparent)]
     Intent(#[from] IntentError),
+    #[error(transparent)]
+    Physics(#[from] PhysicsError),
     #[error("authoritative writes are halted after a persistence failure")]
     Halted,
 }
@@ -80,6 +97,8 @@ pub struct Runtime {
     snapshot_every: u64,
     events_since_snapshot: u64,
     life_support_elapsed_millis: u32,
+    physics_step_phase: u64,
+    physics: Scene,
     halted: bool,
 }
 
@@ -93,12 +112,17 @@ impl Runtime {
         let mut state = store.load_world()?;
         state.fencing_token = store.fencing_token();
 
+        let mut physics = Scene::new(physics_scene_config())?;
+        physics.rebuild(&physics_body_specs(&state))?;
+        let physics_step_phase = state.physics_step_phase;
         let mut runtime = Self {
             store,
             state,
             snapshot_every: snapshot_every.max(1),
             events_since_snapshot: 0,
             life_support_elapsed_millis: 0,
+            physics_step_phase,
+            physics,
             halted: false,
         };
         if runtime.state.event_sequence == 0 {
@@ -109,6 +133,10 @@ impl Runtime {
 
     pub const fn state(&self) -> &WorldState {
         &self.state
+    }
+
+    pub const fn is_halted(&self) -> bool {
+        self.halted
     }
 
     pub fn snapshot(&self) -> WorldSnapshot {
@@ -133,6 +161,9 @@ impl Runtime {
         let event = self.state.prepare_client_event(message)?;
         let mut next_state = self.state.clone();
         next_state.apply_event(&event)?;
+        if event_changes_physics_scene(&event.payload) {
+            self.physics.rebuild(&physics_body_specs(&next_state))?;
+        }
         if let Err(source) = self.store.append_event(&event) {
             self.halted = true;
             return Err(source.into());
@@ -154,25 +185,87 @@ impl Runtime {
     }
 
     pub fn advance(&mut self, delta_millis: u16) -> Result<bool, RuntimeError> {
+        self.advance_with_player_presence(delta_millis, true)
+    }
+
+    pub fn advance_with_player_presence(
+        &mut self,
+        delta_millis: u16,
+        player_active: bool,
+    ) -> Result<bool, RuntimeError> {
         if self.halted {
             return Err(RuntimeError::Halted);
         }
         let moving = self.state.grids.values().any(|grid| {
             !grid.anchored
                 && (grid.linear_velocity.magnitude() > f64::EPSILON
-                    || grid.angular_velocity.abs() > f64::EPSILON)
+                    || grid.angular_velocity.magnitude() > f64::EPSILON
+                    || grid.control_linear_input.magnitude() > f64::EPSILON
+                    || grid.control_angular_input.magnitude() > f64::EPSILON)
         });
         let delta_millis = delta_millis.clamp(1, 250);
         let mut changed = false;
         if moving {
-            self.commit_system_event(EventPayload::SimulationAdvanced { delta_millis })?;
-            changed = true;
+            let fixed_step_hz = content::manifest().physics.fixed_step_hz;
+            self.physics_step_phase = self
+                .physics_step_phase
+                .saturating_add(u64::from(delta_millis) * 1_000_000 * u64::from(fixed_step_hz));
+            let step_count = (self.physics_step_phase / 1_000_000_000).min(15);
+            if step_count > 0 {
+                self.physics_step_phase -= step_count * 1_000_000_000;
+                let controls = physics_controls(&self.state);
+                let mut output = None;
+                let mut contacts = Vec::new();
+                for substep_index in 0..step_count {
+                    let step = match self.physics.step(&controls) {
+                        Ok(step) => step,
+                        Err(source) => {
+                            self.halted = true;
+                            return Err(source.into());
+                        }
+                    };
+                    let substep_index =
+                        u8::try_from(substep_index).expect("bounded physics substep index fits u8");
+                    contacts.extend(
+                        step.contacts
+                            .iter()
+                            .map(|contact| physics_contact_outcome(contact, substep_index)),
+                    );
+                    output = Some(step);
+                }
+                let output = output.expect("positive physics step count produces output");
+                let payload = EventPayload::PhysicsStepCommitted {
+                    fixed_step_hz,
+                    step_count: u8::try_from(step_count)
+                        .expect("bounded physics step count fits u8"),
+                    remaining_step_phase: u32::try_from(self.physics_step_phase)
+                        .expect("substep phase fits u32"),
+                    bodies: output
+                        .bodies
+                        .iter()
+                        .filter(|body| self.state.grids.contains_key(&body.body_id))
+                        .map(physics_body_outcome)
+                        .collect(),
+                    contacts,
+                };
+                if let Err(source) = self.commit_system_event(payload) {
+                    self.halted = true;
+                    return Err(source);
+                }
+                if let Err(source) = self.physics.rebuild(&physics_body_specs(&self.state)) {
+                    self.halted = true;
+                    return Err(source.into());
+                }
+                changed = true;
+            }
         }
 
-        self.life_support_elapsed_millis = self
-            .life_support_elapsed_millis
-            .saturating_add(u32::from(delta_millis));
-        if self.life_support_elapsed_millis >= 1_000 {
+        if player_active {
+            self.life_support_elapsed_millis = self
+                .life_support_elapsed_millis
+                .saturating_add(u32::from(delta_millis));
+        }
+        if player_active && self.life_support_elapsed_millis >= 1_000 {
             let elapsed_seconds = self.life_support_elapsed_millis / 1_000;
             self.life_support_elapsed_millis %= 1_000;
             let previous_oxygen_milli = self.state.player.suit_oxygen_milli;
@@ -278,6 +371,18 @@ impl WorldState {
                     return Err(IntentError::rejected(
                         "movement_below_planet_surface",
                         "player movement cannot pass through the planetary surface",
+                    ));
+                }
+                if self.player_movement_hits_voxel(self.player.position, *position) {
+                    return Err(IntentError::rejected(
+                        "movement_hits_voxel",
+                        "player movement cannot enter authoritative asteroid material",
+                    ));
+                }
+                if self.player_movement_hits_grid(self.player.position, *position) {
+                    return Err(IntentError::rejected(
+                        "movement_hits_grid",
+                        "player movement cannot enter an authoritative grid block",
                     ));
                 }
                 EventPayload::PlayerMoved {
@@ -540,19 +645,15 @@ impl WorldState {
                     max_health,
                 }
             }
-            ClientMessage::SetGridMotion {
+            ClientMessage::SetGridControl {
                 grid_id,
-                linear_velocity,
-                angular_velocity,
+                linear_input,
+                angular_input,
+                dampeners,
                 ..
             } => {
-                ensure_finite(*linear_velocity, "grid velocity")?;
-                if !angular_velocity.is_finite() {
-                    return Err(IntentError::rejected(
-                        "invalid_motion",
-                        "grid angular velocity must be finite",
-                    ));
-                }
+                ensure_finite(*linear_input, "grid linear control")?;
+                ensure_finite(*angular_input, "grid angular control")?;
                 let grid = self.grid(grid_id)?;
                 if grid.anchored {
                     return Err(IntentError::rejected(
@@ -566,18 +667,19 @@ impl WorldState {
                         "the control grid requires power",
                     ));
                 }
-                if linear_velocity.magnitude() > MAX_GRID_SPEED
-                    || angular_velocity.abs() > MAX_GRID_ANGULAR_SPEED
+                if linear_input.magnitude() > MAX_GRID_CONTROL_INPUT + CONTROL_INPUT_EPSILON
+                    || angular_input.magnitude() > MAX_GRID_CONTROL_INPUT + CONTROL_INPUT_EPSILON
                 {
                     return Err(IntentError::rejected(
-                        "motion_limit_exceeded",
-                        "requested grid motion exceeds the P0 safety budget",
+                        "control_limit_exceeded",
+                        "requested grid controls must be normalized",
                     ));
                 }
-                EventPayload::GridMotionSet {
+                EventPayload::GridControlSet {
                     grid_id: grid_id.clone(),
-                    linear_velocity: *linear_velocity,
-                    angular_velocity: *angular_velocity,
+                    linear_input: *linear_input,
+                    angular_input: *angular_input,
+                    dampeners: *dampeners,
                 }
             }
             ClientMessage::ToggleGridAnchor { grid_id, .. } => {
@@ -661,6 +763,12 @@ impl WorldState {
     }
 
     pub fn apply_event(&mut self, event: &CanonicalEvent) -> Result<(), IntentError> {
+        if event.schema_name != EVENT_SCHEMA_NAME || event.schema_version != EVENT_SCHEMA_VERSION {
+            return Err(IntentError::rejected(
+                "event_schema_mismatch",
+                format!("event requires {EVENT_SCHEMA_NAME} schema {EVENT_SCHEMA_VERSION}"),
+            ));
+        }
         let expected = self.event_sequence + 1;
         if event.event_sequence != expected {
             return Err(IntentError::SequenceMismatch {
@@ -818,21 +926,25 @@ impl WorldState {
                 }
                 block.health = *new_health;
             }
-            EventPayload::GridMotionSet {
+            EventPayload::GridControlSet {
                 grid_id,
-                linear_velocity,
-                angular_velocity,
+                linear_input,
+                angular_input,
+                dampeners,
             } => {
                 let grid = self.grid_mut(grid_id)?;
-                grid.linear_velocity = *linear_velocity;
-                grid.angular_velocity = *angular_velocity;
+                grid.control_linear_input = *linear_input;
+                grid.control_angular_input = *angular_input;
+                grid.dampeners = *dampeners;
             }
             EventPayload::GridAnchorSet { grid_id, anchored } => {
                 let grid = self.grid_mut(grid_id)?;
                 grid.anchored = *anchored;
                 if *anchored {
                     grid.linear_velocity = Vec3::ZERO;
-                    grid.angular_velocity = 0.0;
+                    grid.angular_velocity = Vec3::ZERO;
+                    grid.control_linear_input = Vec3::ZERO;
+                    grid.control_angular_input = Vec3::ZERO;
                 }
             }
             EventPayload::BlockDamaged {
@@ -840,14 +952,75 @@ impl WorldState {
                 block_id,
                 damage,
             } => self.apply_damage(grid_id, block_id, *damage, event.event_sequence)?,
-            EventPayload::SimulationAdvanced { delta_millis } => {
-                self.simulation_tick += 1;
-                let delta_seconds = f64::from(*delta_millis) / 1_000.0;
-                for grid in self.grids.values_mut().filter(|grid| !grid.anchored) {
-                    grid.position = grid.position + grid.linear_velocity * delta_seconds;
-                    grid.yaw_radians = (grid.yaw_radians + grid.angular_velocity * delta_seconds)
-                        .rem_euclid(std::f64::consts::TAU);
+            EventPayload::PhysicsStepCommitted {
+                fixed_step_hz,
+                step_count,
+                remaining_step_phase,
+                bodies,
+                contacts,
+            } => {
+                let expected_fixed_step_hz = content::manifest().physics.fixed_step_hz;
+                if *fixed_step_hz != expected_fixed_step_hz
+                    || *step_count == 0
+                    || *step_count > 15
+                    || *remaining_step_phase >= 1_000_000_000
+                {
+                    return Err(IntentError::rejected(
+                        "replay_physics_timing_invalid",
+                        "physics timing must use the configured fixed step, a bounded positive step count, and a substep remainder",
+                    ));
                 }
+                if bodies.len() != self.grids.len() {
+                    return Err(IntentError::rejected(
+                        "replay_physics_body_count_invalid",
+                        "physics outcome must contain every authoritative grid exactly once",
+                    ));
+                }
+                let mut seen = BTreeSet::new();
+                for body in bodies {
+                    if !seen.insert(body.grid_id.as_str()) {
+                        return Err(IntentError::rejected(
+                            "replay_physics_body_duplicate",
+                            "physics outcome contains a duplicate grid",
+                        ));
+                    }
+                    ensure_finite(body.position, "replayed grid position")?;
+                    ensure_finite(body.linear_velocity, "replayed grid velocity")?;
+                    ensure_finite(body.angular_velocity, "replayed grid angular velocity")?;
+                    if !body.orientation.is_finite() {
+                        return Err(IntentError::rejected(
+                            "replay_physics_rotation_invalid",
+                            "physics outcome contains a non-finite rotation",
+                        ));
+                    }
+                    let grid = self.grid_mut(&body.grid_id)?;
+                    grid.position = body.position;
+                    grid.orientation = body.orientation;
+                    grid.linear_velocity = body.linear_velocity;
+                    grid.angular_velocity = body.angular_velocity;
+                }
+                for contact in contacts {
+                    if contact.substep_index >= *step_count {
+                        return Err(IntentError::rejected(
+                            "replay_physics_contact_substep_invalid",
+                            "physics contact substep must refer to a committed solver step",
+                        ));
+                    }
+                    ensure_finite(contact.point, "replayed contact point")?;
+                    ensure_finite(contact.normal, "replayed contact normal")?;
+                    if !contact.penetration_m.is_finite()
+                        || !contact.impact_speed_mps.is_finite()
+                        || contact.penetration_m < 0.0
+                        || contact.impact_speed_mps < 0.0
+                    {
+                        return Err(IntentError::rejected(
+                            "replay_physics_contact_invalid",
+                            "physics contact values must be finite and non-negative",
+                        ));
+                    }
+                }
+                self.physics_step_phase = u64::from(*remaining_step_phase);
+                self.simulation_tick = self.simulation_tick.saturating_add(u64::from(*step_count));
             }
         }
 
@@ -877,12 +1050,12 @@ impl WorldState {
             | EventPayload::InventoryTransferred { .. }
             | EventPayload::BlockBuilt { .. }
             | EventPayload::BlockWelded { .. }
-            | EventPayload::GridMotionSet { .. }
+            | EventPayload::GridControlSet { .. }
             | EventPayload::GridAnchorSet {
                 anchored: false, ..
             }
             | EventPayload::BlockDamaged { .. }
-            | EventPayload::SimulationAdvanced { .. } => {}
+            | EventPayload::PhysicsStepCommitted { .. } => {}
         }
 
         self.event_sequence = event.event_sequence;
@@ -1006,9 +1179,12 @@ impl WorldState {
             let mut grid = Grid {
                 grid_id: new_grid_id.clone(),
                 position: original.position,
-                yaw_radians: original.yaw_radians,
+                orientation: original.orientation,
                 linear_velocity: original.linear_velocity,
                 angular_velocity: original.angular_velocity,
+                control_linear_input: original.control_linear_input,
+                control_angular_input: original.control_angular_input,
+                dampeners: original.dampeners,
                 anchored: original.anchored,
                 blocks,
             };
@@ -1064,6 +1240,306 @@ impl WorldState {
         }
         Ok(())
     }
+
+    fn player_intersects_voxel(&self, position: Vec3) -> bool {
+        let extent = PLAYER_COLLISION_RADIUS + 0.5;
+        let minimum = IVec3::new(
+            (position.x - extent).floor() as i32,
+            (position.y - extent).floor() as i32,
+            (position.z - extent).floor() as i32,
+        );
+        let maximum = IVec3::new(
+            (position.x + extent).ceil() as i32,
+            (position.y + extent).ceil() as i32,
+            (position.z + extent).ceil() as i32,
+        );
+        for x in minimum.x..=maximum.x {
+            for y in minimum.y..=maximum.y {
+                for z in minimum.z..=maximum.z {
+                    let coordinate = IVec3::new(x, y, z);
+                    if self.voxels.material(coordinate).is_some()
+                        && sphere_intersects_unit_cube(position, coordinate)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    fn player_movement_hits_voxel(&self, start: Vec3, end: Vec3) -> bool {
+        movement_samples(start, end)
+            .into_iter()
+            .any(|position| self.player_intersects_voxel(position))
+    }
+
+    fn player_intersects_grid(&self, position: Vec3) -> bool {
+        self.grids.values().any(|grid| {
+            let relative = Vec3::new(
+                position.x - grid.position.x,
+                position.y - grid.position.y,
+                position.z - grid.position.z,
+            );
+            let local_player = grid.orientation.conjugate().rotate(relative);
+            grid.blocks
+                .values()
+                .any(|block| sphere_intersects_unit_cube(local_player, block.coordinate))
+        })
+    }
+
+    fn player_movement_hits_grid(&self, start: Vec3, end: Vec3) -> bool {
+        movement_samples(start, end)
+            .into_iter()
+            .any(|position| self.player_intersects_grid(position))
+    }
+}
+
+fn movement_samples(start: Vec3, end: Vec3) -> Vec<Vec3> {
+    const SAMPLE_SPACING_M: f64 = 0.2;
+    let delta = end - start;
+    let distance = delta.magnitude();
+    let mut steps = 1_u32;
+    while f64::from(steps) * SAMPLE_SPACING_M < distance {
+        steps += 1;
+    }
+    (1..=steps)
+        .map(|step| start + delta * (f64::from(step) / f64::from(steps)))
+        .collect()
+}
+
+fn physics_scene_config() -> SceneConfig {
+    SceneConfig {
+        fixed_delta_seconds: content::manifest().physics.fixed_delta_seconds,
+        max_colliders_per_body: 8_192,
+        max_linear_velocity_mps: 32.0,
+        max_angular_velocity_radians_per_second: 8.0,
+        ..SceneConfig::default()
+    }
+}
+
+fn event_changes_physics_scene(payload: &EventPayload) -> bool {
+    !matches!(
+        payload,
+        EventPayload::PlayerMoved { .. }
+            | EventPayload::SuitModeChanged { .. }
+            | EventPayload::SuitOxygenChanged { .. }
+            | EventPayload::GridControlSet { .. }
+            | EventPayload::PhysicsStepCommitted { .. }
+    )
+}
+
+fn physics_body_specs(state: &WorldState) -> Vec<BodySpec> {
+    let physics = &content::manifest().physics;
+    let mut bodies = Vec::with_capacity(state.grids.len() + 1);
+    if !state.voxels.occupied.is_empty() {
+        let colliders = state
+            .voxels
+            .occupied
+            .iter()
+            .map(|coordinate| BoxColliderSpec {
+                collider_id: format!(
+                    "voxel-{x}-{y}-{z}",
+                    x = coordinate.x,
+                    y = coordinate.y,
+                    z = coordinate.z
+                ),
+                local_pose: PhysicsPose::new(
+                    PhysicsVec3::new(
+                        f64::from(coordinate.x),
+                        f64::from(coordinate.y),
+                        f64::from(coordinate.z),
+                    ),
+                    PhysicsQuat::IDENTITY,
+                ),
+                half_extents: PhysicsVec3::new(0.5, 0.5, 0.5),
+                density_kg_per_m3: 2_600.0,
+            })
+            .collect();
+        let mut asteroid =
+            BodySpec::static_body("voxel-field-origin", PhysicsPose::IDENTITY, colliders);
+        asteroid.friction = physics.friction;
+        asteroid.restitution = physics.restitution;
+        bodies.push(asteroid);
+    }
+    bodies.extend(state.grids.values().map(|grid| {
+        let colliders = grid
+            .blocks
+            .values()
+            .map(|block| {
+                let definition = content::block(block.kind);
+                let integrity = f32::from(block.health) / f32::from(block.max_health());
+                let inventory_mass = block
+                    .inventory_id
+                    .as_ref()
+                    .and_then(|inventory_id| state.inventories.get(inventory_id))
+                    .map_or(0.0, |inventory| inventory.mass_grams() as f32 / 1_000.0);
+                BoxColliderSpec {
+                    collider_id: block.block_id.clone(),
+                    local_pose: PhysicsPose::new(
+                        PhysicsVec3::new(
+                            f64::from(block.coordinate.x),
+                            f64::from(block.coordinate.y),
+                            f64::from(block.coordinate.z),
+                        ),
+                        PhysicsQuat::IDENTITY,
+                    ),
+                    half_extents: PhysicsVec3::new(0.5, 0.5, 0.5),
+                    density_kg_per_m3: (definition.mass_kg as f32 * integrity.max(0.1)
+                        + inventory_mass)
+                        .max(1.0),
+                }
+            })
+            .collect();
+        let pose = PhysicsPose::new(
+            to_physics_vec3(grid.position),
+            to_physics_quat(grid.orientation),
+        );
+        let mut body = if grid.anchored {
+            BodySpec::static_body(grid.grid_id.clone(), pose, colliders)
+        } else {
+            BodySpec::dynamic(grid.grid_id.clone(), pose, colliders)
+        };
+        body.linear_velocity = to_physics_vec3(grid.linear_velocity);
+        body.angular_velocity = to_physics_vec3(grid.angular_velocity);
+        body.friction = physics.friction;
+        body.restitution = physics.restitution;
+        body
+    }));
+    bodies
+}
+
+fn physics_controls(state: &WorldState) -> Vec<BodyControl> {
+    let physics = &content::manifest().physics;
+    state
+        .grids
+        .values()
+        .filter(|grid| !grid.anchored)
+        .map(|grid| {
+            let online = grid.power().online;
+            let user_force = if online {
+                grid.orientation.rotate(grid.control_linear_input) * physics.control_force_newtons
+            } else {
+                Vec3::ZERO
+            };
+            let user_torque = if online {
+                grid.orientation.rotate(grid.control_angular_input)
+                    * physics.control_torque_newton_meters
+            } else {
+                Vec3::ZERO
+            };
+            let dampener_force = if online && grid.dampeners {
+                grid.linear_velocity * -physics.linear_dampener_newtons_per_mps
+            } else {
+                Vec3::ZERO
+            };
+            let dampener_torque = if online && grid.dampeners {
+                grid.angular_velocity * -physics.angular_dampener_newton_meters_per_radian
+            } else {
+                Vec3::ZERO
+            };
+            BodyControl {
+                body_id: grid.grid_id.clone(),
+                force_newtons: to_physics_vec3(user_force + dampener_force),
+                torque_newton_meters: to_physics_vec3(user_torque + dampener_torque),
+            }
+        })
+        .collect()
+}
+
+fn physics_body_outcome(body: &verse_physics::BodyState) -> PhysicsBodyOutcome {
+    PhysicsBodyOutcome {
+        grid_id: body.body_id.clone(),
+        position: from_physics_vec3(body.pose.position),
+        orientation: from_physics_quat(body.pose.rotation),
+        linear_velocity: from_physics_vec3(body.linear_velocity),
+        angular_velocity: from_physics_vec3(body.angular_velocity),
+    }
+}
+
+fn physics_contact_outcome(
+    contact: &verse_physics::ContactRecord,
+    substep_index: u8,
+) -> PhysicsContactOutcome {
+    PhysicsContactOutcome {
+        substep_index,
+        body_a_id: contact.body_a_id.clone(),
+        collider_a_id: contact.collider_a_id.clone(),
+        body_b_id: contact.body_b_id.clone(),
+        collider_b_id: contact.collider_b_id.clone(),
+        point: from_physics_vec3(contact.point),
+        normal: from_physics_vec3(contact.normal),
+        penetration_m: quantize_f64(contact.penetration_m),
+        impact_speed_mps: quantize_f64(contact.impact_speed_mps),
+    }
+}
+
+fn to_physics_vec3(value: Vec3) -> PhysicsVec3 {
+    PhysicsVec3::new(value.x, value.y, value.z)
+}
+
+fn from_physics_vec3(value: PhysicsVec3) -> Vec3 {
+    Vec3::new(
+        quantize_f64(value.x),
+        quantize_f64(value.y),
+        quantize_f64(value.z),
+    )
+}
+
+fn to_physics_quat(value: Quat) -> PhysicsQuat {
+    PhysicsQuat::new(value.x, value.y, value.z, value.w)
+}
+
+fn from_physics_quat(value: PhysicsQuat) -> Quat {
+    let quantized = Quat::new(
+        quantize_f32(value.x),
+        quantize_f32(value.y),
+        quantize_f32(value.z),
+        quantize_f32(value.w),
+    );
+    normalize_quat(quantized)
+}
+
+fn normalize_quat(value: Quat) -> Quat {
+    let length = value.x.mul_add(
+        value.x,
+        value
+            .y
+            .mul_add(value.y, value.z.mul_add(value.z, value.w * value.w)),
+    );
+    if length <= 1.0e-12 || !length.is_finite() {
+        Quat::IDENTITY
+    } else {
+        let inverse = length.sqrt().recip();
+        Quat::new(
+            value.x * inverse,
+            value.y * inverse,
+            value.z * inverse,
+            value.w * inverse,
+        )
+    }
+}
+
+fn quantize_f64(value: f64) -> f64 {
+    (value * 1_000_000.0).round() / 1_000_000.0
+}
+
+fn quantize_f32(value: f32) -> f32 {
+    (value * 1_000_000.0).round() / 1_000_000.0
+}
+
+fn sphere_intersects_unit_cube(center: Vec3, cube: IVec3) -> bool {
+    let closest_x = center
+        .x
+        .clamp(f64::from(cube.x) - 0.5, f64::from(cube.x) + 0.5);
+    let closest_y = center
+        .y
+        .clamp(f64::from(cube.y) - 0.5, f64::from(cube.y) + 0.5);
+    let closest_z = center
+        .z
+        .clamp(f64::from(cube.z) - 0.5, f64::from(cube.z) + 0.5);
+    center.squared_distance(Vec3::new(closest_x, closest_y, closest_z))
+        <= PLAYER_COLLISION_RADIUS * PLAYER_COLLISION_RADIUS
 }
 
 fn ensure_finite(value: Vec3, label: &str) -> Result<(), IntentError> {
@@ -1139,6 +1615,25 @@ mod tests {
                 })
                 .expect("weld stage accepted");
         }
+    }
+
+    #[test]
+    fn replay_rejects_an_incompatible_event_schema_even_with_a_valid_hash() {
+        let runtime = runtime();
+        let mut state = runtime.state().clone();
+        let mut event = state.prepare_system_event(EventPayload::SuitOxygenChanged {
+            previous_oxygen_milli: 1_000,
+            new_oxygen_milli: 995,
+        });
+        event.schema_version = EVENT_SCHEMA_VERSION - 1;
+        event.event_hash = event.calculate_hash();
+
+        let result = state.apply_event(&event);
+        assert!(matches!(
+            result,
+            Err(IntentError::Rejected { ref code, .. }) if code == "event_schema_mismatch"
+        ));
+        assert_eq!(state.event_sequence, 0);
     }
 
     #[test]
@@ -1248,6 +1743,58 @@ mod tests {
         ));
         assert_eq!(runtime.state().event_sequence, 0);
         assert!(runtime.state().conservation().valid);
+    }
+
+    #[test]
+    fn untrusted_player_cannot_phase_into_authoritative_voxels() {
+        let mut runtime = runtime();
+        let target = runtime
+            .state()
+            .voxels
+            .occupied
+            .iter()
+            .next()
+            .copied()
+            .expect("asteroid voxel");
+        runtime.state.player.position = Vec3::new(
+            f64::from(target.x),
+            f64::from(target.y),
+            f64::from(target.z) + 2.5,
+        );
+        let result = runtime.execute(&ClientMessage::MovePlayer {
+            operation_id: "attempt-voxel-phase".into(),
+            position: Vec3::new(
+                f64::from(target.x),
+                f64::from(target.y),
+                f64::from(target.z),
+            ),
+        });
+        assert!(matches!(
+            result,
+            Err(RuntimeError::Intent(IntentError::Rejected { ref code, .. }))
+                if code == "movement_hits_voxel"
+        ));
+        assert_eq!(runtime.state().event_sequence, 0);
+    }
+
+    #[test]
+    fn untrusted_player_cannot_tunnel_through_a_voxel_between_valid_endpoints() {
+        let mut runtime = runtime();
+        runtime.state.player.position = Vec3::new(-1.2, 0.0, 0.0);
+        runtime.state.voxels.occupied = BTreeSet::from([IVec3::ZERO]);
+        runtime.state.voxels.ferrite_ore.clear();
+
+        let result = runtime.execute(&ClientMessage::MovePlayer {
+            operation_id: "tunnel-through-voxel".into(),
+            position: Vec3::new(1.2, 0.0, 0.0),
+        });
+
+        assert!(matches!(
+            result,
+            Err(RuntimeError::Intent(IntentError::Rejected { ref code, .. }))
+                if code == "movement_hits_voxel"
+        ));
+        assert_eq!(runtime.state().event_sequence, 0);
     }
 
     #[test]
@@ -1614,5 +2161,105 @@ mod tests {
         );
         assert_eq!(runtime.state().grids.len(), 2);
         assert!(runtime.state().conservation().valid);
+    }
+
+    #[test]
+    fn authoritative_grid_controls_cannot_drive_through_asteroid_voxels() {
+        let mut runtime = runtime();
+        runtime
+            .execute(&ClientMessage::SetGridControl {
+                operation_id: "drive-into-asteroid".into(),
+                grid_id: STARTER_GRID_ID.into(),
+                linear_input: Vec3::new(-1.0, 0.0, 0.0),
+                angular_input: Vec3::ZERO,
+                dampeners: false,
+            })
+            .expect("bounded powered control accepted");
+
+        for _ in 0..24 {
+            runtime.advance(17).expect("authoritative physics step");
+        }
+
+        let grid = &runtime.state().grids[STARTER_GRID_ID];
+        assert!(
+            grid.position.x >= 10.95,
+            "contact solver allowed the starter grid to enter the asteroid: {}",
+            grid.position.x
+        );
+        assert!(grid.linear_velocity.x > -0.25);
+        assert!(runtime.state().simulation_tick >= 24);
+    }
+
+    #[test]
+    fn committed_physics_outcome_recovers_without_resimulation() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut runtime = Runtime::open(directory.path(), 7, 1_000).expect("runtime opens");
+        runtime
+            .execute(&ClientMessage::SetGridControl {
+                operation_id: "recovery-thrust".into(),
+                grid_id: STARTER_GRID_ID.into(),
+                linear_input: Vec3::new(0.0, 0.0, 0.5),
+                angular_input: Vec3::new(0.0, 0.15, 0.0),
+                dampeners: true,
+            })
+            .expect("control accepted");
+        for _ in 0..8 {
+            runtime.advance(17).expect("physics advances");
+        }
+        let expected_hash = runtime.state().state_hash();
+        let expected_pose = runtime.state().grids[STARTER_GRID_ID].clone();
+        drop(runtime);
+
+        let recovered = Runtime::open(directory.path(), 7, 1_000).expect("runtime recovers");
+        assert_eq!(recovered.state().state_hash(), expected_hash);
+        let recovered_grid = &recovered.state().grids[STARTER_GRID_ID];
+        assert_eq!(recovered_grid.position, expected_pose.position);
+        assert_eq!(recovered_grid.orientation, expected_pose.orientation);
+        assert_eq!(
+            recovered_grid.linear_velocity,
+            expected_pose.linear_velocity
+        );
+        assert_eq!(
+            recovered_grid.angular_velocity,
+            expected_pose.angular_velocity
+        );
+    }
+
+    #[test]
+    fn fixed_step_tick_and_fractional_phase_survive_recovery() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut runtime = Runtime::open(directory.path(), 7, 1).expect("runtime opens");
+        runtime
+            .execute(&ClientMessage::SetGridControl {
+                operation_id: "timing-thrust".into(),
+                grid_id: STARTER_GRID_ID.into(),
+                linear_input: Vec3::new(0.0, 0.0, 0.25),
+                angular_input: Vec3::ZERO,
+                dampeners: true,
+            })
+            .expect("control accepted");
+
+        for _ in 0..10 {
+            runtime.advance(100).expect("physics batch advances");
+        }
+        assert_eq!(runtime.state().simulation_tick, 60);
+        assert_eq!(runtime.state().physics_step_phase, 0);
+
+        runtime.advance(17).expect("fractional batch advances");
+        assert_eq!(runtime.state().simulation_tick, 61);
+        assert_eq!(runtime.state().physics_step_phase, 20_000_000);
+        drop(runtime);
+
+        let mut recovered = Runtime::open(directory.path(), 7, 1).expect("runtime recovers");
+        assert_eq!(recovered.state().simulation_tick, 61);
+        assert_eq!(recovered.state().physics_step_phase, 20_000_000);
+        assert!(!recovered.advance(16).expect("substep phase accumulates"));
+        assert!(
+            recovered
+                .advance(1)
+                .expect("recovered phase completes a step")
+        );
+        assert_eq!(recovered.state().simulation_tick, 62);
+        assert_eq!(recovered.state().physics_step_phase, 40_000_000);
     }
 }

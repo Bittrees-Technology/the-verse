@@ -51,7 +51,7 @@ void vertex() {
 vec3 triplanar_albedo(vec3 point, vec3 normal) {
 	vec3 blend = pow(abs(normal), vec3(5.0));
 	blend /= max(blend.x + blend.y + blend.z, 0.0001);
-	float scale = 0.19;
+	float scale = 0.34;
 	vec3 x_sample = texture(albedo_texture, point.yz * scale).rgb;
 	vec3 y_sample = texture(albedo_texture, point.xz * scale).rgb;
 	vec3 z_sample = texture(albedo_texture, point.xy * scale).rgb;
@@ -63,6 +63,10 @@ void fragment() {
 	float grain = value_noise(world_position * 5.8);
 	float ore_mask = smoothstep(0.12, 0.34, COLOR.r - COLOR.b);
 	vec3 scanned_rock = triplanar_albedo(world_position, world_normal);
+	float scanned_luma = dot(scanned_rock, vec3(0.2126, 0.7152, 0.0722));
+	// Geological scans are deliberately restrained so generated source-map
+	// color cannot turn a close surface into saturated cyan bands.
+	scanned_rock = mix(vec3(scanned_luma), scanned_rock, 0.14) * vec3(0.80, 0.75, 0.68);
 	vec3 rock = mix(scanned_rock, COLOR.rgb, 0.26) * mix(0.72, 1.12, broad);
 	rock *= mix(0.88, 1.08, grain);
 	vec3 ferrite = scanned_rock * vec3(0.74, 0.46, 0.25) * mix(0.72, 1.20, broad);

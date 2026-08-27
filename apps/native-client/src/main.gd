@@ -10,7 +10,7 @@ const ASTEROID_SHADER: Shader = preload("res://shaders/asteroid_surface.gdshader
 const PLANET_SHADER: Shader = preload("res://shaders/planet_surface.gdshader")
 const ATMOSPHERE_SHADER: Shader = preload("res://shaders/planet_atmosphere.gdshader")
 const CLOUD_SHADER: Shader = preload("res://shaders/planet_clouds.gdshader")
-const PROTOCOL_VERSION := 4
+const PROTOCOL_VERSION := 5
 const DEFAULT_SERVER := "ws://127.0.0.1:7777/ws"
 const PLAYER_INVENTORY := "inventory-player-local"
 const STARTER_GRID := "grid-starter"
@@ -32,6 +32,7 @@ const PLAYER_SURFACE_CLEARANCE := 1.05
 const PLANET_VISUAL_CENTER := Vector3(900.0, -2200.0, -3800.0)
 const PLANET_VISUAL_RADIUS := 1200.0
 const PLANET_ATMOSPHERE_RADIUS := 1242.0
+const VOXEL_CHUNK_SIZE := 8
 const ISO_LEVEL := 0.5
 const MARCHING_CORNERS: Array[Vector3i] = [
 	Vector3i(0, 0, 0), Vector3i(1, 0, 0),
@@ -60,6 +61,8 @@ var last_sent_position := Vector3.ZERO
 var first_snapshot := true
 var snapshot: Dictionary = {}
 var voxel_lookup: Dictionary = {}
+var voxel_coordinate_lookup: Dictionary = {}
+var voxel_chunk_nodes: Dictionary = {}
 var grid_lookup: Dictionary = {}
 var rendered_voxel_count := -1
 var selected_block_kind := "structural"
@@ -84,6 +87,7 @@ var build_rotation_quarters := 0
 var last_level := 1
 var pending_mine_position: Variant = null
 var inventory_open := false
+var grid_control_active := false
 var inventory_item_labels: Dictionary = {}
 var inventory_capacity_labels: Dictionary = {}
 var inventory_capacity_bars: Dictionary = {}
@@ -162,6 +166,22 @@ func _input(event: InputEvent) -> void:
 		camera.transform.basis = camera.transform.basis.orthonormalized()
 		return
 
+	# Inventory text entry owns keyboard input. A held grid-control key still gets
+	# its release so opening the terminal cannot leave thrust latched.
+	if inventory_open and event is InputEventKey:
+		if event.keycode == KEY_M and not event.pressed and grid_control_active:
+			_stop_target_grid()
+		if event.pressed and not event.echo and event.keycode in [KEY_ESCAPE, KEY_I]:
+			_set_inventory_open(false)
+		return
+
+	if event is InputEventKey and event.keycode == KEY_M and not event.echo:
+		if event.pressed and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
+			_move_target_grid()
+		elif grid_control_active:
+			_stop_target_grid()
+		return
+
 	if event is InputEventKey and event.pressed and not event.echo:
 		match event.keycode:
 			KEY_ESCAPE:
@@ -215,8 +235,6 @@ func _input(event: InputEvent) -> void:
 					_set_message("Block orientation %d°" % (build_rotation_quarters * 90))
 			KEY_F:
 				_toggle_anchor()
-			KEY_M:
-				_move_target_grid()
 			KEY_X:
 				_stop_target_grid()
 			KEY_R:
@@ -830,7 +848,7 @@ func _build_interface() -> void:
 	selected_label = hotbar_label
 
 	var controls := _hud_label(
-		"WASD / SPACE / C  MOVE    SHIFT  BOOST    J  JETPACK    H  HELMET    I  INVENTORY    B  BUILD    HOLD LMB  WORK    RMB  CUT",
+		"WASD / SPACE / C  MOVE    SHIFT  BOOST    Q/E  ROLL    HOLD M  GRID THRUST    X  STOP    I  INVENTORY    B  BUILD",
 		Vector2(20.0, -40.0),
 		11
 	)
@@ -897,7 +915,7 @@ func _build_inventory_terminal(canvas: CanvasLayer) -> void:
 	heading.add_theme_color_override("font_color", Color(0.78, 0.90, 0.94))
 	terminal.add_child(heading)
 	var subheading := _hud_label(
-		"CONNECTED INVENTORIES  //  DRAG-STYLE TWO-PANE LOGISTICS  //  SERVER AUTHORITATIVE",
+		"CONNECTED INVENTORIES  //  TWO-PANE LOGISTICS  //  SERVER AUTHORITATIVE",
 		Vector2(160.0, 66.0),
 		11
 	)
@@ -1310,13 +1328,11 @@ func _apply_snapshot(authoritative: Dictionary) -> void:
 
 
 func _rebuild_voxels(voxels: Array) -> void:
-	for child in asteroid_root.get_children():
-		child.queue_free()
-	voxel_lookup.clear()
-	if voxels.is_empty():
-		return
-	var minimum := Vector3i(1_000_000, 1_000_000, 1_000_000)
-	var maximum := Vector3i(-1_000_000, -1_000_000, -1_000_000)
+	var started_usec := Time.get_ticks_usec()
+	var previous_lookup := voxel_lookup
+	var previous_coordinates := voxel_coordinate_lookup
+	var next_lookup: Dictionary = {}
+	var next_coordinates: Dictionary = {}
 	for voxel in voxels:
 		var coordinate: Dictionary = voxel.get("coordinate", {})
 		var grid_position := Vector3i(
@@ -1324,10 +1340,39 @@ func _rebuild_voxels(voxels: Array) -> void:
 			int(coordinate.get("y", 0)),
 			int(coordinate.get("z", 0))
 		)
-		voxel_lookup[_coord_key(grid_position)] = voxel
-		minimum = minimum.min(grid_position)
-		maximum = maximum.max(grid_position)
-	_build_voxel_isosurface(minimum, maximum)
+		var key := _coord_key(grid_position)
+		next_lookup[key] = voxel
+		next_coordinates[key] = grid_position
+	voxel_lookup = next_lookup
+	voxel_coordinate_lookup = next_coordinates
+
+	var dirty_chunks: Dictionary = {}
+	if previous_lookup.is_empty():
+		for coordinate in next_coordinates.values():
+			_mark_chunks_influenced_by_voxel(dirty_chunks, coordinate)
+	else:
+		var changed_keys: Dictionary = {}
+		for key in previous_lookup:
+			changed_keys[key] = true
+		for key in next_lookup:
+			changed_keys[key] = true
+		for key in changed_keys:
+			var previous: Dictionary = previous_lookup.get(key, {})
+			var current: Dictionary = next_lookup.get(key, {})
+			if previous == current:
+				continue
+			var changed_coordinate: Vector3i = next_coordinates.get(
+				key, previous_coordinates.get(key, Vector3i.ZERO)
+			)
+			_mark_chunks_influenced_by_voxel(dirty_chunks, changed_coordinate)
+
+	for chunk in dirty_chunks.values():
+		_rebuild_voxel_chunk(chunk)
+	var elapsed_ms := float(Time.get_ticks_usec() - started_usec) / 1000.0
+	print(
+		"VERSE_VOXEL_REMESH chunks=%d total_chunks=%d voxels=%d elapsed_ms=%.3f"
+		% [dirty_chunks.size(), voxel_chunk_nodes.size(), voxels.size(), elapsed_ms]
+	)
 
 
 func _emit_mining_fragments(position: Vector3) -> void:
@@ -1336,18 +1381,42 @@ func _emit_mining_fragments(position: Vector3) -> void:
 	mining_fragments.emitting = true
 
 
-func _build_voxel_isosurface(minimum: Vector3i, maximum: Vector3i) -> void:
+func _voxel_chunk_coordinate(coordinate: Vector3i) -> Vector3i:
+	return Vector3i(
+		floori(float(coordinate.x) / float(VOXEL_CHUNK_SIZE)),
+		floori(float(coordinate.y) / float(VOXEL_CHUNK_SIZE)),
+		floori(float(coordinate.z) / float(VOXEL_CHUNK_SIZE))
+	)
+
+
+func _mark_chunks_influenced_by_voxel(chunks: Dictionary, coordinate: Vector3i) -> void:
+	var minimum := _voxel_chunk_coordinate(coordinate - Vector3i(2, 2, 2))
+	var maximum := _voxel_chunk_coordinate(coordinate + Vector3i.ONE)
+	for x in range(minimum.x, maximum.x + 1):
+		for y in range(minimum.y, maximum.y + 1):
+			for z in range(minimum.z, maximum.z + 1):
+				var chunk := Vector3i(x, y, z)
+				chunks[_coord_key(chunk)] = chunk
+
+
+func _rebuild_voxel_chunk(chunk: Vector3i) -> void:
+	var chunk_key := _coord_key(chunk)
+	var previous: MeshInstance3D = voxel_chunk_nodes.get(chunk_key, null)
+	if previous != null:
+		previous.queue_free()
+		voxel_chunk_nodes.erase(chunk_key)
+	var origin := chunk * VOXEL_CHUNK_SIZE
 	var surface := SurfaceTool.new()
 	surface.begin(Mesh.PRIMITIVE_TRIANGLES)
-	for x in range(minimum.x - 1, maximum.x + 1):
-		for y in range(minimum.y - 1, maximum.y + 1):
-			for z in range(minimum.z - 1, maximum.z + 1):
-				var origin := Vector3i(x, y, z)
+	for x in range(origin.x, origin.x + VOXEL_CHUNK_SIZE):
+		for y in range(origin.y, origin.y + VOXEL_CHUNK_SIZE):
+			for z in range(origin.z, origin.z + VOXEL_CHUNK_SIZE):
+				var cell_origin := Vector3i(x, y, z)
 				var corner_points: Array[Vector3] = []
 				var corner_values: Array[float] = []
 				var filled_count := 0
 				for offset in MARCHING_CORNERS:
-					var coordinate := origin + offset
+					var coordinate := cell_origin + offset
 					var density := _voxel_density(coordinate)
 					corner_points.append(Vector3(coordinate))
 					corner_values.append(density)
@@ -1366,13 +1435,19 @@ func _build_voxel_isosurface(minimum: Vector3i, maximum: Vector3i) -> void:
 						tetra_values.append(corner_values[index])
 					_polygonize_tetrahedron(surface, tetra_points, tetra_values)
 	surface.index()
+	# SurfaceTool's indexed normal generation keeps tetrahedron winding and the
+	# displacement shader consistent at chunk boundaries. Supplying only radial
+	# normals caused near-camera chunks to shade as disconnected black shards.
 	surface.generate_normals()
 	var mesh := surface.commit()
+	if mesh == null or mesh.get_surface_count() == 0:
+		return
 	var instance := MeshInstance3D.new()
-	instance.name = "SmoothVoxelAsteroid"
+	instance.name = "VoxelChunk_%d_%d_%d" % [chunk.x, chunk.y, chunk.z]
 	instance.mesh = mesh
 	instance.material_override = rock_material
 	asteroid_root.add_child(instance)
+	voxel_chunk_nodes[chunk_key] = instance
 
 
 func _voxel_density(coordinate: Vector3i) -> float:
@@ -1511,7 +1586,7 @@ func _rebuild_grids(grids: Array) -> void:
 		var grid_node := Node3D.new()
 		grid_node.name = grid_id
 		grid_node.position = _vec3(grid.get("position", {}))
-		grid_node.rotation.y = float(grid.get("yaw_radians", 0.0))
+		grid_node.quaternion = _grid_quaternion(grid)
 		for block in grid.get("blocks", []):
 			var block_visual := _build_block_visual(block)
 			var coordinate: Dictionary = block.get("coordinate", {})
@@ -1821,12 +1896,11 @@ func _update_target() -> void:
 	if build_mode and not target_block.is_empty() and not _block_needs_weld(target_block["block"]):
 		var grid: Dictionary = target_block["grid"]
 		var grid_position := _vec3(grid.get("position", {}))
-		var grid_basis := Basis(Vector3.UP, float(grid.get("yaw_radians", 0.0)))
+		var grid_basis := _grid_basis(grid)
 		build_preview.global_position = grid_position + grid_basis * Vector3(_build_coordinate())
-		build_preview.global_rotation = Vector3(
-			0.0,
-			float(grid.get("yaw_radians", 0.0)) + deg_to_rad(float(build_rotation_quarters * 90)),
-			0.0
+		build_preview.global_transform = Transform3D(
+			grid_basis * Basis(Vector3.UP, deg_to_rad(float(build_rotation_quarters * 90))),
+			build_preview.global_position
 		)
 		build_preview.visible = true
 
@@ -1864,7 +1938,7 @@ func _ray_target_block() -> Dictionary:
 	for grid_id in grid_lookup:
 		var grid: Dictionary = grid_lookup[grid_id]
 		var grid_position := _vec3(grid.get("position", {}))
-		var grid_basis := Basis(Vector3.UP, float(grid.get("yaw_radians", 0.0)))
+		var grid_basis := _grid_basis(grid)
 		for block in grid.get("blocks", []):
 			var local := _coord_vector(block.get("coordinate", {}))
 			var world := grid_position + grid_basis * local
@@ -2079,11 +2153,11 @@ func _build_coordinate() -> Vector3i:
 	var offset: Vector3i
 	if selected_block_kind == "anchor":
 		var grid_position := _vec3(grid.get("position", {}))
-		var basis := Basis(Vector3.UP, float(grid.get("yaw_radians", 0.0)))
+		var basis := _grid_basis(grid)
 		var toward_asteroid := basis.inverse() * (-grid_position)
 		offset = _dominant_axis(toward_asteroid)
 	else:
-		var basis := Basis(Vector3.UP, float(grid.get("yaw_radians", 0.0)))
+		var basis := _grid_basis(grid)
 		var toward_camera: Vector3 = basis.inverse() * (
 			camera.global_position - target_block.get("world_position", Vector3.ZERO)
 		)
@@ -2103,22 +2177,28 @@ func _toggle_anchor() -> void:
 func _move_target_grid() -> void:
 	var grid_id := _target_or_starter_grid()
 	var direction := -camera.global_transform.basis.z.normalized()
+	var grid: Dictionary = grid_lookup.get(grid_id, {})
+	var local_direction := (_grid_basis(grid).inverse() * direction).limit_length(0.999)
+	grid_control_active = true
 	_send({
-		"type": "set_grid_motion",
-		"operation_id": _operation_id("grid-motion"),
+		"type": "set_grid_control",
+		"operation_id": _operation_id("grid-control"),
 		"grid_id": grid_id,
-		"linear_velocity": _protocol_vec3(direction * 2.0),
-		"angular_velocity": 0.24,
+		"linear_input": _protocol_vec3(local_direction),
+		"angular_input": _protocol_vec3(Vector3(0.0, 0.24, 0.0)),
+		"dampeners": true,
 	})
 
 
 func _stop_target_grid() -> void:
+	grid_control_active = false
 	_send({
-		"type": "set_grid_motion",
+		"type": "set_grid_control",
 		"operation_id": _operation_id("grid-stop"),
 		"grid_id": _target_or_starter_grid(),
-		"linear_velocity": _protocol_vec3(Vector3.ZERO),
-		"angular_velocity": 0.0,
+		"linear_input": _protocol_vec3(Vector3.ZERO),
+		"angular_input": _protocol_vec3(Vector3.ZERO),
+		"dampeners": true,
 	})
 
 
@@ -2367,7 +2447,9 @@ func _update_interface() -> void:
 			if build_mode
 			else "EVA NAVIGATION // AIM AT ROCK OR MACHINERY"
 		)
-	if action_charge <= 0.0:
+	if grid_control_active:
+		mode_label.text = "GRID CONTROL ACTIVE // RELEASE M OR PRESS X TO DAMPEN"
+	elif action_charge <= 0.0:
 		mode_label.text = (
 			"CONSTRUCTION HOLOGRAM // %s // ROT %03d°" % [
 				selected_block_kind.to_upper(), build_rotation_quarters * 90
@@ -2512,6 +2594,21 @@ func _vec3(value: Dictionary) -> Vector3:
 		float(value.get("y", 0.0)),
 		float(value.get("z", 0.0))
 	)
+
+
+func _grid_quaternion(grid: Dictionary) -> Quaternion:
+	var value: Dictionary = grid.get("orientation", {})
+	var rotation := Quaternion(
+		float(value.get("x", 0.0)),
+		float(value.get("y", 0.0)),
+		float(value.get("z", 0.0)),
+		float(value.get("w", 1.0))
+	)
+	return rotation.normalized() if rotation.length_squared() > 0.000001 else Quaternion.IDENTITY
+
+
+func _grid_basis(grid: Dictionary) -> Basis:
+	return Basis(_grid_quaternion(grid))
 
 
 func _protocol_vec3(value: Vector3) -> Dictionary:
