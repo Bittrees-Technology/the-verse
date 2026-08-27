@@ -2,7 +2,10 @@
 
 use std::time::Instant;
 
-use verse_physics::{BodySpec, BoxColliderSpec, Pose, Quat, Scene, SceneConfig, Vec3};
+use verse_physics::{
+    BodySpec, BoxColliderSpec, CapsuleCast, CapsuleColliderSpec, Pose, Quat, Scene, SceneConfig,
+    Vec3,
+};
 
 #[test]
 #[ignore = "focused performance probe; run with --ignored --nocapture"]
@@ -170,5 +173,88 @@ fn dirty_collision_chunk_replacement_distribution() {
     ));
     eprintln!(
         "32 chunks/2,816 leaves, 64 single-chunk replacements: median={median:?}, p95={p95:?}, max={maximum:?}"
+    );
+}
+
+#[test]
+#[ignore = "focused performance probe; run with --ignored --nocapture"]
+fn grounded_capsule_query_set_against_proof_asteroid_budget() {
+    let mut asteroid_colliders = Vec::with_capacity(2_816);
+    for z in 0..44 {
+        for x in 0..64 {
+            asteroid_colliders.push(BoxColliderSpec {
+                collider_id: format!("voxel-{z:02}-{x:02}"),
+                local_pose: Pose::new(
+                    Vec3::new(f64::from(x) - 31.5, 0.0, f64::from(z) - 21.5),
+                    Quat::IDENTITY,
+                ),
+                ..BoxColliderSpec::unit_cube("ignored")
+            });
+        }
+    }
+    let asteroid = BodySpec::static_body(
+        "proof-asteroid",
+        Pose::new(Vec3::new(0.0, -0.5, 0.0), Quat::IDENTITY),
+        asteroid_colliders,
+    );
+    let mut player = BodySpec::dynamic(
+        "player-body",
+        Pose::new(Vec3::new(0.0, 0.9, 0.0), Quat::IDENTITY),
+        Vec::new(),
+    );
+    player
+        .capsule_colliders
+        .push(CapsuleColliderSpec::new("player-capsule", 0.34, 0.56));
+    let mut scene = Scene::new(SceneConfig::default()).expect("scene initializes");
+    scene
+        .rebuild(&[asteroid, player])
+        .expect("capsule proof scene builds");
+
+    let support = CapsuleCast {
+        pose: Pose::new(Vec3::new(0.0, 0.9, 0.0), Quat::IDENTITY),
+        radius: 0.34,
+        half_height_of_cylinder: 0.56,
+        displacement: Vec3::new(0.0, -0.22, 0.0),
+        ignore_body_id: Some("player-body".into()),
+    };
+    let obstruction = CapsuleCast {
+        pose: Pose::new(Vec3::new(0.0, 0.906, 0.0), Quat::IDENTITY),
+        displacement: Vec3::new(0.125, 0.0, 0.0),
+        ..support.clone()
+    };
+    let landing = CapsuleCast {
+        pose: Pose::new(Vec3::new(0.125, 1.35, 0.0), Quat::IDENTITY),
+        displacement: Vec3::new(0.0, -0.63, 0.0),
+        ..support.clone()
+    };
+
+    let sample_count = 600_u32;
+    let started = Instant::now();
+    let mut support_hits = 0_u32;
+    let mut landing_hits = 0_u32;
+    for _ in 0..sample_count {
+        support_hits += u32::from(
+            scene
+                .cast_capsule(&support)
+                .expect("support cast succeeds")
+                .is_some(),
+        );
+        let _ = scene
+            .cast_capsule(&obstruction)
+            .expect("obstruction cast succeeds");
+        landing_hits += u32::from(
+            scene
+                .cast_capsule(&landing)
+                .expect("landing cast succeeds")
+                .is_some(),
+        );
+    }
+    let elapsed = started.elapsed();
+    assert_eq!(support_hits, sample_count);
+    assert_eq!(landing_hits, sample_count);
+    eprintln!(
+        "2,816-leaf grounded query set (support + obstruction + landing), {sample_count} samples: total={elapsed:?}, per-set={:?}, per-cast={:?}",
+        elapsed / sample_count,
+        elapsed / (sample_count * 3),
     );
 }

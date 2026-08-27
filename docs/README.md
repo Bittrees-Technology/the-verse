@@ -58,6 +58,7 @@ These documents form the initial specification baseline.
 - [P0 simulation proof](specifications/P0-simulation-proof.md)
 - [P0.1 Apple Silicon benchmark](benchmarks/P0.1-apple-silicon.md)
 - [P0.7 Apple Silicon contact-physics benchmark](benchmarks/P0.7-contact-physics-apple-silicon.md)
+- [P0.10 Apple Silicon grounded-locomotion benchmark](benchmarks/P0.10-grounded-locomotion-apple-silicon.md)
 - [Architecture decision records](decisions/README.md)
 - [Open questions](open-questions.md)
 
