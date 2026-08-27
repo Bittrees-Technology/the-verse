@@ -657,6 +657,85 @@ fn rebuild_is_atomic_and_controls_are_bounded() {
 }
 
 #[test]
+fn inertia_multiplier_reduces_rotation_without_changing_translational_mass() {
+    let config = SceneConfig {
+        fixed_delta_seconds: 1.0 / 60.0,
+        ..SceneConfig::default()
+    };
+    let mut scene = Scene::new(config).expect("scene initializes");
+    let mut baseline = BodySpec::dynamic(
+        "baseline-grid",
+        pose(-4.0, 0.0, 0.0),
+        vec![BoxColliderSpec::unit_cube("baseline-block")],
+    );
+    baseline.allow_sleeping = false;
+    let mut stabilized = BodySpec::dynamic(
+        "stabilized-grid",
+        pose(4.0, 0.0, 0.0),
+        vec![BoxColliderSpec::unit_cube("stabilized-block")],
+    );
+    stabilized.allow_sleeping = false;
+    stabilized.inertia_multiplier = 12.0;
+    scene
+        .rebuild(&[baseline, stabilized])
+        .expect("comparison bodies build");
+
+    let output = scene
+        .step(&[
+            BodyControl {
+                body_id: "baseline-grid".into(),
+                force_newtons: Vec3::new(6_000.0, 0.0, 0.0),
+                torque_newton_meters: Vec3::new(0.0, 1_000.0, 0.0),
+            },
+            BodyControl {
+                body_id: "stabilized-grid".into(),
+                force_newtons: Vec3::new(6_000.0, 0.0, 0.0),
+                torque_newton_meters: Vec3::new(0.0, 1_000.0, 0.0),
+            },
+        ])
+        .expect("bounded controls apply");
+    let baseline = output_body(&output, "baseline-grid");
+    let stabilized = output_body(&output, "stabilized-grid");
+
+    assert!(baseline.angular_velocity.y > 0.0);
+    assert!(stabilized.angular_velocity.y > 0.0);
+    assert!(
+        stabilized.angular_velocity.y <= baseline.angular_velocity.y / 11.5,
+        "12x rotational inertia must reduce angular acceleration proportionally: baseline={}, stabilized={}",
+        baseline.angular_velocity.y,
+        stabilized.angular_velocity.y
+    );
+    assert!(
+        (baseline.linear_velocity.x - stabilized.linear_velocity.x).abs() <= 1.0e-9,
+        "rotational inertia must not alter translational mass"
+    );
+}
+
+#[test]
+fn invalid_inertia_multiplier_is_rejected_before_native_mutation() {
+    let mut scene = Scene::new(SceneConfig::default()).expect("scene initializes");
+    let valid = BodySpec::dynamic(
+        "controlled-grid",
+        Pose::IDENTITY,
+        vec![BoxColliderSpec::unit_cube("block")],
+    );
+    scene
+        .rebuild(std::slice::from_ref(&valid))
+        .expect("initial body builds");
+
+    let mut invalid = valid;
+    invalid.inertia_multiplier = 0.0;
+    assert!(matches!(
+        scene.replace_body("controlled-grid", Some(invalid)),
+        Err(PhysicsError::InvalidBody { .. })
+    ));
+    assert_eq!(scene.body_count(), 1);
+    scene
+        .step(&[])
+        .expect("rejected replacement leaves the scene usable");
+}
+
+#[test]
 fn one_body_replacement_preserves_unrelated_bodies_and_can_remove_the_final_chunk() {
     let mut scene = Scene::new(SceneConfig::default()).expect("scene initializes");
     let target = BodySpec::static_body(

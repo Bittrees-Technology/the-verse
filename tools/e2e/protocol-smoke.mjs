@@ -272,6 +272,7 @@ async function movePlayerTo(world, target) {
       linear_input: localDirection,
       angular_input: { x: 0, y: 0, z: 0 },
       boost: false,
+      jump: false,
       dampeners: true,
     });
     world = await waitForMotionAfter(tick, "integrated character motion");
@@ -287,6 +288,7 @@ async function movePlayerTo(world, target) {
     linear_input: { x: 0, y: 0, z: 0 },
     angular_input: { x: 0, y: 0, z: 0 },
     boost: false,
+    jump: false,
     dampeners: true,
   });
   world = await waitForMotionAfter(tick, "neutral character control settles");
@@ -324,10 +326,10 @@ async function run() {
     (message) => message.type === "welcome",
     "welcome",
   );
-  assert.equal(welcome.protocol_version, 9);
+  assert.equal(welcome.protocol_version, 10);
   send({
     type: "hello",
-    protocol_version: 9,
+    protocol_version: 10,
     client_name: "node-authoritative-e2e",
   });
   let world = (
@@ -338,7 +340,7 @@ async function run() {
   ).snapshot;
   authoritativeWorld = world;
   assert.equal(world.conservation.valid, true);
-  assert.equal(world.content_manifest_version, "p0.9.0");
+  assert.equal(world.content_manifest_version, "p0.10.0");
   assert.equal(world.grids.length, 1);
   assert.ok(world.voxels.length > 1_000);
   assert.equal(world.environment.celestial_body_name, "Khepri Prime");
@@ -352,6 +354,8 @@ async function run() {
   assert.deepEqual(world.player.life_state, { kind: "alive" });
   assert.equal(world.player.helmet_closed, true);
   assert.equal(world.player.jetpack_enabled, true);
+  assert.equal(world.player.locomotion.kind, "eva");
+  assert.equal(world.player.locomotion.magnetic_boots_enabled, false);
   assert.deepEqual(world.death_drops, []);
   assert.ok(playerInventory(world).capacity_liters > 0);
   assert.ok(playerInventory(world).used_liters > 0);
@@ -369,6 +373,7 @@ async function run() {
     linear_input: { x: 0, y: 0, z: 0 },
     angular_input: { x: 0, y: 0, z: 1 },
     boost: false,
+    jump: false,
     dampeners: true,
   });
   send({
@@ -379,6 +384,7 @@ async function run() {
     linear_input: { x: 0, y: 0, z: 0 },
     angular_input: { x: 0, y: 0, z: 0 },
     boost: false,
+    jump: false,
     dampeners: true,
   });
   for (const operationId of [pulseOperation, releaseOperation]) {
@@ -544,6 +550,7 @@ async function run() {
   world = await intent("set_suit_mode", {
     helmet_closed: false,
     jetpack_enabled: true,
+    magnetic_boots_enabled: false,
   });
   world = await waitForCanonicalIncapacitation(world);
   assert.equal(world.player.suit_oxygen_milli, 0);

@@ -49,7 +49,10 @@ stop_server() {
 }
 
 start_server
-node tools/e2e/protocol-smoke.mjs "ws://127.0.0.1:${verse_port}/ws"
+if ! node tools/e2e/protocol-smoke.mjs "ws://127.0.0.1:${verse_port}/ws"; then
+  sed -n '1,240p' "${verse_test_dir}/server.log" >&2
+  exit 1
+fi
 stop_server
 
 start_server paused

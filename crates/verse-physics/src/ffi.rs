@@ -679,6 +679,7 @@ impl NativeScene {
             Friction: spec.friction,
             Restitution: spec.restitution,
             GravityFactor: spec.gravity_factor,
+            InertiaMultiplier: spec.inertia_multiplier,
             MaxLinearVelocity: config.max_linear_velocity_mps,
             MaxAngularVelocity: config.max_angular_velocity_radians_per_second,
             Shape: compound.0,
