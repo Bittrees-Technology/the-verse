@@ -223,6 +223,20 @@ function publicProjection(state) {
   return shared;
 }
 
+function normalizeSignedZeros(value) {
+  if (typeof value === "number") return value === 0 ? 0 : value;
+  if (Array.isArray(value)) return value.map(normalizeSignedZeros);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, nested]) => [
+        key,
+        normalizeSignedZeros(nested),
+      ]),
+    );
+  }
+  return value;
+}
+
 function assertActorPrivate(state, expectedPlayerId, description) {
   assert.ok(state.actor_private, `${description} has an actor-private overlay`);
   assert.equal(
@@ -245,12 +259,19 @@ function assertActorPrivate(state, expectedPlayerId, description) {
   }
 }
 
-function combineActorSnapshots(local, remote, description) {
-  assert.deepEqual(
-    publicProjection(local),
-    publicProjection(remote),
-    `${description} exposes identical public state`,
-  );
+function combineActorSnapshots(
+  local,
+  remote,
+  description,
+  requireIdenticalPublicState = true,
+) {
+  if (requireIdenticalPublicState) {
+    assert.deepEqual(
+      normalizeSignedZeros(publicProjection(local)),
+      normalizeSignedZeros(publicProjection(remote)),
+      `${description} exposes identical public state`,
+    );
+  }
   assertActorPrivate(local, "player-local", `${description} local projection`);
   assertActorPrivate(
     remote,
@@ -281,7 +302,12 @@ function combineActorSnapshots(local, remote, description) {
       ...remote.actor_private.owned_grid_masses,
     ].map((entry) => [entry.grid_id, entry.mass_kg]),
   );
-  const shared = publicProjection(local);
+  const shared = publicProjection(
+    !requireIdenticalPublicState &&
+      remote.event_sequence > local.event_sequence
+      ? remote
+      : local,
+  );
   return {
     ...shared,
     environment: local.environment,
@@ -338,8 +364,8 @@ function combineActorMotion(local, remote, description) {
       "surface_contact",
     ]) {
       assert.deepEqual(
-        privatePlayer[field],
-        publicPlayer[field],
+        normalizeSignedZeros(privatePlayer[field]),
+        normalizeSignedZeros(publicPlayer[field]),
         `${description} ${privatePlayer.player_id} ${field} is internally consistent`,
       );
     }
@@ -647,6 +673,39 @@ async function waitForCommonSnapshot(
     localMessage.projection,
     remoteMessage.projection,
     description,
+  );
+}
+
+async function waitForCommonVoxelRemoval(
+  local,
+  remote,
+  minimumEventSequence,
+  coordinate,
+  description,
+) {
+  // Voxel chunks have a lower per-kind update cadence than control state.
+  // Two observer sessions may therefore hold different valid chunk revisions
+  // at the same canonical event frontier. Rebase each view and require both
+  // independently to expose the committed removal.
+  local.send({ type: "request_snapshot" });
+  remote.send({ type: "request_snapshot" });
+  const predicate = (message) =>
+    message.type === "interest_state" &&
+    message.projection.event_sequence >= minimumEventSequence &&
+    !message.projection.voxel_chunks.some((chunk) =>
+      chunk.voxels.some(
+        (voxel) => coordinateKey(voxel.coordinate) === coordinateKey(coordinate),
+      ),
+    );
+  const [localMessage, remoteMessage] = await Promise.all([
+    local.waitFor(predicate, `${description} on local`),
+    remote.waitFor(predicate, `${description} on remote`),
+  ]);
+  return combineActorSnapshots(
+    localMessage.projection,
+    remoteMessage.projection,
+    description,
+    false,
   );
 }
 
@@ -1366,25 +1425,13 @@ async function run() {
       remoteMiningOperation,
       "remote mining receipt",
     );
-    let minedSnapshot = await waitForCommonSnapshot(
+    const minedSnapshot = await waitForCommonVoxelRemoval(
       local,
       remote,
       miningReceipt.event_sequence,
+      target.coordinate,
       "remote mining publication",
     );
-    while (
-      minedSnapshot.voxels.some(
-        (voxel) =>
-          coordinateKey(voxel.coordinate) === coordinateKey(target.coordinate),
-      )
-    ) {
-      minedSnapshot = await waitForCommonSnapshot(
-        local,
-        remote,
-        miningReceipt.event_sequence,
-        "remote voxel-chunk replacement",
-      );
-    }
     assert.equal(
       remote.lastProjectedOperationSequence,
       remoteFrontierBeforeMining + 1,
@@ -1564,10 +1611,11 @@ async function run() {
         operationId,
         `remote additional mining receipt ${attempt + 1}`,
       );
-      industrySnapshot = await waitForCommonSnapshot(
+      industrySnapshot = await waitForCommonVoxelRemoval(
         local,
         remote,
         receipt.event_sequence,
+        additionalTarget.coordinate,
         `remote additional mining publication ${attempt + 1}`,
       );
     }

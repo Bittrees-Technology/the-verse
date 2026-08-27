@@ -21,4 +21,5 @@ pub use model::{
 pub use persistence::{PersistenceError, Store};
 pub use projection::{
     InterestEntityIdentity, InterestProjectionState, ProjectedInterestFrame, ProjectionError,
+    ProjectionSource,
 };

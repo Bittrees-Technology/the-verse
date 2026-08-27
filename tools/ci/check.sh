@@ -12,6 +12,7 @@ node --check apps/web-command-center/app.js
 node --test apps/web-command-center/app.test.mjs
 node --check tools/e2e/protocol-smoke.mjs
 node --check tools/e2e/two-player-control-smoke.mjs
+node --check tools/e2e/p15-scale-evidence.mjs
 npx --yes markdownlint-cli2 '**/*.md'
 
 godot_binary="${GODOT_BIN:-}"
@@ -32,6 +33,7 @@ if [[ -n "${godot_binary}" ]]; then
 else
   tools/e2e/verify-local.sh
 fi
+tools/e2e/verify-p15-scale-evidence.sh
 
 git diff --check
 echo "VERSE_CHECKS_OK"

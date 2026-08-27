@@ -230,10 +230,14 @@ function projectionCollections(entities, origin, manifest) {
 
 function compatibilityWorld(projection) {
   const privateState = projection.actor_private;
-  assert.ok(
-    privateState,
-    "a gameplay session receives an actor-private overlay",
-  );
+  if (!privateState) {
+    return {
+      ...projection,
+      voxels: projection.voxel_chunks.flatMap((chunk) => chunk.voxels),
+      inventories: [],
+      conservation: { valid: projection.conservation_valid },
+    };
+  }
   const privateMasses = new Map(
     privateState.owned_grid_masses.map((entry) => [
       entry.grid_id,
@@ -265,6 +269,12 @@ function compatibilityWorld(projection) {
 export class Protocol16InterestStream {
   constructor({ expectedPlayerId, send }) {
     this.expectedPlayerId = expectedPlayerId;
+    this.expectedSessionRole = expectedPlayerId
+      ? { kind: "player", player_id: expectedPlayerId }
+      : { kind: "spectator" };
+    this.expectedObserverClass = expectedPlayerId
+      ? "bound_player"
+      : "public_origin_spectator";
     this.send = send;
     this.phase = "welcome";
     this.welcome = undefined;
@@ -306,10 +316,7 @@ export class Protocol16InterestStream {
     for (const [field, expected] of Object.entries(COMPATIBILITY)) {
       assert.equal(message[field], expected, `welcome.${field} is compatible`);
     }
-    assert.deepEqual(message.session_role, {
-      kind: "player",
-      player_id: this.expectedPlayerId,
-    });
+    assert.deepEqual(message.session_role, this.expectedSessionRole);
     assertNonemptyText(message.server_name, "welcome.server_name");
     this.welcome = structuredClone(message);
     this.phase = "registry";
@@ -434,7 +441,7 @@ export class Protocol16InterestStream {
     assertNonemptyText(interest.session_epoch, "session epoch");
     assertNonemptyText(interest.baseline_id, "baseline id");
     assertNonemptyText(interest.view_hash, "view hash");
-    assert.equal(interest.observer_class, "bound_player");
+    assert.equal(interest.observer_class, this.expectedObserverClass);
     validateCanonicalOperations(
       interest.entered,
       "interest entered operations",
@@ -533,6 +540,13 @@ export class Protocol16InterestStream {
       this.manifest,
       this.expectedPlayerId,
     );
+    if (this.expectedPlayerId === undefined) {
+      assert.equal(
+        actorPrivate,
+        undefined,
+        "a public spectator baseline has no actor-private overlay",
+      );
+    }
     this.projection = {
       ...structuredClone(baseline),
       ...rawCollections,
@@ -632,6 +646,13 @@ export class Protocol16InterestStream {
           this.expectedPlayerId,
         )
       : this.projection.actor_private;
+    if (this.expectedPlayerId === undefined) {
+      assert.equal(
+        actorPrivate,
+        undefined,
+        "a public spectator delta has no actor-private overlay",
+      );
+    }
     const actorMotion = hydrateActorMotion(
       delta.actor_private_motion,
       delta.cell_address,

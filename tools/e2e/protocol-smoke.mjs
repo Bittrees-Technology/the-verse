@@ -16,6 +16,8 @@ const interestStream = new Protocol16InterestStream({
   send: (message) => socket.send(JSON.stringify(message)),
 });
 const CHARACTER_EYE_OFFSET = 1.62 - 1.8 / 2;
+const CHARACTER_MAXIMUM_SPEED = 12.0;
+const CHARACTER_TEST_APPROACH_SPEED = 4.0;
 const CHARACTER_MAXIMUM_ANGULAR_SPEED = 2.5;
 const TOOL_RANGE = 9.0;
 const TARGET_ALIGNMENT_RADIANS = 0.006;
@@ -450,22 +452,37 @@ async function movePlayerTo(
       ? targetOrProvider
       : () => targetOrProvider;
   const targetDistanceSquared = targetDistance * targetDistance;
-  for (let attempt = 0; attempt < 240; attempt += 1) {
+  for (let attempt = 0; attempt < 480; attempt += 1) {
     const target = targetForWorld(world);
-    if (distanceSquared(world.player.position, target) <= targetDistanceSquared)
+    const targetDeltaSquared = distanceSquared(world.player.position, target);
+    if (
+      targetDeltaSquared <= targetDistanceSquared &&
+      vectorMagnitude(world.player.linear_velocity) <= 0.05
+    ) {
       break;
+    }
     const current = world.player.position;
     const delta = {
       x: target.x - current.x,
       y: target.y - current.y,
       z: target.z - current.z,
     };
-    const magnitude = Math.sqrt(distanceSquared(delta, { x: 0, y: 0, z: 0 }));
-    const worldDirection = {
-      x: delta.x / magnitude,
-      y: delta.y / magnitude,
-      z: delta.z / magnitude,
-    };
+    const magnitude = Math.sqrt(targetDeltaSquared);
+    const desiredSpeed =
+      magnitude <= targetDistance
+        ? 0
+        : Math.min(
+            CHARACTER_TEST_APPROACH_SPEED,
+            Math.max(0.15, (magnitude - targetDistance) * 1.5),
+          );
+    const worldDirection =
+      magnitude > 1e-9
+        ? {
+            x: (delta.x / magnitude) * desiredSpeed,
+            y: (delta.y / magnitude) * desiredSpeed,
+            z: (delta.z / magnitude) * desiredSpeed,
+          }
+        : { x: 0, y: 0, z: 0 };
     const orientation = world.player.orientation;
     const rotatedLocalDirection = rotateVector(
       {
@@ -476,14 +493,10 @@ async function movePlayerTo(
       },
       worldDirection,
     );
-    const localMagnitude = Math.sqrt(
-      distanceSquared(rotatedLocalDirection, { x: 0, y: 0, z: 0 }),
-    );
-    const localScale = Math.max(1, localMagnitude);
     const localDirection = {
-      x: rotatedLocalDirection.x / localScale,
-      y: rotatedLocalDirection.y / localScale,
-      z: rotatedLocalDirection.z / localScale,
+      x: rotatedLocalDirection.x / CHARACTER_MAXIMUM_SPEED,
+      y: rotatedLocalDirection.y / CHARACTER_MAXIMUM_SPEED,
+      z: rotatedLocalDirection.z / CHARACTER_MAXIMUM_SPEED,
     };
     const inputSequence = world.player.last_received_input_sequence + 1;
     const tick = world.simulation_tick;
@@ -506,6 +519,11 @@ async function movePlayerTo(
     finalDistance <= targetDistance,
     `authoritative character control reaches the ${description}; ` +
       `remaining distance ${finalDistance.toFixed(6)}m exceeds ${targetDistance.toFixed(6)}m`,
+  );
+  assert.ok(
+    vectorMagnitude(world.player.linear_velocity) <= 0.05,
+    `authoritative character control settles at the ${description}; ` +
+      `remaining speed ${vectorMagnitude(world.player.linear_velocity).toFixed(6)}m/s exceeds 0.050000m/s`,
   );
   const tick = world.simulation_tick;
   world = await intent("set_player_control", {
@@ -605,7 +623,27 @@ function assertVoxelIsCanonicalHit(world, coordinate, description) {
 
 function assertBlockIsCanonicalHit(world, gridId, blockId, description) {
   const hit = canonicalRayHits(world, world.player)[0];
-  assert.equal(hit?.type, "block", `${description} resolves to a block`);
+  const expectedGrid = world.grids.find((grid) => grid.grid_id === gridId);
+  const expectedBlock = expectedGrid?.blocks.find(
+    (block) => block.block_id === blockId,
+  );
+  assert.equal(
+    hit?.type,
+    "block",
+    `${description} resolves to a block; ${JSON.stringify({
+      eye: playerEye(world.player),
+      forward: playerForward(world.player),
+      position: world.player.position,
+      orientation: world.player.orientation,
+      locomotion: world.player.locomotion,
+      linear_velocity: world.player.linear_velocity,
+      expected_target_position:
+        expectedGrid && expectedBlock
+          ? gridBlockWorldPosition(expectedGrid, expectedBlock)
+          : undefined,
+      first_hit: hit,
+    })}`,
+  );
   assert.equal(
     hit.grid.grid_id,
     gridId,

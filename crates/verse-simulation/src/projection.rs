@@ -221,12 +221,60 @@ impl CandidatePayload {
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct Candidate {
     address: UniverseAddress,
     content_fingerprint: u64,
     control_critical: bool,
     payload: CandidatePayload,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct SpatialBucketKey {
+    x: i128,
+    y: i128,
+    z: i128,
+}
+
+/// Immutable, prebuilt public projection material for one authoritative world
+/// revision. Owning the canonical snapshot and indices lets a worker share the
+/// source across sessions and project outside the authoritative runtime lock.
+pub struct ProjectionSource {
+    canonical: verse_protocol::WorldSnapshot,
+    candidates: BTreeMap<InterestEntityIdentity, Candidate>,
+    spatial_buckets: BTreeMap<SpatialBucketKey, Vec<InterestEntityIdentity>>,
+    support_entities: BTreeMap<String, InterestEntityIdentity>,
+    actor_private: BTreeMap<String, ActorPrivateSnapshot>,
+    block_grids: BTreeMap<String, String>,
+    spectator_anchor: UniverseAddress,
+    spectator_environment: verse_protocol::EnvironmentSnapshot,
+}
+
+impl std::fmt::Debug for ProjectionSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProjectionSource")
+            .field("universe_id", &self.canonical.universe_id)
+            .field("cell_id", &self.canonical.cell_id)
+            .field("event_sequence", &self.canonical.event_sequence)
+            .field("simulation_tick", &self.canonical.simulation_tick)
+            .field("world_hash", &self.canonical.world_hash)
+            .finish_non_exhaustive()
+    }
+}
+
+struct CandidateQuery {
+    candidates: BTreeMap<InterestEntityIdentity, Candidate>,
+    #[cfg(test)]
+    stats: CandidateQueryStats,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CandidateQueryStats {
+    bucket_lookups: usize,
+    spatial_candidates_visited: usize,
+    exact_candidates_visited: usize,
 }
 
 struct Selection {
@@ -249,26 +297,9 @@ pub enum ProjectedInterestFrame {
     Delta(ProjectedInterestDelta),
 }
 
-impl WorldState {
-    /// Backward-compatible fresh baseline. Stateful network streams retain an
-    /// [`InterestProjectionState`] and use `project_interest_world_snapshot`.
-    pub fn project_world_snapshot(
-        &self,
-        actor_player_id: Option<&str>,
-    ) -> Result<ProjectedWorldSnapshot, ProjectionError> {
-        let mut cursor = compatibility_cursor(actor_player_id);
-        self.project_interest_world_snapshot(&mut cursor)
-    }
-
-    pub fn project_interest_world_snapshot(
-        &self,
-        cursor: &mut InterestProjectionState,
-    ) -> Result<ProjectedWorldSnapshot, ProjectionError> {
-        self.project_interest_world_snapshot_with_removals(cursor, &BTreeMap::new())
-    }
-
-    /// Emits the explicit protocol-16 stream family. Callers must not mix this
-    /// with the protocol-15 `Snapshot`/`MotionState` compatibility family.
+impl ProjectionSource {
+    /// Projects the next protocol-16 frame while reusing this source's
+    /// canonical snapshot, public payloads, and spatial index.
     pub fn project_interest_frame(
         &self,
         cursor: &mut InterestProjectionState,
@@ -324,8 +355,6 @@ impl WorldState {
         }
     }
 
-    /// Cumulative absolute delta from the view held by `cursor` to current
-    /// canonical state. Project into a cloned cursor and install it on ack.
     pub fn project_interest_delta(
         &self,
         cursor: &mut InterestProjectionState,
@@ -344,6 +373,13 @@ impl WorldState {
         }
     }
 
+    pub fn project_interest_world_snapshot(
+        &self,
+        cursor: &mut InterestProjectionState,
+    ) -> Result<ProjectedWorldSnapshot, ProjectionError> {
+        self.project_interest_world_snapshot_with_removals(cursor, &BTreeMap::new())
+    }
+
     pub fn project_interest_world_snapshot_with_removals(
         &self,
         cursor: &mut InterestProjectionState,
@@ -351,23 +387,22 @@ impl WorldState {
     ) -> Result<ProjectedWorldSnapshot, ProjectionError> {
         validate_session(cursor)?;
         let actor = bound_actor(cursor);
-        let inventory_owners = self.projection_inventory_owners(actor)?;
-        let canonical = self.snapshot();
+        let canonical = &self.canonical;
         let anchor = self.interest_anchor(cursor)?;
         let local_origin = anchor.clone();
-        let observer_position =
-            celestial::local_position_from_address(&canonical.cell_address, &anchor).map_err(
-                |source| {
-                    ProjectionError::InvalidCanonicalSnapshot(format!(
-                        "observer environment position cannot be derived: {source}"
-                    ))
-                },
-            )?;
-        let observer_environment = self.environment_at(observer_position);
-        let candidates = self.candidates(cursor, &canonical)?;
+        let observer_environment = self.observer_environment(cursor)?;
+        if removal_reasons
+            .keys()
+            .any(|identity| self.candidates.contains_key(identity))
+        {
+            return Err(ProjectionError::InvalidCanonicalSnapshot(
+                "a canonical entity cannot carry destroyed or transferred removal evidence".into(),
+            ));
+        }
+        let query = self.candidates(cursor, &anchor)?;
         let selection = select(
             cursor,
-            &candidates,
+            &query.candidates,
             &anchor,
             canonical.simulation_tick,
             removal_reasons,
@@ -390,7 +425,7 @@ impl WorldState {
             }
         }
         let actor_private = actor
-            .map(|actor| self.actor_private(actor, &canonical, &inventory_owners, &visible))
+            .map(|actor| self.filtered_actor_private(actor, &visible))
             .transpose()?;
         let entity_refs = selection
             .members
@@ -466,18 +501,517 @@ impl WorldState {
         Ok(ProjectedWorldSnapshot {
             projection_schema_version: PROJECTION_SCHEMA_VERSION,
             schema_version: canonical.schema_version,
-            content_manifest_version: canonical.content_manifest_version,
-            universe_id: canonical.universe_id,
-            cell_id: canonical.cell_id,
-            universe_manifest_hash: canonical.universe_manifest_hash,
-            celestial_registry_hash: canonical.celestial_registry_hash,
-            cell_address: canonical.cell_address,
-            gravity_body_id: canonical.gravity_body_id,
-            voxel_body_id: canonical.voxel_body_id,
+            content_manifest_version: canonical.content_manifest_version.clone(),
+            universe_id: canonical.universe_id.clone(),
+            cell_id: canonical.cell_id.clone(),
+            universe_manifest_hash: canonical.universe_manifest_hash.clone(),
+            celestial_registry_hash: canonical.celestial_registry_hash.clone(),
+            cell_address: canonical.cell_address.clone(),
+            gravity_body_id: canonical.gravity_body_id.clone(),
+            voxel_body_id: canonical.voxel_body_id.clone(),
             event_sequence: canonical.event_sequence,
             simulation_tick: canonical.simulation_tick,
             fencing_token: canonical.fencing_token,
-            world_hash: canonical.world_hash,
+            world_hash: canonical.world_hash.clone(),
+            players,
+            environment: observer_environment,
+            voxel_chunks,
+            grids,
+            death_drops,
+            conservation_valid: canonical.conservation.valid,
+            interest,
+            actor_private,
+        })
+    }
+
+    fn interest_anchor(
+        &self,
+        cursor: &InterestProjectionState,
+    ) -> Result<UniverseAddress, ProjectionError> {
+        match &cursor.observer {
+            InterestObserver::BoundPlayer { player_id } => self
+                .canonical
+                .players
+                .iter()
+                .find(|player| player.player_id == *player_id)
+                .map(|player| player.address.clone())
+                .ok_or_else(|| ProjectionError::UnboundActor(player_id.clone())),
+            InterestObserver::PublicOriginSpectator => Ok(self.spectator_anchor.clone()),
+        }
+    }
+
+    fn observer_environment(
+        &self,
+        cursor: &InterestProjectionState,
+    ) -> Result<verse_protocol::EnvironmentSnapshot, ProjectionError> {
+        match &cursor.observer {
+            InterestObserver::BoundPlayer { player_id } => self
+                .canonical
+                .players
+                .iter()
+                .find(|player| player.player_id == *player_id)
+                .and_then(|player| player.environment.clone())
+                .ok_or_else(|| ProjectionError::UnboundActor(player_id.clone())),
+            InterestObserver::PublicOriginSpectator => Ok(self.spectator_environment.clone()),
+        }
+    }
+
+    fn filtered_actor_private(
+        &self,
+        actor: &str,
+        visible: &BTreeSet<InterestEntityIdentity>,
+    ) -> Result<ActorPrivateSnapshot, ProjectionError> {
+        let mut private = self
+            .actor_private
+            .get(actor)
+            .cloned()
+            .ok_or_else(|| ProjectionError::UnboundActor(actor.into()))?;
+        let visible_grids = visible_ids(visible, InterestEntityKind::Grid);
+        let visible_drops = visible_ids(visible, InterestEntityKind::DeathDrop);
+        private
+            .death_drops
+            .retain(|drop| visible_drops.contains(drop.drop_id.as_str()));
+        let visible_drop_inventories = private
+            .death_drops
+            .iter()
+            .map(|drop| drop.inventory_id.as_str())
+            .collect::<BTreeSet<_>>();
+        private
+            .inventories
+            .retain(|inventory| match &inventory.domain {
+                InventoryDomain::Player { player_id } => player_id == actor,
+                InventoryDomain::Cargo { block_id } => self
+                    .block_grids
+                    .get(block_id)
+                    .is_some_and(|grid_id| visible_grids.contains(grid_id.as_str())),
+                InventoryDomain::Dropped { .. } => {
+                    visible_drop_inventories.contains(inventory.inventory_id.as_str())
+                }
+            });
+        private
+            .owned_grid_masses
+            .retain(|mass| visible_grids.contains(mass.grid_id.as_str()));
+        private.production_queues.retain(|queue| {
+            self.block_grids
+                .get(&queue.machine_block_id)
+                .is_some_and(|grid_id| visible_grids.contains(grid_id.as_str()))
+        });
+        Ok(private)
+    }
+
+    fn candidates(
+        &self,
+        cursor: &InterestProjectionState,
+        anchor: &UniverseAddress,
+    ) -> Result<CandidateQuery, ProjectionError> {
+        let radius_um = spatial_query_radius_um()?;
+        let bounds = spatial_bucket_bounds(&self.canonical.cell_address, anchor, radius_um)?;
+        let mut identities = BTreeSet::new();
+        #[cfg(test)]
+        let mut bucket_lookups = 0_usize;
+        #[cfg(test)]
+        let mut spatial_candidates_visited = 0_usize;
+        for x in bounds.0.x..=bounds.1.x {
+            for y in bounds.0.y..=bounds.1.y {
+                for z in bounds.0.z..=bounds.1.z {
+                    #[cfg(test)]
+                    {
+                        bucket_lookups += 1;
+                    }
+                    if let Some(bucket) = self.spatial_buckets.get(&SpatialBucketKey { x, y, z }) {
+                        #[cfg(test)]
+                        {
+                            spatial_candidates_visited += bucket.len();
+                        }
+                        identities.extend(bucket.iter().cloned());
+                    }
+                }
+            }
+        }
+
+        // A prior member must still be evaluated after moving beyond the
+        // indexed query radius so hysteresis and removal semantics converge.
+        identities.extend(
+            cursor
+                .members
+                .keys()
+                .filter(|identity| self.candidates.contains_key(*identity))
+                .cloned(),
+        );
+
+        let mut critical = BTreeSet::new();
+        if let Some(actor) = bound_actor(cursor) {
+            let actor_identity =
+                InterestEntityIdentity::new(InterestEntityKind::Player, actor.to_owned());
+            identities.insert(actor_identity.clone());
+            critical.insert(actor_identity);
+            if let Some(support) = self
+                .canonical
+                .players
+                .iter()
+                .find(|player| player.player_id == actor)
+                .and_then(|player| player.locomotion.support.as_ref())
+                .and_then(|support| self.support_entities.get(&support.body_id))
+            {
+                identities.insert(support.clone());
+                critical.insert(support.clone());
+            }
+        }
+
+        let mut candidates = BTreeMap::new();
+        for identity in identities {
+            let Some(source) = self.candidates.get(&identity) else {
+                continue;
+            };
+            let mut candidate = source.clone();
+            candidate.control_critical = critical.contains(&identity);
+            candidates.insert(identity, candidate);
+        }
+        #[cfg(test)]
+        let exact_candidates_visited = candidates.len();
+        Ok(CandidateQuery {
+            candidates,
+            #[cfg(test)]
+            stats: CandidateQueryStats {
+                bucket_lookups,
+                spatial_candidates_visited,
+                exact_candidates_visited,
+            },
+        })
+    }
+}
+
+impl WorldState {
+    /// Builds public projection material once so a worker can reuse it for all
+    /// sessions projected from the same immutable authoritative state.
+    pub fn projection_source(&self) -> Result<ProjectionSource, ProjectionError> {
+        let canonical = self.snapshot();
+        let mut candidates = BTreeMap::new();
+        let mut support_entities = BTreeMap::new();
+        for player in &canonical.players {
+            add_candidate(
+                &mut candidates,
+                player.address.clone(),
+                false,
+                CandidatePayload::Player(public_player(player, &canonical.cell_address)?),
+            )?;
+        }
+        for grid in &canonical.grids {
+            let identity = InterestEntityIdentity::new(InterestEntityKind::Grid, &grid.grid_id);
+            add_candidate(
+                &mut candidates,
+                grid.address.clone(),
+                false,
+                CandidatePayload::Grid(public_grid(self, grid, &canonical.cell_address)?),
+            )?;
+            support_entities.insert(grid.grid_id.clone(), identity);
+        }
+        for chunk in public_voxel_chunks(&canonical.voxel_body_id, &canonical.voxels)? {
+            let address = chunk_address(self.world_seed, &canonical.voxel_body_id, &chunk)?;
+            let (x, y, z) = chunk_coordinates(&chunk)?;
+            let identity =
+                InterestEntityIdentity::new(InterestEntityKind::VoxelChunk, &chunk.chunk_id);
+            add_candidate(
+                &mut candidates,
+                address,
+                false,
+                CandidatePayload::VoxelChunk(chunk),
+            )?;
+            support_entities.insert(format!("voxel-chunk-{x}-{y}-{z}"), identity);
+        }
+        for drop in &canonical.death_drops {
+            add_candidate(
+                &mut candidates,
+                drop.address.clone(),
+                false,
+                CandidatePayload::DeathDrop(public_drop(drop, &canonical.cell_address)?),
+            )?;
+        }
+
+        let mut spatial_buckets = BTreeMap::<SpatialBucketKey, Vec<_>>::new();
+        for (identity, candidate) in &candidates {
+            let bucket = spatial_bucket_key(&canonical.cell_address, &candidate.address)?;
+            spatial_buckets
+                .entry(bucket)
+                .or_default()
+                .push(identity.clone());
+        }
+        let all_entities = candidates.keys().cloned().collect::<BTreeSet<_>>();
+        let inventory_owners = self.projection_inventory_owners(None)?;
+        let actor_private = canonical
+            .players
+            .iter()
+            .map(|player| {
+                self.actor_private(
+                    &player.player_id,
+                    &canonical,
+                    &inventory_owners,
+                    &all_entities,
+                )
+                .map(|private| (player.player_id.clone(), private))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        let block_grids = canonical
+            .grids
+            .iter()
+            .flat_map(|grid| {
+                grid.blocks
+                    .iter()
+                    .map(move |block| (block.block_id.clone(), grid.grid_id.clone()))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let anchor = content::manifest().interest.public_spectator_anchor_um;
+        let spectator_anchor = celestial::address_from_origin_offset_um(
+            &canonical.cell_address,
+            [
+                i128::from(anchor.x),
+                i128::from(anchor.y),
+                i128::from(anchor.z),
+            ],
+        )
+        .map_err(|source| {
+            ProjectionError::InvalidCanonicalSnapshot(format!(
+                "spectator anchor is invalid: {source}"
+            ))
+        })?;
+        let spectator_position =
+            celestial::local_position_from_address(&canonical.cell_address, &spectator_anchor)
+                .map_err(|source| {
+                    ProjectionError::InvalidCanonicalSnapshot(format!(
+                        "spectator environment position cannot be derived: {source}"
+                    ))
+                })?;
+        let spectator_environment = self.environment_at(spectator_position);
+        Ok(ProjectionSource {
+            canonical,
+            candidates,
+            spatial_buckets,
+            support_entities,
+            actor_private,
+            block_grids,
+            spectator_anchor,
+            spectator_environment,
+        })
+    }
+
+    /// Backward-compatible fresh baseline. Stateful network streams retain an
+    /// [`InterestProjectionState`] and use `project_interest_world_snapshot`.
+    pub fn project_world_snapshot(
+        &self,
+        actor_player_id: Option<&str>,
+    ) -> Result<ProjectedWorldSnapshot, ProjectionError> {
+        let mut cursor = compatibility_cursor(actor_player_id);
+        self.project_interest_world_snapshot(&mut cursor)
+    }
+
+    pub fn project_interest_world_snapshot(
+        &self,
+        cursor: &mut InterestProjectionState,
+    ) -> Result<ProjectedWorldSnapshot, ProjectionError> {
+        self.project_interest_world_snapshot_with_removals(cursor, &BTreeMap::new())
+    }
+
+    /// Emits the explicit protocol-16 stream family. Callers must not mix this
+    /// with the protocol-15 `Snapshot`/`MotionState` compatibility family.
+    pub fn project_interest_frame(
+        &self,
+        cursor: &mut InterestProjectionState,
+        removal_reasons: &BTreeMap<InterestEntityIdentity, InterestRemovalReason>,
+    ) -> Result<ProjectedInterestFrame, ProjectionError> {
+        self.projection_source()?
+            .project_interest_frame(cursor, removal_reasons)
+    }
+
+    pub fn project_interest_baseline(
+        &self,
+        cursor: &mut InterestProjectionState,
+    ) -> Result<ProjectedWorldSnapshot, ProjectionError> {
+        if cursor.view_hash.is_some() {
+            return Err(ProjectionError::InvalidSession(
+                "baseline requested from an initialized cursor; call fresh_baseline first".into(),
+            ));
+        }
+        match self.project_interest_frame(cursor, &BTreeMap::new())? {
+            ProjectedInterestFrame::Baseline(value) => Ok(value),
+            ProjectedInterestFrame::Delta(_) => Err(ProjectionError::InvalidSession(
+                "uninitialized cursor emitted a delta".into(),
+            )),
+        }
+    }
+
+    /// Cumulative absolute delta from the view held by `cursor` to current
+    /// canonical state. Project into a cloned cursor and install it on ack.
+    pub fn project_interest_delta(
+        &self,
+        cursor: &mut InterestProjectionState,
+        removal_reasons: &BTreeMap<InterestEntityIdentity, InterestRemovalReason>,
+    ) -> Result<ProjectedInterestDelta, ProjectionError> {
+        if cursor.view_hash.is_none() {
+            return Err(ProjectionError::InvalidSession(
+                "delta requested before a baseline".into(),
+            ));
+        }
+        match self.project_interest_frame(cursor, removal_reasons)? {
+            ProjectedInterestFrame::Delta(value) => Ok(value),
+            ProjectedInterestFrame::Baseline(_) => Err(ProjectionError::InvalidSession(
+                "initialized cursor emitted a baseline".into(),
+            )),
+        }
+    }
+
+    pub fn project_interest_world_snapshot_with_removals(
+        &self,
+        cursor: &mut InterestProjectionState,
+        removal_reasons: &BTreeMap<InterestEntityIdentity, InterestRemovalReason>,
+    ) -> Result<ProjectedWorldSnapshot, ProjectionError> {
+        self.projection_source()?
+            .project_interest_world_snapshot_with_removals(cursor, removal_reasons)
+    }
+
+    #[cfg(test)]
+    fn project_interest_world_snapshot_from_source(
+        &self,
+        source: &ProjectionSource,
+        cursor: &mut InterestProjectionState,
+        removal_reasons: &BTreeMap<InterestEntityIdentity, InterestRemovalReason>,
+    ) -> Result<ProjectedWorldSnapshot, ProjectionError> {
+        validate_session(cursor)?;
+        let actor = bound_actor(cursor);
+        let inventory_owners = self.projection_inventory_owners(actor)?;
+        let canonical = &source.canonical;
+        let anchor = self.interest_anchor(cursor)?;
+        let local_origin = anchor.clone();
+        let observer_position =
+            celestial::local_position_from_address(&canonical.cell_address, &anchor).map_err(
+                |source| {
+                    ProjectionError::InvalidCanonicalSnapshot(format!(
+                        "observer environment position cannot be derived: {source}"
+                    ))
+                },
+            )?;
+        let observer_environment = self.environment_at(observer_position);
+        if removal_reasons
+            .keys()
+            .any(|identity| source.candidates.contains_key(identity))
+        {
+            return Err(ProjectionError::InvalidCanonicalSnapshot(
+                "a canonical entity cannot carry destroyed or transferred removal evidence".into(),
+            ));
+        }
+        let query = source.candidates(cursor, &anchor)?;
+        let selection = select(
+            cursor,
+            &query.candidates,
+            &anchor,
+            canonical.simulation_tick,
+            removal_reasons,
+        )?;
+        let visible = selection.members.keys().cloned().collect::<BTreeSet<_>>();
+
+        let mut players = Vec::new();
+        let mut grids = Vec::new();
+        let mut voxel_chunks = Vec::new();
+        let mut death_drops = Vec::new();
+        for (identity, payload) in &selection.payloads {
+            if !visible.contains(identity) {
+                continue;
+            }
+            match payload {
+                CandidatePayload::Player(value) => players.push(value.clone()),
+                CandidatePayload::Grid(value) => grids.push(value.clone()),
+                CandidatePayload::VoxelChunk(value) => voxel_chunks.push(value.clone()),
+                CandidatePayload::DeathDrop(value) => death_drops.push(value.clone()),
+            }
+        }
+        let actor_private = actor
+            .map(|actor| self.actor_private(actor, canonical, &inventory_owners, &visible))
+            .transpose()?;
+        let entity_refs = selection
+            .members
+            .iter()
+            .map(|(identity, member)| entity_ref(identity, member.projected_revision))
+            .collect::<Vec<_>>();
+        let complete_view_entities = entity_refs
+            .iter()
+            .map(|entity| complete_entity_projection(entity, &selection.payloads))
+            .collect::<Result<Vec<_>, _>>()?;
+        let observer_class = observer_class(&cursor.observer);
+        let view_hash = fixed_hash(&ViewHashMaterial {
+            projection_schema_version: PROJECTION_SCHEMA_VERSION,
+            interest_schema_version: INTEREST_SCHEMA_VERSION,
+            content_manifest_version: &canonical.content_manifest_version,
+            universe_id: &canonical.universe_id,
+            cell_id: &canonical.cell_id,
+            universe_manifest_hash: &canonical.universe_manifest_hash,
+            celestial_registry_hash: &canonical.celestial_registry_hash,
+            cell_address: &canonical.cell_address,
+            local_origin: &local_origin,
+            gravity_body_id: &canonical.gravity_body_id,
+            voxel_body_id: &canonical.voxel_body_id,
+            observer_class,
+            session_epoch: &cursor.session_epoch,
+            interest_epoch: cursor.interest_epoch,
+            baseline_id: &cursor.baseline_id,
+            delta_sequence: selection.delta_sequence,
+            entities: &complete_view_entities,
+            environment: &observer_environment,
+            conservation_valid: canonical.conservation.valid,
+            actor_private: actor_private.as_ref(),
+        })?;
+        let entered = selection
+            .entered
+            .iter()
+            .map(|entity| complete_entity_projection(entity, &selection.payloads))
+            .collect::<Result<Vec<_>, _>>()?;
+        let replaced = selection
+            .replaced
+            .iter()
+            .map(|entity| complete_entity_projection(entity, &selection.payloads))
+            .collect::<Result<Vec<_>, _>>()?;
+        let interest = InterestSnapshot {
+            schema_version: INTEREST_SCHEMA_VERSION,
+            frame_kind: selection.frame_kind,
+            session_epoch: cursor.session_epoch.clone(),
+            interest_epoch: cursor.interest_epoch,
+            baseline_id: cursor.baseline_id.clone(),
+            delta_sequence: selection.delta_sequence,
+            observer_class,
+            cell_address: canonical.cell_address.clone(),
+            local_origin_address: local_origin,
+            registry_hash: canonical.celestial_registry_hash.clone(),
+            universe_manifest_hash: canonical.universe_manifest_hash.clone(),
+            canonical_event_sequence: canonical.event_sequence,
+            canonical_tick: canonical.simulation_tick,
+            canonical_world_hash: canonical.world_hash.clone(),
+            previous_view_hash: selection.previous_view_hash,
+            view_hash: view_hash.clone(),
+            entered,
+            replaced,
+            removed: selection.removed,
+        };
+        cursor.members = selection.members;
+        cursor.payloads = selection.payloads;
+        cursor.delta_sequence = selection.delta_sequence;
+        cursor.view_hash = Some(view_hash);
+        cursor.last_evaluated_tick = Some(canonical.simulation_tick);
+        cursor.environment = Some(observer_environment.clone());
+        cursor.actor_private.clone_from(&actor_private);
+
+        Ok(ProjectedWorldSnapshot {
+            projection_schema_version: PROJECTION_SCHEMA_VERSION,
+            schema_version: canonical.schema_version,
+            content_manifest_version: canonical.content_manifest_version.clone(),
+            universe_id: canonical.universe_id.clone(),
+            cell_id: canonical.cell_id.clone(),
+            universe_manifest_hash: canonical.universe_manifest_hash.clone(),
+            celestial_registry_hash: canonical.celestial_registry_hash.clone(),
+            cell_address: canonical.cell_address.clone(),
+            gravity_body_id: canonical.gravity_body_id.clone(),
+            voxel_body_id: canonical.voxel_body_id.clone(),
+            event_sequence: canonical.event_sequence,
+            simulation_tick: canonical.simulation_tick,
+            fencing_token: canonical.fencing_token,
+            world_hash: canonical.world_hash.clone(),
             players,
             environment: observer_environment,
             voxel_chunks,
@@ -536,6 +1070,7 @@ impl WorldState {
         })
     }
 
+    #[cfg(test)]
     fn interest_anchor(
         &self,
         cursor: &InterestProjectionState,
@@ -563,62 +1098,6 @@ impl WorldState {
                 })
             }
         }
-    }
-
-    fn candidates(
-        &self,
-        cursor: &InterestProjectionState,
-        canonical: &verse_protocol::WorldSnapshot,
-    ) -> Result<BTreeMap<InterestEntityIdentity, Candidate>, ProjectionError> {
-        let actor = bound_actor(cursor);
-        let support = actor.and_then(|id| {
-            canonical
-                .players
-                .iter()
-                .find(|p| p.player_id == id)
-                .and_then(|p| p.locomotion.support.as_ref())
-                .map(|value| value.body_id.as_str())
-        });
-        let mut values = BTreeMap::new();
-        for player in &canonical.players {
-            let public = public_player(player, &canonical.cell_address)?;
-            add_candidate(
-                &mut values,
-                player.address.clone(),
-                actor == Some(player.player_id.as_str()),
-                CandidatePayload::Player(public),
-            )?;
-        }
-        for grid in &canonical.grids {
-            let public = public_grid(self, grid, &canonical.cell_address)?;
-            add_candidate(
-                &mut values,
-                grid.address.clone(),
-                support == Some(grid.grid_id.as_str()),
-                CandidatePayload::Grid(public),
-            )?;
-        }
-        for chunk in public_voxel_chunks(&canonical.voxel_body_id, &canonical.voxels)? {
-            let address = chunk_address(self.world_seed, &canonical.voxel_body_id, &chunk)?;
-            let (x, y, z) = chunk_coordinates(&chunk)?;
-            let support_id = format!("voxel-chunk-{x}-{y}-{z}");
-            let critical = support == Some(support_id.as_str());
-            add_candidate(
-                &mut values,
-                address,
-                critical,
-                CandidatePayload::VoxelChunk(chunk),
-            )?;
-        }
-        for drop in &canonical.death_drops {
-            add_candidate(
-                &mut values,
-                drop.address.clone(),
-                false,
-                CandidatePayload::DeathDrop(public_drop(drop, &canonical.cell_address)?),
-            )?;
-        }
-        Ok(values)
     }
 
     fn actor_private(
@@ -941,6 +1420,96 @@ fn radius_squared_um(radius_m: u32) -> u128 {
     micrometres * micrometres
 }
 
+fn spatial_bucket_edge_um() -> Result<i128, ProjectionError> {
+    let edge_m = content::manifest().interest.spatial_bucket_edge_m;
+    if edge_m == 0 {
+        return Err(ProjectionError::InvalidCanonicalSnapshot(
+            "interest spatial bucket edge must be positive".into(),
+        ));
+    }
+    Ok(i128::from(edge_m) * 1_000_000)
+}
+
+fn spatial_query_radius_um() -> Result<i128, ProjectionError> {
+    let policy = &content::manifest().interest;
+    let selected_context_radius_m = policy
+        .enter_radius_m
+        .checked_add(policy.selected_context_margin_m)
+        .ok_or_else(|| {
+            ProjectionError::InvalidCanonicalSnapshot(
+                "selected-context interest radius overflowed".into(),
+            )
+        })?;
+    let radius_m = policy
+        .entity_bands
+        .iter()
+        .map(|band| band.exit_radius_m)
+        .chain([policy.exit_radius_m, selected_context_radius_m])
+        .max()
+        .ok_or_else(|| {
+            ProjectionError::InvalidCanonicalSnapshot("interest policy has no query radius".into())
+        })?;
+    Ok(i128::from(radius_m) * 1_000_000)
+}
+
+fn spatial_bucket_key(
+    origin: &UniverseAddress,
+    address: &UniverseAddress,
+) -> Result<SpatialBucketKey, ProjectionError> {
+    let offset = celestial::relative_offset_um(origin, address).map_err(|source| {
+        ProjectionError::InvalidCanonicalSnapshot(format!(
+            "interest spatial bucket address is invalid: {source}"
+        ))
+    })?;
+    let edge = spatial_bucket_edge_um()?;
+    Ok(SpatialBucketKey {
+        x: offset[0].div_euclid(edge),
+        y: offset[1].div_euclid(edge),
+        z: offset[2].div_euclid(edge),
+    })
+}
+
+fn spatial_bucket_bounds(
+    origin: &UniverseAddress,
+    anchor: &UniverseAddress,
+    radius_um: i128,
+) -> Result<(SpatialBucketKey, SpatialBucketKey), ProjectionError> {
+    let offset = celestial::relative_offset_um(origin, anchor).map_err(|source| {
+        ProjectionError::InvalidCanonicalSnapshot(format!(
+            "interest spatial anchor is invalid: {source}"
+        ))
+    })?;
+    let edge = spatial_bucket_edge_um()?;
+    let component_bounds = |component: i128| {
+        let minimum = component.checked_sub(radius_um).ok_or_else(|| {
+            ProjectionError::InvalidCanonicalSnapshot(
+                "interest spatial query lower bound overflowed".into(),
+            )
+        })?;
+        let maximum = component.checked_add(radius_um).ok_or_else(|| {
+            ProjectionError::InvalidCanonicalSnapshot(
+                "interest spatial query upper bound overflowed".into(),
+            )
+        })?;
+        Ok::<_, ProjectionError>((minimum.div_euclid(edge), maximum.div_euclid(edge)))
+    };
+    let x = component_bounds(offset[0])?;
+    let y = component_bounds(offset[1])?;
+    let z = component_bounds(offset[2])?;
+    Ok((
+        SpatialBucketKey {
+            x: x.0,
+            y: y.0,
+            z: z.0,
+        },
+        SpatialBucketKey {
+            x: x.1,
+            y: y.1,
+            z: z.1,
+        },
+    ))
+}
+
 fn select(
     prior: &InterestProjectionState,
     candidates: &BTreeMap<InterestEntityIdentity, Candidate>,
@@ -988,10 +1557,16 @@ fn select(
             continue;
         }
         let band = interest_band(identity.kind)?;
+        let old = prior.members.get(identity);
+        let structural_changed = old.is_some()
+            && prior
+                .payloads
+                .get(identity)
+                .is_some_and(|previous| structural_payload_changed(previous, &candidate.payload));
         let due = first_frame
             || candidate.control_critical
+            || structural_changed
             || canonical_tick.is_multiple_of(u64::from(band.update_interval_ticks));
-        let old = prior.members.get(identity);
         let distance = squared_distance_um(anchor, &candidate.address)?;
         let enter = radius_squared_um(band.enter_radius_m);
         let exit = radius_squared_um(band.exit_radius_m);
@@ -1155,6 +1730,31 @@ fn select(
         delta_sequence,
         previous_view_hash: prior.view_hash.clone(),
     })
+}
+
+fn structural_payload_changed(previous: &CandidatePayload, current: &CandidatePayload) -> bool {
+    match (previous, current) {
+        (CandidatePayload::Player(previous), CandidatePayload::Player(current)) => {
+            previous.player_id != current.player_id
+                || previous.life_state != current.life_state
+                || previous.helmet_closed != current.helmet_closed
+                || previous.jetpack_enabled != current.jetpack_enabled
+        }
+        (CandidatePayload::Grid(previous), CandidatePayload::Grid(current)) => {
+            previous.grid_id != current.grid_id
+                || previous.owner_player_id != current.owner_player_id
+                || previous.anchored != current.anchored
+                || previous.power != current.power
+                || previous.blocks != current.blocks
+        }
+        (CandidatePayload::VoxelChunk(previous), CandidatePayload::VoxelChunk(current)) => {
+            previous != current
+        }
+        (CandidatePayload::DeathDrop(previous), CandidatePayload::DeathDrop(current)) => {
+            previous != current
+        }
+        _ => true,
+    }
 }
 
 fn public_life_state(value: &PlayerLifeState) -> PublicPlayerLifeState {
@@ -2199,6 +2799,154 @@ mod tests {
     }
 
     #[test]
+    fn spatial_query_cost_is_independent_of_irrelevant_far_entities() {
+        let base = world_with_two_actors();
+        let mut crowded = base.clone();
+        let far_address = address(&crowded, 6_000.0);
+        for index in 0..2_048_u32 {
+            let inventory_id = format!("inventory-far-drop-{index:04}");
+            let drop_id = format!("far-drop-{index:04}");
+            crowded.inventories.insert(
+                inventory_id.clone(),
+                InventoryRecord {
+                    inventory_id: inventory_id.clone(),
+                    domain: InventoryDomain::Dropped {
+                        reason: "player_death".into(),
+                        owner_player_id: "player-local".into(),
+                    },
+                    contents: InventoryContents::default(),
+                    capacity_liters: 8_000,
+                },
+            );
+            crowded.death_drops.insert(
+                drop_id.clone(),
+                DeathDrop {
+                    drop_id,
+                    death_id: format!("far-death-{index:04}"),
+                    inventory_id,
+                    owner_player_id: "player-local".into(),
+                    address: far_address.clone(),
+                    position: Vec3::new(6_000.0, 0.0, 0.0),
+                    created_event_sequence: crowded.event_sequence,
+                    cause: PlayerDeathCause::OxygenDepleted,
+                },
+            );
+        }
+        crowded
+            .validate_player_roster()
+            .expect("crowded authority graph");
+
+        let cursor = InterestProjectionState::bound_player("indexed", "player-local");
+        let anchor = base.interest_anchor(&cursor).expect("base anchor");
+        let base_source = base.projection_source().expect("base source");
+        let base_query = base_source
+            .candidates(&cursor, &anchor)
+            .expect("base query");
+        let crowded_source = crowded.projection_source().expect("crowded source");
+        let crowded_anchor = crowded.interest_anchor(&cursor).expect("crowded anchor");
+        let crowded_query = crowded_source
+            .candidates(&cursor, &crowded_anchor)
+            .expect("crowded query");
+
+        assert_eq!(
+            crowded_source.candidates.len(),
+            base_source.candidates.len() + 2_048
+        );
+        assert_eq!(crowded_query.stats, base_query.stats);
+        assert_eq!(
+            crowded_query.candidates.keys().collect::<Vec<_>>(),
+            base_query.candidates.keys().collect::<Vec<_>>()
+        );
+        let base_selection = select(
+            &cursor,
+            &base_query.candidates,
+            &anchor,
+            base_source.canonical.simulation_tick,
+            &BTreeMap::new(),
+        )
+        .expect("base selection");
+        let crowded_selection = select(
+            &cursor,
+            &crowded_query.candidates,
+            &crowded_anchor,
+            crowded_source.canonical.simulation_tick,
+            &BTreeMap::new(),
+        )
+        .expect("crowded selection");
+        assert_eq!(
+            crowded_selection.members.keys().collect::<Vec<_>>(),
+            base_selection.members.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            crowded_query
+                .candidates
+                .keys()
+                .all(|identity| !identity.entity_id.starts_with("far-drop-"))
+        );
+    }
+
+    #[test]
+    fn cached_projection_source_matches_direct_private_and_public_projection() {
+        let world = world_with_two_actors();
+        let source = world.projection_source().expect("projection source");
+        let mut direct_cursor =
+            InterestProjectionState::bound_player("source-equivalence", "player-local");
+        let mut cached_cursor = direct_cursor.clone();
+
+        let direct = world
+            .project_interest_world_snapshot_from_source(
+                &source,
+                &mut direct_cursor,
+                &BTreeMap::new(),
+            )
+            .expect("direct projection");
+        let cached = source
+            .project_interest_world_snapshot(&mut cached_cursor)
+            .expect("cached projection");
+
+        assert_eq!(cached, direct);
+        assert_eq!(cached_cursor, direct_cursor);
+    }
+
+    #[test]
+    fn structural_voxel_change_bypasses_the_lower_motion_update_cadence() {
+        let mut world = world_with_two_actors();
+        let mut cursor = InterestProjectionState::bound_player("voxel-structural", "player-local");
+        let baseline = world
+            .projection_source()
+            .expect("baseline source")
+            .project_interest_baseline(&mut cursor)
+            .expect("baseline");
+        let coordinate = baseline
+            .voxel_chunks
+            .iter()
+            .flat_map(|chunk| &chunk.voxels)
+            .map(|voxel| voxel.coordinate)
+            .next()
+            .expect("visible proof chunk has voxels");
+        world.voxels.remove(coordinate).expect("voxel removes");
+        world.event_sequence += 1;
+        world.simulation_tick += 1;
+        let voxel_band = interest_band(InterestEntityKind::VoxelChunk).expect("voxel band");
+        assert!(
+            !world
+                .simulation_tick
+                .is_multiple_of(u64::from(voxel_band.update_interval_ticks))
+        );
+
+        let delta = world
+            .projection_source()
+            .expect("changed source")
+            .project_interest_delta(&mut cursor, &BTreeMap::new())
+            .expect("structural delta");
+        assert!(delta.interest.replaced.iter().any(|entity| {
+            entity.kind == InterestEntityKind::VoxelChunk
+                && matches!(&entity.payload, InterestEntityPayload::VoxelChunk(chunk)
+                    if chunk.voxels.iter().all(|voxel| voxel.coordinate != coordinate))
+        }));
+    }
+
+    #[test]
     fn exact_addresses_not_renderer_floats_decide_membership() {
         let mut world = world_with_two_actors();
         place_player(&mut world, "player-remote", 5_000.0);
@@ -2501,8 +3249,12 @@ mod tests {
             .project_interest_baseline(&mut cursor)
             .expect("baseline");
         let identity = InterestEntityIdentity::new(InterestEntityKind::Player, "player-local");
-        let canonical = world.snapshot();
-        let mut candidates = world.candidates(&cursor, &canonical).expect("candidates");
+        let source = world.projection_source().expect("projection source");
+        let anchor = world.interest_anchor(&cursor).expect("anchor");
+        let mut candidates = source
+            .candidates(&cursor, &anchor)
+            .expect("candidates")
+            .candidates;
         let candidate = candidates
             .get_mut(&identity)
             .expect("local player candidate");
@@ -2516,8 +3268,8 @@ mod tests {
         let selection = select(
             &cursor,
             &candidates,
-            &world.interest_anchor(&cursor).expect("anchor"),
-            canonical.simulation_tick + 1,
+            &anchor,
+            source.canonical.simulation_tick + 1,
             &BTreeMap::new(),
         )
         .expect("selection");
