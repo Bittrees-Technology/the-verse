@@ -285,6 +285,20 @@ Walking, jump, and a canonical grounded-locomotion state are explicitly P0.10-or
 
 The implemented contract is [P0.9 authoritative EVA physics](../gameplay/authoritative-character-motion.md), with authority and recovery rationale in [ADR-0013](../decisions/ADR-0013-input-only-authoritative-character-motion.md).
 
+## P0.10 authoritative grounded-locomotion checkpoint
+
+Accepted implementation boundary:
+
+- Extend the P0.9 input FIFO rather than adding a client transform or a second character clock.
+- Use protocol 10, world schema 13, event schema 8, content schema 8, and manifest `p0.10.0` for the incompatible locomotion state.
+- Replace the spherical character collider with a content-sized capsule and add bounded, stable-identity capsule support and clearance queries to the safe physics adapter.
+- Derive `eva`, `airborne`, `grounded`, and `magnetic` exclusively from canonical suit mode, gravity, probes, contact, and support identity.
+- Add false-to-true jump buffering, radial upright orientation, walk/sprint motors, slope hysteresis, bounded step and ground-snap queries, grid-relative support anchors, exact support-point velocity inheritance, and magnetic attachment to completed grid colliders.
+- Keep grids and the player in one atomic `PhysicsStepCommitted` time domain; replay validates committed support-aware envelopes without rerunning Jolt.
+- Reconcile native prediction relative to a stable support and expose original `EVA`, `FREEFALL`, `GROUND`, `MAG-LOCK`, and `BOOTS ARMED` feedback.
+
+The complete contract and acceptance matrix are [P0.10 authoritative grounded and magnetic locomotion](../gameplay/authoritative-grounded-locomotion.md), with the authority decision in [ADR-0014](../decisions/ADR-0014-authoritative-grounded-and-magnetic-locomotion.md). Ladders, crouching, ragdolls, character-to-character collision, impact damage, suit power, artificial gravity, cockpit possession, and production multiplayer remain later checkpoints.
+
 ## Exit decision
 
 P0 ends with one of:

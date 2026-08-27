@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use verse_physics::{
-    BodyControl, BodySpec, BodyState, BoxColliderSpec, ContactPhase, ContactSource, MotionQuality,
-    PhysicsError, Pose, Quat, Scene, SceneConfig, SphereColliderSpec, StepOutput, Vec3,
+    BodyControl, BodySpec, BodyState, BoxColliderSpec, CapsuleCast, CapsuleColliderSpec,
+    ContactPhase, ContactSource, MotionQuality, PhysicsError, Pose, Quat, Scene, SceneConfig,
+    SphereColliderSpec, StepOutput, Vec3,
 };
 
 const P0_TOTAL_MOMENTUM_ERROR_KG_MPS: f64 = 1.0;
@@ -115,6 +116,165 @@ fn falling_box_contacts_static_floor_and_settles() {
         maximum_speed <= 1.0e-3,
         "resting grid exceeded 1 mm/s: {maximum_speed}"
     );
+}
+
+#[test]
+fn standing_capsule_contacts_floor_with_stable_identity() {
+    let mut scene = Scene::new(SceneConfig::default()).expect("scene initializes");
+    let floor = BodySpec::static_body(
+        "floor",
+        pose(0.0, -0.5, 0.0),
+        vec![BoxColliderSpec {
+            collider_id: "deck-panel".into(),
+            half_extents: Vec3::new(10.0, 0.5, 10.0),
+            ..BoxColliderSpec::unit_cube("ignored")
+        }],
+    );
+    let mut character = BodySpec::dynamic("character", pose(0.0, 2.0, 0.0), Vec::new());
+    character
+        .capsule_colliders
+        .push(CapsuleColliderSpec::new("standing-capsule", 0.34, 0.56));
+    character.gravity_factor = 1.0;
+    character.allow_sleeping = false;
+    character.motion_quality = MotionQuality::LinearCast;
+    scene
+        .rebuild(&[character, floor])
+        .expect("capsule and floor build");
+
+    let mut observed = None;
+    for _ in 0..240 {
+        let output = scene.step(&[]).expect("fixed step succeeds");
+        if let Some(contact) = output.contacts.first() {
+            observed = Some(contact.clone());
+        }
+    }
+
+    let contact = observed.expect("capsule reports floor contact");
+    assert_eq!(contact.body_a_id, "character");
+    assert_eq!(contact.collider_a_id, "standing-capsule");
+    assert_eq!(contact.body_b_id, "floor");
+    assert_eq!(contact.collider_b_id, "deck-panel");
+    assert!(contact.normal.y < -0.9);
+    assert!(
+        (0.895..=0.905).contains(&body_y(&mut scene, "character")),
+        "1.8 m capsule should settle with its center 0.9 m above the deck"
+    );
+    assert!(scene.contains_collider("character", "standing-capsule"));
+}
+
+#[test]
+fn invalid_capsule_dimensions_reject_without_replacing_the_scene() {
+    let mut scene = Scene::new(SceneConfig::default()).expect("scene initializes");
+    scene
+        .rebuild(&[BodySpec::static_body(
+            "existing",
+            Pose::IDENTITY,
+            vec![BoxColliderSpec::unit_cube("existing-block")],
+        )])
+        .expect("baseline builds");
+    let mut invalid = BodySpec::dynamic("invalid", Pose::IDENTITY, Vec::new());
+    invalid
+        .capsule_colliders
+        .push(CapsuleColliderSpec::new("invalid-capsule", 0.34, 0.0));
+
+    let error = scene
+        .rebuild(&[invalid])
+        .expect_err("zero half-height rejects");
+    assert!(matches!(error, PhysicsError::InvalidCollider { .. }));
+    assert_eq!(scene.body_count(), 1);
+    assert!(scene.contains_collider("existing", "existing-block"));
+}
+
+#[test]
+fn capsule_cast_finds_floor_with_stable_identity_and_up_normal() {
+    let mut scene = Scene::new(SceneConfig::default()).expect("scene initializes");
+    let floor = BodySpec::static_body(
+        "moving-deck",
+        pose(0.0, -0.5, 0.0),
+        vec![BoxColliderSpec {
+            collider_id: "deck-plate".into(),
+            half_extents: Vec3::new(10.0, 0.5, 10.0),
+            ..BoxColliderSpec::unit_cube("ignored")
+        }],
+    );
+    scene.rebuild(&[floor]).expect("floor builds");
+
+    let hit = scene
+        .cast_capsule(&CapsuleCast {
+            pose: pose(0.0, 1.2, 0.0),
+            radius: 0.34,
+            half_height_of_cylinder: 0.56,
+            displacement: Vec3::new(0.0, -0.5, 0.0),
+            ignore_body_id: None,
+        })
+        .expect("query succeeds")
+        .expect("floor is in probe range");
+
+    assert_eq!(hit.body_id, "moving-deck");
+    assert_eq!(hit.collider_id, "deck-plate");
+    assert!((hit.fraction - 0.6).abs() <= 1.0e-3, "{hit:?}");
+    assert!(hit.surface_normal.y > 0.999, "{hit:?}");
+    assert!((hit.point_on_body.y - 0.0).abs() <= 1.0e-4, "{hit:?}");
+    assert!(hit.penetration_depth_m <= 1.0e-5, "{hit:?}");
+}
+
+#[test]
+fn capsule_cast_can_ignore_the_live_character_body() {
+    let mut scene = Scene::new(SceneConfig::default()).expect("scene initializes");
+    let floor = BodySpec::static_body(
+        "floor",
+        pose(0.0, -0.5, 0.0),
+        vec![BoxColliderSpec {
+            collider_id: "floor-panel".into(),
+            half_extents: Vec3::new(10.0, 0.5, 10.0),
+            ..BoxColliderSpec::unit_cube("ignored")
+        }],
+    );
+    let mut character = BodySpec::dynamic("character", pose(0.0, 1.2, 0.0), Vec::new());
+    character
+        .capsule_colliders
+        .push(CapsuleColliderSpec::new("character-capsule", 0.34, 0.56));
+    scene
+        .rebuild(&[floor, character])
+        .expect("character and floor build");
+
+    let hit = scene
+        .cast_capsule(&CapsuleCast {
+            pose: pose(0.0, 1.2, 0.0),
+            radius: 0.34,
+            half_height_of_cylinder: 0.56,
+            displacement: Vec3::new(0.0, -0.5, 0.0),
+            ignore_body_id: Some("character".into()),
+        })
+        .expect("query succeeds")
+        .expect("floor remains visible after self filtering");
+
+    assert_eq!(hit.body_id, "floor");
+    assert_eq!(hit.collider_id, "floor-panel");
+}
+
+#[test]
+fn invalid_capsule_cast_rejects_without_advancing_scene() {
+    let mut scene = Scene::new(SceneConfig::default()).expect("scene initializes");
+    scene
+        .rebuild(&[BodySpec::static_body(
+            "floor",
+            Pose::IDENTITY,
+            vec![BoxColliderSpec::unit_cube("floor-panel")],
+        )])
+        .expect("floor builds");
+    let before = scene.body_states().expect("state is readable");
+    let error = scene
+        .cast_capsule(&CapsuleCast {
+            pose: Pose::IDENTITY,
+            radius: 0.34,
+            half_height_of_cylinder: 0.56,
+            displacement: Vec3::ZERO,
+            ignore_body_id: None,
+        })
+        .expect_err("zero displacement rejects");
+    assert!(matches!(error, PhysicsError::InvalidCapsuleCast(_)));
+    assert_eq!(scene.body_states().expect("scene remains usable"), before);
 }
 
 #[test]

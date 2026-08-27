@@ -21,6 +21,7 @@ const MAX_NATIVE_CONTACT_CONSTRAINTS: u32 = 262_144;
 const MAX_NATIVE_CONTACT_RECORDS: u64 = 1_048_576;
 const MAX_TEMPORARY_ALLOCATOR_BYTES: u32 = 1024 * 1024 * 1024;
 const MAX_COLLIDERS_PER_BODY: usize = 262_144;
+const MAX_CAPSULE_CAST_DISTANCE_M: f64 = 10_000.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BodyMotion {
@@ -64,6 +65,29 @@ pub struct SphereColliderSpec {
     pub density_kg_per_m3: f32,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct CapsuleColliderSpec {
+    pub collider_id: String,
+    pub local_pose: Pose,
+    /// Radius of both end caps and of the cylinder in meters.
+    pub radius: f32,
+    /// Half the length of the cylindrical section, excluding the end caps.
+    pub half_height_of_cylinder: f32,
+    pub density_kg_per_m3: f32,
+}
+
+impl CapsuleColliderSpec {
+    pub fn new(collider_id: impl Into<String>, radius: f32, half_height_of_cylinder: f32) -> Self {
+        Self {
+            collider_id: collider_id.into(),
+            local_pose: Pose::IDENTITY,
+            radius,
+            half_height_of_cylinder,
+            density_kg_per_m3: 1_000.0,
+        }
+    }
+}
+
 impl SphereColliderSpec {
     pub fn new(collider_id: impl Into<String>, radius: f32) -> Self {
         Self {
@@ -91,6 +115,7 @@ pub struct BodySpec {
     /// grid and voxel callers remain source-compatible.
     pub colliders: Vec<BoxColliderSpec>,
     pub sphere_colliders: Vec<SphereColliderSpec>,
+    pub capsule_colliders: Vec<CapsuleColliderSpec>,
 }
 
 impl BodySpec {
@@ -112,6 +137,7 @@ impl BodySpec {
             motion_quality: MotionQuality::Discrete,
             colliders,
             sphere_colliders: Vec::new(),
+            capsule_colliders: Vec::new(),
         }
     }
 
@@ -133,6 +159,7 @@ impl BodySpec {
             motion_quality: MotionQuality::Discrete,
             colliders,
             sphere_colliders: Vec::new(),
+            capsule_colliders: Vec::new(),
         }
     }
 }
@@ -151,6 +178,30 @@ pub struct BodyState {
     pub linear_velocity: Vec3,
     pub angular_velocity: Vec3,
     pub active: bool,
+}
+
+/// A bounded world-space capsule sweep. The capsule's local axis is positive Y
+/// and `displacement` is the complete cast vector, not a velocity.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CapsuleCast {
+    pub pose: Pose,
+    pub radius: f32,
+    pub half_height_of_cylinder: f32,
+    pub displacement: Vec3,
+    pub ignore_body_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CapsuleCastHit {
+    pub body_id: String,
+    pub collider_id: String,
+    /// Fraction of `displacement` at which the cast first reaches the body.
+    pub fraction: f64,
+    pub point_on_capsule: Vec3,
+    pub point_on_body: Vec3,
+    /// Unit surface normal directed from the hit body toward the query capsule.
+    pub surface_normal: Vec3,
+    pub penetration_depth_m: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -326,6 +377,10 @@ pub enum PhysicsError {
     Initialization(String),
     #[error("Jolt rejected shape for body {body_id}: {message}")]
     ShapeCreation { body_id: String, message: String },
+    #[error("invalid capsule cast: {0}")]
+    InvalidCapsuleCast(String),
+    #[error("native capsule cast failed: {0}")]
+    CapsuleCastFailed(String),
     #[error("Jolt could not allocate body {0}")]
     BodyCreation(String),
     #[error("Jolt update failed with error mask {0:#x}")]
@@ -451,6 +506,16 @@ impl Scene {
         self.require_native_success(extraction)
     }
 
+    /// Casts a temporary capsule through the live scene without advancing it.
+    /// Results use stable Verse identities and never expose native body IDs.
+    pub fn cast_capsule(
+        &self,
+        query: &CapsuleCast,
+    ) -> Result<Option<CapsuleCastHit>, PhysicsError> {
+        validate_capsule_cast(&self.specs, query)?;
+        self.native.cast_capsule(&self.specs, query)
+    }
+
     pub fn body_count(&self) -> usize {
         self.specs.len()
     }
@@ -462,6 +527,11 @@ impl Scene {
                 .map(|collider| collider.collider_id.as_str())
                 .chain(
                     spec.sphere_colliders
+                        .iter()
+                        .map(|collider| collider.collider_id.as_str()),
+                )
+                .chain(
+                    spec.capsule_colliders
                         .iter()
                         .map(|collider| collider.collider_id.as_str()),
                 )
@@ -479,6 +549,11 @@ impl Scene {
                     .map(|collider| collider.collider_id.clone())
                     .chain(
                         spec.sphere_colliders
+                            .iter()
+                            .map(|collider| collider.collider_id.clone()),
+                    )
+                    .chain(
+                        spec.capsule_colliders
                             .iter()
                             .map(|collider| collider.collider_id.clone()),
                     )
@@ -676,6 +751,7 @@ fn validated_specs(
             .colliders
             .len()
             .checked_add(body.sphere_colliders.len())
+            .and_then(|count| count.checked_add(body.capsule_colliders.len()))
             .ok_or_else(|| PhysicsError::InvalidBody {
                 body_id: body.body_id.clone(),
                 message: "collider count overflowed".into(),
@@ -766,11 +842,53 @@ fn validated_specs(
                     message: "rotation must be finite and normalized".into(),
                 })?;
         }
+        for collider in &mut validated.capsule_colliders {
+            validate_id(&collider.collider_id).map_err(|message| {
+                PhysicsError::InvalidCollider {
+                    body_id: body.body_id.clone(),
+                    collider_id: collider.collider_id.clone(),
+                    message,
+                }
+            })?;
+            if !collider_ids.insert(collider.collider_id.clone()) {
+                return Err(PhysicsError::InvalidCollider {
+                    body_id: body.body_id.clone(),
+                    collider_id: collider.collider_id.clone(),
+                    message: "collider ID is duplicated within its body".into(),
+                });
+            }
+            if !collider.local_pose.position.is_finite()
+                || !collider.radius.is_finite()
+                || collider.radius <= 0.0
+                || collider.radius > 1_000_000.0
+                || !collider.half_height_of_cylinder.is_finite()
+                || collider.half_height_of_cylinder <= 0.0
+                || collider.half_height_of_cylinder > 1_000_000.0
+                || !collider.density_kg_per_m3.is_finite()
+                || collider.density_kg_per_m3 <= 0.0
+            {
+                return Err(PhysicsError::InvalidCollider {
+                    body_id: body.body_id.clone(),
+                    collider_id: collider.collider_id.clone(),
+                    message: "pose, radius, half-height, and density must be finite and positive"
+                        .into(),
+                });
+            }
+            collider.local_pose.rotation = validated_rotation(collider.local_pose.rotation)
+                .ok_or_else(|| PhysicsError::InvalidCollider {
+                    body_id: body.body_id.clone(),
+                    collider_id: collider.collider_id.clone(),
+                    message: "rotation must be finite and normalized".into(),
+                })?;
+        }
         validated
             .colliders
             .sort_by(|left, right| left.collider_id.cmp(&right.collider_id));
         validated
             .sphere_colliders
+            .sort_by(|left, right| left.collider_id.cmp(&right.collider_id));
+        validated
+            .capsule_colliders
             .sort_by(|left, right| left.collider_id.cmp(&right.collider_id));
         result.insert(validated.body_id.clone(), validated);
     }
@@ -825,6 +943,34 @@ fn validate_controls(
                 });
             }
         }
+    }
+    Ok(())
+}
+
+fn validate_capsule_cast(
+    specs: &BTreeMap<String, BodySpec>,
+    query: &CapsuleCast,
+) -> Result<(), PhysicsError> {
+    if !query.pose.position.is_finite()
+        || validated_rotation(query.pose.rotation).is_none()
+        || !query.radius.is_finite()
+        || query.radius <= 0.0
+        || !query.half_height_of_cylinder.is_finite()
+        || query.half_height_of_cylinder <= 0.0
+        || !query.displacement.is_finite()
+        || query.displacement.length() <= f64::EPSILON
+        || query.displacement.length() > MAX_CAPSULE_CAST_DISTANCE_M
+    {
+        return Err(PhysicsError::InvalidCapsuleCast(format!(
+            "pose and dimensions must be finite and normalized, dimensions must be positive, and displacement must be in (0, {MAX_CAPSULE_CAST_DISTANCE_M}] meters"
+        )));
+    }
+    if let Some(body_id) = &query.ignore_body_id
+        && !specs.contains_key(body_id)
+    {
+        return Err(PhysicsError::InvalidCapsuleCast(format!(
+            "ignored body {body_id} does not exist"
+        )));
     }
     Ok(())
 }
