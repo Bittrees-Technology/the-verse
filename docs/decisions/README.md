@@ -14,5 +14,6 @@ ADRs capture durable choices and their consequences.
 | [0008](ADR-0008-emergency-pause.md) | Narrow, non-expiring emergency pause | Accepted |
 | [0009](ADR-0009-p0-network-protocol.md) | P0 JSON WebSocket protocol and complete snapshots | Accepted |
 | [0010](ADR-0010-committed-physics-outcomes.md) | Jolt live solving with committed canonical physics outcomes | Accepted |
+| [0011](ADR-0011-dirty-voxel-collision-chunks.md) | Atomic dirty-chunk replacement for derived voxel collision | Accepted |
 
 Status values: Proposed, Accepted, Superseded, Rejected.

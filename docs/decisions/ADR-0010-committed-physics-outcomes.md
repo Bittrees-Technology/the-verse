@@ -12,11 +12,13 @@ Use Jolt Physics behind an isolated Rust adapter for the live authoritative cont
 
 Before a physics batch becomes visible, the worker sorts stable body and collider identifiers, applies server-approved forces, advances a bounded number of fixed single-thread steps, and validates finite bounded output. It then quantizes and records the step count, fractional 60 Hz phase, ordered body poses, linear and angular velocities, and substep-indexed contacts in one canonical `PhysicsStepCommitted` event. A future version of the same atomic outcome bundle will add collision-derived damage and topology after solved contact data is available.
 
-Event replay applies the committed outcomes exactly and does not run Jolt. After snapshot load and journal replay, the worker reconstructs derived Jolt bodies from canonical state. A content-manifest and schema version pins the mass, collision, material, quantization, and timestep rules used to interpret the event.
+Event replay applies the committed outcomes exactly and does not run Jolt. After snapshot load and journal replay, the worker reconstructs derived Jolt bodies from canonical state. Live commit processing rebuilds or reconciles derived Jolt state at the operation-specific boundary. A content-manifest and schema version pins the mass, collision, material, quantization, and timestep rules used to interpret the event.
 
 Event schema 4 commits native Jolt manifold identity, canonical began/persisted lifecycle, integer closing speed, exact integer reduced translational mass, and explicitly named pairwise estimated normal impulse. The reduced mass ignores contact direction, lever arm, and rotational inertia and therefore remains non-damage telemetry. World schema 9 persists the active-pair set so rebuilding derived Jolt state after each commit cannot manufacture a second canonical onset. Content `p0.7.2` replaces floating block-mass definitions with exact grams.
 
 Jolt invokes the public contact listener before constraint solving. Its `EstimateCollisionResponse` result is not the final applied solver impulse and can diverge during multi-body contact. Collision-derived damage and topology are therefore intentionally not claimed. That work requires a license-compatible Jolt/JoltC fork with a bounded post-solve applied-impulse callback and a separate winning-CCD path, followed by another versioned outcome schema.
+
+Content schema 5 and manifest `p0.7.3` partition derived voxel collision into stable eight-cell chunk bodies under [ADR-0011](ADR-0011-dirty-voxel-collision-chunks.md). The event and world payload shapes remain unchanged; their explicit content version rejects older single-body contact identities.
 
 ## Consequences
 

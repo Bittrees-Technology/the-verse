@@ -13,7 +13,7 @@ This checkpoint targets F-005, F-006, F-007, and F-010 and the acceptance eviden
 1. Grid clients submit bounded control, tool, and construction intents. They never submit a grid pose, velocity, contact, damage amount, or split result. The current P0 character client still proposes an absolute position that is range-, planet-, voxel-, and grid-collision checked; input-only character simulation remains required.
 2. The server owns collision shapes, mass, inertia, friction, restitution, force application, anchoring, contact damage, and grid separation.
 3. Completed blocks and physical inventory contribute to body mass. Incomplete frames are represented consistently but do not gain completed functional behavior.
-4. Static voxel collision is derived from canonical occupied cells. Render edits are dirty-chunk scoped. The current physics adapter atomically rebuilds the complete static compound after a voxel edit; dirty collision-body replacement remains required.
+4. Static voxel collision is derived from canonical occupied cells. Content pins 8×8×8-cell collision chunks with Euclidean floor ownership, stable chunk-body and cell-collider identities, and chunk-local child poses. The current physics adapter atomically rebuilds the complete static compound after a voxel edit; [ADR-0011](../decisions/ADR-0011-dirty-voxel-collision-chunks.md) defines the required dirty collision-body replacement.
 5. Anchoring converts a valid voxel-connected grid to an immovable body. Removing its final valid anchor returns it to dynamic eligibility without teleporting it.
 6. Player motion is swept or subdivided against authoritative voxel and grid volumes so a series of individually valid intents cannot tunnel through matter.
 
@@ -22,15 +22,16 @@ This checkpoint targets F-005, F-006, F-007, and F-010 and the acceptance eviden
 1. The simulation advances with a fixed timestep and a bounded catch-up budget.
 2. The content manifest pins an integer 60 Hz schedule. Each committed batch records its solver-step count, the remaining fractional step phase, and the originating substep for every contact; replay advances the canonical tick by the recorded count and restart resumes the recorded phase.
 3. Stable body and collider identifiers are sorted before insertion and before canonical outcomes are recorded.
-4. Live physics may use floating-point Jolt calculations, but canonical committed values are finite, bounded, and quantized at the event boundary.
-5. The P0 proof uses a deterministic single-thread solver configuration. Parallel production stepping requires a later benchmark and replay decision.
-6. Sleeping bodies remain stable. Low-speed contact must not cause unbounded jitter, energy gain, or anchor drift.
+4. Replacing one dirty voxel chunk must not recreate unrelated native bodies. Removed collider pairs are deleted from canonical active-contact state in the mining event; surviving stable pairs retain their canonical lifecycle.
+5. Live physics may use floating-point Jolt calculations, but canonical committed values are finite, bounded, and quantized at the event boundary.
+6. The P0 proof uses a deterministic single-thread solver configuration. Parallel production stepping requires a later benchmark and replay decision.
+7. Sleeping bodies remain stable. Low-speed contact must not cause unbounded jitter, energy gain, or anchor drift.
 
 ## Recovery contract
 
-The live solver is derived state. Each accepted tick records ordered, quantized transforms, velocities, native manifold telemetry, canonical contact lifecycle, exact integer reduced translational mass, and an explicitly labeled pairwise estimated impulse. Reduced translational mass ignores contact direction, lever arm, and rotational inertia; it is not damage evidence. Recovery applies committed outcomes rather than attempting to reproduce an earlier floating-point collision. After every live commit and after recovery, the server rebuilds Jolt bodies from the recovered canonical snapshot. World schema 9 preserves active pairs across that rebuild. Collision-driven damage and topology outcomes require a later event-schema revision after applied post-solver impulse data is available.
+The live solver is derived state. Each accepted tick records ordered, quantized transforms, velocities, native manifold telemetry, canonical contact lifecycle, exact integer reduced translational mass, and an explicitly labeled pairwise estimated impulse. Reduced translational mass ignores contact direction, lever arm, and rotational inertia; it is not damage evidence. Recovery applies committed outcomes rather than attempting to reproduce an earlier floating-point collision. During live commit processing, the server reconciles derived Jolt state to candidate or canonical state at the operation's defined atomic boundary: physics-step outcomes may rebuild dynamic bodies as required, while voxel edits publish ADR-0011 dirty replacement before journal append. Recovery performs a complete derived-scene rebuild. World schema 9 preserves active pairs across reconciliation. Collision-driven damage and topology outcomes require a later event-schema revision after applied post-solver impulse data is available.
 
-An interruption before the journal commit retains the prior state. An interruption after the durable commit recovers the new state. Neither path may duplicate damage, blocks, inventory, or grid identities.
+An interruption before the journal commit retains the prior state. An interruption after the durable commit recovers the new state. A dirty-chunk failure before native publication preserves the prior usable scene; a persistence failure after native publication halts writes until recovery derives the scene from durable state. Neither path may duplicate damage, blocks, inventory, or grid identities.
 
 ## Current checkpoint evidence
 
@@ -56,7 +57,7 @@ Still required for P0.7 acceptance:
 - An anchored grid does not move under ordinary control or contact forces.
 - Removing the last valid anchor creates one eligible dynamic body with conserved blocks and inventory.
 - An impact above the configured resistance produces server-owned damage; any resulting split conserves topology and inventories.
-- Mining a surface cell removes its collider after the accepted edit and rebuilds only influenced chunks.
+- Mining a surface cell removes its collider and any stale active pair containing it, atomically replaces only its owning collision chunk, preserves every surviving pair and unrelated body state, and recovers the same identities after restart. P0 tests the candidate voxel field with the canonical anchor predicate and rejects removing a currently anchored grid's final support without mutating world, scene, or journal; the player must release that anchor first.
 - Restart during a physics commit recovers either the complete prior tick or the complete committed tick.
 - macOS and Ubuntu reports publish tick time by dynamic-body and completed-block count.
 

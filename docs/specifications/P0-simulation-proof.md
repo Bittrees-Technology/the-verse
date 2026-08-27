@@ -231,7 +231,7 @@ Still required for checkpoint acceptance:
 - Dirty collision-body replacement after voxel edits.
 - Subprocess crash-boundary, edit-remesh, Ubuntu, Linux-artifact, network, and scaling evidence.
 
-The complete contract is [P0.7 server-authoritative contact physics](../gameplay/contact-physics.md), with recovery rationale in [ADR-0010](../decisions/ADR-0010-committed-physics-outcomes.md).
+The complete contract is [P0.7 server-authoritative contact physics](../gameplay/contact-physics.md), with recovery rationale in [ADR-0010](../decisions/ADR-0010-committed-physics-outcomes.md) and dirty-collision rules in [ADR-0011](../decisions/ADR-0011-dirty-voxel-collision-chunks.md).
 
 ## Exit decision
 
