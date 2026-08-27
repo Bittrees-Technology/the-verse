@@ -201,6 +201,46 @@ pub enum RuntimeError {
     CanonicalInvariant(String),
 }
 
+/// The strongest network-visible state class committed while advancing
+/// authoritative time. Structural state subsumes motion because a complete
+/// snapshot must precede any later lightweight motion state.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AdvanceImpact {
+    #[default]
+    None,
+    Motion,
+    Structural,
+}
+
+impl AdvanceImpact {
+    #[must_use]
+    pub const fn combine(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Structural, _) | (_, Self::Structural) => Self::Structural,
+            (Self::Motion, _) | (_, Self::Motion) => Self::Motion,
+            (Self::None, Self::None) => Self::None,
+        }
+    }
+}
+
+/// Result of one elapsed-time advance. Runtime callers that only need the
+/// historical changed/unchanged contract may continue using [`Runtime::advance`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AdvanceOutcome {
+    pub impact: AdvanceImpact,
+}
+
+impl AdvanceOutcome {
+    #[must_use]
+    pub const fn changed(self) -> bool {
+        !matches!(self.impact, AdvanceImpact::None)
+    }
+
+    fn record(&mut self, impact: AdvanceImpact) {
+        self.impact = self.impact.combine(impact);
+    }
+}
+
 #[derive(Debug)]
 pub struct Runtime {
     store: Store,
@@ -562,6 +602,14 @@ impl Runtime {
     }
 
     pub fn advance(&mut self, delta_millis: u16) -> Result<bool, RuntimeError> {
+        self.advance_with_outcome(delta_millis)
+            .map(AdvanceOutcome::changed)
+    }
+
+    pub fn advance_with_outcome(
+        &mut self,
+        delta_millis: u16,
+    ) -> Result<AdvanceOutcome, RuntimeError> {
         if self.halted {
             return Err(RuntimeError::Halted);
         }
@@ -586,7 +634,7 @@ impl Runtime {
         });
         let physics_active = moving_grid || player_physics_active;
         let delta_millis = delta_millis.clamp(1, 250);
-        let mut changed = false;
+        let mut outcome = AdvanceOutcome::default();
         if physics_active {
             let fixed_step_hz = content::manifest().physics.fixed_step_hz;
             self.physics_step_phase = self
@@ -758,7 +806,7 @@ impl Runtime {
                 {
                     self.physics_full_rebuilds += 1;
                 }
-                changed = true;
+                outcome.record(AdvanceImpact::Motion);
             }
         }
 
@@ -818,7 +866,7 @@ impl Runtime {
                     continue;
                 };
                 self.commit_system_event(payload)?;
-                changed = true;
+                outcome.record(AdvanceImpact::Structural);
             }
         }
 
@@ -842,10 +890,10 @@ impl Runtime {
                     continue;
                 };
                 self.commit_system_event(payload)?;
-                changed = true;
+                outcome.record(AdvanceImpact::Structural);
             }
         }
-        Ok(changed)
+        Ok(outcome)
     }
 
     fn commit_system_event(&mut self, payload: EventPayload) -> Result<(), RuntimeError> {
@@ -6293,6 +6341,56 @@ mod tests {
         for _ in 0..seconds * 4 {
             runtime.advance(250).expect("authoritative second advances");
         }
+    }
+
+    #[test]
+    fn advance_outcome_classifies_motion_and_life_support() {
+        let mut motion_runtime = runtime();
+        let player = motion_runtime.state().player.primary();
+        let movement_epoch = player.movement_epoch;
+        let input_sequence = player.last_received_input_sequence + 1;
+        motion_runtime
+            .execute_next_for_fixture(&ClientMessage::SetPlayerControl {
+                operation_sequence: 0,
+                operation_id: "advance-impact-motion".into(),
+                movement_epoch,
+                input_sequence,
+                linear_input: Vec3::new(0.0, 0.0, -1.0),
+                angular_input: Vec3::ZERO,
+                boost: false,
+                dampeners: true,
+                jump: false,
+            })
+            .expect("physics control commits");
+        assert_eq!(
+            motion_runtime
+                .advance_with_outcome(17)
+                .expect("physics advances")
+                .impact,
+            AdvanceImpact::Motion
+        );
+
+        let mut life_support_runtime = runtime();
+        for _ in 0..3 {
+            assert_eq!(
+                life_support_runtime
+                    .advance_with_outcome(250)
+                    .expect("partial life-support interval advances")
+                    .impact,
+                AdvanceImpact::None
+            );
+        }
+        assert_eq!(
+            life_support_runtime
+                .advance_with_outcome(250)
+                .expect("life-support transition advances")
+                .impact,
+            AdvanceImpact::Structural
+        );
+        assert_eq!(
+            AdvanceImpact::Motion.combine(AdvanceImpact::Structural),
+            AdvanceImpact::Structural
+        );
     }
 
     #[test]
