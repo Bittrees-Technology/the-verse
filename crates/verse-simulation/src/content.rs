@@ -107,6 +107,63 @@ fn validate_voxel_collision_chunk_edge_cells(edge_cells: u16) -> Result<(), &'st
     }
 }
 
+fn validate_character(definition: &CharacterDefinition) -> Result<(), &'static str> {
+    if !definition.mass_kg.is_finite() || definition.mass_kg <= 0.0 {
+        return Err("character mass must be finite and positive");
+    }
+    if !definition.collision_radius_m.is_finite() || definition.collision_radius_m <= 0.0 {
+        return Err("character collision radius must be finite and positive");
+    }
+    if definition.control_lease_ticks == 0 {
+        return Err("character control lease must be positive");
+    }
+    if !definition.thrust_acceleration_m_s2.is_finite()
+        || definition.thrust_acceleration_m_s2 <= 0.0
+    {
+        return Err("character thrust acceleration must be finite and positive");
+    }
+    if !definition.boost_acceleration_m_s2.is_finite()
+        || definition.boost_acceleration_m_s2 <= definition.thrust_acceleration_m_s2
+    {
+        return Err("character boost acceleration must be finite and exceed thrust acceleration");
+    }
+    if !definition.linear_dampener_acceleration_m_s2.is_finite()
+        || definition.linear_dampener_acceleration_m_s2 <= 0.0
+    {
+        return Err("character linear dampener acceleration must be finite and positive");
+    }
+    if !definition
+        .angular_acceleration_radians_per_second_squared
+        .is_finite()
+        || definition.angular_acceleration_radians_per_second_squared <= 0.0
+    {
+        return Err("character angular acceleration must be finite and positive");
+    }
+    if !definition
+        .angular_dampener_acceleration_radians_per_second_squared
+        .is_finite()
+        || definition.angular_dampener_acceleration_radians_per_second_squared <= 0.0
+    {
+        return Err("character angular dampener acceleration must be finite and positive");
+    }
+    if !definition.maximum_speed_m_s.is_finite() || definition.maximum_speed_m_s <= 0.0 {
+        return Err("character maximum speed must be finite and positive");
+    }
+    if !definition.boost_maximum_speed_m_s.is_finite()
+        || definition.boost_maximum_speed_m_s <= definition.maximum_speed_m_s
+    {
+        return Err("character boost maximum speed must be finite and exceed maximum speed");
+    }
+    if !definition
+        .maximum_angular_speed_radians_per_second
+        .is_finite()
+        || definition.maximum_angular_speed_radians_per_second <= 0.0
+    {
+        return Err("character maximum angular speed must be finite and positive");
+    }
+    Ok(())
+}
+
 fn validate_survival(definition: &SurvivalDefinition) -> Result<(), &'static str> {
     let capacity = definition.suit_oxygen_capacity_milli;
     if capacity == 0 {
@@ -170,29 +227,7 @@ pub fn manifest() -> &'static ContentManifest {
         assert!(parsed.physics.control_torque_newton_meters > 0.0);
         assert!((0.0..=1.0).contains(&parsed.physics.friction));
         assert!((0.0..=1.0).contains(&parsed.physics.restitution));
-        assert!(parsed.character.mass_kg > 0.0);
-        assert!(parsed.character.collision_radius_m > 0.0);
-        assert!(parsed.character.control_lease_ticks > 0);
-        assert!(parsed.character.thrust_acceleration_m_s2 > 0.0);
-        assert!(
-            parsed.character.boost_acceleration_m_s2 > parsed.character.thrust_acceleration_m_s2
-        );
-        assert!(parsed.character.linear_dampener_acceleration_m_s2 > 0.0);
-        assert!(
-            parsed
-                .character
-                .angular_acceleration_radians_per_second_squared
-                > 0.0
-        );
-        assert!(
-            parsed
-                .character
-                .angular_dampener_acceleration_radians_per_second_squared
-                > 0.0
-        );
-        assert!(parsed.character.maximum_speed_m_s > 0.0);
-        assert!(parsed.character.boost_maximum_speed_m_s > parsed.character.maximum_speed_m_s);
-        assert!(parsed.character.maximum_angular_speed_radians_per_second > 0.0);
+        validate_character(&parsed.character).unwrap_or_else(|message| panic!("{message}"));
         assert_eq!(parsed.blocks.len(), 8, "every P0 block must be defined");
         assert_eq!(
             parsed.voxel_materials.len(),
@@ -281,6 +316,96 @@ mod tests {
             .expect("physics is an object")
             .remove("voxel_collision_chunk_edge_cells");
         assert!(serde_json::from_value::<ContentManifest>(json).is_err());
+    }
+
+    fn assert_character_rejected(
+        update: impl FnOnce(&mut CharacterDefinition),
+        expected: &'static str,
+    ) {
+        let mut character = manifest().character.clone();
+        update(&mut character);
+        assert_eq!(validate_character(&character), Err(expected));
+    }
+
+    #[test]
+    fn character_mass_radius_and_control_lease_are_validated() {
+        for invalid in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_character_rejected(
+                |character| character.mass_kg = invalid,
+                "character mass must be finite and positive",
+            );
+            assert_character_rejected(
+                |character| character.collision_radius_m = invalid,
+                "character collision radius must be finite and positive",
+            );
+        }
+        assert_character_rejected(
+            |character| character.control_lease_ticks = 0,
+            "character control lease must be positive",
+        );
+    }
+
+    #[test]
+    fn character_linear_acceleration_and_speed_bounds_are_validated() {
+        for invalid in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_character_rejected(
+                |character| character.thrust_acceleration_m_s2 = invalid,
+                "character thrust acceleration must be finite and positive",
+            );
+            assert_character_rejected(
+                |character| character.linear_dampener_acceleration_m_s2 = invalid,
+                "character linear dampener acceleration must be finite and positive",
+            );
+            assert_character_rejected(
+                |character| character.maximum_speed_m_s = invalid,
+                "character maximum speed must be finite and positive",
+            );
+        }
+
+        for invalid in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_character_rejected(
+                |character| character.boost_acceleration_m_s2 = invalid,
+                "character boost acceleration must be finite and exceed thrust acceleration",
+            );
+            assert_character_rejected(
+                |character| character.boost_maximum_speed_m_s = invalid,
+                "character boost maximum speed must be finite and exceed maximum speed",
+            );
+        }
+        assert_character_rejected(
+            |character| {
+                character.boost_acceleration_m_s2 = character.thrust_acceleration_m_s2;
+            },
+            "character boost acceleration must be finite and exceed thrust acceleration",
+        );
+        assert_character_rejected(
+            |character| {
+                character.boost_maximum_speed_m_s = character.maximum_speed_m_s;
+            },
+            "character boost maximum speed must be finite and exceed maximum speed",
+        );
+    }
+
+    #[test]
+    fn character_angular_acceleration_and_speed_bounds_are_validated() {
+        for invalid in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_character_rejected(
+                |character| {
+                    character.angular_acceleration_radians_per_second_squared = invalid;
+                },
+                "character angular acceleration must be finite and positive",
+            );
+            assert_character_rejected(
+                |character| {
+                    character.angular_dampener_acceleration_radians_per_second_squared = invalid;
+                },
+                "character angular dampener acceleration must be finite and positive",
+            );
+            assert_character_rejected(
+                |character| character.maximum_angular_speed_radians_per_second = invalid,
+                "character maximum angular speed must be finite and positive",
+            );
+        }
     }
 
     #[test]
