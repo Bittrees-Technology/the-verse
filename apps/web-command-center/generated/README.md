@@ -8,7 +8,10 @@ platform-independent browser distribution of the Apache-2.0
 wasm-bindgen `0.2.127` through `tools/ci/build-browser-verifier.sh`. The
 canonical checked-in WebAssembly bytes are produced on
 `x86_64-unknown-linux-gnu`; Rust/LLVM may assign a different function order
-when producing an equivalent module on another host architecture.
+when producing an equivalent module on another host architecture. The build
+also remaps every checkout root to `/the-verse` and rejects ambient compiler
+flags so the runner's absolute workspace path cannot change code-generation
+identity.
 
 They are committed so a source checkout and packaged authoritative server can
 serve the fail-closed browser command center without installing a Rust-to-WASM
