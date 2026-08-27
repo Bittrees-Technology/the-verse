@@ -19,13 +19,14 @@ func _run() -> void:
 	_test_life_state_reset()
 	_test_bound_player_roster_selection()
 	_test_short_roll_taps_and_idle_silence()
+	_test_exact_tool_targeting()
 	if not failures.is_empty():
 		for failure in failures:
 			printerr("VERSE_NATIVE_IMPAIRMENT_FAILED %s" % failure)
 		quit(1)
 		return
 	print(
-		"VERSE_NATIVE_IMPAIRMENT_OK queued_ack=ordered motion=monotonic corrections=bounded menu=neutral_prediction lifecycle=reset buffers=bounded roll_tap=durable idle=silent rebuild=none"
+		"VERSE_NATIVE_IMPAIRMENT_OK queued_ack=ordered motion=monotonic corrections=bounded menu=neutral_prediction lifecycle=reset buffers=bounded roll_tap=durable idle=silent rebuild=none targeting=closest_hit"
 	)
 	quit(0)
 
@@ -147,6 +148,255 @@ func _motion_message(
 		"player": player,
 		"players": [player],
 		"grids": grids,
+	}
+
+
+func _test_exact_tool_targeting() -> void:
+	var client := _new_client()
+	var face_normals: Array[Vector3] = [
+		Vector3.RIGHT,
+		Vector3.LEFT,
+		Vector3.UP,
+		Vector3.DOWN,
+		Vector3.BACK,
+		Vector3.FORWARD,
+	]
+	client.set("grid_lookup", {
+		"grid-faces": _target_grid(
+			"grid-faces", Vector3.ZERO, Quaternion.IDENTITY,
+			[_target_block("block-faces", Vector3i.ZERO)]
+		),
+	})
+	for expected_normal in face_normals:
+		var origin := expected_normal * 2.0
+		var hit: Dictionary = client.call(
+			"_closest_tool_hit", origin, -expected_normal, 9.0
+		)
+		_check(String(hit.get("kind", "")) == "block", "six-face block selected")
+		_check(
+			is_equal_approx(float(hit.get("distance", -1.0)), 1.5),
+			"six-face exact surface distance"
+		)
+		_check(
+			(hit.get("local_normal", Vector3.ZERO) as Vector3).is_equal_approx(
+				expected_normal
+			),
+			"six-face local entry normal"
+		)
+		_check(
+			(hit.get("hit_position", Vector3.ZERO) as Vector3).is_equal_approx(
+				expected_normal * 0.5
+			),
+			"six-face surface point"
+		)
+	client.set("grid_lookup", {
+		"grid-corner": _target_grid(
+			"grid-corner", Vector3.ZERO, Quaternion.IDENTITY,
+			[_target_block("block-corner", Vector3i(2, 2, 0))]
+		),
+	})
+	var corner_hit: Dictionary = client.call(
+		"_closest_tool_hit", Vector3.ZERO, Vector3(1.0, 1.0, 0.0), 9.0
+	)
+	_check(
+		(corner_hit.get("local_normal", Vector3.ZERO) as Vector3).is_equal_approx(
+			Vector3.LEFT
+		),
+		"equal entry-axis tie resolves to X face"
+	)
+
+	var rotation := Quaternion(Vector3.UP, PI * 0.5)
+	var rotation_basis := Basis(rotation)
+	var rotated_center := rotation_basis * Vector3(2.0, 0.0, 0.0)
+	var rotated_world_normal := (rotation_basis * Vector3.RIGHT).normalized()
+	client.set("grid_lookup", {
+		"grid-rotated": _target_grid(
+			"grid-rotated", Vector3.ZERO, rotation,
+			[_target_block("block-rotated", Vector3i(2, 0, 0))]
+		),
+	})
+	var rotated_hit: Dictionary = client.call(
+		"_closest_tool_hit",
+		rotated_center + rotated_world_normal * 2.0,
+		-rotated_world_normal,
+		9.0
+	)
+	_check(
+		(rotated_hit.get("local_normal", Vector3.ZERO) as Vector3).is_equal_approx(
+			Vector3.RIGHT
+		),
+		"rotated grid keeps local face normal"
+	)
+	_check(
+		(rotated_hit.get("world_normal", Vector3.ZERO) as Vector3).is_equal_approx(
+			rotated_world_normal
+		),
+		"rotated grid emits world face normal"
+	)
+	client.set("target_block", rotated_hit)
+	_check(
+		(client.call("_build_coordinate") as Vector3i) == Vector3i(3, 0, 0),
+		"rotated adjacency uses exact local hit face"
+	)
+
+	client.set("voxel_lookup", {"0,0,2": {"material": "rock"}})
+	client.set("grid_lookup", {
+		"grid-behind": _target_grid(
+			"grid-behind", Vector3.ZERO, Quaternion.IDENTITY,
+			[_target_block("block-behind", Vector3i(0, 0, 4))]
+		),
+	})
+	var voxel_first: Dictionary = client.call(
+		"_closest_tool_hit", Vector3.ZERO, Vector3.BACK, 9.0
+	)
+	_check(String(voxel_first.get("kind", "")) == "voxel", "voxel occludes farther block")
+
+	client.set("voxel_lookup", {"0,0,4": {"material": "rock"}})
+	client.set("grid_lookup", {
+		"grid-front": _target_grid(
+			"grid-front", Vector3.ZERO, Quaternion.IDENTITY,
+			[_target_block("block-front", Vector3i(0, 0, 2))]
+		),
+	})
+	var block_first: Dictionary = client.call(
+		"_closest_tool_hit", Vector3.ZERO, Vector3.BACK, 9.0
+	)
+	_check(String(block_first.get("kind", "")) == "block", "block occludes farther voxel")
+
+	client.set("voxel_lookup", {"0,0,2": {"material": "rock"}})
+	var exact_tie: Dictionary = client.call(
+		"_closest_tool_hit", Vector3.ZERO, Vector3.BACK, 9.0
+	)
+	_check(String(exact_tie.get("kind", "")) == "block", "block wins exact voxel tie")
+
+	client.call("_set_tool_targets_from_hit", voxel_first)
+	_check(client.get("target_voxel") == Vector3i(0, 0, 2), "voxel target derived")
+	_check((client.get("target_block") as Dictionary).is_empty(), "voxel excludes block target")
+	client.call("_set_tool_targets_from_hit", block_first)
+	_check(client.get("target_voxel") == null, "block excludes voxel target")
+	_check(not (client.get("target_block") as Dictionary).is_empty(), "block target derived")
+
+	client.set("voxel_lookup", {})
+	client.set("grid_lookup", {
+		"grid-inside": _target_grid(
+			"grid-inside", Vector3.ZERO, Quaternion.IDENTITY,
+			[_target_block("block-inside", Vector3i.ZERO)]
+		),
+	})
+	var inside_hit: Dictionary = client.call(
+		"_closest_tool_hit", Vector3.ZERO, Vector3.BACK, 9.0
+	)
+	client.call("_set_tool_targets_from_hit", inside_hit)
+	_check(is_zero_approx(float(inside_hit.get("distance", -1.0))), "inside geometry occludes at zero")
+	_check(not bool(inside_hit.get("has_face", true)), "inside geometry has no entry face")
+	_check(client.get("target_voxel") == null, "inside hit cannot mine")
+	_check((client.get("target_block") as Dictionary).is_empty(), "inside hit cannot modify block")
+
+	client.set("grid_lookup", {
+		"grid-range": _target_grid(
+			"grid-range", Vector3(0.0, 0.0, 0.5), Quaternion.IDENTITY,
+			[_target_block("block-range", Vector3i(0, 0, 9))]
+		),
+	})
+	var boundary_hit: Dictionary = client.call(
+		"_closest_tool_hit", Vector3.ZERO, Vector3.BACK, 9.0
+	)
+	_check(
+		String(boundary_hit.get("kind", "")) == "block"
+		and is_equal_approx(float(boundary_hit.get("distance", -1.0)), 9.0),
+		"surface exactly at range boundary is included"
+	)
+	client.set("grid_lookup", {
+		"grid-beyond": _target_grid(
+			"grid-beyond", Vector3(0.0, 0.0, 0.50001), Quaternion.IDENTITY,
+			[_target_block("block-beyond", Vector3i(0, 0, 9))]
+		),
+	})
+	var beyond_hit: Dictionary = client.call(
+		"_closest_tool_hit", Vector3.ZERO, Vector3.BACK, 9.0
+	)
+	_check(beyond_hit.is_empty(), "surface beyond range boundary is excluded")
+
+	client.set("grid_lookup", {
+		"grid-z": _target_grid(
+			"grid-z", Vector3.ZERO, Quaternion.IDENTITY,
+			[_target_block("block-z", Vector3i(0, 0, 2))]
+		),
+		"grid-a": _target_grid(
+			"grid-a", Vector3.ZERO, Quaternion.IDENTITY,
+			[_target_block("block-a", Vector3i(0, 0, 2))]
+		),
+	})
+	var stable_hit: Dictionary = client.call(
+		"_closest_tool_hit", Vector3.ZERO, Vector3.BACK, 9.0
+	)
+	_check(String(stable_hit.get("grid_id", "")) == "grid-a", "equal hit uses stable grid identity")
+	client.set("grid_lookup", {
+		"grid-blocks": _target_grid(
+			"grid-blocks", Vector3.ZERO, Quaternion.IDENTITY,
+			[
+				_target_block("block-z", Vector3i(0, 0, 2)),
+				_target_block("block-a", Vector3i(0, 0, 2)),
+			]
+		),
+	})
+	var stable_block_hit: Dictionary = client.call(
+		"_closest_tool_hit", Vector3.ZERO, Vector3.BACK, 9.0
+	)
+	_check(
+		String(stable_block_hit.get("block", {}).get("block_id", "")) == "block-a",
+		"equal hit uses stable block identity"
+	)
+	client.set("grid_lookup", {})
+	client.set("voxel_lookup", {
+		"1,0,0": {"material": "rock"},
+		"0,0,0": {"material": "rock"},
+	})
+	var stable_voxel_hit: Dictionary = client.call(
+		"_closest_tool_hit", Vector3(0.5, 0.0, 0.0), Vector3.BACK, 9.0
+	)
+	_check(
+		stable_voxel_hit.get("coordinate", Vector3i(99, 99, 99)) == Vector3i.ZERO,
+		"equal hit uses stable voxel coordinate identity"
+	)
+	client.set("voxel_lookup", {"0,0,0": {"material": "rock"}})
+	var parallel_boundary_hit: Dictionary = client.call(
+		"_closest_tool_hit", Vector3(0.5, 0.0, -4.0), Vector3.BACK, 9.0
+	)
+	_check(
+		parallel_boundary_hit.get("coordinate", Vector3i(99, 99, 99)) == Vector3i.ZERO,
+		"parallel boundary ray checks the voxel column on both sides"
+	)
+	_check(
+		absf(float(parallel_boundary_hit.get("distance", 0.0)) - 3.5) <= 0.000000001,
+		"parallel boundary voxel retains the exact surface distance"
+	)
+	client.free()
+
+
+func _target_grid(
+	_grid_id: String,
+	position: Vector3,
+	orientation: Quaternion,
+	blocks: Array
+) -> Dictionary:
+	return {
+		"position": _protocol_vec3(position),
+		"orientation": _protocol_quat(orientation),
+		"blocks": blocks,
+	}
+
+
+func _target_block(block_id: String, coordinate: Vector3i) -> Dictionary:
+	return {
+		"block_id": block_id,
+		"coordinate": {
+			"x": coordinate.x, "y": coordinate.y, "z": coordinate.z,
+		},
+		"kind": "structural",
+		"health": 100,
+		"max_health": 100,
+		"construction_complete": true,
 	}
 
 

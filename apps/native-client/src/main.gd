@@ -49,6 +49,9 @@ const PHYSICS_MAXIMUM_LINEAR_SPEED := 32.0
 const PHYSICS_MAXIMUM_ANGULAR_SPEED := 8.0
 const MOUSE_ANGULAR_INPUT_PER_PIXEL := 0.12
 const TARGET_RANGE := 9.0
+const TOOL_HIT_EPSILON := 0.000000001
+const TOOL_DIRECTION_EPSILON := 0.000000000001
+const TOOL_DDA_MAX_STEPS := 512
 const MINE_DURATION := 0.72
 const WELD_DURATION := 0.52
 const DAMAGE_DURATION := 0.46
@@ -126,6 +129,7 @@ var grid_node_lookup: Dictionary = {}
 var remote_player_nodes: Dictionary = {}
 var rendered_voxel_count := -1
 var selected_block_kind := "structural"
+var target_hit: Dictionary = {}
 var target_voxel: Variant = null
 var target_block: Dictionary = {}
 var recent_message := "Starting local universe connection…"
@@ -3060,20 +3064,30 @@ func _shortest_slerp(first: Quaternion, second: Quaternion, weight: float) -> Qu
 
 func _update_target() -> void:
 	if _local_player_incapacitated():
+		target_hit = {}
 		target_voxel = null
 		target_block = {}
 		target_highlight.visible = false
 		build_preview.visible = false
 		return
-	target_voxel = _raymarch_voxel()
-	target_block = _ray_target_block()
+	var origin := camera.global_position
+	var direction := -camera.global_transform.basis.z.normalized()
+	target_hit = _closest_tool_hit(origin, direction, TARGET_RANGE)
+	_set_tool_targets_from_hit(target_hit)
 	build_preview.visible = false
-	if target_voxel != null:
+	if target_hit.is_empty() or not bool(target_hit.get("has_face", false)):
+		target_highlight.visible = false
+	elif target_voxel != null:
 		target_highlight.visible = true
-		target_highlight.global_position = Vector3(target_voxel)
+		target_highlight.global_transform = Transform3D(
+			Basis.IDENTITY, Vector3(target_voxel)
+		)
 	elif not target_block.is_empty():
 		target_highlight.visible = true
-		target_highlight.global_position = target_block.get("world_position", Vector3.ZERO)
+		target_highlight.global_transform = Transform3D(
+			_grid_basis(target_block["grid"]),
+			target_block.get("world_position", Vector3.ZERO)
+		)
 	else:
 		target_highlight.visible = false
 	if build_mode and not target_block.is_empty() and not _block_needs_weld(target_block["block"]):
@@ -3591,51 +3605,327 @@ func _check_smoke_control_ack(player: Dictionary) -> void:
 	get_tree().quit(0)
 
 
-func _raymarch_voxel() -> Variant:
-	var origin := camera.global_position
-	var direction := -camera.global_transform.basis.z.normalized()
-	var last_coordinate := Vector3i(999999, 999999, 999999)
-	for index in 80:
-		var sample := origin + direction * (float(index) * TARGET_RANGE / 80.0)
-		var coordinate := Vector3i(
-			roundi(sample.x),
-			roundi(sample.y),
-			roundi(sample.z)
-		)
-		if coordinate == last_coordinate:
-			continue
-		last_coordinate = coordinate
-		if voxel_lookup.has(_coord_key(coordinate)):
-			return coordinate
-	return null
-
-
-func _ray_target_block() -> Dictionary:
-	var origin := camera.global_position
-	var direction := -camera.global_transform.basis.z.normalized()
-	var best: Dictionary = {}
-	var best_t := TARGET_RANGE + 1.0
-	for grid_id in grid_lookup:
-		var grid: Dictionary = grid_lookup[grid_id]
+func _closest_tool_hit(
+	origin: Vector3, direction: Vector3, maximum_distance := TARGET_RANGE
+) -> Dictionary:
+	if direction.length() <= TOOL_DIRECTION_EPSILON or maximum_distance < 0.0:
+		return {}
+	var ray_direction := direction.normalized()
+	var best := _raymarch_voxel_hit(origin, ray_direction, maximum_distance)
+	var grid_ids: Array = grid_lookup.keys()
+	grid_ids.sort()
+	for grid_id_value in grid_ids:
+		var grid_id := String(grid_id_value)
+		var grid: Dictionary = grid_lookup[grid_id_value]
 		var grid_position := _vec3(grid.get("position", {}))
 		var grid_basis := _grid_basis(grid)
-		for block in grid.get("blocks", []):
-			var local := _coord_vector(block.get("coordinate", {}))
-			var world := grid_position + grid_basis * local
-			var to_block := world - origin
-			var t := to_block.dot(direction)
-			if t <= 0.0 or t > TARGET_RANGE or t >= best_t:
+		var inverse_basis := grid_basis.inverse()
+		var local_origin := inverse_basis * (origin - grid_position)
+		var local_direction := inverse_basis * ray_direction
+		var blocks: Array = grid.get("blocks", []).duplicate()
+		blocks.sort_custom(func(first: Dictionary, second: Dictionary) -> bool:
+			return String(first.get("block_id", "")) < String(second.get("block_id", ""))
+		)
+		for block in blocks:
+			var local_center := _coord_vector(block.get("coordinate", {}))
+			var intersection := _ray_unit_box_hit(
+				local_origin, local_direction, local_center, maximum_distance
+			)
+			if intersection.is_empty():
 				continue
-			var perpendicular := (to_block - direction * t).length()
-			if perpendicular <= 0.68:
-				best_t = t
-				best = {
-					"grid_id": grid_id,
-					"grid": grid,
-					"block": block,
-					"world_position": world,
-				}
+			var local_normal: Vector3 = intersection.get("normal", Vector3.ZERO)
+			var distance := float(intersection.get("distance", 0.0))
+			var candidate := {
+				"kind": "block",
+				"distance": distance,
+				"has_face": not local_normal.is_zero_approx(),
+				"hit_position": origin + ray_direction * distance,
+				"local_normal": local_normal,
+				"world_normal": (grid_basis * local_normal).normalized()
+				if not local_normal.is_zero_approx()
+				else Vector3.ZERO,
+				"grid_id": grid_id,
+				"grid": grid,
+				"block": block,
+				"world_position": grid_position + grid_basis * local_center,
+			}
+			if _tool_hit_is_better(candidate, best):
+				best = candidate
 	return best
+
+
+func _raymarch_voxel_hit(
+	origin: Vector3, direction: Vector3, maximum_distance: float
+) -> Dictionary:
+	var touching := _origin_touching_voxel_hit(origin)
+	if not touching.is_empty():
+		return touching
+	var coordinate := _voxel_cell_at(origin)
+	var step := Vector3i(
+		_ray_axis_step(direction.x),
+		_ray_axis_step(direction.y),
+		_ray_axis_step(direction.z)
+	)
+	var next_crossing := Vector3(
+		_first_voxel_boundary_distance(origin.x, direction.x, coordinate.x, step.x),
+		_first_voxel_boundary_distance(origin.y, direction.y, coordinate.y, step.y),
+		_first_voxel_boundary_distance(origin.z, direction.z, coordinate.z, step.z)
+	)
+	var crossing_delta := Vector3(
+		_ray_crossing_delta(direction.x),
+		_ray_crossing_delta(direction.y),
+		_ray_crossing_delta(direction.z)
+	)
+	var best: Dictionary = {}
+	for _index in TOOL_DDA_MAX_STEPS:
+		for touched_coordinate in _parallel_boundary_voxel_cells(coordinate, origin, step):
+			if voxel_lookup.has(_coord_key(touched_coordinate)):
+				var intersection := _ray_unit_box_hit(
+					origin, direction, Vector3(touched_coordinate), maximum_distance
+				)
+				if not intersection.is_empty():
+					var normal: Vector3 = intersection.get("normal", Vector3.ZERO)
+					var distance := float(intersection.get("distance", 0.0))
+					var candidate := {
+						"kind": "voxel",
+						"distance": distance,
+						"has_face": not normal.is_zero_approx(),
+						"hit_position": origin + direction * distance,
+						"local_normal": normal,
+						"world_normal": normal,
+						"coordinate": touched_coordinate,
+					}
+					if _tool_hit_is_better(candidate, best):
+						best = candidate
+
+		var axis := _first_crossing_axis(next_crossing)
+		var next_distance := _vector_axis(next_crossing, axis)
+		if next_distance > maximum_distance + TOOL_HIT_EPSILON:
+			break
+		if (
+			not best.is_empty()
+			and next_distance > float(best.get("distance", 0.0)) + TOOL_HIT_EPSILON
+		):
+			break
+		coordinate = _step_coordinate_axis(coordinate, step, axis)
+		next_crossing = _advance_vector_axis(next_crossing, crossing_delta, axis)
+	return best
+
+
+func _origin_touching_voxel_hit(origin: Vector3) -> Dictionary:
+	var x_coordinates := _voxel_axis_origin_cells(origin.x)
+	var y_coordinates := _voxel_axis_origin_cells(origin.y)
+	var z_coordinates := _voxel_axis_origin_cells(origin.z)
+	var candidates: Array[Vector3i] = []
+	for x in x_coordinates:
+		for y in y_coordinates:
+			for z in z_coordinates:
+				var coordinate := Vector3i(int(x), int(y), int(z))
+				if voxel_lookup.has(_coord_key(coordinate)):
+					candidates.append(coordinate)
+	if candidates.is_empty():
+		return {}
+	candidates.sort_custom(func(first: Vector3i, second: Vector3i) -> bool:
+		return _voxel_coordinate_less(first, second)
+	)
+	var coordinate: Vector3i = candidates.front()
+	return {
+		"kind": "voxel",
+		"distance": 0.0,
+		"has_face": false,
+		"hit_position": origin,
+		"local_normal": Vector3.ZERO,
+		"world_normal": Vector3.ZERO,
+		"coordinate": coordinate,
+	}
+
+
+func _ray_unit_box_hit(
+	origin: Vector3, direction: Vector3, center: Vector3, maximum_distance: float
+) -> Dictionary:
+	var relative_origin := origin - center
+	var near_distance := -INF
+	var far_distance := INF
+	var entry_normal := Vector3.ZERO
+	for axis in 3:
+		var axis_origin := _vector_axis(relative_origin, axis)
+		var axis_direction := _vector_axis(direction, axis)
+		if absf(axis_direction) <= TOOL_DIRECTION_EPSILON:
+			if axis_origin < -0.5 or axis_origin > 0.5:
+				return {}
+			continue
+		var first := (-0.5 - axis_origin) / axis_direction
+		var second := (0.5 - axis_origin) / axis_direction
+		var axis_near := minf(first, second)
+		var axis_far := maxf(first, second)
+		var axis_normal := _axis_vector(axis) * (-1.0 if axis_direction > 0.0 else 1.0)
+		if axis_near > near_distance + TOOL_HIT_EPSILON:
+			near_distance = axis_near
+			entry_normal = axis_normal
+		far_distance = minf(far_distance, axis_far)
+		if near_distance > far_distance + TOOL_HIT_EPSILON:
+			return {}
+
+	if far_distance < -TOOL_HIT_EPSILON:
+		return {}
+	var distance := maxf(near_distance, 0.0)
+	if distance > maximum_distance + TOOL_HIT_EPSILON:
+		return {}
+	return {
+		"distance": distance,
+		"normal": entry_normal if distance > TOOL_HIT_EPSILON else Vector3.ZERO,
+	}
+
+
+func _tool_hit_is_better(candidate: Dictionary, current: Dictionary) -> bool:
+	if current.is_empty():
+		return true
+	var candidate_distance := float(candidate.get("distance", INF))
+	var current_distance := float(current.get("distance", INF))
+	if candidate_distance < current_distance - TOOL_HIT_EPSILON:
+		return true
+	if candidate_distance > current_distance + TOOL_HIT_EPSILON:
+		return false
+	var candidate_kind := String(candidate.get("kind", ""))
+	var current_kind := String(current.get("kind", ""))
+	if candidate_kind != current_kind:
+		return candidate_kind == "block"
+	if candidate_kind == "block":
+		var candidate_grid := String(candidate.get("grid_id", ""))
+		var current_grid := String(current.get("grid_id", ""))
+		if candidate_grid != current_grid:
+			return candidate_grid < current_grid
+		return (
+			String(candidate.get("block", {}).get("block_id", ""))
+			< String(current.get("block", {}).get("block_id", ""))
+		)
+	return _voxel_coordinate_less(
+		candidate.get("coordinate", Vector3i.ZERO),
+		current.get("coordinate", Vector3i.ZERO)
+	)
+
+
+func _set_tool_targets_from_hit(hit: Dictionary) -> void:
+	target_voxel = null
+	target_block = {}
+	if hit.is_empty() or not bool(hit.get("has_face", false)):
+		return
+	if String(hit.get("kind", "")) == "voxel":
+		target_voxel = hit.get("coordinate", null)
+	elif String(hit.get("kind", "")) == "block":
+		target_block = hit
+
+
+func _voxel_cell_at(point: Vector3) -> Vector3i:
+	return Vector3i(
+		floori(point.x + 0.5), floori(point.y + 0.5), floori(point.z + 0.5)
+	)
+
+
+func _voxel_axis_origin_cells(value: float) -> Array[int]:
+	var primary := floori(value + 0.5)
+	var coordinates: Array[int] = [primary]
+	if absf(value - (float(primary) - 0.5)) <= TOOL_DIRECTION_EPSILON:
+		coordinates.append(primary - 1)
+	coordinates.sort()
+	return coordinates
+
+
+func _parallel_boundary_voxel_cells(
+	coordinate: Vector3i, origin: Vector3, step: Vector3i
+) -> Array[Vector3i]:
+	var x_coordinates := _parallel_boundary_axis_cells(coordinate.x, origin.x, step.x)
+	var y_coordinates := _parallel_boundary_axis_cells(coordinate.y, origin.y, step.y)
+	var z_coordinates := _parallel_boundary_axis_cells(coordinate.z, origin.z, step.z)
+	var coordinates: Array[Vector3i] = []
+	for x in x_coordinates:
+		for y in y_coordinates:
+			for z in z_coordinates:
+				coordinates.append(Vector3i(int(x), int(y), int(z)))
+	coordinates.sort_custom(func(first: Vector3i, second: Vector3i) -> bool:
+		return _voxel_coordinate_less(first, second)
+	)
+	return coordinates
+
+
+func _parallel_boundary_axis_cells(
+	coordinate: int, origin: float, step: int
+) -> Array[int]:
+	if (
+		step == 0
+		and absf((origin + 0.5) - roundf(origin + 0.5)) <= TOOL_DIRECTION_EPSILON
+	):
+		return [coordinate - 1, coordinate]
+	return [coordinate]
+
+
+func _ray_axis_step(value: float) -> int:
+	if value > TOOL_DIRECTION_EPSILON:
+		return 1
+	if value < -TOOL_DIRECTION_EPSILON:
+		return -1
+	return 0
+
+
+func _first_voxel_boundary_distance(
+	origin: float, direction: float, coordinate: int, step: int
+) -> float:
+	if step == 0:
+		return INF
+	var boundary := float(coordinate) + (0.5 if step > 0 else -0.5)
+	return (boundary - origin) / direction
+
+
+func _ray_crossing_delta(direction: float) -> float:
+	return INF if absf(direction) <= TOOL_DIRECTION_EPSILON else absf(1.0 / direction)
+
+
+func _first_crossing_axis(crossing: Vector3) -> int:
+	if crossing.x <= crossing.y and crossing.x <= crossing.z:
+		return 0
+	if crossing.y <= crossing.z:
+		return 1
+	return 2
+
+
+func _vector_axis(value: Vector3, axis: int) -> float:
+	if axis == 0:
+		return value.x
+	if axis == 1:
+		return value.y
+	return value.z
+
+
+func _axis_vector(axis: int) -> Vector3:
+	if axis == 0:
+		return Vector3.RIGHT
+	if axis == 1:
+		return Vector3.UP
+	return Vector3.BACK
+
+
+func _step_coordinate_axis(coordinate: Vector3i, step: Vector3i, axis: int) -> Vector3i:
+	if axis == 0:
+		return coordinate + Vector3i(step.x, 0, 0)
+	if axis == 1:
+		return coordinate + Vector3i(0, step.y, 0)
+	return coordinate + Vector3i(0, 0, step.z)
+
+
+func _advance_vector_axis(value: Vector3, delta: Vector3, axis: int) -> Vector3:
+	if axis == 0:
+		return Vector3(value.x + delta.x, value.y, value.z)
+	if axis == 1:
+		return Vector3(value.x, value.y + delta.y, value.z)
+	return Vector3(value.x, value.y, value.z + delta.z)
+
+
+func _voxel_coordinate_less(first: Vector3i, second: Vector3i) -> bool:
+	if first.x != second.x:
+		return first.x < second.x
+	if first.y != second.y:
+		return first.y < second.y
+	return first.z < second.z
 
 
 func _update_tool_action(delta: float) -> void:
@@ -3753,14 +4043,10 @@ func _update_action_feedback() -> void:
 
 
 func _active_action_position() -> Vector3:
-	if action_target_key.begins_with("mine:") and target_voxel != null:
-		return Vector3(target_voxel)
-	if action_target_key.begins_with("weld:") and not target_block.is_empty():
-		return target_block.get("world_position", camera.global_position - camera.basis.z * 2.0)
-	if action_target_key.begins_with("build:"):
-		return build_preview.global_position
-	if not target_block.is_empty():
-		return target_block.get("world_position", camera.global_position - camera.basis.z * 2.0)
+	if not target_hit.is_empty():
+		return target_hit.get(
+			"hit_position", camera.global_position - camera.global_transform.basis.z * 2.0
+		)
 	return camera.global_position - camera.basis.z * 2.0
 
 
@@ -3823,21 +4109,14 @@ func _weld_target_block() -> void:
 func _build_coordinate() -> Vector3i:
 	if target_block.is_empty():
 		return Vector3i.ZERO
-	var grid: Dictionary = target_block["grid"]
 	var block: Dictionary = target_block["block"]
 	var current := _coord_i(block.get("coordinate", {}))
-	var offset: Vector3i
-	if selected_block_kind == "anchor":
-		var grid_position := _vec3(grid.get("position", {}))
-		var basis := _grid_basis(grid)
-		var toward_asteroid := basis.inverse() * (-grid_position)
-		offset = _dominant_axis(toward_asteroid)
-	else:
-		var basis := _grid_basis(grid)
-		var toward_camera: Vector3 = basis.inverse() * (
-			camera.global_position - target_block.get("world_position", Vector3.ZERO)
-		)
-		offset = _dominant_axis(toward_camera)
+	var local_normal: Vector3 = target_block.get("local_normal", Vector3.ZERO)
+	if local_normal.is_zero_approx():
+		return current
+	var offset := Vector3i(
+		roundi(local_normal.x), roundi(local_normal.y), roundi(local_normal.z)
+	)
 	return current + offset
 
 

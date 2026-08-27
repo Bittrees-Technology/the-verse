@@ -7,6 +7,7 @@ mod engine;
 mod event;
 mod model;
 mod persistence;
+mod targeting;
 
 pub use content::ContentManifest;
 pub use engine::{IntentError, Runtime, RuntimeError};
