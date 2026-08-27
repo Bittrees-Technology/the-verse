@@ -40,6 +40,7 @@ pub struct PhysicsDefinition {
     pub fixed_step_hz: u16,
     pub fixed_delta_seconds: f32,
     pub collision_substeps: i32,
+    pub voxel_collision_chunk_edge_cells: u16,
     pub control_force_newtons: f64,
     pub control_torque_newton_meters: f64,
     pub linear_dampener_newtons_per_mps: f64,
@@ -67,12 +68,20 @@ pub struct ComponentRecipe {
     pub component_output: u64,
 }
 
+fn validate_voxel_collision_chunk_edge_cells(edge_cells: u16) -> Result<(), &'static str> {
+    if edge_cells == 8 {
+        Ok(())
+    } else {
+        Err("P0.7 collision chunks must be 8×8×8 cells")
+    }
+}
+
 pub fn manifest() -> &'static ContentManifest {
     static MANIFEST: OnceLock<ContentManifest> = OnceLock::new();
     MANIFEST.get_or_init(|| {
         let parsed: ContentManifest =
             serde_json::from_str(P0_CONTENT).expect("embedded P0 content must be valid JSON");
-        assert_eq!(parsed.schema_version, 4, "unsupported P0 content schema");
+        assert_eq!(parsed.schema_version, 5, "unsupported P0 content schema");
         assert_eq!(
             parsed.license, "AGPL-3.0-or-later",
             "content definition license must be explicit"
@@ -80,6 +89,8 @@ pub fn manifest() -> &'static ContentManifest {
         assert!(parsed.physics.fixed_delta_seconds > 0.0);
         assert_eq!(parsed.physics.fixed_step_hz, 60);
         assert!((1..=16).contains(&parsed.physics.collision_substeps));
+        validate_voxel_collision_chunk_edge_cells(parsed.physics.voxel_collision_chunk_edge_cells)
+            .unwrap_or_else(|message| panic!("{message}"));
         assert!(parsed.physics.control_force_newtons > 0.0);
         assert!(parsed.physics.control_torque_newton_meters > 0.0);
         assert!((0.0..=1.0).contains(&parsed.physics.friction));
@@ -134,6 +145,9 @@ mod tests {
             .map(|definition| format!("{:?}", definition.kind))
             .collect::<BTreeSet<_>>();
         assert_eq!(block_kinds.len(), content.blocks.len());
+        assert_eq!(content.schema_version, 5);
+        assert_eq!(content.manifest_version, "p0.7.3");
+        assert_eq!(content.physics.voxel_collision_chunk_edge_cells, 8);
         assert!(content.blocks.iter().all(|definition| {
             definition.max_health > 0 && definition.component_cost > 0 && definition.mass_grams > 0
         }));
@@ -141,5 +155,20 @@ mod tests {
             content.recipes.component_crafting.refined_input,
             content.recipes.component_crafting.component_output
         );
+    }
+
+    #[test]
+    fn collision_chunk_size_is_required_and_pinned() {
+        assert!(validate_voxel_collision_chunk_edge_cells(0).is_err());
+        assert!(validate_voxel_collision_chunk_edge_cells(7).is_err());
+        assert!(validate_voxel_collision_chunk_edge_cells(9).is_err());
+
+        let mut json: serde_json::Value =
+            serde_json::from_str(P0_CONTENT).expect("embedded content parses as JSON");
+        json.get_mut("physics")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("physics is an object")
+            .remove("voxel_collision_chunk_edge_cells");
+        assert!(serde_json::from_value::<ContentManifest>(json).is_err());
     }
 }

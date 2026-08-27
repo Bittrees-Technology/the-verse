@@ -100,6 +100,10 @@ pub struct Runtime {
     physics_step_phase: u64,
     physics: Scene,
     halted: bool,
+    #[cfg(test)]
+    physics_full_rebuilds: u64,
+    #[cfg(test)]
+    physics_chunk_replacements: u64,
 }
 
 impl Runtime {
@@ -124,6 +128,10 @@ impl Runtime {
             physics_step_phase,
             physics,
             halted: false,
+            #[cfg(test)]
+            physics_full_rebuilds: 0,
+            #[cfg(test)]
+            physics_chunk_replacements: 0,
         };
         if runtime.state.event_sequence == 0 {
             runtime.store.save_snapshot(&runtime.state)?;
@@ -161,8 +169,23 @@ impl Runtime {
         let event = self.state.prepare_client_event(message)?;
         let mut next_state = self.state.clone();
         next_state.apply_event(&event)?;
-        if event_changes_physics_scene(&event.payload) {
+        if let EventPayload::VoxelMined { coordinate, .. } = &event.payload {
+            let chunk = voxel_collision_chunk_coordinate(*coordinate);
+            let body_id = voxel_collision_chunk_body_id(chunk);
+            self.physics.replace_body(
+                &body_id,
+                voxel_collision_chunk_body_spec(&next_state, chunk),
+            )?;
+            #[cfg(test)]
+            {
+                self.physics_chunk_replacements += 1;
+            }
+        } else if event_changes_physics_scene(&event.payload) {
             self.physics.rebuild(&physics_body_specs(&next_state))?;
+            #[cfg(test)]
+            {
+                self.physics_full_rebuilds += 1;
+            }
         }
         if let Err(source) = self.store.append_event(&event) {
             self.halted = true;
@@ -267,6 +290,10 @@ impl Runtime {
                 if let Err(source) = self.physics.rebuild(&physics_body_specs(&self.state)) {
                     self.halted = true;
                     return Err(source.into());
+                }
+                #[cfg(test)]
+                {
+                    self.physics_full_rebuilds += 1;
                 }
                 changed = true;
             }
@@ -444,6 +471,16 @@ impl WorldState {
                     return Err(IntentError::rejected(
                         "inventory_capacity_exceeded",
                         "the suit inventory has no volume for the mined ore",
+                    ));
+                }
+                if self.grids.values().any(|grid| {
+                    grid.anchored
+                        && grid.anchor_touches(&self.voxels)
+                        && !grid.anchor_touches_after_removal(&self.voxels, Some(*coordinate))
+                }) {
+                    return Err(IntentError::rejected(
+                        "voxel_supports_anchor",
+                        "release the anchored grid before mining its final voxel support",
                     ));
                 }
                 EventPayload::VoxelMined {
@@ -849,6 +886,13 @@ impl WorldState {
                 }
                 self.inventory_mut(inventory_id)?.contents.ore += ore_yield;
                 self.ledger.mined_ore += ore_yield;
+                let body_id =
+                    voxel_collision_chunk_body_id(voxel_collision_chunk_coordinate(*coordinate));
+                let collider_id = voxel_collision_collider_id(*coordinate);
+                self.active_contact_pairs.retain(|pair| {
+                    !((pair.body_a == body_id && pair.collider_a == collider_id)
+                        || (pair.body_b == body_id && pair.collider_b == collider_id))
+                });
             }
             EventPayload::OreRefined {
                 inventory_id,
@@ -1459,15 +1503,10 @@ impl WorldState {
         if let Some(grid) = self.grids.get(body_id) {
             return grid.blocks.contains_key(collider_id);
         }
-        body_id == "voxel-field-origin"
-            && self.voxels.occupied.iter().any(|coordinate| {
-                format!(
-                    "voxel-{x}-{y}-{z}",
-                    x = coordinate.x,
-                    y = coordinate.y,
-                    z = coordinate.z
-                ) == collider_id
-            })
+        self.voxels.occupied.iter().any(|coordinate| {
+            voxel_collision_chunk_body_id(voxel_collision_chunk_coordinate(*coordinate)) == body_id
+                && voxel_collision_collider_id(*coordinate) == collider_id
+        })
     }
 
     fn inventory(&self, inventory_id: &str) -> Result<&InventoryRecord, IntentError> {
@@ -1631,39 +1670,123 @@ fn event_changes_physics_scene(payload: &EventPayload) -> bool {
     )
 }
 
-fn physics_body_specs(state: &WorldState) -> Vec<BodySpec> {
-    let physics = &content::manifest().physics;
-    let mut bodies = Vec::with_capacity(state.grids.len() + 1);
-    if !state.voxels.occupied.is_empty() {
-        let colliders = state
-            .voxels
-            .occupied
-            .iter()
-            .map(|coordinate| BoxColliderSpec {
-                collider_id: format!(
-                    "voxel-{x}-{y}-{z}",
-                    x = coordinate.x,
-                    y = coordinate.y,
-                    z = coordinate.z
-                ),
+fn voxel_collision_chunk_edge_cells() -> i32 {
+    i32::from(content::manifest().physics.voxel_collision_chunk_edge_cells)
+}
+
+fn voxel_collision_chunk_cell_count() -> usize {
+    usize::from(content::manifest().physics.voxel_collision_chunk_edge_cells).pow(3)
+}
+
+fn voxel_collision_chunk_coordinate(coordinate: IVec3) -> IVec3 {
+    let edge = voxel_collision_chunk_edge_cells();
+    IVec3::new(
+        coordinate.x.div_euclid(edge),
+        coordinate.y.div_euclid(edge),
+        coordinate.z.div_euclid(edge),
+    )
+}
+
+fn voxel_collision_chunk_origin(chunk: IVec3) -> IVec3 {
+    let edge = voxel_collision_chunk_edge_cells();
+    IVec3::new(chunk.x * edge, chunk.y * edge, chunk.z * edge)
+}
+
+fn voxel_collision_chunk_body_id(chunk: IVec3) -> String {
+    format!(
+        "voxel-chunk-{x}-{y}-{z}",
+        x = chunk.x,
+        y = chunk.y,
+        z = chunk.z
+    )
+}
+
+fn voxel_collision_chunk_coordinates(chunk: IVec3) -> Vec<IVec3> {
+    let origin = voxel_collision_chunk_origin(chunk);
+    let edge = voxel_collision_chunk_edge_cells();
+    let mut coordinates = Vec::with_capacity(voxel_collision_chunk_cell_count());
+    for local_x in 0..edge {
+        for local_y in 0..edge {
+            for local_z in 0..edge {
+                coordinates.push(IVec3::new(
+                    origin.x + local_x,
+                    origin.y + local_y,
+                    origin.z + local_z,
+                ));
+            }
+        }
+    }
+    coordinates
+}
+
+fn voxel_collision_collider_id(coordinate: IVec3) -> String {
+    format!(
+        "voxel-{x}-{y}-{z}",
+        x = coordinate.x,
+        y = coordinate.y,
+        z = coordinate.z
+    )
+}
+
+fn voxel_collision_chunk_body_spec(state: &WorldState, chunk: IVec3) -> Option<BodySpec> {
+    let origin = voxel_collision_chunk_origin(chunk);
+    let mut colliders = Vec::with_capacity(voxel_collision_chunk_cell_count());
+    for coordinate in voxel_collision_chunk_coordinates(chunk) {
+        if state.voxels.occupied.contains(&coordinate) {
+            colliders.push(BoxColliderSpec {
+                collider_id: voxel_collision_collider_id(coordinate),
                 local_pose: PhysicsPose::new(
                     PhysicsVec3::new(
-                        f64::from(coordinate.x),
-                        f64::from(coordinate.y),
-                        f64::from(coordinate.z),
+                        f64::from(coordinate.x - origin.x),
+                        f64::from(coordinate.y - origin.y),
+                        f64::from(coordinate.z - origin.z),
                     ),
                     PhysicsQuat::IDENTITY,
                 ),
                 half_extents: PhysicsVec3::new(0.5, 0.5, 0.5),
                 density_kg_per_m3: 2_600.0,
-            })
-            .collect();
-        let mut asteroid =
-            BodySpec::static_body("voxel-field-origin", PhysicsPose::IDENTITY, colliders);
-        asteroid.friction = physics.friction;
-        asteroid.restitution = physics.restitution;
-        bodies.push(asteroid);
+            });
+        }
     }
+    if colliders.is_empty() {
+        return None;
+    }
+    let physics = &content::manifest().physics;
+    let mut body = BodySpec::static_body(
+        voxel_collision_chunk_body_id(chunk),
+        PhysicsPose::new(
+            PhysicsVec3::new(
+                f64::from(origin.x),
+                f64::from(origin.y),
+                f64::from(origin.z),
+            ),
+            PhysicsQuat::IDENTITY,
+        ),
+        colliders,
+    );
+    body.friction = physics.friction;
+    body.restitution = physics.restitution;
+    Some(body)
+}
+
+fn voxel_collision_body_specs(state: &WorldState) -> Vec<BodySpec> {
+    let chunks = state
+        .voxels
+        .occupied
+        .iter()
+        .copied()
+        .map(voxel_collision_chunk_coordinate)
+        .collect::<BTreeSet<_>>();
+    chunks
+        .into_iter()
+        .filter_map(|chunk| voxel_collision_chunk_body_spec(state, chunk))
+        .collect()
+}
+
+fn physics_body_specs(state: &WorldState) -> Vec<BodySpec> {
+    let physics = &content::manifest().physics;
+    let mut bodies = voxel_collision_body_specs(state);
+    bodies.reserve(state.grids.len());
     bodies.extend(state.grids.values().map(|grid| {
         let colliders = grid
             .blocks
@@ -1957,6 +2080,42 @@ mod tests {
         }
     }
 
+    fn reachable_voxel(runtime: &Runtime) -> IVec3 {
+        runtime
+            .state()
+            .voxels
+            .occupied
+            .iter()
+            .copied()
+            .find(|coordinate| {
+                let position = Vec3::new(
+                    f64::from(coordinate.x),
+                    f64::from(coordinate.y),
+                    f64::from(coordinate.z),
+                );
+                runtime.state().player.position.squared_distance(position)
+                    <= MINING_RANGE * MINING_RANGE
+            })
+            .expect("reachable voxel exists")
+    }
+
+    fn expected_physics_fingerprint(state: &WorldState) -> Vec<(String, Vec<String>)> {
+        let mut fingerprint = physics_body_specs(state)
+            .into_iter()
+            .map(|spec| {
+                let mut colliders = spec
+                    .colliders
+                    .into_iter()
+                    .map(|collider| collider.collider_id)
+                    .collect::<Vec<_>>();
+                colliders.sort();
+                (spec.body_id, colliders)
+            })
+            .collect::<Vec<_>>();
+        fingerprint.sort_by(|left, right| left.0.cmp(&right.0));
+        fingerprint
+    }
+
     fn weld_to_completion(runtime: &mut Runtime, coordinate: IVec3, prefix: &str) {
         loop {
             let block = runtime.state().grids[STARTER_GRID_ID]
@@ -2059,11 +2218,12 @@ mod tests {
         let runtime = runtime();
         let state = runtime.state();
         let voxel = state.voxels.occupied.iter().next().expect("voxel exists");
-        let voxel_collider = format!("voxel-{}-{}-{}", voxel.x, voxel.y, voxel.z);
+        let voxel_body = voxel_collision_chunk_body_id(voxel_collision_chunk_coordinate(*voxel));
+        let voxel_collider = voxel_collision_collider_id(*voxel);
         let key = ContactPairKey {
             body_a: STARTER_GRID_ID.into(),
             collider_a: "block-core".into(),
-            body_b: "voxel-field-origin".into(),
+            body_b: voxel_body.clone(),
             collider_b: voxel_collider.clone(),
         };
         let bodies = state
@@ -2086,7 +2246,7 @@ mod tests {
                 substep_index: 0,
                 body_a_id: STARTER_GRID_ID.into(),
                 collider_a_id: "block-core".into(),
-                body_b_id: "voxel-field-origin".into(),
+                body_b_id: voxel_body.clone(),
                 collider_b_id: voxel_collider,
                 point: Vec3::ZERO,
                 normal: Vec3::new(-1.0, 0.0, 0.0),
@@ -2096,7 +2256,7 @@ mod tests {
                 reduced_translational_mass_grams: reduced_translational_contact_mass_grams(
                     state,
                     STARTER_GRID_ID,
-                    "voxel-field-origin",
+                    &voxel_body,
                 ),
                 phase: PhysicsContactPhase::Began,
             }],
@@ -2294,27 +2454,316 @@ mod tests {
     #[test]
     fn mining_retry_is_idempotent() {
         let mut runtime = runtime();
-        let target = runtime
-            .state()
-            .voxels
-            .occupied
-            .iter()
-            .copied()
-            .find(|coord| {
-                let pos = Vec3::new(f64::from(coord.x), f64::from(coord.y), f64::from(coord.z));
-                runtime.state().player.position.squared_distance(pos) <= MINING_RANGE * MINING_RANGE
-            })
-            .expect("reachable voxel");
+        let target = reachable_voxel(&runtime);
+        let body_id = voxel_collision_chunk_body_id(voxel_collision_chunk_coordinate(target));
+        let collider_id = voxel_collision_collider_id(target);
+        assert!(runtime.physics.contains_collider(&body_id, &collider_id));
         let intent = ClientMessage::MineVoxel {
             operation_id: "mine-once".into(),
             coordinate: target,
         };
         let first = runtime.execute(&intent).expect("first mine accepted");
+        assert_eq!(runtime.physics_chunk_replacements, 1);
+        assert_eq!(runtime.physics_full_rebuilds, 0);
+        assert!(!runtime.physics.contains_collider(&body_id, &collider_id));
         let hash_after_first = runtime.state().state_hash();
         let second = runtime.execute(&intent).expect("retry accepted");
         assert_eq!(first, second);
         assert_eq!(hash_after_first, runtime.state().state_hash());
+        assert_eq!(runtime.physics_chunk_replacements, 1);
+        assert_eq!(runtime.physics_full_rebuilds, 0);
         assert!(runtime.state().conservation().valid);
+    }
+
+    #[test]
+    fn voxel_collision_chunks_use_euclidean_ownership_and_stable_local_leaves() {
+        let cases = [(-9, -2), (-8, -1), (-1, -1), (0, 0), (7, 0), (8, 1)];
+        for (coordinate, expected_chunk) in cases {
+            assert_eq!(
+                voxel_collision_chunk_coordinate(IVec3::new(coordinate, 0, 0)).x,
+                expected_chunk
+            );
+        }
+
+        let enumerated_chunk = IVec3::new(-2, 3, -4);
+        let enumerated = voxel_collision_chunk_coordinates(enumerated_chunk);
+        assert_eq!(enumerated.len(), 8 * 8 * 8);
+        assert_eq!(
+            enumerated.iter().copied().collect::<BTreeSet<_>>().len(),
+            8 * 8 * 8
+        );
+        assert!(enumerated
+            .iter()
+            .all(|coordinate| voxel_collision_chunk_coordinate(*coordinate) == enumerated_chunk));
+        assert!(!enumerated.contains(&IVec3::new(8_000, 8_000, 8_000)));
+
+        let mut state = runtime().state().clone();
+        state.voxels = VoxelField {
+            occupied: BTreeSet::from([
+                IVec3::new(-9, 0, 0),
+                IVec3::new(-8, 0, 0),
+                IVec3::new(-1, 0, 0),
+                IVec3::new(0, 0, 0),
+                IVec3::new(7, 7, 7),
+                IVec3::new(8, 0, 0),
+            ]),
+            ferrite_ore: BTreeSet::new(),
+        };
+        let specs = voxel_collision_body_specs(&state);
+        assert_eq!(specs.len(), 4);
+        assert_eq!(
+            specs
+                .iter()
+                .map(|spec| spec.body_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "voxel-chunk--2-0-0",
+                "voxel-chunk--1-0-0",
+                "voxel-chunk-0-0-0",
+                "voxel-chunk-1-0-0"
+            ]
+        );
+        for spec in specs {
+            assert!(spec.colliders.len() <= 8 * 8 * 8);
+            for collider in spec.colliders {
+                assert!((0.0..8.0).contains(&collider.local_pose.position.x));
+                assert!((0.0..8.0).contains(&collider.local_pose.position.y));
+                assert!((0.0..8.0).contains(&collider.local_pose.position.z));
+                assert!(collider.collider_id.starts_with("voxel-"));
+            }
+        }
+    }
+
+    #[test]
+    fn mining_replay_prunes_removed_collider_on_either_pair_side_only() {
+        let mut state = runtime().state().clone();
+        let target = state
+            .voxels
+            .occupied
+            .iter()
+            .copied()
+            .find(|coordinate| {
+                let chunk = voxel_collision_chunk_coordinate(*coordinate);
+                state.voxels.occupied.iter().any(|other| {
+                    *other != *coordinate && voxel_collision_chunk_coordinate(*other) == chunk
+                })
+            })
+            .expect("target has a surviving chunk neighbor");
+        let survivor = state
+            .voxels
+            .occupied
+            .iter()
+            .copied()
+            .find(|coordinate| {
+                *coordinate != target
+                    && voxel_collision_chunk_coordinate(*coordinate)
+                        == voxel_collision_chunk_coordinate(target)
+            })
+            .expect("surviving collider exists");
+        state.player.position = Vec3::new(
+            f64::from(target.x),
+            f64::from(target.y),
+            f64::from(target.z),
+        );
+        let body_id = voxel_collision_chunk_body_id(voxel_collision_chunk_coordinate(target));
+        let collider_id = voxel_collision_collider_id(target);
+        let removed_on_right = ContactPairKey {
+            body_a: "aa-grid".into(),
+            collider_a: "aa-block".into(),
+            body_b: body_id.clone(),
+            collider_b: collider_id.clone(),
+        };
+        let removed_on_left = ContactPairKey {
+            body_a: body_id.clone(),
+            collider_a: collider_id,
+            body_b: "zz-grid".into(),
+            collider_b: "zz-block".into(),
+        };
+        let survivor_pair = ContactPairKey {
+            body_a: "aa-grid".into(),
+            collider_a: "aa-block".into(),
+            body_b: body_id,
+            collider_b: voxel_collision_collider_id(survivor),
+        };
+        state.active_contact_pairs = BTreeSet::from([
+            removed_on_right.clone(),
+            removed_on_left.clone(),
+            survivor_pair.clone(),
+        ]);
+        let event = state
+            .prepare_client_event(&ClientMessage::MineVoxel {
+                operation_id: "prune-mined-contact".into(),
+                coordinate: target,
+            })
+            .expect("mining event prepares");
+        let mut replay = state.clone();
+        replay.apply_event(&event).expect("mining event replays");
+
+        assert!(!replay.active_contact_pairs.contains(&removed_on_right));
+        assert!(!replay.active_contact_pairs.contains(&removed_on_left));
+        assert_eq!(replay.active_contact_pairs, BTreeSet::from([survivor_pair]));
+    }
+
+    #[test]
+    fn dirty_chunk_replacement_preserves_surviving_canonical_contact_lifecycle() {
+        let directory = tempdir().expect("tempdir");
+        let mut runtime = Runtime::open(directory.path(), 127, 1_000).expect("runtime opens");
+        let target = IVec3::ZERO;
+        let survivor = IVec3::new(1, 0, 0);
+        let resting = test_grid(
+            "resting-grid",
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec3::ZERO,
+            [
+                Block::new("resting-battery", IVec3::ZERO, BlockKind::Battery),
+                Block::new("resting-armor", IVec3::new(1, 0, 0), BlockKind::Structural),
+            ],
+        );
+        replace_with_physics_fixture(
+            &mut runtime,
+            [resting],
+            VoxelField {
+                occupied: BTreeSet::from([target, survivor]),
+                ferrite_ore: BTreeSet::new(),
+            },
+        );
+        runtime.state.player.position = Vec3::new(0.0, 3.0, 0.0);
+        runtime.persist_snapshot().expect("player pose persists");
+        runtime
+            .execute(&ClientMessage::SetGridControl {
+                operation_id: "settle-on-two-voxels".into(),
+                grid_id: "resting-grid".into(),
+                linear_input: Vec3::new(0.0, -0.2, 0.0),
+                angular_input: Vec3::ZERO,
+                dampeners: true,
+            })
+            .expect("settling control is accepted");
+        let target_collider = voxel_collision_collider_id(target);
+        let survivor_collider = voxel_collision_collider_id(survivor);
+        let contacted_both = (0..120).any(|_| {
+            runtime.advance(17).expect("contact physics advances");
+            let touches_target = runtime.state().active_contact_pairs.iter().any(|pair| {
+                pair.collider_a == target_collider || pair.collider_b == target_collider
+            });
+            let touches_survivor = runtime.state().active_contact_pairs.iter().any(|pair| {
+                pair.collider_a == survivor_collider || pair.collider_b == survivor_collider
+            });
+            touches_target && touches_survivor
+        });
+        assert!(contacted_both, "grid must contact both terrain leaves");
+        let surviving_pair = runtime
+            .state()
+            .active_contact_pairs
+            .iter()
+            .find(|pair| {
+                pair.collider_a == survivor_collider || pair.collider_b == survivor_collider
+            })
+            .cloned()
+            .expect("surviving pair is active");
+
+        runtime
+            .execute(&ClientMessage::MineVoxel {
+                operation_id: "mine-one-contact-leaf".into(),
+                coordinate: target,
+            })
+            .expect("contacted voxel is mined");
+        assert!(!runtime.state().active_contact_pairs.iter().any(|pair| {
+            pair.collider_a == target_collider || pair.collider_b == target_collider
+        }));
+        assert!(
+            runtime
+                .state()
+                .active_contact_pairs
+                .contains(&surviving_pair)
+        );
+        assert_eq!(runtime.physics_chunk_replacements, 1);
+
+        runtime.advance(17).expect("post-edit physics advances");
+        let journal = fs::read_to_string(directory.path().join("events.ndjson"))
+            .expect("post-edit journal reads");
+        let event = journal
+            .lines()
+            .rev()
+            .map(|line| serde_json::from_str::<CanonicalEvent>(line).expect("event parses"))
+            .find(|event| matches!(event.payload, EventPayload::PhysicsStepCommitted { .. }))
+            .expect("post-edit physics event exists");
+        let EventPayload::PhysicsStepCommitted {
+            contacts,
+            active_contacts_after,
+            ..
+        } = event.payload
+        else {
+            unreachable!("filtered event is a physics commit")
+        };
+        assert!(contacts.iter().any(|contact| {
+            (contact.collider_a_id == survivor_collider
+                || contact.collider_b_id == survivor_collider)
+                && contact.phase == PhysicsContactPhase::Persisted
+        }));
+        assert!(!contacts.iter().any(|contact| {
+            contact.collider_a_id == target_collider || contact.collider_b_id == target_collider
+        }));
+        assert!(active_contacts_after.contains(&surviving_pair));
+        assert!(runtime.state().conservation().valid);
+    }
+
+    #[test]
+    fn mining_final_anchor_support_is_rejected_without_any_mutation() {
+        let directory = tempdir().expect("tempdir");
+        let mut runtime = Runtime::open(directory.path(), 107, 100).expect("runtime opens");
+        let target = IVec3::ZERO;
+        let mut anchored = test_grid(
+            "anchored-grid",
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec3::ZERO,
+            [
+                Block::new("anchor-block", IVec3::ZERO, BlockKind::Anchor),
+                Block::new("anchor-battery", IVec3::new(1, 0, 0), BlockKind::Battery),
+            ],
+        );
+        anchored.anchored = true;
+        replace_with_physics_fixture(
+            &mut runtime,
+            [anchored],
+            VoxelField {
+                occupied: BTreeSet::from([target]),
+                ferrite_ore: BTreeSet::new(),
+            },
+        );
+        runtime.state.player.position = Vec3::new(0.0, 0.0, 3.0);
+        runtime.persist_snapshot().expect("player pose persists");
+        assert!(runtime.state().grids["anchored-grid"].anchor_touches(&runtime.state().voxels));
+        let before_hash = runtime.state().state_hash();
+        let before_fingerprint = runtime.physics.body_collider_fingerprint();
+        let before_journal =
+            fs::read(directory.path().join("events.ndjson")).expect("journal reads");
+
+        let result = runtime.execute(&ClientMessage::MineVoxel {
+            operation_id: "mine-final-anchor-support".into(),
+            coordinate: target,
+        });
+        assert!(matches!(
+            result,
+            Err(RuntimeError::Intent(IntentError::Rejected { ref code, .. }))
+                if code == "voxel_supports_anchor"
+        ));
+        assert_eq!(runtime.state().state_hash(), before_hash);
+        assert_eq!(
+            runtime.physics.body_collider_fingerprint(),
+            before_fingerprint
+        );
+        assert_eq!(runtime.physics_chunk_replacements, 0);
+        assert_eq!(runtime.physics_full_rebuilds, 0);
+        assert!(
+            !runtime
+                .state()
+                .processed_operations
+                .contains_key("mine-final-anchor-support")
+        );
+        assert_eq!(
+            fs::read(directory.path().join("events.ndjson")).expect("journal rereads"),
+            before_journal
+        );
     }
 
     #[test]
@@ -3081,6 +3530,105 @@ mod tests {
         assert_eq!(recovered_without_new_lease, expected_durable_state);
         assert!(recovered.advance(17).expect("recovered solver resumes"));
         assert_eq!(recovered.state().simulation_tick, 2);
+        assert!(recovered.state().conservation().valid);
+    }
+
+    #[test]
+    fn mining_commit_failpoints_recover_matching_world_and_collision_fingerprints() {
+        let before_directory = tempdir().expect("tempdir");
+        let prior_hash;
+        let prior_fingerprint;
+        let before_target;
+        {
+            let mut runtime =
+                Runtime::open(before_directory.path(), 109, 100).expect("runtime opens");
+            before_target = reachable_voxel(&runtime);
+            let body_id =
+                voxel_collision_chunk_body_id(voxel_collision_chunk_coordinate(before_target));
+            let collider_id = voxel_collision_collider_id(before_target);
+            prior_hash = runtime.state().state_hash();
+            prior_fingerprint = runtime.physics.body_collider_fingerprint();
+            assert_eq!(
+                prior_fingerprint,
+                expected_physics_fingerprint(runtime.state())
+            );
+            runtime
+                .store
+                .set_append_failpoint(AppendFailpoint::BeforeWrite);
+            assert!(matches!(
+                runtime.execute(&ClientMessage::MineVoxel {
+                    operation_id: "mine-before-write".into(),
+                    coordinate: before_target,
+                }),
+                Err(RuntimeError::Persistence(
+                    PersistenceError::InjectedFailure("before journal write")
+                ))
+            ));
+            assert!(runtime.is_halted());
+            assert_eq!(runtime.state().state_hash(), prior_hash);
+            assert!(runtime.state().voxels.occupied.contains(&before_target));
+            assert!(!runtime.physics.contains_collider(&body_id, &collider_id));
+        }
+        let recovered = Runtime::open(before_directory.path(), 109, 100)
+            .expect("before-write mining failure recovers");
+        assert_eq!(recovered.state().state_hash(), prior_hash);
+        assert!(recovered.state().voxels.occupied.contains(&before_target));
+        assert_eq!(
+            recovered.physics.body_collider_fingerprint(),
+            prior_fingerprint
+        );
+
+        let after_directory = tempdir().expect("tempdir");
+        let expected_durable_state;
+        let after_target;
+        {
+            let mut runtime =
+                Runtime::open(after_directory.path(), 113, 100).expect("runtime opens");
+            after_target = reachable_voxel(&runtime);
+            let body_id =
+                voxel_collision_chunk_body_id(voxel_collision_chunk_coordinate(after_target));
+            let collider_id = voxel_collision_collider_id(after_target);
+            let prior_state = runtime.state().clone();
+            runtime
+                .store
+                .set_append_failpoint(AppendFailpoint::AfterSync);
+            assert!(matches!(
+                runtime.execute(&ClientMessage::MineVoxel {
+                    operation_id: "mine-after-sync".into(),
+                    coordinate: after_target,
+                }),
+                Err(RuntimeError::Persistence(
+                    PersistenceError::InjectedFailure("after journal sync")
+                ))
+            ));
+            assert!(runtime.is_halted());
+            assert_eq!(runtime.state().state_hash(), prior_state.state_hash());
+            assert!(runtime.state().voxels.occupied.contains(&after_target));
+            assert!(!runtime.physics.contains_collider(&body_id, &collider_id));
+
+            let journal = fs::read_to_string(after_directory.path().join("events.ndjson"))
+                .expect("synced mining journal reads");
+            let durable_event = serde_json::from_str::<CanonicalEvent>(
+                journal.lines().last().expect("durable mining event exists"),
+            )
+            .expect("durable mining event parses");
+            let mut expected = prior_state;
+            expected
+                .apply_event(&durable_event)
+                .expect("durable mining event applies");
+            expected_durable_state = expected;
+        }
+        let recovered = Runtime::open(after_directory.path(), 113, 100)
+            .expect("after-sync mining failure recovers");
+        assert_eq!(
+            recovered.state().state_hash(),
+            expected_durable_state.state_hash()
+        );
+        assert!(!recovered.state().voxels.occupied.contains(&after_target));
+        assert_eq!(
+            recovered.physics.body_collider_fingerprint(),
+            expected_physics_fingerprint(&expected_durable_state)
+        );
         assert!(recovered.state().conservation().valid);
     }
 

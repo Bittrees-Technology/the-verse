@@ -99,6 +99,13 @@ struct NativeBody {
 }
 
 #[derive(Debug)]
+struct StagedNativeBody {
+    body: NativeBody,
+    #[cfg(test)]
+    catalog_rollback: ContactCatalogRollback,
+}
+
+#[derive(Debug)]
 struct ContactBuffer {
     bodies: Vec<BodyContactCatalog>,
     contacts: Vec<RawContact>,
@@ -110,6 +117,12 @@ struct ContactBuffer {
 struct BodyContactCatalog {
     body_id: String,
     collider_ids: Vec<String>,
+}
+
+#[derive(Debug)]
+struct ContactCatalogRollback {
+    index: usize,
+    previous: Option<BodyContactCatalog>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -414,6 +427,8 @@ pub(crate) struct NativeScene {
     bodies: BTreeMap<String, NativeBody>,
     contact_listener: *mut JpcContactListener,
     contact_listener_state: Box<NativeContactListener>,
+    #[cfg(test)]
+    fail_replacement_before_publish: bool,
 }
 
 impl std::fmt::Debug for NativeScene {
@@ -513,6 +528,8 @@ impl NativeScene {
             bodies: BTreeMap::new(),
             contact_listener,
             contact_listener_state,
+            #[cfg(test)]
+            fail_replacement_before_publish: false,
         })
     }
 
@@ -535,22 +552,59 @@ impl NativeScene {
     }
 
     fn add_body(&mut self, config: &SceneConfig, spec: &BodySpec) -> Result<(), PhysicsError> {
-        let body_user_data = {
-            let mut buffer = self.contact_listener_state.buffer.lock().map_err(|_| {
-                PhysicsError::Initialization("native contact buffer lock was poisoned".into())
-            })?;
-            buffer.bodies.push(BodyContactCatalog {
-                body_id: spec.body_id.clone(),
-                collider_ids: spec
-                    .colliders
-                    .iter()
-                    .map(|collider| collider.collider_id.clone())
-                    .collect(),
-            });
-            u64::try_from(buffer.bodies.len()).map_err(|_| {
-                PhysicsError::Initialization("native body contact catalog overflowed".into())
-            })?
-        };
+        let staged = self.create_body(config, spec)?;
+        let previous = self.bodies.insert(spec.body_id.clone(), staged.body);
+        debug_assert!(previous.is_none(), "validated build contains unique bodies");
+        Ok(())
+    }
+
+    pub(crate) fn replace_body(
+        &mut self,
+        config: &SceneConfig,
+        body_id: &str,
+        replacement: Option<&BodySpec>,
+    ) -> Result<(), PhysicsError> {
+        let previous = self
+            .bodies
+            .get(body_id)
+            .copied()
+            .ok_or_else(|| PhysicsError::ReplacementBodyMissing(body_id.into()))?;
+        let staged = replacement
+            .map(|spec| self.create_body(config, spec))
+            .transpose()?;
+
+        #[cfg(test)]
+        if self.fail_replacement_before_publish {
+            self.fail_replacement_before_publish = false;
+            if let Some(staged) = staged {
+                self.discard_staged_body(staged)?;
+            }
+            return Err(PhysicsError::Initialization(
+                "injected replacement failure before publication".into(),
+            ));
+        }
+
+        let interface = self.body_interface();
+        // SAFETY: `previous` is the live body currently mapped by `body_id`.
+        // A staged replacement, when present, was already added successfully;
+        // no solver update or callback can overlap this exclusive mutation.
+        unsafe {
+            JPC_BodyInterface_RemoveBody(interface, previous.id);
+            JPC_BodyInterface_DestroyBody(interface, previous.id);
+        }
+        if let Some(staged) = staged {
+            self.bodies.insert(body_id.into(), staged.body);
+        } else {
+            self.bodies.remove(body_id);
+        }
+        Ok(())
+    }
+
+    fn create_body(
+        &mut self,
+        config: &SceneConfig,
+        spec: &BodySpec,
+    ) -> Result<StagedNativeBody, PhysicsError> {
         let mut child_shapes = Vec::with_capacity(spec.colliders.len());
         let mut sub_shapes = Vec::with_capacity(spec.colliders.len());
         for (index, collider) in spec.colliders.iter().enumerate() {
@@ -575,6 +629,8 @@ impl NativeScene {
                 body_id: spec.body_id.clone(),
                 message,
             })?;
+
+        let (body_user_data, catalog_rollback) = self.stage_contact_catalog(spec)?;
 
         let mut settings = JPC_BodyCreationSettings {
             Position: world_vec3(spec.pose.position),
@@ -613,6 +669,7 @@ impl NativeScene {
         // the call. Jolt's BodyCreationSettings copies/refcounts that shape.
         let body = unsafe { JPC_BodyInterface_CreateBody(interface, ptr::from_ref(&settings)) };
         if body.is_null() {
+            self.restore_contact_catalog(catalog_rollback)?;
             return Err(PhysicsError::BodyCreation(spec.body_id.clone()));
         }
         // SAFETY: `body` is the non-null body pointer just returned by the
@@ -630,8 +687,84 @@ impl NativeScene {
                 },
             );
         }
-        self.bodies.insert(spec.body_id.clone(), NativeBody { id });
+        #[cfg(not(test))]
+        drop(catalog_rollback);
+        Ok(StagedNativeBody {
+            body: NativeBody { id },
+            #[cfg(test)]
+            catalog_rollback,
+        })
+    }
+
+    fn stage_contact_catalog(
+        &mut self,
+        spec: &BodySpec,
+    ) -> Result<(u64, ContactCatalogRollback), PhysicsError> {
+        let mut buffer = self.contact_listener_state.buffer.lock().map_err(|_| {
+            PhysicsError::Initialization("native contact buffer lock was poisoned".into())
+        })?;
+        let existing_index = buffer
+            .bodies
+            .iter()
+            .position(|catalog| catalog.body_id == spec.body_id);
+        let index = existing_index.unwrap_or(buffer.bodies.len());
+        let user_data = index
+            .checked_add(1)
+            .and_then(|value| u64::try_from(value).ok())
+            .ok_or_else(|| {
+                PhysicsError::Initialization("native body contact catalog overflowed".into())
+            })?;
+        let replacement = BodyContactCatalog {
+            body_id: spec.body_id.clone(),
+            collider_ids: spec
+                .colliders
+                .iter()
+                .map(|collider| collider.collider_id.clone())
+                .collect(),
+        };
+        let previous = if existing_index.is_some() {
+            Some(std::mem::replace(&mut buffer.bodies[index], replacement))
+        } else {
+            buffer.bodies.push(replacement);
+            None
+        };
+        Ok((user_data, ContactCatalogRollback { index, previous }))
+    }
+
+    fn restore_contact_catalog(
+        &mut self,
+        rollback: ContactCatalogRollback,
+    ) -> Result<(), PhysicsError> {
+        let mut buffer = self.contact_listener_state.buffer.lock().map_err(|_| {
+            PhysicsError::Initialization("native contact buffer lock was poisoned".into())
+        })?;
+        if let Some(previous) = rollback.previous {
+            buffer.bodies[rollback.index] = previous;
+        } else if rollback.index + 1 == buffer.bodies.len() {
+            buffer.bodies.pop();
+        } else {
+            return Err(PhysicsError::Initialization(
+                "native contact catalog rollback order was invalid".into(),
+            ));
+        }
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn discard_staged_body(&mut self, staged: StagedNativeBody) -> Result<(), PhysicsError> {
+        let interface = self.body_interface();
+        // SAFETY: The staged body was added exactly once but has not replaced
+        // the published body map. No update overlaps this rollback.
+        unsafe {
+            JPC_BodyInterface_RemoveBody(interface, staged.body.id);
+            JPC_BodyInterface_DestroyBody(interface, staged.body.id);
+        }
+        self.restore_contact_catalog(staged.catalog_rollback)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_replacement_before_publish(&mut self) {
+        self.fail_replacement_before_publish = true;
     }
 
     pub(crate) fn apply_controls(&mut self, controls: &[BodyControl]) {

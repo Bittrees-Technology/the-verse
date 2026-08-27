@@ -267,6 +267,13 @@ pub enum PhysicsError {
     },
     #[error("duplicate body ID {0}")]
     DuplicateBodyId(String),
+    #[error("replacement body {0} does not exist")]
+    ReplacementBodyMissing(String),
+    #[error("replacement body ID {replacement_id} does not match target {target_id}")]
+    ReplacementBodyIdMismatch {
+        target_id: String,
+        replacement_id: String,
+    },
     #[error("control body {0} does not exist")]
     ControlBodyMissing(String),
     #[error("control body {0} is static")]
@@ -340,6 +347,46 @@ impl Scene {
         Ok(())
     }
 
+    /// Atomically replaces or removes one existing body while leaving every
+    /// unrelated native body untouched. A failed validation or native stage
+    /// preserves the previous body and keeps the scene usable.
+    pub fn replace_body(
+        &mut self,
+        body_id: &str,
+        replacement: Option<BodySpec>,
+    ) -> Result<(), PhysicsError> {
+        if self.requires_rebuild {
+            return Err(PhysicsError::SceneRequiresRebuild);
+        }
+        if !self.specs.contains_key(body_id) {
+            return Err(PhysicsError::ReplacementBodyMissing(body_id.into()));
+        }
+        if let Some(spec) = &replacement
+            && spec.body_id != body_id
+        {
+            return Err(PhysicsError::ReplacementBodyIdMismatch {
+                target_id: body_id.into(),
+                replacement_id: spec.body_id.clone(),
+            });
+        }
+
+        let validated_replacement = replacement
+            .map(|spec| {
+                validated_specs(&self.config, std::slice::from_ref(&spec))?
+                    .remove(body_id)
+                    .ok_or_else(|| PhysicsError::ReplacementBodyMissing(body_id.into()))
+            })
+            .transpose()?;
+        self.native
+            .replace_body(&self.config, body_id, validated_replacement.as_ref())?;
+        if let Some(spec) = validated_replacement {
+            self.specs.insert(body_id.into(), spec);
+        } else {
+            self.specs.remove(body_id);
+        }
+        Ok(())
+    }
+
     /// Applies bounded controls and advances exactly one configured fixed step.
     pub fn step(&mut self, controls: &[BodyControl]) -> Result<StepOutput, PhysicsError> {
         if self.requires_rebuild {
@@ -370,6 +417,34 @@ impl Scene {
 
     pub fn body_count(&self) -> usize {
         self.specs.len()
+    }
+
+    pub fn contains_collider(&self, body_id: &str, collider_id: &str) -> bool {
+        self.specs.get(body_id).is_some_and(|spec| {
+            spec.colliders
+                .iter()
+                .any(|collider| collider.collider_id == collider_id)
+        })
+    }
+
+    pub fn body_collider_fingerprint(&self) -> Vec<(String, Vec<String>)> {
+        self.specs
+            .iter()
+            .map(|(body_id, spec)| {
+                (
+                    body_id.clone(),
+                    spec.colliders
+                        .iter()
+                        .map(|collider| collider.collider_id.clone())
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn fail_next_replacement_before_publish(&mut self) {
+        self.native.fail_next_replacement_before_publish();
     }
 
     fn require_native_success<T>(
@@ -713,6 +788,54 @@ mod tests {
         assert_eq!(scene.step(&[]), Err(PhysicsError::SceneRequiresRebuild));
         scene.rebuild(&[body]).expect("explicit rebuild succeeds");
         assert!(scene.step(&[]).is_ok());
+    }
+
+    #[test]
+    fn staged_replacement_failure_restores_catalog_body_and_scene_usability() {
+        let mut scene = Scene::new(SceneConfig::default()).expect("scene initializes");
+        let target = BodySpec::static_body(
+            "voxel-chunk-0-0-0",
+            Pose::IDENTITY,
+            vec![
+                BoxColliderSpec::unit_cube("voxel-0-0-0"),
+                BoxColliderSpec {
+                    local_pose: Pose::new(Vec3::new(1.0, 0.0, 0.0), Quat::IDENTITY),
+                    ..BoxColliderSpec::unit_cube("voxel-1-0-0")
+                },
+            ],
+        );
+        let probe = BodySpec::dynamic(
+            "probe-grid",
+            Pose::new(Vec3::new(1.0, 0.0, 0.0), Quat::IDENTITY),
+            vec![BoxColliderSpec::unit_cube("probe-block")],
+        );
+        scene
+            .rebuild(&[target.clone(), probe])
+            .expect("initial scene builds");
+        let before = scene.body_states().expect("prior body state extracts");
+        let replacement = BodySpec::static_body(
+            target.body_id.clone(),
+            target.pose,
+            vec![target.colliders[0].clone()],
+        );
+
+        scene.fail_next_replacement_before_publish();
+        let error = scene
+            .replace_body(&target.body_id, Some(replacement))
+            .expect_err("injected replacement fails");
+        assert!(matches!(error, PhysicsError::Initialization(_)));
+        assert_eq!(
+            scene.body_states().expect("old scene remains usable"),
+            before
+        );
+        assert!(scene.contains_collider(&target.body_id, "voxel-1-0-0"));
+        let output = scene.step(&[]).expect("restored catalog remains stepable");
+        assert!(
+            output
+                .contacts
+                .iter()
+                .any(|contact| contact.collider_b_id == "voxel-1-0-0")
+        );
     }
 
     #[test]

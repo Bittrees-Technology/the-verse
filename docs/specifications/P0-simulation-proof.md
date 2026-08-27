@@ -222,13 +222,13 @@ Implemented foundation:
 - Authoritative runtime grid–grid momentum exchange and restart within a published `1 kg m/s` P0 tolerance, cargo-mass acceleration response, two-second settle plus two-second bounded resting-contact observation, and immovable static-anchor behavior under impact followed by conservative release and restart. Adapter coverage separately proves unequal-density collision response.
 - Authoritative swept player collision against voxels and axis-aligned or rotated grids, including a nearby clear-motion control case.
 - In-process before-write and after-sync physics-commit failures proving recovery of exactly the complete prior or durable tick, torn-tail truncation, and parent-directory synchronization after atomic snapshot rename.
+- Atomic 8×8×8 voxel collision chunks with stable signed-coordinate identities, Euclidean negative-coordinate ownership, one-body mining replacement, surviving contact lifecycle, anchored-support rejection, failure rollback, exact collider-fingerprint recovery, and old-content rejection.
 - Sparse dirty-chunk rendering after accepted voxel edits.
 - Initial contact, conservation, recovery, body-count, native-client, and macOS evidence.
 
 Still required for checkpoint acceptance:
 
 - A project-owned post-solve applied-impulse binding, collision damage, and atomic damage/split outcomes.
-- Dirty collision-body replacement after voxel edits.
 - Subprocess crash-boundary, edit-remesh, Ubuntu, Linux-artifact, network, and scaling evidence.
 
 The complete contract is [P0.7 server-authoritative contact physics](../gameplay/contact-physics.md), with recovery rationale in [ADR-0010](../decisions/ADR-0010-committed-physics-outcomes.md) and dirty-collision rules in [ADR-0011](../decisions/ADR-0011-dirty-voxel-collision-chunks.md).

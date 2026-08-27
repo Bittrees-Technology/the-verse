@@ -186,7 +186,7 @@ async function run() {
     )
   ).snapshot;
   assert.equal(world.conservation.valid, true);
-  assert.equal(world.content_manifest_version, "p0.7.2");
+  assert.equal(world.content_manifest_version, "p0.7.3");
   assert.equal(world.grids.length, 1);
   assert.ok(world.voxels.length > 1_000);
   assert.equal(world.environment.celestial_body_name, "Khepri Prime");
