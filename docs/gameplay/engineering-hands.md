@@ -20,6 +20,11 @@ This remains an original clean-room implementation. Publicly observable engineer
 8. Placement and welding must be within the inclusive nine-metre server-owned surface range and cannot pass through nearer blocks or voxels.
 9. Construction completion is durable historical state. Later damage lowers integrity but never turns completed armor back into a frame, and repair never grants completion credit again.
 10. Cargo identity may exist on a placed frame, but its inventory remains sealed until the final weld completes construction.
+11. In multiplayer, frame placement and welding require ownership of the
+    target grid. Placement consumes components only from the authenticated
+    actor's carried inventory.
+12. Frame placement awards 5 experience and the first construction completion
+    awards 20. Intermediate construction welds and later repairs award none.
 
 ## Mining contract
 

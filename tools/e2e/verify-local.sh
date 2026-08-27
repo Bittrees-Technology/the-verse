@@ -59,6 +59,48 @@ if ! node tools/e2e/two-player-control-smoke.mjs "ws://127.0.0.1:${verse_port}/w
 fi
 stop_server
 
+# Reopen paused once to establish the exact durable state after the live
+# physics loop has stopped, then reopen it again to prove recovery.
+start_server paused "${verse_test_dir}/two-player-control"
+two_player_before="$(
+  curl --fail --silent "http://127.0.0.1:${verse_port}/api/v1/status"
+)"
+two_player_hash="$(jq -r '.world_hash' <<<"${two_player_before}")"
+two_player_sequence="$(jq -r '.event_sequence' <<<"${two_player_before}")"
+two_player_fence="$(jq -r '.fencing_token' <<<"${two_player_before}")"
+echo "VERSE_TWO_PLAYER_RECOVERY_BEFORE sequence=${two_player_sequence} fence=${two_player_fence} hash=${two_player_hash}"
+stop_server
+
+start_server paused "${verse_test_dir}/two-player-control"
+two_player_after="$(
+  curl --fail --silent "http://127.0.0.1:${verse_port}/api/v1/status"
+)"
+two_player_after_hash="$(jq -r '.world_hash' <<<"${two_player_after}")"
+two_player_after_sequence="$(jq -r '.event_sequence' <<<"${two_player_after}")"
+two_player_after_fence="$(jq -r '.fencing_token' <<<"${two_player_after}")"
+echo "VERSE_TWO_PLAYER_RECOVERY_AFTER sequence=${two_player_after_sequence} fence=${two_player_after_fence} hash=${two_player_after_hash}"
+if [[ "${two_player_after_hash}" != "${two_player_hash}" ]]; then
+  echo "Two-player recovery hash mismatch" >&2
+  exit 1
+fi
+if [[ "${two_player_after_sequence}" != "${two_player_sequence}" ]]; then
+  echo "Two-player recovery event-sequence mismatch" >&2
+  exit 1
+fi
+if [[ "${two_player_after_fence}" -le "${two_player_fence}" ]]; then
+  echo "Two-player recovery fencing token did not advance" >&2
+  exit 1
+fi
+if ! node tools/e2e/two-player-control-smoke.mjs \
+  "ws://127.0.0.1:${verse_port}/ws" \
+  --verify-recovery \
+  "${two_player_hash}" \
+  "${two_player_sequence}"; then
+  sed -n '1,240p' "${verse_test_dir}/server.log" >&2
+  exit 1
+fi
+stop_server
+
 start_server
 if ! node tools/e2e/protocol-smoke.mjs "ws://127.0.0.1:${verse_port}/ws"; then
   sed -n '1,240p' "${verse_test_dir}/server.log" >&2

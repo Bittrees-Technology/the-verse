@@ -3,10 +3,17 @@
 import assert from "node:assert/strict";
 
 const url = process.argv[2] ?? "ws://127.0.0.1:17777/ws";
+const recoveryMode = process.argv[3] === "--verify-recovery";
+const expectedRecoveryHash = process.argv[4];
+const expectedRecoverySequence = Number.parseInt(process.argv[5] ?? "", 10);
 const expectedRoster = ["player-local", "player-remote"];
 const sharedControlOperation = "two-player-e2e-shared-control-operation";
 const sharedReleaseOperation = "two-player-e2e-shared-release-operation";
 const remoteMiningOperation = "two-player-e2e-remote-mining-operation";
+const remoteRefiningOperation = "two-player-e2e-remote-refining-operation";
+const remoteCraftingOperation = "two-player-e2e-remote-crafting-operation";
+const remoteDamageOperation = "two-player-e2e-non-owner-damage-operation";
+const PROTOCOL_VERSION = 12;
 const CHARACTER_EYE_OFFSET = 1.62 - 1.8 / 2;
 const CHARACTER_MAXIMUM_ANGULAR_SPEED = 2.5;
 const TOOL_RANGE = 9.0;
@@ -81,7 +88,7 @@ class ProtocolClient {
     });
     this.send({
       type: "hello",
-      protocol_version: 11,
+      protocol_version: PROTOCOL_VERSION,
       client_name: `node-two-player-e2e-${this.playerId}`,
       authentication: {
         kind: "local_development",
@@ -92,7 +99,7 @@ class ProtocolClient {
       (message) => message.type === "welcome",
       "authenticated welcome",
     );
-    assert.equal(welcome.protocol_version, 11);
+    assert.equal(welcome.protocol_version, PROTOCOL_VERSION);
     assert.deepEqual(welcome.session_role, {
       kind: "player",
       player_id: this.playerId,
@@ -311,10 +318,12 @@ function canonicalRayHits(state, player, direction) {
   });
 }
 
-function visibleVoxel(state, player) {
+function visibleVoxel(state, player, preferredMaterial = undefined) {
   const eye = playerEye(player);
   const candidates = [...state.voxels].sort(
     (left, right) =>
+      Number(right.material === preferredMaterial) -
+        Number(left.material === preferredMaterial) ||
       distanceSquared(left.coordinate, eye) -
       distanceSquared(right.coordinate, eye),
   );
@@ -329,6 +338,45 @@ function visibleVoxel(state, player) {
     }
   }
   return undefined;
+}
+
+function gridBlockWorldPosition(grid, block) {
+  return addVector(grid.position, rotateVector(grid.orientation, block.coordinate));
+}
+
+function visibleBlock(state, player) {
+  const eye = playerEye(player);
+  const candidates = state.grids
+    .flatMap((grid) => grid.blocks.map((block) => ({ grid, block })))
+    .sort(
+      (left, right) =>
+        distanceSquared(gridBlockWorldPosition(left.grid, left.block), eye) -
+        distanceSquared(gridBlockWorldPosition(right.grid, right.block), eye),
+    );
+  for (const candidate of candidates) {
+    const target = gridBlockWorldPosition(candidate.grid, candidate.block);
+    const direction = normalizeVector(subtractVector(target, eye));
+    const hit = canonicalRayHits(state, player, direction)[0];
+    if (
+      hit?.type === "block" &&
+      hit.grid.grid_id === candidate.grid.grid_id &&
+      hit.block.block_id === candidate.block.block_id
+    ) {
+      return { ...candidate, target };
+    }
+  }
+  return undefined;
+}
+
+function nearestBlock(state, player) {
+  const eye = playerEye(player);
+  return state.grids
+    .flatMap((grid) => grid.blocks.map((block) => ({ grid, block })))
+    .sort(
+      (left, right) =>
+        distanceSquared(gridBlockWorldPosition(left.grid, left.block), eye) -
+        distanceSquared(gridBlockWorldPosition(right.grid, right.block), eye),
+    )[0];
 }
 
 async function waitForCommonSnapshot(
@@ -477,6 +525,34 @@ async function waitForReceipt(client, operationId, description) {
   return message.receipt;
 }
 
+async function expectRejection(
+  client,
+  intent,
+  expectedCode,
+  description,
+) {
+  client.send(intent);
+  const message = await client.waitFor(
+    (candidate) =>
+      candidate.type === "intent_rejected" &&
+      candidate.operation_id === intent.operation_id,
+    description,
+  );
+  assert.equal(message.code, expectedCode, `${description} fails closed`);
+  return message;
+}
+
+async function requestCommonSnapshot(local, remote, minimumSequence, description) {
+  local.send({ type: "request_snapshot" });
+  remote.send({ type: "request_snapshot" });
+  return waitForCommonSnapshot(
+    local,
+    remote,
+    minimumSequence,
+    description,
+  );
+}
+
 function controlFor(
   player,
   operationId,
@@ -569,6 +645,73 @@ async function aimActorAt(local, remote, state, playerId, target, description) {
   );
 }
 
+async function approachVisibleBlock(
+  local,
+  remote,
+  state,
+  playerId,
+  description,
+) {
+  const client = playerId === local.playerId ? local : remote;
+  for (let attempt = 0; attempt < 360; attempt += 1) {
+    const player = state.players.find(
+      (candidate) => candidate.player_id === playerId,
+    );
+    assert.ok(player, `${description} actor remains in the canonical roster`);
+    const visible = visibleBlock(state, player);
+    const speed = vectorMagnitude(player.linear_velocity);
+    if (visible && speed <= 0.2) return state;
+
+    let linearInput = { x: 0, y: 0, z: 0 };
+    if (!visible) {
+      const nearest = nearestBlock(state, player);
+      assert.ok(nearest, `${description} has a grid block to approach`);
+      const worldDirection = normalizeVector(
+        subtractVector(
+          gridBlockWorldPosition(nearest.grid, nearest.block),
+          player.position,
+        ),
+      );
+      linearInput = scaleVector(
+        rotateVector(
+          {
+            x: -player.orientation.x,
+            y: -player.orientation.y,
+            z: -player.orientation.z,
+            w: player.orientation.w,
+          },
+          worldDirection,
+        ),
+        0.45,
+      );
+    }
+
+    targetingOperationSequence += 1;
+    const operationId = `two-player-approach-${playerId}-${targetingOperationSequence}`;
+    const inputSequence = player.last_received_input_sequence + 1;
+    client.send(
+      controlFor(
+        player,
+        operationId,
+        inputSequence,
+        linearInput,
+        { x: 0, y: 0, z: 0 },
+      ),
+    );
+    await waitForReceipt(client, operationId, `${description} control receipt`);
+    const motion = await waitForCommonMotion(
+      local,
+      remote,
+      (candidate) =>
+        playerById(candidate, playerId)?.last_processed_input_sequence >=
+        inputSequence,
+      `${description} movement integration`,
+    );
+    state = applyMotionToSnapshot(state, motion);
+  }
+  assert.fail(`${description} did not reach a visible block and settle`);
+}
+
 async function run() {
   const local = new ProtocolClient("player-local");
   const remote = new ProtocolClient("player-remote");
@@ -601,12 +744,251 @@ async function run() {
     const initialRemote = localSnapshot.players.find(
       (player) => player.player_id === "player-remote",
     );
-    const target = visibleVoxel(localSnapshot, initialRemote);
+    const starterGrid = localSnapshot.grids.find(
+      (grid) => grid.owner_player_id === "player-local",
+    );
+    assert.ok(starterGrid, "the starter grid exposes its canonical local owner");
+    assert.ok(initialPrimary, "the local player is in the canonical roster");
+    assert.ok(initialRemote, "the remote player is in the canonical roster");
+
+    if (recoveryMode) {
+      assert.ok(expectedRecoveryHash, "recovery verification receives a hash");
+      assert.ok(
+        Number.isSafeInteger(expectedRecoverySequence),
+        "recovery verification receives an event sequence",
+      );
+      assert.equal(localSnapshot.world_hash, expectedRecoveryHash);
+      assert.equal(localSnapshot.event_sequence, expectedRecoverySequence);
+      console.log(
+        JSON.stringify({
+          result: "VERSE_TWO_PLAYER_RECOVERY_OK",
+          players: rosterIds(localSnapshot),
+          grid_owner: starterGrid.owner_player_id,
+          world_hash: localSnapshot.world_hash,
+          event_sequence: localSnapshot.event_sequence,
+        }),
+      );
+      return;
+    }
+
+    const primaryInventory = playerInventory(localSnapshot, initialPrimary);
+    const remoteInventory = playerInventory(localSnapshot, initialRemote);
+    const firstStarterBlock = starterGrid.blocks[0];
+    assert.ok(primaryInventory, "the local carried inventory is present");
+    assert.ok(remoteInventory, "the remote carried inventory is present");
+    assert.ok(firstStarterBlock, "the starter grid has a denial target");
+    const deniedIntents = [
+      {
+        intent: {
+          type: "refine_ore",
+          operation_id: "two-player-deny-refine-primary",
+          inventory_id: primaryInventory.inventory_id,
+          batches: 1,
+        },
+        code: "inventory_access_denied",
+      },
+      {
+        intent: {
+          type: "craft_component",
+          operation_id: "two-player-deny-craft-primary",
+          inventory_id: primaryInventory.inventory_id,
+          quantity: 1,
+        },
+        code: "inventory_access_denied",
+      },
+      {
+        intent: {
+          type: "transfer_inventory",
+          operation_id: "two-player-deny-withdraw-primary",
+          source_inventory_id: primaryInventory.inventory_id,
+          destination_inventory_id: remoteInventory.inventory_id,
+          resource: "component",
+          quantity: 1,
+        },
+        code: "inventory_access_denied",
+      },
+      {
+        intent: {
+          type: "transfer_inventory",
+          operation_id: "two-player-deny-deposit-primary",
+          source_inventory_id: remoteInventory.inventory_id,
+          destination_inventory_id: primaryInventory.inventory_id,
+          resource: "ore",
+          quantity: 1,
+        },
+        code: "inventory_access_denied",
+      },
+      {
+        intent: {
+          type: "build_block",
+          operation_id: "two-player-deny-build-primary-grid",
+          grid_id: starterGrid.grid_id,
+          coordinate: firstStarterBlock.coordinate,
+          kind: "structural",
+          orientation: 0,
+        },
+        code: "grid_access_denied",
+      },
+      {
+        intent: {
+          type: "weld_block",
+          operation_id: "two-player-deny-weld-primary-grid",
+          grid_id: starterGrid.grid_id,
+          block_id: firstStarterBlock.block_id,
+        },
+        code: "grid_access_denied",
+      },
+      {
+        intent: {
+          type: "set_grid_control",
+          operation_id: "two-player-deny-control-primary-grid",
+          grid_id: starterGrid.grid_id,
+          linear_input: { x: 0, y: 0, z: 0 },
+          angular_input: { x: 0, y: 0, z: 0 },
+          dampeners: true,
+        },
+        code: "grid_access_denied",
+      },
+      {
+        intent: {
+          type: "toggle_grid_anchor",
+          operation_id: "two-player-deny-anchor-primary-grid",
+          grid_id: starterGrid.grid_id,
+        },
+        code: "grid_access_denied",
+      },
+    ];
+    for (const { intent, code } of deniedIntents) {
+      await expectRejection(
+        remote,
+        intent,
+        code,
+        `${intent.type} against another player's authority`,
+      );
+    }
+    const denialSnapshot = await requestCommonSnapshot(
+      local,
+      remote,
+      localSnapshot.event_sequence,
+      "cross-player denial convergence",
+    );
+    assert.deepEqual(
+      playerInventory(denialSnapshot, initialPrimary).contents,
+      primaryInventory.contents,
+      "denied operations do not spend the primary inventory",
+    );
+    assert.deepEqual(
+      playerInventory(denialSnapshot, initialRemote).contents,
+      remoteInventory.contents,
+      "denied operations do not alter the remote inventory",
+    );
+    assert.deepEqual(
+      denialSnapshot.grids.find((grid) => grid.grid_id === starterGrid.grid_id)
+        .blocks,
+      starterGrid.blocks,
+      "denied operations do not change primary grid topology or integrity",
+    );
+
+    const damageStagingSnapshot = await approachVisibleBlock(
+      local,
+      remote,
+      denialSnapshot,
+      "player-remote",
+      "non-owner damage approach",
+    );
+    const denialRemote = damageStagingSnapshot.players.find(
+      (player) => player.player_id === "player-remote",
+    );
+    const damageTarget = visibleBlock(damageStagingSnapshot, denialRemote);
+    assert.ok(
+      damageTarget,
+      "the remote actor has a closest-visible non-owned block",
+    );
+    const damageTargetedSnapshot = await aimActorAt(
+      local,
+      remote,
+      damageStagingSnapshot,
+      "player-remote",
+      damageTarget.target,
+      "non-owner damage target",
+    );
+    const damageActor = damageTargetedSnapshot.players.find(
+      (player) => player.player_id === "player-remote",
+    );
+    const canonicalDamageHit = canonicalRayHits(
+      damageTargetedSnapshot,
+      damageActor,
+      playerForward(damageActor),
+    )[0];
+    assert.equal(canonicalDamageHit?.type, "block");
+    const damagedGridId = canonicalDamageHit.grid.grid_id;
+    const damagedBlockId = canonicalDamageHit.block.block_id;
+    const damageExperienceBefore = damageActor.experience;
+    const primaryExperienceBeforeDamage = damageTargetedSnapshot.players.find(
+      (player) => player.player_id === "player-local",
+    ).experience;
+    remote.send({
+      type: "damage_block",
+      operation_id: remoteDamageOperation,
+      grid_id: damagedGridId,
+      block_id: damagedBlockId,
+    });
+    const damageReceipt = await waitForReceipt(
+      remote,
+      remoteDamageOperation,
+      "non-owner PvP damage receipt",
+    );
+    const damageSnapshot = await waitForCommonSnapshot(
+      local,
+      remote,
+      damageReceipt.event_sequence,
+      "non-owner PvP damage publication",
+    );
+    const damagedGrid = damageSnapshot.grids.find(
+      (grid) =>
+        grid.grid_id === damagedGridId ||
+        grid.blocks.some((block) => block.block_id === damagedBlockId),
+    );
+    const damagedBlock = damagedGrid?.blocks.find(
+      (block) => block.block_id === damagedBlockId,
+    );
+    assert.ok(
+      damagedBlock === undefined ||
+        damagedBlock.health < canonicalDamageHit.block.health,
+      "non-owner closest-hit damage changes only the targeted integrity or removes the block",
+    );
+    assert.ok(
+      damageSnapshot.grids.every(
+        (grid) => grid.owner_player_id === "player-local",
+      ),
+      "PvP damage and any resulting split do not transfer ownership",
+    );
+    assert.equal(
+      damageSnapshot.players.find(
+        (player) => player.player_id === "player-remote",
+      ).experience,
+      damageExperienceBefore,
+      "non-owner PvP damage awards no attacker experience",
+    );
+    assert.equal(
+      damageSnapshot.players.find(
+        (player) => player.player_id === "player-local",
+      ).experience,
+      primaryExperienceBeforeDamage,
+      "non-owner PvP damage awards no owner experience",
+    );
+
+    const remoteAfterDamage = damageSnapshot.players.find(
+      (player) => player.player_id === "player-remote",
+    );
+    const target =
+      visibleVoxel(damageSnapshot, remoteAfterDamage, "ferrite_ore") ??
+      visibleVoxel(damageSnapshot, remoteAfterDamage);
     assert.ok(target, "the remote actor has a visible unanchored voxel");
     const targetedSnapshot = await aimActorAt(
       local,
       remote,
-      localSnapshot,
+      damageSnapshot,
       "player-remote",
       target.coordinate,
       "remote mining target",
@@ -698,8 +1080,159 @@ async function run() {
       "remote mining retry returns the original actor-scoped receipt",
     );
 
+    let industrySnapshot = minedSnapshot;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const industryRemote = industrySnapshot.players.find(
+        (player) => player.player_id === "player-remote",
+      );
+      if (playerInventory(industrySnapshot, industryRemote).contents.ore >= 2) {
+        break;
+      }
+      const additionalTarget = visibleVoxel(industrySnapshot, industryRemote);
+      assert.ok(
+        additionalTarget,
+        "the remote actor can expose enough ore for its own proof production",
+      );
+      industrySnapshot = await aimActorAt(
+        local,
+        remote,
+        industrySnapshot,
+        "player-remote",
+        additionalTarget.coordinate,
+        `remote additional mining target ${attempt + 1}`,
+      );
+      const operationId = `two-player-e2e-remote-mining-extra-${attempt + 1}`;
+      remote.send({
+        type: "mine_voxel",
+        operation_id: operationId,
+        coordinate: additionalTarget.coordinate,
+      });
+      const receipt = await waitForReceipt(
+        remote,
+        operationId,
+        `remote additional mining receipt ${attempt + 1}`,
+      );
+      industrySnapshot = await waitForCommonSnapshot(
+        local,
+        remote,
+        receipt.event_sequence,
+        `remote additional mining publication ${attempt + 1}`,
+      );
+    }
+
+    const productionPrimaryBefore = industrySnapshot.players.find(
+      (player) => player.player_id === "player-local",
+    );
+    const productionRemoteBefore = industrySnapshot.players.find(
+      (player) => player.player_id === "player-remote",
+    );
+    const productionPrimaryInventoryBefore = structuredClone(
+      playerInventory(industrySnapshot, productionPrimaryBefore).contents,
+    );
+    const productionRemoteInventoryBefore = structuredClone(
+      playerInventory(industrySnapshot, productionRemoteBefore).contents,
+    );
+    assert.ok(
+      productionRemoteInventoryBefore.ore >= 2,
+      "the remote actor owns enough mined ore for one proof refining batch",
+    );
+    remote.send({
+      type: "refine_ore",
+      operation_id: remoteRefiningOperation,
+      inventory_id: productionRemoteBefore.inventory_id,
+      batches: 1,
+    });
+    const refiningReceipt = await waitForReceipt(
+      remote,
+      remoteRefiningOperation,
+      "remote actor-owned refining receipt",
+    );
+    const refinedSnapshot = await waitForCommonSnapshot(
+      local,
+      remote,
+      refiningReceipt.event_sequence,
+      "remote actor-owned refining publication",
+    );
+    const refinedRemote = refinedSnapshot.players.find(
+      (player) => player.player_id === "player-remote",
+    );
+    const refinedInventory = playerInventory(refinedSnapshot, refinedRemote);
+    assert.equal(
+      refinedInventory.contents.ore,
+      productionRemoteInventoryBefore.ore - 2,
+    );
+    assert.equal(
+      refinedInventory.contents.refined_material,
+      productionRemoteInventoryBefore.refined_material + 1,
+    );
+    assert.equal(
+      refinedRemote.experience,
+      productionRemoteBefore.experience + 12,
+      "proof refining credits only its authenticated actor",
+    );
+    assert.equal(
+      refinedRemote.career.refining_batches,
+      productionRemoteBefore.career.refining_batches + 1,
+    );
+    assert.deepEqual(
+      playerInventory(
+        refinedSnapshot,
+        refinedSnapshot.players.find(
+          (player) => player.player_id === "player-local",
+        ),
+      ).contents,
+      productionPrimaryInventoryBefore,
+      "remote refining cannot spend or credit the primary inventory",
+    );
+
+    remote.send({
+      type: "craft_component",
+      operation_id: remoteCraftingOperation,
+      inventory_id: refinedRemote.inventory_id,
+      quantity: 1,
+    });
+    const craftingReceipt = await waitForReceipt(
+      remote,
+      remoteCraftingOperation,
+      "remote actor-owned crafting receipt",
+    );
+    const craftedSnapshot = await waitForCommonSnapshot(
+      local,
+      remote,
+      craftingReceipt.event_sequence,
+      "remote actor-owned crafting publication",
+    );
+    const craftedRemote = craftedSnapshot.players.find(
+      (player) => player.player_id === "player-remote",
+    );
+    const craftedInventory = playerInventory(craftedSnapshot, craftedRemote);
+    assert.equal(
+      craftedInventory.contents.refined_material,
+      refinedInventory.contents.refined_material - 1,
+    );
+    assert.equal(
+      craftedInventory.contents.components,
+      refinedInventory.contents.components + 1,
+    );
+    assert.equal(
+      craftedRemote.experience,
+      refinedRemote.experience + 18,
+      "proof crafting credits only its authenticated actor",
+    );
+    assert.equal(
+      craftedRemote.career.components_crafted,
+      refinedRemote.career.components_crafted + 1,
+    );
+    assert.equal(
+      craftedSnapshot.players.find(
+        (player) => player.player_id === "player-local",
+      ).experience,
+      productionPrimaryBefore.experience,
+      "remote production never credits the primary career",
+    );
+
     const initialPlayers = new Map(
-      minedSnapshot.players.map((player) => [player.player_id, player]),
+      craftedSnapshot.players.map((player) => [player.player_id, player]),
     );
     const localPlayer = initialPlayers.get("player-local");
     const remotePlayer = initialPlayers.get("player-remote");
@@ -804,6 +1337,7 @@ async function run() {
         players: rosterIds(settled),
         initial_world_hash: localSnapshot.world_hash,
         mined_world_hash: minedSnapshot.world_hash,
+        industry_world_hash: craftedSnapshot.world_hash,
         final_world_hash: settled.world_hash,
         event_sequence: settled.event_sequence,
         local_input_frontier: localSequence + 1,

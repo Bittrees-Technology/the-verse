@@ -679,7 +679,7 @@ async function run() {
 
   send({
     type: "hello",
-    protocol_version: 11,
+    protocol_version: 12,
     client_name: "node-authoritative-e2e",
     authentication: {
       kind: "local_development",
@@ -690,7 +690,7 @@ async function run() {
     (message) => message.type === "welcome",
     "authenticated welcome",
   );
-  assert.equal(welcome.protocol_version, 11);
+  assert.equal(welcome.protocol_version, 12);
   assert.deepEqual(welcome.session_role, {
     kind: "player",
     player_id: "player-local",
@@ -703,7 +703,7 @@ async function run() {
   ).snapshot;
   authoritativeWorld = world;
   assert.equal(world.conservation.valid, true);
-  assert.equal(world.content_manifest_version, "p0.10.0");
+  assert.equal(world.content_manifest_version, "p1.1.0");
   assert.equal(world.grids.length, 1);
   assert.deepEqual(
     world.players.map((player) => player.player_id),
