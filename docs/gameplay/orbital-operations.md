@@ -29,6 +29,7 @@ The opening salvage site must read as an asteroid operation in planetary orbit, 
 3. Rows expose item type, amount, total volume, and total mass rather than oversized presentation cards.
 4. The selected item receives an explicit outline. Center arrows transfer one unit or the full source stack in either direction.
 5. Capacity bars and aggregate mass remain sourced from authoritative snapshots. The UI never calculates acceptance or changes inventory directly.
+6. Focused search fields own printable keys, including `I`; `Escape` always closes the terminal, while `I` closes it only when text entry does not own focus.
 
 ## Visual material contract
 
