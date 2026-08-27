@@ -1134,14 +1134,14 @@ async function run() {
       helmet_closed: initialPrimary.helmet_closed,
       jetpack_enabled: initialPrimary.jetpack_enabled,
       magnetic_boots_enabled:
-        initialPrimary.locomotion.magnetic_boots_enabled,
+        !initialPrimary.locomotion.magnetic_boots_enabled,
     });
     const localIsolationReceipt = await waitForReceipt(
       local,
       localIsolationOperation,
       "local-only operation frontier receipt",
     );
-    const postDenialSnapshot = await requestCommonSnapshot(
+    const localIsolationSnapshot = await requestCommonSnapshot(
       local,
       remote,
       localIsolationReceipt.event_sequence,
@@ -1160,6 +1160,41 @@ async function run() {
       remote.lastProjectedOperationSequence,
       remoteFrontierBeforeLocalIsolation,
       "the local accepted operation cannot advance the remote private frontier",
+    );
+    const localIsolationRestoreOperation =
+      "two-player-local-frontier-isolation-restore";
+    local.send({
+      type: "set_suit_mode",
+      operation_id: localIsolationRestoreOperation,
+      helmet_closed: initialPrimary.helmet_closed,
+      jetpack_enabled: initialPrimary.jetpack_enabled,
+      magnetic_boots_enabled:
+        initialPrimary.locomotion.magnetic_boots_enabled,
+    });
+    const localIsolationRestoreReceipt = await waitForReceipt(
+      local,
+      localIsolationRestoreOperation,
+      "local-only operation frontier restore receipt",
+    );
+    const postDenialSnapshot = await requestCommonSnapshot(
+      local,
+      remote,
+      localIsolationRestoreReceipt.event_sequence,
+      "local-only operation frontier restore publication",
+    );
+    assert.equal(
+      local.lastProjectedOperationSequence,
+      localIsolationReceipt.operation_sequence + 1,
+    );
+    assert.equal(
+      remote.lastProjectedOperationSequence,
+      remoteFrontierBeforeLocalIsolation,
+      "the local restore operation also remains actor-private",
+    );
+    assert.notEqual(
+      localIsolationSnapshot.world_hash,
+      postDenialSnapshot.world_hash,
+      "the restore is a distinct canonical operation",
     );
 
     const damageStagingSnapshot = await approachVisibleBlock(
@@ -1391,7 +1426,7 @@ async function run() {
       operation_id: remoteMiningOperation,
       helmet_closed: minedRemote.helmet_closed,
       jetpack_enabled: minedRemote.jetpack_enabled,
-      magnetic_boots_enabled: minedRemote.locomotion.magnetic_boots_enabled,
+      magnetic_boots_enabled: !minedRemote.locomotion.magnetic_boots_enabled,
     });
     const reusedIdReceipt = await waitForReceipt(
       remote,
@@ -1404,7 +1439,7 @@ async function run() {
       miningReceipt,
       "the same diagnostic ID at a new sequence is a distinct operation",
     );
-    let industrySnapshot = await waitForCommonSnapshot(
+    const reusedIdSnapshot = await waitForCommonSnapshot(
       local,
       remote,
       reusedIdReceipt.event_sequence,
@@ -1418,6 +1453,39 @@ async function run() {
       local.lastProjectedOperationSequence,
       localFrontierBeforeIdReuse,
       "same-ID reuse remains isolated to the committing actor",
+    );
+    const reuseRestoreOperation = "two-player-e2e-id-reuse-restore";
+    remote.send({
+      type: "set_suit_mode",
+      operation_id: reuseRestoreOperation,
+      helmet_closed: minedRemote.helmet_closed,
+      jetpack_enabled: minedRemote.jetpack_enabled,
+      magnetic_boots_enabled: minedRemote.locomotion.magnetic_boots_enabled,
+    });
+    const reuseRestoreReceipt = await waitForReceipt(
+      remote,
+      reuseRestoreOperation,
+      "same-ID probe suit restore receipt",
+    );
+    let industrySnapshot = await waitForCommonSnapshot(
+      local,
+      remote,
+      reuseRestoreReceipt.event_sequence,
+      "same-ID probe suit restore publication",
+    );
+    assert.equal(
+      remote.lastProjectedOperationSequence,
+      reusedOperationSequence + 1,
+    );
+    assert.equal(
+      local.lastProjectedOperationSequence,
+      localFrontierBeforeIdReuse,
+      "the restore after same-ID reuse stays isolated to the remote actor",
+    );
+    assert.notEqual(
+      reusedIdSnapshot.world_hash,
+      industrySnapshot.world_hash,
+      "the remote suit restore is a distinct canonical operation",
     );
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const industryRemote = industrySnapshot.players.find(

@@ -27,6 +27,7 @@ const PREDICTION_HISTORY_LIMIT := 180
 const MUTATION_QUEUE_LIMIT := 32
 const MUTATION_RETRY_INTERVAL := 1.5
 const MUTATION_RETRY_LIMIT := 3
+const JSON_SAFE_INTEGER_MAX := 9007199254740991
 const POSITION_SNAP_DISTANCE := 2.0
 const ORIENTATION_SNAP_ANGLE := PI / 3.0
 const CHARACTER_COLLISION_RADIUS := 0.34
@@ -91,6 +92,7 @@ var operation_counter := 0
 var committed_operation_sequence := 0
 var committed_operation_actor_id := ""
 var operation_frontier_observed := false
+var observed_operation_frontier := -1
 var operation_frontier_ready := false
 var mutation_queue: Array[Dictionary] = []
 var mutation_queue_actor_id := ""
@@ -479,6 +481,26 @@ func _clear_actor_private_state() -> void:
 		selector.disabled = true
 
 
+func _protocol_nonnegative_integer(value: Variant) -> int:
+	var value_type := typeof(value)
+	if value_type == TYPE_INT:
+		var integer_value := int(value)
+		if integer_value >= 0 and integer_value <= JSON_SAFE_INTEGER_MAX:
+			return integer_value
+		return -1
+	if value_type != TYPE_FLOAT:
+		return -1
+	var float_value := float(value)
+	if (
+		not is_finite(float_value)
+		or float_value < 0.0
+		or float_value > float(JSON_SAFE_INTEGER_MAX)
+		or floor(float_value) != float_value
+	):
+		return -1
+	return int(float_value)
+
+
 func _actor_private_matches(candidate: Variant, event_sequence: int) -> bool:
 	if not candidate is Dictionary or candidate.is_empty() or bound_player_id.is_empty():
 		return false
@@ -501,8 +523,9 @@ func _actor_private_matches(candidate: Variant, event_sequence: int) -> bool:
 		return false
 	if (
 		not candidate.has("committed_operation_sequence")
-		or typeof(candidate.get("committed_operation_sequence")) != TYPE_INT
-		or int(candidate.get("committed_operation_sequence", -1)) < 0
+		or _protocol_nonnegative_integer(
+			candidate.get("committed_operation_sequence", null)
+		) < 0
 	):
 		return false
 	# Protocol 14 nests the overlay in the outer projected snapshot, making the
@@ -510,7 +533,8 @@ func _actor_private_matches(candidate: Variant, event_sequence: int) -> bool:
 	# it agrees, so malformed extensions still fail closed.
 	return (
 		not candidate.has("event_sequence")
-		or int(candidate.get("event_sequence", -1)) == event_sequence
+		or _protocol_nonnegative_integer(candidate.get("event_sequence", null))
+		== event_sequence
 	)
 
 
@@ -520,7 +544,9 @@ func _install_actor_private(candidate: Variant, event_sequence: int) -> bool:
 		return false
 	actor_private_snapshot = (candidate as Dictionary).duplicate(true)
 	return _reconcile_operation_frontier(
-		int(actor_private_snapshot.get("committed_operation_sequence", -1))
+		_protocol_nonnegative_integer(
+			actor_private_snapshot.get("committed_operation_sequence", null)
+		)
 	)
 
 
@@ -1669,6 +1695,7 @@ func _handle_server_message(message: Dictionary) -> void:
 				committed_operation_sequence = 0
 				committed_operation_actor_id = ""
 				operation_frontier_observed = false
+				observed_operation_frontier = -1
 			_set_message(
 				"Connected to %s // %s"
 				% [message.get("server_name", "The Verse"), _controlled_player_id()]
@@ -1731,6 +1758,8 @@ func _apply_snapshot(authoritative: Dictionary) -> void:
 				_emit_mining_fragments(Vector3(mined_coordinate))
 				pending_mine_position = null
 	_rebuild_grids(snapshot.get("grids", []))
+	if smoke_test:
+		print("VERSE_SMOKE_STRUCTURAL_READY event=%d" % event_sequence)
 
 	var public_player := _player_from_roster(players, bound_player_id)
 	var projection_valid := (
@@ -1739,6 +1768,11 @@ func _apply_snapshot(authoritative: Dictionary) -> void:
 		and _install_actor_private(private_candidate, event_sequence)
 	)
 	if not projection_valid:
+		if smoke_test:
+			printerr(
+				"VERSE_SMOKE_PRIVATE_PROJECTION_INVALID actor=%s event=%d"
+				% [bound_player_id, event_sequence]
+			)
 		_clear_actor_private_state()
 		authoritative_player_ready = false
 		last_authoritative_event_sequence = event_sequence
@@ -1765,10 +1799,12 @@ func _apply_snapshot(authoritative: Dictionary) -> void:
 	)
 	_dispatch_next_mutation()
 	if smoke_test and not smoke_visual_ready:
+		print("VERSE_SMOKE_VISUAL_ASSERTIONS_START event=%d" % event_sequence)
 		if not _run_visual_smoke_assertions():
 			get_tree().quit(1)
 			return
 		smoke_visual_ready = true
+		print("VERSE_SMOKE_VISUAL_ASSERTIONS_COMPLETE event=%d" % event_sequence)
 
 
 func _full_snapshot_event_is_current(incoming_sequence: int, current_sequence: int) -> bool:
@@ -4800,9 +4836,9 @@ func _dispatch_next_mutation() -> bool:
 		or not _mutation_actor_matches_session()
 	):
 		return false
-	if committed_operation_sequence >= 9223372036854775807:
+	if committed_operation_sequence >= JSON_SAFE_INTEGER_MAX:
 		mutation_resync_required = true
-		_set_message("COMMAND SEQUENCE EXHAUSTED // AUTHORITY HALTED", true)
+		_set_message("COMMAND SEQUENCE EXCEEDS SAFE CLIENT RANGE // AUTHORITY HALTED", true)
 		return false
 
 	var message: Dictionary = mutation_queue.pop_front()
@@ -4852,10 +4888,13 @@ func _reconcile_operation_frontier(frontier: int) -> bool:
 	if frontier < 0 or not _mutation_actor_matches_session():
 		mutation_resync_required = true
 		return false
+	var observed_floor := committed_operation_sequence
+	if operation_frontier_observed:
+		observed_floor = maxi(observed_floor, observed_operation_frontier)
 	if (
 		operation_frontier_observed
 		and committed_operation_actor_id == bound_player_id
-		and frontier < committed_operation_sequence
+		and frontier < observed_floor
 	):
 		mutation_resync_required = true
 		return false
@@ -4866,10 +4905,12 @@ func _reconcile_operation_frontier(frontier: int) -> bool:
 	):
 		mutation_resync_required = true
 		return false
+	var resuming_after_resync := mutation_resync_required or not operation_frontier_ready
 	committed_operation_actor_id = bound_player_id
 	if in_flight_mutation.is_empty():
 		committed_operation_sequence = frontier
 		operation_frontier_observed = true
+		observed_operation_frontier = frontier
 		operation_frontier_ready = true
 		mutation_resync_required = false
 		_refresh_mutation_actor_binding()
@@ -4882,22 +4923,24 @@ func _reconcile_operation_frontier(frontier: int) -> bool:
 	if frontier == pending_sequence - 1:
 		committed_operation_sequence = frontier
 		operation_frontier_observed = true
+		observed_operation_frontier = frontier
 		operation_frontier_ready = true
 		mutation_resync_required = false
 		mutation_retry_elapsed = MUTATION_RETRY_INTERVAL
-		mutation_retry_count = 0
+		if resuming_after_resync:
+			mutation_retry_count = 0
 		return true
 	if frontier == pending_sequence:
-		committed_operation_sequence = frontier
+		# A frontier alone cannot prove that this exact payload won a race with
+		# another session using the same actor. Retain and retry the byte-identical
+		# command so authority returns either its original receipt or a conflict.
 		operation_frontier_observed = true
-		in_flight_mutation = {}
-		in_flight_mutation_text = ""
-		in_flight_mutation_actor_id = ""
-		mutation_retry_elapsed = 0.0
-		mutation_retry_count = 0
+		observed_operation_frontier = frontier
 		operation_frontier_ready = true
 		mutation_resync_required = false
-		_refresh_mutation_actor_binding()
+		mutation_retry_elapsed = MUTATION_RETRY_INTERVAL
+		if resuming_after_resync:
+			mutation_retry_count = 0
 		return true
 
 	# Another writer advanced this actor while the local command outcome was
@@ -4905,6 +4948,7 @@ func _reconcile_operation_frontier(frontier: int) -> bool:
 	# authored against an obsolete frontier and must never be guessed forward.
 	committed_operation_sequence = frontier
 	operation_frontier_observed = true
+	observed_operation_frontier = frontier
 	_clear_mutation_pipeline()
 	operation_frontier_ready = true
 	mutation_resync_required = false
@@ -4913,13 +4957,12 @@ func _reconcile_operation_frontier(frontier: int) -> bool:
 
 
 func _handle_intent_accepted(receipt: Dictionary) -> bool:
-	if (
-		not receipt.has("operation_sequence")
-		or typeof(receipt.get("operation_sequence")) != TYPE_INT
-	):
+	var sequence := _protocol_nonnegative_integer(
+		receipt.get("operation_sequence", null)
+	)
+	if sequence < 0:
 		_request_operation_resync("MALFORMED COMMAND RECEIPT")
 		return false
-	var sequence := int(receipt.get("operation_sequence", 0))
 	if sequence <= committed_operation_sequence:
 		return false
 	if in_flight_mutation.is_empty():
@@ -4936,6 +4979,7 @@ func _handle_intent_accepted(receipt: Dictionary) -> bool:
 	committed_operation_sequence = sequence
 	committed_operation_actor_id = bound_player_id
 	operation_frontier_observed = true
+	observed_operation_frontier = maxi(observed_operation_frontier, sequence)
 	in_flight_mutation = {}
 	in_flight_mutation_text = ""
 	in_flight_mutation_actor_id = ""
@@ -4949,11 +4993,12 @@ func _handle_intent_accepted(receipt: Dictionary) -> bool:
 
 
 func _handle_intent_rejected(message: Dictionary) -> bool:
-	var sequence_value: Variant = message.get("operation_sequence", null)
-	if sequence_value == null or typeof(sequence_value) != TYPE_INT:
+	var sequence := _protocol_nonnegative_integer(
+		message.get("operation_sequence", null)
+	)
+	if sequence < 0:
 		_request_operation_resync("UNBOUND COMMAND REJECTION")
 		return false
-	var sequence := int(sequence_value)
 	if sequence <= committed_operation_sequence:
 		return false
 	if in_flight_mutation.is_empty():
