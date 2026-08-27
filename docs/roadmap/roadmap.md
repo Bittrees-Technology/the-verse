@@ -22,6 +22,41 @@ scheduling must reuse the same integer-tick production event before the project
 claims sleeping-cell, background, or offline production. This ordering improves
 the playable work loop without inventing a second production state machine.
 
+P1.5 is the fixed-celestial and interest-management correctness slice. It pins
+the current planet and asteroid to immutable hierarchical universe addresses,
+validates a versioned proof separation threshold, and replaces whole-cell
+fanout with deterministic server-derived interest baselines and deltas. Player
+views follow authoritative position. The browser receives a bounded public
+spectator view. Visible machines may expose only coarse operating state; actor
+inventories, production queues, job details, progress, cargo handles, and
+escrow remain private.
+
+P1.5 deliberately remains inside one active authoritative cell. It does not
+materialize frontier sectors, allocate workers dynamically, hand entities
+between cells, simulate multi-day routes, stream editable planets, provide
+arbitrary remote spectator cameras, or claim thousands-player capacity. Its
+correctness semantics are encoding-independent; the production binary codec,
+cross-cell execution, and public-scale soak evidence remain later P1 work.
+
+P1.5 acceptance requires:
+
+- Deterministic registry identity, normalized addresses, minimum-separation
+  validation, persistence binding, and exact recovery.
+- Explicit rejection of duplicate IDs, malformed or overflowing addresses,
+  registry-hash mismatch, and silent body relocation.
+- Deterministic interest ordering, hysteretic enter/leave behavior, complete
+  entity entry, explicit removal, and structural-before-motion delivery.
+- Exact baseline convergence after delayed, duplicated, reordered, stale-epoch,
+  disconnected, or backpressured delivery.
+- Proof that interest projection cannot mutate canonical state, authority,
+  conservation, event order, or the world hash.
+- Raw spectator and other-player messages containing no private inventory or
+  production fields while coarse visible machine state remains available.
+- Scaling evidence showing that out-of-view decoy entities do not make a
+  connection's payload proportional to the total cell population.
+- Existing multiplayer, industry, recovery, native, and browser evidence
+  remaining green.
+
 ## Phase S0 — Canonical specification
 
 Deliverables:
@@ -91,8 +126,8 @@ Build:
 - Server-issued session authority bound to one durable player identity.
 - Multiple users in a cell with independent input, inventory, life, and recovery state.
 - Deterministic shared-player physics and replication budgets.
-- Interest management.
-- Fixed celestial registry.
+- Deterministic single-cell interest management.
+- Fixed canonical celestial registry.
 - Dynamic cell scheduling.
 - Cross-cell handoff.
 - Capital safe zone.
@@ -157,7 +192,7 @@ Exit gate:
 
 Build:
 
-- Expanding frontier.
+- Procedural frontier-sector materialization and continued resource expansion.
 - Multi-day routes.
 - Regional markets.
 - PvP/PvE.

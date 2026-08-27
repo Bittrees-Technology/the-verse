@@ -49,7 +49,8 @@ expression.
 - Existing qualifying-power gate, pause, and resume.
 - Output escrow and exactly-once delivery after capacity or route recovery.
 - Queue and escrow behavior under damage, destruction, and grid splits.
-- Native inventory and production terminal views.
+- Native inventory and production terminal views, with P1.5 delivery limited
+  to machines and cargo in the authorized active-cell interest view.
 - Exact persistence, replay, idempotency, and conservation evidence.
 
 ### Excluded
@@ -209,6 +210,14 @@ conveyor-connected across grids or at arbitrary distance; queue admission still
 requires one physical same-grid network. Later terminal and signal authority
 will replace owner-wide access.
 
+P1.5 narrows presentation without changing the production aggregate. Detailed
+cargo, mass, machine queue, endpoints, progress, and escrow are projected only
+while the corresponding public grid or machine is in the actor's authorized
+active-cell interest view. A machine leaving interest clears its actionable
+terminal selection and displays `OUT OF LOCAL VIEW`; it does not cancel, pause,
+advance, or destroy the canonical queue. A public machine entering another
+player's or spectator's view exposes only coarse public operating state.
+
 ## Normal flow
 
 1. The player completes cargo, refinery, conveyor, and assembler blocks.
@@ -305,6 +314,8 @@ world; it does not open a P1.4 world under older schemas.
 - Capacity toggling cannot deliver pending output more than once.
 - Split and destruction cannot clone escrow or restore committed loss.
 - Public and other-player projections contain no private queue or cargo fields.
+- Interest enter, leave, reset, and re-entry cannot leak, duplicate, cancel, or
+  advance a private queue or its escrow.
 
 ## Economic and conservation impact
 
@@ -340,6 +351,13 @@ but it must stop describing all owned cargo as physically connected. It shows:
 The native client removes R/T pocket conversion after queue controls are usable.
 Inventory transfer remains an authoritative action; whether a generic transfer
 must also follow conveyors is deferred outside this production slice.
+
+Under P1.5, a machine or cargo enter supplies its structural baseline before
+private production details. Unrelated structural updates retain the selected
+machine's stable client identity. An `out_of_interest` leave disables queue and
+transfer controls without presenting destruction; `destroyed` uses the distinct
+authoritative drop outcome. Re-entry installs one fresh machine baseline and
+one matching private queue, never a second local job list or optimistic replay.
 
 The interface may use familiar engineering-terminal interaction patterns, but
 its visuals, layout, words, assets, and audiovisual feedback must remain an
@@ -395,6 +413,9 @@ telemetry.
     a component, and builds a block without accepted direct refine/craft intents.
 15. Active and synthetic background advancement produce identical production
     events for the same prior state and elapsed tick count.
+16. A machine leaving P1.5 interest disables its terminal controls with an
+    out-of-view reason while its canonical queue and escrow remain unchanged;
+    re-entry restores one exact private queue after the public machine baseline.
 
 ## Test strategy
 
@@ -411,7 +432,8 @@ telemetry.
 - **Security/fuzz:** Malformed graph links, IDs, quantities, job states,
   manifests, progress bounds, and actor projection.
 - **Native smoke:** Functional production controls, progress presentation,
-  reconnect reconciliation, and no pocket conversion shortcut.
+  reconnect reconciliation, interest leave/re-entry, stable machine identity,
+  and no pocket conversion shortcut.
 
 ## Rollout and rollback
 

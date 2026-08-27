@@ -25,10 +25,10 @@ Priorities:
 | F-011 | Durable snapshot and event recovery | P0 | Persistence |
 | F-012 | Multiple players in one cell | P1 | F-002, SIM-011, SIM-012 |
 | F-013 | Dynamic cell assignment and handoff | P1 | Universe directory |
-| F-014 | Fixed celestial registry | P1 | Coordinate schema |
-| F-015 | Procedural frontier generation | P1 | Generation rules |
+| F-014 | Fixed canonical celestial registry | P1 | F-003, WORLD-002/003/009 |
+| F-015 | Procedural frontier sector materialization | P4 | F-014, generation rules, universe directory |
 | F-016 | Multi-day autopilot travel | P1 | Route service |
-| F-017 | Browser journey and asset status | P1 | Public API |
+| F-017 | Browser journey, asset status, and bounded public-cell spectating | P1 | Public API, F-059 |
 | F-018 | Capital hard safe zone | P1 | Policy volumes |
 | F-019 | Offline structures and powered turrets | P1 | Cell wake-up |
 | F-020 | Death drop, 15-minute recovery grace, and six-hour cleanup | P1 | Lifecycle scheduler |
@@ -52,7 +52,7 @@ Priorities:
 | F-038 | Public GraphQL/REST/WebSocket APIs | P1 | API gateway |
 | F-039 | Agent SDK | P2 | Public schemas |
 | F-040 | Browser market and management application | P2 | F-038 |
-| F-041 | Browser spectating | P3 | Read model/stream |
+| F-041 | Production delayed, permissioned, and global browser spectating | P3 | F-017, read model/stream |
 | F-042 | Cloud-streamed native client | P4 | Operations |
 | F-043 | Signed official mod manifests | P2 | Governance |
 | F-044 | Mod sandbox and budgets | P2 | Extension API |
@@ -70,6 +70,7 @@ Priorities:
 | F-056 | Direct-download updater for macOS/Linux | P1 | Release signing |
 | F-057 | Server-authoritative EVA, landing, and rotation | P0 | F-002, F-004, F-006 |
 | F-058 | Server-authoritative grounded and magnetic locomotion | P0 | F-057, F-006, SIM-010 |
+| F-059 | Deterministic single-cell spatial interest replication | P1 | F-012, SIM-013/014 |
 
 ## Current implementation readiness
 
@@ -84,6 +85,20 @@ choices. Hosted CI remains the milestone evidence gate.
 Offline/background production remains dependent on dynamic cell scheduling,
 and public-scale replication remains dependent on interest management. Neither
 deferred system changes the P1.4 canonical production-event contract.
+
+F-014 and F-059 form the bounded P1.5 correctness slice. It introduces an
+immutable, content-addressed celestial registry and deterministic interest
+baselines/deltas inside the current authoritative cell. The server derives a
+player's view from canonical position; a browser spectator receives only a
+server-approved public view. Coarse visible machine operation may replicate,
+but inventory, queue, job, recipe, progress, cargo-handle, and escrow fields
+remain actor-private.
+
+P1.5 does not materialize new frontier sectors, schedule or hand off cells,
+simulate multi-day routes, stream planetary terrain, provide arbitrary remote
+spectator cameras, or establish a thousands-of-players capacity claim. Its
+encoding-independent correctness contract may continue over the inspectable
+transport while the production binary codec remains a later P1 exit item.
 
 ## Definition of specification-ready
 

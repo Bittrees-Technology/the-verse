@@ -1,6 +1,6 @@
 # Universe simulation
 
-**Status:** Proposed baseline
+**Status:** P1.5 address and fixed-registry contract accepted; multi-cell runtime proposed
 
 ## Coordinate model
 
@@ -8,33 +8,79 @@ The Verse uses hierarchical coordinates rather than one global floating-point sc
 
 ```text
 Universe
-└── generated region key
-    └── sector coordinate
-        └── simulation cell
-            └── local double-precision frame
+└── sector coordinate (signed 128-bit)
+    └── cell index within sector
+        └── normalized local integer-micrometre position
+            └── derived cell-local physics frame
                 └── grid or voxel-local frame
 ```
 
-Proposed persistent address:
+The canonical persistent address is versioned by
+[ADR-0019](../decisions/ADR-0019-fixed-celestial-registry.md):
 
 ```text
-UniverseAddress {
+UniverseAddressV1 {
   universe_id
-  region_seed
-  sector_x: signed 128-bit integer
-  sector_y: signed 128-bit integer
-  sector_z: signed 128-bit integer
-  local_position: three signed fixed-point values
+  sector: three signed 128-bit integers
+  cell: three bounded indexes within the sector
+  local_um: three signed 64-bit integers in the cell-centered half-open range
 }
 ```
 
-Network and database representations encode 128-bit values as canonical decimal strings or 16-byte two's-complement values. Physics operates only in a bounded local frame and uses origin rebasing.
+Universe manifest schema `2` pins the sector and cell dimensions. Network and
+database JSON represents 128-bit values as canonical decimal strings; a future
+binary codec uses 16-byte two's-complement values. Euclidean floor division
+normalizes local overflow through cell and sector coordinates, including on
+negative axes. An alternative representation of the same point is invalid.
+
+Physics operates only in a bounded cell-local `f64` frame. Origin rebasing and
+client floating origins are derived presentation state and cannot change a
+canonical address or intent target. A generated region is only a routing label
+over sectors; it is not another address component or identity seed.
 
 The address space is finite mathematically but has no practical reachable boundary.
 
-## Generated celestial registry
+## Fixed celestial registry
 
-A generated region is deterministic from:
+Celestial registry schema `1` is an ordered, content-addressed set of immutable
+body identities. Universe manifest schema `2` binds its hash together with the
+universe seed, address dimensions, generation rules, frontier policy, and
+content manifest. World schema `18` and event schema `14` bind both the
+registry and universe-manifest hashes; recovery fails before replay when any
+binding differs.
+
+Each body records:
+
+- Immutable body ID and kind.
+- Optional parent body; moons require an existing planet parent, while missing,
+  self, non-planet, and cyclic parentage fails validation.
+- Public display name, visual descriptor, and proof or production scale class.
+- Normalized center address and integer exclusion radius.
+- Fixed gameplay orientation.
+- Geometry, voxel, gravity, atmosphere, material, and resource definitions.
+- Generation seed and rule version where procedural generation is used.
+- Content-manifest version and hash.
+
+P1.5 bodies do not orbit, translate, or change gameplay orientation. Cosmetic
+motion cannot affect collision, gravity, atmosphere, resources, or targeting.
+Voxel edits are canonical world events relative to the fixed body and do not
+rewrite the registry.
+
+Every official-client planet, moon, asteroid, or asteroid field that appears
+physical resolves to a registry entry. The existing visible moon is registered
+as Khepri's fixed child rather than removed or retained as untracked decorative
+geometry. A missing visual asset produces a labelled proxy; it cannot hide an
+authoritative collider or gravity source.
+
+Content schema `11` and manifest `p1.5.0` require at least `3,000 m` between
+the integer exclusion surfaces of every pair in the local proof. The planet
+radius includes terrain and gameplay atmosphere; an asteroid field uses its
+bounding radius. Equality passes and one micrometre below the boundary fails.
+This proves nonoverlap for one local planet, its registered fixed moon, and the
+origin asteroid field. It does not claim production planet-to-planet
+separation or real-day travel.
+
+A future generated registry remains deterministic from:
 
 - Universe seed.
 - Sector coordinate.
@@ -42,19 +88,21 @@ A generated region is deterministic from:
 - Approved content manifest.
 - Governance-controlled frontier policy.
 
-Planets are generated only when minimum-separation rules are satisfied. Asteroids may appear as belts, dense clusters, sparse fields, or isolated bodies. Once a generated body becomes canonical, its identity and coordinates are recorded so later generator changes cannot move it.
-
-Planets and asteroids do not orbit in the initial model.
+Planets are admitted only when their active manifest's stronger production
+separation rule passes. Asteroids may appear as belts, dense clusters, sparse
+fields, or isolated bodies. Once published, later generator changes cannot
+move or reuse a body identity.
 
 ## Frontier expansion
 
 New sectors become canonical when:
 
 1. A route, survey, or expansion action requests an unmaterialized region.
-2. The generator produces a candidate manifest.
-3. Minimum-separation and content rules validate it.
-4. The manifest is signed by the universe service.
-5. The sector becomes immutable apart from authorized voxel edits and future content migrations.
+2. The generator produces a candidate registry extension.
+3. Address normalization, minimum separation, and content rules validate it.
+4. The registry and universe-manifest hashes are published and attested.
+5. The sector becomes immutable apart from authorized voxel edits and explicit
+   future content migrations.
 
 Resource availability expands through frontier discovery rather than regenerating mined canonical deposits.
 
@@ -70,6 +118,10 @@ Unmaterialized → Generated → Sleeping → Background → Active → Draining
 - **Draining:** no new entrants; transfer and snapshot complete before worker release.
 
 Attacks, arrivals, expiring timers, or observation may wake a cell.
+
+P1.5 implements only the active local cell and records the hierarchy needed by
+later schedulers. Sleeping/background execution, dynamic activation, and
+multi-process leasing remain requirements, not demonstrated capabilities.
 
 ## Player and grid handoff
 
@@ -157,6 +209,23 @@ A route has:
 
 The ship enters active physics when observed, intercepted, maneuvering, near a hazard, or approaching a destination. Otherwise the route service advances it analytically.
 
+This route model is not implemented by P1.5. The local fixed-body registry must
+not be presented as evidence of seamless interplanetary travel.
+
+## Schema and migration boundary
+
+P1.5 is one coordinated compatibility set: protocol `16`, projection schema
+`3`, world schema `18`, event schema `14`, content schema `11`, content manifest
+`p1.5.0`, celestial registry schema `1`, universe manifest schema `2`, and
+interest schema `1`. Partial combinations fail closed before state delivery or
+journal replay.
+
+The local P1.4 proof is archived and reset because it has no registry binding.
+A future persistent migration must normalize every address offline, validate
+all bodies and subjects, record old and new hashes, and switch manifests only
+after replay equality. Rollback restores the previous binary, manifests, and
+read-only world together; it never opens world schema `18` under older rules.
+
 ## Prototype gates
 
 The architecture is not accepted for production until benchmarks demonstrate:
@@ -169,3 +238,7 @@ The architecture is not accepted for production until benchmarks demonstrate:
 - Cell wake-up under attack.
 - No duplicate ownership during handoff.
 - Inventory conservation across crashes and retries.
+- Canonical positive and negative address normalization vectors.
+- Cross-platform registry and universe-manifest hash equality.
+- Fixed-body separation at the exact accepted and rejected boundaries.
+- Registry mismatch rejection before load, replay, or append.

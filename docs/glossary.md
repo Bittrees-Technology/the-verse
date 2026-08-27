@@ -7,6 +7,7 @@
 - **Block:** A placed construction unit that may contain structural or functional behavior.
 - **Capital:** The protected primary settlement and default market on the main planet.
 - **Canonical universe:** The official shared universe whose assets may enter official markets.
+- **Celestial registry:** The versioned, content-addressed record that binds every materialized planet, moon, asteroid, or asteroid field to one immutable identity and universe address.
 - **Cell:** A bounded unit of active or background simulation assigned to one authoritative writer.
 - **Commodity:** A standardized fungible resource, refined material, or component grade.
 - **Component:** A manufactured input used to construct or repair blocks and other goods.
@@ -15,6 +16,9 @@
 - **Derelict:** An eligible unpowered object in the cleanup lifecycle.
 - **Dynamic grid:** A constructed grid that may move because it is not voxel-anchored.
 - **Grid:** A connected set of constructed blocks.
+- **Interest baseline:** A complete, deterministically ordered snapshot of the public entities currently relevant to one connection-local view.
+- **Interest delta:** A connection-local update containing complete entered entities, changed relevant entities, and explicit removals under one interest epoch and sequence.
+- **Interest view:** A bounded presentation selected by authoritative position and server policy; it is neither mutation authority nor a substitute for actor-private projection.
 - **Lifecycle proof:** A Merkle proof that a canonical event was included in an on-chain batch.
 - **Location receipt:** An on-chain representation of standardized goods held at a specific market.
 - **Market custody:** Authoritative locked inventory backing on-chain receipts or listings.
@@ -24,5 +28,6 @@
 - **Settlement:** Confirmed on-chain custody, trade, governance, or lifecycle-root state.
 - **Static grid:** A voxel-anchored or foundation-anchored structure eligible for partitioned simulation.
 - **Structure:** A grid or connected collection of grids functioning as a ship, station, facility, or installation.
+- **Universe address:** A normalized hierarchical location composed of universe, generated region, signed sector coordinate, cell, and bounded local position.
 - **Verse DAO:** The protocol authority initially executed by the two-of-three Safe.
 - **Voxel:** A volume element in deformable planetary or asteroid terrain.
