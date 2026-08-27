@@ -129,7 +129,9 @@ Create original:
 
 ### OQ-015 — Linux packaging
 
-Choose primary direct-download format:
+P0 uses a portable archive containing the client, authoritative server, launcher,
+version record, licenses, and checksums. Before a signed public release, choose
+whether that archive remains primary or is supplemented/replaced by:
 
 - AppImage.
 - Flatpak.

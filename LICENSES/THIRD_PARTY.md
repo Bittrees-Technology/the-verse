@@ -8,14 +8,14 @@ This record covers the direct dependencies and build tools used by P0. Exact Rus
 
 | Component | Version | License | Source |
 | --- | --- | --- | --- |
-| Godot Engine | 4.7.2 | MIT | Official Godot release archive |
+| Godot Engine | 4.7.2 | MIT | Official Godot release archive; bundled notice in `Godot-MIT.txt` |
 | Rust toolchain | 1.96.0 | Apache-2.0 and MIT components | Rust project distribution |
 | Node.js | 25 or compatible | MIT and bundled third-party notices | Node.js distribution |
 | CMake | 3.16 or newer | BSD-3-Clause | CMake project distribution |
 | Clang and libclang | 17 or compatible | Apache-2.0 WITH LLVM-exception | LLVM project distribution |
 | GitHub checkout action | v4 | MIT | `actions/checkout` |
 
-The macOS and Linux CI scripts pin and verify Godot release archive checksums. The repository contains no copied Godot source or third-party art assets.
+The macOS and Linux CI scripts pin and verify Godot release archive checksums. The repository contains the required Godot license notice but no copied Godot source or third-party art assets.
 
 ## Direct Rust dependencies
 

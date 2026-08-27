@@ -29,3 +29,63 @@ jobs:
         run: tools/ci/check.sh
       - name: Verify Linux container
         run: tools/ci/check-container.sh
+
+  package-native:
+    name: Package native (${{ matrix.package }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: linux-x86_64
+            runner: ubuntu-24.04
+            godot_archive: Godot_v4.7.2-stable_linux.x86_64.zip
+            godot_checksum: cadd3204e728a35d3f13adb7fd0d7902636b79f6b95c40c265eb73b6c35329e4
+            godot_binary: /tmp/godot/Godot_v4.7.2-stable_linux.x86_64
+          - package: macos-arm64
+            runner: macos-15
+            godot_archive: Godot_v4.7.2-stable_macos.universal.zip
+            godot_checksum: c58a24e31d720be9d62f60cb5627c4e695fb72f21b0cfe1bc9ccaa9a3b3ba63e
+            godot_binary: /tmp/godot/Godot.app/Contents/MacOS/Godot
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.96.0 --profile minimal
+      - name: Restore Godot export templates
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.local/share/godot/export_templates/4.7.2.stable
+            ~/Library/Application Support/Godot/export_templates/4.7.2.stable
+          key: godot-export-templates-${{ matrix.package }}-4.7.2-f298490b
+      - name: Install Godot 4.7.2
+        env:
+          GODOT_ARCHIVE: ${{ matrix.godot_archive }}
+          GODOT_CHECKSUM: ${{ matrix.godot_checksum }}
+        run: |
+          curl -L --fail --show-error -o /tmp/godot.zip \
+            "https://github.com/godotengine/godot-builds/releases/download/4.7.2-stable/${GODOT_ARCHIVE}"
+          if command -v sha256sum >/dev/null 2>&1; then
+            echo "${GODOT_CHECKSUM}  /tmp/godot.zip" | sha256sum -c -
+          else
+            echo "${GODOT_CHECKSUM}  /tmp/godot.zip" | shasum -a 256 -c -
+          fi
+          unzip -q /tmp/godot.zip -d /tmp/godot
+      - name: Install pinned export templates
+        run: tools/release/install-godot-export-templates.sh
+      - name: Build and smoke-test native package
+        env:
+          GODOT_BIN: ${{ matrix.godot_binary }}
+          VERSE_RELEASE_VERSION: p0.10.0-ci-${{ github.sha }}
+        run: tools/release/package-native.sh
+      - name: Upload native development package
+        uses: actions/upload-artifact@v4
+        with:
+          name: the-verse-p0.10.0-${{ matrix.package }}
+          path: |
+            artifacts/release/*.zip
+            artifacts/release/*.tar.gz
+            artifacts/release/*.sha256
+          if-no-files-found: error
+          retention-days: 7
