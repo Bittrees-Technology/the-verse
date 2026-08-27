@@ -96,7 +96,8 @@ jobs:
           for sample in 1 2 3 4 5; do
             echo "sample=${sample}" | tee -a "${benchmark_file}"
             cargo test -p verse-physics --release --locked \
-              --test compound_grid_benchmark -- --ignored --nocapture \
+              --test compound_grid_benchmark -- \
+              --ignored --nocapture --test-threads=1 \
               2>&1 | tee -a "${benchmark_file}"
           done
       - name: Upload native development package
