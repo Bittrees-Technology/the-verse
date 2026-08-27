@@ -1216,13 +1216,17 @@ fn validated_body_state(
             body_id: body_id.into(),
             field: "rotation",
         })?;
-    if linear_velocity.length() > f64::from(config.max_linear_velocity_mps) {
+    let linear_limit = f64::from(config.max_linear_velocity_mps);
+    let angular_limit = f64::from(config.max_angular_velocity_radians_per_second);
+    let linear_tolerance = linear_limit * f64::from(f32::EPSILON) * 8.0 + 1.0e-9;
+    let angular_tolerance = angular_limit * f64::from(f32::EPSILON) * 8.0 + 1.0e-9;
+    if linear_velocity.length() > linear_limit + linear_tolerance {
         return Err(PhysicsError::BodyStateInvalid {
             body_id: body_id.into(),
             field: "linear velocity bound",
         });
     }
-    if angular_velocity.length() > f64::from(config.max_angular_velocity_radians_per_second) {
+    if angular_velocity.length() > angular_limit + angular_tolerance {
         return Err(PhysicsError::BodyStateInvalid {
             body_id: body_id.into(),
             field: "angular velocity bound",
@@ -1231,8 +1235,8 @@ fn validated_body_state(
     Ok(BodyState {
         body_id: body_id.into(),
         pose: Pose::new(position, rotation),
-        linear_velocity,
-        angular_velocity,
+        linear_velocity: linear_velocity.clamped_length(linear_limit),
+        angular_velocity: angular_velocity.clamped_length(angular_limit),
         active,
     })
 }
@@ -1319,6 +1323,41 @@ mod tests {
             over_speed,
             Err(PhysicsError::BodyStateInvalid {
                 field: "linear velocity bound",
+                ..
+            })
+        ));
+
+        let config = SceneConfig::default();
+        let angular_limit = f64::from(config.max_angular_velocity_radians_per_second);
+        let axis = config.max_angular_velocity_radians_per_second / 2.0_f32.sqrt();
+        let rounded_up_axis = f32::from_bits(axis.to_bits() + 1);
+        let reconstructed = Vec3::new(f64::from(rounded_up_axis), f64::from(rounded_up_axis), 0.0);
+        assert!(reconstructed.length() > angular_limit);
+        let tolerated_roundoff = validated_body_state(
+            "player",
+            Vec3::ZERO,
+            Quat::IDENTITY,
+            Vec3::ZERO,
+            reconstructed,
+            true,
+            &config,
+        )
+        .expect("f32-native roundoff within the tight tolerance is accepted");
+        assert!(tolerated_roundoff.angular_velocity.length() <= angular_limit);
+
+        let material_overspeed = validated_body_state(
+            "player",
+            Vec3::ZERO,
+            Quat::IDENTITY,
+            Vec3::ZERO,
+            Vec3::new(angular_limit + 0.001, 0.0, 0.0),
+            true,
+            &config,
+        );
+        assert!(matches!(
+            material_overspeed,
+            Err(PhysicsError::BodyStateInvalid {
+                field: "angular velocity bound",
                 ..
             })
         ));
