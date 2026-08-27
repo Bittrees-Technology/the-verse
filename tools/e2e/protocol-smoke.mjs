@@ -7,8 +7,9 @@ const socket = new WebSocket(url);
 const buffered = [];
 const waiters = [];
 let operationSequence = 0;
+let committedOperationSequence = 0;
 let authoritativeWorld;
-const PROTOCOL_VERSION = 13;
+const PROTOCOL_VERSION = 14;
 const CHARACTER_EYE_OFFSET = 1.62 - 1.8 / 2;
 const CHARACTER_MAXIMUM_ANGULAR_SPEED = 2.5;
 const TOOL_RANGE = 9.0;
@@ -54,6 +55,16 @@ function hydrateActorSnapshot(snapshot) {
   const privateState = snapshot.actor_private;
   assert.ok(privateState, "an authenticated pilot receives an actor-private overlay");
   assert.equal(privateState.player.player_id, "player-local");
+  assert.ok(
+    Number.isSafeInteger(privateState.committed_operation_sequence) &&
+      privateState.committed_operation_sequence >= 0,
+    "the private overlay carries a valid actor-local operation frontier",
+  );
+  assert.ok(
+    privateState.committed_operation_sequence >= committedOperationSequence,
+    "a full snapshot cannot regress the actor-local operation frontier",
+  );
+  committedOperationSequence = privateState.committed_operation_sequence;
   const privateMasses = new Map(
     privateState.owned_grid_masses.map((entry) => [entry.grid_id, entry.mass_kg]),
   );
@@ -79,7 +90,8 @@ function hydrateActorSnapshot(snapshot) {
 
 async function intent(type, payload) {
   const operation_id = operationId(type);
-  send({ type, operation_id, ...payload });
+  const operation_sequence = committedOperationSequence + 1;
+  send({ type, operation_sequence, operation_id, ...payload });
   const result = await waitFor(
     (message) =>
       (message.type === "intent_accepted" &&
@@ -93,6 +105,8 @@ async function intent(type, payload) {
       [type, " rejected: ", result.code, ": ", result.message].join(""),
     );
   }
+  assert.equal(result.receipt.operation_sequence, operation_sequence);
+  committedOperationSequence = operation_sequence;
   const eventSequence = result.receipt.event_sequence;
   const acceptsMotionState = type === "set_player_control";
   const minimumStateSequence = Math.max(
@@ -120,6 +134,11 @@ function applyMotion(world, motion) {
   assert.ok(world, "a full snapshot precedes motion deltas");
   assert.ok(motion.actor_private, "pilot motion includes its exact private frontier");
   assert.equal(motion.actor_private.player_id, "player-local");
+  assert.equal(
+    motion.actor_private.committed_operation_sequence,
+    undefined,
+    "motion deltas do not disclose durable operation history",
+  );
   const movingGrids = new Map(motion.grids.map((grid) => [grid.grid_id, grid]));
   const movingPlayers = new Map(
     motion.players.map((player) => [player.player_id, player]),
@@ -157,9 +176,10 @@ async function waitForMotionAfter(simulationTick, description) {
 
 async function expectRejectedIntent(type, payload, expectedCode) {
   const operation_id = operationId(`rejected-${type}`);
+  const operation_sequence = committedOperationSequence + 1;
   const sequence = authoritativeWorld.event_sequence;
   const hash = authoritativeWorld.world_hash;
-  send({ type, operation_id, ...payload });
+  send({ type, operation_sequence, operation_id, ...payload });
   const rejection = await waitFor(
     (message) =>
       message.type === "intent_rejected" &&
@@ -167,6 +187,7 @@ async function expectRejectedIntent(type, payload, expectedCode) {
     `${type} rejection`,
   );
   assert.equal(rejection.code, expectedCode);
+  assert.equal(rejection.operation_sequence, operation_sequence);
   assert.equal(authoritativeWorld.event_sequence, sequence);
   assert.equal(authoritativeWorld.world_hash, hash);
   return rejection;
@@ -776,12 +797,38 @@ async function run() {
   assert.ok(playerInventory(world).used_liters > 0);
   assert.ok(playerInventory(world).mass_grams > 0);
 
+  for (const [operation_sequence, expectedCode] of [
+    [0, "operation_sequence_invalid"],
+    [committedOperationSequence + 2, "operation_sequence_gap"],
+  ]) {
+    const operation_id = operationId(`sequence-${expectedCode}`);
+    send({
+      type: "set_suit_mode",
+      operation_sequence,
+      operation_id,
+      helmet_closed: world.player.helmet_closed,
+      jetpack_enabled: world.player.jetpack_enabled,
+      magnetic_boots_enabled: world.player.locomotion.magnetic_boots_enabled,
+    });
+    const rejected = await waitFor(
+      (message) =>
+        message.type === "intent_rejected" &&
+        message.operation_id === operation_id,
+      `${expectedCode} rejection`,
+    );
+    assert.equal(rejected.operation_sequence, operation_sequence);
+    assert.equal(rejected.code, expectedCode);
+  }
+
   const pulseStartOrientation = world.player.orientation;
   const pulseSequence = world.player.last_received_input_sequence + 1;
   const pulseOperation = operationId("character-angular-pulse");
   const releaseOperation = operationId("character-angular-release");
-  send({
+  const pulseOperationSequence = committedOperationSequence + 1;
+  const releaseOperationSequence = pulseOperationSequence + 1;
+  const pulseMessage = {
     type: "set_player_control",
+    operation_sequence: pulseOperationSequence,
     operation_id: pulseOperation,
     movement_epoch: world.player.movement_epoch,
     input_sequence: pulseSequence,
@@ -790,9 +837,10 @@ async function run() {
     boost: false,
     jump: false,
     dampeners: true,
-  });
-  send({
+  };
+  const releaseMessage = {
     type: "set_player_control",
+    operation_sequence: releaseOperationSequence,
     operation_id: releaseOperation,
     movement_epoch: world.player.movement_epoch,
     input_sequence: pulseSequence + 1,
@@ -801,16 +849,50 @@ async function run() {
     boost: false,
     jump: false,
     dampeners: true,
-  });
-  for (const operationId of [pulseOperation, releaseOperation]) {
+  };
+  send(pulseMessage);
+  send(releaseMessage);
+  const pulseReceipts = new Map();
+  for (const [operationId, operation_sequence] of [
+    [pulseOperation, pulseOperationSequence],
+    [releaseOperation, releaseOperationSequence],
+  ]) {
     const receipt = await waitFor(
       (message) =>
         message.type === "intent_accepted" &&
         message.receipt.operation_id === operationId,
       operationId + " receipt",
     );
+    assert.equal(receipt.receipt.operation_sequence, operation_sequence);
+    committedOperationSequence = operation_sequence;
     assert.ok(receipt.receipt.event_sequence > world.event_sequence);
+    pulseReceipts.set(operationId, receipt.receipt);
   }
+  send(pulseMessage);
+  assert.deepEqual(
+    (
+      await waitFor(
+        (message) =>
+          message.type === "intent_accepted" &&
+          message.receipt.operation_id === pulseOperation,
+        "exact control retry receipt",
+      )
+    ).receipt,
+    pulseReceipts.get(pulseOperation),
+    "an exact retained retry returns its original receipt",
+  );
+  send({
+    ...pulseMessage,
+    angular_input: { x: 0, y: 1, z: 0 },
+  });
+  const conflict = await waitFor(
+    (message) =>
+      message.type === "intent_rejected" &&
+      message.operation_id === pulseOperation,
+    "changed-payload operation conflict",
+  );
+  assert.equal(conflict.operation_sequence, pulseOperationSequence);
+  assert.equal(conflict.code, "operation_conflict");
   const pulseState = await waitFor(
     (message) =>
       message.type === "motion_state" &&
@@ -1173,8 +1255,10 @@ async function run() {
   );
 
   const blockedOperation = operationId("dead-mine");
+  const blockedOperationSequence = committedOperationSequence + 1;
   send({
     type: "mine_voxel",
+    operation_sequence: blockedOperationSequence,
     operation_id: blockedOperation,
     coordinate: { x: 0, y: 0, z: 0 },
   });
@@ -1185,6 +1269,7 @@ async function run() {
     "incapacitated mutation rejection",
   );
   assert.equal(blocked.code, "player_incapacitated");
+  assert.equal(blocked.operation_sequence, blockedOperationSequence);
 
   const progressionAtDeath = {
     experience: world.player.experience,

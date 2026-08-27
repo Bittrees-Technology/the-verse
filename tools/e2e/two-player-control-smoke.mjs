@@ -13,7 +13,7 @@ const remoteMiningOperation = "two-player-e2e-remote-mining-operation";
 const remoteRefiningOperation = "two-player-e2e-remote-refining-operation";
 const remoteCraftingOperation = "two-player-e2e-remote-crafting-operation";
 const remoteDamageOperation = "two-player-e2e-non-owner-damage-operation";
-const PROTOCOL_VERSION = 13;
+const PROTOCOL_VERSION = 14;
 const CHARACTER_EYE_OFFSET = 1.62 - 1.8 / 2;
 const CHARACTER_MAXIMUM_ANGULAR_SPEED = 2.5;
 const TOOL_RANGE = 9.0;
@@ -27,6 +27,9 @@ class ProtocolClient {
     this.buffered = [];
     this.waiters = [];
     this.lastReceiptEventSequence = 0;
+    this.committedOperationSequence = 0;
+    this.lastProjectedOperationSequence = 0;
+    this.operationSequenceById = new Map();
     this.socket.addEventListener("message", (event) => {
       this.dispatch(JSON.parse(event.data));
     });
@@ -39,6 +42,20 @@ class ProtocolClient {
   }
 
   dispatch(message) {
+    if (message.type === "snapshot" && message.snapshot.actor_private) {
+      const frontier = message.snapshot.actor_private.committed_operation_sequence;
+      assert.ok(
+        Number.isSafeInteger(frontier) && frontier >= 0,
+        `${this.playerId} receives a valid private operation frontier`,
+      );
+      assert.ok(
+        frontier >= this.lastProjectedOperationSequence &&
+          frontier >= this.committedOperationSequence,
+        `${this.playerId} private operation frontier never regresses`,
+      );
+      this.lastProjectedOperationSequence = frontier;
+      this.committedOperationSequence = frontier;
+    }
     const index = this.waiters.findIndex((waiter) => waiter.predicate(message));
     if (index >= 0) {
       const [waiter] = this.waiters.splice(index, 1);
@@ -75,7 +92,28 @@ class ProtocolClient {
   }
 
   send(message) {
-    this.socket.send(JSON.stringify(message));
+    let outbound = message;
+    if (typeof message.operation_id === "string") {
+      let operationSequence = message.operation_sequence;
+      if (operationSequence === undefined) {
+        operationSequence = this.operationSequenceById.get(message.operation_id);
+      }
+      if (operationSequence === undefined) {
+        operationSequence = this.committedOperationSequence + 1;
+      }
+      assert.ok(
+        Number.isSafeInteger(operationSequence) && operationSequence > 0,
+        `${this.playerId} sends a positive operation sequence`,
+      );
+      this.operationSequenceById.set(message.operation_id, operationSequence);
+      outbound = { ...message, operation_sequence: operationSequence };
+    }
+    this.socket.send(JSON.stringify(outbound));
+    return outbound;
+  }
+
+  operationSequenceFor(operationId) {
+    return this.operationSequenceById.get(operationId);
   }
 
   async connect() {
@@ -163,6 +201,19 @@ function assertActorPrivate(state, expectedPlayerId, description) {
     expectedPlayerId,
     `${description} is bound to the authenticated actor`,
   );
+  if (state.actor_private.player) {
+    assert.ok(
+      Number.isSafeInteger(state.actor_private.committed_operation_sequence) &&
+        state.actor_private.committed_operation_sequence >= 0,
+      `${description} includes only its actor's valid operation frontier`,
+    );
+  } else {
+    assert.equal(
+      state.actor_private.committed_operation_sequence,
+      undefined,
+      `${description} motion does not disclose durable operation history`,
+    );
+  }
 }
 
 function combineActorSnapshots(local, remote, description) {
@@ -659,6 +710,15 @@ async function waitForReceipt(client, operationId, description) {
       `${client.playerId} operation rejected: ${message.code}: ${message.message}`,
     );
   }
+  assert.equal(
+    message.receipt.operation_sequence,
+    client.operationSequenceFor(operationId),
+    `${description} echoes the actor-local operation sequence`,
+  );
+  client.committedOperationSequence = Math.max(
+    client.committedOperationSequence,
+    message.receipt.operation_sequence,
+  );
   client.lastReceiptEventSequence = Math.max(
     client.lastReceiptEventSequence,
     message.receipt.event_sequence,
@@ -672,7 +732,7 @@ async function expectRejection(
   expectedCode,
   description,
 ) {
-  client.send(intent);
+  const outbound = client.send(intent);
   const message = await client.waitFor(
     (candidate) =>
       candidate.type === "intent_rejected" &&
@@ -680,6 +740,11 @@ async function expectRejection(
     description,
   );
   assert.equal(message.code, expectedCode, `${description} fails closed`);
+  assert.equal(
+    message.operation_sequence,
+    outbound.operation_sequence,
+    `${description} echoes the rejected operation sequence only to its requester`,
+  );
   return message;
 }
 
@@ -924,6 +989,30 @@ async function run() {
     assert.ok(primaryInventory, "the local carried inventory is present");
     assert.ok(remoteInventory, "the remote carried inventory is present");
     assert.ok(firstStarterBlock, "the starter grid has a denial target");
+    await expectRejection(
+      remote,
+      {
+        type: "set_suit_mode",
+        operation_sequence: remote.committedOperationSequence + 2,
+        operation_id: "two-player-remote-operation-gap",
+        helmet_closed: initialRemote.helmet_closed,
+        jetpack_enabled: initialRemote.jetpack_enabled,
+        magnetic_boots_enabled:
+          initialRemote.locomotion.magnetic_boots_enabled,
+      },
+      "operation_sequence_gap",
+      "remote actor operation gap",
+    );
+    assert.equal(
+      local.committedOperationSequence,
+      localProjection.actor_private.committed_operation_sequence,
+      "a remote rejected sequence cannot advance the local private frontier",
+    );
+    assert.equal(
+      remote.committedOperationSequence,
+      remoteProjection.actor_private.committed_operation_sequence,
+      "a rejected gap cannot advance the remote private frontier",
+    );
     const deniedIntents = [
       {
         intent: {
@@ -1036,10 +1125,47 @@ async function run() {
       "denied operations do not change primary grid topology or integrity",
     );
 
+    const localFrontierBeforeIsolation = local.committedOperationSequence;
+    const remoteFrontierBeforeLocalIsolation = remote.committedOperationSequence;
+    const localIsolationOperation = "two-player-local-frontier-isolation";
+    local.send({
+      type: "set_suit_mode",
+      operation_id: localIsolationOperation,
+      helmet_closed: initialPrimary.helmet_closed,
+      jetpack_enabled: initialPrimary.jetpack_enabled,
+      magnetic_boots_enabled:
+        initialPrimary.locomotion.magnetic_boots_enabled,
+    });
+    const localIsolationReceipt = await waitForReceipt(
+      local,
+      localIsolationOperation,
+      "local-only operation frontier receipt",
+    );
+    const postDenialSnapshot = await requestCommonSnapshot(
+      local,
+      remote,
+      localIsolationReceipt.event_sequence,
+      "local-only operation frontier publication",
+    );
+    assert.equal(
+      local.lastProjectedOperationSequence,
+      localFrontierBeforeIsolation + 1,
+      "the local private projection advances for its accepted operation",
+    );
+    assert.equal(
+      local.lastProjectedOperationSequence,
+      localIsolationReceipt.operation_sequence,
+    );
+    assert.equal(
+      remote.lastProjectedOperationSequence,
+      remoteFrontierBeforeLocalIsolation,
+      "the local accepted operation cannot advance the remote private frontier",
+    );
+
     const damageStagingSnapshot = await approachVisibleBlock(
       local,
       remote,
-      denialSnapshot,
+      postDenialSnapshot,
       "player-remote",
       "non-owner damage approach",
     );
@@ -1160,6 +1286,8 @@ async function run() {
     const remoteInventoryBefore = structuredClone(
       playerInventory(targetedSnapshot, initialRemote).contents,
     );
+    const localFrontierBeforeRemoteMining = local.committedOperationSequence;
+    const remoteFrontierBeforeMining = remote.committedOperationSequence;
     remote.send({
       type: "mine_voxel",
       operation_id: remoteMiningOperation,
@@ -1175,6 +1303,20 @@ async function run() {
       remote,
       miningReceipt.event_sequence,
       "remote mining publication",
+    );
+    assert.equal(
+      remote.lastProjectedOperationSequence,
+      remoteFrontierBeforeMining + 1,
+      "the remote private projection advances for remote mining",
+    );
+    assert.equal(
+      remote.lastProjectedOperationSequence,
+      miningReceipt.operation_sequence,
+    );
+    assert.equal(
+      local.lastProjectedOperationSequence,
+      localFrontierBeforeRemoteMining,
+      "remote mining cannot advance the local private operation frontier",
     );
     const minedPrimary = minedSnapshot.players.find(
       (player) => player.player_id === "player-local",
@@ -1226,8 +1368,57 @@ async function run() {
       miningReceipt,
       "remote mining retry returns the original actor-scoped receipt",
     );
+    await expectRejection(
+      remote,
+      {
+        type: "mine_voxel",
+        operation_id: remoteMiningOperation,
+        coordinate: {
+          x: target.coordinate.x + 1,
+          y: target.coordinate.y,
+          z: target.coordinate.z,
+        },
+      },
+      "operation_conflict",
+      "changed-payload remote mining retry",
+    );
 
-    let industrySnapshot = minedSnapshot;
+    const reusedOperationSequence = remote.committedOperationSequence + 1;
+    const localFrontierBeforeIdReuse = local.committedOperationSequence;
+    remote.send({
+      type: "set_suit_mode",
+      operation_sequence: reusedOperationSequence,
+      operation_id: remoteMiningOperation,
+      helmet_closed: minedRemote.helmet_closed,
+      jetpack_enabled: minedRemote.jetpack_enabled,
+      magnetic_boots_enabled: minedRemote.locomotion.magnetic_boots_enabled,
+    });
+    const reusedIdReceipt = await waitForReceipt(
+      remote,
+      remoteMiningOperation,
+      "diagnostic operation ID reuse at the next sequence",
+    );
+    assert.equal(reusedIdReceipt.operation_sequence, reusedOperationSequence);
+    assert.notDeepEqual(
+      reusedIdReceipt,
+      miningReceipt,
+      "the same diagnostic ID at a new sequence is a distinct operation",
+    );
+    let industrySnapshot = await waitForCommonSnapshot(
+      local,
+      remote,
+      reusedIdReceipt.event_sequence,
+      "same-ID next-sequence publication",
+    );
+    assert.equal(
+      remote.lastProjectedOperationSequence,
+      reusedOperationSequence,
+    );
+    assert.equal(
+      local.lastProjectedOperationSequence,
+      localFrontierBeforeIdReuse,
+      "same-ID reuse remains isolated to the committing actor",
+    );
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const industryRemote = industrySnapshot.players.find(
         (player) => player.player_id === "player-remote",
