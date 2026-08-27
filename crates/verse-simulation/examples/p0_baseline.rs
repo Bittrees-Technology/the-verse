@@ -73,6 +73,7 @@ fn move_player(
                 linear_input: Vec3::ZERO,
                 angular_input: Vec3::ZERO,
                 boost: false,
+                jump: false,
                 dampeners: true,
             })?;
             *sequence += 1;
@@ -94,6 +95,7 @@ fn move_player(
             linear_input: local_direction,
             angular_input: Vec3::ZERO,
             boost: true,
+            jump: false,
             dampeners: true,
         })?;
         *sequence += 1;

@@ -728,6 +728,7 @@ mod tests {
                     operation_id: "persistent-suit-mode".into(),
                     helmet_closed: false,
                     jetpack_enabled: false,
+                    magnetic_boots_enabled: false,
                 })
                 .expect("suit mode accepted");
             runtime.persist_snapshot().expect("snapshot persists");
@@ -786,6 +787,7 @@ mod tests {
                     linear_input: Vec3::new(1.0, 0.0, 0.0),
                     angular_input: Vec3::ZERO,
                     boost: false,
+                    jump: false,
                     dampeners: true,
                 })
                 .expect("committed character control");
@@ -811,6 +813,7 @@ mod tests {
                     linear_input: Vec3::ZERO,
                     angular_input: Vec3::ZERO,
                     boost: false,
+                    jump: false,
                     dampeners: true,
                 })
                 .expect("journal remains appendable after truncation");
@@ -855,8 +858,8 @@ mod tests {
     }
 
     #[test]
-    fn pre_p0_9_content_manifests_are_rejected_before_replay() {
-        for stored_version in ["p0.7.3", "p0.8.0"] {
+    fn pre_p0_10_content_manifests_are_rejected_before_replay() {
+        for stored_version in ["p0.8.0", "p0.9.0"] {
             let directory = tempdir().expect("tempdir");
             drop(Store::open(directory.path(), 41).expect("store"));
             let manifest_path = directory.path().join(MANIFEST_FILE);
@@ -872,7 +875,7 @@ mod tests {
             assert!(matches!(
                 Store::open(directory.path(), 41),
                 Err(PersistenceError::ContentManifestMismatch { stored, runtime })
-                    if stored == stored_version && runtime == "p0.9.0"
+                    if stored == stored_version && runtime == "p0.10.0"
             ));
         }
     }

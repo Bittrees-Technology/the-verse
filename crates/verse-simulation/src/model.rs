@@ -6,14 +6,14 @@ use serde::{Deserialize, Serialize};
 use verse_protocol::{
     BlockKind, BlockSnapshot, CareerSnapshot, ConservationSnapshot, DeathDropSnapshot,
     EnvironmentSnapshot, GridMotionSnapshot, GridSnapshot, IVec3, InventoryContents,
-    InventoryDomain, InventorySnapshot, MotionSnapshot, PlayerDeathCause, PlayerLifeState,
-    PlayerMotionSnapshot, PlayerSnapshot, PowerSnapshot, Quat, ResourceKind, Vec3, VoxelMaterial,
-    VoxelSnapshot, WorldSnapshot,
+    InventoryDomain, InventorySnapshot, LocomotionKind, MotionSnapshot, PlayerDeathCause,
+    PlayerLifeState, PlayerLocomotionSnapshot, PlayerMotionSnapshot, PlayerSnapshot, PowerSnapshot,
+    Quat, ResourceKind, Vec3, VoxelMaterial, VoxelSnapshot, WorldSnapshot,
 };
 
 use crate::content;
 
-pub const WORLD_SCHEMA_VERSION: u32 = 12;
+pub const WORLD_SCHEMA_VERSION: u32 = 13;
 pub const PLAYER_INVENTORY_ID: &str = "inventory-player-local";
 pub const STARTER_GRID_ID: &str = "grid-starter";
 pub const PLANET_CENTER: Vec3 = Vec3::new(900.0, -2_200.0, -3_800.0);
@@ -22,6 +22,16 @@ pub const PLANET_ATMOSPHERE_HEIGHT_M: f64 = 180.0;
 pub const PLANET_SURFACE_GRAVITY_M_S2: f64 = 6.2;
 pub const PLAYER_INVENTORY_CAPACITY_LITERS: u64 = 1_200;
 pub const CARGO_INVENTORY_CAPACITY_LITERS: u64 = 8_000;
+
+pub fn radial_up(position: Vec3) -> Vec3 {
+    let radial = position - PLANET_CENTER;
+    let magnitude = radial.magnitude();
+    if magnitude > 1.0e-9 && magnitude.is_finite() {
+        radial * (1.0 / magnitude)
+    } else {
+        Vec3::new(0.0, 1.0, 0.0)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VoxelField {
@@ -159,6 +169,7 @@ pub struct Player {
     pub linear_velocity: Vec3,
     pub angular_velocity: Vec3,
     pub surface_contact: bool,
+    pub locomotion: PlayerLocomotionSnapshot,
     pub movement_epoch: u64,
     pub last_received_input_sequence: u64,
     pub last_processed_input_sequence: u64,
@@ -167,6 +178,7 @@ pub struct Player {
     pub control_angular_input: Vec3,
     pub boost: bool,
     pub dampeners: bool,
+    pub jump: bool,
     pub control_expires_at_simulation_tick: u64,
     pub inventory_id: String,
     pub experience: u64,
@@ -185,6 +197,7 @@ pub struct PlayerControlFrame {
     pub angular_input: Vec3,
     pub boost: bool,
     pub dampeners: bool,
+    pub jump: bool,
     pub expires_at_simulation_tick: u64,
 }
 
@@ -456,6 +469,7 @@ pub struct WorldState {
 
 impl WorldState {
     pub fn genesis(seed: u64) -> Self {
+        let player_position = Vec3::new(12.0, 4.5, 10.0);
         let player_inventory = InventoryRecord {
             inventory_id: PLAYER_INVENTORY_ID.into(),
             domain: InventoryDomain::Player {
@@ -553,11 +567,22 @@ impl WorldState {
             last_event_hash: String::new(),
             player: Player {
                 player_id: "player-local".into(),
-                position: Vec3::new(12.0, 4.5, 10.0),
+                position: player_position,
                 orientation: Quat::IDENTITY,
                 linear_velocity: Vec3::ZERO,
                 angular_velocity: Vec3::ZERO,
                 surface_contact: false,
+                locomotion: PlayerLocomotionSnapshot {
+                    kind: LocomotionKind::Eva,
+                    up: radial_up(player_position),
+                    view_pitch_radians: 0.0,
+                    support: None,
+                    jump_held: false,
+                    jump_buffer_expires_at_simulation_tick: 0,
+                    support_grace_expires_at_simulation_tick: 0,
+                    magnetic_boots_enabled: false,
+                    magnetic_reattach_after_simulation_tick: 0,
+                },
                 movement_epoch: 1,
                 last_received_input_sequence: 0,
                 last_processed_input_sequence: 0,
@@ -566,6 +591,7 @@ impl WorldState {
                 control_angular_input: Vec3::ZERO,
                 boost: false,
                 dampeners: true,
+                jump: false,
                 control_expires_at_simulation_tick: 0,
                 inventory_id: PLAYER_INVENTORY_ID.into(),
                 experience: 0,
@@ -720,6 +746,7 @@ impl WorldState {
                 linear_velocity: self.player.linear_velocity,
                 angular_velocity: self.player.angular_velocity,
                 surface_contact: self.player.surface_contact,
+                locomotion: self.player.locomotion.clone(),
                 movement_epoch: self.player.movement_epoch,
                 last_received_input_sequence: self.player.last_received_input_sequence,
                 last_processed_input_sequence: self.player.last_processed_input_sequence,
@@ -727,6 +754,7 @@ impl WorldState {
                 control_angular_input: self.player.control_angular_input,
                 boost: self.player.boost,
                 dampeners: self.player.dampeners,
+                jump: self.player.jump,
                 control_expires_at_simulation_tick: self.player.control_expires_at_simulation_tick,
                 inventory_id: self.player.inventory_id.clone(),
                 experience: self.player.experience,
@@ -783,6 +811,7 @@ impl WorldState {
                 linear_velocity: self.player.linear_velocity,
                 angular_velocity: self.player.angular_velocity,
                 surface_contact: self.player.surface_contact,
+                locomotion: self.player.locomotion.clone(),
                 movement_epoch: self.player.movement_epoch,
                 last_received_input_sequence: self.player.last_received_input_sequence,
                 last_processed_input_sequence: self.player.last_processed_input_sequence,
@@ -790,6 +819,7 @@ impl WorldState {
                 control_angular_input: self.player.control_angular_input,
                 boost: self.player.boost,
                 dampeners: self.player.dampeners,
+                jump: self.player.jump,
                 control_expires_at_simulation_tick: self.player.control_expires_at_simulation_tick,
                 jetpack_enabled: self.player.jetpack_enabled,
                 life_state: self.player.life_state.clone(),
