@@ -68,6 +68,7 @@ Priorities:
 | F-054 | Creative-mode public audit log | P1 | Admin authority |
 | F-055 | Economic and supply dashboards | P2 | Analytics |
 | F-056 | Direct-download updater for macOS/Linux | P1 | Release signing |
+| F-057 | Server-authoritative character motion | P0 | F-002, F-004, F-006 |
 
 ## Definition of specification-ready
 

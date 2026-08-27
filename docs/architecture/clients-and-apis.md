@@ -17,6 +17,8 @@ The native macOS/Linux client is responsible for:
 
 It is not authoritative for inventory, damage, physics results, voxel changes, production, contracts, or market settlement.
 
+Character clients submit sequenced bounded inputs, never transforms. The cell owns character pose, velocity, gravity, collision, and grounded state; the native client may predict and reconcile those results under [ADR-0013](../decisions/ADR-0013-input-only-authoritative-character-motion.md).
+
 ## Browser command center
 
 Initial browser capabilities:

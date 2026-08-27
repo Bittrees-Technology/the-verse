@@ -44,6 +44,7 @@ Requirement IDs are stable references for issues, pull requests, tests, and rele
 - **SIM-006 — Finite execution budgets:** Simulation may partition, sleep, or reduce update frequency to operate within finite resources.
 - **SIM-007 — Destruction:** Damage shall support block loss, grid separation, cargo release, debris, salvage, and voxel cratering.
 - **SIM-008 — Power:** Machines, defenses, respawn systems, control cores, and cleanup exemptions shall depend on authoritative power or contract state.
+- **SIM-009 — Character motion authority:** Gameplay clients shall submit bounded character controls only. The authoritative cell shall own character position, orientation, velocity, gravity response, collision, and grounded state.
 
 ## Persistence, death, and cleanup
 

@@ -30,7 +30,7 @@ The engineering loop must read as physical survival work rather than counters ov
 
 1. The authoritative snapshot identifies Khepri Prime, its center and surface radius, player altitude, gravity vector and magnitude, atmospheric density, oxygen fraction, and breathability.
 2. The server rejects movement beneath the modeled planetary surface.
-3. `J` toggles the authoritative jetpack state. The client predicts the same gravity vector in both modes: jetpack drift accumulates gravity with dampeners off, powered dampeners compensate it when idle, and jetpack-off movement predicts walking, jumping, and surface contact. The server continues to validate accepted positions.
+3. `J` toggles the authoritative jetpack state. The current client predicts the same gravity vector in both modes: jetpack drift accumulates gravity with dampeners off, powered dampeners compensate it when idle, and jetpack-off movement predicts walking, jumping, and surface contact. P0.9 replaces accepted positions with the input-only authority contract in [ADR-0013](../decisions/ADR-0013-input-only-authoritative-character-motion.md).
 4. `H` toggles the authoritative helmet seal.
 5. An open helmet replenishes suit oxygen in breathable atmosphere and rapidly loses oxygen in vacuum. A sealed helmet preserves oxygen in breathable atmosphere and consumes reserve oxygen in vacuum. P0.8 makes terminal depletion canonically incapacitating under the separate survival-death contract.
 6. Suit oxygen and equipment modes persist through snapshots, events, restart, and reconnect.

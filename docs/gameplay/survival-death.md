@@ -26,4 +26,4 @@ The client renders and predicts feedback only. It cannot declare death, choose a
 
 ## Explicit limits
 
-This checkpoint is the creation and recovery foundation, not the complete P1 death-drop lifecycle. It does not implement recovery or salvage actions, team permissions, the 15-minute private window, public access, six-hour cleanup, verified-outage pausing, tombstones, physical loot-container collision, powered spawn facilities, or the capital. It also does not close the separate absolute-position character-motion authority gap while alive.
+This checkpoint is the creation and recovery foundation, not the complete P1 death-drop lifecycle. It does not implement recovery or salvage actions, team permissions, the 15-minute private window, public access, six-hour cleanup, verified-outage pausing, tombstones, physical loot-container collision, powered spawn facilities, or the capital. The separate absolute-position character-motion gap is governed by the P0.9 contract in [ADR-0013](../decisions/ADR-0013-input-only-authoritative-character-motion.md).
