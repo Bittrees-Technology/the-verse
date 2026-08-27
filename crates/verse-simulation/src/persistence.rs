@@ -511,13 +511,19 @@ mod tests {
                 .occupied
                 .iter()
                 .copied()
-                .find(|coord| {
-                    let dx = f64::from(coord.x) - runtime.state().player.position.x;
-                    let dy = f64::from(coord.y) - runtime.state().player.position.y;
-                    let dz = f64::from(coord.z) - runtime.state().player.position.z;
-                    dx.mul_add(dx, dy.mul_add(dy, dz * dz)) <= 8.5 * 8.5
-                })
-                .expect("reachable voxel");
+                .max_by_key(|coordinate| coordinate.z)
+                .expect("asteroid has a visible positive-Z surface voxel");
+            runtime.aim_player_for_test(
+                Vec3::new(
+                    f64::from(target.x),
+                    f64::from(target.y),
+                    f64::from(target.z),
+                ),
+                Vec3::new(0.0, 0.0, 1.0),
+            );
+            runtime
+                .persist_snapshot()
+                .expect("aimed mining baseline persists");
             runtime
                 .execute(&ClientMessage::MineVoxel {
                     operation_id: "durable-mine".into(),
@@ -538,7 +544,11 @@ mod tests {
         let expected_hash;
         {
             let mut runtime = Runtime::open(directory.path(), 29, 100).expect("runtime starts");
-            runtime.relocate_player_for_test(Vec3::new(10.0, 1.0, 3.0));
+            let core = runtime.state().grids[STARTER_GRID_ID].world_position(IVec3::ZERO);
+            runtime.aim_player_for_test(core, Vec3::new(0.0, 1.0, 0.0));
+            runtime
+                .persist_snapshot()
+                .expect("aimed build baseline persists");
             runtime
                 .execute(&ClientMessage::BuildBlock {
                     operation_id: "recovery-frame".into(),
@@ -582,10 +592,11 @@ mod tests {
         let expected_hash;
         {
             let mut runtime = Runtime::open(directory.path(), 30, 100).expect("runtime starts");
-            runtime.relocate_player_for_test(Vec3::new(10.0, 1.0, 3.0));
+            let core = runtime.state().grids[STARTER_GRID_ID].world_position(IVec3::ZERO);
+            runtime.aim_player_for_test(core, Vec3::new(0.0, 1.0, 0.0));
             runtime
                 .persist_snapshot()
-                .expect("durable range-test baseline persists");
+                .expect("durable aimed baseline persists");
             runtime
                 .execute(&ClientMessage::BuildBlock {
                     operation_id: "completed-recovery-frame".into(),

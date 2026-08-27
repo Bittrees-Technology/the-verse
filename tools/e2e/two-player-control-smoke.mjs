@@ -7,6 +7,11 @@ const expectedRoster = ["player-local", "player-remote"];
 const sharedControlOperation = "two-player-e2e-shared-control-operation";
 const sharedReleaseOperation = "two-player-e2e-shared-release-operation";
 const remoteMiningOperation = "two-player-e2e-remote-mining-operation";
+const CHARACTER_EYE_OFFSET = 1.62 - 1.8 / 2;
+const CHARACTER_MAXIMUM_ANGULAR_SPEED = 2.5;
+const TOOL_RANGE = 9.0;
+const TARGET_ALIGNMENT_RADIANS = 0.006;
+let targetingOperationSequence = 0;
 
 class ProtocolClient {
   constructor(playerId) {
@@ -53,7 +58,9 @@ class ProtocolClient {
       waiter.timeout = setTimeout(() => {
         const position = this.waiters.indexOf(waiter);
         if (position >= 0) this.waiters.splice(position, 1);
-        reject(new Error(`${this.playerId} timed out waiting for ${description}`));
+        reject(
+          new Error(`${this.playerId} timed out waiting for ${description}`),
+        );
       }, timeoutMillis);
       this.waiters.push(waiter);
     });
@@ -124,7 +131,11 @@ function rosterIds(state) {
 
 function assertCanonicalRoster(state, description) {
   const roster = rosterIds(state);
-  assert.deepEqual(roster, expectedRoster, `${description} has the expected roster`);
+  assert.deepEqual(
+    roster,
+    expectedRoster,
+    `${description} has the expected roster`,
+  );
   assert.deepEqual(
     roster,
     [...roster].sort(),
@@ -138,10 +149,61 @@ function playerById(motion, playerId) {
 
 function distanceSquared(left, right) {
   return (
-    (left.x - right.x) ** 2 +
-    (left.y - right.y) ** 2 +
-    (left.z - right.z) ** 2
+    (left.x - right.x) ** 2 + (left.y - right.y) ** 2 + (left.z - right.z) ** 2
   );
+}
+
+function addVector(left, right) {
+  return {
+    x: left.x + right.x,
+    y: left.y + right.y,
+    z: left.z + right.z,
+  };
+}
+
+function subtractVector(left, right) {
+  return {
+    x: left.x - right.x,
+    y: left.y - right.y,
+    z: left.z - right.z,
+  };
+}
+
+function scaleVector(vector, scale) {
+  return { x: vector.x * scale, y: vector.y * scale, z: vector.z * scale };
+}
+
+function vectorMagnitude(vector) {
+  return Math.sqrt(vector.x ** 2 + vector.y ** 2 + vector.z ** 2);
+}
+
+function normalizeVector(vector) {
+  const magnitude = vectorMagnitude(vector);
+  assert.ok(magnitude > 1e-12, "a targeting direction has non-zero length");
+  return scaleVector(vector, 1 / magnitude);
+}
+
+function dotVector(left, right) {
+  return left.x * right.x + left.y * right.y + left.z * right.z;
+}
+
+function crossVector(left, right) {
+  return {
+    x: left.y * right.z - left.z * right.y,
+    y: left.z * right.x - left.x * right.z,
+    z: left.x * right.y - left.y * right.x,
+  };
+}
+
+function rotateVector(quaternion, vector) {
+  const tx = 2 * (quaternion.y * vector.z - quaternion.z * vector.y);
+  const ty = 2 * (quaternion.z * vector.x - quaternion.x * vector.z);
+  const tz = 2 * (quaternion.x * vector.y - quaternion.y * vector.x);
+  return {
+    x: vector.x + quaternion.w * tx + (quaternion.y * tz - quaternion.z * ty),
+    y: vector.y + quaternion.w * ty + (quaternion.z * tx - quaternion.x * tz),
+    z: vector.z + quaternion.w * tz + (quaternion.x * ty - quaternion.y * tx),
+  };
 }
 
 function playerInventory(state, player) {
@@ -150,22 +212,123 @@ function playerInventory(state, player) {
   );
 }
 
-function reachableVoxel(state, player) {
-  return state.voxels
-    .filter(
-      (voxel) =>
-        distanceSquared(voxel.coordinate, player.position) <= 8.5 ** 2 &&
-        !(
-          voxel.coordinate.x >= 7 &&
-          Math.abs(voxel.coordinate.y) <= 1 &&
-          Math.abs(voxel.coordinate.z) <= 1
-        ),
-    )
-    .sort(
-      (left, right) =>
-        distanceSquared(left.coordinate, player.position) -
-        distanceSquared(right.coordinate, player.position),
-    )[0];
+function playerUp(player) {
+  if (player.locomotion.kind !== "eva") {
+    return normalizeVector(player.locomotion.up);
+  }
+  return normalizeVector(
+    rotateVector(player.orientation, { x: 0, y: 1, z: 0 }),
+  );
+}
+
+function playerEye(player) {
+  return addVector(
+    player.position,
+    scaleVector(playerUp(player), CHARACTER_EYE_OFFSET),
+  );
+}
+
+function playerForward(player) {
+  const pitch =
+    player.locomotion.kind === "eva" ? 0 : player.locomotion.view_pitch_radians;
+  return normalizeVector(
+    rotateVector(player.orientation, {
+      x: 0,
+      y: Math.sin(pitch),
+      z: -Math.cos(pitch),
+    }),
+  );
+}
+
+function coordinateKey(coordinate) {
+  return [coordinate.x, coordinate.y, coordinate.z].join(",");
+}
+
+function compareText(left, right) {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function compareCoordinate(left, right) {
+  return left.x - right.x || left.y - right.y || left.z - right.z;
+}
+
+function rayUnitCube(origin, direction, center) {
+  let entry = -Infinity;
+  let exit = Infinity;
+  for (const axis of ["x", "y", "z"]) {
+    const minimum = center[axis] - 0.5;
+    const maximum = center[axis] + 0.5;
+    if (Math.abs(direction[axis]) <= 1e-12) {
+      if (origin[axis] < minimum || origin[axis] > maximum) return undefined;
+      continue;
+    }
+    let near = (minimum - origin[axis]) / direction[axis];
+    let far = (maximum - origin[axis]) / direction[axis];
+    if (near > far) [near, far] = [far, near];
+    entry = Math.max(entry, near);
+    exit = Math.min(exit, far);
+    if (entry > exit) return undefined;
+  }
+  if (exit < 0 || entry > TOOL_RANGE) return undefined;
+  return { distance: Math.max(0, entry) };
+}
+
+function canonicalRayHits(state, player, direction) {
+  const eye = playerEye(player);
+  const hits = [];
+  for (const grid of state.grids) {
+    const inverse = {
+      x: -grid.orientation.x,
+      y: -grid.orientation.y,
+      z: -grid.orientation.z,
+      w: grid.orientation.w,
+    };
+    const localOrigin = rotateVector(
+      inverse,
+      subtractVector(eye, grid.position),
+    );
+    const localDirection = rotateVector(inverse, direction);
+    for (const block of grid.blocks) {
+      const hit = rayUnitCube(localOrigin, localDirection, block.coordinate);
+      if (hit) hits.push({ type: "block", ...hit, grid, block });
+    }
+  }
+  for (const voxel of state.voxels) {
+    const hit = rayUnitCube(eye, direction, voxel.coordinate);
+    if (hit) hits.push({ type: "voxel", ...hit, voxel });
+  }
+  return hits.sort((left, right) => {
+    const distance = left.distance - right.distance;
+    if (Math.abs(distance) > 1e-9) return distance;
+    if (left.type !== right.type) return left.type === "block" ? -1 : 1;
+    if (left.type === "block") {
+      return (
+        compareText(left.grid.grid_id, right.grid.grid_id) ||
+        compareText(left.block.block_id, right.block.block_id)
+      );
+    }
+    return compareCoordinate(left.voxel.coordinate, right.voxel.coordinate);
+  });
+}
+
+function visibleVoxel(state, player) {
+  const eye = playerEye(player);
+  const candidates = [...state.voxels].sort(
+    (left, right) =>
+      distanceSquared(left.coordinate, eye) -
+      distanceSquared(right.coordinate, eye),
+  );
+  for (const voxel of candidates) {
+    const direction = normalizeVector(subtractVector(voxel.coordinate, eye));
+    const hit = canonicalRayHits(state, player, direction)[0];
+    if (
+      hit?.type === "voxel" &&
+      coordinateKey(hit.voxel.coordinate) === coordinateKey(voxel.coordinate)
+    ) {
+      return voxel;
+    }
+  }
+  return undefined;
 }
 
 async function waitForCommonSnapshot(
@@ -183,21 +346,25 @@ async function waitForCommonSnapshot(
     remote.waitFor(predicate, `${description} on remote`, timeoutMillis),
   ]);
   while (
-    localMessage.snapshot.event_sequence !== remoteMessage.snapshot.event_sequence
+    localMessage.snapshot.event_sequence !==
+    remoteMessage.snapshot.event_sequence
   ) {
     if (
-      localMessage.snapshot.event_sequence < remoteMessage.snapshot.event_sequence
+      localMessage.snapshot.event_sequence <
+      remoteMessage.snapshot.event_sequence
     ) {
       const minimum = remoteMessage.snapshot.event_sequence;
       localMessage = await local.waitFor(
-        (message) => predicate(message) && message.snapshot.event_sequence >= minimum,
+        (message) =>
+          predicate(message) && message.snapshot.event_sequence >= minimum,
         `${description} convergence on local`,
         timeoutMillis,
       );
     } else {
       const minimum = localMessage.snapshot.event_sequence;
       remoteMessage = await remote.waitFor(
-        (message) => predicate(message) && message.snapshot.event_sequence >= minimum,
+        (message) =>
+          predicate(message) && message.snapshot.event_sequence >= minimum,
         `${description} convergence on remote`,
         timeoutMillis,
       );
@@ -271,6 +438,28 @@ async function waitForCommonMotion(
   return localMessage.motion;
 }
 
+function applyMotionToSnapshot(state, motion) {
+  const movingPlayers = new Map(
+    motion.players.map((player) => [player.player_id, player]),
+  );
+  const movingGrids = new Map(motion.grids.map((grid) => [grid.grid_id, grid]));
+  return {
+    ...state,
+    event_sequence: motion.event_sequence,
+    simulation_tick: motion.simulation_tick,
+    world_hash: motion.world_hash,
+    player: { ...state.player, ...motion.player },
+    players: state.players.map((player) => ({
+      ...player,
+      ...(movingPlayers.get(player.player_id) ?? {}),
+    })),
+    grids: state.grids.map((grid) => ({
+      ...grid,
+      ...(movingGrids.get(grid.grid_id) ?? {}),
+    })),
+  };
+}
+
 async function waitForReceipt(client, operationId, description) {
   const message = await client.waitFor(
     (candidate) =>
@@ -288,18 +477,96 @@ async function waitForReceipt(client, operationId, description) {
   return message.receipt;
 }
 
-function controlFor(player, operationId, inputSequence, linearInput) {
+function controlFor(
+  player,
+  operationId,
+  inputSequence,
+  linearInput,
+  angularInput = { x: 0, y: 0, z: 0 },
+) {
   return {
     type: "set_player_control",
     operation_id: operationId,
     movement_epoch: player.movement_epoch,
     input_sequence: inputSequence,
     linear_input: linearInput,
-    angular_input: { x: 0, y: 0, z: 0 },
+    angular_input: angularInput,
     boost: false,
     jump: false,
     dampeners: true,
   };
+}
+
+async function aimActorAt(local, remote, state, playerId, target, description) {
+  const client = playerId === local.playerId ? local : remote;
+  let alignedSamples = 0;
+  for (let attempt = 0; attempt < 420; attempt += 1) {
+    const player = state.players.find(
+      (candidate) => candidate.player_id === playerId,
+    );
+    assert.ok(player, `${description} actor remains in the canonical roster`);
+    const forward = playerForward(player);
+    const desired = normalizeVector(subtractVector(target, playerEye(player)));
+    const cosine = Math.min(1, Math.max(-1, dotVector(forward, desired)));
+    const angle = Math.acos(cosine);
+    const angularSpeed = vectorMagnitude(player.angular_velocity);
+    if (angle <= TARGET_ALIGNMENT_RADIANS && angularSpeed <= 0.025) {
+      alignedSamples += 1;
+      if (alignedSamples >= 2) return state;
+    } else {
+      alignedSamples = 0;
+    }
+
+    let axis = crossVector(forward, desired);
+    if (vectorMagnitude(axis) <= 1e-9) {
+      axis = playerUp(player);
+    } else {
+      axis = normalizeVector(axis);
+    }
+    const desiredAngularSpeed =
+      angle <= TARGET_ALIGNMENT_RADIANS
+        ? 0
+        : Math.min(1.2, Math.max(0.04, angle * 4));
+    const desiredWorldAngularVelocity = scaleVector(axis, desiredAngularSpeed);
+    const localDesiredAngularVelocity = rotateVector(
+      {
+        x: -player.orientation.x,
+        y: -player.orientation.y,
+        z: -player.orientation.z,
+        w: player.orientation.w,
+      },
+      desiredWorldAngularVelocity,
+    );
+    const angularInput = scaleVector(
+      localDesiredAngularVelocity,
+      1 / CHARACTER_MAXIMUM_ANGULAR_SPEED,
+    );
+    targetingOperationSequence += 1;
+    const operationId = `two-player-target-${playerId}-${targetingOperationSequence}`;
+    const inputSequence = player.last_received_input_sequence + 1;
+    client.send(
+      controlFor(
+        player,
+        operationId,
+        inputSequence,
+        { x: 0, y: 0, z: 0 },
+        angularInput,
+      ),
+    );
+    await waitForReceipt(client, operationId, `${description} control receipt`);
+    const motion = await waitForCommonMotion(
+      local,
+      remote,
+      (candidate) =>
+        playerById(candidate, playerId)?.last_processed_input_sequence >=
+        inputSequence,
+      `${description} orientation integration`,
+    );
+    state = applyMotionToSnapshot(state, motion);
+  }
+  assert.fail(
+    `${description} did not align within the deterministic control budget`,
+  );
 }
 
 async function run() {
@@ -334,13 +601,35 @@ async function run() {
     const initialRemote = localSnapshot.players.find(
       (player) => player.player_id === "player-remote",
     );
-    const target = reachableVoxel(localSnapshot, initialRemote);
-    assert.ok(target, "the remote actor has a reachable unanchored voxel");
+    const target = visibleVoxel(localSnapshot, initialRemote);
+    assert.ok(target, "the remote actor has a visible unanchored voxel");
+    const targetedSnapshot = await aimActorAt(
+      local,
+      remote,
+      localSnapshot,
+      "player-remote",
+      target.coordinate,
+      "remote mining target",
+    );
+    const targetedRemote = targetedSnapshot.players.find(
+      (player) => player.player_id === "player-remote",
+    );
+    const canonicalMiningHit = canonicalRayHits(
+      targetedSnapshot,
+      targetedRemote,
+      playerForward(targetedRemote),
+    )[0];
+    assert.equal(canonicalMiningHit?.type, "voxel");
+    assert.equal(
+      coordinateKey(canonicalMiningHit.voxel.coordinate),
+      coordinateKey(target.coordinate),
+      "the remote pilot's canonical eye ray resolves to the requested voxel",
+    );
     const primaryInventoryBefore = structuredClone(
-      playerInventory(localSnapshot, initialPrimary).contents,
+      playerInventory(targetedSnapshot, initialPrimary).contents,
     );
     const remoteInventoryBefore = structuredClone(
-      playerInventory(localSnapshot, initialRemote).contents,
+      playerInventory(targetedSnapshot, initialRemote).contents,
     );
     remote.send({
       type: "mine_voxel",

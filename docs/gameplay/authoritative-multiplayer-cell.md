@@ -4,7 +4,7 @@
 
 This checkpoint targets F-012, SIM-011, and SIM-012. It converts the P0.10 single-pilot proof into a shared authoritative cell without claiming production universe scale.
 
-Protocol 11 completes the first trust-boundary increment: authentication precedes the welcome and world snapshot; a socket is bound to an admitted player or to a read-only spectator role; unknown and concurrently claimed players fail closed; and the simulation receives the bound actor separately from the client intent. World schema 14 now persists one canonically ordered player map and actor-scoped operation namespaces. Event schema 10 stores a canonical player actor on human events, explicit target IDs on automatic life-support events, no impersonated actor on system events, and an ordered outcome for every living roster member in the same fixed-step event as all grids. Each capsule has independent control and life-support scheduling and collides with planets, voxels, and grids while character-to-character collision and locomotion-query occlusion are disabled. Full and motion snapshots include the environment evaluated at every player's own position. Unit tests cover roster ownership and kinematics, atomic two-player live stepping and exact restart recovery, per-player idempotency and input frontiers, canonical outcome order, collision-layer/query behavior, actor-isolated oxygen/death/drop/respawn, and rejection of forged character or lifecycle outcomes. A fresh loopback development worker now pre-admits `player-local` and `player-remote`; separate sockets bind, advance independent control frontiers, mine using only their own pose, inventory, experience, and career state, and operate only their own suit and recovery state. The native client selects its actor and location-specific gravity from welcome metadata and renders the other engineering suit, while the browser merges and displays the complete roster. Secondary-player refining, manufacturing, transfers, construction, and grid actions fail closed until their ownership rules are converted, so F-012 and SIM-012 are not yet complete.
+Protocol 11 completes the first trust-boundary increment: authentication precedes the welcome and world snapshot; a socket is bound to an admitted player or to a read-only spectator role; unknown and concurrently claimed players fail closed; and the simulation receives the bound actor separately from the client intent. World schema 14 now persists one canonically ordered player map and actor-scoped operation namespaces. Event schema 10 stores a canonical player actor on human events, explicit target IDs on automatic life-support events, no impersonated actor on system events, and an ordered outcome for every living roster member in the same fixed-step event as all grids. Each capsule has independent control and life-support scheduling and collides with planets, voxels, and grids while character-to-character collision and locomotion-query occlusion are disabled. Full and motion snapshots include the environment evaluated at every player's own position. Mining and hand-tool grid actions reconstruct the bound actor's canonical eye ray and accept only the closest visible voxel, block, or exact build face within nine metres; the same rule is replay-validated before mutation. Unit tests cover roster ownership and kinematics, atomic two-player live stepping and exact restart recovery, per-player idempotency and input frontiers, canonical outcome order, collision-layer/query behavior, actor-isolated oxygen/death/drop/respawn, closest-hit targeting, and rejection of forged character, lifecycle, or tool outcomes. A fresh loopback development worker now pre-admits `player-local` and `player-remote`; separate sockets bind, advance independent control frontiers, mine using only their own pose, aim, inventory, experience, and career state, and operate only their own suit and recovery state. The native client selects its actor and location-specific gravity from welcome metadata and renders the other engineering suit, while the browser merges and displays the complete roster. Secondary-player refining, manufacturing, transfers, construction, and grid actions fail closed until their ownership rules are converted, so F-012 and SIM-012 are not yet complete.
 
 ## Player-visible contract
 
@@ -55,10 +55,10 @@ Only one gameplay session controls a player at a time. A second session receives
 | --- | --- |
 | Character control | Actor movement epoch and actor FIFO |
 | Suit mode / respawn | Actor life and suit state |
-| Mine / build / weld | Range from actor capsule; actor must be alive |
+| Mine / build / weld | Closest visible target from actor eye ray; actor must be alive |
 | Refine / craft | Actor must be allowed to operate the addressed inventory |
 | Inventory transfer | Actor must have withdraw permission on source and deposit permission on destination |
-| Grid control / anchor / damage | Explicit grid permission; P1.0 development ownership only |
+| Grid control / anchor / damage | Explicit grid permission; hand damage also requires the closest visible block; P1.0 development ownership only |
 
 Generic knowledge of an inventory or grid ID is never authority.
 
@@ -86,8 +86,10 @@ scenario. The browser unit harness proves deterministic roster ordering,
 identity-based motion merging, and selected-pilot environment fallback. A
 concurrent two-socket scenario submits the
 same operation IDs from both actors, verifies independent processed frontiers,
-mines one shared voxel as the remote actor, proves actor-only ore and career
-credit, retries idempotently, and converges both clients on the same hash.
+aims and mines one shared voxel as the remote actor, proves actor-only ore and
+career credit, retries idempotently, and converges both clients on the same
+hash. The full scenario derives construction coordinates from exact hit faces
+and proves that an intentionally occluded damage request cannot mutate state.
 
 ## Not yet included
 

@@ -180,7 +180,7 @@ Implemented and continuously verified:
 
 Implemented and continuously verified:
 
-- Server-range-checked construction placement and welding.
+- Server-reconstructed closest-visible-target construction, welding, damage, and mining with an inclusive nine-metre surface reach.
 - Persistent 90-degree block orientations transmitted in protocol snapshots.
 - Frames that consume components once, begin at 25 percent integrity, and require three accepted weld stages.
 - Power and anchor rules that ignore unfinished construction.
@@ -188,6 +188,7 @@ Implemented and continuously verified:
 - Durable completion state that keeps damaged armor visually distinct from frames and prevents repair from re-awarding build credit.
 - Completion-derived career progress, exact recovery, and idempotent final-weld receipts.
 - Exact mined-coordinate removal assertions in the cross-process scenario.
+- Exact voxel DDA and rotated-grid block intersection, stable tie ordering, fail-closed origin contact, exact-face adjacency, and prepare/replay occlusion rejection.
 - Client-side frame skeletons, rotating directional holograms, integrity telemetry, and confirmed-edit rock fragments.
 
 ## P0.5 planetary logistics checkpoint

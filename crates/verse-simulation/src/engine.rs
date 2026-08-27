@@ -26,6 +26,9 @@ use crate::model::{
     WorldState, radial_up,
 };
 use crate::persistence::{PersistenceError, Store};
+#[cfg(test)]
+use crate::targeting::{TOOL_SURFACE_RANGE_M, ToolHit};
+use crate::targeting::{ToolTarget, closest_tool_hit};
 
 #[cfg(test)]
 const PLAYER_BODY_ID: &str = "player-body-player-local";
@@ -33,8 +36,6 @@ const PLAYER_BODY_ID: &str = "player-body-player-local";
 const PLAYER_COLLIDER_ID: &str = "player-collider-player-local";
 const PLANET_BODY_ID: &str = "planet-body-khepri-prime";
 const PLANET_COLLIDER_ID: &str = "planet-collider-khepri-prime";
-const MINING_RANGE: f64 = 8.5;
-const HAND_TOOL_RANGE: f64 = 9.0;
 const MAX_GRID_CONTROL_INPUT: f64 = 1.0;
 const CONTROL_INPUT_EPSILON: f64 = 1.0e-9;
 // Godot's standard Vector3 uses float32 components. Normalizing in float32 and
@@ -286,6 +287,41 @@ impl Runtime {
         self.physics
             .rebuild(&physics_body_specs(&self.state))
             .expect("test relocation must produce a valid physics scene");
+    }
+
+    #[cfg(test)]
+    pub(crate) fn aim_player_for_test(&mut self, target: Vec3, outward_face: Vec3) {
+        let face = outward_face * outward_face.magnitude().recip();
+        let eye = target + face * 4.0;
+        let forward = (target - eye) * (target - eye).magnitude().recip();
+        let dot = -forward.z;
+        let orientation = if dot < -1.0 + 1.0e-9 {
+            Quat::new(0.0, 1.0, 0.0, 0.0)
+        } else {
+            let x = forward.y;
+            let y = -forward.x;
+            let w = 1.0 + dot;
+            let inverse_length = x.mul_add(x, y.mul_add(y, w * w)).sqrt().recip();
+            Quat::new(
+                (x * inverse_length) as f32,
+                (y * inverse_length) as f32,
+                0.0,
+                (w * inverse_length) as f32,
+            )
+        };
+        let eye_offset = content::manifest().character.eye_height_m
+            - content::manifest().character.standing_height_m * 0.5;
+        self.state.player.position = eye - Vec3::new(0.0, eye_offset, 0.0);
+        self.state.player.orientation = orientation;
+        self.state.player.linear_velocity = Vec3::ZERO;
+        self.state.player.angular_velocity = Vec3::ZERO;
+        self.state.player.surface_contact = false;
+        self.state.player.locomotion.kind = LocomotionKind::Airborne;
+        self.state.player.locomotion.up = Vec3::new(0.0, 1.0, 0.0);
+        self.state.player.locomotion.view_pitch_radians = 0.0;
+        self.physics
+            .rebuild(&physics_body_specs(&self.state))
+            .expect("test aim must produce a valid physics scene");
     }
 
     pub const fn is_halted(&self) -> bool {
@@ -1011,17 +1047,12 @@ impl WorldState {
                 let material = self.voxels.material(*coordinate).ok_or_else(|| {
                     IntentError::rejected("voxel_missing", "target voxel is already empty")
                 })?;
-                let voxel_position = Vec3::new(
-                    f64::from(coordinate.x),
-                    f64::from(coordinate.y),
-                    f64::from(coordinate.z),
-                );
-                if actor.position.squared_distance(voxel_position) > MINING_RANGE * MINING_RANGE {
-                    return Err(IntentError::rejected(
-                        "voxel_out_of_range",
-                        "target voxel is beyond the mining tool range",
-                    ));
-                }
+                self.ensure_voxel_tool_target(
+                    actor,
+                    *coordinate,
+                    "voxel_not_targeted",
+                    "the requested voxel is not the authenticated actor's closest visible tool target",
+                )?;
                 let ore_yield = content::voxel(material).ore_yield;
                 if !self
                     .inventory(&actor.inventory_id)?
@@ -1209,7 +1240,13 @@ impl WorldState {
                         "new blocks must share a face with the target grid",
                     ));
                 }
-                self.ensure_hand_tool_range(grid, *coordinate, "block_out_of_range")?;
+                self.ensure_build_tool_target(
+                    actor,
+                    grid_id,
+                    *coordinate,
+                    "build_face_not_targeted",
+                    "the requested frame is not on the exact visible face targeted by the authenticated actor",
+                )?;
                 if self.player_intersects_grid_coordinate(grid, *coordinate) {
                     return Err(IntentError::rejected(
                         "block_intersects_player",
@@ -1245,7 +1282,13 @@ impl WorldState {
                 let block = grid.blocks.get(block_id).ok_or_else(|| {
                     IntentError::rejected("block_missing", "weld target does not exist")
                 })?;
-                self.ensure_hand_tool_range(grid, block.coordinate, "block_out_of_range")?;
+                self.ensure_block_tool_target(
+                    actor,
+                    grid_id,
+                    block_id,
+                    "block_not_targeted",
+                    "the requested weld block is not the authenticated actor's closest visible tool target",
+                )?;
                 let max_health = block.max_health();
                 if block.health >= max_health {
                     return Err(IntentError::rejected(
@@ -1330,13 +1373,19 @@ impl WorldState {
                 grid_id, block_id, ..
             } => {
                 let grid = self.grid(grid_id)?;
-                let block = grid.blocks.get(block_id).ok_or_else(|| {
+                let _block = grid.blocks.get(block_id).ok_or_else(|| {
                     IntentError::rejected(
                         "block_missing",
                         "target block does not exist on the grid",
                     )
                 })?;
-                self.ensure_hand_tool_range(grid, block.coordinate, "block_out_of_range")?;
+                self.ensure_block_tool_target(
+                    actor,
+                    grid_id,
+                    block_id,
+                    "block_not_targeted",
+                    "the requested damage block is not the authenticated actor's closest visible tool target",
+                )?;
                 EventPayload::BlockDamaged {
                     grid_id: grid_id.clone(),
                     block_id: block_id.clone(),
@@ -1466,6 +1515,18 @@ impl WorldState {
                 return Err(IntentError::rejected(
                     "replay_mining_envelope_invalid",
                     "voxel mining requires the authoritative player actor and an operation ID",
+                ));
+            }
+            EventPayload::BlockBuilt { .. }
+            | EventPayload::BlockWelded { .. }
+            | EventPayload::BlockDamaged { .. }
+                if event.actor_type != "human"
+                    || event.actor_player_id.is_none()
+                    || event.operation_id.as_deref().is_none_or(str::is_empty) =>
+            {
+                return Err(IntentError::rejected(
+                    "replay_hand_tool_envelope_invalid",
+                    "construction, welding, and hand-tool damage require an authenticated player actor and operation ID",
                 ));
             }
             EventPayload::PhysicsStepCommitted { .. }
@@ -1763,17 +1824,12 @@ impl WorldState {
                         "event material does not match voxel material",
                     ));
                 }
-                let voxel_position = Vec3::new(
-                    f64::from(coordinate.x),
-                    f64::from(coordinate.y),
-                    f64::from(coordinate.z),
-                );
-                if actor.position.squared_distance(voxel_position) > MINING_RANGE * MINING_RANGE {
-                    return Err(IntentError::rejected(
-                        "replay_mining_range_invalid",
-                        "mining event target is beyond the authenticated actor's tool range",
-                    ));
-                }
+                self.ensure_voxel_tool_target(
+                    actor,
+                    *coordinate,
+                    "replay_mining_target_invalid",
+                    "mining event does not match the authenticated actor's closest visible tool target",
+                )?;
                 let canonical_ore_yield = content::voxel(canonical_material).ore_yield;
                 if *ore_yield != canonical_ore_yield {
                     return Err(IntentError::rejected(
@@ -1944,6 +2000,14 @@ impl WorldState {
                     ));
                 }
                 let grid = self.grid(grid_id)?;
+                let actor_player_id = event
+                    .actor_player_id
+                    .as_deref()
+                    .expect("validated construction event has a human actor");
+                let actor = self
+                    .player
+                    .get(actor_player_id)
+                    .expect("validated construction actor is present");
                 if grid.blocks.len() >= MAX_GRID_BLOCKS_P0
                     || grid.block_at(block.coordinate).is_some()
                     || (!grid.blocks.is_empty()
@@ -1956,10 +2020,12 @@ impl WorldState {
                         "placed frame exceeds the grid budget or is not at a free face-connected coordinate",
                     ));
                 }
-                self.ensure_hand_tool_range(
-                    grid,
+                self.ensure_build_tool_target(
+                    actor,
+                    grid_id,
                     block.coordinate,
-                    "replay_construction_out_of_range",
+                    "replay_construction_target_invalid",
+                    "construction event is not on the exact closest visible face targeted by its authenticated actor",
                 )?;
                 if self.player_intersects_grid_coordinate(grid, block.coordinate) {
                     return Err(IntentError::rejected(
@@ -2001,6 +2067,25 @@ impl WorldState {
                 max_health,
                 completed_construction,
             } => {
+                let actor_player_id = event
+                    .actor_player_id
+                    .as_deref()
+                    .expect("validated weld event has a human actor");
+                let actor = self
+                    .player
+                    .get(actor_player_id)
+                    .expect("validated weld actor is present");
+                let grid = self.grid(grid_id)?;
+                let _targeted_block = grid.blocks.get(block_id).ok_or_else(|| {
+                    IntentError::rejected("replay_block_missing", "weld target is missing")
+                })?;
+                self.ensure_block_tool_target(
+                    actor,
+                    grid_id,
+                    block_id,
+                    "replay_weld_target_invalid",
+                    "weld event does not match the authenticated actor's closest visible tool target",
+                )?;
                 let block = self
                     .grid_mut(grid_id)?
                     .blocks
@@ -2065,7 +2150,28 @@ impl WorldState {
                 grid_id,
                 block_id,
                 damage,
-            } => self.apply_damage(grid_id, block_id, *damage, event.event_sequence)?,
+            } => {
+                let actor_player_id = event
+                    .actor_player_id
+                    .as_deref()
+                    .expect("validated damage event has a human actor");
+                let actor = self
+                    .player
+                    .get(actor_player_id)
+                    .expect("validated damage actor is present");
+                let grid = self.grid(grid_id)?;
+                let _block = grid.blocks.get(block_id).ok_or_else(|| {
+                    IntentError::rejected("replay_block_missing", "damage target is missing")
+                })?;
+                self.ensure_block_tool_target(
+                    actor,
+                    grid_id,
+                    block_id,
+                    "replay_damage_target_invalid",
+                    "damage event does not match the authenticated actor's closest visible tool target",
+                )?;
+                self.apply_damage(grid_id, block_id, *damage, event.event_sequence)?;
+            }
             EventPayload::PhysicsStepCommitted {
                 fixed_step_hz,
                 step_count,
@@ -2773,21 +2879,86 @@ impl WorldState {
         })
     }
 
-    fn ensure_hand_tool_range(
+    fn ensure_voxel_tool_target(
         &self,
-        grid: &Grid,
-        coordinate: verse_protocol::IVec3,
+        actor: &Player,
+        coordinate: IVec3,
         code: &str,
+        message: &str,
     ) -> Result<(), IntentError> {
-        let world = grid.world_coordinate(coordinate);
-        let position = Vec3::new(f64::from(world.x), f64::from(world.y), f64::from(world.z));
-        if self.player.position.squared_distance(position) > HAND_TOOL_RANGE * HAND_TOOL_RANGE {
-            return Err(IntentError::rejected(
-                code,
-                "the targeted block coordinate is beyond the hand-tool range",
-            ));
+        let hit = closest_tool_hit(actor, &self.voxels, &self.grids);
+        if matches!(
+            hit,
+            Some(ref hit)
+                if hit.local_face.is_some()
+                    && hit.target == ToolTarget::Voxel { coordinate }
+        ) {
+            Ok(())
+        } else {
+            Err(IntentError::rejected(code, message))
         }
-        Ok(())
+    }
+
+    fn ensure_block_tool_target(
+        &self,
+        actor: &Player,
+        grid_id: &str,
+        block_id: &str,
+        code: &str,
+        message: &str,
+    ) -> Result<(), IntentError> {
+        let hit = closest_tool_hit(actor, &self.voxels, &self.grids);
+        if matches!(
+            hit,
+            Some(ref hit)
+                if hit.local_face.is_some()
+                    && matches!(
+                        &hit.target,
+                        ToolTarget::Block {
+                            grid_id: targeted_grid_id,
+                            block_id: targeted_block_id,
+                            ..
+                        } if targeted_grid_id == grid_id && targeted_block_id == block_id
+                    )
+        ) {
+            Ok(())
+        } else {
+            Err(IntentError::rejected(code, message))
+        }
+    }
+
+    fn ensure_build_tool_target(
+        &self,
+        actor: &Player,
+        grid_id: &str,
+        coordinate: IVec3,
+        code: &str,
+        message: &str,
+    ) -> Result<(), IntentError> {
+        let Some(hit) = closest_tool_hit(actor, &self.voxels, &self.grids) else {
+            return Err(IntentError::rejected(code, message));
+        };
+        let Some(face) = hit.local_face else {
+            return Err(IntentError::rejected(code, message));
+        };
+        let ToolTarget::Block {
+            grid_id: targeted_grid_id,
+            coordinate: targeted_coordinate,
+            ..
+        } = hit.target
+        else {
+            return Err(IntentError::rejected(code, message));
+        };
+        let expected = IVec3::new(
+            targeted_coordinate.x.saturating_add(face.x),
+            targeted_coordinate.y.saturating_add(face.y),
+            targeted_coordinate.z.saturating_add(face.z),
+        );
+        if targeted_grid_id == grid_id && expected == coordinate {
+            Ok(())
+        } else {
+            Err(IntentError::rejected(code, message))
+        }
     }
 
     fn player_intersects_voxel(&self, position: Vec3, orientation: Quat) -> bool {
@@ -4751,12 +4922,230 @@ mod tests {
     }
 
     fn move_player_near_grid(runtime: &mut Runtime) {
-        runtime.state.player.position = Vec3::new(10.0, 1.0, 3.0);
-        runtime.state.player.linear_velocity = Vec3::ZERO;
+        aim_player_for_build(runtime, STARTER_GRID_ID, IVec3::new(0, 1, 0));
+    }
+
+    fn normalized(value: Vec3) -> Vec3 {
+        value * value.magnitude().recip()
+    }
+
+    fn orientation_from_forward(forward: Vec3) -> Quat {
+        let forward = normalized(forward);
+        // Shortest rotation from Godot's local forward (-Z) to the target.
+        let dot = -forward.z;
+        if dot < -1.0 + 1.0e-9 {
+            return Quat::new(0.0, 1.0, 0.0, 0.0);
+        }
+        let x = forward.y;
+        let y = -forward.x;
+        let w = 1.0 + dot;
+        let inverse_length = x.mul_add(x, y.mul_add(y, w * w)).sqrt().recip();
+        Quat::new(
+            (x * inverse_length) as f32,
+            (y * inverse_length) as f32,
+            0.0,
+            (w * inverse_length) as f32,
+        )
+    }
+
+    fn aim_player_from_face(player: &mut Player, target: Vec3, outward_face: Vec3) {
+        let eye_offset = content::manifest().character.eye_height_m
+            - content::manifest().character.standing_height_m * 0.5;
+        let eye = target + normalized(outward_face) * 4.0;
+        player.position = eye - Vec3::new(0.0, eye_offset, 0.0);
+        player.orientation = orientation_from_forward(target - eye);
+        player.linear_velocity = Vec3::ZERO;
+        player.angular_velocity = Vec3::ZERO;
+        player.locomotion.kind = LocomotionKind::Airborne;
+        player.locomotion.up = Vec3::new(0.0, 1.0, 0.0);
+        player.locomotion.view_pitch_radians = 0.0;
+    }
+
+    fn aim_player_for_build(runtime: &mut Runtime, grid_id: &str, coordinate: IVec3) {
+        let grid = runtime.state.grids[grid_id].clone();
+        let mut aimed = None;
+        for existing in coordinate
+            .neighbors()
+            .into_iter()
+            .filter(|neighbor| grid.block_at(*neighbor).is_some())
+        {
+            let local_face = IVec3::new(
+                coordinate.x - existing.x,
+                coordinate.y - existing.y,
+                coordinate.z - existing.z,
+            );
+            let world_face = grid.orientation.rotate(Vec3::new(
+                f64::from(local_face.x),
+                f64::from(local_face.y),
+                f64::from(local_face.z),
+            ));
+            let mut candidate = runtime.state.player.primary().clone();
+            aim_player_from_face(&mut candidate, grid.world_position(existing), world_face);
+            let hit = closest_tool_hit(&candidate, &runtime.state.voxels, &runtime.state.grids);
+            if matches!(
+                hit,
+                Some(ToolHit {
+                    target: ToolTarget::Block {
+                        ref grid_id,
+                        coordinate: targeted,
+                        ..
+                    },
+                    local_face: Some(face),
+                    ..
+                }) if grid_id == &grid.grid_id
+                    && targeted == existing
+                    && IVec3::new(
+                        targeted.x + face.x,
+                        targeted.y + face.y,
+                        targeted.z + face.z,
+                    ) == coordinate
+            ) {
+                aimed = Some(candidate);
+                break;
+            }
+        }
+        *runtime.state.player.primary_mut() =
+            aimed.expect("build fixture has one visible face-connected existing block");
         runtime
             .physics
             .rebuild(&physics_body_specs(&runtime.state))
-            .expect("test setup rebuilds player near the grid");
+            .expect("test setup rebuilds aimed player near the grid");
+    }
+
+    fn exposed_voxel_face(voxels: &VoxelField, coordinate: IVec3) -> Option<IVec3> {
+        coordinate
+            .neighbors()
+            .into_iter()
+            .find(|neighbor| !voxels.occupied.contains(neighbor))
+            .map(|neighbor| {
+                IVec3::new(
+                    neighbor.x - coordinate.x,
+                    neighbor.y - coordinate.y,
+                    neighbor.z - coordinate.z,
+                )
+            })
+    }
+
+    fn aim_player_at_voxel(runtime: &mut Runtime, player_id: &str, coordinate: IVec3) {
+        let target = Vec3::new(
+            f64::from(coordinate.x),
+            f64::from(coordinate.y),
+            f64::from(coordinate.z),
+        );
+        let baseline = runtime
+            .state
+            .player
+            .get(player_id)
+            .expect("aimed fixture actor exists")
+            .clone();
+        let mut aimed = None;
+        for neighbor in coordinate
+            .neighbors()
+            .into_iter()
+            .filter(|neighbor| !runtime.state.voxels.occupied.contains(neighbor))
+        {
+            let face = IVec3::new(
+                neighbor.x - coordinate.x,
+                neighbor.y - coordinate.y,
+                neighbor.z - coordinate.z,
+            );
+            let mut candidate = baseline.clone();
+            aim_player_from_face(
+                &mut candidate,
+                target,
+                Vec3::new(f64::from(face.x), f64::from(face.y), f64::from(face.z)),
+            );
+            if matches!(
+                closest_tool_hit(&candidate, &runtime.state.voxels, &runtime.state.grids),
+                Some(ToolHit {
+                    target: ToolTarget::Voxel { coordinate: targeted },
+                    local_face: Some(_),
+                    ..
+                }) if targeted == coordinate
+            ) {
+                aimed = Some(candidate);
+                break;
+            }
+        }
+        *runtime
+            .state
+            .player
+            .get_mut(player_id)
+            .expect("aimed fixture actor exists") =
+            aimed.expect("mining fixture voxel has a visible exposed face");
+        runtime
+            .physics
+            .rebuild(&physics_body_specs(&runtime.state))
+            .expect("test setup rebuilds aimed player near the voxel");
+    }
+
+    fn aim_player_at_block(runtime: &mut Runtime, grid_id: &str, block_id: &str) {
+        let grid = runtime.state.grids[grid_id].clone();
+        let block = grid.blocks[block_id].clone();
+        let baseline = runtime.state.player.primary().clone();
+        let mut aimed = None;
+        for neighbor in block
+            .coordinate
+            .neighbors()
+            .into_iter()
+            .filter(|neighbor| grid.block_at(*neighbor).is_none())
+        {
+            let face = Vec3::new(
+                f64::from(neighbor.x - block.coordinate.x),
+                f64::from(neighbor.y - block.coordinate.y),
+                f64::from(neighbor.z - block.coordinate.z),
+            );
+            let mut candidate = baseline.clone();
+            aim_player_from_face(
+                &mut candidate,
+                grid.world_position(block.coordinate),
+                grid.orientation.rotate(face),
+            );
+            if matches!(
+                closest_tool_hit(&candidate, &runtime.state.voxels, &runtime.state.grids),
+                Some(ToolHit {
+                    target: ToolTarget::Block {
+                        ref grid_id,
+                        ref block_id,
+                        ..
+                    },
+                    local_face: Some(_),
+                    ..
+                }) if grid_id == &grid.grid_id && block_id == &block.block_id
+            ) {
+                aimed = Some(candidate);
+                break;
+            }
+        }
+        *runtime.state.player.primary_mut() =
+            aimed.expect("hand-tool fixture block has one visible exposed face");
+        runtime
+            .physics
+            .rebuild(&physics_body_specs(&runtime.state))
+            .expect("test setup rebuilds aimed player near the block");
+    }
+
+    fn aim_player_at_block_preserving_locomotion(
+        runtime: &mut Runtime,
+        grid_id: &str,
+        block_id: &str,
+    ) {
+        let preserved_locomotion = runtime.state.player.locomotion.clone();
+        aim_player_at_block(runtime, grid_id, block_id);
+        runtime.state.player.locomotion = preserved_locomotion;
+        runtime.state.player.locomotion.view_pitch_radians = 0.0;
+    }
+
+    fn restore_player_pose_after_tool_fixture(runtime: &mut Runtime, prior: &Player) {
+        runtime.state.player.position = prior.position;
+        runtime.state.player.orientation = prior.orientation;
+        runtime.state.player.linear_velocity = prior.linear_velocity;
+        runtime.state.player.angular_velocity = prior.angular_velocity;
+        runtime.state.player.surface_contact = prior.surface_contact;
+        runtime
+            .physics
+            .rebuild(&physics_body_specs(&runtime.state))
+            .expect("tool fixture restores the physical player pose");
     }
 
     fn add_remote_player(runtime: &mut Runtime) {
@@ -4957,23 +5346,211 @@ mod tests {
             .collect()
     }
 
-    fn reachable_voxel(runtime: &Runtime) -> IVec3 {
-        runtime
+    fn reachable_voxel(runtime: &mut Runtime) -> IVec3 {
+        let coordinate = runtime
             .state()
             .voxels
             .occupied
             .iter()
             .copied()
-            .find(|coordinate| {
-                let position = Vec3::new(
-                    f64::from(coordinate.x),
-                    f64::from(coordinate.y),
-                    f64::from(coordinate.z),
-                );
-                runtime.state().player.position.squared_distance(position)
-                    <= MINING_RANGE * MINING_RANGE
+            .find(|coordinate| exposed_voxel_face(&runtime.state.voxels, *coordinate).is_some())
+            .expect("exposed voxel exists");
+        aim_player_at_voxel(runtime, "player-local", coordinate);
+        coordinate
+    }
+
+    #[test]
+    fn hand_tool_prepare_rejects_nonvisible_targets_and_wrong_build_face_without_mutation() {
+        let mut runtime = runtime();
+        move_player_near_grid(&mut runtime);
+        let assert_rejected_unchanged =
+            |runtime: &mut Runtime, message: ClientMessage, expected_code: &str| {
+                let before_hash = runtime.state().state_hash();
+                let before_sequence = runtime.state().event_sequence;
+                let result = runtime.execute(&message);
+                assert!(matches!(
+                    result,
+                    Err(RuntimeError::Intent(IntentError::Rejected { ref code, .. }))
+                        if code == expected_code
+                ));
+                assert_eq!(runtime.state().state_hash(), before_hash);
+                assert_eq!(runtime.state().event_sequence, before_sequence);
+            };
+
+        assert_rejected_unchanged(
+            &mut runtime,
+            ClientMessage::DamageBlock {
+                operation_id: "occluded-damage-prepare".into(),
+                grid_id: STARTER_GRID_ID.into(),
+                block_id: "block-deck-e".into(),
+            },
+            "block_not_targeted",
+        );
+        assert_rejected_unchanged(
+            &mut runtime,
+            ClientMessage::BuildBlock {
+                operation_id: "wrong-build-face-prepare".into(),
+                grid_id: STARTER_GRID_ID.into(),
+                coordinate: IVec3::new(0, -1, 0),
+                kind: BlockKind::Structural,
+                orientation: 0,
+            },
+            "build_face_not_targeted",
+        );
+
+        let visible = reachable_voxel(&mut runtime);
+        let different = runtime
+            .state()
+            .voxels
+            .occupied
+            .iter()
+            .copied()
+            .find(|coordinate| *coordinate != visible)
+            .expect("asteroid has another voxel");
+        assert_rejected_unchanged(
+            &mut runtime,
+            ClientMessage::MineVoxel {
+                operation_id: "occluded-mining-prepare".into(),
+                coordinate: different,
+            },
+            "voxel_not_targeted",
+        );
+    }
+
+    #[test]
+    fn mining_prepare_accepts_exactly_nine_meter_surface_range_and_rejects_beyond_it() {
+        let mut state = runtime().state().clone();
+        state.voxels = VoxelField {
+            occupied: BTreeSet::from([IVec3::ZERO]),
+            ferrite_ore: BTreeSet::new(),
+        };
+        state.grids.clear();
+        let eye_offset = content::manifest().character.eye_height_m
+            - content::manifest().character.standing_height_m * 0.5;
+        state.player.position = Vec3::new(0.0, -eye_offset, 9.5);
+        state.player.orientation = Quat::IDENTITY;
+        state.player.locomotion.kind = LocomotionKind::Airborne;
+        state.player.locomotion.up = Vec3::new(0.0, 1.0, 0.0);
+        state.player.locomotion.view_pitch_radians = 0.0;
+        state
+            .prepare_client_event(&ClientMessage::MineVoxel {
+                operation_id: "exact-nine-meter-surface".into(),
+                coordinate: IVec3::ZERO,
             })
-            .expect("reachable voxel exists")
+            .expect("a surface exactly nine meters from the eye is targetable");
+
+        state.player.position.z += 1.0e-8;
+        let before_hash = state.state_hash();
+        let error = state
+            .prepare_client_event(&ClientMessage::MineVoxel {
+                operation_id: "beyond-nine-meter-surface".into(),
+                coordinate: IVec3::ZERO,
+            })
+            .expect_err("a surface beyond the inclusive range rejects");
+        assert_eq!(error.code(), "voxel_not_targeted");
+        assert_eq!(state.state_hash(), before_hash);
+    }
+
+    #[test]
+    fn hand_tool_replay_rejects_target_and_actor_substitution_before_mutation() {
+        let mut runtime = runtime();
+        runtime
+            .admit_development_player("player-remote")
+            .expect("secondary fixture actor admits");
+        move_player_near_grid(&mut runtime);
+        aim_player_at_block(&mut runtime, STARTER_GRID_ID, "block-core");
+        let state = runtime.state().clone();
+
+        let damage = state
+            .prepare_client_event(&ClientMessage::DamageBlock {
+                operation_id: "canonical-targeted-damage".into(),
+                grid_id: STARTER_GRID_ID.into(),
+                block_id: "block-core".into(),
+            })
+            .expect("visible damage event prepares");
+        let reject = |event: &CanonicalEvent, expected_code: &str, state: &WorldState| {
+            let mut candidate = state.clone();
+            let before_hash = candidate.state_hash();
+            let error = candidate
+                .apply_event(event)
+                .expect_err("forged tool replay rejects");
+            assert_eq!(error.code(), expected_code);
+            assert_eq!(candidate.state_hash(), before_hash);
+        };
+
+        let mut wrong_damage_target = damage.clone();
+        let EventPayload::BlockDamaged { block_id, .. } = &mut wrong_damage_target.payload else {
+            unreachable!();
+        };
+        *block_id = "block-deck-e".into();
+        wrong_damage_target.event_hash = wrong_damage_target.calculate_hash();
+        reject(&wrong_damage_target, "replay_damage_target_invalid", &state);
+
+        let mut wrong_damage_actor = damage;
+        wrong_damage_actor.actor_player_id = Some("player-remote".into());
+        wrong_damage_actor.event_hash = wrong_damage_actor.calculate_hash();
+        reject(&wrong_damage_actor, "replay_damage_target_invalid", &state);
+
+        let mut build_runtime = runtime;
+        move_player_near_grid(&mut build_runtime);
+        let build_state = build_runtime.state().clone();
+        let build = build_state
+            .prepare_client_event(&ClientMessage::BuildBlock {
+                operation_id: "canonical-targeted-build".into(),
+                grid_id: STARTER_GRID_ID.into(),
+                coordinate: IVec3::new(0, 1, 0),
+                kind: BlockKind::Structural,
+                orientation: 0,
+            })
+            .expect("visible construction event prepares");
+        let mut wrong_build_face = build.clone();
+        let EventPayload::BlockBuilt { block, .. } = &mut wrong_build_face.payload else {
+            unreachable!();
+        };
+        block.coordinate = IVec3::new(0, -1, 0);
+        wrong_build_face.event_hash = wrong_build_face.calculate_hash();
+        reject(
+            &wrong_build_face,
+            "replay_construction_target_invalid",
+            &build_state,
+        );
+
+        let mut wrong_build_actor = build.clone();
+        wrong_build_actor.actor_player_id = Some("player-remote".into());
+        wrong_build_actor.event_hash = wrong_build_actor.calculate_hash();
+        reject(
+            &wrong_build_actor,
+            "replay_construction_target_invalid",
+            &build_state,
+        );
+
+        let mut post_build_state = build_state;
+        post_build_state
+            .apply_event(&build)
+            .expect("canonical visible frame replays");
+        let frame_id = post_build_state.grids[STARTER_GRID_ID]
+            .block_at(IVec3::new(0, 1, 0))
+            .expect("frame exists")
+            .block_id
+            .clone();
+        let weld = post_build_state
+            .prepare_client_event(&ClientMessage::WeldBlock {
+                operation_id: "canonical-targeted-weld".into(),
+                grid_id: STARTER_GRID_ID.into(),
+                block_id: frame_id,
+            })
+            .expect("visible weld event prepares");
+        let mut wrong_weld_target = weld;
+        let EventPayload::BlockWelded { block_id, .. } = &mut wrong_weld_target.payload else {
+            unreachable!();
+        };
+        *block_id = "block-core".into();
+        wrong_weld_target.event_hash = wrong_weld_target.calculate_hash();
+        reject(
+            &wrong_weld_target,
+            "replay_weld_target_invalid",
+            &post_build_state,
+        );
     }
 
     fn expected_physics_fingerprint(state: &WorldState) -> Vec<(String, Vec<String>)> {
@@ -5012,6 +5589,7 @@ mod tests {
             if block.is_complete() {
                 break;
             }
+            aim_player_at_block(runtime, STARTER_GRID_ID, &block.block_id);
             runtime
                 .execute(&ClientMessage::WeldBlock {
                     operation_id: format!("{prefix}-{}", block.health),
@@ -5673,18 +6251,25 @@ mod tests {
 
     #[test]
     fn replay_rejects_a_full_integrity_no_op_weld_without_awarding_experience() {
-        let runtime = runtime();
+        let mut runtime = runtime();
+        move_player_near_grid(&mut runtime);
+        aim_player_at_block(&mut runtime, STARTER_GRID_ID, "block-core");
         let mut state = runtime.state().clone();
         let before_hash = state.state_hash();
         let max_health = state.grids[STARTER_GRID_ID].blocks["block-core"].max_health();
-        let event = state.prepare_system_event(EventPayload::BlockWelded {
-            grid_id: STARTER_GRID_ID.into(),
-            block_id: "block-core".into(),
-            previous_health: max_health,
-            new_health: max_health,
-            max_health,
-            completed_construction: false,
-        });
+        let event = state.new_event(
+            Some("player-local"),
+            "human",
+            Some("replayed-full-weld".into()),
+            EventPayload::BlockWelded {
+                grid_id: STARTER_GRID_ID.into(),
+                block_id: "block-core".into(),
+                previous_health: max_health,
+                new_health: max_health,
+                max_health,
+                completed_construction: false,
+            },
+        );
 
         let error = state
             .apply_event(&event)
@@ -5756,7 +6341,7 @@ mod tests {
     #[test]
     fn mining_retry_is_idempotent() {
         let mut runtime = runtime();
-        let target = reachable_voxel(&runtime);
+        let target = reachable_voxel(&mut runtime);
         let body_id = voxel_collision_chunk_body_id(voxel_collision_chunk_coordinate(target));
         let collider_id = voxel_collision_collider_id(target);
         assert!(runtime.physics.contains_collider(&body_id, &collider_id));
@@ -5802,26 +6387,12 @@ mod tests {
                     f64::from(coordinate.y),
                     f64::from(coordinate.z),
                 );
-                primary_position.squared_distance(position) > MINING_RANGE * MINING_RANGE
+                primary_position.squared_distance(position)
+                    > TOOL_SURFACE_RANGE_M * TOOL_SURFACE_RANGE_M
+                    && exposed_voxel_face(&runtime.state.voxels, *coordinate).is_some()
             })
             .expect("asteroid has a voxel outside primary mining range");
-        let target_position = Vec3::new(
-            f64::from(target.x),
-            f64::from(target.y),
-            f64::from(target.z),
-        );
-        let remote = runtime
-            .state
-            .player
-            .get_mut("player-remote")
-            .expect("remote player exists");
-        remote.position = target_position + Vec3::new(0.0, 3.0, 0.0);
-        remote.linear_velocity = Vec3::ZERO;
-        remote.angular_velocity = Vec3::ZERO;
-        runtime
-            .physics
-            .rebuild(&physics_body_specs(&runtime.state))
-            .expect("remote mining fixture physics builds");
+        aim_player_at_voxel(&mut runtime, "player-remote", target);
         runtime
             .persist_snapshot()
             .expect("remote mining baseline persists");
@@ -6018,7 +6589,7 @@ mod tests {
             &mut runtime,
             "remote-mine-out-of-range",
             out_of_range_target,
-            "voxel_out_of_range",
+            "voxel_not_targeted",
         );
 
         let reachable_target = *runtime
@@ -6076,20 +6647,11 @@ mod tests {
                     f64::from(coordinate.x),
                     f64::from(coordinate.y),
                     f64::from(coordinate.z),
-                )) > MINING_RANGE * MINING_RANGE
+                )) > TOOL_SURFACE_RANGE_M * TOOL_SURFACE_RANGE_M
+                    && exposed_voxel_face(&runtime.state.voxels, *coordinate).is_some()
             })
             .expect("asteroid has a fixture voxel outside primary mining range");
-        let target_position = Vec3::new(
-            f64::from(target.x),
-            f64::from(target.y),
-            f64::from(target.z),
-        );
-        runtime
-            .state
-            .player
-            .get_mut("player-remote")
-            .expect("remote player exists")
-            .position = target_position + Vec3::new(0.0, 3.0, 0.0);
+        aim_player_at_voxel(&mut runtime, "player-remote", target);
         let canonical_event = runtime
             .state()
             .prepare_client_event_as(
@@ -6136,7 +6698,7 @@ mod tests {
         };
         inventory_id.clone_from(&primary_inventory_id);
         event.event_hash = event.calculate_hash();
-        assert_replay_rejected_without_mutation(&event, "replay_mining_range_invalid");
+        assert_replay_rejected_without_mutation(&event, "replay_mining_target_invalid");
 
         let mut event = canonical_event;
         let EventPayload::VoxelMined { ore_yield, .. } = &mut event.payload else {
@@ -6216,9 +6778,10 @@ mod tests {
             .copied()
             .find(|coordinate| {
                 let chunk = voxel_collision_chunk_coordinate(*coordinate);
-                state.voxels.occupied.iter().any(|other| {
-                    *other != *coordinate && voxel_collision_chunk_coordinate(*other) == chunk
-                })
+                exposed_voxel_face(&state.voxels, *coordinate).is_some()
+                    && state.voxels.occupied.iter().any(|other| {
+                        *other != *coordinate && voxel_collision_chunk_coordinate(*other) == chunk
+                    })
             })
             .expect("target has a surviving chunk neighbor");
         let survivor = state
@@ -6232,10 +6795,16 @@ mod tests {
                         == voxel_collision_chunk_coordinate(target)
             })
             .expect("surviving collider exists");
-        state.player.position = Vec3::new(
+        let target_position = Vec3::new(
             f64::from(target.x),
             f64::from(target.y),
             f64::from(target.z),
+        );
+        let face = exposed_voxel_face(&state.voxels, target).unwrap();
+        aim_player_from_face(
+            state.player.primary_mut(),
+            target_position,
+            Vec3::new(f64::from(face.x), f64::from(face.y), f64::from(face.z)),
         );
         let body_id = voxel_collision_chunk_body_id(voxel_collision_chunk_coordinate(target));
         let collider_id = voxel_collision_collider_id(target);
@@ -6333,6 +6902,8 @@ mod tests {
             .cloned()
             .expect("surviving pair is active");
 
+        aim_player_at_voxel(&mut runtime, "player-local", target);
+
         runtime
             .execute(&ClientMessage::MineVoxel {
                 operation_id: "mine-one-contact-leaf".into(),
@@ -6402,7 +6973,7 @@ mod tests {
                 ferrite_ore: BTreeSet::new(),
             },
         );
-        runtime.state.player.position = Vec3::new(0.0, 0.0, 3.0);
+        aim_player_at_voxel(&mut runtime, "player-local", target);
         runtime.persist_snapshot().expect("player pose persists");
         assert!(runtime.state().grids["anchored-grid"].anchor_touches(&runtime.state().voxels));
         let before_hash = runtime.state().state_hash();
@@ -8718,6 +9289,8 @@ mod tests {
             assert!(original.construction_complete);
             assert_eq!(runtime.state().player.career.blocks_built, 0);
 
+            aim_player_at_block(&mut runtime, STARTER_GRID_ID, &block_id);
+
             runtime
                 .execute(&ClientMessage::DamageBlock {
                     operation_id: "damage-completed-armor".into(),
@@ -8743,6 +9316,7 @@ mod tests {
             while runtime.state().grids[STARTER_GRID_ID].blocks[&block_id].health
                 < original.max_health()
             {
+                aim_player_at_block(&mut runtime, STARTER_GRID_ID, &block_id);
                 runtime
                     .execute(&ClientMessage::WeldBlock {
                         operation_id: format!("repair-completed-armor-{weld_index}"),
@@ -8783,7 +9357,7 @@ mod tests {
         assert!(matches!(
             remote,
             Err(RuntimeError::Intent(IntentError::Rejected { ref code, .. }))
-                if code == "block_out_of_range"
+                if code == "build_face_not_targeted"
         ));
         move_player_near_grid(&mut runtime);
         let candidate = IVec3::new(0, 1, 0);
@@ -8819,8 +9393,9 @@ mod tests {
 
     #[test]
     fn construction_replay_rejects_a_frame_around_the_player_before_mutation() {
-        let mut state = runtime().state().clone();
-        state.player.position = Vec3::new(10.0, 1.0, 3.0);
+        let mut runtime = runtime();
+        move_player_near_grid(&mut runtime);
+        let mut state = runtime.state().clone();
         let coordinate = IVec3::new(0, 1, 0);
         let canonical = state
             .prepare_client_event(&ClientMessage::BuildBlock {
@@ -8843,12 +9418,13 @@ mod tests {
     #[test]
     fn unfinished_anchor_cannot_lock_the_grid() {
         let mut runtime = runtime();
-        move_player_near_grid(&mut runtime);
+        let anchor_coordinate = IVec3::new(-2, 1, -1);
+        aim_player_for_build(&mut runtime, STARTER_GRID_ID, anchor_coordinate);
         runtime
             .execute(&ClientMessage::BuildBlock {
                 operation_id: "place-anchor-frame".into(),
                 grid_id: STARTER_GRID_ID.into(),
-                coordinate: IVec3::new(-2, 0, 0),
+                coordinate: anchor_coordinate,
                 kind: BlockKind::Anchor,
                 orientation: 3,
             })
@@ -8862,7 +9438,7 @@ mod tests {
             Err(RuntimeError::Intent(IntentError::Rejected { ref code, .. }))
                 if code == "anchor_not_touching_voxel"
         ));
-        weld_to_completion(&mut runtime, IVec3::new(-2, 0, 0), "weld-anchor");
+        weld_to_completion(&mut runtime, anchor_coordinate, "weld-anchor");
         runtime
             .execute(&ClientMessage::ToggleGridAnchor {
                 operation_id: "engage-complete-anchor".into(),
@@ -9770,7 +10346,13 @@ mod tests {
         let hit_count = runtime.state.grids[STARTER_GRID_ID].blocks[&support.collider_id]
             .health
             .div_ceil(35);
+        let supported_player = runtime.state.player.primary().clone();
         for index in 0..hit_count {
+            aim_player_at_block_preserving_locomotion(
+                &mut runtime,
+                STARTER_GRID_ID,
+                &support.collider_id,
+            );
             runtime
                 .execute(&ClientMessage::DamageBlock {
                     operation_id: format!("destroy-magnetic-support-{index}"),
@@ -9778,6 +10360,7 @@ mod tests {
                     block_id: support.collider_id.clone(),
                 })
                 .expect("support damage commits");
+            restore_player_pose_after_tool_fixture(&mut runtime, &supported_player);
         }
         assert!(!runtime.state.grids.values().any(|grid| {
             grid.blocks
@@ -9853,7 +10436,9 @@ mod tests {
         let position_before_split = runtime.state.player.position;
 
         let bridge_health = runtime.state.grids["split-grid"].blocks["split-bridge"].health;
+        let supported_player = runtime.state.player.primary().clone();
         for index in 0..bridge_health.div_ceil(35) {
+            aim_player_at_block_preserving_locomotion(&mut runtime, "split-grid", "split-bridge");
             runtime
                 .execute(&ClientMessage::DamageBlock {
                     operation_id: format!("split-support-bridge-{index}"),
@@ -9861,6 +10446,7 @@ mod tests {
                     block_id: "split-bridge".into(),
                 })
                 .expect("bridge damage commits");
+            restore_player_pose_after_tool_fixture(&mut runtime, &supported_player);
         }
         let split_grid_id = runtime
             .state
@@ -10189,7 +10775,10 @@ mod tests {
         {
             let mut runtime =
                 Runtime::open(before_directory.path(), 109, 100).expect("runtime opens");
-            before_target = reachable_voxel(&runtime);
+            before_target = reachable_voxel(&mut runtime);
+            runtime
+                .persist_snapshot()
+                .expect("aimed mining baseline persists");
             let body_id =
                 voxel_collision_chunk_body_id(voxel_collision_chunk_coordinate(before_target));
             let collider_id = voxel_collision_collider_id(before_target);
@@ -10231,7 +10820,10 @@ mod tests {
         {
             let mut runtime =
                 Runtime::open(after_directory.path(), 113, 100).expect("runtime opens");
-            after_target = reachable_voxel(&runtime);
+            after_target = reachable_voxel(&mut runtime);
+            runtime
+                .persist_snapshot()
+                .expect("aimed mining baseline persists");
             let body_id =
                 voxel_collision_chunk_body_id(voxel_collision_chunk_coordinate(after_target));
             let collider_id = voxel_collision_collider_id(after_target);
@@ -10307,6 +10899,7 @@ mod tests {
             .block_id
             .clone();
         for index in 0..2 {
+            aim_player_at_block(&mut runtime, STARTER_GRID_ID, &bridge_id);
             runtime
                 .execute(&ClientMessage::DamageBlock {
                     operation_id: format!("damage-{index}"),
