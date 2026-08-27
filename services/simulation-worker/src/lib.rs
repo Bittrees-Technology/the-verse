@@ -748,6 +748,7 @@ mod tests {
     use tokio_tungstenite::tungstenite::Message as ClientWebSocketMessage;
     use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
     use tower::ServiceExt;
+    use verse_protocol::{BlockKind, ResourceKind, Vec3};
 
     use super::*;
 
@@ -819,6 +820,30 @@ mod tests {
             ))
             .await
             .expect("client message sends");
+    }
+
+    async fn assert_intent_rejected(
+        socket: &mut TestSocket,
+        intent: ClientMessage,
+        expected_code: &str,
+    ) {
+        let operation_id = intent
+            .operation_id()
+            .expect("test mutation has an operation ID")
+            .to_owned();
+        send_client_message(socket, &intent).await;
+        let response = receive_server_message(socket).await;
+        assert!(
+            matches!(
+                &response,
+            ServerMessage::IntentRejected {
+                operation_id: Some(candidate),
+                code,
+                ..
+            } if candidate == &operation_id && code == expected_code
+            ),
+            "{operation_id} must fail closed with {expected_code}; received {response:?}"
+        );
     }
 
     fn player_hello(client_name: &str, player_id: &str) -> ClientMessage {
@@ -1346,6 +1371,131 @@ mod tests {
         assert_eq!(local_final.world_hash, shared.world_hash);
 
         local.close(None).await.expect("local socket closes");
+        remote.close(None).await.expect("remote socket closes");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn remote_socket_cannot_operate_another_players_industry_or_grid() {
+        let (mut remote, state, server) = connect_test_socket().await;
+        send_client_message(
+            &mut remote,
+            &player_hello("remote-authority-test", "player-remote"),
+        )
+        .await;
+        assert!(matches!(
+            receive_server_message(&mut remote).await,
+            ServerMessage::Welcome {
+                session_role: SessionRole::Player { ref player_id },
+                ..
+            } if player_id == "player-remote"
+        ));
+        let ServerMessage::Snapshot { snapshot } = receive_server_message(&mut remote).await else {
+            panic!("remote player receives the canonical initial snapshot");
+        };
+        let before = *snapshot;
+        let primary = before
+            .players
+            .iter()
+            .find(|player| player.player_id == "player-local")
+            .expect("primary actor is present");
+        let remote_player = before
+            .players
+            .iter()
+            .find(|player| player.player_id == "player-remote")
+            .expect("remote actor is present");
+        let starter_grid = before.grids.first().expect("starter grid is present");
+        assert_eq!(starter_grid.owner_player_id, "player-local");
+        let starter_block = starter_grid
+            .blocks
+            .first()
+            .expect("starter block is present");
+        let cargo_inventory_id = starter_grid
+            .blocks
+            .iter()
+            .find_map(|block| block.inventory_id.as_deref())
+            .expect("starter grid has canonical cargo");
+
+        let denied_inventory_intents = [
+            ClientMessage::RefineOre {
+                operation_id: "deny-remote-refine-primary".into(),
+                inventory_id: primary.inventory_id.clone(),
+                batches: 1,
+            },
+            ClientMessage::CraftComponent {
+                operation_id: "deny-remote-craft-primary".into(),
+                inventory_id: primary.inventory_id.clone(),
+                quantity: 1,
+            },
+            ClientMessage::TransferInventory {
+                operation_id: "deny-remote-withdraw-primary".into(),
+                source_inventory_id: primary.inventory_id.clone(),
+                destination_inventory_id: remote_player.inventory_id.clone(),
+                resource: ResourceKind::Component,
+                quantity: 1,
+            },
+            ClientMessage::TransferInventory {
+                operation_id: "deny-remote-deposit-primary".into(),
+                source_inventory_id: remote_player.inventory_id.clone(),
+                destination_inventory_id: primary.inventory_id.clone(),
+                resource: ResourceKind::Ore,
+                quantity: 1,
+            },
+            ClientMessage::TransferInventory {
+                operation_id: "deny-remote-withdraw-cargo".into(),
+                source_inventory_id: cargo_inventory_id.into(),
+                destination_inventory_id: remote_player.inventory_id.clone(),
+                resource: ResourceKind::Component,
+                quantity: 1,
+            },
+            ClientMessage::TransferInventory {
+                operation_id: "deny-remote-deposit-cargo".into(),
+                source_inventory_id: remote_player.inventory_id.clone(),
+                destination_inventory_id: cargo_inventory_id.into(),
+                resource: ResourceKind::Ore,
+                quantity: 1,
+            },
+        ];
+        for intent in denied_inventory_intents {
+            assert_intent_rejected(&mut remote, intent, "inventory_access_denied").await;
+        }
+
+        let denied_grid_intents = [
+            ClientMessage::BuildBlock {
+                operation_id: "deny-remote-build-primary-grid".into(),
+                grid_id: starter_grid.grid_id.clone(),
+                coordinate: starter_block.coordinate,
+                kind: BlockKind::Structural,
+                orientation: 0,
+            },
+            ClientMessage::WeldBlock {
+                operation_id: "deny-remote-weld-primary-grid".into(),
+                grid_id: starter_grid.grid_id.clone(),
+                block_id: starter_block.block_id.clone(),
+            },
+            ClientMessage::SetGridControl {
+                operation_id: "deny-remote-control-primary-grid".into(),
+                grid_id: starter_grid.grid_id.clone(),
+                linear_input: Vec3::ZERO,
+                angular_input: Vec3::ZERO,
+                dampeners: true,
+            },
+            ClientMessage::ToggleGridAnchor {
+                operation_id: "deny-remote-anchor-primary-grid".into(),
+                grid_id: starter_grid.grid_id.clone(),
+            },
+        ];
+        for intent in denied_grid_intents {
+            assert_intent_rejected(&mut remote, intent, "grid_access_denied").await;
+        }
+
+        let after = state.snapshot();
+        assert_eq!(after.event_sequence, before.event_sequence);
+        assert_eq!(after.world_hash, before.world_hash);
+        assert_eq!(after.inventories, before.inventories);
+        assert_eq!(after.grids, before.grids);
+        assert_eq!(after.conservation, before.conservation);
+
         remote.close(None).await.expect("remote socket closes");
         server.abort();
     }

@@ -24,6 +24,7 @@ These documents form the initial specification baseline.
 - [P0.9 Authoritative EVA Physics](gameplay/authoritative-character-motion.md)
 - [P0.10 Authoritative Grounded and Magnetic Locomotion](gameplay/authoritative-grounded-locomotion.md)
 - [P1.0 Authoritative Multi-player Cell](gameplay/authoritative-multiplayer-cell.md)
+- [P1.1 Actor-owned Industry and Engineering](gameplay/actor-owned-industry.md)
 - [Authoritative Hand-tool Targeting](gameplay/authoritative-hand-tool-targeting.md)
 
 ## Research
@@ -38,6 +39,7 @@ These documents form the initial specification baseline.
 - [Data and events](architecture/data-and-events.md)
 - [Clients and public APIs](architecture/clients-and-apis.md)
 - [P1 latest-state replication backpressure](architecture/replication-backpressure.md)
+- [P1 actor authority architecture](architecture/p1-actor-authority.md)
 - [Proposed repository layout](architecture/repository-layout.md)
 
 ## Economy and blockchain

@@ -1,10 +1,10 @@
 # Authoritative multi-player cell
 
-**Status:** P1.0 in progress; session boundary and deterministic roster physics verified
+**Status:** P1.1 local proof verified; public identity, scale, and private projections remain deferred
 
 This checkpoint targets F-012, SIM-011, and SIM-012. It converts the P0.10 single-pilot proof into a shared authoritative cell without claiming production universe scale.
 
-Protocol 11 completes the first trust-boundary increment: authentication precedes the welcome and world snapshot; a socket is bound to an admitted player or to a read-only spectator role; unknown and concurrently claimed players fail closed; and the simulation receives the bound actor separately from the client intent. World schema 14 now persists one canonically ordered player map and actor-scoped operation namespaces. Event schema 10 stores a canonical player actor on human events, explicit target IDs on automatic life-support events, no impersonated actor on system events, and an ordered outcome for every living roster member in the same fixed-step event as all grids. Each capsule has independent control and life-support scheduling and collides with planets, voxels, and grids while character-to-character collision and locomotion-query occlusion are disabled. Full and motion snapshots include the environment evaluated at every player's own position. Mining and hand-tool grid actions reconstruct the bound actor's canonical eye ray and accept only the closest visible voxel, block, or exact build face within nine metres; the same rule is replay-validated before mutation. Unit tests cover roster ownership and kinematics, atomic two-player live stepping and exact restart recovery, per-player idempotency and input frontiers, canonical outcome order, collision-layer/query behavior, actor-isolated oxygen/death/drop/respawn, closest-hit targeting, and rejection of forged character, lifecycle, or tool outcomes. A fresh loopback development worker now pre-admits `player-local` and `player-remote`; separate sockets bind, advance independent control frontiers, mine using only their own pose, aim, inventory, experience, and career state, and operate only their own suit and recovery state. The native client selects its actor and location-specific gravity from welcome metadata and renders the other engineering suit, while the browser merges and displays the complete roster. Secondary-player refining, manufacturing, transfers, construction, and grid actions fail closed until their ownership rules are converted, so F-012 and SIM-012 are not yet complete.
+Protocol 12 completes the P1.1 trust-boundary increment: authentication precedes world state; a socket is bound to an admitted player or read-only spectator; and the simulation receives the bound actor separately from the client intent. World schema 15 persists the ordered player map, actor-scoped operation namespaces, grid owners, owner-retaining drops, and one-time anchor eligibility. Event schema 11 stores the player actor on human work, the inventory consumed by construction, exact anchor reward eligibility, explicit lifecycle targets, and an ordered outcome for every living player and grid. Content schema 9 and manifest `p1.1.0` own the corrected non-repeatable reward schedule. Each capsule has independent control and life-support scheduling. Mining and hand-tool grid actions reconstruct the actor's eye ray and accept only the closest visible voxel, block, or build face within nine metres; preparation and replay also resolve inventory and grid authority before mutation. The fresh development worker pre-admits `player-local` and `player-remote`; the starter grid belongs to the local player and the remote player begins without a grid. Separate sockets operate only their own inventory and constructive capabilities, while non-owner closest-hit damage remains possible and reward-free.
 
 ## Player-visible contract
 
@@ -55,16 +55,18 @@ Only one gameplay session controls a player at a time. A second session receives
 | --- | --- |
 | Character control | Actor movement epoch and actor FIFO |
 | Suit mode / respawn | Actor life and suit state |
-| Mine / build / weld | Closest visible target from actor eye ray; actor must be alive |
-| Refine / craft | Actor must be allowed to operate the addressed inventory |
-| Inventory transfer | Actor must have withdraw permission on source and deposit permission on destination |
-| Grid control / anchor / damage | Explicit grid permission; hand damage also requires the closest visible block; P1.0 development ownership only |
+| Mine | Closest visible target from the living actor's eye ray; yield enters actor inventory |
+| Refine / craft | Actor access to the addressed player or owner-derived cargo inventory |
+| Inventory transfer | Actor access to both source and destination |
+| Build / weld | Grid ownership plus closest visible target from the actor eye ray |
+| Grid control / anchor | Grid ownership; P1.1 permits remote owner control |
+| Damage | Closest visible block; ownership is not required and no experience is awarded |
 
 Generic knowledge of an inventory or grid ID is never authority.
 
 ## Replication and budgets
 
-Protocol 11 initially sends complete deterministic rosters so correctness is inspectable. The worker limits message size, accepted input rate, queued outbound messages, and consecutive lag recoveries. A client that cannot consume within budget is disconnected and must resume from a new snapshot. The next transport slice introduces spatial interest sets and binary deltas without changing canonical state.
+Protocol 12 initially sends complete deterministic rosters and inventories so correctness is inspectable. This is not a private-inventory projection. The worker limits message size, accepted input rate, and retained state. A later transport must provide actor-specific private projections, spatial interest sets, and binary deltas without changing canonical state.
 
 The serialized P0.10 Linux baseline measured a 0.0298 ms median three-cast grounded query set but a 29.8 ms worst-path naive loop for 1,000 characters. Therefore P1.0 must publish 2, 8, 16, 32, and 64 active-player distributions and set a conservative cell budget; thousands of universe participants require multiple cells and reduced-frequency/background modes.
 
@@ -74,6 +76,8 @@ The serialized P0.10 Linux baseline measured a 0.0298 ms median three-cast groun
 - The same operation ID can succeed once for each player but duplicate only within that player's namespace.
 - Cross-player control and inventory attempts fail without changing event sequence or world hash.
 - Shared mining removes one voxel once and credits only the accepted actor.
+- Non-owner production, transfer, construction, welding, grid control, and anchoring fail closed.
+- A non-owner can damage a closest-visible block without receiving experience or ownership.
 - Disconnect/reconnect, snapshot recovery, and event replay preserve both players exactly.
 - The native client identifies the local actor from connection metadata and renders at least one remote actor.
 - Automated two-client impairment tests cover delay, duplication, reordering, lag recovery, and stale epochs.
@@ -93,4 +97,10 @@ and proves that an intentionally occluded damage request cannot mutate state.
 
 ## Not yet included
 
-This checkpoint does not claim interest-managed scale, cell transfer, public passkey authentication, PvP hit validation, teams, company permissions, capital safety, offline turret behavior, cleanup scheduling, or browser gameplay.
+Refining and crafting remain immediate recipe proofs without machines, power,
+queues, duration, or conveyor paths. Grid control is owner-authorized remotely
+without a cockpit, terminal, or signal system. Complete snapshots expose the
+proof cell's inventories and do not claim confidentiality. This checkpoint
+also excludes interest-managed scale, cell transfer, public passkey
+authentication, teams, company permissions, capital safe-zone enforcement,
+offline turret behavior, cleanup scheduling, and browser gameplay.
