@@ -39,18 +39,19 @@ use joltc_sys::{
 use rolt::{
     Body as RoltBody, BodyFilter, BodyFilterImpl, BodyId as RoltBodyId, BroadPhaseLayer,
     BroadPhaseLayerInterface, CastShapeArgs, CastShapeCollectorImpl, ClosestHitCastShapeCollector,
-    ObjectLayer, ObjectLayerPairFilter, ObjectVsBroadPhaseLayerFilter, PhysicsSystem, RShapeCast,
-    RVec3 as RoltRVec3, Vec3 as RoltVec3,
+    ObjectLayer, ObjectLayerFilter, ObjectLayerFilterImpl, ObjectLayerPairFilter,
+    ObjectVsBroadPhaseLayerFilter, PhysicsSystem, RShapeCast, RVec3 as RoltRVec3, Vec3 as RoltVec3,
 };
 
 use crate::{
-    BodyControl, BodyMotion, BodySpec, BodyState, BoxColliderSpec, CapsuleCast, CapsuleCastHit,
-    CapsuleColliderSpec, ContactInvariant, ContactPhase, ContactRecord, ContactSource,
-    MotionQuality, PhysicsError, Pose, Quat, SceneConfig, SphereColliderSpec, Vec3,
+    BodyCollisionClass, BodyControl, BodyMotion, BodySpec, BodyState, BoxColliderSpec, CapsuleCast,
+    CapsuleCastHit, CapsuleColliderSpec, ContactInvariant, ContactPhase, ContactRecord,
+    ContactSource, MotionQuality, PhysicsError, Pose, Quat, SceneConfig, SphereColliderSpec, Vec3,
 };
 
 const OBJECT_LAYER_STATIC: u16 = 0;
 const OBJECT_LAYER_DYNAMIC: u16 = 1;
+const OBJECT_LAYER_CHARACTER: u16 = 2;
 const BROAD_PHASE_STATIC: u8 = 0;
 const BROAD_PHASE_DYNAMIC: u8 = 1;
 
@@ -64,7 +65,9 @@ impl BroadPhaseLayerInterface for Layers {
 
     fn get_broad_phase_layer(&self, layer: ObjectLayer) -> BroadPhaseLayer {
         match layer.raw() {
-            OBJECT_LAYER_DYNAMIC => BroadPhaseLayer::new(BROAD_PHASE_DYNAMIC),
+            OBJECT_LAYER_DYNAMIC | OBJECT_LAYER_CHARACTER => {
+                BroadPhaseLayer::new(BROAD_PHASE_DYNAMIC)
+            }
             _ => BroadPhaseLayer::new(BROAD_PHASE_STATIC),
         }
     }
@@ -77,7 +80,7 @@ impl ObjectVsBroadPhaseLayerFilter for ObjectVsBroadPhase {
     fn should_collide(&self, object: ObjectLayer, broad_phase: BroadPhaseLayer) -> bool {
         match object.raw() {
             OBJECT_LAYER_STATIC => broad_phase.raw() == BROAD_PHASE_DYNAMIC,
-            OBJECT_LAYER_DYNAMIC => true,
+            OBJECT_LAYER_DYNAMIC | OBJECT_LAYER_CHARACTER => true,
             _ => false,
         }
     }
@@ -89,12 +92,31 @@ struct ObjectPairs;
 impl ObjectLayerPairFilter for ObjectPairs {
     fn should_collide(&self, left: ObjectLayer, right: ObjectLayer) -> bool {
         match left.raw() {
-            OBJECT_LAYER_STATIC => right.raw() == OBJECT_LAYER_DYNAMIC,
+            OBJECT_LAYER_STATIC => {
+                matches!(right.raw(), OBJECT_LAYER_DYNAMIC | OBJECT_LAYER_CHARACTER)
+            }
             OBJECT_LAYER_DYNAMIC => {
+                matches!(
+                    right.raw(),
+                    OBJECT_LAYER_STATIC | OBJECT_LAYER_DYNAMIC | OBJECT_LAYER_CHARACTER
+                )
+            }
+            OBJECT_LAYER_CHARACTER => {
                 matches!(right.raw(), OBJECT_LAYER_STATIC | OBJECT_LAYER_DYNAMIC)
             }
             _ => false,
         }
+    }
+}
+
+#[derive(Debug)]
+struct QueryObjectLayers {
+    query_layer: ObjectLayer,
+}
+
+impl ObjectLayerFilter for QueryObjectLayers {
+    fn should_collide(&self, candidate_layer: ObjectLayer) -> bool {
+        ObjectPairs.should_collide(self.query_layer, candidate_layer)
     }
 }
 
@@ -663,9 +685,10 @@ impl NativeScene {
             Rotation: quat(spec.pose.rotation),
             LinearVelocity: local_vec3(spec.linear_velocity),
             AngularVelocity: local_vec3(spec.angular_velocity),
-            ObjectLayer: match spec.motion {
-                BodyMotion::Static => OBJECT_LAYER_STATIC,
-                BodyMotion::Dynamic => OBJECT_LAYER_DYNAMIC,
+            ObjectLayer: match (spec.motion, spec.collision_class) {
+                (BodyMotion::Static, _) => OBJECT_LAYER_STATIC,
+                (BodyMotion::Dynamic, BodyCollisionClass::Default) => OBJECT_LAYER_DYNAMIC,
+                (BodyMotion::Dynamic, BodyCollisionClass::Character) => OBJECT_LAYER_CHARACTER,
             },
             MotionType: match spec.motion {
                 BodyMotion::Static => JPC_MOTION_TYPE_STATIC,
@@ -967,6 +990,12 @@ impl NativeScene {
             .map(BodyFilterImpl::new);
         let base_offset = query.pose.position;
         let mut collector = ClosestHitCastShapeCollector::new();
+        let mut object_layer_filter = QueryObjectLayers {
+            query_layer: match query.collision_class {
+                BodyCollisionClass::Default => ObjectLayer::new(OBJECT_LAYER_DYNAMIC),
+                BodyCollisionClass::Character => ObjectLayer::new(OBJECT_LAYER_CHARACTER),
+            },
+        };
         let physics = self
             .physics
             .as_ref()
@@ -995,7 +1024,9 @@ impl NativeScene {
                 settings,
                 collector: Some(CastShapeCollectorImpl::new_borrowed(&mut collector)),
                 broad_phase_layer_filter: None,
-                object_layer_filter: None,
+                object_layer_filter: Some(ObjectLayerFilterImpl::new_borrowed(
+                    &mut object_layer_filter,
+                )),
                 body_filter: ignored,
                 shape_filter: None,
             });

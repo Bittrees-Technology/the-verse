@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::ops::{Deref, DerefMut};
 
 use serde::{Deserialize, Serialize};
 use verse_protocol::{
@@ -13,7 +14,7 @@ use verse_protocol::{
 
 use crate::content;
 
-pub const WORLD_SCHEMA_VERSION: u32 = 13;
+pub const WORLD_SCHEMA_VERSION: u32 = 14;
 pub const PLAYER_INVENTORY_ID: &str = "inventory-player-local";
 pub const STARTER_GRID_ID: &str = "grid-starter";
 pub const PLANET_CENTER: Vec3 = Vec3::new(900.0, -2_200.0, -3_800.0);
@@ -189,6 +190,80 @@ pub struct Player {
     pub life_state: PlayerLifeState,
 }
 
+/// Canonically ordered player ownership. Dereferencing intentionally exposes
+/// the primary P0 pilot while P1 systems migrate one subsystem at a time to
+/// explicit actor lookup; serialized state already has one roster source of
+/// truth and cannot duplicate the primary player.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlayerRoster {
+    pub primary_player_id: String,
+    pub by_id: BTreeMap<String, Player>,
+}
+
+impl PlayerRoster {
+    pub fn from_primary(player: Player) -> Self {
+        let primary_player_id = player.player_id.clone();
+        Self {
+            primary_player_id: primary_player_id.clone(),
+            by_id: BTreeMap::from([(primary_player_id, player)]),
+        }
+    }
+
+    pub fn get(&self, player_id: &str) -> Option<&Player> {
+        self.by_id.get(player_id)
+    }
+
+    pub fn get_mut(&mut self, player_id: &str) -> Option<&mut Player> {
+        self.by_id.get_mut(player_id)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &Player)> {
+        self.by_id.iter()
+    }
+
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.primary_player_id.trim().is_empty()
+            || !self.by_id.contains_key(&self.primary_player_id)
+        {
+            return Err("player roster must identify one present primary player");
+        }
+        if self
+            .by_id
+            .iter()
+            .any(|(player_id, player)| player_id != &player.player_id)
+        {
+            return Err("player roster keys must match canonical player IDs");
+        }
+        Ok(())
+    }
+
+    pub fn primary(&self) -> &Player {
+        self.by_id
+            .get(&self.primary_player_id)
+            .expect("canonical player roster contains its primary player")
+    }
+
+    pub fn primary_mut(&mut self) -> &mut Player {
+        self.by_id
+            .get_mut(&self.primary_player_id)
+            .expect("canonical player roster contains its primary player")
+    }
+}
+
+impl Deref for PlayerRoster {
+    type Target = Player;
+
+    fn deref(&self) -> &Self::Target {
+        self.primary()
+    }
+}
+
+impl DerefMut for PlayerRoster {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.primary_mut()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct PlayerControlFrame {
@@ -214,6 +289,60 @@ impl Player {
 
     pub fn next_level_experience(&self) -> u64 {
         (1..=self.level()).map(|level| u64::from(level) * 100).sum()
+    }
+
+    fn snapshot(&self) -> PlayerSnapshot {
+        PlayerSnapshot {
+            player_id: self.player_id.clone(),
+            position: self.position,
+            orientation: self.orientation,
+            linear_velocity: self.linear_velocity,
+            angular_velocity: self.angular_velocity,
+            surface_contact: self.surface_contact,
+            locomotion: self.locomotion.clone(),
+            movement_epoch: self.movement_epoch,
+            last_received_input_sequence: self.last_received_input_sequence,
+            last_processed_input_sequence: self.last_processed_input_sequence,
+            control_linear_input: self.control_linear_input,
+            control_angular_input: self.control_angular_input,
+            boost: self.boost,
+            dampeners: self.dampeners,
+            jump: self.jump,
+            control_expires_at_simulation_tick: self.control_expires_at_simulation_tick,
+            inventory_id: self.inventory_id.clone(),
+            experience: self.experience,
+            level: self.level(),
+            next_level_experience: self.next_level_experience(),
+            career: self.career.clone(),
+            suit_oxygen_milli: self.suit_oxygen_milli,
+            helmet_closed: self.helmet_closed,
+            jetpack_enabled: self.jetpack_enabled,
+            life_state: self.life_state.clone(),
+            critical_oxygen_milli: content::manifest().survival.critical_oxygen_milli,
+        }
+    }
+
+    fn motion_snapshot(&self) -> PlayerMotionSnapshot {
+        PlayerMotionSnapshot {
+            player_id: self.player_id.clone(),
+            position: self.position,
+            orientation: self.orientation,
+            linear_velocity: self.linear_velocity,
+            angular_velocity: self.angular_velocity,
+            surface_contact: self.surface_contact,
+            locomotion: self.locomotion.clone(),
+            movement_epoch: self.movement_epoch,
+            last_received_input_sequence: self.last_received_input_sequence,
+            last_processed_input_sequence: self.last_processed_input_sequence,
+            control_linear_input: self.control_linear_input,
+            control_angular_input: self.control_angular_input,
+            boost: self.boost,
+            dampeners: self.dampeners,
+            jump: self.jump,
+            control_expires_at_simulation_tick: self.control_expires_at_simulation_tick,
+            jetpack_enabled: self.jetpack_enabled,
+            life_state: self.life_state.clone(),
+        }
     }
 }
 
@@ -458,7 +587,8 @@ pub struct WorldState {
     pub active_contact_pairs: BTreeSet<ContactPairKey>,
     pub fencing_token: u64,
     pub last_event_hash: String,
-    pub player: Player,
+    #[serde(rename = "players")]
+    pub player: PlayerRoster,
     pub voxels: VoxelField,
     pub grids: BTreeMap<String, Grid>,
     pub inventories: BTreeMap<String, InventoryRecord>,
@@ -468,6 +598,72 @@ pub struct WorldState {
 }
 
 impl WorldState {
+    pub fn validate_player_roster(&self) -> Result<(), String> {
+        self.player.validate().map_err(str::to_owned)?;
+        let mut inventory_ids = BTreeSet::new();
+        let finite_vec =
+            |value: Vec3| value.x.is_finite() && value.y.is_finite() && value.z.is_finite();
+        for (player_id, player) in self.player.iter() {
+            if player_id.is_empty()
+                || player_id.len() > 128
+                || !player_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+            {
+                return Err(
+                    "player IDs must be 1-128 ASCII letters, numbers, dots, hyphens, or underscores"
+                        .into(),
+                );
+            }
+            if self.grids.contains_key(&format!("player-body-{player_id}")) {
+                return Err("a player physics body ID collides with a canonical grid ID".into());
+            }
+            let orientation_length_squared = f64::from(player.orientation.x).mul_add(
+                f64::from(player.orientation.x),
+                f64::from(player.orientation.y).mul_add(
+                    f64::from(player.orientation.y),
+                    f64::from(player.orientation.z).mul_add(
+                        f64::from(player.orientation.z),
+                        f64::from(player.orientation.w) * f64::from(player.orientation.w),
+                    ),
+                ),
+            );
+            if !finite_vec(player.position)
+                || !finite_vec(player.linear_velocity)
+                || !finite_vec(player.angular_velocity)
+                || !player.orientation.is_finite()
+                || (orientation_length_squared - 1.0).abs() > 1.0e-3
+                || !finite_vec(player.locomotion.up)
+                || !player.locomotion.view_pitch_radians.is_finite()
+            {
+                return Err(
+                    "player kinematics and locomotion must be finite and normalized".into(),
+                );
+            }
+            if !inventory_ids.insert(player.inventory_id.as_str()) {
+                return Err("each player must own a unique carried inventory".into());
+            }
+            let inventory = self
+                .inventories
+                .get(&player.inventory_id)
+                .ok_or_else(|| "each player inventory must exist in canonical state".to_owned())?;
+            if inventory.inventory_id != player.inventory_id
+                || inventory.domain
+                    != (InventoryDomain::Player {
+                        player_id: player_id.clone(),
+                    })
+                || inventory.capacity_liters == 0
+                || inventory.used_liters() > inventory.capacity_liters
+            {
+                return Err(
+                    "each player inventory must have matching identity, ownership, and capacity"
+                        .into(),
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub fn genesis(seed: u64) -> Self {
         let player_position = Vec3::new(12.0, 4.5, 10.0);
         let player_inventory = InventoryRecord {
@@ -565,7 +761,7 @@ impl WorldState {
             active_contact_pairs: BTreeSet::new(),
             fencing_token: 0,
             last_event_hash: String::new(),
-            player: Player {
+            player: PlayerRoster::from_primary(Player {
                 player_id: "player-local".into(),
                 position: player_position,
                 orientation: Quat::IDENTITY,
@@ -600,7 +796,7 @@ impl WorldState {
                 helmet_closed: true,
                 jetpack_enabled: true,
                 life_state: PlayerLifeState::Alive,
-            },
+            }),
             voxels: VoxelField::procedural_asteroid(seed, 8),
             grids: BTreeMap::from([(STARTER_GRID_ID.into(), grid)]),
             inventories: BTreeMap::from([
@@ -739,34 +935,12 @@ impl WorldState {
             simulation_tick: self.simulation_tick,
             fencing_token: self.fencing_token,
             world_hash: self.state_hash(),
-            player: PlayerSnapshot {
-                player_id: self.player.player_id.clone(),
-                position: self.player.position,
-                orientation: self.player.orientation,
-                linear_velocity: self.player.linear_velocity,
-                angular_velocity: self.player.angular_velocity,
-                surface_contact: self.player.surface_contact,
-                locomotion: self.player.locomotion.clone(),
-                movement_epoch: self.player.movement_epoch,
-                last_received_input_sequence: self.player.last_received_input_sequence,
-                last_processed_input_sequence: self.player.last_processed_input_sequence,
-                control_linear_input: self.player.control_linear_input,
-                control_angular_input: self.player.control_angular_input,
-                boost: self.player.boost,
-                dampeners: self.player.dampeners,
-                jump: self.player.jump,
-                control_expires_at_simulation_tick: self.player.control_expires_at_simulation_tick,
-                inventory_id: self.player.inventory_id.clone(),
-                experience: self.player.experience,
-                level: self.player.level(),
-                next_level_experience: self.player.next_level_experience(),
-                career: self.player.career.clone(),
-                suit_oxygen_milli: self.player.suit_oxygen_milli,
-                helmet_closed: self.player.helmet_closed,
-                jetpack_enabled: self.player.jetpack_enabled,
-                life_state: self.player.life_state.clone(),
-                critical_oxygen_milli: content::manifest().survival.critical_oxygen_milli,
-            },
+            player: self.player.snapshot(),
+            players: self
+                .player
+                .iter()
+                .map(|(_, player)| player.snapshot())
+                .collect(),
             environment: self.environment_at(self.player.position),
             voxels: self.voxels.snapshot(),
             grids,
@@ -804,26 +978,12 @@ impl WorldState {
             event_sequence: self.event_sequence,
             simulation_tick: self.simulation_tick,
             world_hash: self.state_hash(),
-            player: PlayerMotionSnapshot {
-                player_id: self.player.player_id.clone(),
-                position: self.player.position,
-                orientation: self.player.orientation,
-                linear_velocity: self.player.linear_velocity,
-                angular_velocity: self.player.angular_velocity,
-                surface_contact: self.player.surface_contact,
-                locomotion: self.player.locomotion.clone(),
-                movement_epoch: self.player.movement_epoch,
-                last_received_input_sequence: self.player.last_received_input_sequence,
-                last_processed_input_sequence: self.player.last_processed_input_sequence,
-                control_linear_input: self.player.control_linear_input,
-                control_angular_input: self.player.control_angular_input,
-                boost: self.player.boost,
-                dampeners: self.player.dampeners,
-                jump: self.player.jump,
-                control_expires_at_simulation_tick: self.player.control_expires_at_simulation_tick,
-                jetpack_enabled: self.player.jetpack_enabled,
-                life_state: self.player.life_state.clone(),
-            },
+            player: self.player.motion_snapshot(),
+            players: self
+                .player
+                .iter()
+                .map(|(_, player)| player.motion_snapshot())
+                .collect(),
             grids: self
                 .grids
                 .values()
@@ -949,5 +1109,13 @@ mod tests {
         assert!(world.grids[STARTER_GRID_ID].power().online);
         assert!(world.voxels.occupied.len() > 1_000);
         assert!(world.voxels.occupied.contains(&IVec3::new(8, 0, 0)));
+        assert!(world.player.validate().is_ok());
+        assert_eq!(world.player.iter().count(), 1);
+        let snapshot = world.snapshot();
+        assert_eq!(snapshot.players.len(), 1);
+        assert_eq!(snapshot.players[0], snapshot.player);
+        let persisted = serde_json::to_value(&world).expect("world serializes");
+        assert!(persisted.get("players").is_some());
+        assert!(persisted.get("player").is_none());
     }
 }

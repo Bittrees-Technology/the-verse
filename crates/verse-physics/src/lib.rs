@@ -103,6 +103,7 @@ impl SphereColliderSpec {
 pub struct BodySpec {
     pub body_id: String,
     pub motion: BodyMotion,
+    pub collision_class: BodyCollisionClass,
     pub pose: Pose,
     pub linear_velocity: Vec3,
     pub angular_velocity: Vec3,
@@ -120,6 +121,15 @@ pub struct BodySpec {
     pub capsule_colliders: Vec<CapsuleColliderSpec>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BodyCollisionClass {
+    #[default]
+    Default,
+    /// Dynamic character bodies collide with world geometry but not with one
+    /// another until player pushing and griefing rules are specified.
+    Character,
+}
+
 impl BodySpec {
     pub fn dynamic(
         body_id: impl Into<String>,
@@ -129,6 +139,7 @@ impl BodySpec {
         Self {
             body_id: body_id.into(),
             motion: BodyMotion::Dynamic,
+            collision_class: BodyCollisionClass::Default,
             pose,
             linear_velocity: Vec3::ZERO,
             angular_velocity: Vec3::ZERO,
@@ -152,6 +163,7 @@ impl BodySpec {
         Self {
             body_id: body_id.into(),
             motion: BodyMotion::Static,
+            collision_class: BodyCollisionClass::Default,
             pose,
             linear_velocity: Vec3::ZERO,
             angular_velocity: Vec3::ZERO,
@@ -192,6 +204,10 @@ pub struct CapsuleCast {
     pub radius: f32,
     pub half_height_of_cylinder: f32,
     pub displacement: Vec3,
+    /// Applies the same object-layer pairing rules as a body of this class.
+    /// Character locomotion queries therefore skip every character while
+    /// retaining world geometry, not merely the querying body.
+    pub collision_class: BodyCollisionClass,
     pub ignore_body_id: Option<String>,
 }
 
@@ -796,6 +812,14 @@ fn validated_specs(
             return Err(PhysicsError::InvalidBody {
                 body_id: body.body_id.clone(),
                 message: "linear-cast motion quality is valid only for dynamic bodies".into(),
+            });
+        }
+        if body.motion == BodyMotion::Static
+            && body.collision_class == BodyCollisionClass::Character
+        {
+            return Err(PhysicsError::InvalidBody {
+                body_id: body.body_id.clone(),
+                message: "character collision class is valid only for dynamic bodies".into(),
             });
         }
         let collider_count = body

@@ -42,6 +42,8 @@ pub enum PersistenceError {
     SnapshotSchema { found: u32, expected: u32 },
     #[error("snapshot content hash is invalid")]
     SnapshotHashMismatch,
+    #[error("snapshot player roster is invalid: {0}")]
+    InvalidPlayerRoster(String),
     #[error("journal line {line} is corrupt: {message}")]
     CorruptJournal { line: usize, message: String },
     #[error(
@@ -215,6 +217,10 @@ impl Store {
                 });
             }
             let snapshot: SnapshotDocument = read_json(&snapshot_path)?;
+            snapshot
+                .state
+                .validate_player_roster()
+                .map_err(PersistenceError::InvalidPlayerRoster)?;
             if snapshot.state_hash != snapshot.state.state_hash()
                 || snapshot.event_sequence != snapshot.state.event_sequence
                 || snapshot.last_event_hash != snapshot.state.last_event_hash
@@ -294,6 +300,9 @@ impl Store {
                     message: source.to_string(),
                 })?;
         }
+        state
+            .validate_player_roster()
+            .map_err(PersistenceError::InvalidPlayerRoster)?;
         Ok(state)
     }
 
@@ -322,6 +331,9 @@ impl Store {
 
     pub fn save_snapshot(&mut self, state: &WorldState) -> Result<(), PersistenceError> {
         self.verify_fencing_token()?;
+        state
+            .validate_player_roster()
+            .map_err(PersistenceError::InvalidPlayerRoster)?;
         let snapshot = SnapshotDocument {
             schema_version: WORLD_SCHEMA_VERSION,
             state_hash: state.state_hash(),
@@ -842,7 +854,8 @@ mod tests {
         let snapshot_path = directory.path().join(SNAPSHOT_FILE);
         let mut snapshot: serde_json::Value =
             read_json(&snapshot_path).expect("snapshot JSON reads");
-        snapshot["state"]["player"]["position"]["x"] = serde_json::json!(999.0);
+        snapshot["state"]["players"]["by_id"]["player-local"]["position"]["x"] =
+            serde_json::json!(999.0);
         fs::write(
             &snapshot_path,
             serde_json::to_vec_pretty(&snapshot).expect("snapshot serializes"),
@@ -853,6 +866,30 @@ mod tests {
             Runtime::open(directory.path(), 31, 100),
             Err(crate::RuntimeError::Persistence(
                 PersistenceError::SnapshotHashMismatch
+            ))
+        ));
+    }
+
+    #[test]
+    fn malformed_player_roster_is_rejected_before_hashing() {
+        let directory = tempdir().expect("tempdir");
+        {
+            let mut runtime = Runtime::open(directory.path(), 48, 100).expect("runtime starts");
+            runtime.persist_snapshot().expect("snapshot persisted");
+        }
+        let snapshot_path = directory.path().join(SNAPSHOT_FILE);
+        let mut snapshot: serde_json::Value = read_json(&snapshot_path).expect("snapshot reads");
+        snapshot["state"]["players"]["primary_player_id"] = serde_json::json!("missing-player");
+        fs::write(
+            &snapshot_path,
+            serde_json::to_vec_pretty(&snapshot).expect("snapshot serializes"),
+        )
+        .expect("malformed roster writes");
+
+        assert!(matches!(
+            Runtime::open(directory.path(), 48, 100),
+            Err(crate::RuntimeError::Persistence(
+                PersistenceError::InvalidPlayerRoster(_)
             ))
         ));
     }
