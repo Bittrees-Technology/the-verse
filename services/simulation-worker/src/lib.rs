@@ -667,6 +667,7 @@ async fn handle_client_message(
             return send_server_message(
                 sender,
                 &ServerMessage::IntentRejected {
+                    operation_sequence: None,
                     operation_id: None,
                     code: "invalid_json".into(),
                     message: source.to_string(),
@@ -704,6 +705,7 @@ async fn handle_client_message(
                 return send_server_message(
                     sender,
                     &ServerMessage::IntentRejected {
+                        operation_sequence: intent.operation_sequence(),
                         operation_id: intent.operation_id().map(str::to_owned),
                         code: "spectator_read_only".into(),
                         message: "spectator sessions cannot submit gameplay mutations".into(),
@@ -724,7 +726,23 @@ async fn handle_client_message(
                     true
                 }
                 Err(RuntimeError::Intent(source)) => {
-                    send_intent_error(sender, intent.operation_id(), source).await
+                    send_intent_error(
+                        sender,
+                        intent.operation_sequence(),
+                        intent.operation_id(),
+                        source,
+                    )
+                    .await
+                }
+                Err(RuntimeError::CanonicalInvariant(source)) => {
+                    error!(%source, "canonical world invariant failed while processing intent");
+                    send_fatal_and_close(
+                        sender,
+                        "canonical_state_invalid",
+                        "authoritative state validation failed; writes are stopped",
+                    )
+                    .await;
+                    false
                 }
                 Err(RuntimeError::Persistence(source)) => {
                     error!(%source, "persistence failure while processing intent");
@@ -762,6 +780,7 @@ async fn handle_client_message(
 
 async fn send_intent_error(
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    operation_sequence: Option<u64>,
     operation_id: Option<&str>,
     source: IntentError,
 ) -> bool {
@@ -769,6 +788,7 @@ async fn send_intent_error(
     send_server_message(
         sender,
         &ServerMessage::IntentRejected {
+            operation_sequence,
             operation_id: operation_id.map(ToOwned::to_owned),
             code: source.code().into(),
             message,
@@ -893,9 +913,9 @@ mod tests {
         for _ in 0..16 {
             let message = receive_server_json(socket).await;
             if forbid_receipt {
-                assert_ne!(
-                    message["type"], "intent_accepted",
-                    "another session must never receive an actor's intent receipt"
+                assert!(
+                    message["type"] != "intent_accepted" && message["type"] != "intent_rejected",
+                    "another session must never receive an actor's intent result: {message}"
                 );
             }
             if message["type"] == expected_type {
@@ -903,6 +923,14 @@ mod tests {
             }
         }
         panic!("expected {expected_type} did not arrive within the bounded queue");
+    }
+
+    async fn assert_no_server_message(socket: &mut TestSocket) {
+        let received = tokio::time::timeout(REPLICATION_PERIOD * 4, socket.next()).await;
+        assert!(
+            received.is_err(),
+            "session unexpectedly received a server message: {received:?}"
+        );
     }
 
     async fn receive_until(
@@ -956,6 +984,7 @@ mod tests {
         assert!(snapshot.get("inventories").is_none());
         assert!(snapshot.get("death_drops").is_none());
         assert!(snapshot.get("conservation").is_none());
+        assert!(snapshot.get("committed_operation_sequence").is_none());
         for player in snapshot["players"]
             .as_array()
             .expect("public player roster")
@@ -968,6 +997,7 @@ mod tests {
                 "movement_epoch",
                 "last_received_input_sequence",
                 "control_linear_input",
+                "committed_operation_sequence",
             ] {
                 assert!(
                     player.get(private_field).is_none(),
@@ -991,6 +1021,7 @@ mod tests {
         match expected_actor {
             None => {
                 assert!(snapshot.get("actor_private").is_none());
+                assert!(!encoded.contains("committed_operation_sequence"));
                 for secret in [
                     "inventory-player-local",
                     "inventory-player-remote",
@@ -1006,6 +1037,7 @@ mod tests {
                     .get("actor_private")
                     .expect("player projection contains actor-private state");
                 assert_eq!(private["player"]["player_id"], player_id);
+                assert!(private["committed_operation_sequence"].is_u64());
                 assert_eq!(
                     private["player"]["inventory_id"],
                     format!("inventory-{player_id}")
@@ -1058,19 +1090,55 @@ mod tests {
             .operation_id()
             .expect("test mutation has an operation ID")
             .to_owned();
+        let operation_sequence = intent
+            .operation_sequence()
+            .expect("test mutation has an operation sequence");
         send_client_message(socket, &intent).await;
-        let response = receive_server_message(socket).await;
+        let response = receive_until(socket, |message| {
+            matches!(
+                message,
+                ServerMessage::IntentRejected {
+                    operation_sequence: Some(candidate_sequence),
+                    operation_id: Some(candidate),
+                    ..
+                } if *candidate_sequence == operation_sequence && candidate == &operation_id
+            )
+        })
+        .await;
         assert!(
             matches!(
                 &response,
             ServerMessage::IntentRejected {
+                operation_sequence: Some(candidate_sequence),
                 operation_id: Some(candidate),
                 code,
                 ..
-            } if candidate == &operation_id && code == expected_code
+            } if *candidate_sequence == operation_sequence
+                && candidate == &operation_id
+                && code == expected_code
             ),
             "{operation_id} must fail closed with {expected_code}; received {response:?}"
         );
+    }
+
+    async fn receive_intent_accepted(
+        socket: &mut TestSocket,
+        operation_sequence: u64,
+        operation_id: &str,
+    ) -> IntentReceipt {
+        let message = receive_until(socket, |message| {
+            matches!(
+                message,
+                ServerMessage::IntentAccepted { receipt }
+                    if receipt.operation_sequence == operation_sequence
+                        && receipt.operation_id == operation_id
+            )
+        })
+        .await;
+        let ServerMessage::IntentAccepted { receipt } = message else {
+            unreachable!("receive_until matched an accepted receipt")
+        };
+        receipt
     }
 
     fn player_hello(client_name: &str, player_id: &str) -> ClientMessage {
@@ -1085,6 +1153,20 @@ mod tests {
 
     fn local_player_hello(client_name: &str) -> ClientMessage {
         player_hello(client_name, "player-local")
+    }
+
+    fn suit_mode_intent(
+        operation_sequence: u64,
+        operation_id: &str,
+        helmet_closed: bool,
+    ) -> ClientMessage {
+        ClientMessage::SetSuitMode {
+            operation_sequence,
+            operation_id: operation_id.into(),
+            helmet_closed,
+            jetpack_enabled: true,
+            magnetic_boots_enabled: false,
+        }
     }
 
     fn actor_player(snapshot: &ProjectedWorldSnapshot) -> &verse_protocol::PlayerSnapshot {
@@ -1133,6 +1215,7 @@ mod tests {
         let mut observer = state.updates.subscribe();
         let player = state.snapshot().player;
         let intent = ClientMessage::SetSuitMode {
+            operation_sequence: 1,
             operation_id: "idempotent-structural-retry".into(),
             helmet_closed: !player.helmet_closed,
             jetpack_enabled: player.jetpack_enabled,
@@ -1240,6 +1323,7 @@ mod tests {
                 .execute_as(
                     "player-local",
                     &ClientMessage::SetPlayerControl {
+                        operation_sequence: input_sequence,
                         operation_id: format!("slow-consumer-burst-{input_sequence}"),
                         movement_epoch: player.movement_epoch,
                         input_sequence,
@@ -1307,6 +1391,7 @@ mod tests {
         send_client_message(
             &mut socket,
             &ClientMessage::SetPlayerControl {
+                operation_sequence: 1,
                 operation_id: "pre-handshake-mutation".into(),
                 movement_epoch: 1,
                 input_sequence: 1,
@@ -1395,6 +1480,7 @@ mod tests {
         send_client_message(
             &mut socket,
             &ClientMessage::SetPlayerControl {
+                operation_sequence: 1,
                 operation_id: "spectator-spoof-1".into(),
                 movement_epoch: 1,
                 input_sequence: 1,
@@ -1528,6 +1614,7 @@ mod tests {
         send_client_message(
             &mut local,
             &ClientMessage::SetPlayerControl {
+                operation_sequence: 1,
                 operation_id: shared_operation_id.into(),
                 movement_epoch: local_player.movement_epoch,
                 input_sequence: 1,
@@ -1552,6 +1639,7 @@ mod tests {
         send_client_message(
             &mut remote,
             &ClientMessage::SetPlayerControl {
+                operation_sequence: 1,
                 operation_id: shared_operation_id.into(),
                 movement_epoch: remote_player.movement_epoch,
                 input_sequence: 1,
@@ -1600,6 +1688,22 @@ mod tests {
         };
         assert_eq!(local_final.world_hash, remote_final.world_hash);
         assert_eq!(local_final.world_hash, shared.world_hash);
+        assert_eq!(
+            local_final
+                .actor_private
+                .as_ref()
+                .expect("local private frontier")
+                .committed_operation_sequence,
+            1
+        );
+        assert_eq!(
+            remote_final
+                .actor_private
+                .as_ref()
+                .expect("remote private frontier")
+                .committed_operation_sequence,
+            1
+        );
 
         local.close(None).await.expect("local socket closes");
         remote.close(None).await.expect("remote socket closes");
@@ -1650,16 +1754,19 @@ mod tests {
 
         let denied_inventory_intents = [
             ClientMessage::RefineOre {
+                operation_sequence: 1,
                 operation_id: "deny-remote-refine-primary".into(),
                 inventory_id: primary.inventory_id.clone(),
                 batches: 1,
             },
             ClientMessage::CraftComponent {
+                operation_sequence: 1,
                 operation_id: "deny-remote-craft-primary".into(),
                 inventory_id: primary.inventory_id.clone(),
                 quantity: 1,
             },
             ClientMessage::TransferInventory {
+                operation_sequence: 1,
                 operation_id: "deny-remote-withdraw-primary".into(),
                 source_inventory_id: primary.inventory_id.clone(),
                 destination_inventory_id: remote_player.inventory_id.clone(),
@@ -1667,6 +1774,7 @@ mod tests {
                 quantity: 1,
             },
             ClientMessage::TransferInventory {
+                operation_sequence: 1,
                 operation_id: "deny-remote-deposit-primary".into(),
                 source_inventory_id: remote_player.inventory_id.clone(),
                 destination_inventory_id: primary.inventory_id.clone(),
@@ -1674,6 +1782,7 @@ mod tests {
                 quantity: 1,
             },
             ClientMessage::TransferInventory {
+                operation_sequence: 1,
                 operation_id: "deny-remote-withdraw-cargo".into(),
                 source_inventory_id: cargo_inventory_id.into(),
                 destination_inventory_id: remote_player.inventory_id.clone(),
@@ -1681,6 +1790,7 @@ mod tests {
                 quantity: 1,
             },
             ClientMessage::TransferInventory {
+                operation_sequence: 1,
                 operation_id: "deny-remote-deposit-cargo".into(),
                 source_inventory_id: remote_player.inventory_id.clone(),
                 destination_inventory_id: cargo_inventory_id.into(),
@@ -1694,6 +1804,7 @@ mod tests {
 
         let denied_grid_intents = [
             ClientMessage::BuildBlock {
+                operation_sequence: 1,
                 operation_id: "deny-remote-build-primary-grid".into(),
                 grid_id: starter_grid.grid_id.clone(),
                 coordinate: starter_block.coordinate,
@@ -1701,11 +1812,13 @@ mod tests {
                 orientation: 0,
             },
             ClientMessage::WeldBlock {
+                operation_sequence: 1,
                 operation_id: "deny-remote-weld-primary-grid".into(),
                 grid_id: starter_grid.grid_id.clone(),
                 block_id: starter_block.block_id.clone(),
             },
             ClientMessage::SetGridControl {
+                operation_sequence: 1,
                 operation_id: "deny-remote-control-primary-grid".into(),
                 grid_id: starter_grid.grid_id.clone(),
                 linear_input: Vec3::ZERO,
@@ -1713,6 +1826,7 @@ mod tests {
                 dampeners: true,
             },
             ClientMessage::ToggleGridAnchor {
+                operation_sequence: 1,
                 operation_id: "deny-remote-anchor-primary-grid".into(),
                 grid_id: starter_grid.grid_id.clone(),
             },
@@ -1748,6 +1862,7 @@ mod tests {
         send_client_message(
             &mut socket,
             &ClientMessage::SetPlayerControl {
+                operation_sequence: 1,
                 operation_id: operation_id.into(),
                 movement_epoch,
                 input_sequence: 1,
@@ -1806,6 +1921,7 @@ mod tests {
         send_client_message(
             &mut socket,
             &ClientMessage::SetSuitMode {
+                operation_sequence: 1,
                 operation_id: "arm-boots-and-release-jetpack".into(),
                 helmet_closed: player.helmet_closed,
                 jetpack_enabled: false,
@@ -1831,6 +1947,7 @@ mod tests {
         send_client_message(
             &mut socket,
             &ClientMessage::SetPlayerControl {
+                operation_sequence: 2,
                 operation_id: "airborne-jump-edge".into(),
                 movement_epoch: player.movement_epoch,
                 input_sequence: 1,
@@ -1932,6 +2049,14 @@ mod tests {
         assert_snapshot_audience(&local_initial, Some("player-local"));
         assert_snapshot_audience(&remote_initial, Some("player-remote"));
         assert_snapshot_audience(&spectator_initial, None);
+        assert_eq!(
+            local_initial["snapshot"]["actor_private"]["committed_operation_sequence"],
+            0
+        );
+        assert_eq!(
+            remote_initial["snapshot"]["actor_private"]["committed_operation_sequence"],
+            0
+        );
         for candidate in [&remote_initial, &spectator_initial] {
             assert_eq!(
                 candidate["snapshot"]["event_sequence"],
@@ -1956,6 +2081,14 @@ mod tests {
         assert_snapshot_audience(&local_requested, Some("player-local"));
         assert_snapshot_audience(&remote_requested, Some("player-remote"));
         assert_snapshot_audience(&spectator_requested, None);
+        assert_eq!(
+            local_requested["snapshot"]["actor_private"]["committed_operation_sequence"],
+            0
+        );
+        assert_eq!(
+            remote_requested["snapshot"]["actor_private"]["committed_operation_sequence"],
+            0
+        );
         for candidate in [&remote_requested, &spectator_requested] {
             assert_eq!(
                 candidate["snapshot"]["event_sequence"],
@@ -1966,6 +2099,231 @@ mod tests {
                 local_requested["snapshot"]["world_hash"]
             );
         }
+
+        local.close(None).await.expect("local closes");
+        remote.close(None).await.expect("remote closes");
+        spectator.close(None).await.expect("spectator closes");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn websocket_exact_retry_conflicts_and_diagnostic_id_reuse_are_safe() {
+        let (mut local, state, server) = connect_test_socket().await;
+        let mut spectator = connect_additional(&local).await;
+        let local_initial =
+            complete_session(&mut local, &local_player_hello("idempotency-local")).await;
+        let spectator_initial = complete_session(
+            &mut spectator,
+            &ClientMessage::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                client_name: "idempotency-spectator".into(),
+                authentication: ClientAuthentication::Spectator,
+            },
+        )
+        .await;
+        assert_eq!(
+            local_initial["snapshot"]["actor_private"]["committed_operation_sequence"],
+            0
+        );
+        assert_snapshot_audience(&spectator_initial, None);
+
+        let first = suit_mode_intent(1, "reusable-diagnostic-id", false);
+        send_client_message(&mut local, &first).await;
+        let first_receipt = receive_intent_accepted(&mut local, 1, "reusable-diagnostic-id").await;
+        let local_update = receive_json_type(&mut local, "snapshot", false).await;
+        let spectator_update = receive_json_type(&mut spectator, "snapshot", true).await;
+        assert_eq!(
+            local_update["snapshot"]["actor_private"]["committed_operation_sequence"],
+            1
+        );
+        assert_snapshot_audience(&spectator_update, None);
+        let committed = state.snapshot();
+
+        send_client_message(&mut local, &first).await;
+        let retry_receipt = receive_intent_accepted(&mut local, 1, "reusable-diagnostic-id").await;
+        assert_eq!(retry_receipt, first_receipt);
+        assert_eq!(state.snapshot().event_sequence, committed.event_sequence);
+        assert_eq!(state.snapshot().world_hash, committed.world_hash);
+        assert_no_server_message(&mut local).await;
+        assert_no_server_message(&mut spectator).await;
+
+        assert_intent_rejected(
+            &mut local,
+            suit_mode_intent(1, "reusable-diagnostic-id", true),
+            "operation_conflict",
+        )
+        .await;
+        assert_intent_rejected(
+            &mut local,
+            suit_mode_intent(1, "changed-diagnostic-id", false),
+            "operation_conflict",
+        )
+        .await;
+        assert_eq!(state.snapshot().event_sequence, committed.event_sequence);
+        assert_eq!(state.snapshot().world_hash, committed.world_hash);
+        assert_no_server_message(&mut spectator).await;
+
+        let second = suit_mode_intent(2, "reusable-diagnostic-id", true);
+        send_client_message(&mut local, &second).await;
+        let second_receipt = receive_intent_accepted(&mut local, 2, "reusable-diagnostic-id").await;
+        assert!(second_receipt.event_sequence > first_receipt.event_sequence);
+        let local_update = receive_json_type(&mut local, "snapshot", false).await;
+        let spectator_update = receive_json_type(&mut spectator, "snapshot", true).await;
+        assert_eq!(
+            local_update["snapshot"]["actor_private"]["committed_operation_sequence"],
+            2
+        );
+        assert_snapshot_audience(&spectator_update, None);
+        assert_eq!(
+            local_update["snapshot"]["world_hash"],
+            spectator_update["snapshot"]["world_hash"]
+        );
+
+        local.close(None).await.expect("local closes");
+        spectator.close(None).await.expect("spectator closes");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn invalid_gap_and_gameplay_rejection_leave_sequence_reusable() {
+        let (mut local, state, server) = connect_test_socket().await;
+        let initial = complete_session(
+            &mut local,
+            &local_player_hello("reusable-rejected-frontier"),
+        )
+        .await;
+        assert_eq!(
+            initial["snapshot"]["actor_private"]["committed_operation_sequence"],
+            0
+        );
+        let before = state.snapshot();
+
+        assert_intent_rejected(
+            &mut local,
+            suit_mode_intent(0, "invalid-zero", false),
+            "operation_sequence_invalid",
+        )
+        .await;
+        assert_intent_rejected(
+            &mut local,
+            suit_mode_intent(2, "invalid-gap", false),
+            "operation_sequence_gap",
+        )
+        .await;
+        assert_intent_rejected(
+            &mut local,
+            suit_mode_intent(1, "rejected-no-change", true),
+            "suit_mode_no_change",
+        )
+        .await;
+        assert_eq!(state.snapshot().event_sequence, before.event_sequence);
+        assert_eq!(state.snapshot().world_hash, before.world_hash);
+
+        let corrected = suit_mode_intent(1, "corrected-one", false);
+        send_client_message(&mut local, &corrected).await;
+        let receipt = receive_intent_accepted(&mut local, 1, "corrected-one").await;
+        assert_eq!(receipt.event_sequence, before.event_sequence + 1);
+        let update = receive_json_type(&mut local, "snapshot", false).await;
+        assert_eq!(
+            update["snapshot"]["actor_private"]["committed_operation_sequence"],
+            1
+        );
+
+        local.close(None).await.expect("local closes");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn compacted_retry_is_denied_and_actor_frontiers_remain_private() {
+        let (mut local, state, server) = connect_test_socket().await;
+        complete_session(&mut local, &local_player_hello("compaction-local")).await;
+
+        for operation_sequence in 1..=129 {
+            let operation_id = format!("compacted-{operation_sequence}");
+            let intent = suit_mode_intent(
+                operation_sequence,
+                &operation_id,
+                operation_sequence % 2 == 0,
+            );
+            send_client_message(&mut local, &intent).await;
+            receive_intent_accepted(&mut local, operation_sequence, &operation_id).await;
+        }
+        send_client_message(&mut local, &ClientMessage::RequestSnapshot).await;
+        let local_snapshot = receive_until(&mut local, |message| {
+            matches!(
+                message,
+                ServerMessage::Snapshot { snapshot }
+                    if snapshot
+                        .actor_private
+                        .as_ref()
+                        .is_some_and(|private| private.committed_operation_sequence == 129)
+            )
+        })
+        .await;
+        let ServerMessage::Snapshot {
+            snapshot: local_snapshot,
+        } = local_snapshot
+        else {
+            unreachable!("snapshot predicate matched")
+        };
+        assert_eq!(local_snapshot.event_sequence, 129);
+
+        let mut remote = connect_additional(&local).await;
+        let mut spectator = connect_additional(&local).await;
+        let remote_snapshot = complete_session(
+            &mut remote,
+            &player_hello("compaction-remote", "player-remote"),
+        )
+        .await;
+        let spectator_snapshot = complete_session(
+            &mut spectator,
+            &ClientMessage::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                client_name: "compaction-spectator".into(),
+                authentication: ClientAuthentication::Spectator,
+            },
+        )
+        .await;
+        assert_eq!(
+            remote_snapshot["snapshot"]["actor_private"]["committed_operation_sequence"],
+            0
+        );
+        assert_snapshot_audience(&spectator_snapshot, None);
+        for candidate in [&remote_snapshot, &spectator_snapshot] {
+            assert_eq!(candidate["snapshot"]["event_sequence"], 129);
+            assert_eq!(
+                candidate["snapshot"]["world_hash"],
+                local_snapshot.world_hash
+            );
+        }
+
+        local.close(None).await.expect("first local session closes");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let mut local = connect_additional(&remote).await;
+        let local_reconnect = complete_session(
+            &mut local,
+            &local_player_hello("compaction-local-reconnect"),
+        )
+        .await;
+        assert_eq!(
+            local_reconnect["snapshot"]["actor_private"]["committed_operation_sequence"],
+            129
+        );
+        assert_eq!(local_reconnect["snapshot"]["event_sequence"], 129);
+        assert_eq!(
+            local_reconnect["snapshot"]["world_hash"],
+            local_snapshot.world_hash
+        );
+
+        assert_intent_rejected(
+            &mut local,
+            suit_mode_intent(1, "compacted-1", false),
+            "operation_already_committed",
+        )
+        .await;
+        assert_eq!(state.snapshot().event_sequence, 129);
+        assert_no_server_message(&mut remote).await;
+        assert_no_server_message(&mut spectator).await;
 
         local.close(None).await.expect("local closes");
         remote.close(None).await.expect("remote closes");
@@ -1994,6 +2352,7 @@ mod tests {
         send_client_message(
             &mut local,
             &ClientMessage::TransferInventory {
+                operation_sequence: 1,
                 operation_id: "private-cargo-transfer".into(),
                 source_inventory_id: "inventory-player-local".into(),
                 destination_inventory_id: "inventory-cargo-starter".into(),
@@ -2012,6 +2371,14 @@ mod tests {
         assert_snapshot_audience(&local_structural, Some("player-local"));
         assert_snapshot_audience(&remote_structural, Some("player-remote"));
         assert_snapshot_audience(&spectator_structural, None);
+        assert_eq!(
+            local_structural["snapshot"]["actor_private"]["committed_operation_sequence"],
+            1
+        );
+        assert_eq!(
+            remote_structural["snapshot"]["actor_private"]["committed_operation_sequence"],
+            0
+        );
         let local_inventories = local_structural["snapshot"]["actor_private"]["inventories"]
             .as_array()
             .expect("local private inventories");
@@ -2041,6 +2408,7 @@ mod tests {
         send_client_message(
             &mut local,
             &ClientMessage::SetPlayerControl {
+                operation_sequence: 2,
                 operation_id: "private-motion-control".into(),
                 movement_epoch:
                     local_initial["snapshot"]["actor_private"]["player"]["movement_epoch"]
@@ -2074,6 +2442,22 @@ mod tests {
             assert_eq!(candidate["motion"]["world_hash"], authoritative.world_hash);
         }
 
+        for socket in [&mut local, &mut remote, &mut spectator] {
+            send_client_message(socket, &ClientMessage::RequestSnapshot).await;
+        }
+        let local_final = receive_json_type(&mut local, "snapshot", false).await;
+        let remote_final = receive_json_type(&mut remote, "snapshot", true).await;
+        let spectator_final = receive_json_type(&mut spectator, "snapshot", true).await;
+        assert_eq!(
+            local_final["snapshot"]["actor_private"]["committed_operation_sequence"],
+            2
+        );
+        assert_eq!(
+            remote_final["snapshot"]["actor_private"]["committed_operation_sequence"],
+            0
+        );
+        assert_snapshot_audience(&spectator_final, None);
+
         local.close(None).await.expect("local closes");
         remote.close(None).await.expect("remote closes");
         spectator.close(None).await.expect("spectator closes");
@@ -2087,6 +2471,7 @@ mod tests {
             .execute_as(
                 "player-local",
                 &ClientMessage::SetSuitMode {
+                    operation_sequence: 1,
                     operation_id: "prepare-private-drop".into(),
                     helmet_closed: false,
                     jetpack_enabled: true,
