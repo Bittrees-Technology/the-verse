@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use axum::{
@@ -37,8 +37,8 @@ use verse_protocol::{
 };
 use verse_simulation::{
     AdvanceImpact, EVENT_SCHEMA_VERSION, IntentError, InterestEntityIdentity,
-    InterestProjectionState, ProjectedInterestFrame, ProjectionError, Runtime, RuntimeError,
-    WORLD_SCHEMA_VERSION, registry_snapshot, universe_manifest,
+    InterestProjectionState, ProjectedInterestFrame, ProjectionError, ProjectionSource, Runtime,
+    RuntimeError, WORLD_SCHEMA_VERSION, WorldState, registry_snapshot, universe_manifest,
 };
 
 const COMMAND_CENTER_HTML: &str = include_str!("../../../apps/web-command-center/index.html");
@@ -193,6 +193,7 @@ pub struct AppState {
     session_admission: Arc<Semaphore>,
     http_projection_admission: Arc<Semaphore>,
     public_world_cache: Mutex<Option<CachedPublicWorld>>,
+    projection_revision: Mutex<Arc<ProjectionRevision>>,
     registry: CelestialRegistrySnapshot,
     universe_manifest: UniverseManifestSnapshot,
 }
@@ -204,6 +205,34 @@ struct CachedPublicWorld {
     encoded: Arc<str>,
 }
 
+#[derive(Debug)]
+struct ProjectionRevision {
+    world: WorldState,
+    source: OnceLock<Result<Arc<ProjectionSource>, String>>,
+}
+
+impl ProjectionRevision {
+    fn new(world: WorldState) -> Self {
+        Self {
+            world,
+            source: OnceLock::new(),
+        }
+    }
+
+    fn source(&self) -> Result<Arc<ProjectionSource>, ProjectionError> {
+        self.source
+            .get_or_init(|| {
+                self.world
+                    .projection_source()
+                    .map(Arc::new)
+                    .map_err(|source| source.to_string())
+            })
+            .as_ref()
+            .cloned()
+            .map_err(|source| ProjectionError::InvalidCanonicalSnapshot(source.clone()))
+    }
+}
+
 impl AppState {
     pub fn new(runtime: Runtime) -> Arc<Self> {
         let world_seed = runtime.state().world_seed;
@@ -212,6 +241,7 @@ impl AppState {
         let universe_manifest =
             universe_manifest(world_seed, WORLD_SCHEMA_VERSION, EVENT_SCHEMA_VERSION)
                 .expect("the runtime's validated universe manifest remains available");
+        let projection_revision = Arc::new(ProjectionRevision::new(runtime.state().clone()));
         let (updates, _) = watch::channel(ReplicationFeed::default());
         Arc::new(Self {
             runtime: Mutex::new(runtime),
@@ -220,6 +250,7 @@ impl AppState {
             session_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS)),
             http_projection_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_HTTP_PROJECTIONS)),
             public_world_cache: Mutex::new(None),
+            projection_revision: Mutex::new(projection_revision),
             registry,
             universe_manifest,
         })
@@ -258,10 +289,9 @@ impl AppState {
         &self,
         projection: &mut InterestProjectionState,
     ) -> Result<ProjectedInterestFrame, ProjectionError> {
-        self.runtime
-            .lock()
-            .state()
-            .project_interest_frame(projection, &BTreeMap::<InterestEntityIdentity, _>::new())
+        let revision = self.projection_revision.lock().clone();
+        let source = revision.source()?;
+        source.project_interest_frame(projection, &BTreeMap::<InterestEntityIdentity, _>::new())
     }
 
     fn bounded_public_world_json(&self) -> Result<Arc<str>, String> {
@@ -304,6 +334,7 @@ impl AppState {
             AdvanceImpact::Structural => Some(ReplicationKind::Structural),
         };
         if let Some(update_kind) = update_kind {
+            self.publish_projection_revision(&runtime);
             self.publish_update(update_kind, runtime.state().event_sequence);
         }
         Ok(outcome.changed())
@@ -327,8 +358,14 @@ impl AppState {
         };
         // Keep mutation and publication in the same runtime critical section so
         // every subscriber observes structural and motion state in event order.
+        self.publish_projection_revision(&runtime);
         self.publish_update(update_kind, runtime.state().event_sequence);
         Ok(receipt)
+    }
+
+    fn publish_projection_revision(&self, runtime: &Runtime) {
+        *self.projection_revision.lock() =
+            Arc::new(ProjectionRevision::new(runtime.state().clone()));
     }
 
     fn publish_update(&self, kind: ReplicationKind, event_sequence: u64) {
@@ -1830,6 +1867,27 @@ mod tests {
             panic!("the slow consumer receives the latest coalesced motion state");
         };
         assert_eq!(feed.latest_motion_sequence, Some(4_096));
+    }
+
+    #[test]
+    fn session_projection_does_not_hold_or_wait_for_the_authoritative_runtime_lock() {
+        let state = test_state();
+        let projecting_state = state.clone();
+        let runtime_guard = state.runtime.lock();
+        let (result_sender, result_receiver) = std::sync::mpsc::channel();
+        let projection = std::thread::spawn(move || {
+            let mut cursor = InterestProjectionState::public_origin_spectator("lock-proof");
+            let result = projecting_state.projected_interest_frame(&mut cursor);
+            result_sender.send(result).expect("projection result sends");
+        });
+
+        let result = result_receiver.recv_timeout(Duration::from_secs(1));
+        drop(runtime_guard);
+        projection.join().expect("projection thread joins");
+        assert!(matches!(
+            result.expect("projection completes while the runtime lock is held"),
+            Ok(ProjectedInterestFrame::Baseline(_))
+        ));
     }
 
     #[test]
