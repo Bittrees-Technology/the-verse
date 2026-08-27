@@ -5,13 +5,14 @@ use std::path::Path;
 
 use thiserror::Error;
 use verse_physics::{
-    BodyControl, BodySpec, BoxColliderSpec, MotionQuality, PhysicsError, Pose as PhysicsPose,
-    Quat as PhysicsQuat, Scene, SceneConfig, SphereColliderSpec, Vec3 as PhysicsVec3,
+    BodyControl, BodySpec, BoxColliderSpec, CapsuleCast, CapsuleColliderSpec, MotionQuality,
+    PhysicsError, Pose as PhysicsPose, Quat as PhysicsQuat, Scene, SceneConfig, SphereColliderSpec,
+    Vec3 as PhysicsVec3,
 };
 use verse_protocol::{
     BlockKind, ClientMessage, IVec3, IntentReceipt, InventoryContents, InventoryDomain,
-    LocomotionKind, MotionSnapshot, PlayerDeathCause, PlayerLifeState, PlayerLocomotionSnapshot,
-    Quat, ResourceKind, Vec3, WorldSnapshot,
+    LocomotionKind, LocomotionSupportSnapshot, MotionSnapshot, PlayerDeathCause, PlayerLifeState,
+    PlayerLocomotionSnapshot, Quat, ResourceKind, Vec3, WorldSnapshot,
 };
 
 use crate::content;
@@ -42,8 +43,10 @@ const REPLAY_QUANTIZATION_SLOP: f64 = 0.000_004;
 #[cfg(test)]
 const REPLAY_CONTACT_SLOP_M: f64 = 0.15;
 const PHYSICS_SPECULATIVE_DISTANCE_M: f64 = 0.02;
+const PHYSICS_CONTACT_POINT_SLOP_M: f64 = 0.001;
 const PLAYER_PLANET_PENETRATION_LIMIT_M: f64 = 0.28;
 const PLAYER_BOX_PENETRATION_LIMIT_M: f64 = 0.85;
+const CHARACTER_INERTIA_MULTIPLIER: f64 = 12.0;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum IntentError {
@@ -287,11 +290,19 @@ impl Runtime {
                         &mut scheduled_player,
                         substep_simulation_tick,
                     );
+                    let player_jump = classify_player_locomotion_for_substep(
+                        &self.state,
+                        &self.physics,
+                        &mut scheduled_player,
+                        &body_states,
+                        substep_simulation_tick,
+                    )?;
                     let controls = physics_controls(
                         &self.state,
                         &scheduled_player,
                         &body_states,
                         substep_simulation_tick,
+                        player_jump,
                     );
                     let step = match self.physics.step(&controls) {
                         Ok(step) => step,
@@ -1727,6 +1738,12 @@ impl WorldState {
                     )?;
                     let resulting_tick =
                         self.simulation_tick.saturating_add(u64::from(*step_count));
+                    validate_player_locomotion_outcome(
+                        self,
+                        &scheduled_player,
+                        player,
+                        resulting_tick,
+                    )?;
                     let lease_active =
                         resulting_tick < scheduled_player.control_expires_at_simulation_tick;
                     let expected_linear = if lease_active {
@@ -1744,7 +1761,6 @@ impl WorldState {
                         || player.boost != (scheduled_player.boost && lease_active)
                         || player.jump != (scheduled_player.jump && lease_active)
                         || player.dampeners != (scheduled_player.dampeners || !lease_active)
-                        || player.locomotion != scheduled_player.locomotion
                         || player.control_expires_at_simulation_tick
                             != scheduled_player.control_expires_at_simulation_tick
                     {
@@ -1931,7 +1947,8 @@ impl WorldState {
                     ));
                 }
                 if let Some(player) = player {
-                    let expected_surface_contact = active.iter().any(contact_key_involves_player);
+                    let expected_surface_contact = active.iter().any(contact_key_involves_player)
+                        || player.locomotion.support.is_some();
                     if player.surface_contact != expected_surface_contact {
                         return Err(IntentError::rejected(
                             "replay_player_surface_contact_invalid",
@@ -2314,15 +2331,25 @@ impl WorldState {
             + PLAYER_POSITION_CORRECTION_BUDGET_M_PER_STEP
             + REPLAY_QUANTIZATION_SLOP;
         let surface_slack = 0.5 * contact.penetration_m.max(PHYSICS_SPECULATIVE_DISTANCE_M)
+            + PHYSICS_CONTACT_POINT_SLOP_M
             + REPLAY_QUANTIZATION_SLOP;
-        if contact.point.squared_distance(self.player.position).sqrt()
-            > completed_steps * per_step_reach + radius + surface_slack
+        let capsule_half_height = character_capsule_half_height();
+        if point_capsule_axis_distance(
+            contact.point,
+            self.player.position,
+            self.player.orientation,
+            capsule_half_height,
+        ) > completed_steps * per_step_reach + radius + surface_slack
         {
             return false;
         }
         if contact.substep_index + 1 == step_count
-            && contact.point.squared_distance(player.position).sqrt()
-                > radius + per_step_reach + surface_slack
+            && point_capsule_axis_distance(
+                contact.point,
+                player.position,
+                player.orientation,
+                capsule_half_height,
+            ) > radius + per_step_reach + surface_slack
         {
             return false;
         }
@@ -2423,12 +2450,110 @@ fn ensure_player_motion_continuity(
         ));
     }
     let radius = content::manifest().character.collision_radius_m;
+    let capsule_axis = outcome.orientation.rotate(Vec3::new(0.0, 1.0, 0.0));
+    let outcome_up = radial_up(outcome.position);
+    let radial_capsule_extent = radius
+        + character_capsule_half_height()
+            * (capsule_axis.x * outcome_up.x
+                + capsule_axis.y * outcome_up.y
+                + capsule_axis.z * outcome_up.z)
+                .abs();
     let planet_distance = (outcome.position - PLANET_CENTER).magnitude();
-    if planet_distance < PLANET_SURFACE_RADIUS_M + radius - PLAYER_PLANET_PENETRATION_LIMIT_M {
+    if planet_distance
+        < PLANET_SURFACE_RADIUS_M + radial_capsule_extent - PLAYER_PLANET_PENETRATION_LIMIT_M
+    {
         return Err(IntentError::rejected(
             "replay_player_planet_penetration_invalid",
             "player physics outcome penetrates beyond the planet contact tolerance",
         ));
+    }
+    Ok(())
+}
+
+fn validate_player_locomotion_outcome(
+    state: &WorldState,
+    scheduled_player: &Player,
+    outcome: &PlayerPhysicsOutcome,
+    resulting_tick: u64,
+) -> Result<(), IntentError> {
+    let locomotion = &outcome.locomotion;
+    ensure_finite(locomotion.up, "replayed locomotion up")?;
+    let up_length = locomotion.up.magnitude();
+    let maximum_pitch = content::manifest()
+        .character
+        .maximum_view_pitch_degrees
+        .to_radians();
+    if (up_length - 1.0).abs() > 1.0e-5
+        || !locomotion.view_pitch_radians.is_finite()
+        || locomotion.view_pitch_radians.abs() > maximum_pitch + 1.0e-9
+        || locomotion.magnetic_boots_enabled != scheduled_player.locomotion.magnetic_boots_enabled
+        || locomotion.jump_held != scheduled_player.locomotion.jump_held
+        || locomotion.jump_buffer_expires_at_simulation_tick
+            > scheduled_player
+                .locomotion
+                .jump_buffer_expires_at_simulation_tick
+        || locomotion.support_grace_expires_at_simulation_tick
+            > resulting_tick.saturating_add(content::manifest().character.coyote_ticks)
+        || locomotion.magnetic_reattach_after_simulation_tick
+            > resulting_tick.saturating_add(
+                content::manifest()
+                    .character
+                    .magnetic_reattach_lockout_ticks,
+            )
+    {
+        return Err(IntentError::rejected(
+            "replay_player_locomotion_invalid",
+            "player locomotion orientation, view, input edge, or timing state is not canonical",
+        ));
+    }
+    if scheduled_player.jetpack_enabled {
+        if !matches!(locomotion.kind, LocomotionKind::Eva) || locomotion.support.is_some() {
+            return Err(IntentError::rejected(
+                "replay_player_locomotion_invalid",
+                "jetpack locomotion must be EVA and unsupported",
+            ));
+        }
+        return Ok(());
+    }
+    if matches!(locomotion.kind, LocomotionKind::Eva) {
+        return Err(IntentError::rejected(
+            "replay_player_locomotion_invalid",
+            "EVA locomotion requires the authoritative jetpack mode",
+        ));
+    }
+    let support_required = matches!(
+        locomotion.kind,
+        LocomotionKind::Grounded | LocomotionKind::Magnetic
+    );
+    if support_required != locomotion.support.is_some()
+        || matches!(locomotion.kind, LocomotionKind::Magnetic) && !locomotion.magnetic_boots_enabled
+    {
+        return Err(IntentError::rejected(
+            "replay_player_locomotion_invalid",
+            "grounded and magnetic states require a valid support and magnetic mode requires armed boots",
+        ));
+    }
+    if matches!(locomotion.kind, LocomotionKind::Grounded)
+        && dot(locomotion.up, radial_up(outcome.position)) < 0.999_99
+    {
+        return Err(IntentError::rejected(
+            "replay_player_locomotion_invalid",
+            "grounded locomotion up must follow the canonical radial gravity frame",
+        ));
+    }
+    if let Some(support) = &locomotion.support {
+        ensure_finite(support.local_anchor, "replayed support anchor")?;
+        ensure_finite(support.local_normal, "replayed support normal")?;
+        if support.body_id == PLAYER_BODY_ID
+            || !state.physics_collider_exists(&support.body_id, &support.collider_id)
+            || (support.local_normal.magnitude() - 1.0).abs() > 1.0e-5
+            || support.local_anchor.magnitude() > 1.0e7
+        {
+            return Err(IntentError::rejected(
+                "replay_player_locomotion_invalid",
+                "locomotion support must identify one live non-player collider with finite local geometry",
+            ));
+        }
     }
     Ok(())
 }
@@ -2575,6 +2700,91 @@ fn point_unit_cube_distance(point: Vec3, coordinate: IVec3) -> f64 {
             .clamp(f64::from(coordinate.z) - 0.5, f64::from(coordinate.z) + 0.5),
     );
     point.squared_distance(closest).sqrt()
+}
+
+fn character_capsule_half_height() -> f64 {
+    let character = &content::manifest().character;
+    (character.standing_height_m - 2.0 * character.collision_radius_m) * 0.5
+}
+
+fn character_capsule_inertia(mass_kg: f64) -> (f64, f64) {
+    let radius = content::manifest().character.collision_radius_m;
+    let half_cylinder = character_capsule_half_height();
+    let cylinder_length = 2.0 * half_cylinder;
+    let cylinder_volume = std::f64::consts::PI * radius.powi(2) * cylinder_length;
+    let sphere_volume = 4.0 / 3.0 * std::f64::consts::PI * radius.powi(3);
+    let cylinder_mass = mass_kg * cylinder_volume / (cylinder_volume + sphere_volume);
+    let sphere_mass = mass_kg - cylinder_mass;
+    let axis_inertia = 0.5 * cylinder_mass * radius.powi(2) + 0.4 * sphere_mass * radius.powi(2);
+    let cylinder_perpendicular_inertia =
+        cylinder_mass * (3.0 * radius.powi(2) + cylinder_length.powi(2)) / 12.0;
+    let hemisphere_mass = sphere_mass * 0.5;
+    let hemisphere_center_offset = half_cylinder + 3.0 * radius / 8.0;
+    let hemisphere_centroid_inertia = hemisphere_mass * 83.0 / 320.0 * radius.powi(2);
+    let perpendicular_inertia = cylinder_perpendicular_inertia
+        + 2.0 * (hemisphere_centroid_inertia + hemisphere_mass * hemisphere_center_offset.powi(2));
+    (axis_inertia, perpendicular_inertia)
+}
+
+fn point_capsule_axis_distance(
+    point: Vec3,
+    center: Vec3,
+    orientation: Quat,
+    half_height: f64,
+) -> f64 {
+    let axis = orientation.rotate(Vec3::new(0.0, 1.0, 0.0));
+    let start = center - axis * half_height;
+    let end = center + axis * half_height;
+    let segment = end - start;
+    let to_point = point - start;
+    let length_squared = segment.x * segment.x + segment.y * segment.y + segment.z * segment.z;
+    let projection = if length_squared > f64::EPSILON {
+        ((to_point.x * segment.x + to_point.y * segment.y + to_point.z * segment.z)
+            / length_squared)
+            .clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    point.squared_distance(start + segment * projection).sqrt()
+}
+
+fn dot(left: Vec3, right: Vec3) -> f64 {
+    left.x * right.x + left.y * right.y + left.z * right.z
+}
+
+fn cross(left: Vec3, right: Vec3) -> Vec3 {
+    Vec3::new(
+        left.y * right.z - left.z * right.y,
+        left.z * right.x - left.x * right.z,
+        left.x * right.y - left.y * right.x,
+    )
+}
+
+fn normalized_or(value: Vec3, fallback: Vec3) -> Vec3 {
+    let magnitude = value.magnitude();
+    if magnitude > 1.0e-9 && magnitude.is_finite() {
+        value * (1.0 / magnitude)
+    } else {
+        let fallback_magnitude = fallback.magnitude();
+        if fallback_magnitude > 1.0e-9 && fallback_magnitude.is_finite() {
+            fallback * (1.0 / fallback_magnitude)
+        } else {
+            Vec3::new(0.0, 1.0, 0.0)
+        }
+    }
+}
+
+fn canonical_vec3(value: Vec3) -> Vec3 {
+    Vec3::new(
+        canonical_f64(value.x),
+        canonical_f64(value.y),
+        canonical_f64(value.z),
+    )
+}
+
+fn canonical_f64(value: f64) -> f64 {
+    let quantized = quantize_f64(value);
+    if quantized == 0.0 { 0.0 } else { quantized }
 }
 
 fn movement_samples(start: Vec3, end: Vec3) -> Vec<Vec3> {
@@ -2745,7 +2955,9 @@ fn physics_body_specs(state: &WorldState) -> Vec<BodySpec> {
     if matches!(state.player.life_state, PlayerLifeState::Alive) {
         let character = &content::manifest().character;
         let radius = character.collision_radius_m;
-        let volume = 4.0 / 3.0 * std::f64::consts::PI * radius.powi(3);
+        let half_height_of_cylinder = (character.standing_height_m - 2.0 * radius) * 0.5;
+        let volume = std::f64::consts::PI * radius.powi(2) * (2.0 * half_height_of_cylinder)
+            + 4.0 / 3.0 * std::f64::consts::PI * radius.powi(3);
         let mut player = BodySpec::dynamic(
             PLAYER_BODY_ID,
             PhysicsPose::new(
@@ -2754,10 +2966,11 @@ fn physics_body_specs(state: &WorldState) -> Vec<BodySpec> {
             ),
             Vec::new(),
         );
-        player.sphere_colliders.push(SphereColliderSpec {
+        player.capsule_colliders.push(CapsuleColliderSpec {
             collider_id: PLAYER_COLLIDER_ID.into(),
             local_pose: PhysicsPose::IDENTITY,
             radius: radius as f32,
+            half_height_of_cylinder: half_height_of_cylinder as f32,
             density_kg_per_m3: (character.mass_kg / volume) as f32,
         });
         player.linear_velocity = to_physics_vec3(state.player.linear_velocity);
@@ -2765,6 +2978,7 @@ fn physics_body_specs(state: &WorldState) -> Vec<BodySpec> {
         player.friction = physics.friction;
         player.restitution = physics.restitution;
         player.allow_sleeping = false;
+        player.inertia_multiplier = CHARACTER_INERTIA_MULTIPLIER as f32;
         player.motion_quality = MotionQuality::LinearCast;
         bodies.push(player);
     }
@@ -2875,11 +3089,260 @@ fn reset_locomotion(
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PlayerJumpLaunch {
+    up: Vec3,
+    support_velocity: Vec3,
+}
+
+fn classify_player_locomotion_for_substep(
+    state: &WorldState,
+    physics_scene: &Scene,
+    player: &mut Player,
+    body_states: &[verse_physics::BodyState],
+    simulation_tick: u64,
+) -> Result<Option<PlayerJumpLaunch>, PhysicsError> {
+    if !matches!(player.life_state, PlayerLifeState::Alive) {
+        return Ok(None);
+    }
+    let Some(body) = body_states
+        .iter()
+        .find(|body| body.body_id == PLAYER_BODY_ID)
+    else {
+        return Ok(None);
+    };
+    let position = from_physics_vec3(body.pose.position);
+    if player.jetpack_enabled {
+        player.locomotion.kind = LocomotionKind::Eva;
+        player.locomotion.support = None;
+        player.locomotion.up = canonical_vec3(radial_up(position));
+        return Ok(None);
+    }
+
+    let character = &content::manifest().character;
+    let maximum_pitch = character.maximum_view_pitch_degrees.to_radians();
+    player.locomotion.view_pitch_radians = canonical_f64(
+        (player.locomotion.view_pitch_radians
+            + player.control_angular_input.x
+                * character.maximum_angular_speed_radians_per_second
+                * f64::from(content::manifest().physics.fixed_delta_seconds))
+        .clamp(-maximum_pitch, maximum_pitch),
+    );
+    let body_orientation = from_physics_quat(body.pose.rotation);
+    let body_up = normalized_or(
+        body_orientation.rotate(Vec3::new(0.0, 1.0, 0.0)),
+        player.locomotion.up,
+    );
+    let environment = state.environment_at(position);
+    let gravity_up = radial_up(position);
+    let magnetic_probe = player.locomotion.magnetic_boots_enabled
+        && simulation_tick >= player.locomotion.magnetic_reattach_after_simulation_tick;
+    let probe_up = if matches!(player.locomotion.kind, LocomotionKind::Magnetic) || magnetic_probe {
+        body_up
+    } else {
+        gravity_up
+    };
+    let probe_distance = if magnetic_probe {
+        character
+            .support_probe_distance_m
+            .max(character.magnetic_probe_distance_m)
+    } else {
+        character.support_probe_distance_m
+    };
+    let hit = physics_scene.cast_capsule(&CapsuleCast {
+        pose: body.pose,
+        radius: character.collision_radius_m as f32,
+        half_height_of_cylinder: character_capsule_half_height() as f32,
+        displacement: to_physics_vec3(probe_up * -probe_distance),
+        ignore_body_id: Some(PLAYER_BODY_ID.into()),
+    })?;
+    let prior_had_support = player.locomotion.support.is_some();
+    let mut accepted_support = None;
+    let mut support_kind = LocomotionKind::Airborne;
+    let mut support_up = gravity_up;
+    if let Some(hit) = hit {
+        let surface_normal = normalized_or(from_physics_vec3(hit.surface_normal), probe_up);
+        let slope_cosine = (character.walkable_slope_degrees.to_radians()).cos();
+        let slope_dot = dot(surface_normal, gravity_up);
+        let gravity_walkable = environment.gravity_m_s2 > 0.05 && slope_dot >= slope_cosine;
+        let relative_normal_speed = support_relative_normal_speed(
+            state,
+            body_states,
+            &hit.body_id,
+            from_physics_vec3(hit.point_on_body),
+            from_physics_vec3(body.linear_velocity),
+            surface_normal,
+        );
+        let same_magnetic_support = matches!(player.locomotion.kind, LocomotionKind::Magnetic)
+            && player.locomotion.support.as_ref().is_some_and(|support| {
+                support.body_id == hit.body_id && support.collider_id == hit.collider_id
+            });
+        let magnetic_walkable = magnetic_probe
+            && (same_magnetic_support
+                || relative_normal_speed <= character.magnetic_catch_speed_m_s);
+        if gravity_walkable || magnetic_walkable {
+            support_kind = if gravity_walkable {
+                LocomotionKind::Grounded
+            } else {
+                LocomotionKind::Magnetic
+            };
+            support_up = if gravity_walkable {
+                gravity_up
+            } else {
+                surface_normal
+            };
+            accepted_support = Some(locomotion_support_snapshot(
+                state,
+                body_states,
+                &hit.body_id,
+                &hit.collider_id,
+                from_physics_vec3(hit.point_on_body),
+                surface_normal,
+            ));
+        }
+    }
+
+    let jump_requested = player.jump
+        && player.locomotion.jump_buffer_expires_at_simulation_tick >= simulation_tick
+        && (accepted_support.is_some()
+            || player.locomotion.support_grace_expires_at_simulation_tick >= simulation_tick);
+    if jump_requested {
+        let support_velocity = accepted_support.as_ref().map_or(Vec3::ZERO, |support| {
+            let anchor = support_world_anchor(state, body_states, support);
+            support_point_velocity(state, body_states, &support.body_id, anchor)
+        });
+        if matches!(player.locomotion.kind, LocomotionKind::Magnetic) {
+            player.locomotion.magnetic_reattach_after_simulation_tick =
+                simulation_tick.saturating_add(character.magnetic_reattach_lockout_ticks);
+        }
+        player.locomotion.kind = LocomotionKind::Airborne;
+        player.locomotion.support = None;
+        player.locomotion.up = canonical_vec3(support_up);
+        player.locomotion.jump_buffer_expires_at_simulation_tick = simulation_tick;
+        player.locomotion.support_grace_expires_at_simulation_tick = simulation_tick;
+        return Ok(Some(PlayerJumpLaunch {
+            up: support_up,
+            support_velocity,
+        }));
+    }
+
+    if let Some(support) = accepted_support {
+        player.locomotion.kind = support_kind;
+        player.locomotion.support = Some(support);
+        player.locomotion.up = canonical_vec3(support_up);
+        player.locomotion.support_grace_expires_at_simulation_tick =
+            simulation_tick.saturating_add(character.coyote_ticks);
+    } else {
+        if prior_had_support {
+            player.locomotion.support_grace_expires_at_simulation_tick =
+                simulation_tick.saturating_add(character.coyote_ticks);
+        }
+        player.locomotion.kind = LocomotionKind::Airborne;
+        player.locomotion.support = None;
+        player.locomotion.up = canonical_vec3(gravity_up);
+    }
+    Ok(None)
+}
+
+fn locomotion_support_snapshot(
+    state: &WorldState,
+    body_states: &[verse_physics::BodyState],
+    body_id: &str,
+    collider_id: &str,
+    world_anchor: Vec3,
+    world_normal: Vec3,
+) -> LocomotionSupportSnapshot {
+    let pose = support_body_pose(state, body_states, body_id);
+    let (local_anchor, local_normal) = pose.map_or((world_anchor, world_normal), |pose| {
+        let orientation = from_physics_quat(pose.rotation);
+        (
+            orientation
+                .conjugate()
+                .rotate(world_anchor - from_physics_vec3(pose.position)),
+            normalized_or(orientation.conjugate().rotate(world_normal), world_normal),
+        )
+    });
+    LocomotionSupportSnapshot {
+        body_id: body_id.into(),
+        collider_id: collider_id.into(),
+        local_anchor: canonical_vec3(local_anchor),
+        local_normal: canonical_vec3(local_normal),
+    }
+}
+
+fn support_body_pose(
+    state: &WorldState,
+    body_states: &[verse_physics::BodyState],
+    body_id: &str,
+) -> Option<PhysicsPose> {
+    body_states
+        .iter()
+        .find(|body| body.body_id == body_id)
+        .map(|body| body.pose)
+        .or_else(|| {
+            state.grids.get(body_id).map(|grid| {
+                PhysicsPose::new(
+                    to_physics_vec3(grid.position),
+                    to_physics_quat(grid.orientation),
+                )
+            })
+        })
+        .or_else(|| {
+            (body_id == PLANET_BODY_ID).then_some(PhysicsPose::new(
+                to_physics_vec3(PLANET_CENTER),
+                PhysicsQuat::IDENTITY,
+            ))
+        })
+}
+
+fn support_relative_normal_speed(
+    state: &WorldState,
+    body_states: &[verse_physics::BodyState],
+    body_id: &str,
+    world_anchor: Vec3,
+    player_velocity: Vec3,
+    surface_normal: Vec3,
+) -> f64 {
+    let support_velocity = support_point_velocity(state, body_states, body_id, world_anchor);
+    dot(player_velocity - support_velocity, surface_normal).abs()
+}
+
+fn support_point_velocity(
+    state: &WorldState,
+    body_states: &[verse_physics::BodyState],
+    body_id: &str,
+    world_anchor: Vec3,
+) -> Vec3 {
+    let Some(body) = body_states.iter().find(|body| body.body_id == body_id) else {
+        return Vec3::ZERO;
+    };
+    let linear_velocity = from_physics_vec3(body.linear_velocity);
+    let angular_velocity = from_physics_vec3(body.angular_velocity);
+    let pose_position = from_physics_vec3(body.pose.position);
+    let center_of_mass = state.grids.get(body_id).map_or(pose_position, |grid| {
+        pose_position
+            + from_physics_quat(body.pose.rotation).rotate(grid_local_center_of_mass(state, grid))
+    });
+    linear_velocity + cross(angular_velocity, world_anchor - center_of_mass)
+}
+
+fn support_world_anchor(
+    state: &WorldState,
+    body_states: &[verse_physics::BodyState],
+    support: &LocomotionSupportSnapshot,
+) -> Vec3 {
+    support_body_pose(state, body_states, &support.body_id).map_or(support.local_anchor, |pose| {
+        from_physics_vec3(pose.position)
+            + from_physics_quat(pose.rotation).rotate(support.local_anchor)
+    })
+}
+
 fn physics_controls(
     state: &WorldState,
     player: &Player,
     body_states: &[verse_physics::BodyState],
     simulation_tick: u64,
+    player_jump: Option<PlayerJumpLaunch>,
 ) -> Vec<BodyControl> {
     let physics = &content::manifest().physics;
     let mut controls = state
@@ -2998,8 +3461,67 @@ fn physics_controls(
                 };
                 acceleration = (bounded_velocity - linear_velocity) * (1.0 / delta_seconds);
             }
+        } else if matches!(
+            player.locomotion.kind,
+            LocomotionKind::Grounded | LocomotionKind::Magnetic
+        ) {
+            let up = normalized_or(player.locomotion.up, radial_up(position));
+            let local_walk_input = Vec3::new(linear_input.x, 0.0, linear_input.z);
+            let raw_world_direction = orientation.rotate(local_walk_input);
+            let tangent_direction = raw_world_direction - up * dot(raw_world_direction, up);
+            let tangent_input = if tangent_direction.magnitude() > CONTROL_INPUT_EPSILON {
+                tangent_direction
+                    * (1.0 / tangent_direction.magnitude())
+                    * local_walk_input.magnitude().min(1.0)
+            } else {
+                Vec3::ZERO
+            };
+            let support_velocity =
+                player
+                    .locomotion
+                    .support
+                    .as_ref()
+                    .map_or(Vec3::ZERO, |support| {
+                        let anchor = support_world_anchor(state, body_states, support);
+                        support_point_velocity(state, body_states, &support.body_id, anchor)
+                    });
+            let relative_velocity = linear_velocity - support_velocity;
+            let relative_tangent_velocity = relative_velocity - up * dot(relative_velocity, up);
+            let selected_speed = if boost {
+                character.sprint_speed_m_s
+            } else {
+                character.walk_speed_m_s
+            };
+            let target_tangent_velocity = tangent_input * selected_speed;
+            let motor_limit = if tangent_input.magnitude() > CONTROL_INPUT_EPSILON {
+                character.ground_acceleration_m_s2
+            } else {
+                character.ground_braking_m_s2
+            };
+            let delta_seconds = f64::from(physics.fixed_delta_seconds);
+            let tangent_acceleration = ((target_tangent_velocity - relative_tangent_velocity)
+                * (1.0 / delta_seconds))
+                .clamped(motor_limit);
+            acceleration = tangent_acceleration;
+            if matches!(player.locomotion.kind, LocomotionKind::Magnetic) {
+                acceleration = acceleration - up * character.magnetic_adhesion_acceleration_m_s2;
+            } else {
+                let gravity_into_support = dot(gravity, up).min(0.0);
+                acceleration = acceleration + gravity - up * gravity_into_support;
+            }
         }
-        let world_angular_input = orientation.rotate(angular_input);
+        if let Some(jump) = player_jump {
+            let delta_seconds = f64::from(physics.fixed_delta_seconds);
+            let relative_normal_speed = dot(linear_velocity - jump.support_velocity, jump.up);
+            acceleration = acceleration
+                + jump.up
+                    * ((character.jump_speed_m_s - relative_normal_speed) / delta_seconds).max(0.0);
+        }
+        let world_angular_input = if player.jetpack_enabled {
+            orientation.rotate(angular_input)
+        } else {
+            normalized_or(player.locomotion.up, radial_up(position)) * angular_input.y
+        };
         let angular_acceleration = if dampeners {
             let target = world_angular_input * character.maximum_angular_speed_radians_per_second;
             ((target - angular_velocity) * (1.0 / f64::from(physics.fixed_delta_seconds))).clamped(
@@ -3025,12 +3547,18 @@ fn physics_controls(
             };
             (bounded_velocity - angular_velocity) * (1.0 / delta_seconds)
         };
-        let sphere_inertia =
-            0.4 * character.mass_kg * character.collision_radius_m * character.collision_radius_m;
+        let (capsule_axis_inertia, capsule_perpendicular_inertia) =
+            character_capsule_inertia(character.mass_kg);
+        let local_angular_acceleration = orientation.conjugate().rotate(angular_acceleration);
+        let local_torque = Vec3::new(
+            local_angular_acceleration.x * capsule_perpendicular_inertia,
+            local_angular_acceleration.y * capsule_axis_inertia,
+            local_angular_acceleration.z * capsule_perpendicular_inertia,
+        ) * CHARACTER_INERTIA_MULTIPLIER;
         controls.push(BodyControl {
             body_id: PLAYER_BODY_ID.into(),
             force_newtons: to_physics_vec3(acceleration * character.mass_kg),
-            torque_newton_meters: to_physics_vec3(angular_acceleration * sphere_inertia),
+            torque_newton_meters: to_physics_vec3(orientation.rotate(local_torque)),
         });
     }
     controls
@@ -3065,7 +3593,7 @@ fn player_physics_outcome(
             .clamped(f64::from(limits.max_linear_velocity_mps)),
         angular_velocity: from_physics_vec3(body.angular_velocity)
             .clamped(f64::from(limits.max_angular_velocity_radians_per_second)),
-        surface_contact,
+        surface_contact: surface_contact || player.locomotion.support.is_some(),
         locomotion: player.locomotion.clone(),
         control_linear_input: if lease_active {
             player.control_linear_input
@@ -3880,7 +4408,7 @@ mod tests {
             unreachable!();
         };
         player.locomotion.kind = LocomotionKind::Grounded;
-        reject(wrong_locomotion, "replay_player_physics_control_invalid");
+        reject(wrong_locomotion, "replay_player_locomotion_invalid");
 
         let mut wrong_jump = canonical.clone();
         let EventPayload::PhysicsStepCommitted {
@@ -4904,25 +5432,25 @@ mod tests {
         assert!(
             player
                 .position
-                .squared_distance(Vec3::new(12.173_76, 4.152_002, 10.511_92))
+                .squared_distance(Vec3::new(12.173_758, 4.151_999, 10.511_918))
                 .sqrt()
                 <= tolerance
         );
         assert!(
             player
                 .linear_velocity
-                .squared_distance(Vec3::new(1.358_501, -2.721_636, 3.926_716))
+                .squared_distance(Vec3::new(1.358_482, -2.721_69, 3.926_687))
                 .sqrt()
                 <= tolerance
         );
         assert!(
             player
                 .angular_velocity
-                .squared_distance(Vec3::new(0.691_878, -0.461_252, 0.922_504))
+                .squared_distance(Vec3::new(0.692_12, -0.461_254, 0.922_32))
                 .sqrt()
                 <= tolerance
         );
-        let expected_orientation = Quat::new(0.044_726, -0.029_817, 0.059_634, 0.996_772);
+        let expected_orientation = Quat::new(0.044_743, -0.029_817, 0.059_621, 0.996_772);
         assert!((player.orientation.x - expected_orientation.x).abs() <= tolerance as f32);
         assert!((player.orientation.y - expected_orientation.y).abs() <= tolerance as f32);
         assert!((player.orientation.z - expected_orientation.z).abs() <= tolerance as f32);
@@ -4943,7 +5471,7 @@ mod tests {
             state.player.jetpack_enabled = true;
             state.player.dampeners = false;
             state.player.control_expires_at_simulation_tick = 1;
-            let controls = physics_controls(&state, &state.player, &[], 0);
+            let controls = physics_controls(&state, &state.player, &[], 0, None);
             let player = controls
                 .iter()
                 .find(|control| control.body_id == PLAYER_BODY_ID)
@@ -6401,9 +6929,13 @@ mod tests {
     #[test]
     fn authoritative_player_lands_on_planet_with_stable_canonical_contact() {
         let mut runtime = runtime();
-        let radius = content::manifest().character.collision_radius_m;
-        runtime.state.player.position =
-            PLANET_CENTER + Vec3::new(0.0, PLANET_SURFACE_RADIUS_M + radius + 2.0, 0.0);
+        let standing_half_height = content::manifest().character.standing_height_m * 0.5;
+        runtime.state.player.position = PLANET_CENTER
+            + Vec3::new(
+                0.0,
+                PLANET_SURFACE_RADIUS_M + standing_half_height + 2.0,
+                0.0,
+            );
         runtime.state.player.linear_velocity = Vec3::new(0.0, -24.0, 0.0);
         runtime.state.player.jetpack_enabled = false;
         runtime
@@ -6429,7 +6961,7 @@ mod tests {
                 .advance(17)
                 .expect("landed player remains simulated");
             let distance = (runtime.state().player.position - PLANET_CENTER).magnitude();
-            let gap = distance - PLANET_SURFACE_RADIUS_M - radius;
+            let gap = distance - PLANET_SURFACE_RADIUS_M - standing_half_height;
             minimum_gap = minimum_gap.min(gap);
             maximum_gap = maximum_gap.max(gap);
         }
@@ -6437,14 +6969,235 @@ mod tests {
         assert!(maximum_gap - minimum_gap < 0.05);
         assert!(runtime.state().player.linear_velocity.magnitude() < 0.25);
         assert!(runtime.state().player.surface_contact);
+        assert_eq!(
+            runtime.state().player.locomotion.kind,
+            LocomotionKind::Grounded
+        );
+        let support = runtime
+            .state()
+            .player
+            .locomotion
+            .support
+            .as_ref()
+            .expect("settled capsule retains authoritative support");
+        assert_eq!(support.body_id, PLANET_BODY_ID);
+        assert_eq!(support.collider_id, PLANET_COLLIDER_ID);
+    }
+
+    #[test]
+    fn grounded_capsule_walks_sprints_and_brakes_in_the_surface_tangent_frame() {
+        let mut runtime = runtime();
+        let standing_half_height = content::manifest().character.standing_height_m * 0.5;
+        runtime.state.player.position = PLANET_CENTER
+            + Vec3::new(
+                0.0,
+                PLANET_SURFACE_RADIUS_M + standing_half_height + 0.02,
+                0.0,
+            );
+        runtime.state.player.linear_velocity = Vec3::ZERO;
+        runtime.state.player.angular_velocity = Vec3::ZERO;
+        runtime.state.player.jetpack_enabled = false;
+        runtime.state.player.locomotion = reset_locomotion(
+            runtime.state.player.position,
+            LocomotionKind::Airborne,
+            false,
+            runtime.state.simulation_tick,
+        );
+        runtime
+            .physics
+            .rebuild(&physics_body_specs(&runtime.state))
+            .expect("grounded walking fixture rebuilds");
+        runtime.advance(17).expect("support is classified");
+        assert_eq!(
+            runtime.state().player.locomotion.kind,
+            LocomotionKind::Grounded
+        );
+
+        let initial_x = runtime.state().player.position.x;
+        runtime
+            .execute(&ClientMessage::SetPlayerControl {
+                operation_id: "ground-walk".into(),
+                movement_epoch: 1,
+                input_sequence: 1,
+                linear_input: Vec3::new(1.0, 0.0, 0.0),
+                angular_input: Vec3::ZERO,
+                boost: false,
+                jump: false,
+                dampeners: true,
+            })
+            .expect("walk input commits");
+        runtime.advance(200).expect("walk advances");
+        let walk_speed = runtime.state().player.linear_velocity.x.abs();
+        assert!(runtime.state().player.position.x > initial_x + 0.05);
+        assert!(walk_speed > 1.0);
+        assert!(walk_speed <= content::manifest().character.walk_speed_m_s + 0.1);
+
+        runtime
+            .execute(&ClientMessage::SetPlayerControl {
+                operation_id: "ground-sprint".into(),
+                movement_epoch: 1,
+                input_sequence: 2,
+                linear_input: Vec3::new(1.0, 0.0, 0.0),
+                angular_input: Vec3::ZERO,
+                boost: true,
+                jump: false,
+                dampeners: true,
+            })
+            .expect("sprint input commits");
+        runtime.advance(250).expect("sprint advances");
+        let sprint_speed = runtime.state().player.linear_velocity.x.abs();
+        assert!(sprint_speed > walk_speed);
+        assert!(sprint_speed <= content::manifest().character.sprint_speed_m_s + 0.1);
+
+        runtime
+            .execute(&ClientMessage::SetPlayerControl {
+                operation_id: "ground-brake".into(),
+                movement_epoch: 1,
+                input_sequence: 3,
+                linear_input: Vec3::ZERO,
+                angular_input: Vec3::ZERO,
+                boost: false,
+                jump: false,
+                dampeners: true,
+            })
+            .expect("brake input commits");
+        runtime.advance(250).expect("ground braking advances");
+        assert!(runtime.state().player.linear_velocity.x.abs() < sprint_speed * 0.35);
+        assert_eq!(
+            runtime.state().player.locomotion.kind,
+            LocomotionKind::Grounded
+        );
+    }
+
+    #[test]
+    fn grounded_jump_is_edge_triggered_and_inherits_support_motion() {
+        let mut runtime = runtime();
+        let standing_half_height = content::manifest().character.standing_height_m * 0.5;
+        runtime.state.player.position = PLANET_CENTER
+            + Vec3::new(
+                0.0,
+                PLANET_SURFACE_RADIUS_M + standing_half_height + 0.02,
+                0.0,
+            );
+        runtime.state.player.linear_velocity = Vec3::ZERO;
+        runtime.state.player.jetpack_enabled = false;
+        runtime.state.player.locomotion = reset_locomotion(
+            runtime.state.player.position,
+            LocomotionKind::Airborne,
+            false,
+            runtime.state.simulation_tick,
+        );
+        runtime
+            .physics
+            .rebuild(&physics_body_specs(&runtime.state))
+            .expect("jump fixture rebuilds");
+        runtime.advance(17).expect("support is classified");
+
+        runtime
+            .execute(&ClientMessage::SetPlayerControl {
+                operation_id: "ground-jump-press".into(),
+                movement_epoch: 1,
+                input_sequence: 1,
+                linear_input: Vec3::ZERO,
+                angular_input: Vec3::ZERO,
+                boost: false,
+                jump: true,
+                dampeners: true,
+            })
+            .expect("jump press commits");
+        runtime.advance(17).expect("jump launches");
+        assert_eq!(
+            runtime.state().player.locomotion.kind,
+            LocomotionKind::Airborne
+        );
+        assert!(runtime.state().player.locomotion.support.is_none());
+        assert!(runtime.state().player.linear_velocity.y > 4.0);
+        let first_launch_speed = runtime.state().player.linear_velocity.y;
+
+        runtime
+            .execute(&ClientMessage::SetPlayerControl {
+                operation_id: "ground-jump-held".into(),
+                movement_epoch: 1,
+                input_sequence: 2,
+                linear_input: Vec3::ZERO,
+                angular_input: Vec3::ZERO,
+                boost: false,
+                jump: true,
+                dampeners: true,
+            })
+            .expect("held jump frame commits");
+        runtime.advance(17).expect("held jump advances once");
+        assert!(runtime.state().player.linear_velocity.y < first_launch_speed);
+    }
+
+    #[test]
+    fn magnetic_capsule_tracks_a_powered_moving_grid_in_support_space() {
+        let mut runtime = runtime();
+        {
+            let grid = runtime
+                .state
+                .grids
+                .get_mut(STARTER_GRID_ID)
+                .expect("starter grid exists");
+            grid.linear_velocity = Vec3::new(2.0, 0.0, 0.0);
+            grid.angular_velocity = Vec3::ZERO;
+            grid.dampeners = false;
+        }
+        runtime.state.player.position = Vec3::new(11.0, 1.42, 0.0);
+        runtime.state.player.orientation = Quat::IDENTITY;
+        runtime.state.player.linear_velocity = Vec3::new(2.0, 0.0, 0.0);
+        runtime.state.player.angular_velocity = Vec3::ZERO;
+        runtime.state.player.jetpack_enabled = false;
+        runtime.state.player.locomotion = reset_locomotion(
+            runtime.state.player.position,
+            LocomotionKind::Airborne,
+            true,
+            runtime.state.simulation_tick,
+        );
+        runtime
+            .physics
+            .rebuild(&physics_body_specs(&runtime.state))
+            .expect("moving support fixture rebuilds");
+
+        runtime.advance(17).expect("magnetic support is classified");
+        assert_eq!(
+            runtime.state().player.locomotion.kind,
+            LocomotionKind::Magnetic
+        );
+        assert_eq!(
+            runtime
+                .state()
+                .player
+                .locomotion
+                .support
+                .as_ref()
+                .expect("magnetic support exists")
+                .body_id,
+            STARTER_GRID_ID
+        );
+        runtime.advance(200).expect("moving support advances");
+        let grid_speed = runtime.state().grids[STARTER_GRID_ID].linear_velocity.x;
+        let relative_speed = runtime.state().player.linear_velocity.x - grid_speed;
+        assert!(
+            relative_speed.abs() < 0.35,
+            "relative speed {relative_speed}"
+        );
+        assert_eq!(
+            runtime.state().player.locomotion.kind,
+            LocomotionKind::Magnetic
+        );
     }
 
     #[test]
     fn below_ccd_threshold_planet_step_stays_inside_the_replay_penetration_budget() {
         let mut runtime = runtime();
-        let radius = content::manifest().character.collision_radius_m;
-        runtime.state.player.position =
-            PLANET_CENTER + Vec3::new(0.0, PLANET_SURFACE_RADIUS_M + radius + 0.10, 0.0);
+        let standing_half_height = content::manifest().character.standing_height_m * 0.5;
+        runtime.state.player.position = PLANET_CENTER
+            + Vec3::new(
+                0.0,
+                PLANET_SURFACE_RADIUS_M + standing_half_height + 0.10,
+                0.0,
+            );
         runtime.state.player.linear_velocity = Vec3::new(0.0, -12.0, 0.0);
         runtime.state.player.jetpack_enabled = false;
         runtime
@@ -6456,7 +7209,11 @@ mod tests {
             .advance(17)
             .expect("near-threshold planet step remains replay-valid");
         let distance = (runtime.state().player.position - PLANET_CENTER).magnitude();
-        assert!(distance >= PLANET_SURFACE_RADIUS_M + radius - PLAYER_PLANET_PENETRATION_LIMIT_M);
+        assert!(
+            distance
+                >= PLANET_SURFACE_RADIUS_M + standing_half_height
+                    - PLAYER_PLANET_PENETRATION_LIMIT_M
+        );
     }
 
     #[test]

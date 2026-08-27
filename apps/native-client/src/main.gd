@@ -11,11 +11,11 @@ const PLANET_SHADER: Shader = preload("res://shaders/planet_surface.gdshader")
 const ATMOSPHERE_SHADER: Shader = preload("res://shaders/planet_atmosphere.gdshader")
 const CLOUD_SHADER: Shader = preload("res://shaders/planet_clouds.gdshader")
 const BLOCK_DAMAGE_SHADER: Shader = preload("res://shaders/block_damage.gdshader")
-const PROTOCOL_VERSION := 9
+const PROTOCOL_VERSION := 10
 const DEFAULT_SERVER := "ws://127.0.0.1:7777/ws"
 const PLAYER_INVENTORY := "inventory-player-local"
 const STARTER_GRID := "grid-starter"
-# Clean-room prediction mirrors the protocol-fenced p0.9.0 character content.
+# Clean-room prediction mirrors the protocol-fenced p0.10.0 character content.
 # The server remains authoritative for elapsed time, contacts, and final motion.
 const CHARACTER_FIXED_DELTA := 1.0 / 60.0
 const CONTROL_SEND_INTERVAL := 0.10
@@ -23,6 +23,10 @@ const PREDICTION_HISTORY_LIMIT := 180
 const POSITION_SNAP_DISTANCE := 2.0
 const ORIENTATION_SNAP_ANGLE := PI / 3.0
 const CHARACTER_COLLISION_RADIUS := 0.34
+const CHARACTER_STANDING_HEIGHT := 1.8
+const CHARACTER_EYE_HEIGHT := 1.62
+const CHARACTER_CAPSULE_HALF_HEIGHT := (CHARACTER_STANDING_HEIGHT - 2.0 * CHARACTER_COLLISION_RADIUS) * 0.5
+const CHARACTER_EYE_OFFSET := CHARACTER_EYE_HEIGHT - CHARACTER_STANDING_HEIGHT * 0.5
 const CHARACTER_THRUST_ACCELERATION := 10.0
 const CHARACTER_BOOST_ACCELERATION := 20.0
 const CHARACTER_LINEAR_DAMPENER_ACCELERATION := 14.0
@@ -31,6 +35,12 @@ const CHARACTER_ANGULAR_DAMPENER_ACCELERATION := 7.0
 const CHARACTER_MAXIMUM_SPEED := 12.0
 const CHARACTER_BOOST_MAXIMUM_SPEED := 24.0
 const CHARACTER_MAXIMUM_ANGULAR_SPEED := 2.5
+const CHARACTER_WALK_SPEED := 4.5
+const CHARACTER_SPRINT_SPEED := 7.5
+const CHARACTER_GROUND_ACCELERATION := 18.0
+const CHARACTER_GROUND_BRAKING := 24.0
+const CHARACTER_JUMP_SPEED := 5.0
+const CHARACTER_MAGNETIC_ADHESION_ACCELERATION := 24.0
 const PHYSICS_MAXIMUM_LINEAR_SPEED := 32.0
 const PHYSICS_MAXIMUM_ANGULAR_SPEED := 8.0
 const MOUSE_ANGULAR_INPUT_PER_PIXEL := 0.12
@@ -79,12 +89,14 @@ var predicted_orientation := Quaternion.IDENTITY
 var predicted_linear_velocity := Vector3.ZERO
 var predicted_angular_velocity := Vector3.ZERO
 var predicted_surface_contact := false
+var predicted_jump_held := false
 var prediction_planet_center := Vector3.ZERO
 var prediction_surface_radius := 0.0
 var prediction_gravitational_parameter := 0.0
 var prediction_gravity_fallback := Vector3.ZERO
 var prediction_gravity_model_ready := false
 var desired_dampeners := true
+var desired_magnetic_boots := false
 var last_sent_control: Dictionary = {}
 var current_prediction_input_sequence := 0
 var prediction_history: Array[Dictionary] = []
@@ -270,6 +282,8 @@ func _input(event: InputEvent) -> void:
 				_set_inventory_open(not inventory_open)
 			KEY_J:
 				_toggle_jetpack()
+			KEY_K:
+				_toggle_magnetic_boots()
 			KEY_H:
 				_toggle_helmet()
 			KEY_1:
@@ -950,7 +964,7 @@ func _build_interface() -> void:
 	selected_label = hotbar_label
 
 	var controls := _hud_label(
-		"WASD / SPACE / C  MOVE    SHIFT  BOOST    Q/E  ROLL    HOLD M  GRID THRUST    X  STOP    I  INVENTORY    B  BUILD",
+		"WASD  MOVE    SPACE  JUMP/ASCEND    SHIFT  SPRINT/BOOST    Q/E  EVA ROLL    J  JETPACK    K  MAG BOOTS    I  INVENTORY",
 		Vector2(20.0, -40.0),
 		11
 	)
@@ -1617,6 +1631,7 @@ func _apply_authoritative_player(
 	var incoming_epoch := int(player.get("movement_epoch", 0))
 	var incoming_ack := int(player.get("last_processed_input_sequence", 0))
 	var incoming_received := int(player.get("last_received_input_sequence", incoming_ack))
+	var incoming_locomotion: Dictionary = player.get("locomotion", {})
 	var lifecycle_reset := (
 		not authoritative_player_ready
 		or awaiting_reconnect_baseline
@@ -1625,7 +1640,7 @@ func _apply_authoritative_player(
 		or incoming_epoch != movement_epoch
 		or source == "reconnect"
 	)
-	var old_present_position := camera.position
+	var old_present_position := camera.position - _camera_eye_offset()
 	var old_present_orientation := camera.quaternion
 	var old_history := prediction_history.duplicate(true)
 	var old_predicted_simulation_tick := predicted_simulation_tick
@@ -1645,6 +1660,7 @@ func _apply_authoritative_player(
 	predicted_linear_velocity = _vec3(player.get("linear_velocity", {}))
 	predicted_angular_velocity = _vec3(player.get("angular_velocity", {}))
 	predicted_surface_contact = bool(player.get("surface_contact", false))
+	predicted_jump_held = bool(incoming_locomotion.get("jump_held", false))
 	predicted_simulation_tick = simulation_tick
 	movement_epoch = incoming_epoch
 	last_acked_input_sequence = incoming_ack
@@ -1664,6 +1680,7 @@ func _apply_authoritative_player(
 		next_input_sequence = incoming_received + 1
 		current_prediction_input_sequence = incoming_ack
 		desired_dampeners = bool(player.get("dampeners", true))
+		desired_magnetic_boots = bool(incoming_locomotion.get("magnetic_boots_enabled", false))
 		last_sent_control = {}
 		control_send_elapsed = CONTROL_SEND_INTERVAL
 		mouse_delta_accumulator = Vector2.ZERO
@@ -1677,6 +1694,7 @@ func _apply_authoritative_player(
 		prediction_history_invalid = false
 		current_prediction_input_sequence = incoming_ack
 		desired_dampeners = bool(player.get("dampeners", true))
+		desired_magnetic_boots = bool(incoming_locomotion.get("magnetic_boots_enabled", false))
 		last_sent_control = {}
 		control_send_elapsed = CONTROL_SEND_INTERVAL
 		mouse_delta_accumulator = Vector2.ZERO
@@ -1700,22 +1718,26 @@ func _apply_authoritative_player(
 			_predict_player_step(frame.get("control", _neutral_player_control()), CHARACTER_FIXED_DELTA, true)
 		if pending_controls.is_empty():
 			desired_dampeners = bool(player.get("dampeners", true))
+		desired_magnetic_boots = bool(incoming_locomotion.get("magnetic_boots_enabled", false))
 
 	var correction_distance := old_present_position.distance_to(predicted_position)
+	var target_view_orientation := _player_view_orientation(
+		predicted_orientation, incoming_locomotion
+	)
 	var correction_angle := _quaternion_angular_distance(
-		old_present_orientation, predicted_orientation
+		old_present_orientation, target_view_orientation
 	)
 	if _correction_requires_snap(
 		lifecycle_reset or history_reset, correction_distance, correction_angle
 	):
 		presentation_position_offset = Vector3.ZERO
 		presentation_orientation_offset = Quaternion.IDENTITY
-		camera.position = predicted_position
-		camera.quaternion = predicted_orientation
+		camera.position = predicted_position + _camera_eye_offset()
+		camera.quaternion = target_view_orientation
 	else:
 		presentation_position_offset = old_present_position - predicted_position
 		presentation_orientation_offset = (
-			old_present_orientation * predicted_orientation.inverse()
+			old_present_orientation * target_view_orientation.inverse()
 		).normalized()
 
 	authoritative_player_ready = true
@@ -2289,9 +2311,16 @@ func _sample_player_control() -> Dictionary:
 	if Input.mouse_mode != Input.MOUSE_MODE_CAPTURED or inventory_open:
 		mouse_delta_accumulator = Vector2.ZERO
 		return _neutral_player_control()
+	var player: Dictionary = snapshot.get("player", {})
+	var jetpack_enabled := bool(player.get("jetpack_enabled", true))
+	var vertical_input := (
+		Input.get_action_strength("move_up") - Input.get_action_strength("move_down")
+		if jetpack_enabled
+		else 0.0
+	)
 	var linear_input := Vector3(
 		Input.get_action_strength("move_right") - Input.get_action_strength("move_left"),
-		Input.get_action_strength("move_up") - Input.get_action_strength("move_down"),
+		vertical_input,
 		Input.get_action_strength("move_backward") - Input.get_action_strength("move_forward")
 	).limit_length(1.0)
 	var roll_input := (
@@ -2308,6 +2337,7 @@ func _sample_player_control() -> Dictionary:
 		"linear_input": linear_input,
 		"angular_input": angular_input,
 		"boost": Input.is_action_pressed("move_boost"),
+		"jump": not jetpack_enabled and Input.is_action_pressed("move_up"),
 		"dampeners": desired_dampeners,
 	}
 
@@ -2317,6 +2347,7 @@ func _neutral_player_control() -> Dictionary:
 		"linear_input": Vector3.ZERO,
 		"angular_input": Vector3.ZERO,
 		"boost": false,
+		"jump": false,
 		"dampeners": desired_dampeners,
 	}
 
@@ -2332,6 +2363,7 @@ func _controls_equal(first: Dictionary, second: Dictionary) -> bool:
 			second.get("angular_input", Vector3.ZERO) as Vector3
 		)
 		and bool(first.get("boost", false)) == bool(second.get("boost", false))
+		and bool(first.get("jump", false)) == bool(second.get("jump", false))
 		and bool(first.get("dampeners", true)) == bool(second.get("dampeners", true))
 	)
 
@@ -2360,6 +2392,7 @@ func _send_player_control(control: Dictionary, force: bool) -> bool:
 		"linear_input": (control.get("linear_input", Vector3.ZERO) as Vector3).limit_length(1.0),
 		"angular_input": (control.get("angular_input", Vector3.ZERO) as Vector3).limit_length(1.0),
 		"boost": bool(control.get("boost", false)),
+		"jump": bool(control.get("jump", false)),
 		"dampeners": bool(control.get("dampeners", true)),
 	}
 	var sequence := next_input_sequence
@@ -2410,30 +2443,45 @@ func _player_control_message(
 		"linear_input": _protocol_vec3(control.get("linear_input", Vector3.ZERO)),
 		"angular_input": _protocol_vec3(control.get("angular_input", Vector3.ZERO)),
 		"boost": bool(control.get("boost", false)),
+		"jump": bool(control.get("jump", false)),
 		"dampeners": bool(control.get("dampeners", true)),
 	}
 
 
 func _predict_player_step(control: Dictionary, delta: float, record_history: bool) -> void:
 	var player: Dictionary = snapshot.get("player", {})
+	var locomotion: Dictionary = player.get("locomotion", {})
+	var prediction_control := control.duplicate(true)
+	var jump_held := bool(control.get("jump", false))
+	prediction_control["jump"] = jump_held and not predicted_jump_held
+	predicted_jump_held = jump_held
 	var result := _integrate_player_motion(
 		predicted_position,
 		predicted_orientation,
 		predicted_linear_velocity,
 		predicted_angular_velocity,
-		control,
+		prediction_control,
 		_prediction_gravity(predicted_position),
 		bool(player.get("jetpack_enabled", true)),
-		delta
+		delta,
+		locomotion
 	)
 	var proposed_position: Vector3 = result.get("position", predicted_position)
-	var sweep := _sweep_player_position(predicted_position, proposed_position)
+	var locomotion_kind := String(locomotion.get("kind", "eva"))
+	var supported := locomotion_kind in ["grounded", "magnetic"] and not bool(
+		prediction_control.get("jump", false)
+	)
+	var sweep := (
+		{"position": proposed_position, "collided": true}
+		if supported
+		else _sweep_player_position(predicted_position, proposed_position)
+	)
 	predicted_position = sweep.get("position", proposed_position)
 	predicted_orientation = result.get("orientation", predicted_orientation)
 	predicted_linear_velocity = result.get("linear_velocity", predicted_linear_velocity)
 	predicted_angular_velocity = result.get("angular_velocity", predicted_angular_velocity)
 	predicted_surface_contact = bool(sweep.get("collided", false))
-	if predicted_surface_contact:
+	if predicted_surface_contact and not supported:
 		predicted_linear_velocity *= 0.05
 		tool_kick = max(tool_kick, 0.22)
 	predicted_simulation_tick += 1
@@ -2454,7 +2502,8 @@ func _integrate_player_motion(
 	control: Dictionary,
 	gravity: Vector3,
 	jetpack_enabled: bool,
-	delta: float
+	delta: float,
+	locomotion: Dictionary = {}
 ) -> Dictionary:
 	var linear_input := (control.get("linear_input", Vector3.ZERO) as Vector3).limit_length(1.0)
 	var angular_input := (control.get("angular_input", Vector3.ZERO) as Vector3).limit_length(1.0)
@@ -2492,11 +2541,45 @@ func _integrate_player_motion(
 			maximum_acceleration
 		)
 		linear_velocity += acceleration * delta
+	elif String(locomotion.get("kind", "airborne")) in ["grounded", "magnetic"]:
+		var up := _vec3(locomotion.get("up", {"x": 0.0, "y": 1.0, "z": 0.0}))
+		up = up.normalized() if up.length_squared() > 0.000001 else Vector3.UP
+		var walk_input := Vector3(linear_input.x, 0.0, linear_input.z)
+		var raw_direction := body_basis * walk_input
+		var tangent_direction := raw_direction - up * raw_direction.dot(up)
+		var tangent_input := (
+			tangent_direction.normalized() * minf(walk_input.length(), 1.0)
+			if tangent_direction.length_squared() > 0.000001
+			else Vector3.ZERO
+		)
+		var support_velocity := _prediction_support_velocity(locomotion)
+		var relative_velocity := linear_velocity - support_velocity
+		var relative_tangent := relative_velocity - up * relative_velocity.dot(up)
+		var selected_speed := CHARACTER_SPRINT_SPEED if boost else CHARACTER_WALK_SPEED
+		var target_tangent := tangent_input * selected_speed
+		var motor_acceleration := (
+			CHARACTER_GROUND_ACCELERATION
+			if tangent_input.length_squared() > 0.000001
+			else CHARACTER_GROUND_BRAKING
+		)
+		relative_tangent = relative_tangent.move_toward(
+			target_tangent, motor_acceleration * delta
+		)
+		linear_velocity = support_velocity + relative_tangent
+		if bool(control.get("jump", false)):
+			linear_velocity += up * CHARACTER_JUMP_SPEED
+		elif String(locomotion.get("kind", "")) == "magnetic":
+			linear_velocity -= up * CHARACTER_MAGNETIC_ADHESION_ACCELERATION * delta
 	else:
 		linear_velocity += gravity * delta
 	linear_velocity = linear_velocity.limit_length(PHYSICS_MAXIMUM_LINEAR_SPEED)
 
-	var world_angular_input := body_basis * angular_input
+	var world_angular_input := (
+		body_basis * angular_input
+		if jetpack_enabled
+		else _vec3(locomotion.get("up", {"x": 0.0, "y": 1.0, "z": 0.0})).normalized()
+			* angular_input.y
+	)
 	if dampeners:
 		var target_angular_velocity := world_angular_input * CHARACTER_MAXIMUM_ANGULAR_SPEED
 		var angular_acceleration := (
@@ -2527,6 +2610,20 @@ func _integrate_player_motion(
 		"linear_velocity": linear_velocity,
 		"angular_velocity": angular_velocity,
 	}
+
+
+func _prediction_support_velocity(locomotion: Dictionary) -> Vector3:
+	var support: Dictionary = locomotion.get("support", {})
+	var body_id := String(support.get("body_id", ""))
+	if body_id.is_empty() or not grid_lookup.has(body_id):
+		return Vector3.ZERO
+	var grid: Dictionary = grid_lookup.get(body_id, {})
+	var grid_position := _vec3(grid.get("position", {}))
+	var grid_basis := _grid_basis(grid)
+	var world_anchor := grid_position + grid_basis * _vec3(support.get("local_anchor", {}))
+	var linear_velocity := _vec3(grid.get("linear_velocity", {}))
+	var angular_velocity := _vec3(grid.get("angular_velocity", {}))
+	return linear_velocity + angular_velocity.cross(world_anchor - grid_position)
 
 
 func _prediction_gravity(position: Vector3) -> Vector3:
@@ -2581,11 +2678,20 @@ func _sweep_player_position(start: Vector3, finish: Vector3) -> Dictionary:
 
 func _player_position_is_clear(position: Vector3) -> bool:
 	var environment: Dictionary = snapshot.get("environment", {})
+	var capsule_up := _camera_up()
 	var surface_radius := float(environment.get("surface_radius_m", 0.0))
 	if surface_radius > 0.0:
 		var planet_center := _vec3(environment.get("planet_center", {}))
-		if position.distance_to(planet_center) < surface_radius + CHARACTER_COLLISION_RADIUS:
+		var radial := position - planet_center
+		var radial_up := radial.normalized() if radial.length_squared() > 0.000001 else Vector3.UP
+		var radial_extent := CHARACTER_COLLISION_RADIUS + CHARACTER_CAPSULE_HALF_HEIGHT * absf(
+			capsule_up.dot(radial_up)
+		)
+		if radial.length() < surface_radius + radial_extent:
 			return false
+	var capsule_centers: Array[Vector3] = []
+	for fraction in [-1.0, -0.5, 0.0, 0.5, 1.0]:
+		capsule_centers.append(position + capsule_up * CHARACTER_CAPSULE_HALF_HEIGHT * fraction)
 	var collision_offsets: Array[Vector3] = [
 		Vector3.ZERO,
 		Vector3(CHARACTER_COLLISION_RADIUS, 0.0, 0.0),
@@ -2595,25 +2701,27 @@ func _player_position_is_clear(position: Vector3) -> bool:
 		Vector3(0.0, 0.0, CHARACTER_COLLISION_RADIUS),
 		Vector3(0.0, 0.0, -CHARACTER_COLLISION_RADIUS),
 	]
-	for offset in collision_offsets:
-		var sample: Vector3 = position + offset
-		var coordinate := Vector3i(roundi(sample.x), roundi(sample.y), roundi(sample.z))
-		if voxel_lookup.has(_coord_key(coordinate)):
-			return false
+	for center in capsule_centers:
+		for offset in collision_offsets:
+			var sample: Vector3 = center + offset
+			var coordinate := Vector3i(roundi(sample.x), roundi(sample.y), roundi(sample.z))
+			if voxel_lookup.has(_coord_key(coordinate)):
+				return false
 	for grid_id in grid_lookup:
 		var grid: Dictionary = grid_lookup[grid_id]
-		var local_position := _grid_basis(grid).inverse() * (
-			position - _vec3(grid.get("position", {}))
-		)
-		for block in grid.get("blocks", []):
-			var delta := local_position - _coord_vector(block.get("coordinate", {}))
-			var closest := Vector3(
-				clampf(delta.x, -0.5, 0.5),
-				clampf(delta.y, -0.5, 0.5),
-				clampf(delta.z, -0.5, 0.5)
-			)
-			if (delta - closest).length_squared() < CHARACTER_COLLISION_RADIUS * CHARACTER_COLLISION_RADIUS:
-				return false
+		var inverse_grid_basis := _grid_basis(grid).inverse()
+		var grid_position := _vec3(grid.get("position", {}))
+		for center in capsule_centers:
+			var local_position := inverse_grid_basis * (center - grid_position)
+			for block in grid.get("blocks", []):
+				var delta := local_position - _coord_vector(block.get("coordinate", {}))
+				var closest := Vector3(
+					clampf(delta.x, -0.5, 0.5),
+					clampf(delta.y, -0.5, 0.5),
+					clampf(delta.z, -0.5, 0.5)
+				)
+				if (delta - closest).length_squared() < CHARACTER_COLLISION_RADIUS * CHARACTER_COLLISION_RADIUS:
+					return false
 	return true
 
 
@@ -2625,12 +2733,36 @@ func _update_player_presentation(delta: float) -> void:
 	presentation_orientation_offset = _shortest_slerp(
 		presentation_orientation_offset, Quaternion.IDENTITY, blend
 	)
-	camera.position = predicted_position + presentation_position_offset
-	camera.quaternion = (presentation_orientation_offset * predicted_orientation).normalized()
+	var locomotion: Dictionary = snapshot.get("player", {}).get("locomotion", {})
+	var view_orientation := _player_view_orientation(predicted_orientation, locomotion)
+	camera.position = predicted_position + presentation_position_offset + _camera_eye_offset()
+	camera.quaternion = (presentation_orientation_offset * view_orientation).normalized()
 	var boost_amount := clampf(
 		predicted_linear_velocity.length() / CHARACTER_BOOST_MAXIMUM_SPEED, 0.0, 1.0
 	)
 	camera.fov = lerpf(camera.fov, 74.0 + boost_amount * 8.0, minf(delta * 5.0, 1.0))
+
+
+func _camera_up() -> Vector3:
+	var player: Dictionary = snapshot.get("player", {})
+	var locomotion: Dictionary = player.get("locomotion", {})
+	var kind := String(locomotion.get("kind", "eva"))
+	if kind in ["grounded", "magnetic", "airborne"]:
+		var authoritative_up := _vec3(locomotion.get("up", {}))
+		if authoritative_up.length_squared() > 0.000001:
+			return authoritative_up.normalized()
+	return (Basis(predicted_orientation) * Vector3.UP).normalized()
+
+
+func _camera_eye_offset() -> Vector3:
+	return _camera_up() * CHARACTER_EYE_OFFSET
+
+
+func _player_view_orientation(body_orientation: Quaternion, locomotion: Dictionary) -> Quaternion:
+	if String(locomotion.get("kind", "eva")) == "eva":
+		return body_orientation
+	var pitch := float(locomotion.get("view_pitch_radians", 0.0))
+	return (body_orientation * Quaternion(Vector3.RIGHT, pitch)).normalized()
 
 
 func _shortest_slerp(first: Quaternion, second: Quaternion, weight: float) -> Quaternion:
@@ -2949,6 +3081,33 @@ func _run_motion_prediction_smoke_assertions() -> bool:
 		true,
 		CHARACTER_FIXED_DELTA
 	)
+	var grounded_locomotion := {
+		"kind": "grounded",
+		"up": {"x": 0.0, "y": 1.0, "z": 0.0},
+		"support": {},
+	}
+	var ground_walk_control := dampened_control.duplicate(true)
+	ground_walk_control["linear_input"] = Vector3.RIGHT
+	ground_walk_control["jump"] = false
+	var ground_jump_control := dampened_control.duplicate(true)
+	ground_jump_control["jump"] = true
+	var ground_roll_control := dampened_control.duplicate(true)
+	ground_roll_control["angular_input"] = Vector3(0.0, 0.0, 1.0)
+	var ground_walk := _integrate_player_motion(
+		Vector3.ZERO, Quaternion.IDENTITY, Vector3.ZERO, Vector3.ZERO,
+		ground_walk_control, gravity_probe, false, CHARACTER_FIXED_DELTA,
+		grounded_locomotion
+	)
+	var ground_jump := _integrate_player_motion(
+		Vector3.ZERO, Quaternion.IDENTITY, Vector3.ZERO, Vector3.ZERO,
+		ground_jump_control, gravity_probe, false, CHARACTER_FIXED_DELTA,
+		grounded_locomotion
+	)
+	var ground_roll := _integrate_player_motion(
+		Vector3.ZERO, Quaternion.IDENTITY, Vector3.ZERO, Vector3.ZERO,
+		ground_roll_control, gravity_probe, false, CHARACTER_FIXED_DELTA,
+		grounded_locomotion
+	)
 	var message := _player_control_message("player-control-4-9", 4, 9, roll_control)
 	var forbidden_fields := [
 		"position", "orientation", "linear_velocity", "angular_velocity",
@@ -2971,6 +3130,7 @@ func _run_motion_prediction_smoke_assertions() -> bool:
 		message.get("type", "") == "set_player_control"
 		and int(message.get("movement_epoch", 0)) == 4
 		and int(message.get("input_sequence", 0)) == 9
+		and message.has("jump")
 		and not contains_forbidden_field
 		and (drift.get("linear_velocity", Vector3.ZERO) as Vector3).is_equal_approx(
 			gravity_probe * CHARACTER_FIXED_DELTA
@@ -3016,6 +3176,10 @@ func _run_motion_prediction_smoke_assertions() -> bool:
 		)
 		and float(rolled_orientation.length_squared()) > 0.999
 		and (rolled.get("angular_velocity", Vector3.ZERO) as Vector3).z < 0.0
+		and (ground_walk.get("linear_velocity", Vector3.ZERO) as Vector3).x > 0.0
+		and is_zero_approx((ground_walk.get("linear_velocity", Vector3.ZERO) as Vector3).y)
+		and (ground_jump.get("linear_velocity", Vector3.ZERO) as Vector3).y >= CHARACTER_JUMP_SPEED
+		and (ground_roll.get("angular_velocity", Vector3.ZERO) as Vector3).is_zero_approx()
 		and _controls_equal(dampened_control, dampened_control.duplicate(true))
 		and not _controls_equal(dampened_control, roll_control)
 		and _control_send_due(dampened_control, thrust_control, 0.0)
@@ -3027,7 +3191,7 @@ func _run_motion_prediction_smoke_assertions() -> bool:
 		printerr("VERSE_CHARACTER_PREDICTION_FAILED")
 		return false
 	print(
-		"VERSE_CHARACTER_PREDICTION_OK input_only=true roll=single_path fixed_step=60hz drift=inertial caps=preserved"
+		"VERSE_CHARACTER_PREDICTION_OK input_only=true roll=eva_only ground=walk_jump fixed_step=60hz drift=inertial caps=preserved"
 	)
 	return true
 
@@ -3483,7 +3647,21 @@ func _toggle_jetpack() -> void:
 		"operation_id": _operation_id("suit"),
 		"helmet_closed": bool(player.get("helmet_closed", true)),
 		"jetpack_enabled": not bool(player.get("jetpack_enabled", true)),
+		"magnetic_boots_enabled": desired_magnetic_boots,
 	})
+
+
+func _toggle_magnetic_boots() -> void:
+	var player: Dictionary = snapshot.get("player", {})
+	desired_magnetic_boots = not desired_magnetic_boots
+	_send({
+		"type": "set_suit_mode",
+		"operation_id": _operation_id("suit"),
+		"helmet_closed": bool(player.get("helmet_closed", true)),
+		"jetpack_enabled": bool(player.get("jetpack_enabled", true)),
+		"magnetic_boots_enabled": desired_magnetic_boots,
+	})
+	_set_message("Magnetic boots %s" % ("armed" if desired_magnetic_boots else "off"))
 
 
 func _toggle_helmet() -> void:
@@ -3493,6 +3671,7 @@ func _toggle_helmet() -> void:
 		"operation_id": _operation_id("suit"),
 		"helmet_closed": not bool(player.get("helmet_closed", true)),
 		"jetpack_enabled": bool(player.get("jetpack_enabled", true)),
+		"magnetic_boots_enabled": desired_magnetic_boots,
 	})
 
 
@@ -3637,11 +3816,23 @@ func _update_interface() -> void:
 	var suit_power := clampi(100 - roundi(predicted_linear_velocity.length() * 1.4), 72, 100)
 	var oxygen_percent := int(player.get("suit_oxygen_milli", 1000)) / 10
 	var helmet_state := "SEALED" if player.get("helmet_closed", true) else "OPEN"
-	var jetpack_state := "JET" if player.get("jetpack_enabled", true) else "FALL"
+	var locomotion: Dictionary = player.get("locomotion", {})
+	var locomotion_kind := String(locomotion.get("kind", "eva"))
+	var jetpack_state := (
+		"JET"
+		if player.get("jetpack_enabled", true)
+		else "MAG-LOCK"
+		if locomotion_kind == "magnetic"
+		else "GROUND"
+		if locomotion_kind == "grounded"
+		else "FREEFALL"
+	)
+	var boots_state := "BOOTS ARMED" if desired_magnetic_boots else "BOOTS OFF"
 	var dampener_state := "DAMP" if desired_dampeners else "DRIFT"
 	var contact_state := "CONTACT" if predicted_surface_contact else "FREE"
-	telemetry_label.text = "O₂ %03d%%   PWR %03d%%   %s   %s   %s   %s" % [
-		oxygen_percent, suit_power, helmet_state, jetpack_state, dampener_state, contact_state
+	telemetry_label.text = "O₂ %03d%%   PWR %03d%%   %s   %s   %s   %s   %s" % [
+		oxygen_percent, suit_power, helmet_state, jetpack_state, boots_state,
+		dampener_state, contact_state
 	]
 	var life_support_state := _life_support_display_state(player)
 	telemetry_label.add_theme_color_override(
@@ -3705,7 +3896,7 @@ func _update_interface() -> void:
 			"     ".join(hotbar_parts), build_rotation_quarters * 90
 		]
 	else:
-		hotbar_label.text = "HAND DRILL     [Q/E] ROLL     [B] CONSTRUCTION     [R] REFINE     [T] FABRICATE     [V] CARGO"
+		hotbar_label.text = "HAND DRILL     [J] JETPACK     [K] MAG BOOTS     [B] CONSTRUCTION     [R] REFINE     [T] FABRICATE     [V] CARGO"
 	if target_voxel != null:
 		var voxel: Dictionary = voxel_lookup.get(_coord_key(target_voxel), {})
 		var deposit := (

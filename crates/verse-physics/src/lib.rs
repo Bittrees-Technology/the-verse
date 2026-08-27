@@ -109,6 +109,8 @@ pub struct BodySpec {
     pub friction: f32,
     pub restitution: f32,
     pub gravity_factor: f32,
+    /// Multiplies rotational inertia without changing translational mass.
+    pub inertia_multiplier: f32,
     pub allow_sleeping: bool,
     pub motion_quality: MotionQuality,
     /// Box colliders are retained under the original field name so existing
@@ -133,6 +135,7 @@ impl BodySpec {
             friction: 0.4,
             restitution: 0.0,
             gravity_factor: 0.0,
+            inertia_multiplier: 1.0,
             allow_sleeping: true,
             motion_quality: MotionQuality::Discrete,
             colliders,
@@ -155,6 +158,7 @@ impl BodySpec {
             friction: 0.4,
             restitution: 0.0,
             gravity_factor: 0.0,
+            inertia_multiplier: 1.0,
             allow_sleeping: true,
             motion_quality: MotionQuality::Discrete,
             colliders,
@@ -734,11 +738,12 @@ fn validated_specs(
             || !(0.0..=1.0).contains(&body.restitution)
             || !body.gravity_factor.is_finite()
             || !(0.0..=8.0).contains(&body.gravity_factor)
+            || !body.inertia_multiplier.is_finite()
+            || !(0.01..=100.0).contains(&body.inertia_multiplier)
         {
             return Err(PhysicsError::InvalidBody {
                 body_id: body.body_id.clone(),
-                message: "friction, restitution, or gravity factor is outside its safe range"
-                    .into(),
+                message: "friction, restitution, gravity factor, or inertia multiplier is outside its safe range".into(),
             });
         }
         if body.motion == BodyMotion::Static && body.motion_quality != MotionQuality::Discrete {
