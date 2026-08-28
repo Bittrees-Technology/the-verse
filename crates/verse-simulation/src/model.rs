@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::ops::{Deref, DerefMut};
 
 use serde::{Deserialize, Serialize};
 use verse_protocol::{
     BlockKind, BlockSnapshot, CareerSnapshot, ConservationSnapshot, DeathDropSnapshot,
-    EnvironmentSnapshot, GridMotionSnapshot, GridSnapshot, IVec3, InventoryContents,
+    EnvironmentSnapshot, GridMotionSnapshot, GridSnapshot, IVec3, IntentReceipt, InventoryContents,
     InventoryDomain, InventorySnapshot, LocomotionKind, MotionSnapshot, PlayerDeathCause,
     PlayerLifeState, PlayerLocomotionSnapshot, PlayerMotionSnapshot, PlayerSnapshot, PowerSnapshot,
     Quat, ResourceKind, Vec3, VoxelMaterial, VoxelSnapshot, WorldSnapshot,
@@ -13,7 +14,10 @@ use verse_protocol::{
 
 use crate::content;
 
-pub const WORLD_SCHEMA_VERSION: u32 = 13;
+pub const WORLD_SCHEMA_VERSION: u32 = 16;
+pub const PROCESSED_OPERATION_RETENTION_LIMIT: usize = 128;
+pub const PROCESSED_OPERATION_RETAINED_BYTES_LIMIT: usize = 131_072;
+pub const PROCESSED_OPERATION_RECORD_BYTES_LIMIT: usize = 4_096;
 pub const PLAYER_INVENTORY_ID: &str = "inventory-player-local";
 pub const STARTER_GRID_ID: &str = "grid-starter";
 pub const PLANET_CENTER: Vec3 = Vec3::new(900.0, -2_200.0, -3_800.0);
@@ -22,6 +26,21 @@ pub const PLANET_ATMOSPHERE_HEIGHT_M: f64 = 180.0;
 pub const PLANET_SURFACE_GRAVITY_M_S2: f64 = 6.2;
 pub const PLAYER_INVENTORY_CAPACITY_LITERS: u64 = 1_200;
 pub const CARGO_INVENTORY_CAPACITY_LITERS: u64 = 8_000;
+
+pub fn valid_player_id(player_id: &str) -> bool {
+    !player_id.is_empty()
+        && player_id.len() <= 128
+        && player_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+pub fn valid_blake3_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
 
 pub fn radial_up(position: Vec3) -> Vec3 {
     let radial = position - PLANET_CENTER;
@@ -189,6 +208,80 @@ pub struct Player {
     pub life_state: PlayerLifeState,
 }
 
+/// Canonically ordered player ownership. Dereferencing intentionally exposes
+/// the primary P0 pilot while P1 systems migrate one subsystem at a time to
+/// explicit actor lookup; serialized state already has one roster source of
+/// truth and cannot duplicate the primary player.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlayerRoster {
+    pub primary_player_id: String,
+    pub by_id: BTreeMap<String, Player>,
+}
+
+impl PlayerRoster {
+    pub fn from_primary(player: Player) -> Self {
+        let primary_player_id = player.player_id.clone();
+        Self {
+            primary_player_id: primary_player_id.clone(),
+            by_id: BTreeMap::from([(primary_player_id, player)]),
+        }
+    }
+
+    pub fn get(&self, player_id: &str) -> Option<&Player> {
+        self.by_id.get(player_id)
+    }
+
+    pub fn get_mut(&mut self, player_id: &str) -> Option<&mut Player> {
+        self.by_id.get_mut(player_id)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &Player)> {
+        self.by_id.iter()
+    }
+
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.primary_player_id.trim().is_empty()
+            || !self.by_id.contains_key(&self.primary_player_id)
+        {
+            return Err("player roster must identify one present primary player");
+        }
+        if self
+            .by_id
+            .iter()
+            .any(|(player_id, player)| player_id != &player.player_id)
+        {
+            return Err("player roster keys must match canonical player IDs");
+        }
+        Ok(())
+    }
+
+    pub fn primary(&self) -> &Player {
+        self.by_id
+            .get(&self.primary_player_id)
+            .expect("canonical player roster contains its primary player")
+    }
+
+    pub fn primary_mut(&mut self) -> &mut Player {
+        self.by_id
+            .get_mut(&self.primary_player_id)
+            .expect("canonical player roster contains its primary player")
+    }
+}
+
+impl Deref for PlayerRoster {
+    type Target = Player;
+
+    fn deref(&self) -> &Self::Target {
+        self.primary()
+    }
+}
+
+impl DerefMut for PlayerRoster {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.primary_mut()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct PlayerControlFrame {
@@ -214,6 +307,62 @@ impl Player {
 
     pub fn next_level_experience(&self) -> u64 {
         (1..=self.level()).map(|level| u64::from(level) * 100).sum()
+    }
+
+    fn snapshot(&self, environment: EnvironmentSnapshot) -> PlayerSnapshot {
+        PlayerSnapshot {
+            player_id: self.player_id.clone(),
+            position: self.position,
+            orientation: self.orientation,
+            linear_velocity: self.linear_velocity,
+            angular_velocity: self.angular_velocity,
+            surface_contact: self.surface_contact,
+            locomotion: self.locomotion.clone(),
+            movement_epoch: self.movement_epoch,
+            last_received_input_sequence: self.last_received_input_sequence,
+            last_processed_input_sequence: self.last_processed_input_sequence,
+            control_linear_input: self.control_linear_input,
+            control_angular_input: self.control_angular_input,
+            boost: self.boost,
+            dampeners: self.dampeners,
+            jump: self.jump,
+            control_expires_at_simulation_tick: self.control_expires_at_simulation_tick,
+            inventory_id: self.inventory_id.clone(),
+            experience: self.experience,
+            level: self.level(),
+            next_level_experience: self.next_level_experience(),
+            career: self.career.clone(),
+            suit_oxygen_milli: self.suit_oxygen_milli,
+            helmet_closed: self.helmet_closed,
+            jetpack_enabled: self.jetpack_enabled,
+            life_state: self.life_state.clone(),
+            critical_oxygen_milli: content::manifest().survival.critical_oxygen_milli,
+            environment: Some(environment),
+        }
+    }
+
+    fn motion_snapshot(&self, environment: EnvironmentSnapshot) -> PlayerMotionSnapshot {
+        PlayerMotionSnapshot {
+            player_id: self.player_id.clone(),
+            position: self.position,
+            orientation: self.orientation,
+            linear_velocity: self.linear_velocity,
+            angular_velocity: self.angular_velocity,
+            surface_contact: self.surface_contact,
+            locomotion: self.locomotion.clone(),
+            movement_epoch: self.movement_epoch,
+            last_received_input_sequence: self.last_received_input_sequence,
+            last_processed_input_sequence: self.last_processed_input_sequence,
+            control_linear_input: self.control_linear_input,
+            control_angular_input: self.control_angular_input,
+            boost: self.boost,
+            dampeners: self.dampeners,
+            jump: self.jump,
+            control_expires_at_simulation_tick: self.control_expires_at_simulation_tick,
+            jetpack_enabled: self.jetpack_enabled,
+            life_state: self.life_state.clone(),
+            environment: Some(environment),
+        }
     }
 }
 
@@ -331,6 +480,11 @@ impl Block {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Grid {
     pub grid_id: String,
+    pub owner_player_id: String,
+    /// One non-duplicable opportunity for the grid lineage to award its first
+    /// successful anchor engagement. A split may preserve this only on its
+    /// deterministic primary fragment.
+    pub anchor_reward_eligible: bool,
     pub position: Vec3,
     pub orientation: Quat,
     pub linear_velocity: Vec3,
@@ -445,6 +599,36 @@ pub struct ContactPairKey {
     pub collider_b: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessedOperationRecord {
+    pub operation_id: String,
+    pub intent_fingerprint: String,
+    pub receipt: IntentReceipt,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActorOperationHistory {
+    pub committed_through: u64,
+    pub compacted_through: u64,
+    pub compacted_history_hash: String,
+    pub retained: BTreeMap<u64, ProcessedOperationRecord>,
+}
+
+impl ActorOperationHistory {
+    pub const fn last_sequence(&self) -> u64 {
+        self.committed_through
+    }
+}
+
+#[derive(Serialize)]
+struct OperationCompactionMaterial<'a> {
+    domain: &'static str,
+    prior_hash: &'a str,
+    operation_sequence: u64,
+    intent_fingerprint: &'a str,
+    receipt: &'a IntentReceipt,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorldState {
     pub schema_version: u32,
@@ -458,16 +642,439 @@ pub struct WorldState {
     pub active_contact_pairs: BTreeSet<ContactPairKey>,
     pub fencing_token: u64,
     pub last_event_hash: String,
-    pub player: Player,
+    #[serde(rename = "players")]
+    pub player: PlayerRoster,
     pub voxels: VoxelField,
     pub grids: BTreeMap<String, Grid>,
     pub inventories: BTreeMap<String, InventoryRecord>,
     pub death_drops: BTreeMap<String, DeathDrop>,
     pub ledger: Ledger,
-    pub processed_operations: BTreeMap<String, verse_protocol::IntentReceipt>,
+    pub processed_operations: BTreeMap<String, ActorOperationHistory>,
 }
 
 impl WorldState {
+    pub fn processed_operation_record(
+        &self,
+        actor_player_id: &str,
+        operation_sequence: u64,
+    ) -> Option<&ProcessedOperationRecord> {
+        self.processed_operations
+            .get(actor_player_id)
+            .and_then(|history| history.retained.get(&operation_sequence))
+    }
+
+    /// Diagnostic compatibility lookup over the bounded retained suffix.
+    /// Ordering and idempotency authority always use operation sequence.
+    pub fn processed_operation(
+        &self,
+        actor_player_id: &str,
+        operation_id: &str,
+    ) -> Option<&IntentReceipt> {
+        self.processed_operations
+            .get(actor_player_id)?
+            .retained
+            .values()
+            .find(|record| record.operation_id == operation_id)
+            .map(|record| &record.receipt)
+    }
+
+    pub fn last_operation_sequence(&self, actor_player_id: &str) -> u64 {
+        self.processed_operations
+            .get(actor_player_id)
+            .map_or(0, ActorOperationHistory::last_sequence)
+    }
+
+    pub fn record_processed_operation(
+        &mut self,
+        actor_player_id: &str,
+        record: ProcessedOperationRecord,
+    ) -> Result<(), String> {
+        if record.operation_id.trim().is_empty()
+            || record.operation_id.len() > 128
+            || !valid_blake3_hex(&record.intent_fingerprint)
+            || record.receipt.operation_id != record.operation_id
+            || record.receipt.event_sequence == 0
+            || record.receipt.event_sequence < record.receipt.operation_sequence
+            || record.receipt.event_sequence > self.event_sequence
+            || record.receipt.code.trim().is_empty()
+        {
+            return Err("processed operation record identity is invalid".into());
+        }
+        let history = self
+            .processed_operations
+            .entry(actor_player_id.to_owned())
+            .or_default();
+        let expected = history
+            .committed_through
+            .checked_add(1)
+            .ok_or_else(|| "operation sequence space is exhausted".to_owned())?;
+        if record.receipt.operation_sequence != expected {
+            return Err(format!(
+                "operation sequence {} does not match expected {expected}",
+                record.receipt.operation_sequence
+            ));
+        }
+        if history
+            .retained
+            .last_key_value()
+            .is_some_and(|(_, prior)| prior.receipt.event_sequence >= record.receipt.event_sequence)
+        {
+            return Err(
+                "processed operation receipt event sequences must advance monotonically".into(),
+            );
+        }
+        history.committed_through = expected;
+        history.retained.insert(expected, record);
+        while operation_history_crosses_retention_bound(history) {
+            let (&sequence, compacted) = history
+                .retained
+                .first_key_value()
+                .expect("an over-limit operation history is nonempty");
+            let material = OperationCompactionMaterial {
+                domain: "the-verse-operation-compaction-v1",
+                prior_hash: &history.compacted_history_hash,
+                operation_sequence: sequence,
+                intent_fingerprint: &compacted.intent_fingerprint,
+                receipt: &compacted.receipt,
+            };
+            let bytes = serde_json::to_vec(&material)
+                .expect("canonical operation compaction material serializes");
+            history.compacted_history_hash = blake3::hash(&bytes).to_hex().to_string();
+            history.retained.remove(&sequence);
+            history.compacted_through = sequence;
+        }
+        Ok(())
+    }
+
+    pub fn validate_player_roster(&self) -> Result<(), String> {
+        if self.schema_version != WORLD_SCHEMA_VERSION {
+            return Err(format!(
+                "world schema {} does not match required schema {WORLD_SCHEMA_VERSION}",
+                self.schema_version
+            ));
+        }
+        if self.content_manifest_version != content::manifest().manifest_version {
+            return Err("world content manifest does not match the active rules".into());
+        }
+        self.player.validate().map_err(str::to_owned)?;
+        let mut inventory_ids = BTreeSet::new();
+        let finite_vec =
+            |value: Vec3| value.x.is_finite() && value.y.is_finite() && value.z.is_finite();
+        for (player_id, player) in self.player.iter() {
+            if !valid_player_id(player_id) {
+                return Err(
+                    "player IDs must be 1-128 ASCII letters, numbers, dots, hyphens, or underscores"
+                        .into(),
+                );
+            }
+            if self.grids.contains_key(&format!("player-body-{player_id}")) {
+                return Err("a player physics body ID collides with a canonical grid ID".into());
+            }
+            let orientation_length_squared = f64::from(player.orientation.x).mul_add(
+                f64::from(player.orientation.x),
+                f64::from(player.orientation.y).mul_add(
+                    f64::from(player.orientation.y),
+                    f64::from(player.orientation.z).mul_add(
+                        f64::from(player.orientation.z),
+                        f64::from(player.orientation.w) * f64::from(player.orientation.w),
+                    ),
+                ),
+            );
+            if !finite_vec(player.position)
+                || !finite_vec(player.linear_velocity)
+                || !finite_vec(player.angular_velocity)
+                || !player.orientation.is_finite()
+                || (orientation_length_squared - 1.0).abs() > 1.0e-3
+                || !finite_vec(player.locomotion.up)
+                || !player.locomotion.view_pitch_radians.is_finite()
+            {
+                return Err(
+                    "player kinematics and locomotion must be finite and normalized".into(),
+                );
+            }
+            if !inventory_ids.insert(player.inventory_id.as_str()) {
+                return Err("each player must own a unique carried inventory".into());
+            }
+            let inventory = self
+                .inventories
+                .get(&player.inventory_id)
+                .ok_or_else(|| "each player inventory must exist in canonical state".to_owned())?;
+            if inventory.inventory_id != player.inventory_id
+                || inventory.domain
+                    != (InventoryDomain::Player {
+                        player_id: player_id.clone(),
+                    })
+                || inventory.capacity_liters == 0
+                || inventory.used_liters() > inventory.capacity_liters
+            {
+                return Err(
+                    "each player inventory must have matching identity, ownership, and capacity"
+                        .into(),
+                );
+            }
+        }
+        self.validate_authority_graph()?;
+        Ok(())
+    }
+
+    /// Validates every durable ownership edge independently of active session
+    /// state. Grid and drop owners are permitted to be offline, but their IDs,
+    /// inventory linkage, and asset identities remain canonical.
+    pub fn validate_authority_graph(&self) -> Result<(), String> {
+        let finite_vec =
+            |value: Vec3| value.x.is_finite() && value.y.is_finite() && value.z.is_finite();
+        let normalized_quat = |orientation: Quat| {
+            let length_squared = f64::from(orientation.x).mul_add(
+                f64::from(orientation.x),
+                f64::from(orientation.y).mul_add(
+                    f64::from(orientation.y),
+                    f64::from(orientation.z).mul_add(
+                        f64::from(orientation.z),
+                        f64::from(orientation.w) * f64::from(orientation.w),
+                    ),
+                ),
+            );
+            orientation.is_finite() && (length_squared - 1.0).abs() <= 1.0e-3
+        };
+
+        let mut global_block_ids = BTreeSet::new();
+        let mut cargo_inventory_by_block = BTreeMap::new();
+        for (grid_id, grid) in &self.grids {
+            if grid_id != &grid.grid_id || grid_id.trim().is_empty() {
+                return Err("grid map keys must match nonempty canonical grid IDs".into());
+            }
+            if !valid_player_id(&grid.owner_player_id) {
+                return Err("every grid must retain one syntactically valid player owner".into());
+            }
+            if !finite_vec(grid.position)
+                || !finite_vec(grid.linear_velocity)
+                || !finite_vec(grid.angular_velocity)
+                || !finite_vec(grid.control_linear_input)
+                || !finite_vec(grid.control_angular_input)
+                || !normalized_quat(grid.orientation)
+            {
+                return Err("grid kinematics and controls must be finite and normalized".into());
+            }
+            if grid.anchored && !grid.anchor_touches(&self.voxels) {
+                return Err(
+                    "an anchored grid must retain a completed voxel-touching anchor".into(),
+                );
+            }
+
+            let mut coordinates = BTreeSet::new();
+            for (block_id, block) in &grid.blocks {
+                if block_id != &block.block_id || block_id.trim().is_empty() {
+                    return Err("block map keys must match nonempty canonical block IDs".into());
+                }
+                if !global_block_ids.insert(block_id.as_str()) {
+                    return Err("block IDs must be globally unique across all grids".into());
+                }
+                if !coordinates.insert(block.coordinate) {
+                    return Err("a grid cannot contain two blocks at one coordinate".into());
+                }
+                let definition = content::block(block.kind);
+                if block.orientation > 3
+                    || block.component_cost != definition.component_cost
+                    || block.health == 0
+                    || block.health > definition.max_health
+                {
+                    return Err(
+                        "blocks must retain canonical orientation, cost, and positive integrity"
+                            .into(),
+                    );
+                }
+                match (block.kind, &block.inventory_id) {
+                    (BlockKind::Cargo, Some(inventory_id)) => {
+                        if cargo_inventory_by_block
+                            .insert(block_id.clone(), inventory_id.clone())
+                            .is_some()
+                        {
+                            return Err("a cargo block may own only one inventory".into());
+                        }
+                    }
+                    (BlockKind::Cargo, None) => {
+                        return Err("every cargo block must retain its inventory identity".into());
+                    }
+                    (_, Some(_)) => {
+                        return Err("only cargo blocks may reference an inventory".into());
+                    }
+                    (_, None) => {}
+                }
+            }
+        }
+
+        for (inventory_id, inventory) in &self.inventories {
+            if inventory_id != &inventory.inventory_id
+                || inventory_id.trim().is_empty()
+                || inventory.capacity_liters == 0
+                || inventory.used_liters() > inventory.capacity_liters
+            {
+                return Err(
+                    "inventory keys, identities, capacity, and contents must remain canonical"
+                        .into(),
+                );
+            }
+            match &inventory.domain {
+                InventoryDomain::Player { player_id } => {
+                    let player = self.player.get(player_id).ok_or_else(|| {
+                        "player inventory domains must reference a canonical player".to_owned()
+                    })?;
+                    if player.inventory_id != *inventory_id {
+                        return Err(
+                            "player inventory domains must match the player's carried inventory"
+                                .into(),
+                        );
+                    }
+                }
+                InventoryDomain::Cargo { block_id } => {
+                    if cargo_inventory_by_block.get(block_id) != Some(inventory_id) {
+                        return Err(
+                            "cargo inventories require one bidirectional live cargo-block link"
+                                .into(),
+                        );
+                    }
+                }
+                InventoryDomain::Dropped {
+                    reason,
+                    owner_player_id,
+                } => {
+                    if reason.trim().is_empty() || !valid_player_id(owner_player_id) {
+                        return Err(
+                            "dropped inventories must retain a reason and valid prior owner".into(),
+                        );
+                    }
+                }
+            }
+        }
+
+        for (block_id, inventory_id) in &cargo_inventory_by_block {
+            let inventory = self.inventories.get(inventory_id).ok_or_else(|| {
+                "every cargo block must reference one existing inventory".to_owned()
+            })?;
+            if inventory.domain
+                != (InventoryDomain::Cargo {
+                    block_id: block_id.clone(),
+                })
+            {
+                return Err("cargo block and inventory ownership links must agree".into());
+            }
+        }
+
+        let mut dropped_inventory_ids = BTreeSet::new();
+        for (drop_id, drop) in &self.death_drops {
+            if drop_id != &drop.drop_id
+                || drop_id.trim().is_empty()
+                || drop.death_id.trim().is_empty()
+                || !valid_player_id(&drop.owner_player_id)
+                || !finite_vec(drop.position)
+                || drop.created_event_sequence > self.event_sequence
+                || !dropped_inventory_ids.insert(drop.inventory_id.as_str())
+            {
+                return Err(
+                    "death-drop identity, owner, position, and sequence must be valid".into(),
+                );
+            }
+            let inventory = self.inventories.get(&drop.inventory_id).ok_or_else(|| {
+                "every death drop must reference one existing sealed inventory".to_owned()
+            })?;
+            match &inventory.domain {
+                InventoryDomain::Dropped {
+                    owner_player_id, ..
+                } if owner_player_id == &drop.owner_player_id => {}
+                _ => {
+                    return Err(
+                        "death-drop inventory domain must preserve the death-drop owner".into(),
+                    );
+                }
+            }
+        }
+
+        for (actor_player_id, history) in &self.processed_operations {
+            if !valid_player_id(actor_player_id) || self.player.get(actor_player_id).is_none() {
+                return Err("operation namespaces require present canonical player actors".into());
+            }
+            let retained_bytes = processed_operation_retained_bytes(&history.retained);
+            if history.committed_through == 0
+                || history.compacted_through > history.committed_through
+                || history.committed_through > self.event_sequence
+                || history.retained.len() > PROCESSED_OPERATION_RETENTION_LIMIT
+                || retained_bytes > PROCESSED_OPERATION_RETAINED_BYTES_LIMIT
+                || (history.compacted_through == 0 && !history.compacted_history_hash.is_empty())
+                || (history.compacted_through > 0
+                    && !valid_blake3_hex(&history.compacted_history_hash))
+            {
+                return Err("operation history bounds and commitment must remain canonical".into());
+            }
+            let mut last_seen = history.compacted_through;
+            let mut last_receipt_event_sequence = 0;
+            for (operation_sequence, record) in &history.retained {
+                let expected_sequence = last_seen
+                    .checked_add(1)
+                    .ok_or_else(|| "operation history cannot advance beyond u64::MAX".to_owned())?;
+                if *operation_sequence != expected_sequence
+                    || record.operation_id.trim().is_empty()
+                    || record.operation_id.len() > 128
+                    || !valid_blake3_hex(&record.intent_fingerprint)
+                    || processed_operation_record_bytes(record)
+                        > PROCESSED_OPERATION_RECORD_BYTES_LIMIT
+                    || record.receipt.operation_sequence != *operation_sequence
+                    || record.receipt.operation_id != record.operation_id
+                    || record.receipt.event_sequence == 0
+                    || record.receipt.event_sequence < *operation_sequence
+                    || record.receipt.event_sequence <= last_receipt_event_sequence
+                    || record.receipt.event_sequence > self.event_sequence
+                    || record.receipt.code.trim().is_empty()
+                {
+                    return Err("processed operations must form one bounded contiguous suffix with canonical receipts and fingerprints".into());
+                }
+                last_seen = *operation_sequence;
+                last_receipt_event_sequence = record.receipt.event_sequence;
+            }
+            if last_seen != history.committed_through {
+                return Err(
+                    "retained operation history must cover the contiguous uncompacted suffix"
+                        .into(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolves the durable economic owner without caching cargo ownership in
+    /// two mutable places. Dropped inventories preserve the owner captured at
+    /// the moment their live player or grid linkage ended.
+    pub fn inventory_owner_player_id(&self, inventory_id: &str) -> Result<&str, String> {
+        let inventory = self
+            .inventories
+            .get(inventory_id)
+            .ok_or_else(|| format!("inventory {inventory_id} does not exist"))?;
+        match &inventory.domain {
+            InventoryDomain::Player { player_id } => Ok(player_id),
+            InventoryDomain::Dropped {
+                owner_player_id, ..
+            } => Ok(owner_player_id),
+            InventoryDomain::Cargo { block_id } => {
+                let mut owner = None;
+                for grid in self.grids.values() {
+                    if let Some(block) = grid.blocks.get(block_id) {
+                        if block.inventory_id.as_deref() != Some(inventory_id) {
+                            return Err(format!(
+                                "cargo block {block_id} does not link back to inventory {inventory_id}"
+                            ));
+                        }
+                        if owner.is_some() {
+                            return Err(format!(
+                                "cargo block {block_id} is linked from multiple grids"
+                            ));
+                        }
+                        owner = Some(grid.owner_player_id.as_str());
+                    }
+                }
+                owner.ok_or_else(|| format!("cargo inventory {inventory_id} has no live owner"))
+            }
+        }
+    }
+
     pub fn genesis(seed: u64) -> Self {
         let player_position = Vec3::new(12.0, 4.5, 10.0);
         let player_inventory = InventoryRecord {
@@ -542,6 +1149,8 @@ impl WorldState {
 
         let grid = Grid {
             grid_id: STARTER_GRID_ID.into(),
+            owner_player_id: "player-local".into(),
+            anchor_reward_eligible: true,
             position: Vec3::new(11.0, 0.0, 0.0),
             orientation: Quat::IDENTITY,
             linear_velocity: Vec3::ZERO,
@@ -565,7 +1174,7 @@ impl WorldState {
             active_contact_pairs: BTreeSet::new(),
             fencing_token: 0,
             last_event_hash: String::new(),
-            player: Player {
+            player: PlayerRoster::from_primary(Player {
                 player_id: "player-local".into(),
                 position: player_position,
                 orientation: Quat::IDENTITY,
@@ -600,7 +1209,7 @@ impl WorldState {
                 helmet_closed: true,
                 jetpack_enabled: true,
                 life_state: PlayerLifeState::Alive,
-            },
+            }),
             voxels: VoxelField::procedural_asteroid(seed, 8),
             grids: BTreeMap::from([(STARTER_GRID_ID.into(), grid)]),
             inventories: BTreeMap::from([
@@ -705,6 +1314,7 @@ impl WorldState {
             .values()
             .map(|grid| GridSnapshot {
                 grid_id: grid.grid_id.clone(),
+                owner_player_id: grid.owner_player_id.clone(),
                 position: grid.position,
                 orientation: grid.orientation,
                 linear_velocity: grid.linear_velocity,
@@ -729,6 +1339,7 @@ impl WorldState {
             })
             .collect::<Vec<_>>();
         grids.sort_by(|left, right| left.grid_id.cmp(&right.grid_id));
+        let primary_environment = self.environment_at(self.player.position);
 
         WorldSnapshot {
             schema_version: self.schema_version,
@@ -739,35 +1350,13 @@ impl WorldState {
             simulation_tick: self.simulation_tick,
             fencing_token: self.fencing_token,
             world_hash: self.state_hash(),
-            player: PlayerSnapshot {
-                player_id: self.player.player_id.clone(),
-                position: self.player.position,
-                orientation: self.player.orientation,
-                linear_velocity: self.player.linear_velocity,
-                angular_velocity: self.player.angular_velocity,
-                surface_contact: self.player.surface_contact,
-                locomotion: self.player.locomotion.clone(),
-                movement_epoch: self.player.movement_epoch,
-                last_received_input_sequence: self.player.last_received_input_sequence,
-                last_processed_input_sequence: self.player.last_processed_input_sequence,
-                control_linear_input: self.player.control_linear_input,
-                control_angular_input: self.player.control_angular_input,
-                boost: self.player.boost,
-                dampeners: self.player.dampeners,
-                jump: self.player.jump,
-                control_expires_at_simulation_tick: self.player.control_expires_at_simulation_tick,
-                inventory_id: self.player.inventory_id.clone(),
-                experience: self.player.experience,
-                level: self.player.level(),
-                next_level_experience: self.player.next_level_experience(),
-                career: self.player.career.clone(),
-                suit_oxygen_milli: self.player.suit_oxygen_milli,
-                helmet_closed: self.player.helmet_closed,
-                jetpack_enabled: self.player.jetpack_enabled,
-                life_state: self.player.life_state.clone(),
-                critical_oxygen_milli: content::manifest().survival.critical_oxygen_milli,
-            },
-            environment: self.environment_at(self.player.position),
+            player: self.player.snapshot(primary_environment.clone()),
+            players: self
+                .player
+                .iter()
+                .map(|(_, player)| player.snapshot(self.environment_at(player.position)))
+                .collect(),
+            environment: primary_environment,
             voxels: self.voxels.snapshot(),
             grids,
             inventories: self
@@ -800,30 +1389,17 @@ impl WorldState {
     }
 
     pub fn motion_snapshot(&self) -> MotionSnapshot {
+        let primary_environment = self.environment_at(self.player.position);
         MotionSnapshot {
             event_sequence: self.event_sequence,
             simulation_tick: self.simulation_tick,
             world_hash: self.state_hash(),
-            player: PlayerMotionSnapshot {
-                player_id: self.player.player_id.clone(),
-                position: self.player.position,
-                orientation: self.player.orientation,
-                linear_velocity: self.player.linear_velocity,
-                angular_velocity: self.player.angular_velocity,
-                surface_contact: self.player.surface_contact,
-                locomotion: self.player.locomotion.clone(),
-                movement_epoch: self.player.movement_epoch,
-                last_received_input_sequence: self.player.last_received_input_sequence,
-                last_processed_input_sequence: self.player.last_processed_input_sequence,
-                control_linear_input: self.player.control_linear_input,
-                control_angular_input: self.player.control_angular_input,
-                boost: self.player.boost,
-                dampeners: self.player.dampeners,
-                jump: self.player.jump,
-                control_expires_at_simulation_tick: self.player.control_expires_at_simulation_tick,
-                jetpack_enabled: self.player.jetpack_enabled,
-                life_state: self.player.life_state.clone(),
-            },
+            player: self.player.motion_snapshot(primary_environment),
+            players: self
+                .player
+                .iter()
+                .map(|(_, player)| player.motion_snapshot(self.environment_at(player.position)))
+                .collect(),
             grids: self
                 .grids
                 .values()
@@ -872,9 +1448,242 @@ impl WorldState {
     }
 }
 
+fn processed_operation_record_bytes(record: &ProcessedOperationRecord) -> usize {
+    serde_json::to_vec(record)
+        .expect("canonical processed operation record serializes")
+        .len()
+}
+
+/// Canonical byte budget for the retained suffix. Serializing the complete map
+/// includes operation-sequence keys and collection delimiters as well as every
+/// record, so validation and compaction measure exactly the same representation.
+fn processed_operation_retained_bytes(retained: &BTreeMap<u64, ProcessedOperationRecord>) -> usize {
+    serde_json::to_vec(retained)
+        .expect("canonical processed operation retained map serializes")
+        .len()
+}
+
+fn operation_history_crosses_retention_bound(history: &ActorOperationHistory) -> bool {
+    history.retained.len() > PROCESSED_OPERATION_RETENTION_LIMIT
+        || processed_operation_retained_bytes(&history.retained)
+            > PROCESSED_OPERATION_RETAINED_BYTES_LIMIT
+        || history.retained.values().any(|record| {
+            processed_operation_record_bytes(record) > PROCESSED_OPERATION_RECORD_BYTES_LIMIT
+        })
+}
+
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
+
+    fn synthetic_operation_record(operation_sequence: u64) -> ProcessedOperationRecord {
+        let operation_id = format!("synthetic-{operation_sequence}");
+        ProcessedOperationRecord {
+            operation_id: operation_id.clone(),
+            intent_fingerprint: blake3::hash(operation_id.as_bytes()).to_hex().to_string(),
+            receipt: IntentReceipt {
+                operation_sequence,
+                operation_id,
+                event_sequence: operation_sequence,
+                code: "synthetic_committed".into(),
+                message: "synthetic bounded-history receipt".into(),
+            },
+        }
+    }
+
+    fn synthetic_operation_record_with_size(
+        operation_sequence: u64,
+        target_bytes: usize,
+    ) -> ProcessedOperationRecord {
+        let mut record = synthetic_operation_record(operation_sequence);
+        record.receipt.message.clear();
+        let base_bytes = processed_operation_record_bytes(&record);
+        assert!(target_bytes >= base_bytes);
+        record.receipt.message = "x".repeat(target_bytes - base_bytes);
+        assert_eq!(processed_operation_record_bytes(&record), target_bytes);
+        record
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(16))]
+
+        #[test]
+        fn operation_compaction_preserves_a_deterministic_bounded_suffix(
+            operation_count in 129_u16..400,
+        ) {
+            let operation_count = u64::from(operation_count);
+            let mut first = WorldState::genesis(97);
+            let mut second = first.clone();
+            first.event_sequence = operation_count;
+            second.event_sequence = operation_count;
+
+            for operation_sequence in 1..=operation_count {
+                first
+                    .record_processed_operation(
+                        "player-local",
+                        synthetic_operation_record(operation_sequence),
+                    )
+                    .expect("synthetic operation records contiguously");
+                second
+                    .record_processed_operation(
+                        "player-local",
+                        synthetic_operation_record(operation_sequence),
+                    )
+                    .expect("the duplicate campaign records contiguously");
+            }
+
+            let first_history = &first.processed_operations["player-local"];
+            let second_history = &second.processed_operations["player-local"];
+            prop_assert_eq!(first_history, second_history);
+            prop_assert_eq!(first_history.committed_through, operation_count);
+            prop_assert!(first_history.retained.len() <= PROCESSED_OPERATION_RETENTION_LIMIT);
+            prop_assert!(
+                processed_operation_retained_bytes(&first_history.retained)
+                    <= PROCESSED_OPERATION_RETAINED_BYTES_LIMIT
+            );
+            let all_records_bounded = first_history.retained.values().all(|record| {
+                processed_operation_record_bytes(record)
+                    <= PROCESSED_OPERATION_RECORD_BYTES_LIMIT
+            });
+            prop_assert!(all_records_bounded);
+            prop_assert_eq!(
+                first_history.compacted_through
+                    + u64::try_from(first_history.retained.len()).expect("retained bound fits u64"),
+                operation_count
+            );
+            prop_assert!(first.validate_player_roster().is_ok());
+        }
+    }
+
+    #[test]
+    fn operation_history_rejects_impossible_global_and_receipt_frontiers() {
+        let mut impossible_compacted = WorldState::genesis(103);
+        impossible_compacted.event_sequence = 1;
+        impossible_compacted.processed_operations.insert(
+            "player-local".into(),
+            ActorOperationHistory {
+                committed_through: 100,
+                compacted_through: 100,
+                compacted_history_hash: "0".repeat(64),
+                retained: BTreeMap::new(),
+            },
+        );
+        assert!(
+            impossible_compacted
+                .validate_player_roster()
+                .expect_err("an actor frontier cannot exceed the global event frontier")
+                .contains("operation history bounds")
+        );
+
+        let mut first = synthetic_operation_record(1);
+        first.receipt.event_sequence = 3;
+        let mut second = synthetic_operation_record(2);
+        second.receipt.event_sequence = 2;
+        let mut out_of_order = WorldState::genesis(107);
+        out_of_order.event_sequence = 3;
+        out_of_order.processed_operations.insert(
+            "player-local".into(),
+            ActorOperationHistory {
+                committed_through: 2,
+                compacted_through: 0,
+                compacted_history_hash: String::new(),
+                retained: BTreeMap::from([(1, first), (2, second)]),
+            },
+        );
+        assert!(
+            out_of_order
+                .validate_player_roster()
+                .expect_err("retained receipt events must advance with actor operations")
+                .contains("canonical receipts")
+        );
+
+        let mut zero_receipt = WorldState::genesis(109);
+        zero_receipt.event_sequence = 1;
+        let mut record = synthetic_operation_record(1);
+        record.receipt.event_sequence = 0;
+        zero_receipt.processed_operations.insert(
+            "player-local".into(),
+            ActorOperationHistory {
+                committed_through: 1,
+                compacted_through: 0,
+                compacted_history_hash: String::new(),
+                retained: BTreeMap::from([(1, record)]),
+            },
+        );
+        assert!(zero_receipt.validate_player_roster().is_err());
+    }
+
+    #[test]
+    fn retained_history_byte_budget_includes_sequence_keys_and_delimiters() {
+        const RECORD_COUNT: u64 = 32;
+        const RECORD_BYTES: usize = 4_091;
+
+        let candidate = (1..=RECORD_COUNT)
+            .map(|sequence| {
+                (
+                    sequence,
+                    synthetic_operation_record_with_size(sequence, RECORD_BYTES),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let value_bytes = candidate
+            .values()
+            .map(processed_operation_record_bytes)
+            .sum::<usize>();
+        assert!(value_bytes <= PROCESSED_OPERATION_RETAINED_BYTES_LIMIT);
+        assert!(
+            processed_operation_retained_bytes(&candidate)
+                > PROCESSED_OPERATION_RETAINED_BYTES_LIMIT,
+            "map keys and delimiters must count toward the canonical byte budget"
+        );
+
+        let mut world = WorldState::genesis(113);
+        world.event_sequence = RECORD_COUNT;
+        for record in candidate.into_values() {
+            world
+                .record_processed_operation("player-local", record)
+                .expect("boundary records commit contiguously");
+        }
+        let history = &world.processed_operations["player-local"];
+        assert!(history.compacted_through > 0);
+        assert!(
+            processed_operation_retained_bytes(&history.retained)
+                <= PROCESSED_OPERATION_RETAINED_BYTES_LIMIT
+        );
+        assert!(world.validate_player_roster().is_ok());
+    }
+
+    #[test]
+    fn oversized_operation_record_is_committed_only_into_the_rolling_hash() {
+        let mut world = WorldState::genesis(101);
+        world.event_sequence = 1;
+        let operation_id = "oversized-record".to_owned();
+        world
+            .record_processed_operation(
+                "player-local",
+                ProcessedOperationRecord {
+                    operation_id: operation_id.clone(),
+                    intent_fingerprint: blake3::hash(b"oversized").to_hex().to_string(),
+                    receipt: IntentReceipt {
+                        operation_sequence: 1,
+                        operation_id,
+                        event_sequence: 1,
+                        code: "oversized_committed".into(),
+                        message: "x".repeat(PROCESSED_OPERATION_RECORD_BYTES_LIMIT + 1),
+                    },
+                },
+            )
+            .expect("a large durable receipt is immediately compacted");
+
+        let history = &world.processed_operations["player-local"];
+        assert_eq!(history.committed_through, 1);
+        assert_eq!(history.compacted_through, 1);
+        assert!(history.retained.is_empty());
+        assert!(valid_blake3_hex(&history.compacted_history_hash));
+        assert!(world.validate_player_roster().is_ok());
+    }
 
     #[test]
     fn procedural_asteroid_is_deterministic() {
@@ -945,9 +1754,113 @@ mod tests {
     fn genesis_is_conserved_and_playable() {
         let world = WorldState::genesis(7);
         assert!(world.conservation().valid);
+        assert!(world.validate_player_roster().is_ok());
         assert_eq!(world.grids[STARTER_GRID_ID].blocks.len(), 25);
+        assert_eq!(world.grids[STARTER_GRID_ID].owner_player_id, "player-local");
+        assert!(world.grids[STARTER_GRID_ID].anchor_reward_eligible);
+        assert_eq!(
+            world
+                .inventory_owner_player_id("inventory-cargo-starter")
+                .unwrap(),
+            "player-local"
+        );
         assert!(world.grids[STARTER_GRID_ID].power().online);
         assert!(world.voxels.occupied.len() > 1_000);
         assert!(world.voxels.occupied.contains(&IVec3::new(8, 0, 0)));
+        assert!(world.player.validate().is_ok());
+        assert_eq!(world.player.iter().count(), 1);
+        let snapshot = world.snapshot();
+        assert_eq!(snapshot.players.len(), 1);
+        assert_eq!(snapshot.players[0], snapshot.player);
+        assert_eq!(snapshot.grids[0].owner_player_id, "player-local");
+        let persisted = serde_json::to_value(&world).expect("world serializes");
+        assert!(persisted.get("players").is_some());
+        assert!(persisted.get("player").is_none());
+    }
+
+    #[test]
+    fn cargo_owner_is_derived_from_its_containing_grid() {
+        let mut world = WorldState::genesis(7);
+        world
+            .grids
+            .get_mut(STARTER_GRID_ID)
+            .unwrap()
+            .owner_player_id = "player-remote".into();
+
+        assert_eq!(
+            world
+                .inventory_owner_player_id("inventory-cargo-starter")
+                .unwrap(),
+            "player-remote"
+        );
+        assert!(world.validate_authority_graph().is_ok());
+    }
+
+    #[test]
+    fn authority_graph_rejects_duplicate_blocks_and_broken_cargo_links() {
+        let mut duplicate = WorldState::genesis(7);
+        let block = duplicate.grids[STARTER_GRID_ID].blocks["block-core"].clone();
+        let mut second = duplicate.grids[STARTER_GRID_ID].clone();
+        second.grid_id = "grid-duplicate".into();
+        second.position = Vec3::new(100.0, 0.0, 0.0);
+        second.blocks = BTreeMap::from([(block.block_id.clone(), block)]);
+        duplicate.grids.insert(second.grid_id.clone(), second);
+        assert_eq!(
+            duplicate.validate_authority_graph().unwrap_err(),
+            "block IDs must be globally unique across all grids"
+        );
+
+        let mut broken = WorldState::genesis(7);
+        broken
+            .inventories
+            .get_mut("inventory-cargo-starter")
+            .unwrap()
+            .domain = InventoryDomain::Cargo {
+            block_id: "block-missing".into(),
+        };
+        assert_eq!(
+            broken.validate_authority_graph().unwrap_err(),
+            "cargo inventories require one bidirectional live cargo-block link"
+        );
+    }
+
+    #[test]
+    fn dropped_inventories_retain_a_valid_prior_owner() {
+        let mut world = WorldState::genesis(7);
+        world.inventories.insert(
+            "inventory-destroyed-cargo".into(),
+            InventoryRecord {
+                inventory_id: "inventory-destroyed-cargo".into(),
+                domain: InventoryDomain::Dropped {
+                    reason: "cargo_block_destroyed".into(),
+                    owner_player_id: "player-remote".into(),
+                },
+                contents: InventoryContents::default(),
+                capacity_liters: CARGO_INVENTORY_CAPACITY_LITERS,
+            },
+        );
+        assert_eq!(
+            world
+                .inventory_owner_player_id("inventory-destroyed-cargo")
+                .unwrap(),
+            "player-remote"
+        );
+        assert!(world.validate_authority_graph().is_ok());
+
+        let InventoryDomain::Dropped {
+            owner_player_id, ..
+        } = &mut world
+            .inventories
+            .get_mut("inventory-destroyed-cargo")
+            .unwrap()
+            .domain
+        else {
+            unreachable!();
+        };
+        owner_player_id.clear();
+        assert_eq!(
+            world.validate_authority_graph().unwrap_err(),
+            "dropped inventories must retain a reason and valid prior owner"
+        );
     }
 }

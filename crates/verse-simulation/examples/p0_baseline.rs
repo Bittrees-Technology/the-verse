@@ -56,7 +56,8 @@ fn summarize(mut samples: Vec<Duration>) -> LatencySummary {
 fn move_player(
     runtime: &mut Runtime,
     target: Vec3,
-    sequence: &mut u64,
+    input_sequence: &mut u64,
+    operation_sequence: &mut u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     for _ in 0..240 {
         let current = runtime.state().player.position;
@@ -67,16 +68,18 @@ fn move_player(
         );
         if delta.magnitude() <= 0.5 {
             runtime.execute(&ClientMessage::SetPlayerControl {
-                operation_id: format!("benchmark-control-{sequence}"),
+                operation_sequence: *operation_sequence + 1,
+                operation_id: format!("benchmark-control-{}", *operation_sequence + 1),
                 movement_epoch: runtime.state().player.movement_epoch,
-                input_sequence: *sequence + 1,
+                input_sequence: *input_sequence + 1,
                 linear_input: Vec3::ZERO,
                 angular_input: Vec3::ZERO,
                 boost: false,
                 jump: false,
                 dampeners: true,
             })?;
-            *sequence += 1;
+            *input_sequence += 1;
+            *operation_sequence += 1;
             runtime.advance(100)?;
             return Ok(());
         }
@@ -89,16 +92,18 @@ fn move_player(
             .rotate(direction)
             .clamped(1.0);
         runtime.execute(&ClientMessage::SetPlayerControl {
-            operation_id: format!("benchmark-control-{sequence}"),
+            operation_sequence: *operation_sequence + 1,
+            operation_id: format!("benchmark-control-{}", *operation_sequence + 1),
             movement_epoch: runtime.state().player.movement_epoch,
-            input_sequence: *sequence + 1,
+            input_sequence: *input_sequence + 1,
             linear_input: local_direction,
             angular_input: Vec3::ZERO,
             boost: true,
             jump: false,
             dampeners: true,
         })?;
-        *sequence += 1;
+        *input_sequence += 1;
+        *operation_sequence += 1;
         runtime.advance(100)?;
     }
     Err("authoritative player movement did not converge".into())
@@ -112,11 +117,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let initial_voxels = runtime.state().voxels.occupied.len();
     let snapshot_json_bytes = serde_json::to_vec(&runtime.snapshot())?.len();
 
-    let mut mining_move_sequence = 0;
+    let mut mining_input_sequence = 0;
+    let mut mining_operation_sequence = 0;
     move_player(
         &mut runtime,
         Vec3::new(10.0, 0.0, 3.0),
-        &mut mining_move_sequence,
+        &mut mining_input_sequence,
+        &mut mining_operation_sequence,
     )?;
     let mut mining_samples = Vec::new();
     let cargo_inventory_id = runtime
@@ -144,20 +151,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .ok_or("benchmark exhausted reachable voxels")?;
         let started = Instant::now();
         runtime.execute(&ClientMessage::MineVoxel {
+            operation_sequence: mining_operation_sequence + 1,
             operation_id: format!("benchmark-mine-{index}"),
             coordinate: target,
         })?;
+        mining_operation_sequence += 1;
         mining_samples.push(started.elapsed());
         let mined_quantity = runtime.state().inventories["inventory-player-local"]
             .contents
             .ore;
         runtime.execute(&ClientMessage::TransferInventory {
+            operation_sequence: mining_operation_sequence + 1,
             operation_id: format!("benchmark-offload-{index}"),
             source_inventory_id: "inventory-player-local".into(),
             destination_inventory_id: cargo_inventory_id.clone(),
             resource: ResourceKind::Ore,
             quantity: mined_quantity,
         })?;
+        mining_operation_sequence += 1;
     }
     runtime.persist_snapshot()?;
     let expected_hash = runtime.state().state_hash();
@@ -172,14 +183,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let split_directory = tempdir()?;
     let mut split_runtime = Runtime::open(split_directory.path(), 84, 10_000)?;
-    let mut move_sequence = 0;
+    let mut split_input_sequence = 0;
+    let mut split_operation_sequence = 0;
     for y in 1..=20 {
         move_player(
             &mut split_runtime,
             Vec3::new(10.0, f64::from(y), 3.0),
-            &mut move_sequence,
+            &mut split_input_sequence,
+            &mut split_operation_sequence,
         )?;
         split_runtime.execute(&ClientMessage::BuildBlock {
+            operation_sequence: split_operation_sequence + 1,
             operation_id: format!("benchmark-build-{y}"),
             grid_id: "grid-starter".into(),
             coordinate: IVec3::new(0, y, 0),
@@ -190,6 +204,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
             orientation: 0,
         })?;
+        split_operation_sequence += 1;
         let block_id = split_runtime.state().grids["grid-starter"]
             .block_at(IVec3::new(0, y, 0))
             .expect("construction frame exists")
@@ -197,10 +212,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .clone();
         for stage in 0..3 {
             split_runtime.execute(&ClientMessage::WeldBlock {
+                operation_sequence: split_operation_sequence + 1,
                 operation_id: format!("benchmark-weld-{y}-{stage}"),
                 grid_id: "grid-starter".into(),
                 block_id: block_id.clone(),
             })?;
+            split_operation_sequence += 1;
         }
     }
     let bridge_id = split_runtime.state().grids["grid-starter"]
@@ -211,15 +228,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     move_player(
         &mut split_runtime,
         Vec3::new(10.0, 10.0, 3.0),
-        &mut move_sequence,
+        &mut split_input_sequence,
+        &mut split_operation_sequence,
     )?;
     split_runtime.execute(&ClientMessage::DamageBlock {
+        operation_sequence: split_operation_sequence + 1,
         operation_id: "benchmark-damage-1".into(),
         grid_id: "grid-starter".into(),
         block_id: bridge_id.clone(),
     })?;
+    split_operation_sequence += 1;
     let split_started = Instant::now();
     split_runtime.execute(&ClientMessage::DamageBlock {
+        operation_sequence: split_operation_sequence + 1,
         operation_id: "benchmark-damage-2".into(),
         grid_id: "grid-starter".into(),
         block_id: bridge_id,

@@ -6,7 +6,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta
       name="description"
-      content="Local browser command center for The Verse authoritative P0 universe."
+      content="Local browser spectator command center for The Verse authoritative universe."
     />
     <title>The Verse — Command Center</title>
     <link rel="stylesheet" href="/styles.css" />
@@ -22,8 +22,9 @@
 
     <main>
       <section class="notice">
-        P0.7 local proof. This screen observes and submits intents to the same
-        server as the native client; it never mutates canonical state directly.
+        P1.2 public spectator projection. This screen observes public topology
+        only; pilot inventories, progression, and protected drops remain private.
+        <strong id="session-status">CONNECTING // READ-ONLY</strong>
       </section>
 
       <section class="metrics" aria-label="Universe metrics">
@@ -63,23 +64,25 @@
             <span><i class="rock"></i>Rock</span>
             <span><i class="ore"></i>Ferrite</span>
             <span><i class="grid"></i>Grid</span>
-            <span><i class="player"></i>Player</span>
+            <span><i class="player"></i>Authoritative player</span>
+            <strong id="active-players">0 AUTHORITATIVE PLAYERS</strong>
           </div>
+          <ol id="player-roster" class="player-roster" aria-label="Active players"></ol>
         </article>
 
         <aside>
           <article class="panel">
-            <p class="eyebrow">LOCAL PROFILE</p>
-            <h2 id="profile-rank">SALVAGER // LEVEL 1</h2>
-            <p id="career-progress" class="career-progress">0 / 100 XP</p>
+            <p id="profile-label" class="eyebrow">PUBLIC PILOT PROFILE</p>
+            <h2 id="profile-rank">AWAITING AUTHORITATIVE PILOT</h2>
+            <p id="career-progress" class="career-progress">PRIVATE TO PILOT</p>
             <dl>
-              <div><dt>Ore</dt><dd id="ore">0</dd></div>
-              <div><dt>Refined</dt><dd id="refined">0</dd></div>
-              <div><dt>Components</dt><dd id="components">0</dd></div>
+              <div><dt>Ore</dt><dd id="ore">PRIVATE</dd></div>
+              <div><dt>Refined</dt><dd id="refined">PRIVATE</dd></div>
+              <div><dt>Components</dt><dd id="components">PRIVATE</dd></div>
             </dl>
             <div class="button-grid">
-              <button id="refine">REFINE 2 ORE</button>
-              <button id="craft">CRAFT COMPONENT</button>
+              <button id="refine" disabled>PRIVATE TO PILOT</button>
+              <button id="craft" disabled>PRIVATE TO PILOT</button>
             </div>
           </article>
 

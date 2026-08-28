@@ -42,6 +42,8 @@ pub enum PersistenceError {
     SnapshotSchema { found: u32, expected: u32 },
     #[error("snapshot content hash is invalid")]
     SnapshotHashMismatch,
+    #[error("snapshot player roster is invalid: {0}")]
+    InvalidPlayerRoster(String),
     #[error("journal line {line} is corrupt: {message}")]
     CorruptJournal { line: usize, message: String },
     #[error(
@@ -215,6 +217,10 @@ impl Store {
                 });
             }
             let snapshot: SnapshotDocument = read_json(&snapshot_path)?;
+            snapshot
+                .state
+                .validate_player_roster()
+                .map_err(PersistenceError::InvalidPlayerRoster)?;
             if snapshot.state_hash != snapshot.state.state_hash()
                 || snapshot.event_sequence != snapshot.state.event_sequence
                 || snapshot.last_event_hash != snapshot.state.last_event_hash
@@ -294,6 +300,9 @@ impl Store {
                     message: source.to_string(),
                 })?;
         }
+        state
+            .validate_player_roster()
+            .map_err(PersistenceError::InvalidPlayerRoster)?;
         Ok(state)
     }
 
@@ -322,6 +331,9 @@ impl Store {
 
     pub fn save_snapshot(&mut self, state: &WorldState) -> Result<(), PersistenceError> {
         self.verify_fencing_token()?;
+        state
+            .validate_player_roster()
+            .map_err(PersistenceError::InvalidPlayerRoster)?;
         let snapshot = SnapshotDocument {
             schema_version: WORLD_SCHEMA_VERSION,
             state_hash: state.state_hash(),
@@ -499,15 +511,22 @@ mod tests {
                 .occupied
                 .iter()
                 .copied()
-                .find(|coord| {
-                    let dx = f64::from(coord.x) - runtime.state().player.position.x;
-                    let dy = f64::from(coord.y) - runtime.state().player.position.y;
-                    let dz = f64::from(coord.z) - runtime.state().player.position.z;
-                    dx.mul_add(dx, dy.mul_add(dy, dz * dz)) <= 8.5 * 8.5
-                })
-                .expect("reachable voxel");
+                .max_by_key(|coordinate| coordinate.z)
+                .expect("asteroid has a visible positive-Z surface voxel");
+            runtime.aim_player_for_test(
+                Vec3::new(
+                    f64::from(target.x),
+                    f64::from(target.y),
+                    f64::from(target.z),
+                ),
+                Vec3::new(0.0, 0.0, 1.0),
+            );
             runtime
-                .execute(&ClientMessage::MineVoxel {
+                .persist_snapshot()
+                .expect("aimed mining baseline persists");
+            runtime
+                .execute_next_for_fixture(&ClientMessage::MineVoxel {
+                    operation_sequence: 0,
                     operation_id: "durable-mine".into(),
                     coordinate: target,
                 })
@@ -526,9 +545,14 @@ mod tests {
         let expected_hash;
         {
             let mut runtime = Runtime::open(directory.path(), 29, 100).expect("runtime starts");
-            runtime.relocate_player_for_test(Vec3::new(10.0, 1.0, 3.0));
+            let core = runtime.state().grids[STARTER_GRID_ID].world_position(IVec3::ZERO);
+            runtime.aim_player_for_test(core, Vec3::new(0.0, 1.0, 0.0));
             runtime
-                .execute(&ClientMessage::BuildBlock {
+                .persist_snapshot()
+                .expect("aimed build baseline persists");
+            runtime
+                .execute_next_for_fixture(&ClientMessage::BuildBlock {
+                    operation_sequence: 0,
                     operation_id: "recovery-frame".into(),
                     grid_id: "grid-starter".into(),
                     coordinate: IVec3::new(0, 1, 0),
@@ -542,7 +566,8 @@ mod tests {
                 .block_id
                 .clone();
             runtime
-                .execute(&ClientMessage::WeldBlock {
+                .execute_next_for_fixture(&ClientMessage::WeldBlock {
+                    operation_sequence: 0,
                     operation_id: "recovery-weld".into(),
                     grid_id: "grid-starter".into(),
                     block_id,
@@ -570,12 +595,14 @@ mod tests {
         let expected_hash;
         {
             let mut runtime = Runtime::open(directory.path(), 30, 100).expect("runtime starts");
-            runtime.relocate_player_for_test(Vec3::new(10.0, 1.0, 3.0));
+            let core = runtime.state().grids[STARTER_GRID_ID].world_position(IVec3::ZERO);
+            runtime.aim_player_for_test(core, Vec3::new(0.0, 1.0, 0.0));
             runtime
                 .persist_snapshot()
-                .expect("durable range-test baseline persists");
+                .expect("durable aimed baseline persists");
             runtime
-                .execute(&ClientMessage::BuildBlock {
+                .execute_next_for_fixture(&ClientMessage::BuildBlock {
+                    operation_sequence: 0,
                     operation_id: "completed-recovery-frame".into(),
                     grid_id: STARTER_GRID_ID.into(),
                     coordinate: IVec3::new(0, 1, 0),
@@ -590,7 +617,8 @@ mod tests {
                 .clone();
             for stage in 0..3 {
                 runtime
-                    .execute(&ClientMessage::WeldBlock {
+                    .execute_next_for_fixture(&ClientMessage::WeldBlock {
+                        operation_sequence: 0,
                         operation_id: format!("completed-recovery-weld-{stage}"),
                         grid_id: STARTER_GRID_ID.into(),
                         block_id: block_id.clone(),
@@ -599,7 +627,7 @@ mod tests {
             }
             assert!(runtime.state().grids[STARTER_GRID_ID].blocks[&block_id].construction_complete);
             assert_eq!(runtime.state().player.career.blocks_built, 1);
-            assert_eq!(runtime.state().player.experience, 37);
+            assert_eq!(runtime.state().player.experience, 25);
             expected_hash = runtime.state().state_hash();
         }
 
@@ -724,7 +752,8 @@ mod tests {
         {
             let mut runtime = Runtime::open(directory.path(), 37, 100).expect("runtime starts");
             runtime
-                .execute(&ClientMessage::SetSuitMode {
+                .execute_next_for_fixture(&ClientMessage::SetSuitMode {
+                    operation_sequence: 0,
                     operation_id: "persistent-suit-mode".into(),
                     helmet_closed: false,
                     jetpack_enabled: false,
@@ -780,7 +809,8 @@ mod tests {
         {
             let mut runtime = Runtime::open(directory.path(), 47, 100).expect("runtime starts");
             runtime
-                .execute(&ClientMessage::SetPlayerControl {
+                .execute_next_for_fixture(&ClientMessage::SetPlayerControl {
+                    operation_sequence: 0,
                     operation_id: "committed-before-torn-tail".into(),
                     movement_epoch: 1,
                     input_sequence: 1,
@@ -806,7 +836,8 @@ mod tests {
                 Runtime::open(directory.path(), 47, 100).expect("prior state recovers");
             assert_eq!(recovered.state().state_hash(), expected_hash);
             recovered
-                .execute(&ClientMessage::SetPlayerControl {
+                .execute_next_for_fixture(&ClientMessage::SetPlayerControl {
+                    operation_sequence: 0,
                     operation_id: "committed-after-torn-tail".into(),
                     movement_epoch: 1,
                     input_sequence: 2,
@@ -842,7 +873,8 @@ mod tests {
         let snapshot_path = directory.path().join(SNAPSHOT_FILE);
         let mut snapshot: serde_json::Value =
             read_json(&snapshot_path).expect("snapshot JSON reads");
-        snapshot["state"]["player"]["position"]["x"] = serde_json::json!(999.0);
+        snapshot["state"]["players"]["by_id"]["player-local"]["position"]["x"] =
+            serde_json::json!(999.0);
         fs::write(
             &snapshot_path,
             serde_json::to_vec_pretty(&snapshot).expect("snapshot serializes"),
@@ -858,8 +890,32 @@ mod tests {
     }
 
     #[test]
-    fn pre_p0_10_content_manifests_are_rejected_before_replay() {
-        for stored_version in ["p0.8.0", "p0.9.0"] {
+    fn malformed_player_roster_is_rejected_before_hashing() {
+        let directory = tempdir().expect("tempdir");
+        {
+            let mut runtime = Runtime::open(directory.path(), 48, 100).expect("runtime starts");
+            runtime.persist_snapshot().expect("snapshot persisted");
+        }
+        let snapshot_path = directory.path().join(SNAPSHOT_FILE);
+        let mut snapshot: serde_json::Value = read_json(&snapshot_path).expect("snapshot reads");
+        snapshot["state"]["players"]["primary_player_id"] = serde_json::json!("missing-player");
+        fs::write(
+            &snapshot_path,
+            serde_json::to_vec_pretty(&snapshot).expect("snapshot serializes"),
+        )
+        .expect("malformed roster writes");
+
+        assert!(matches!(
+            Runtime::open(directory.path(), 48, 100),
+            Err(crate::RuntimeError::Persistence(
+                PersistenceError::InvalidPlayerRoster(_)
+            ))
+        ));
+    }
+
+    #[test]
+    fn pre_p1_1_content_manifests_are_rejected_before_replay() {
+        for stored_version in ["p0.8.0", "p0.9.0", "p0.10.0"] {
             let directory = tempdir().expect("tempdir");
             drop(Store::open(directory.path(), 41).expect("store"));
             let manifest_path = directory.path().join(MANIFEST_FILE);
@@ -875,7 +931,7 @@ mod tests {
             assert!(matches!(
                 Store::open(directory.path(), 41),
                 Err(PersistenceError::ContentManifestMismatch { stored, runtime })
-                    if stored == stored_version && runtime == "p0.10.0"
+                    if stored == stored_version && runtime == "p1.1.0"
             ));
         }
     }

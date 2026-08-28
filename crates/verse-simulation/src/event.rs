@@ -9,7 +9,7 @@ use verse_protocol::{
 use crate::model::{Block, ContactPairKey, DeathDrop, InventoryRecord};
 
 pub const EVENT_SCHEMA_NAME: &str = "verse.world_event";
-pub const EVENT_SCHEMA_VERSION: u32 = 8;
+pub const EVENT_SCHEMA_VERSION: u32 = 12;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event_type", rename_all = "snake_case")]
@@ -30,10 +30,12 @@ pub enum EventPayload {
         magnetic_boots_enabled: bool,
     },
     SuitOxygenChanged {
+        player_id: String,
         previous_oxygen_milli: u16,
         new_oxygen_milli: u16,
     },
     PlayerIncapacitated {
+        player_id: String,
         death_id: String,
         cause: PlayerDeathCause,
         position: Vec3,
@@ -71,6 +73,7 @@ pub enum EventPayload {
     },
     BlockBuilt {
         grid_id: String,
+        component_inventory_id: String,
         block: Block,
     },
     BlockWelded {
@@ -90,6 +93,7 @@ pub enum EventPayload {
     GridAnchorSet {
         grid_id: String,
         anchored: bool,
+        reward_credited: bool,
     },
     BlockDamaged {
         grid_id: String,
@@ -101,7 +105,7 @@ pub enum EventPayload {
         step_count: u8,
         remaining_step_phase: u32,
         bodies: Vec<PhysicsBodyOutcome>,
-        player: Option<PlayerPhysicsOutcome>,
+        players: Vec<PlayerPhysicsOutcome>,
         contacts: Vec<PhysicsContactOutcome>,
         active_contacts_after: Vec<ContactPairKey>,
     },
@@ -161,33 +165,37 @@ pub enum PhysicsContactPhase {
 
 impl EventPayload {
     pub fn experience_reward(&self) -> u64 {
+        let rewards = &crate::content::manifest().experience_rewards;
         match self {
-            Self::VoxelMined { ore_yield, .. } => ore_yield * 5,
-            Self::OreRefined { batches, .. } => batches * 12,
-            Self::ComponentCrafted { quantity, .. } => quantity * 18,
-            Self::InventoryTransferred { .. } => 2,
-            Self::BlockBuilt { .. } => 5,
+            Self::VoxelMined { ore_yield, .. } => ore_yield.saturating_mul(rewards.mined_ore_unit),
+            Self::OreRefined { batches, .. } => batches.saturating_mul(rewards.refining_batch),
+            Self::ComponentCrafted { quantity, .. } => {
+                quantity.saturating_mul(rewards.crafted_component)
+            }
+            Self::InventoryTransferred { .. } => rewards.inventory_transfer,
+            Self::BlockBuilt { .. } => rewards.frame_placed,
             Self::BlockWelded {
                 completed_construction,
                 ..
             } => {
                 if *completed_construction {
-                    20
+                    rewards.construction_completed
                 } else {
-                    6
+                    rewards.weld_progress_or_repair
                 }
             }
-            Self::GridAnchorSet { anchored: true, .. } => 40,
-            Self::BlockDamaged { .. } => 3,
+            Self::GridAnchorSet {
+                reward_credited: true,
+                ..
+            } => rewards.first_anchor_engagement,
+            Self::BlockDamaged { .. } => rewards.block_damage,
             Self::PlayerControlSet { .. }
             | Self::SuitModeChanged { .. }
             | Self::SuitOxygenChanged { .. }
             | Self::PlayerIncapacitated { .. }
             | Self::PlayerRespawned { .. }
             | Self::GridControlSet { .. }
-            | Self::GridAnchorSet {
-                anchored: false, ..
-            }
+            | Self::GridAnchorSet { .. }
             | Self::PhysicsStepCommitted { .. } => 0,
         }
     }
@@ -291,9 +299,13 @@ pub struct CanonicalEvent {
     pub universe_id: String,
     pub cell_id: String,
     pub authority_fencing_token: u64,
-    pub actor_profile_id: String,
+    /// Canonical player actor for human mutations. System events have no
+    /// player actor; credentials and connection identity never enter replay.
+    pub actor_player_id: Option<String>,
     pub actor_type: String,
     pub operation_id: Option<String>,
+    pub operation_sequence: Option<u64>,
+    pub intent_fingerprint: Option<String>,
     pub previous_event_hash: String,
     pub payload: EventPayload,
     pub event_hash: String,
@@ -310,9 +322,11 @@ struct EventHashMaterial<'a> {
     universe_id: &'a str,
     cell_id: &'a str,
     authority_fencing_token: u64,
-    actor_profile_id: &'a str,
+    actor_player_id: &'a Option<String>,
     actor_type: &'a str,
     operation_id: &'a Option<String>,
+    operation_sequence: &'a Option<u64>,
+    intent_fingerprint: &'a Option<String>,
     previous_event_hash: &'a str,
     payload: &'a EventPayload,
 }
@@ -325,9 +339,11 @@ impl CanonicalEvent {
         universe_id: impl Into<String>,
         cell_id: impl Into<String>,
         authority_fencing_token: u64,
-        actor_profile_id: impl Into<String>,
+        actor_player_id: Option<String>,
         actor_type: impl Into<String>,
         operation_id: Option<String>,
+        operation_sequence: Option<u64>,
+        intent_fingerprint: Option<String>,
         previous_event_hash: impl Into<String>,
         payload: EventPayload,
     ) -> Self {
@@ -347,9 +363,11 @@ impl CanonicalEvent {
             universe_id: universe_id.into(),
             cell_id: cell_id.into(),
             authority_fencing_token,
-            actor_profile_id: actor_profile_id.into(),
+            actor_player_id,
             actor_type: actor_type.into(),
             operation_id,
+            operation_sequence,
+            intent_fingerprint,
             previous_event_hash: previous_event_hash.into(),
             payload,
             event_hash: String::new(),
@@ -369,9 +387,11 @@ impl CanonicalEvent {
             universe_id: &self.universe_id,
             cell_id: &self.cell_id,
             authority_fencing_token: self.authority_fencing_token,
-            actor_profile_id: &self.actor_profile_id,
+            actor_player_id: &self.actor_player_id,
             actor_type: &self.actor_type,
             operation_id: &self.operation_id,
+            operation_sequence: &self.operation_sequence,
+            intent_fingerprint: &self.intent_fingerprint,
             previous_event_hash: &self.previous_event_hash,
             payload: &self.payload,
         };
@@ -392,13 +412,15 @@ mod tests {
     fn event_hash_detects_payload_tampering() {
         let mut event = CanonicalEvent::new(
             1,
-            "p0.10.0",
+            "p1.1.0",
             "universe",
             "cell",
             9,
-            "player",
+            Some("player".into()),
             "human",
             Some("op-1".into()),
+            Some(1),
+            Some("0".repeat(64)),
             "",
             EventPayload::PlayerControlSet {
                 movement_epoch: 1,
@@ -423,5 +445,44 @@ mod tests {
             expires_at_simulation_tick: 18,
         };
         assert!(!event.hash_is_valid());
+    }
+
+    #[test]
+    fn p11_rewards_close_repeatable_work_loops() {
+        let transfer = EventPayload::InventoryTransferred {
+            source_inventory_id: "suit".into(),
+            destination_inventory_id: "cargo".into(),
+            resource: ResourceKind::Ore,
+            quantity: 1,
+        };
+        let repair = EventPayload::BlockWelded {
+            grid_id: "grid".into(),
+            block_id: "block".into(),
+            previous_health: 50,
+            new_health: 75,
+            max_health: 100,
+            completed_construction: false,
+        };
+        let damage = EventPayload::BlockDamaged {
+            grid_id: "grid".into(),
+            block_id: "block".into(),
+            damage: 35,
+        };
+        let anchor = EventPayload::GridAnchorSet {
+            grid_id: "grid".into(),
+            anchored: true,
+            reward_credited: true,
+        };
+        let repeated_anchor = EventPayload::GridAnchorSet {
+            grid_id: "grid".into(),
+            anchored: true,
+            reward_credited: false,
+        };
+
+        assert_eq!(transfer.experience_reward(), 0);
+        assert_eq!(repair.experience_reward(), 0);
+        assert_eq!(damage.experience_reward(), 0);
+        assert_eq!(anchor.experience_reward(), 40);
+        assert_eq!(repeated_anchor.experience_reward(), 0);
     }
 }

@@ -46,6 +46,8 @@ Requirement IDs are stable references for issues, pull requests, tests, and rele
 - **SIM-008 — Power:** Machines, defenses, respawn systems, control cores, and cleanup exemptions shall depend on authoritative power or contract state.
 - **SIM-009 — Character motion authority:** Gameplay clients shall submit bounded character controls only. The authoritative cell shall own character position, orientation, velocity, gravity response, collision, and surface-contact results.
 - **SIM-010 — Grounded locomotion authority:** The authoritative cell shall derive grounded, airborne, EVA, and magnetic locomotion from gravity, collision queries, and stable support identity. Walking, sprinting, jumping, slope and step traversal, and moving-support inheritance shall not be selected by a client transform or client-reported contact.
+- **SIM-011 — Session-bound player authority:** Every authenticated gameplay connection shall be bound by the server to exactly one canonical player identity. Every mutation, input frontier, inventory permission, life-support transition, receipt, and audit event shall identify that actor; one connection shall not be able to act as another player by changing client payload fields.
+- **SIM-012 — Multi-player cell:** An active simulation cell shall advance and replicate multiple canonical players in one shared fixed-step world. Each player shall have independent durable movement state, inventory, life state, operation-id namespace, and reconnect frontier while sharing the same authoritative voxel, grid, contact, and event order.
 
 ## Persistence, death, and cleanup
 

@@ -2,7 +2,7 @@
 
 The Verse is an open-source persistent voxel space universe, work-and-economy simulator, and Web3 marketplace.
 
-The repository now contains the **cross-platform verified P0.10 simulation proof**, including authoritative grounded locomotion, EVA, orbital operations, contact physics, survival death, mining, production, construction, and exact recovery. It is still a single-player proof—not yet the public multiplayer universe or real-value economy—but the irreducible gameplay loop now shares one authoritative world on packaged macOS and Linux clients.
+The repository now contains the **cross-platform verified P0.10 simulation proof**, including authoritative grounded locomotion, EVA, orbital operations, contact physics, survival death, mining, production, construction, and exact recovery. P1 work adds a session-bound deterministic player roster, one atomic physics outcome for every living roster member and grid, server-reconstructed closest-visible hand-tool targeting, and a P1.1 actor-owned industry boundary. A fresh local universe pre-admits two loopback-only development pilots; either native client identity can bind, move independently, aim, mine, and render the other pilot, while ownership prevents one pilot from spending or constructively operating the other's assets. This remains a development multiplayer cell, not yet the public universe or real-value economy.
 
 ## Play it on macOS
 
@@ -13,7 +13,19 @@ tools/dev/bootstrap-macos.sh
 tools/dev/run-local.sh
 ```
 
-The bootstrap downloads the pinned Godot 4.7.2 editor from the official release and verifies its checksum. The launcher starts the authoritative server and native client. While the server is running, the browser command center is available at <http://127.0.0.1:7777>.
+The bootstrap downloads the pinned Godot 4.7.2 editor from the official release and verifies its checksum. The launcher starts the authoritative server and native client. While the server is running, the read-only browser command center is available at <http://127.0.0.1:7777>.
+
+To test the second pilot, leave the first client and server running, open a
+second terminal, and launch:
+
+```bash
+tools/dev/run-client.sh player-remote
+```
+
+Each window controls only the pilot named in its connection binding and renders
+the other pilot as a remote engineering suit. A previous single-pilot test
+world cannot be silently rewritten; if startup reports an incompatible world,
+archive it with `tools/dev/reset-local-world.sh` and launch again.
 
 To create the portable Apple Silicon development package used by release testing:
 
@@ -88,7 +100,7 @@ Start with [the documentation map](docs/README.md), then read:
 
 ## Current status
 
-P0.10 retains durable input-only controls and one atomic Jolt-backed character/grid physics step, while protocol 10 adds jump and magnetic preference without accepting a client transform. A 1.8 m dynamic capsule owns radial upright alignment, tangent walk/sprint, buffered jump, 50° slope entry with 2° exit hysteresis, bounded 45 cm steps, 18 cm ground snap, magnetic attachment to completed grid blocks, and moving-support velocity inheritance. The native client predicts these modes, presents `EVA`, `FREEFALL`, `GROUND`, and `MAG-LOCK`, and retains the oxygen, death-drop, and recovery loop. Local and hosted Rust, Godot, protocol, impairment, exact-recovery, package, container, and serialized performance gates are green in [run 33077252402](https://github.com/Bittrees-Technology/the-verse/actions/runs/33077252402). Multiplayer, drop recovery/expiry, global streaming, safe zones, accounts, AMMs, and blockchain settlement remain sequenced in the [delivery roadmap](docs/roadmap/roadmap.md).
+P0.10 retains durable input-only controls and one atomic Jolt-backed character/grid physics step. A 1.8 m dynamic capsule owns radial upright alignment, tangent walk/sprint, buffered jump, slope handling, bounded steps, ground snap, magnetic attachment, and moving-support velocity inheritance. The active P1.3 transport uses protocol 14: P1.2's public/private projections remain intact, and every gameplay mutation now carries a contiguous actor-local operation sequence plus a typed, server-derived intent fingerprint. Exact retries return their original durable receipt, changed retries fail as conflicts, rejected gameplay does not consume a sequence, and bounded per-actor history survives journal recovery without leaking another pilot's frontier. Other players cannot read carried or cargo inventory, protected drops, progression, exact oxygen, control frontiers, operation history, or cargo-inclusive mass. The canonical P1.1 world remains an ordered roster with owner-labelled grids. Character control, mining, production, inventory use, constructive grid actions, career credit, suit lifecycle, and receipts resolve from their canonical actor. Mining, construction, welding, and cutting accept only the closest visible target from that actor's eye ray within nine metres. Building, welding, cargo use, grid control, and anchoring additionally require the grid owner; visible non-owner damage remains allowed for PvP but awards no experience. Two deterministic loopback pilots act independently, converge on one world hash, retain disjoint private views, and survive exact restart recovery. Immediate refining/crafting and owner-authorized remote grid control remain proof mechanics. Drop recovery/expiry, global streaming, safe zones, accounts, AMMs, and blockchain settlement remain in the [delivery roadmap](docs/roadmap/roadmap.md). See [Actor-owned industry and engineering](docs/gameplay/actor-owned-industry.md), [Private player state projection](docs/gameplay/private-state-projection.md), and [Operation idempotency and retry contract](docs/architecture/operation-idempotency.md) for the exact authority, visibility, and recovery contracts.
 
 ## Licensing
 

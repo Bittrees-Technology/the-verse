@@ -3,8 +3,8 @@
 use std::{sync::Mutex, time::Instant};
 
 use verse_physics::{
-    BodySpec, BoxColliderSpec, CapsuleCast, CapsuleColliderSpec, Pose, Quat, Scene, SceneConfig,
-    Vec3,
+    BodyCollisionClass, BodySpec, BoxColliderSpec, CapsuleCast, CapsuleColliderSpec, Pose, Quat,
+    Scene, SceneConfig, Vec3,
 };
 
 static BENCHMARK_LOCK: Mutex<()> = Mutex::new(());
@@ -221,6 +221,7 @@ fn grounded_capsule_query_set_against_proof_asteroid_budget() {
         radius: 0.34,
         half_height_of_cylinder: 0.56,
         displacement: Vec3::new(0.0, -0.22, 0.0),
+        collision_class: BodyCollisionClass::Character,
         ignore_body_id: Some("player-body".into()),
     };
     let obstruction = CapsuleCast {
