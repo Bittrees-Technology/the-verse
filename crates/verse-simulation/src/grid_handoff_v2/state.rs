@@ -22,7 +22,8 @@ use super::{
     MAX_DRAFT_GRID_CONTACTS, MAX_DRAFT_GRID_MEMBERS, MAX_DRAFT_GRID_PRODUCTION_JOBS,
     MAX_DRAFT_GRID_PRODUCTION_QUEUES, MobileAggregateKind, WorldState, celestial,
     extract_draft_grid_closure_from_validated_world, hash_json, player_body_id_v2,
-    valid_blake3_hex, valid_stable_id, validate_adjacent_cells, validate_destination_conflicts,
+    valid_blake3_hex, valid_stable_id, validate_adjacent_cells,
+    validate_destination_conflicts_in_validated_world_v21,
 };
 use crate::cell_directory::TransferPhase;
 use crate::cell_directory_v3::{DirectoryPhaseProofV3, ValidatedGridTransferAuthorityV3};
@@ -2449,7 +2450,11 @@ fn stage_grid_quarantine_v2(
             "directory authority is not awaiting first destination quarantine".into(),
         ));
     }
-    validate_destination_conflicts(&state.base, package)?;
+    validate_destination_conflicts_in_validated_world_v21(
+        &state.base,
+        package,
+        authority.live_destination_fencing_token,
+    )?;
     let frozen = DraftFrozenClosureIdsV2::from_package(package);
     if state.aggregate_locks.values().any(|lock| {
         lock.binding.transfer_id == package.transfer_id || lock.frozen.overlaps(&frozen)
@@ -3414,6 +3419,36 @@ mod tests {
         let mut noncanonical = vec![b' '];
         noncanonical.extend(bytes);
         assert!(DraftGridTransferCellStateV2::decode_canonical(&noncanonical).is_err());
+    }
+
+    #[test]
+    fn successor_destination_fence_can_create_the_first_quarantine() {
+        let (_, _, package) = package_fixture();
+        let mut destination = destination_state(&package);
+        destination.base.fencing_token = destination
+            .base
+            .fencing_token
+            .checked_add(1)
+            .expect("successor fence advances");
+        destination.seal().expect("successor destination seals");
+        let mut authority =
+            DraftGridDirectoryAuthorityV2::for_package(&package, TransferPhase::Prepared);
+        authority
+            .proofs
+            .insert(DraftGridDirectoryProofKindV2::SourcePrepare);
+        authority.live_destination_assignment_generation += 1;
+        authority.live_destination_fencing_token = destination.base.fencing_token;
+        let (reserved, receipt) =
+            stage_grid_quarantine_v2(&destination, 1_800_000_000_000, &package, &authority)
+                .expect("successor creates the first exact quarantine");
+        assert_eq!(
+            receipt.destination_fencing_token,
+            package.destination_fencing_token
+        );
+        assert_eq!(
+            reserved.base.fencing_token,
+            authority.live_destination_fencing_token
+        );
     }
 
     #[test]

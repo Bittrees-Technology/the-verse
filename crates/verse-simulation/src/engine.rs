@@ -58,7 +58,7 @@ pub const MAX_PRODUCTION_CATCH_UP_MILLIS: u128 = 250;
 const PLAYER_BODY_ID: &str = "player-body-player-local";
 #[cfg(test)]
 const PLAYER_COLLIDER_ID: &str = "player-collider-player-local";
-const PLANET_BODY_ID: &str = "planet-body-khepri-prime";
+pub(crate) const PLANET_BODY_ID: &str = "planet-body-khepri-prime";
 const PLANET_COLLIDER_ID: &str = "planet-collider-khepri-prime";
 const MAX_GRID_CONTROL_INPUT: f64 = 1.0;
 const CONTROL_INPUT_EPSILON: f64 = 1.0e-9;
@@ -6406,7 +6406,7 @@ fn voxel_collision_chunk_cell_count() -> usize {
     usize::from(content::manifest().physics.voxel_collision_chunk_edge_cells).pow(3)
 }
 
-fn voxel_collision_chunk_coordinate(coordinate: IVec3) -> IVec3 {
+pub(crate) fn voxel_collision_chunk_coordinate(coordinate: IVec3) -> IVec3 {
     let edge = voxel_collision_chunk_edge_cells();
     IVec3::new(
         coordinate.x.div_euclid(edge),
@@ -6420,7 +6420,7 @@ fn voxel_collision_chunk_origin(chunk: IVec3) -> IVec3 {
     IVec3::new(chunk.x * edge, chunk.y * edge, chunk.z * edge)
 }
 
-fn voxel_collision_chunk_body_id(chunk: IVec3) -> String {
+pub(crate) fn voxel_collision_chunk_body_id(chunk: IVec3) -> String {
     format!(
         "voxel-chunk-{x}-{y}-{z}",
         x = chunk.x,

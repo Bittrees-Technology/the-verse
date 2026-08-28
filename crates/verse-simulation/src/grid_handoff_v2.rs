@@ -18,6 +18,9 @@ use thiserror::Error;
 use verse_protocol::{CellKeyV1, InventoryContents, InventoryDomain, LocomotionKind, Vec3};
 
 use crate::cell_directory::{BundledPlacementMember, BundledPlacementPlan, MobileAggregateKind};
+use crate::engine::{
+    PLANET_BODY_ID, voxel_collision_chunk_body_id, voxel_collision_chunk_coordinate,
+};
 use crate::model::{
     ActorOperationHistory, ContactPairKey, Grid, InventoryRecord,
     PROCESSED_OPERATION_RECORD_BYTES_LIMIT, PROCESSED_OPERATION_RETAINED_BYTES_LIMIT,
@@ -1318,6 +1321,42 @@ fn validate_destination_conflicts(
             "destination cell, fence, or trust roots do not match the package".into(),
         ));
     }
+    validate_destination_identity_conflicts(destination, package)
+}
+
+/// Conflict-only world-21 destination gate.
+///
+/// The caller must first validate the package, the origin-aware draft cell
+/// envelope, and the directory authority. This helper deliberately neither
+/// re-runs world-20's local-only production frontier nor pins the destination
+/// to the package's historical fence.
+fn validate_destination_conflicts_in_validated_world_v21(
+    destination: &WorldState,
+    package: &DraftGridClosurePackageV2,
+    live_destination_fencing_token: u64,
+) -> Result<(), DraftGridClosureError> {
+    let destination_key = celestial::cell_key_from_address(&destination.cell_address)
+        .map_err(|source| DraftGridClosureError::Invalid(source.to_string()))?;
+    if destination_key != package.destination_cell_key
+        || destination.cell_id != package.destination_cell_id
+        || destination.universe_id != package.universe_id
+        || destination.universe_manifest_hash != package.universe_manifest_hash
+        || destination.celestial_registry_hash != package.celestial_registry_hash
+        || destination.content_manifest_version != package.content_manifest_version
+        || live_destination_fencing_token < package.destination_fencing_token
+        || destination.fencing_token != live_destination_fencing_token
+    {
+        return Err(DraftGridClosureError::Invalid(
+            "validated world-21 destination identity, live fence, or trust roots disagree".into(),
+        ));
+    }
+    validate_destination_identity_conflicts(destination, package)
+}
+
+fn validate_destination_identity_conflicts(
+    destination: &WorldState,
+    package: &DraftGridClosurePackageV2,
+) -> Result<(), DraftGridClosureError> {
     let block_ids = package.grid.blocks.keys().collect::<BTreeSet<_>>();
     let inventory_ids = package
         .cargo_inventories
@@ -1341,7 +1380,34 @@ fn validate_destination_conflicts(
         .flatten()
         .map(|job| &job.job_id)
         .collect::<BTreeSet<_>>();
-    if destination.grids.contains_key(&package.grid.grid_id)
+    let closure_body_ids = std::iter::once(package.grid.grid_id.clone())
+        .chain(
+            package
+                .players
+                .keys()
+                .map(|player_id| player_body_id_v2(player_id)),
+        )
+        .collect::<BTreeSet<_>>();
+    let resident_player_body_ids = destination
+        .player
+        .iter()
+        .map(|(player_id, _)| player_body_id_v2(player_id))
+        .collect::<BTreeSet<_>>();
+    let resident_voxel_body_ids = destination
+        .voxels
+        .occupied
+        .iter()
+        .copied()
+        .map(voxel_collision_chunk_coordinate)
+        .map(voxel_collision_chunk_body_id)
+        .collect::<BTreeSet<_>>();
+    if destination
+        .grids
+        .keys()
+        .any(|grid_id| closure_body_ids.contains(grid_id))
+        || resident_player_body_ids.contains(&package.grid.grid_id)
+        || resident_voxel_body_ids.contains(&package.grid.grid_id)
+        || package.grid.grid_id == PLANET_BODY_ID
         || destination
             .grids
             .values()
@@ -1374,6 +1440,9 @@ fn validate_destination_conflicts(
         || destination
             .transfer_witnesses
             .contains_key(&package.transfer_id)
+        || destination.active_contact_pairs.iter().any(|contact| {
+            closure_body_ids.contains(&contact.body_a) || closure_body_ids.contains(&contact.body_b)
+        })
     {
         return Err(DraftGridClosureError::Unsupported(
             "destination already contains a closure subject or conflicting reservation".into(),
@@ -2224,6 +2293,93 @@ mod tests {
             validate_destination_conflicts(&destination, &package),
             Err(DraftGridClosureError::Unsupported(_))
         ));
+    }
+
+    #[test]
+    fn world21_destination_conflicts_use_live_fence_and_reject_touching_contacts() {
+        let (_, _, package) = package_fixture();
+        let mut destination = WorldState::genesis_for_cell(801, &package.destination_cell_key)
+            .expect("destination world derives");
+        let live_fence = package
+            .destination_fencing_token
+            .checked_add(1)
+            .expect("fixture fence advances");
+        destination.fencing_token = live_fence;
+        assert!(validate_destination_conflicts(&destination, &package).is_err());
+        validate_destination_conflicts_in_validated_world_v21(&destination, &package, live_fence)
+            .expect("validated successor fence accepts an empty destination");
+        assert!(
+            validate_destination_conflicts_in_validated_world_v21(
+                &destination,
+                &package,
+                package.destination_fencing_token,
+            )
+            .is_err()
+        );
+
+        destination.active_contact_pairs.insert(ContactPairKey {
+            body_a: package.grid.grid_id.clone(),
+            collider_a: "stale-grid-collider".into(),
+            body_b: "resident-body".into(),
+            collider_b: "resident-collider".into(),
+        });
+        assert!(matches!(
+            validate_destination_conflicts_in_validated_world_v21(
+                &destination,
+                &package,
+                live_fence,
+            ),
+            Err(DraftGridClosureError::Unsupported(_))
+        ));
+
+        let mut grid_body_collision =
+            WorldState::genesis_for_cell(801, &package.destination_cell_key)
+                .expect("destination world derives");
+        let mut resident_grid = package.grid.clone();
+        resident_grid.grid_id = player_body_id_v2("player-local");
+        resident_grid.blocks.clear();
+        grid_body_collision
+            .grids
+            .insert(resident_grid.grid_id.clone(), resident_grid);
+        assert!(validate_destination_identity_conflicts(&grid_body_collision, &package).is_err());
+
+        let mut player_body_collision =
+            WorldState::genesis_for_cell(801, &package.destination_cell_key)
+                .expect("destination world derives");
+        let mut resident_player = package.players["player-local"].destination_player.clone();
+        resident_player.player_id = "resident".into();
+        player_body_collision
+            .player
+            .by_id
+            .insert("resident".into(), resident_player);
+        let mut colliding_package = package;
+        colliding_package.grid.grid_id = player_body_id_v2("resident");
+        assert!(
+            validate_destination_identity_conflicts(&player_body_collision, &colliding_package)
+                .is_err()
+        );
+
+        let origin_destination = WorldState::genesis(801);
+        let occupied = origin_destination
+            .voxels
+            .occupied
+            .iter()
+            .next()
+            .copied()
+            .expect("origin fixture has occupied voxels");
+        let mut voxel_body_package = colliding_package.clone();
+        voxel_body_package.grid.grid_id =
+            voxel_collision_chunk_body_id(voxel_collision_chunk_coordinate(occupied));
+        assert!(
+            validate_destination_identity_conflicts(&origin_destination, &voxel_body_package)
+                .is_err()
+        );
+        let mut planet_body_package = colliding_package;
+        planet_body_package.grid.grid_id = PLANET_BODY_ID.into();
+        assert!(
+            validate_destination_identity_conflicts(&origin_destination, &planet_body_package)
+                .is_err()
+        );
     }
 
     #[test]
