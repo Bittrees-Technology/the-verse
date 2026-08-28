@@ -16,16 +16,17 @@ use serde::ser::{
 use serde_json::Value;
 use thiserror::Error;
 use verse_protocol::{
-    ActorPrivateSnapshot, BlockKind, BlockSnapshot, DeathDropSnapshot, EnvironmentSnapshot,
-    GridMotionSnapshot, GridSnapshot, INTEREST_SCHEMA_VERSION, InterestEntityKind,
-    InterestEntityPayload, InterestEntityProjection, InterestEntityRef, InterestFrameKind,
-    InterestObserverClass, InterestRemoval, InterestRemovalReason, InterestSnapshot,
-    InventoryDomain, InventorySnapshot, OwnedGridMassSnapshot, PROJECTION_SCHEMA_VERSION,
-    PlayerLifeState, PlayerMotionSnapshot, PlayerSnapshot, ProductionJobSnapshot,
-    ProductionJobStatus, ProductionQueueSnapshot, ProjectedInterestDelta, ProjectedMotionSnapshot,
-    ProjectedWorldSnapshot, PublicBlockSnapshot, PublicDeathDropSnapshot, PublicGridMotionSnapshot,
-    PublicGridSnapshot, PublicMachineState, PublicPlayerLifeState, PublicPlayerMotionSnapshot,
-    PublicPlayerSnapshot, PublicVoxelChunkSnapshot, UniverseAddress, Vec3, VoxelSnapshot,
+    ActorPrivateSnapshot, BlockKind, BlockSnapshot, CellKeyV1, DeathDropSnapshot,
+    EnvironmentSnapshot, GridMotionSnapshot, GridSnapshot, INTEREST_SCHEMA_VERSION,
+    InterestEntityKind, InterestEntityPayload, InterestEntityProjection, InterestEntityRef,
+    InterestFrameKind, InterestObserverClass, InterestRemoval, InterestRemovalReason,
+    InterestSnapshot, InterestTransferLink, InventoryDomain, InventorySnapshot,
+    OwnedGridMassSnapshot, PROJECTION_SCHEMA_VERSION, PlayerLifeState, PlayerMotionSnapshot,
+    PlayerSnapshot, ProductionJobSnapshot, ProductionJobStatus, ProductionQueueSnapshot,
+    ProjectedInterestDelta, ProjectedMotionSnapshot, ProjectedWorldSnapshot, PublicBlockSnapshot,
+    PublicDeathDropSnapshot, PublicGridMotionSnapshot, PublicGridSnapshot, PublicMachineState,
+    PublicPlayerLifeState, PublicPlayerMotionSnapshot, PublicPlayerSnapshot,
+    PublicVoxelChunkSnapshot, UniverseAddress, Vec3, VoxelSnapshot,
 };
 
 use crate::{celestial, content, model::WorldState};
@@ -90,6 +91,7 @@ pub struct InterestProjectionState {
     last_evaluated_tick: Option<u64>,
     environment: Option<EnvironmentSnapshot>,
     actor_private: Option<ActorPrivateSnapshot>,
+    transfer_link: Option<InterestTransferLink>,
 }
 
 impl InterestProjectionState {
@@ -125,6 +127,7 @@ impl InterestProjectionState {
             last_evaluated_tick: None,
             environment: None,
             actor_private: None,
+            transfer_link: None,
         }
     }
 
@@ -185,6 +188,41 @@ impl InterestProjectionState {
         self.last_evaluated_tick = None;
         self.environment = None;
         self.actor_private = None;
+        self.transfer_link = None;
+        Ok(())
+    }
+
+    /// Invalidate the source replication frontier and bind the next complete
+    /// baseline to one committed destination placement. The link is emitted
+    /// once and cleared from the cursor after that baseline is projected.
+    pub fn fresh_transfer_baseline(
+        &mut self,
+        transfer_id: impl Into<String>,
+        destination_cell_key: CellKeyV1,
+        placement_generation: u64,
+    ) -> Result<(), ProjectionError> {
+        if !matches!(self.observer, InterestObserver::BoundPlayer { .. }) {
+            return Err(ProjectionError::InvalidSession(
+                "only a bound player session can install a transfer baseline".into(),
+            ));
+        }
+        let transfer_id = transfer_id.into();
+        if !valid_transfer_identifier(&transfer_id) || placement_generation == 0 {
+            return Err(ProjectionError::InvalidSession(
+                "transfer baseline identity or placement generation is invalid".into(),
+            ));
+        }
+        celestial::validate_cell_key(&destination_cell_key).map_err(|source| {
+            ProjectionError::InvalidSession(format!(
+                "transfer baseline destination cell is invalid: {source}"
+            ))
+        })?;
+        self.fresh_baseline()?;
+        self.transfer_link = Some(InterestTransferLink {
+            transfer_id,
+            destination_cell_key,
+            placement_generation,
+        });
         Ok(())
     }
 
@@ -288,7 +326,7 @@ struct Selection {
     previous_view_hash: Option<String>,
 }
 
-/// Official protocol-16 state stream result. A session begins with one
+/// Official protocol-18 state stream result. A session begins with one
 /// baseline and then emits only deltas from the same cursor.
 #[derive(Debug, Clone, PartialEq)]
 #[allow(clippy::large_enum_variant)]
@@ -298,7 +336,7 @@ pub enum ProjectedInterestFrame {
 }
 
 impl ProjectionSource {
-    /// Projects the next protocol-16 frame while reusing this source's
+    /// Projects the next protocol-18 frame while reusing this source's
     /// canonical snapshot, public payloads, and spatial index.
     pub fn project_interest_frame(
         &self,
@@ -437,6 +475,7 @@ impl ProjectionSource {
             .map(|entity| complete_entity_projection(entity, &selection.payloads))
             .collect::<Result<Vec<_>, _>>()?;
         let observer_class = observer_class(&cursor.observer);
+        let transfer_link = transfer_link_for_frame(cursor, canonical, selection.frame_kind)?;
         let view_hash = fixed_hash(&ViewHashMaterial {
             projection_schema_version: PROJECTION_SCHEMA_VERSION,
             interest_schema_version: INTEREST_SCHEMA_VERSION,
@@ -454,6 +493,7 @@ impl ProjectionSource {
             interest_epoch: cursor.interest_epoch,
             baseline_id: &cursor.baseline_id,
             delta_sequence: selection.delta_sequence,
+            transfer_link: transfer_link.as_ref(),
             entities: &complete_view_entities,
             environment: &observer_environment,
             conservation_valid: canonical.conservation.valid,
@@ -481,6 +521,7 @@ impl ProjectionSource {
             local_origin_address: local_origin,
             registry_hash: canonical.celestial_registry_hash.clone(),
             universe_manifest_hash: canonical.universe_manifest_hash.clone(),
+            transfer_link,
             canonical_event_sequence: canonical.event_sequence,
             canonical_tick: canonical.simulation_tick,
             canonical_world_hash: canonical.world_hash.clone(),
@@ -497,6 +538,7 @@ impl ProjectionSource {
         cursor.last_evaluated_tick = Some(canonical.simulation_tick);
         cursor.environment = Some(observer_environment.clone());
         cursor.actor_private.clone_from(&actor_private);
+        cursor.transfer_link = None;
 
         Ok(ProjectedWorldSnapshot {
             projection_schema_version: PROJECTION_SCHEMA_VERSION,
@@ -811,7 +853,7 @@ impl WorldState {
         self.project_interest_world_snapshot_with_removals(cursor, &BTreeMap::new())
     }
 
-    /// Emits the explicit protocol-16 stream family. Callers must not mix this
+    /// Emits the explicit protocol-18 stream family. Callers must not mix this
     /// with the protocol-15 `Snapshot`/`MotionState` compatibility family.
     pub fn project_interest_frame(
         &self,
@@ -936,6 +978,7 @@ impl WorldState {
             .map(|entity| complete_entity_projection(entity, &selection.payloads))
             .collect::<Result<Vec<_>, _>>()?;
         let observer_class = observer_class(&cursor.observer);
+        let transfer_link = transfer_link_for_frame(cursor, canonical, selection.frame_kind)?;
         let view_hash = fixed_hash(&ViewHashMaterial {
             projection_schema_version: PROJECTION_SCHEMA_VERSION,
             interest_schema_version: INTEREST_SCHEMA_VERSION,
@@ -953,6 +996,7 @@ impl WorldState {
             interest_epoch: cursor.interest_epoch,
             baseline_id: &cursor.baseline_id,
             delta_sequence: selection.delta_sequence,
+            transfer_link: transfer_link.as_ref(),
             entities: &complete_view_entities,
             environment: &observer_environment,
             conservation_valid: canonical.conservation.valid,
@@ -980,6 +1024,7 @@ impl WorldState {
             local_origin_address: local_origin,
             registry_hash: canonical.celestial_registry_hash.clone(),
             universe_manifest_hash: canonical.universe_manifest_hash.clone(),
+            transfer_link,
             canonical_event_sequence: canonical.event_sequence,
             canonical_tick: canonical.simulation_tick,
             canonical_world_hash: canonical.world_hash.clone(),
@@ -996,6 +1041,7 @@ impl WorldState {
         cursor.last_evaluated_tick = Some(canonical.simulation_tick);
         cursor.environment = Some(observer_environment.clone());
         cursor.actor_private.clone_from(&actor_private);
+        cursor.transfer_link = None;
 
         Ok(ProjectedWorldSnapshot {
             projection_schema_version: PROJECTION_SCHEMA_VERSION,
@@ -1244,6 +1290,8 @@ struct ViewHashMaterial<'a> {
     interest_epoch: u64,
     baseline_id: &'a str,
     delta_sequence: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transfer_link: Option<&'a InterestTransferLink>,
     entities: &'a [InterestEntityProjection],
     environment: &'a verse_protocol::EnvironmentSnapshot,
     conservation_valid: bool,
@@ -1289,6 +1337,57 @@ fn validate_session(cursor: &InterestProjectionState) -> Result<(), ProjectionEr
         ));
     }
     Ok(())
+}
+
+fn transfer_link_for_frame(
+    cursor: &InterestProjectionState,
+    canonical: &verse_protocol::WorldSnapshot,
+    frame_kind: InterestFrameKind,
+) -> Result<Option<InterestTransferLink>, ProjectionError> {
+    let Some(link) = cursor.transfer_link.as_ref() else {
+        return Ok(None);
+    };
+    if frame_kind != InterestFrameKind::Baseline
+        || !matches!(cursor.observer, InterestObserver::BoundPlayer { .. })
+        || !valid_transfer_identifier(&link.transfer_id)
+        || link.placement_generation == 0
+    {
+        return Err(ProjectionError::InvalidSession(
+            "transfer linkage is valid only on one bound-player baseline".into(),
+        ));
+    }
+    celestial::validate_cell_key(&link.destination_cell_key).map_err(|source| {
+        ProjectionError::InvalidSession(format!(
+            "transfer destination cell key is invalid: {source}"
+        ))
+    })?;
+    let destination_cell_id = celestial::cell_id(&link.destination_cell_key).map_err(|source| {
+        ProjectionError::InvalidSession(format!(
+            "transfer destination cell identity is invalid: {source}"
+        ))
+    })?;
+    let destination_cell_address = celestial::cell_address_from_key(&link.destination_cell_key)
+        .map_err(|source| {
+            ProjectionError::InvalidSession(format!(
+                "transfer destination cell address is invalid: {source}"
+            ))
+        })?;
+    if destination_cell_id != canonical.cell_id
+        || destination_cell_address != canonical.cell_address
+    {
+        return Err(ProjectionError::InvalidSession(
+            "transfer link does not name the projected destination cell".into(),
+        ));
+    }
+    Ok(Some(link.clone()))
+}
+
+fn valid_transfer_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
 }
 
 fn visible_ids(
@@ -2619,6 +2718,111 @@ mod tests {
             commit_wire(&mut verifier, &receipt),
             StageKind::IntentAccepted
         );
+    }
+
+    #[test]
+    fn transfer_link_is_one_time_destination_bound_and_independently_verified() {
+        let world = world_with_two_actors();
+        let role = SessionRole::Player {
+            player_id: "player-local".into(),
+        };
+        let mut verifier = verifier_for(&world, role.clone());
+        establish_verifier(&mut verifier, &world, role);
+        let mut cursor = InterestProjectionState::bound_player("transfer-session", "player-local");
+        let initial = world
+            .project_interest_baseline(&mut cursor)
+            .expect("initial baseline projects");
+        assert_eq!(
+            commit_wire(
+                &mut verifier,
+                &ServerMessage::InterestBaseline {
+                    baseline: Box::new(initial),
+                },
+            ),
+            StageKind::Baseline
+        );
+        let initial_epoch = verifier
+            .committed_view()
+            .expect("initial view commits")
+            .interest_epoch;
+
+        cursor
+            .fresh_transfer_baseline("transfer-session-proof", celestial::cell_origin_key(), 8)
+            .expect("committed placement installs a fresh transfer baseline");
+        let linked = world
+            .project_interest_baseline(&mut cursor)
+            .expect("linked destination baseline projects");
+        let link = linked
+            .interest
+            .transfer_link
+            .as_ref()
+            .expect("destination baseline carries the one-time link");
+        assert_eq!(link.transfer_id, "transfer-session-proof");
+        assert_eq!(link.placement_generation, 8);
+        assert_eq!(linked.interest.interest_epoch, initial_epoch + 1);
+
+        let mut tampered = linked.clone();
+        tampered
+            .interest
+            .transfer_link
+            .as_mut()
+            .expect("link exists")
+            .placement_generation += 1;
+        assert_eq!(
+            verifier
+                .stage(
+                    &serde_json::to_vec(&ServerMessage::InterestBaseline {
+                        baseline: Box::new(tampered),
+                    })
+                    .expect("tampered link serializes"),
+                )
+                .expect_err("unhashed transfer substitution is rejected")
+                .code(),
+            ErrorCode::HashMismatch
+        );
+        assert_eq!(
+            commit_wire(
+                &mut verifier,
+                &ServerMessage::InterestBaseline {
+                    baseline: Box::new(linked),
+                },
+            ),
+            StageKind::Baseline
+        );
+
+        let delta = world
+            .project_interest_delta(&mut cursor, &BTreeMap::new())
+            .expect("post-handoff delta projects");
+        assert!(
+            delta.interest.transfer_link.is_none(),
+            "the link is emitted only on the destination baseline"
+        );
+        assert_eq!(
+            commit_wire(
+                &mut verifier,
+                &ServerMessage::InterestDelta {
+                    delta: Box::new(delta),
+                },
+            ),
+            StageKind::Delta
+        );
+
+        let mut spectator = InterestProjectionState::public_origin_spectator("spectator");
+        assert!(
+            spectator
+                .fresh_transfer_baseline("transfer-private", celestial::cell_origin_key(), 8)
+                .is_err()
+        );
+        let mut wrong_cell = InterestProjectionState::bound_player("wrong-cell", "player-local");
+        wrong_cell
+            .fresh_transfer_baseline(
+                "transfer-wrong-cell",
+                celestial::neighbor_cell_key(&celestial::cell_origin_key(), [1, 0, 0])
+                    .expect("neighbor derives"),
+                8,
+            )
+            .expect("well-formed link installs before world binding");
+        assert!(world.project_interest_baseline(&mut wrong_cell).is_err());
     }
 
     #[test]

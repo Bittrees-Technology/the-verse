@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Clean-room verifier for protocol-17 interest baselines and deltas.
+//! Clean-room verifier for protocol-18 interest baselines and deltas.
 //!
 //! The verifier consumes original UTF-8 JSON bytes. All connection and view
 //! transitions are staged and require an opaque one-use token to commit.
@@ -20,14 +20,15 @@ use std::collections::{BTreeMap, BTreeSet};
 pub use error::{ErrorCode, VerifyError};
 use serde::Serialize;
 use verse_protocol::{
-    ActorPrivateSnapshot, BlockKind, CELESTIAL_REGISTRY_SCHEMA_VERSION, CelestialRegistrySnapshot,
-    EnvironmentSnapshot, INTEREST_SCHEMA_VERSION, InterestEntityKind, InterestEntityPayload,
-    InterestEntityProjection, InterestFrameKind, InterestObserverClass, InterestSnapshot,
-    InventoryDomain, InventorySnapshot, PROJECTION_SCHEMA_VERSION, PROTOCOL_VERSION,
-    PlayerMotionSnapshot, ProductionRecipeKind, ProjectedInterestDelta, ProjectedWorldSnapshot,
-    PublicBlockSnapshot, PublicDeathDropSnapshot, PublicGridSnapshot, PublicPlayerSnapshot,
-    PublicVoxelChunkSnapshot, ServerMessage, SessionRole, UNIVERSE_MANIFEST_SCHEMA_VERSION,
-    UniverseAddress, UniverseManifestSnapshot,
+    ActorPrivateSnapshot, BlockKind, CELESTIAL_REGISTRY_SCHEMA_VERSION, CELL_KEY_SCHEMA_VERSION,
+    CelestialRegistrySnapshot, EnvironmentSnapshot, I64Vec3, INTEREST_SCHEMA_VERSION,
+    InterestEntityKind, InterestEntityPayload, InterestEntityProjection, InterestFrameKind,
+    InterestObserverClass, InterestSnapshot, InterestTransferLink, InventoryDomain,
+    InventorySnapshot, PROJECTION_SCHEMA_VERSION, PROTOCOL_VERSION, PlayerMotionSnapshot,
+    ProductionRecipeKind, ProjectedInterestDelta, ProjectedWorldSnapshot, PublicBlockSnapshot,
+    PublicDeathDropSnapshot, PublicGridSnapshot, PublicPlayerSnapshot, PublicVoxelChunkSnapshot,
+    ServerMessage, SessionRole, UNIVERSE_MANIFEST_SCHEMA_VERSION, UniverseAddress,
+    UniverseManifestSnapshot,
 };
 
 use crate::error::Result;
@@ -186,6 +187,7 @@ struct ViewState {
     environment: EnvironmentSnapshot,
     conservation_valid: bool,
     actor_private: Option<ActorPrivateSnapshot>,
+    transfer_link: Option<InterestTransferLink>,
     view_hash: String,
 }
 
@@ -554,6 +556,13 @@ impl InterestVerifier {
         validate_outer_baseline(welcome, binding, baseline)?;
         validate_interest_header(&baseline.interest, InterestFrameKind::Baseline, binding)?;
         repeated_baseline_headers(baseline)?;
+        validate_transfer_link(
+            baseline.interest.transfer_link.as_ref(),
+            &baseline.cell_id,
+            &baseline.interest.cell_address,
+            &welcome.role,
+            binding,
+        )?;
         validate_role(
             welcome,
             baseline.interest.observer_class,
@@ -612,6 +621,7 @@ impl InterestVerifier {
             environment: baseline.environment.clone(),
             conservation_valid: baseline.conservation_valid,
             actor_private: baseline.actor_private.clone(),
+            transfer_link: interest.transfer_link.clone(),
             view_hash: String::new(),
         };
         state.view_hash = hash_view(&state)?;
@@ -636,6 +646,12 @@ impl InterestVerifier {
             delta.actor_private_motion.as_ref(),
         )?;
         validate_delta_frontier(current, &delta.interest)?;
+        if delta.interest.transfer_link.is_some() {
+            return Err(VerifyError::new(
+                ErrorCode::InvalidDelta,
+                "transfer linkage is valid only on a complete destination baseline",
+            ));
+        }
         if delta.cell_id != current.cell_id
             || delta.gravity_body_id != current.gravity_body_id
             || delta.voxel_body_id != current.voxel_body_id
@@ -744,6 +760,7 @@ impl InterestVerifier {
             .conservation_valid
             .unwrap_or(current.conservation_valid);
         state.actor_private = actor_private;
+        state.transfer_link = None;
         state.view_hash.clear();
         state.view_hash = hash_view(&state)?;
         require_wire_hash(&delta.interest.view_hash, &state.view_hash)?;
@@ -880,6 +897,58 @@ fn validate_interest_header(
         &interest.local_origin_address,
         "interest local-origin address",
     )?;
+    Ok(())
+}
+
+fn validate_transfer_link(
+    link: Option<&InterestTransferLink>,
+    destination_cell_id: &str,
+    destination_cell_address: &UniverseAddress,
+    role: &SessionRole,
+    binding: &RegistryBinding,
+) -> Result<()> {
+    let Some(link) = link else {
+        return Ok(());
+    };
+    let valid_identifier = !link.transfer_id.is_empty()
+        && link.transfer_id.len() <= 128
+        && link
+            .transfer_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'));
+    if !matches!(role, SessionRole::Player { .. })
+        || !valid_identifier
+        || link.placement_generation == 0
+        || link.destination_cell_key.schema_version != CELL_KEY_SCHEMA_VERSION
+    {
+        return Err(VerifyError::new(
+            ErrorCode::InvalidBaseline,
+            "transfer link role, identity, schema, or placement generation is invalid",
+        ));
+    }
+    let address = UniverseAddress {
+        universe_id: link.destination_cell_key.universe_id.clone(),
+        sector: link.destination_cell_key.sector.clone(),
+        cell: link.destination_cell_key.cell,
+        local_um: I64Vec3::ZERO,
+    };
+    binding.validate_address(&address, "transfer destination cell key")?;
+    if &address != destination_cell_address {
+        return Err(VerifyError::new(
+            ErrorCode::BindingMismatch,
+            "transfer link does not name the baseline destination cell address",
+        ));
+    }
+    let canonical = canonical::fixed_json(&link.destination_cell_key)?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"the-verse/cell-key/v1\0");
+    hasher.update(&canonical);
+    if hasher.finalize().to_hex().as_str() != destination_cell_id {
+        return Err(VerifyError::new(
+            ErrorCode::BindingMismatch,
+            "transfer link does not name the baseline destination cell identity",
+        ));
+    }
     Ok(())
 }
 
@@ -1520,6 +1589,8 @@ struct HashMaterial<'a> {
     interest_epoch: u64,
     baseline_id: &'a str,
     delta_sequence: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transfer_link: Option<&'a InterestTransferLink>,
     entities: &'a [InterestEntityProjection],
     environment: &'a EnvironmentSnapshot,
     conservation_valid: bool,
@@ -1544,6 +1615,7 @@ fn hash_view(view: &ViewState) -> Result<String> {
         interest_epoch: view.interest_epoch,
         baseline_id: &view.baseline_id,
         delta_sequence: view.delta_sequence,
+        transfer_link: view.transfer_link.as_ref(),
         entities: &view.entities,
         environment: &view.environment,
         conservation_valid: view.conservation_valid,
@@ -2053,6 +2125,7 @@ mod tests {
             local_origin_address: address(),
             registry_hash,
             universe_manifest_hash: manifest_hash,
+            transfer_link: None,
             canonical_event_sequence: 50 + sequence,
             canonical_tick: 60 + sequence,
             canonical_world_hash: format!("world-{sequence}"),
@@ -2087,6 +2160,7 @@ mod tests {
             environment: environment(),
             conservation_valid: true,
             actor_private: None,
+            transfer_link: None,
             view_hash: String::new(),
         };
         state.view_hash = hash_view(&state).expect("fixture hashes");
