@@ -160,6 +160,24 @@ struct DraftGridClosurePackageV2 {
     package_hash: String,
 }
 
+/// Borrow proving that one exact package-v2 document is bound to the complete
+/// validated manifest-5 identity, not merely to caller-supplied hash strings.
+#[derive(Debug)]
+struct ValidatedDraftGridClosurePackageV2<'package, 'manifest> {
+    package: &'package DraftGridClosurePackageV2,
+    manifest: &'manifest crate::manifest_v5::ValidatedUniverseManifestV5,
+}
+
+impl ValidatedDraftGridClosurePackageV2<'_, '_> {
+    fn package(&self) -> &DraftGridClosurePackageV2 {
+        self.package
+    }
+
+    fn manifest_hash(&self) -> &str {
+        self.manifest.manifest_hash()
+    }
+}
+
 #[derive(Serialize)]
 struct ClosureHashMaterial<'a> {
     root_aggregate_id: &'a str,
@@ -331,6 +349,30 @@ impl DraftGridClosurePackageV2 {
             ));
         }
         Ok(())
+    }
+
+    fn validate_manifest_v5<'package, 'manifest>(
+        &'package self,
+        manifest: &'manifest crate::manifest_v5::ValidatedUniverseManifestV5,
+    ) -> Result<ValidatedDraftGridClosurePackageV2<'package, 'manifest>, DraftGridClosureError>
+    {
+        self.validate_wire()?;
+        let document = manifest.document();
+        if self.universe_id != manifest.universe_id()
+            || self.universe_manifest_hash != manifest.manifest_hash()
+            || self.celestial_registry_hash != document.celestial_registry_hash
+            || self.content_manifest_version != document.compatibility.content_manifest_version
+            || self.schema_version != document.compatibility.transfer_package_schema_version
+            || self.receipt_schema_version != DRAFT_GRID_TRANSFER_RECEIPT_SCHEMA_VERSION
+        {
+            return Err(DraftGridClosureError::Invalid(
+                "package-v2 does not match the complete validated manifest-5 identity".into(),
+            ));
+        }
+        Ok(ValidatedDraftGridClosurePackageV2 {
+            package: self,
+            manifest,
+        })
     }
 }
 
@@ -1901,6 +1943,41 @@ mod tests {
         assert_eq!(
             package.package_hash,
             "dc06fd2d41b50671dca5189c905e40a9ec364aa0e35413a4c2de22d569862826"
+        );
+    }
+
+    #[test]
+    fn package_v2_requires_complete_manifest5_identity_before_persistence() {
+        let (_, _, active_bound) = package_fixture();
+        let manifest = crate::manifest_v5::build_validated_manifest_v5(801)
+            .expect("manifest-5 capability builds");
+        let other_manifest = crate::manifest_v5::build_validated_manifest_v5(802)
+            .expect("other manifest-5 capability builds");
+        assert!(active_bound.validate_manifest_v5(&manifest).is_err());
+
+        let mut package = active_bound;
+        package.universe_manifest_hash = manifest.manifest_hash().to_owned();
+        package.package_hash = package
+            .calculate_package_hash()
+            .expect("manifest-5 package rehashes");
+        let validated = package
+            .validate_manifest_v5(&manifest)
+            .expect("package binds the complete manifest-5 identity");
+        assert_eq!(validated.package(), &package);
+        assert_eq!(validated.manifest_hash(), manifest.manifest_hash());
+        assert!(package.validate_manifest_v5(&other_manifest).is_err());
+
+        let mut substituted_registry = package;
+        substituted_registry.celestial_registry_hash = "ab".repeat(32);
+        substituted_registry.package_hash = substituted_registry
+            .calculate_package_hash()
+            .expect("substituted registry package rehashes");
+        assert!(substituted_registry.validate_wire().is_ok());
+        assert!(
+            substituted_registry
+                .validate_manifest_v5(&manifest)
+                .is_err(),
+            "syntactically valid raw trust roots cannot replace manifest-5 authority"
         );
     }
 
