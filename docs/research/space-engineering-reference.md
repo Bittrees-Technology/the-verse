@@ -43,6 +43,8 @@ The public file tree shows that a mature engineering sandbox treats these as sep
 | Dedicated server projects | Headless authoritative cell workers and orchestration |
 
 This module map is a completeness checklist, not a design or code dependency.
+The accepted product consequences of the broader feature review are recorded
+in [Section 21 of the delivery roadmap](../roadmap/roadmap.md#section-21--lessons-for-the-verse).
 
 ## Parity sequence
 

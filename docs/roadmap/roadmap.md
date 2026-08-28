@@ -4,6 +4,72 @@
 
 The project will reconcile and specify systems before building them one by one.
 
+## Section 21 — Lessons for The Verse
+
+**Status:** Accepted product direction
+
+The project shall preserve the strengths of a physical engineering sandbox
+while extending them into a persistent public industrial society. These are
+product guardrails for sequencing, scope review, and milestone acceptance.
+
+### Preserve
+
+- Every manufactured object begins with conserved resources and remains
+  traceable through extraction, hauling, refining, manufacturing,
+  construction, use, repair, salvage, recycling, and destruction.
+- Bases, ships, factories, vehicles, and infrastructure use one interoperable
+  functional-block construction grammar.
+- Damage changes real subsystems, topology, cargo, power, motion, and productive
+  capability instead of acting only as a health-bar reduction.
+- Vehicles are tools for work, logistics, exploration, construction, salvage,
+  defense, and trade.
+- Blueprints, control logic, and automation are programmable and shareable
+  through versioned, permissioned, provenance-checked formats.
+- The world remembers discoveries, depletion, construction, damage, repair,
+  abandonment, ownership, and recovery.
+
+### Improve
+
+- Treat movement, camera behavior, targeting, mining, welding, cutting,
+  inventory, and construction feel as release gates before adding more blocks.
+- Give a new player safe, guided, server-verified work in the first session.
+- Make salvage, hauling, manufacturing, construction, repair, survey, security,
+  and logistics durable careers supported by contracts and work records.
+- Connect production to regional demand, scarcity, custody, transport cost, and
+  risk rather than flattening the economy into one global price.
+- Give companies scoped roles, payroll, treasury, permissions, asset custody,
+  work assignment, and auditable governance.
+- Let NPCs and autonomous agents participate in production, logistics,
+  contracts, and markets under the same authoritative rules as humans.
+- Design prediction and interpolation for irregular delivery, and publish
+  budgets for grids, automation, physics, voxel changes, replication, and
+  recovery before claiming scale.
+- Make progression reflect useful work and make exploration change economic or
+  historical knowledge.
+
+### Build order
+
+1. Make movement, interaction, targeting, mining, welding, cutting, inventory,
+   and construction consistently trustworthy.
+2. Complete the conserved mining-to-manufacturing loop and guide a new player
+   through it at a safe starter worksite.
+3. Add work-capable vehicles, power, cargo, conveyors, topology-aware damage,
+   salvage, and repair.
+4. Add bounded automation, control scripts, and programmable workers.
+5. Add contracts, work records, companies, reputation, payroll, and public
+   trade with regional demand signals.
+6. Expand into regions, planets, stations, routes, surveys, encounters, and
+   durable discovery history.
+7. Add portable blueprints, scripts, and approved content packages.
+8. Deepen combat only after movement, authority, recovery, and economic
+   consequences are reliable.
+
+The differentiator is durable economic meaning: what a participant builds,
+moves, programs, discovers, damages, repairs, sells, or abandons should matter
+to other participants later. Feature reviews shall prefer strengthening that
+continuity over reproducing another product's catalog, interface, fiction, or
+signature designs.
+
 ## Blockchain dependency sequencing
 
 The bNOTE acquisition interface and Base BIT/bridge deployment manifest are intentionally deferred. They do not block P0 gameplay, P1 multiplayer, or P2's internal test-credit economy. They become required inputs before P3 testnet Web3 integration, after voxel mining and the economic lifecycle have been validated.
@@ -109,6 +175,15 @@ availability, cross-cell collision/combat, static or oversized structure
 partitioning, planet streaming, frontier expansion, routes, or thousands-player
 capacity.
 
+P1.8 persistence migration and install is the active correctness bridge. It
+must transform the protocol-18/world-20/event-16 proof state into the isolated
+protocol-19/world-21/event-17 store through canonical migration receipts,
+immutable per-cell genesis records, exact legacy-frontier preservation,
+single-writer installation, and process-crash recovery. It may activate no
+hybrid world and may not invent, duplicate, omit, or reseal conserved state.
+After this bridge is green, the next playable slice prioritizes F-062 and
+F-063 before broader construction breadth.
+
 P1.5 acceptance requires:
 
 - Deterministic registry identity, normalized addresses, minimum-separation
@@ -206,6 +281,8 @@ Build:
 - Death drops.
 - Derelict cleanup.
 - Physical refining, conveyor logistics, manufacturing, and production queues.
+- Published movement, camera, interaction, correction, and performance gates.
+- Safe guided first-session worksite and one conserved engineering work loop.
 - Browser status application.
 - Public read API.
 - Signed direct-download updater.
@@ -222,9 +299,14 @@ Build:
 
 - Passkey profiles.
 - Companies, roles, and formal contracts.
+- Company payroll, treasury, permissions, custody, and work operations.
+- Useful-work reputation and occupational progression.
+- Bounded programmable workers and engineering automation.
 - Internal test-credit AMMs.
 - Capital and regional custody.
+- Regional demand, scarcity, transport, and logistics signals.
 - Unique-item listings.
+- Durable survey, route, discovery, and world-history records.
 - Registered-station cleanup exception.
 - Economic dashboards.
 - Agent SDK.

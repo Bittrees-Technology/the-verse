@@ -10,6 +10,11 @@ A player can begin with nothing, find resources, produce useful goods, join or f
 
 The universe continues when a player logs out. Travel, power usage, production, defense, attack, decay, markets, and contracts remain meaningful persistent processes.
 
+The Verse is differentiated by a persistent public industrial society, not by
+the number of blocks it exposes or by reproducing another product. A useful
+object carries material origin, labor, ownership, location, operating history,
+and consequences that remain meaningful to other participants.
+
 ## Product pillars
 
 ### Physical industry
@@ -35,6 +40,22 @@ Humans, bots, NPCs, and AI agents may play and use published interfaces under th
 ### Open development
 
 The official client and server are open source. SDKs and schemas are permissively licensed. Official content changes use public specifications and governance.
+
+## Experience principles
+
+- **Feel before breadth:** movement, camera behavior, targeting, mining,
+  welding, cutting, inventory, and construction must be trustworthy before the
+  project expands the block catalog.
+- **Work creates progress:** extraction, hauling, manufacturing, construction,
+  repair, survey, salvage, security, and logistics are first-class careers and
+  the primary sources of reputation and progression.
+- **One construction grammar:** the same interoperable functional-block model
+  supports bases, ships, factories, vehicles, and infrastructure.
+- **A remembered world:** the universe records what participants discover,
+  build, mine, damage, repair, trade, abandon, and recover.
+- **One authority model:** humans and autonomous participants use the same
+  server-authoritative, conservation-preserving rules through native, browser,
+  and published interfaces.
 
 ## Explicit non-goals for the first implementation
 
