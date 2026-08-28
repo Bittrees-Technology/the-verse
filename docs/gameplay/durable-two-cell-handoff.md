@@ -582,6 +582,17 @@ to the same capability. The returned event capability borrows the event,
 predecessor state, manifest, and validated context; raw serialized authority
 claims and self-consistent hash substitutions cannot create it.
 
+The offline protocol-18-to-19 migration bridge now has a dormant canonical
+anchor and receipt codec. It commits the exact source and target compatibility
+tuples, manifest roots, terminal directory/archive roots, ordered cell set,
+fencing and lifecycle evidence, production/identity mapping roots, and equal
+global conservation and normalized-gameplay roots. Every target cell retains
+its event-16 `(sequence, head hash)` as a typed legacy predecessor, begins with
+an empty event-17 journal at that same frontier, and must accept its first event
+17 only at `sequence + 1`. Canonical decoding is bounded and hash-sealed but is
+explicitly not an install capability; live source locks, terminal-state proof,
+staged target reopening, and policy approval remain required.
+
 Implementation is staged behind that boundary. The private directory-v3 draft
 already validates ordered grid-and-rider membership, closure and conservation
 roots, package and receipt schemas, historical cell fences, phase-specific
