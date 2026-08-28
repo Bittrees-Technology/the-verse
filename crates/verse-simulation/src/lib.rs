@@ -8,6 +8,7 @@ mod content;
 mod engine;
 mod event;
 mod handoff;
+mod identity;
 mod model;
 mod persistence;
 mod projection;
@@ -42,6 +43,7 @@ pub use handoff::{
     quarantine_eva_player_transfer, stage_aborted_eva_unlock, stage_committed_eva_export,
     stage_committed_eva_import, stage_eva_player_quarantine, stage_prepared_eva_lock,
 };
+pub use identity::{SUBJECT_ID_SCHEMA_VERSION, SubjectIdError, canonical_subject_id};
 pub use model::{
     ActorOperationHistory, Block, Grid, InventoryRecord, Ledger, Player, PlayerTransferLock,
     PlayerTransferReservation, ProductionClock, TransferConservationWitness,
