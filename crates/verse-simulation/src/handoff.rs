@@ -1136,7 +1136,7 @@ mod tests {
     use super::*;
     use crate::model::WORLD_SCHEMA_VERSION;
     use crate::{
-        EVENT_SCHEMA_VERSION, EventPayload, LocalCellDirectory, MobileAggregateKind,
+        EVENT_SCHEMA_VERSION, EventPayload, LocalCellDirectory, MobileAggregateKind, Store,
         neighbor_cell_key, proof_cell_keys, universe_manifest,
     };
     use tempfile::tempdir;
@@ -1668,6 +1668,197 @@ mod tests {
             .apply_event(&round_trip_event(&import_event))
             .expect("import replays from reserved destination");
         assert_eq!(replayed_destination, reserved_destination);
+    }
+
+    #[test]
+    fn source_and_destination_journals_recover_the_committed_transfer_exactly() {
+        let seed = 8_021;
+        let source_key = celestial::cell_origin_key();
+        let destination_key =
+            neighbor_cell_key(&source_key, [1, 0, 0]).expect("destination cell derives");
+        let source_root = tempdir().expect("source root");
+        let destination_root = tempdir().expect("destination root");
+        let mut source_store = Store::open_for_cell(source_root.path(), seed, source_key.clone())
+            .expect("source store opens");
+        let mut destination_store =
+            Store::open_for_cell(destination_root.path(), seed, destination_key.clone())
+                .expect("destination store opens");
+        let mut source = source_store.load_world().expect("source world loads");
+        source.fencing_token = source_store.fencing_token();
+        let mut destination = destination_store
+            .load_world()
+            .expect("destination world loads");
+        destination.fencing_token = destination_store.fencing_token();
+
+        let boundary_address = celestial::address_from_origin_offset_um(
+            &source.cell_address,
+            [i128::from(celestial::CELL_EDGE_UM / 2), 0, 0],
+        )
+        .expect("boundary address canonicalizes");
+        let boundary_position =
+            celestial::local_position_from_address(&source.cell_address, &boundary_address)
+                .expect("boundary position hydrates");
+        let player = source
+            .player
+            .get_mut("player-local")
+            .expect("source player exists");
+        player.address = boundary_address;
+        player.position = boundary_position;
+        player.locomotion.kind = LocomotionKind::Eva;
+        player.locomotion.support = None;
+        player.locomotion.magnetic_boots_enabled = false;
+        source
+            .validate_player_roster()
+            .expect("journal source boundary is canonical");
+        source_store
+            .save_snapshot(&source)
+            .expect("source prepare boundary persists");
+        destination_store
+            .save_snapshot(&destination)
+            .expect("destination quarantine boundary persists");
+
+        let context = PlayerTransferContext {
+            transfer_id: "transfer-journal-recovery".into(),
+            source_cell_key: source_key,
+            destination_cell_key: destination_key,
+            source_assignment_generation: 3,
+            destination_assignment_generation: 5,
+            source_fencing_token: source_store.fencing_token(),
+            prior_placement_generation: 7,
+            resulting_placement_generation: 8,
+        };
+        let package = prepare_eva_player_transfer(&source, "player-local", &context)
+            .expect("journal transfer package prepares");
+        let prepared = CellTransferRecord {
+            transfer_id: package.transfer_id.clone(),
+            aggregate_id: package.aggregate_id.clone(),
+            aggregate_kind: MobileAggregateKind::Player,
+            source_cell_key: package.source_cell_key.clone(),
+            source_cell_id: package.source_cell_id.clone(),
+            destination_cell_key: package.destination_cell_key.clone(),
+            destination_cell_id: package.destination_cell_id.clone(),
+            source_assignment_generation: package.source_assignment_generation,
+            destination_assignment_generation: package.destination_assignment_generation,
+            prior_placement_generation: package.prior_placement_generation,
+            resulting_placement_generation: package.resulting_placement_generation,
+            package_hash: package.package_hash.clone(),
+            quarantine_receipt_hash: None,
+            phase: TransferPhase::Prepared,
+        };
+        let prepare_event = source.prepare_system_event(EventPayload::PlayerTransferPrepared {
+            package: package.clone(),
+            directory_transfer: prepared.clone(),
+        });
+        let mut exported = source.clone();
+        exported
+            .apply_event(&prepare_event)
+            .expect("source prepare applies");
+        source_store
+            .append_event(&prepare_event)
+            .expect("source prepare synchronizes");
+
+        let receipt = quarantine_eva_player_transfer(
+            &destination,
+            destination_store.fencing_token(),
+            &package,
+        )
+        .expect("destination receipt prepares");
+        let quarantine_event =
+            destination.prepare_system_event(EventPayload::PlayerTransferQuarantined {
+                package: package.clone(),
+                receipt: receipt.clone(),
+            });
+        destination
+            .apply_event(&quarantine_event)
+            .expect("destination quarantine applies");
+        destination_store
+            .append_event(&quarantine_event)
+            .expect("destination quarantine synchronizes");
+
+        let committed = CellTransferRecord {
+            quarantine_receipt_hash: Some(receipt.receipt_hash.clone()),
+            phase: TransferPhase::Committed,
+            ..prepared
+        };
+        let export_event = exported.prepare_system_event(EventPayload::PlayerTransferExported {
+            package: package.clone(),
+            directory_transfer: committed.clone(),
+        });
+        exported
+            .apply_event(&export_event)
+            .expect("source export applies");
+        source_store
+            .append_event(&export_event)
+            .expect("source export synchronizes");
+
+        let import_event = destination.prepare_system_event(EventPayload::PlayerTransferImported {
+            package: package.clone(),
+            receipt,
+            directory_transfer: committed,
+        });
+        destination
+            .apply_event(&import_event)
+            .expect("destination import applies");
+        destination_store
+            .append_event(&import_event)
+            .expect("destination import synchronizes");
+        let exported_hash = exported.state_hash();
+        let imported_hash = destination.state_hash();
+        drop(source_store);
+        drop(destination_store);
+
+        let mut recovered_source =
+            Store::open_for_cell(source_root.path(), seed, package.source_cell_key.clone())
+                .expect("source store reopens");
+        let mut recovered_destination = Store::open_for_cell(
+            destination_root.path(),
+            seed,
+            package.destination_cell_key.clone(),
+        )
+        .expect("destination store reopens");
+        let recovered_source = recovered_source
+            .load_world()
+            .expect("source journal replays");
+        let recovered_destination = recovered_destination
+            .load_world()
+            .expect("destination journal replays");
+        assert_eq!(recovered_source.state_hash(), exported_hash);
+        assert_eq!(recovered_destination.state_hash(), imported_hash);
+        assert!(recovered_source.player.get("player-local").is_none());
+        assert_eq!(
+            recovered_destination.player.get("player-local"),
+            Some(&package.destination_player)
+        );
+        assert_eq!(
+            recovered_destination
+                .inventories
+                .get(&package.inventory.inventory_id),
+            Some(&package.inventory)
+        );
+        assert!(recovered_source.player_transfer_locks.is_empty());
+        assert!(
+            recovered_destination
+                .player_transfer_reservations
+                .is_empty()
+        );
+        assert_eq!(
+            recovered_source
+                .transfer_witnesses
+                .get(&package.transfer_id)
+                .expect("source witness recovers")
+                .direction,
+            TransferWitnessDirection::Export
+        );
+        assert_eq!(
+            recovered_destination
+                .transfer_witnesses
+                .get(&package.transfer_id)
+                .expect("destination witness recovers")
+                .direction,
+            TransferWitnessDirection::Import
+        );
+        assert!(recovered_source.conservation().valid);
+        assert!(recovered_destination.conservation().valid);
     }
 
     fn round_trip_event(event: &crate::CanonicalEvent) -> crate::CanonicalEvent {
