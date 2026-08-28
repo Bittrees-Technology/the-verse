@@ -814,6 +814,45 @@ mod tests {
     }
 
     #[test]
+    fn live_event_sealing_requires_a_current_head_capability() {
+        use super::super::event_v17::ValidatedCurrentGridEventAuthorityV17;
+
+        let (source_world, _, package) = package_v3_directory_fixture();
+        let source = DraftGridTransferCellStateV2::new_with_production_origins(
+            source_world,
+            BTreeMap::new(),
+        )
+        .expect("source state seals");
+        let mut directory = authority_harness(&package);
+        directory.prepare().expect("directory prepares");
+        let root = tempdir().expect("temporary history directory");
+        let directory = directory
+            .persist_history(root.path())
+            .expect("directory history persists");
+        let capability = directory
+            .current_grid_authority(&package.transfer_id)
+            .expect("current grid authority resolves from the locked head");
+        let event = DraftCanonicalGridEventV17::new_live_system_for_store(
+            &source,
+            "store-live-grid-prepare",
+            1_800_000_030_500,
+            DraftGridEventPayloadV17::GridTransferPrepared {
+                package,
+                authority: DraftGridDirectoryAuthorityV2::from_validated_v3(capability.validated()),
+            },
+            ValidatedCurrentGridEventAuthorityV17::Grid(&capability),
+        )
+        .expect("live event seals only through current-head authority");
+        let applied = apply_proven_event_v17(
+            &source,
+            &event,
+            ValidatedDraftGridEventAuthorityV17::Grid(capability.validated()),
+        )
+        .expect("the sealed live event applies exactly once");
+        assert_event_proof(&applied.proof, &event);
+    }
+
+    #[test]
     fn trusted_dispatcher_rejects_a_predecessor_fence_never_issued_by_the_directory() {
         let (source_world, _, package) = package_v3_directory_fixture();
         let mut source = DraftGridTransferCellStateV2::new_with_production_origins(

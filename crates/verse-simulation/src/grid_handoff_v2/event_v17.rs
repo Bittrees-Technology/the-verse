@@ -15,7 +15,10 @@ use super::{
     DraftGridClosureError, DraftGridClosurePackageV2, DraftGridCompatibilityTupleV19, hash_json,
     valid_blake3_hex, valid_stable_id,
 };
-use crate::cell_directory_v3::{ValidatedCellAuthorityV3, ValidatedGridTransferAuthorityV3};
+use crate::cell_directory_v3::{
+    ValidatedCellAuthorityV3, ValidatedCurrentCellAuthorityV3, ValidatedCurrentGridAuthorityV3,
+    ValidatedGridTransferAuthorityV3,
+};
 use crate::event::ProductionScheduleOccurrence;
 
 pub(super) const DRAFT_GRID_EVENT_SCHEMA_VERSION: u32 = 17;
@@ -90,6 +93,15 @@ impl DraftProductionAuthorityClaimV17 {
 pub(super) enum ValidatedDraftGridEventAuthorityV17<'a> {
     Grid(&'a ValidatedGridTransferAuthorityV3),
     Production(&'a ValidatedCellAuthorityV3),
+}
+
+/// Live authority can only be minted from the locked directory's current
+/// head. The world-21 Store consumes this type; replay uses the separate
+/// historical capability above.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum ValidatedCurrentGridEventAuthorityV17<'authority, 'store> {
+    Grid(&'authority ValidatedCurrentGridAuthorityV3<'store>),
+    Production(&'authority ValidatedCurrentCellAuthorityV3<'store>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -397,6 +409,34 @@ impl DraftCanonicalGridEventV17 {
         event.event_hash = event.calculate_hash()?;
         event.bind_for_state(&rebound, authority)?;
         Ok(event)
+    }
+
+    #[cfg(test)]
+    pub(super) fn new_live_system_for_store(
+        state: &DraftGridTransferCellStateV2,
+        event_id: impl Into<String>,
+        occurred_at_unix_ms: u64,
+        payload: DraftGridEventPayloadV17,
+        authority: ValidatedCurrentGridEventAuthorityV17<'_, '_>,
+    ) -> Result<Self, DraftGridClosureError> {
+        match authority {
+            ValidatedCurrentGridEventAuthorityV17::Grid(authority) => Self::new_proven_system(
+                state,
+                event_id,
+                occurred_at_unix_ms,
+                payload,
+                ValidatedDraftGridEventAuthorityV17::Grid(authority.validated()),
+            ),
+            ValidatedCurrentGridEventAuthorityV17::Production(authority) => {
+                Self::new_proven_system(
+                    state,
+                    event_id,
+                    occurred_at_unix_ms,
+                    payload,
+                    ValidatedDraftGridEventAuthorityV17::Production(authority.validated()),
+                )
+            }
+        }
     }
 
     fn calculate_payload_hash(&self) -> Result<String, DraftGridClosureError> {
