@@ -607,14 +607,36 @@ reconstructs the pre-removal active world; after later events it permits
 ordinary motion, damage, rider changes, and a new transfer ID for the same grid.
 Production remains independently held: every eligibility binds the exact
 import boundary and full packaged queue hash, so even a same-job-ID queue-body
-change fails until an authenticated release transaction exists. Dormant
-directory v3 persists and reconstructs both typed destination import and
+change fails until an authenticated whole-cell occurrence exists. The dormant
+production occurrence now derives a canonical decision for every ordered
+queue-bearing machine. A schedule before an imported queue's boundary records
+an explicit transfer pause, does not evaluate ordinary machine conditions, and
+changes no job work state. The first occurrence at or after the boundary removes
+every due hold and evaluates its ordinary power, route, capacity, progress,
+output, ledger, and reward result in the same atomic vector as unrelated
+machines. Accepted trusted time must have reached the schedule, the production
+clock advances once, and exact redelivery returns the historical result.
+Complete release batches are excluded from the active-world hash but retain
+the predecessor snapshots needed to reconstruct and replay the release
+frontier. A compact append-only occurrence head and count remain inside that
+hash, so an older pause or release cannot be silently deleted after the frontier
+moves. Validation partitions each import's original eligibility root between
+live records and archived released records, rejecting loss, duplication,
+resurrection, queue-body substitution, contradictory lifecycle/quantum identity,
+and another handoff while a destination-bound hold remains. Because the boundary
+is import time plus one second, background production can release while the
+gameplay activation lock is still pending; later activation neither recreates
+nor delays it. Dormant directory v3 persists and reconstructs both typed
+destination import and
 activation proofs, and Imported/Finalized retries must match the local
-historical results exactly. Source finalization, eligibility release and the
-explicit transfer-paused scheduler outcome, plus crash/replay integration,
-remain to be implemented before activation. All drafts are
+historical results exactly. Source finalization, the active event-17 runtime
+scheduler and durable wake-up path, and persistence failpoint crash/replay
+integration remain to be implemented before activation. All drafts are
 intentionally unreachable from the production directory-v2/package-v1 paths
 until every version in the table above moves in one coordinated activation.
+The dormant proof harness retains bounded predecessor projections for replay;
+the activated path must persist occurrences through the canonical event journal
+and reserve evidence capacity before an import can consume the cell envelope.
 
 The first P1.7 proof archives and resets P1.6 data. A later offline migration
 must derive canonical cell keys, install one placement generation for every
