@@ -20,6 +20,8 @@ mod persistence;
 mod projection;
 #[allow(dead_code)]
 mod protocol19_migration;
+#[allow(dead_code)]
+mod protocol19_source;
 mod targeting;
 mod two_cell;
 

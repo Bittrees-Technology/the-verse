@@ -722,14 +722,19 @@ fn has_exact_transfer_witness(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
     use std::io::Write as _;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     use tempfile::tempdir;
     use verse_protocol::{LocomotionKind, Vec3};
 
     use super::*;
+    use crate::event::CanonicalEvent;
+    use crate::persistence::{
+        DurableTransferBoundary, TransferBoundaryKind, validate_frozen_transfer_archive,
+    };
     use crate::{Store, TransferPhase};
 
     fn initialize_boundary_universe(root: &Path, seed: u64) -> [CellKeyV1; 2] {
@@ -879,6 +884,149 @@ mod tests {
                 .expect("directory binds source prepare proof");
         }
         (transfer_id, source_index, destination_index, package)
+    }
+
+    fn read_canonical_events(path: &Path) -> Vec<CanonicalEvent> {
+        fs::read_to_string(path)
+            .expect("event archive reads")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("event record parses"))
+            .collect()
+    }
+
+    fn read_transfer_boundaries(path: &Path) -> Vec<DurableTransferBoundary> {
+        fs::read_to_string(path)
+            .expect("transfer archive reads")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("transfer boundary parses"))
+            .collect()
+    }
+
+    fn replayed_transfer_roots(
+        initial: &WorldState,
+        events: &[CanonicalEvent],
+        boundaries: &[DurableTransferBoundary],
+    ) -> BTreeMap<(String, TransferBoundaryKind), String> {
+        let mut replay = initial.clone();
+        let mut state_hashes = BTreeMap::new();
+        for event in events {
+            replay
+                .apply_event(event)
+                .expect("real transfer event replays");
+            state_hashes.insert(event.event_sequence, replay.state_hash());
+        }
+        boundaries
+            .iter()
+            .map(|boundary| {
+                (
+                    (boundary.transfer_id.clone(), boundary.kind),
+                    state_hashes
+                        .get(&boundary.event_sequence)
+                        .expect("boundary event has a replayed post-state")
+                        .clone(),
+                )
+            })
+            .collect()
+    }
+
+    fn terminal_archive_paths(
+        coordinator: &LocalTwoCellRuntime,
+        cell_key: &CellKeyV1,
+    ) -> (PathBuf, PathBuf) {
+        let cell_root = coordinator
+            .directory
+            .cell_store_root(cell_key)
+            .expect("cell root derives");
+        (
+            cell_root.join("events.ndjson"),
+            cell_root.join("transfer-boundaries.ndjson"),
+        )
+    }
+
+    fn validate_real_terminal_archives(seed: u64, abort: bool) {
+        let root = tempdir().expect("universe root");
+        let cells = initialize_boundary_universe(root.path(), seed);
+        let mut coordinator = LocalTwoCellRuntime::open(root.path(), seed, 1, "terminal-proof")
+            .expect("coordinator opens");
+        let initial_states = cells
+            .iter()
+            .map(|cell_key| {
+                coordinator
+                    .runtime_for_cell(cell_key)
+                    .expect("cell runtime exists")
+                    .state()
+                    .clone()
+            })
+            .collect::<Vec<_>>();
+        if abort {
+            let (transfer_id, _, _, _) = prepare_test_transfer(&mut coordinator, true);
+            let transfer = coordinator
+                .abort_transfer(&transfer_id)
+                .expect("prepared transfer aborts");
+            assert_eq!(transfer.phase, TransferPhase::Aborted);
+        } else {
+            coordinator
+                .handoff_player("player-local")
+                .expect("player transfer finalizes");
+        }
+
+        for (cell_key, initial_state) in cells.iter().zip(&initial_states) {
+            let (event_path, boundary_path) = terminal_archive_paths(&coordinator, cell_key);
+            let events = read_canonical_events(&event_path);
+            let boundary_bytes = fs::read(&boundary_path).expect("transfer archive bytes read");
+            let boundaries = read_transfer_boundaries(&boundary_path);
+            assert!(!boundaries.is_empty());
+            let replayed_roots = replayed_transfer_roots(initial_state, &events, &boundaries);
+            let expected_head = boundaries
+                .last()
+                .expect("terminal archive has a head")
+                .boundary_hash
+                .clone();
+            validate_frozen_transfer_archive(
+                &boundary_path,
+                &boundary_bytes,
+                &events,
+                &replayed_roots,
+                &expected_head,
+            )
+            .expect("real terminal archive matches replay-derived world roots");
+
+            if !abort && cell_key == &cells[0] {
+                let mut forged = boundaries.clone();
+                forged[0].resulting_world_hash = "f".repeat(64);
+                let mut previous_hash = String::new();
+                for boundary in &mut forged {
+                    boundary.previous_boundary_hash.clone_from(&previous_hash);
+                    boundary.boundary_hash.clear();
+                    boundary.boundary_hash = boundary.calculate_hash();
+                    previous_hash.clone_from(&boundary.boundary_hash);
+                }
+                let mut forged_bytes = Vec::new();
+                for boundary in &forged {
+                    forged_bytes.extend(
+                        serde_json::to_vec(boundary).expect("forged boundary encodes canonically"),
+                    );
+                    forged_bytes.push(b'\n');
+                }
+                assert!(
+                    validate_frozen_transfer_archive(
+                        &boundary_path,
+                        &forged_bytes,
+                        &events,
+                        &replayed_roots,
+                        &previous_hash,
+                    )
+                    .is_err(),
+                    "a self-consistently resealed boundary must not replace its replayed world root"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_transfer_archives_bind_finalized_and_aborted_replayed_world_roots() {
+        validate_real_terminal_archives(8_041, false);
+        validate_real_terminal_archives(8_042, true);
     }
 
     #[test]

@@ -25,6 +25,18 @@ const JOURNAL_FILE: &str = "events.ndjson";
 const LOCK_FILE: &str = "writer.lock";
 const LIFECYCLE_FILE: &str = "cell-lifecycle.json";
 const TRANSFER_BOUNDARY_FILE: &str = "transfer-boundaries.ndjson";
+const MAX_FROZEN_MANIFEST_BYTES: u64 = 64 * 1_024;
+const MAX_FROZEN_LIFECYCLE_BYTES: u64 = 256 * 1_024;
+const MAX_FROZEN_SNAPSHOT_BYTES: u64 = 256 * 1_024 * 1_024;
+const MAX_FROZEN_EVENT_ARCHIVE_BYTES: u64 = 1_024 * 1_024 * 1_024;
+const MAX_FROZEN_TRANSFER_ARCHIVE_BYTES: u64 = 256 * 1_024 * 1_024;
+const FROZEN_SNAPSHOT_HASH_DOMAIN: &[u8] = b"the-verse/protocol-18-frozen-snapshot-document/v1\0";
+const FROZEN_EVENT_ARCHIVE_ROOT_DOMAIN: &[u8] = b"the-verse/protocol-18-frozen-event-archive/v1\0";
+const FROZEN_LIFECYCLE_HASH_DOMAIN: &[u8] = b"the-verse/protocol-18-frozen-lifecycle-record/v1\0";
+const FROZEN_TRANSFER_ARCHIVE_ROOT_DOMAIN: &[u8] =
+    b"the-verse/protocol-18-frozen-transfer-boundary-archive/v1\0";
+const FROZEN_NEXT_PRODUCTION_ROOT_DOMAIN: &[u8] =
+    b"the-verse/protocol-18-frozen-next-production-occurrence/v1\0";
 pub const LIFECYCLE_CONTROL_SCHEMA_VERSION: u32 = verse_protocol::LIFECYCLE_CONTROL_SCHEMA_VERSION;
 pub const LEASE_DURATION_MILLIS: u64 = 15_000;
 pub const LEASE_RENEWAL_INTERVAL_MILLIS: u64 = 5_000;
@@ -151,6 +163,8 @@ pub enum PersistenceError {
     },
     #[error("durable transfer boundary is invalid: {0}")]
     InvalidTransferBoundary(String),
+    #[error("frozen protocol-18 migration source is invalid: {0}")]
+    InvalidMigrationSource(String),
     #[cfg(test)]
     #[error("injected persistence failure at {0}")]
     InjectedFailure(&'static str),
@@ -226,9 +240,14 @@ pub(crate) struct DurableTransferBoundary {
 
 type TransferBoundaryIndex = BTreeMap<(String, TransferBoundaryKind), DurableTransferBoundary>;
 type LoadedTransferBoundaries = (TransferBoundaryIndex, String);
+type FrozenEventArchiveValidation = (
+    Vec<CanonicalEvent>,
+    WorldState,
+    BTreeMap<(String, TransferBoundaryKind), String>,
+);
 
 impl DurableTransferBoundary {
-    fn calculate_hash(&self) -> String {
+    pub(crate) fn calculate_hash(&self) -> String {
         let mut material = self.clone();
         material.boundary_hash.clear();
         let bytes = serde_json::to_vec(&material)
@@ -339,6 +358,309 @@ pub struct Store {
     recovered_observed_mode: Option<LifecycleMode>,
     #[cfg(test)]
     append_failpoint: Option<AppendFailpoint>,
+}
+
+/// Non-serializable proof that one existing protocol-18 cell store was locked
+/// and validated without creating files, truncating an archive, healing a
+/// boundary, advancing a fence, or sampling trusted time.
+#[derive(Debug)]
+pub(crate) struct FrozenProtocol18Cell {
+    state: WorldState,
+    events: Vec<CanonicalEvent>,
+    transfer_boundaries: Vec<DurableTransferBoundary>,
+    cell_key: CellKeyV1,
+    cell_id: String,
+    authority_fencing_token: u64,
+    world_state_hash: String,
+    snapshot_document_hash: String,
+    event_sequence: u64,
+    event_head_hash: String,
+    event_archive_entry_count: u64,
+    event_archive_root: String,
+    lifecycle_revision: u64,
+    lifecycle_record_hash: String,
+    transfer_boundary_entry_count: u64,
+    transfer_boundary_head_hash: String,
+    transfer_boundary_archive_root: String,
+    acknowledged_production_sequence: u64,
+    next_production_occurrence_root: String,
+    last_trusted_unix_ms: u64,
+    _lock_file: File,
+}
+
+impl FrozenProtocol18Cell {
+    pub(crate) fn lock_existing(
+        root: impl AsRef<Path>,
+        requested_seed: u64,
+        cell_key: CellKeyV1,
+        expected_authority_fencing_token: u64,
+    ) -> Result<Self, PersistenceError> {
+        celestial::validate_cell_key(&cell_key)
+            .map_err(|source| PersistenceError::InvalidCellIdentity(source.to_string()))?;
+        let cell_id = celestial::cell_id(&cell_key)
+            .map_err(|source| PersistenceError::InvalidCellIdentity(source.to_string()))?;
+        let root = root.as_ref().to_path_buf();
+        if !root.is_dir() {
+            return Err(PersistenceError::InvalidMigrationSource(
+                "protocol-18 cell store does not exist".into(),
+            ));
+        }
+        let lock_path = root.join(LOCK_FILE);
+        let lock_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|source| io_error(&lock_path, source))?;
+        FileExt::try_lock_exclusive(&lock_file).map_err(|source| {
+            if source.kind() == std::io::ErrorKind::WouldBlock {
+                PersistenceError::WriterAlreadyActive(root.clone())
+            } else {
+                io_error(&lock_path, source)
+            }
+        })?;
+
+        let manifest_path = root.join(MANIFEST_FILE);
+        let (manifest, _) = read_frozen_pretty_json::<UniverseManifestSnapshot>(
+            &manifest_path,
+            MAX_FROZEN_MANIFEST_BYTES,
+        )?;
+        let runtime_manifest = celestial::universe_manifest(
+            requested_seed,
+            WORLD_SCHEMA_VERSION,
+            EVENT_SCHEMA_VERSION,
+        )
+        .map_err(|source| PersistenceError::InvalidRuntimeUniverseManifest(source.to_string()))?;
+        if manifest != runtime_manifest || cell_key.universe_id != manifest.universe_id {
+            return Err(PersistenceError::InvalidMigrationSource(
+                "protocol-18 cell manifest or universe route changed".into(),
+            ));
+        }
+
+        let lifecycle_path = root.join(LIFECYCLE_FILE);
+        let (lifecycle, lifecycle_bytes) = read_frozen_pretty_json::<CellLifecycleRecord>(
+            &lifecycle_path,
+            MAX_FROZEN_LIFECYCLE_BYTES,
+        )?;
+        validate_prior_lifecycle(&lifecycle, &manifest, &cell_id)?;
+        if lifecycle.pending_world_commit.is_some()
+            || expected_authority_fencing_token == 0
+            || lifecycle.fencing_token != expected_authority_fencing_token
+            || lifecycle.desired_mode != LifecycleMode::Sleeping
+            || lifecycle.observed_mode != LifecycleMode::Sleeping
+            || lifecycle.last_trusted_unix_ms == 0
+        {
+            return Err(PersistenceError::InvalidMigrationSource(
+                "protocol-18 cell is not released sleeping, lacks trusted time, retains a pending commit, or differs from directory authority".into(),
+            ));
+        }
+
+        let snapshot_path = root.join(SNAPSHOT_FILE);
+        let (mut snapshot, snapshot_bytes) =
+            read_frozen_pretty_json::<SnapshotDocument>(&snapshot_path, MAX_FROZEN_SNAPSHOT_BYTES)?;
+        if snapshot.schema_version != WORLD_SCHEMA_VERSION {
+            return Err(PersistenceError::SnapshotSchema {
+                found: snapshot.schema_version,
+                expected: WORLD_SCHEMA_VERSION,
+            });
+        }
+        snapshot
+            .state
+            .hydrate_spatial_poses()
+            .map_err(PersistenceError::InvalidPlayerRoster)?;
+        if snapshot.state_hash != snapshot.state.state_hash()
+            || snapshot.event_sequence != snapshot.state.event_sequence
+            || snapshot.last_event_hash != snapshot.state.last_event_hash
+            || !world_binding_matches(
+                &snapshot.state,
+                requested_seed,
+                &cell_key,
+                &cell_id,
+                &manifest,
+            )
+        {
+            return Err(PersistenceError::InvalidMigrationSource(
+                "protocol-18 snapshot hash, frontier, or world binding is invalid".into(),
+            ));
+        }
+        snapshot
+            .state
+            .validate_player_roster()
+            .map_err(PersistenceError::InvalidPlayerRoster)?;
+
+        let journal_path = root.join(JOURNAL_FILE);
+        let journal_bytes = read_frozen_bytes(&journal_path, MAX_FROZEN_EVENT_ARCHIVE_BYTES)?;
+        let (events, state, replayed_transfer_world_hashes) = validate_frozen_event_archive(
+            &journal_path,
+            &journal_bytes,
+            &snapshot.state,
+            &manifest,
+            &cell_id,
+        )?;
+        state
+            .validate_player_roster()
+            .map_err(PersistenceError::InvalidPlayerRoster)?;
+        if !world_binding_matches(&state, requested_seed, &cell_key, &cell_id, &manifest)
+            || state.event_sequence != lifecycle.last_world_event_sequence
+            || state.last_event_hash != lifecycle.last_world_event_hash
+            || state.state_hash() != lifecycle.last_world_state_hash
+            || state.fencing_token != lifecycle.fencing_token
+            || lifecycle.acknowledged_production_sequence
+                != state.production_clock.last_committed_quantum_sequence
+            || lifecycle.next_production_occurrence.is_some()
+            || state
+                .background_production_is_runnable()
+                .map_err(|source| PersistenceError::InvalidMigrationSource(source.to_string()))?
+        {
+            return Err(PersistenceError::LifecycleWorldFrontierMismatch);
+        }
+
+        let boundary_path = root.join(TRANSFER_BOUNDARY_FILE);
+        let boundary_bytes = read_frozen_bytes(&boundary_path, MAX_FROZEN_TRANSFER_ARCHIVE_BYTES)?;
+        let (transfer_boundaries, boundary_head) = validate_frozen_transfer_archive(
+            &boundary_path,
+            &boundary_bytes,
+            &events,
+            &replayed_transfer_world_hashes,
+            &lifecycle.transfer_boundary_head_hash,
+        )?;
+        let boundary_count = u64::try_from(transfer_boundaries.len()).map_err(|_| {
+            PersistenceError::InvalidTransferBoundary(
+                "transfer-boundary archive count overflowed".into(),
+            )
+        })?;
+        let event_archive_entry_count = u64::try_from(events.len()).map_err(|_| {
+            PersistenceError::InvalidMigrationSource(
+                "protocol-18 event archive entry count overflowed".into(),
+            )
+        })?;
+        let event_archive_root = if journal_bytes.is_empty() {
+            String::new()
+        } else {
+            hash_frozen_material(FROZEN_EVENT_ARCHIVE_ROOT_DOMAIN, &journal_bytes)
+        };
+        let transfer_boundary_archive_root = if boundary_bytes.is_empty() {
+            String::new()
+        } else {
+            hash_frozen_material(FROZEN_TRANSFER_ARCHIVE_ROOT_DOMAIN, &boundary_bytes)
+        };
+        let next_production_occurrence_root = hash_frozen_json(
+            FROZEN_NEXT_PRODUCTION_ROOT_DOMAIN,
+            &lifecycle.next_production_occurrence,
+        )?;
+        let world_state_hash = state.state_hash();
+        let event_sequence = state.event_sequence;
+        let event_head_hash = state.last_event_hash.clone();
+
+        Ok(Self {
+            state,
+            events,
+            transfer_boundaries,
+            cell_key,
+            cell_id,
+            authority_fencing_token: lifecycle.fencing_token,
+            world_state_hash,
+            snapshot_document_hash: hash_frozen_material(
+                FROZEN_SNAPSHOT_HASH_DOMAIN,
+                &snapshot_bytes,
+            ),
+            event_sequence,
+            event_head_hash,
+            event_archive_entry_count,
+            event_archive_root,
+            lifecycle_revision: lifecycle.lifecycle_revision,
+            lifecycle_record_hash: hash_frozen_material(
+                FROZEN_LIFECYCLE_HASH_DOMAIN,
+                &lifecycle_bytes,
+            ),
+            transfer_boundary_entry_count: boundary_count,
+            transfer_boundary_head_hash: boundary_head,
+            transfer_boundary_archive_root,
+            acknowledged_production_sequence: lifecycle.acknowledged_production_sequence,
+            next_production_occurrence_root,
+            last_trusted_unix_ms: lifecycle.last_trusted_unix_ms,
+            _lock_file: lock_file,
+        })
+    }
+
+    pub(crate) fn cell_key(&self) -> &CellKeyV1 {
+        &self.cell_key
+    }
+
+    pub(crate) fn state(&self) -> &WorldState {
+        &self.state
+    }
+
+    pub(crate) fn events(&self) -> &[CanonicalEvent] {
+        &self.events
+    }
+
+    pub(crate) fn transfer_boundaries(&self) -> &[DurableTransferBoundary] {
+        &self.transfer_boundaries
+    }
+
+    pub(crate) fn cell_id(&self) -> &str {
+        &self.cell_id
+    }
+
+    pub(crate) const fn authority_fencing_token(&self) -> u64 {
+        self.authority_fencing_token
+    }
+
+    pub(crate) fn world_state_hash(&self) -> &str {
+        &self.world_state_hash
+    }
+
+    pub(crate) fn snapshot_document_hash(&self) -> &str {
+        &self.snapshot_document_hash
+    }
+
+    pub(crate) const fn event_sequence(&self) -> u64 {
+        self.event_sequence
+    }
+
+    pub(crate) fn event_head_hash(&self) -> &str {
+        &self.event_head_hash
+    }
+
+    pub(crate) const fn event_archive_entry_count(&self) -> u64 {
+        self.event_archive_entry_count
+    }
+
+    pub(crate) fn event_archive_root(&self) -> &str {
+        &self.event_archive_root
+    }
+
+    pub(crate) const fn lifecycle_revision(&self) -> u64 {
+        self.lifecycle_revision
+    }
+
+    pub(crate) fn lifecycle_record_hash(&self) -> &str {
+        &self.lifecycle_record_hash
+    }
+
+    pub(crate) const fn transfer_boundary_entry_count(&self) -> u64 {
+        self.transfer_boundary_entry_count
+    }
+
+    pub(crate) fn transfer_boundary_head_hash(&self) -> &str {
+        &self.transfer_boundary_head_hash
+    }
+
+    pub(crate) fn transfer_boundary_archive_root(&self) -> &str {
+        &self.transfer_boundary_archive_root
+    }
+
+    pub(crate) const fn acknowledged_production_sequence(&self) -> u64 {
+        self.acknowledged_production_sequence
+    }
+
+    pub(crate) fn next_production_occurrence_root(&self) -> &str {
+        &self.next_production_occurrence_root
+    }
+
+    pub(crate) const fn last_trusted_unix_ms(&self) -> u64 {
+        self.last_trusted_unix_ms
+    }
 }
 
 impl Store {
@@ -2073,6 +2395,338 @@ fn accept_trusted_time(sample: u64, previous: u64) -> Result<u64, PersistenceErr
     Ok(sample.max(previous))
 }
 
+fn read_frozen_bytes(path: &Path, maximum: u64) -> Result<Vec<u8>, PersistenceError> {
+    let mut file = File::open(path).map_err(|source| io_error(path, source))?;
+    let metadata = file.metadata().map_err(|source| io_error(path, source))?;
+    if !metadata.is_file() || metadata.len() > maximum {
+        return Err(PersistenceError::InvalidMigrationSource(format!(
+            "artifact {} is not a bounded regular file",
+            path.display()
+        )));
+    }
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take(maximum.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|source| io_error(path, source))?;
+    if u64::try_from(bytes.len())
+        .map_or(true, |length| length > maximum || length != metadata.len())
+    {
+        return Err(PersistenceError::InvalidMigrationSource(format!(
+            "artifact {} changed while its source lock was held",
+            path.display()
+        )));
+    }
+    Ok(bytes)
+}
+
+fn read_frozen_pretty_json<T>(path: &Path, maximum: u64) -> Result<(T, Vec<u8>), PersistenceError>
+where
+    T: for<'de> Deserialize<'de> + Serialize,
+{
+    let bytes = read_frozen_bytes(path, maximum)?;
+    let value = serde_json::from_slice::<T>(&bytes).map_err(|source| PersistenceError::Json {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let canonical = serde_json::to_vec_pretty(&value).map_err(|source| PersistenceError::Json {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if canonical != bytes {
+        return Err(PersistenceError::InvalidMigrationSource(format!(
+            "artifact {} is not the exact canonical encoding",
+            path.display()
+        )));
+    }
+    Ok((value, bytes))
+}
+
+fn world_binding_matches(
+    state: &WorldState,
+    world_seed: u64,
+    cell_key: &CellKeyV1,
+    cell_id: &str,
+    manifest: &UniverseManifestSnapshot,
+) -> bool {
+    state.world_seed == world_seed
+        && state.universe_id == manifest.universe_id
+        && state.content_manifest_version == manifest.content_manifest_version
+        && state.universe_manifest_hash == manifest.manifest_hash
+        && state.celestial_registry_hash == manifest.celestial_registry_hash
+        && state.cell_id == cell_id
+        && celestial::cell_key_from_address(&state.cell_address)
+            .is_ok_and(|stored| &stored == cell_key)
+}
+
+fn validate_frozen_event_archive(
+    path: &Path,
+    bytes: &[u8],
+    snapshot_state: &WorldState,
+    manifest: &UniverseManifestSnapshot,
+    cell_id: &str,
+) -> Result<FrozenEventArchiveValidation, PersistenceError> {
+    if !bytes.is_empty() && bytes.last() != Some(&b'\n') {
+        return Err(PersistenceError::InvalidMigrationSource(format!(
+            "event archive {} has a torn tail",
+            path.display()
+        )));
+    }
+    let snapshot_sequence = snapshot_state.event_sequence;
+    let snapshot_fence = snapshot_state.fencing_token;
+    let mut events = Vec::new();
+    let mut previous_fence = 0_u64;
+    for (index, line) in bytes
+        .split(|byte| *byte == b'\n')
+        .take_while(|line| !line.is_empty())
+        .enumerate()
+    {
+        let line_number = index + 1;
+        let event = serde_json::from_slice::<CanonicalEvent>(line).map_err(|source| {
+            PersistenceError::CorruptJournal {
+                line: line_number,
+                message: source.to_string(),
+            }
+        })?;
+        let canonical = serde_json::to_vec(&event).map_err(|source| PersistenceError::Json {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let expected_sequence = u64::try_from(line_number).map_err(|_| {
+            PersistenceError::InvalidMigrationSource(
+                "event archive sequence cannot be represented".into(),
+            )
+        })?;
+        if canonical != line
+            || event.schema_name != EVENT_SCHEMA_NAME
+            || event.schema_version != EVENT_SCHEMA_VERSION
+            || event.event_sequence != expected_sequence
+            || event.authority_fencing_token == 0
+            || event.authority_fencing_token < previous_fence
+            || event.content_manifest_version != manifest.content_manifest_version
+            || event.universe_manifest_hash != manifest.manifest_hash
+            || event.celestial_registry_hash != manifest.celestial_registry_hash
+            || event.universe_id != manifest.universe_id
+            || event.cell_id != cell_id
+            || !event.hash_is_valid()
+        {
+            return Err(PersistenceError::CorruptJournal {
+                line: line_number,
+                message: "event is noncanonical or breaks its protocol-18 binding".into(),
+            });
+        }
+        if (event.event_sequence <= snapshot_sequence
+            && event.authority_fencing_token > snapshot_fence)
+            || (event.event_sequence > snapshot_sequence
+                && event.authority_fencing_token < snapshot_fence)
+        {
+            return Err(PersistenceError::HistoricalFenceSnapshotMismatch {
+                line: line_number,
+                snapshot: snapshot_fence,
+                found: event.authority_fencing_token,
+            });
+        }
+        previous_fence = event.authority_fencing_token;
+        events.push(event);
+    }
+    let parsed_record_count = bytes.split(|byte| *byte == b'\n').count().saturating_sub(1);
+    if events.len() != parsed_record_count
+        || usize::try_from(snapshot_sequence).map_or(true, |sequence| sequence > events.len())
+    {
+        return Err(PersistenceError::InvalidMigrationSource(
+            "event archive has an empty record or omits the snapshot frontier".into(),
+        ));
+    }
+
+    let cell_key = celestial::cell_key_from_address(&snapshot_state.cell_address)
+        .map_err(|source| PersistenceError::InvalidCellIdentity(source.to_string()))?;
+    let genesis = WorldState::genesis_for_cell(snapshot_state.world_seed, &cell_key)
+        .map_err(PersistenceError::InvalidCellIdentity)?;
+    let mut allowed_initial_states = vec![genesis.clone()];
+    if cell_key == celestial::cell_origin_key() {
+        let mut surface_profile = genesis;
+        if surface_profile
+            .configure_earth_start_profile()
+            .map_err(|source| {
+                PersistenceError::InvalidMigrationSource(format!(
+                    "canonical event-zero surface profile cannot be derived: {source}"
+                ))
+            })?
+        {
+            allowed_initial_states.push(surface_profile);
+        }
+    }
+
+    let mut matching_initial_states = Vec::new();
+    for initial_state in allowed_initial_states {
+        let mut candidate = initial_state.clone();
+        let mut replay_failed = false;
+        for event in events.iter().take(
+            usize::try_from(snapshot_sequence)
+                .expect("snapshot sequence was already bounded by archive length"),
+        ) {
+            if candidate.apply_event(event).is_err() {
+                replay_failed = true;
+                break;
+            }
+        }
+        if replay_failed {
+            continue;
+        }
+        candidate.fencing_token = snapshot_fence;
+        if &candidate == snapshot_state {
+            matching_initial_states.push(initial_state);
+        }
+    }
+    if matching_initial_states.len() != 1 {
+        return Err(PersistenceError::InvalidMigrationSource(
+            "snapshot does not have one exact canonical event-zero origin and fully replayed event-16 frontier".into(),
+        ));
+    }
+
+    let mut replay = matching_initial_states
+        .pop()
+        .expect("one matching initial state was established");
+    if snapshot_sequence == 0 {
+        replay.fencing_token = snapshot_fence;
+        debug_assert_eq!(&replay, snapshot_state);
+    }
+    let mut replayed_transfer_world_hashes = BTreeMap::new();
+    for event in &events {
+        replay
+            .apply_event(event)
+            .map_err(|source| PersistenceError::Replay {
+                event_sequence: event.event_sequence,
+                message: source.to_string(),
+            })?;
+        if let Some(boundary) = transfer_boundary_from_event(event, &replay.state_hash())? {
+            let key = (boundary.transfer_id, boundary.kind);
+            if replayed_transfer_world_hashes
+                .insert(key, boundary.resulting_world_hash)
+                .is_some()
+            {
+                return Err(PersistenceError::InvalidTransferBoundary(
+                    "event archive repeats one replay-derived transfer boundary kind".into(),
+                ));
+            }
+        }
+        if event.event_sequence == snapshot_sequence {
+            replay.fencing_token = snapshot_fence;
+            if &replay != snapshot_state {
+                return Err(PersistenceError::InvalidMigrationSource(
+                    "snapshot differs from its selected fully replayed event-16 frontier".into(),
+                ));
+            }
+        }
+    }
+    Ok((events, replay, replayed_transfer_world_hashes))
+}
+
+pub(crate) fn validate_frozen_transfer_archive(
+    path: &Path,
+    bytes: &[u8],
+    events: &[CanonicalEvent],
+    replayed_transfer_world_hashes: &BTreeMap<(String, TransferBoundaryKind), String>,
+    expected_head: &str,
+) -> Result<(Vec<DurableTransferBoundary>, String), PersistenceError> {
+    if !bytes.is_empty() && bytes.last() != Some(&b'\n') {
+        return Err(PersistenceError::InvalidMigrationSource(format!(
+            "transfer-boundary archive {} has a torn tail",
+            path.display()
+        )));
+    }
+    let mut canonical_events = BTreeMap::<(String, TransferBoundaryKind), &CanonicalEvent>::new();
+    for event in events {
+        if let Some(identity) = transfer_boundary_from_event(event, &"0".repeat(64))? {
+            let key = (identity.transfer_id, identity.kind);
+            if canonical_events.insert(key, event).is_some() {
+                return Err(PersistenceError::InvalidTransferBoundary(
+                    "event archive repeats one transfer boundary kind".into(),
+                ));
+            }
+        }
+    }
+
+    let mut committed = BTreeMap::new();
+    let mut observed_head = String::new();
+    let mut prior_sequence = 0_u64;
+    let mut boundaries = Vec::new();
+    for (index, line) in bytes
+        .split(|byte| *byte == b'\n')
+        .take_while(|line| !line.is_empty())
+        .enumerate()
+    {
+        let boundary =
+            serde_json::from_slice::<DurableTransferBoundary>(line).map_err(|source| {
+                PersistenceError::InvalidTransferBoundary(format!(
+                    "record {} is invalid JSON: {source}",
+                    index + 1
+                ))
+            })?;
+        let canonical = serde_json::to_vec(&boundary).map_err(|source| PersistenceError::Json {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let key = (boundary.transfer_id.clone(), boundary.kind);
+        let Some(event) = canonical_events.get(&key) else {
+            return Err(PersistenceError::InvalidTransferBoundary(format!(
+                "transfer {} {:?} has no exact event-16 record",
+                boundary.transfer_id, boundary.kind
+            )));
+        };
+        let Some(replayed_world_hash) = replayed_transfer_world_hashes.get(&key) else {
+            return Err(PersistenceError::InvalidTransferBoundary(format!(
+                "transfer {} {:?} has no replay-derived post-state root",
+                boundary.transfer_id, boundary.kind
+            )));
+        };
+        let event_bound = transfer_boundary_from_event(event, replayed_world_hash)?;
+        if canonical != line
+            || boundary.previous_boundary_hash != observed_head
+            || boundary.event_sequence <= prior_sequence
+            || !boundary.hash_is_valid()
+            || event_bound
+                .as_ref()
+                .is_none_or(|candidate| !same_transfer_boundary_material(candidate, &boundary))
+            || committed.insert(key, boundary.clone()).is_some()
+        {
+            return Err(PersistenceError::InvalidTransferBoundary(format!(
+                "transfer {} {:?} is noncanonical or breaks the frozen archive",
+                boundary.transfer_id, boundary.kind
+            )));
+        }
+        observed_head.clone_from(&boundary.boundary_hash);
+        prior_sequence = boundary.event_sequence;
+        boundaries.push(boundary);
+    }
+    let parsed_record_count = bytes.split(|byte| *byte == b'\n').count().saturating_sub(1);
+    if boundaries.len() != parsed_record_count
+        || committed.len() != canonical_events.len()
+        || observed_head != expected_head
+    {
+        return Err(PersistenceError::InvalidTransferBoundary(
+            "frozen transfer-boundary archive is incomplete or differs from lifecycle".into(),
+        ));
+    }
+    Ok((boundaries, observed_head))
+}
+
+fn hash_frozen_material(domain: &[u8], bytes: &[u8]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(domain);
+    hasher.update(bytes);
+    hasher.finalize().to_hex().to_string()
+}
+
+fn hash_frozen_json<T: Serialize>(domain: &[u8], value: &T) -> Result<String, PersistenceError> {
+    let bytes = serde_json::to_vec(value).map_err(|source| {
+        PersistenceError::InvalidMigrationSource(format!(
+            "frozen source commitment cannot be encoded: {source}"
+        ))
+    })?;
+    Ok(hash_frozen_material(domain, &bytes))
+}
+
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, PersistenceError> {
     let bytes = fs::read(path).map_err(|source| io_error(path, source))?;
     serde_json::from_slice(&bytes).map_err(|source| PersistenceError::Json {
@@ -2113,6 +2767,16 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), Persist
         let _ = fs::remove_file(&temp_path);
     }
     result
+}
+
+#[cfg(test)]
+pub(crate) fn set_snapshot_fencing_token_for_test(
+    path: &Path,
+    fencing_token: u64,
+) -> Result<(), PersistenceError> {
+    let mut snapshot = read_json::<SnapshotDocument>(path)?;
+    snapshot.state.fencing_token = fencing_token;
+    write_json_atomic(path, &snapshot)
 }
 
 fn io_error(path: impl AsRef<Path>, source: std::io::Error) -> PersistenceError {

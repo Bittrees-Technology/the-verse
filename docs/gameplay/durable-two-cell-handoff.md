@@ -811,10 +811,22 @@ That borrow prevents a successor directory commit while an event is being
 sealed and durably appended; historical revision lookup cannot construct the
 capability. The Store-owned manifest-5 identity gate is exercised again on
 replay, including the successor-fence path.
-The active event-17 runtime adapter, scheduler and durable wake-up path, the
-source-evidence validators and universe-wide migration install head, and
-whole-world process-crash integration
-remain to be implemented before activation. All drafts are
+The first frozen protocol-18 source validator is now implemented. It opens no
+missing artifact and holds the existing directory-v2 lock before the two
+existing cell writer locks in canonical cell-ID order. Both assignments and
+cell lifecycles must be released sleeping, every transfer must be terminal,
+and strict bounded readers fully replay event 16 and validate its exact
+snapshot, lifecycle, production cursor, transfer-boundary chain, directory
+proofs, and issued fence history. Torn tails, pending commits, noncanonical
+encodings, missing boundaries, and changed frontiers fail without truncation,
+backfill, recovery, fence advancement, or trusted-time sampling. Dropping the
+non-Serde capability releases every lock.
+
+The identity-map and production-origin transforms, global conservation and
+normalized-gameplay roots, receipt/source binding, archive copying, target
+directory validation, universe-wide install head, active event-17 runtime
+adapter, scheduler, durable wake-up path, and whole-world process-crash
+integration remain to be implemented before activation. All drafts are
 intentionally unreachable from the production directory-v2/package-v1 paths
 until every version in the table above moves in one coordinated activation.
 The dormant proof harness retains bounded predecessor projections for replay;
