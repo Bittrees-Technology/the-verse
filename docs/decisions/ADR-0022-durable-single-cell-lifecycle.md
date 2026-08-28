@@ -110,12 +110,15 @@ One injected trusted-clock interface supplies scheduler UTC. The accepted local
 backend persists the last observed time. Clients, frame timing, process uptime,
 and dispatch arrival time are not time authority.
 
-Every production occurrence is a stable, positive, contiguous sequence with a
-`scheduled_for_unix_ms` exactly 1,000 milliseconds after its predecessor.
-Backward time never reverses a cursor or repeats an occurrence; a rollback past
-the configured tolerance halts scheduling. Forward time creates exact
-sequential backlog. It never creates one oversized elapsed quantum or silently
-skips work.
+Every production occurrence is a stable, positive, contiguous sequence. While
+work remains continuously runnable, `scheduled_for_unix_ms` is exactly 1,000
+milliseconds after its predecessor. After an idle cursor is cancelled, a new
+runnable boundary re-arms the next sequence exactly 1,000 milliseconds after
+that trusted boundary, so the time gap from the last committed occurrence may
+be larger. Backward time never reverses a cursor or repeats an occurrence; a
+rollback past the configured tolerance halts scheduling. Forward time creates
+exact sequential backlog. It never creates one oversized elapsed quantum or
+silently skips work.
 
 The occurrence `lifecycle_generation` is a production-clock generation. It
 does not change on an ordinary mode transition, process restart, lease renewal,

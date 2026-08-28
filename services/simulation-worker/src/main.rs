@@ -10,7 +10,7 @@ use clap::Parser;
 use tokio::net::TcpListener;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
-use verse_simulation::Runtime;
+use verse_simulation::{LifecycleMode, Runtime};
 use verse_simulation_worker::{AppState, router};
 
 #[derive(Debug, Parser)]
@@ -33,6 +33,10 @@ struct Arguments {
 
     #[arg(long, env = "VERSE_TICK_MS", default_value_t = 16)]
     tick_millis: u16,
+
+    /// Seconds without an authenticated player before the active cell drains.
+    #[arg(long, env = "VERSE_IDLE_DRAIN_SECONDS", default_value_t = 30)]
+    idle_drain_seconds: u64,
 
     /// Comma-separated loopback-only development actors pre-admitted before
     /// the first event. Gameplay hello messages can bind but never create one.
@@ -66,11 +70,19 @@ async fn main() -> Result<()> {
             "protocol 11 local-development player authentication is restricted to a loopback bind; use 127.0.0.1 or wait for the configured session authority"
         );
     }
-    let mut runtime = Runtime::open(
-        &arguments.data_directory,
-        arguments.world_seed,
-        arguments.snapshot_every,
-    )
+    let mut runtime = if arguments.pause_simulation {
+        Runtime::open(
+            &arguments.data_directory,
+            arguments.world_seed,
+            arguments.snapshot_every,
+        )
+    } else {
+        Runtime::open_hosted(
+            &arguments.data_directory,
+            arguments.world_seed,
+            arguments.snapshot_every,
+        )
+    }
     .with_context(|| {
         format!(
             "failed to open universe data at {}",
@@ -83,34 +95,29 @@ async fn main() -> Result<()> {
             .with_context(|| format!("failed to pre-admit development player {player_id}"))?;
     }
     let state = AppState::new(runtime);
-    let lease_state = Arc::clone(&state);
-    let lease_task = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(1));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            interval.tick().await;
-            if let Err(source) = lease_state.renew_lease() {
-                error!(%source, "authoritative lease renewal failed; worker is fenced");
-                break;
-            }
-        }
-    });
-    let tick_task = if arguments.pause_simulation {
-        None
-    } else {
-        let tick_state = Arc::clone(&state);
-        // Input transitions are durably queued until fixed-step consumption;
-        // this cadence controls latency, not whether a short input is observed.
-        let tick_millis = arguments.tick_millis.clamp(1, 250);
+    let lifecycle_task = if arguments.pause_simulation {
+        let lease_state = Arc::clone(&state);
         Some(tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(u64::from(tick_millis)));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 interval.tick().await;
-                if let Err(source) = tick_state.advance(tick_millis) {
-                    error!(%source, "authoritative simulation tick failed");
+                if let Err(source) = lease_state.renew_lease() {
+                    error!(%source, "authoritative lease renewal failed; worker is fenced");
                     break;
                 }
+            }
+        }))
+    } else {
+        let lifecycle_state = Arc::clone(&state);
+        let tick_millis = arguments.tick_millis;
+        let idle_drain_after = Duration::from_secs(arguments.idle_drain_seconds);
+        Some(tokio::spawn(async move {
+            if let Err(source) = lifecycle_state
+                .supervise(tick_millis, idle_drain_after)
+                .await
+            {
+                error!(%source, "authoritative lifecycle supervisor failed");
             }
         }))
     };
@@ -129,14 +136,24 @@ async fn main() -> Result<()> {
         .await
         .context("simulation HTTP server failed")?;
 
-    if let Some(tick_task) = tick_task {
-        tick_task.abort();
+    if let Some(lifecycle_task) = lifecycle_task {
+        lifecycle_task.abort();
     }
-    lease_task.abort();
-    state
-        .persist_snapshot()
-        .context("failed to persist shutdown snapshot")?;
-    info!("authoritative shutdown snapshot persisted");
+    match state.lifecycle_mode() {
+        LifecycleMode::Active => {
+            state
+                .drain_to_background_or_sleeping()
+                .context("failed to drain the shutdown cell")?;
+            info!("authoritative shutdown drain persisted");
+        }
+        LifecycleMode::Background | LifecycleMode::Activating | LifecycleMode::Draining => {
+            state
+                .persist_snapshot()
+                .context("failed to persist shutdown snapshot")?;
+            info!("authoritative shutdown snapshot persisted");
+        }
+        LifecycleMode::Sleeping => info!("sleeping cell already persisted and released"),
+    }
     Ok(())
 }
 
@@ -172,6 +189,7 @@ mod tests {
     fn authoritative_tick_defaults_to_at_most_one_sixty_hz_frame() {
         let arguments = Arguments::parse_from(["verse-simulation-worker"]);
         assert_eq!(arguments.tick_millis, 16);
+        assert_eq!(arguments.idle_drain_seconds, 30);
         assert_eq!(arguments.development_players, ["player-remote"]);
         assert!(f64::from(arguments.tick_millis) <= 1_000.0 / 60.0);
     }

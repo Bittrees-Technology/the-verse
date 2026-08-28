@@ -235,6 +235,7 @@ struct CellLifecycleRecord {
     acquired_at_unix_ms: Option<u64>,
     renewed_at_unix_ms: Option<u64>,
     expires_at_unix_ms: Option<u64>,
+    activation_cutoff_unix_ms: Option<u64>,
     last_trusted_unix_ms: u64,
     last_world_event_sequence: u64,
     last_world_event_hash: String,
@@ -257,6 +258,7 @@ pub struct Store {
     universe_manifest: UniverseManifestSnapshot,
     clock: Arc<dyn TrustedClock>,
     write_enabled: bool,
+    recovered_observed_mode: Option<LifecycleMode>,
     #[cfg(test)]
     append_failpoint: Option<AppendFailpoint>,
 }
@@ -352,6 +354,9 @@ impl Store {
             }
             None
         };
+        let recovered_observed_mode = previous_lifecycle
+            .as_ref()
+            .map(|record| record.observed_mode);
         let recovered_fence = recover_persisted_fencing_frontier(&root)?;
         let previous_token = previous_lifecycle
             .as_ref()
@@ -375,6 +380,11 @@ impl Store {
             .checked_add(LEASE_DURATION_MILLIS)
             .ok_or(PersistenceError::TrustedClockUnavailable)?;
         let holder_id = Uuid::new_v4().to_string();
+        let activation_cutoff_unix_ms = previous_lifecycle
+            .as_ref()
+            .filter(|record| record.observed_mode == LifecycleMode::Activating)
+            .and_then(|record| record.activation_cutoff_unix_ms)
+            .or(Some(acquired_at_unix_ms));
         let lifecycle = CellLifecycleRecord {
             schema_version: LIFECYCLE_CONTROL_SCHEMA_VERSION,
             universe_id: runtime_manifest.universe_id.clone(),
@@ -389,6 +399,7 @@ impl Store {
             acquired_at_unix_ms: Some(acquired_at_unix_ms),
             renewed_at_unix_ms: Some(acquired_at_unix_ms),
             expires_at_unix_ms: Some(expires_at_unix_ms),
+            activation_cutoff_unix_ms,
             last_trusted_unix_ms: acquired_at_unix_ms,
             last_world_event_sequence: previous_lifecycle
                 .as_ref()
@@ -431,6 +442,7 @@ impl Store {
             universe_manifest: runtime_manifest,
             clock,
             write_enabled: true,
+            recovered_observed_mode,
             #[cfg(test)]
             append_failpoint: None,
         })
@@ -440,12 +452,24 @@ impl Store {
         self.fencing_token
     }
 
+    pub(crate) fn root_path(&self) -> &Path {
+        &self.root
+    }
+
+    pub(crate) fn clock(&self) -> Arc<dyn TrustedClock> {
+        Arc::clone(&self.clock)
+    }
+
     pub const fn lifecycle_mode(&self) -> LifecycleMode {
         self.lifecycle.observed_mode
     }
 
     pub fn next_production_occurrence(&self) -> Option<&ProductionScheduleOccurrence> {
         self.lifecycle.next_production_occurrence.as_ref()
+    }
+
+    pub const fn activation_cutoff_unix_ms(&self) -> Option<u64> {
+        self.lifecycle.activation_cutoff_unix_ms
     }
 
     pub fn lifecycle_status(&self) -> CellLifecycleStatus {
@@ -665,6 +689,7 @@ impl Store {
         })?;
         active.desired_mode = LifecycleMode::Active;
         active.observed_mode = LifecycleMode::Active;
+        active.activation_cutoff_unix_ms = None;
         active.last_world_event_sequence = state.event_sequence;
         active
             .last_world_event_hash
@@ -703,6 +728,8 @@ impl Store {
             })?;
         transitioned.desired_mode = desired_mode;
         transitioned.observed_mode = observed_mode;
+        transitioned.activation_cutoff_unix_ms =
+            (observed_mode == LifecycleMode::Activating).then_some(now_unix_ms);
         transitioned.last_world_event_sequence = state.event_sequence;
         transitioned
             .last_world_event_hash
@@ -735,6 +762,7 @@ impl Store {
         sleeping.acquired_at_unix_ms = None;
         sleeping.renewed_at_unix_ms = None;
         sleeping.expires_at_unix_ms = None;
+        sleeping.activation_cutoff_unix_ms = None;
         sleeping.last_world_event_sequence = state.event_sequence;
         sleeping
             .last_world_event_hash
@@ -748,6 +776,91 @@ impl Store {
             .map_err(|source| io_error(self.root.join(LOCK_FILE), source))?;
         self.write_enabled = false;
         Ok(())
+    }
+
+    pub fn restore_recovered_host_mode(
+        &mut self,
+        state: &WorldState,
+    ) -> Result<LifecycleMode, PersistenceError> {
+        match self.recovered_observed_mode {
+            Some(LifecycleMode::Sleeping) => {
+                if self.lifecycle.observed_mode != LifecycleMode::Activating {
+                    return Err(PersistenceError::InvalidLifecycleControl(
+                        "sleeping recovery must hold activating authority".into(),
+                    ));
+                }
+                self.save_snapshot(state)?;
+                let now_unix_ms = self.trusted_unix_millis()?;
+                let mut sleeping = self.lifecycle.clone();
+                sleeping.lifecycle_revision =
+                    sleeping.lifecycle_revision.checked_add(1).ok_or_else(|| {
+                        PersistenceError::InvalidLifecycleControl(
+                            "lifecycle revision is exhausted".into(),
+                        )
+                    })?;
+                sleeping.desired_mode = LifecycleMode::Sleeping;
+                sleeping.observed_mode = LifecycleMode::Sleeping;
+                sleeping.holder_id = None;
+                sleeping.acquired_at_unix_ms = None;
+                sleeping.renewed_at_unix_ms = None;
+                sleeping.expires_at_unix_ms = None;
+                sleeping.activation_cutoff_unix_ms = None;
+                sleeping.last_world_event_sequence = state.event_sequence;
+                sleeping
+                    .last_world_event_hash
+                    .clone_from(&state.last_event_hash);
+                sleeping.last_world_state_hash = state.state_hash();
+                sleeping.last_trusted_unix_ms = now_unix_ms;
+                sleeping.updated_at_unix_ms = now_unix_ms;
+                write_json_atomic(&self.root.join(LIFECYCLE_FILE), &sleeping)?;
+                self.lifecycle = sleeping;
+                FileExt::unlock(&self.lock_file)
+                    .map_err(|source| io_error(self.root.join(LOCK_FILE), source))?;
+                self.write_enabled = false;
+                Ok(LifecycleMode::Sleeping)
+            }
+            Some(LifecycleMode::Background) => {
+                self.verify_live_lease_for_write()?;
+                let now_unix_ms = self.trusted_unix_millis()?;
+                let mut background = self.lifecycle.clone();
+                background.lifecycle_revision = background
+                    .lifecycle_revision
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        PersistenceError::InvalidLifecycleControl(
+                            "lifecycle revision is exhausted".into(),
+                        )
+                    })?;
+                background.desired_mode = LifecycleMode::Background;
+                background.observed_mode = LifecycleMode::Background;
+                background.activation_cutoff_unix_ms = None;
+                background.last_world_event_sequence = state.event_sequence;
+                background
+                    .last_world_event_hash
+                    .clone_from(&state.last_event_hash);
+                background.last_world_state_hash = state.state_hash();
+                background.last_trusted_unix_ms = now_unix_ms;
+                background.updated_at_unix_ms = now_unix_ms;
+                self.persist_lifecycle(background)?;
+                Ok(LifecycleMode::Background)
+            }
+            Some(LifecycleMode::Draining) => {
+                let runnable = state
+                    .background_production_is_runnable()
+                    .map_err(|source| {
+                        PersistenceError::InvalidLifecycleControl(source.to_string())
+                    })?;
+                self.recovered_observed_mode = Some(if runnable {
+                    LifecycleMode::Background
+                } else {
+                    LifecycleMode::Sleeping
+                });
+                self.restore_recovered_host_mode(state)
+            }
+            Some(LifecycleMode::Activating | LifecycleMode::Active) | None => {
+                Ok(LifecycleMode::Activating)
+            }
+        }
     }
 
     pub fn commit_world_event(
@@ -1097,6 +1210,31 @@ impl Store {
     }
 
     #[cfg(test)]
+    pub(crate) fn install_next_production_occurrence_for_test(
+        &mut self,
+        occurrence: ProductionScheduleOccurrence,
+    ) -> Result<(), PersistenceError> {
+        validate_occurrence_binding(&occurrence, &self.lifecycle)?;
+        let expected_sequence = self
+            .lifecycle
+            .acknowledged_production_sequence
+            .checked_add(1)
+            .ok_or_else(|| {
+                PersistenceError::InvalidLifecycleControl(
+                    "acknowledged production sequence is exhausted".into(),
+                )
+            })?;
+        if occurrence.production_quantum_sequence != expected_sequence {
+            return Err(PersistenceError::InvalidLifecycleControl(
+                "test production occurrence does not follow the acknowledged frontier".into(),
+            ));
+        }
+        let mut lifecycle = self.lifecycle.clone();
+        lifecycle.next_production_occurrence = Some(occurrence);
+        self.persist_lifecycle(lifecycle)
+    }
+
+    #[cfg(test)]
     fn consume_append_failpoint(&mut self, failpoint: AppendFailpoint) -> bool {
         if self.append_failpoint == Some(failpoint) {
             self.append_failpoint = None;
@@ -1166,6 +1304,11 @@ fn validate_prior_lifecycle(
                     "sleeping lifecycle cannot retain a live holder or lease times".into(),
                 ));
             }
+            if lifecycle.activation_cutoff_unix_ms.is_some() {
+                return Err(PersistenceError::InvalidLifecycleControl(
+                    "sleeping lifecycle cannot retain an activation cut-off".into(),
+                ));
+            }
         }
         LifecycleMode::Activating
         | LifecycleMode::Background
@@ -1190,6 +1333,21 @@ fn validate_prior_lifecycle(
                 return Err(PersistenceError::InvalidLifecycleControl(
                     "live lifecycle holder, fence, or timestamps are not canonical".into(),
                 ));
+            }
+            match (lifecycle.observed_mode, lifecycle.activation_cutoff_unix_ms) {
+                (LifecycleMode::Activating, Some(cutoff))
+                    if cutoff <= lifecycle.last_trusted_unix_ms => {}
+                (LifecycleMode::Activating, _) => {
+                    return Err(PersistenceError::InvalidLifecycleControl(
+                        "activating lifecycle requires a trusted wake cut-off".into(),
+                    ));
+                }
+                (_, None) => {}
+                (_, Some(_)) => {
+                    return Err(PersistenceError::InvalidLifecycleControl(
+                        "only an activating lifecycle may retain a wake cut-off".into(),
+                    ));
+                }
             }
         }
     }

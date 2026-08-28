@@ -21,7 +21,7 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use serde::Serialize;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
+use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore, watch};
 use tower_http::{
     cors::CorsLayer,
     trace::{DefaultMakeSpan, TraceLayer},
@@ -37,8 +37,9 @@ use verse_protocol::{
 };
 use verse_simulation::{
     AdvanceImpact, CellLifecycleStatus, EVENT_SCHEMA_VERSION, IntentError, InterestEntityIdentity,
-    InterestProjectionState, ProjectedInterestFrame, ProjectionError, ProjectionSource, Runtime,
-    RuntimeError, WORLD_SCHEMA_VERSION, WorldState, registry_snapshot, universe_manifest,
+    InterestProjectionState, LifecycleMode, ProjectedInterestFrame, ProjectionError,
+    ProjectionSource, Runtime, RuntimeError, RuntimeOpenConfig, WORLD_SCHEMA_VERSION, WorldState,
+    registry_snapshot, universe_manifest,
 };
 
 const COMMAND_CENTER_HTML: &str = include_str!("../../../apps/web-command-center/index.html");
@@ -79,6 +80,9 @@ struct ReplicationFeed {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum WorkerAuthorityStatus {
+    Sleeping,
+    Activating,
+    Background,
     Active,
     Draining(Arc<str>),
     Fenced(Arc<str>),
@@ -198,16 +202,26 @@ fn replication_interest(message: &ServerMessage) -> Option<&InterestSnapshot> {
 
 #[derive(Debug)]
 pub struct AppState {
-    runtime: Mutex<Runtime>,
+    runtime: Mutex<HostedRuntime>,
+    activation_gate: AsyncMutex<()>,
+    lifecycle_signal: Notify,
     updates: watch::Sender<ReplicationFeed>,
     authority: watch::Sender<WorkerAuthorityStatus>,
     connected_players: Mutex<BTreeSet<String>>,
+    last_player_activity: Mutex<Instant>,
     session_admission: Arc<Semaphore>,
     http_projection_admission: Arc<Semaphore>,
     public_world_cache: Mutex<Option<CachedPublicWorld>>,
     projection_revision: Mutex<Arc<ProjectionRevision>>,
     registry: CelestialRegistrySnapshot,
     universe_manifest: UniverseManifestSnapshot,
+}
+
+#[derive(Debug)]
+struct HostedRuntime {
+    runtime: Option<Runtime>,
+    open_config: RuntimeOpenConfig,
+    lifecycle: CellLifecycleStatus,
 }
 
 #[derive(Debug, Clone)]
@@ -248,19 +262,39 @@ impl ProjectionRevision {
 impl AppState {
     pub fn new(runtime: Runtime) -> Arc<Self> {
         let world_seed = runtime.state().world_seed;
+        let open_config = runtime.open_config();
+        let lifecycle = runtime.lifecycle_status();
         let registry = registry_snapshot(world_seed)
             .expect("the runtime's validated celestial registry remains available");
         let universe_manifest =
             universe_manifest(world_seed, WORLD_SCHEMA_VERSION, EVENT_SCHEMA_VERSION)
                 .expect("the runtime's validated universe manifest remains available");
         let projection_revision = Arc::new(ProjectionRevision::new(runtime.state().clone()));
+        let observed_mode = lifecycle.observed_mode;
+        let authority_status = match observed_mode {
+            LifecycleMode::Sleeping => WorkerAuthorityStatus::Sleeping,
+            LifecycleMode::Activating => WorkerAuthorityStatus::Activating,
+            LifecycleMode::Background => WorkerAuthorityStatus::Background,
+            LifecycleMode::Active => WorkerAuthorityStatus::Active,
+            LifecycleMode::Draining => WorkerAuthorityStatus::Draining(Arc::from(
+                "the authoritative cell is recovering a drain",
+            )),
+        };
+        let hosted_runtime = (observed_mode != LifecycleMode::Sleeping).then_some(runtime);
         let (updates, _) = watch::channel(ReplicationFeed::default());
-        let (authority, _) = watch::channel(WorkerAuthorityStatus::Active);
+        let (authority, _) = watch::channel(authority_status);
         Arc::new(Self {
-            runtime: Mutex::new(runtime),
+            runtime: Mutex::new(HostedRuntime {
+                runtime: hosted_runtime,
+                open_config,
+                lifecycle,
+            }),
+            activation_gate: AsyncMutex::new(()),
+            lifecycle_signal: Notify::new(),
             updates,
             authority,
             connected_players: Mutex::new(BTreeSet::new()),
+            last_player_activity: Mutex::new(Instant::now()),
             session_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS)),
             http_projection_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_HTTP_PROJECTIONS)),
             public_world_cache: Mutex::new(None),
@@ -271,24 +305,28 @@ impl AppState {
     }
 
     pub fn snapshot(&self) -> WorldSnapshot {
-        self.runtime.lock().snapshot()
+        self.projection_revision.lock().world.snapshot()
     }
 
     pub fn motion_snapshot(&self) -> MotionSnapshot {
-        self.runtime.lock().motion_snapshot()
+        self.projection_revision.lock().world.motion_snapshot()
     }
 
     pub fn lifecycle_status(&self) -> CellLifecycleStatus {
-        self.runtime.lock().lifecycle_status()
+        self.runtime.lock().lifecycle.clone()
+    }
+
+    pub fn lifecycle_mode(&self) -> LifecycleMode {
+        self.runtime.lock().lifecycle.observed_mode
     }
 
     fn projected_snapshot(
         &self,
         actor_player_id: Option<&str>,
     ) -> Result<ProjectedWorldSnapshot, ProjectionError> {
-        self.runtime
+        self.projection_revision
             .lock()
-            .state()
+            .world
             .project_world_snapshot(actor_player_id)
     }
 
@@ -297,9 +335,9 @@ impl AppState {
         &self,
         actor_player_id: Option<&str>,
     ) -> Result<ProjectedMotionSnapshot, ProjectionError> {
-        self.runtime
+        self.projection_revision
             .lock()
-            .state()
+            .world
             .project_motion_snapshot(actor_player_id)
     }
 
@@ -313,7 +351,7 @@ impl AppState {
     }
 
     fn bounded_public_world_json(&self) -> Result<Arc<str>, String> {
-        let current_sequence = self.runtime.lock().state().event_sequence;
+        let current_sequence = self.projection_revision.lock().world.event_sequence;
         if let Some(cached) = self.public_world_cache.lock().as_ref()
             && (cached.event_sequence == current_sequence
                 || cached.generated_at.elapsed() < HTTP_PROJECTION_MIN_REFRESH)
@@ -336,14 +374,28 @@ impl AppState {
     }
 
     pub fn persist_snapshot(&self) -> Result<(), RuntimeError> {
-        self.runtime.lock().persist_snapshot()
+        let mut hosted = self.runtime.lock();
+        let mode = hosted.lifecycle.observed_mode;
+        let runtime = hosted
+            .runtime
+            .as_mut()
+            .ok_or(RuntimeError::LifecycleUnavailable { mode })?;
+        runtime.persist_snapshot()?;
+        hosted.lifecycle = runtime.lifecycle_status();
+        Ok(())
     }
 
     pub fn renew_lease(&self) -> Result<(), RuntimeError> {
-        let mut runtime = self.runtime.lock();
+        let mut hosted = self.runtime.lock();
+        let mode = hosted.lifecycle.observed_mode;
+        let runtime = hosted
+            .runtime
+            .as_mut()
+            .ok_or(RuntimeError::LifecycleUnavailable { mode })?;
         let result = runtime.renew_lease();
         let halted = runtime.is_halted();
-        drop(runtime);
+        hosted.lifecycle = runtime.lifecycle_status();
+        drop(hosted);
         if halted {
             self.publish_fenced(result.as_ref().err().map_or_else(
                 || "authoritative runtime halted".into(),
@@ -354,7 +406,11 @@ impl AppState {
     }
 
     pub fn is_halted(&self) -> bool {
-        self.runtime.lock().is_halted()
+        self.runtime
+            .lock()
+            .runtime
+            .as_ref()
+            .is_some_and(Runtime::is_halted)
     }
 
     pub fn drain_to_background_or_sleeping(
@@ -364,7 +420,33 @@ impl AppState {
             .send_replace(WorkerAuthorityStatus::Draining(Arc::from(
                 "the authoritative cell is draining",
             )));
-        let result = self.runtime.lock().drain_to_background_or_sleeping();
+        let mut hosted = self.runtime.lock();
+        let mode = hosted.lifecycle.observed_mode;
+        let (result, lifecycle, sleeping_world) = {
+            let runtime = hosted
+                .runtime
+                .as_mut()
+                .ok_or(RuntimeError::LifecycleUnavailable { mode })?;
+            let result = runtime.drain_to_background_or_sleeping();
+            let lifecycle = runtime.lifecycle_status();
+            let sleeping_world =
+                matches!(result, Ok(LifecycleMode::Sleeping)).then(|| runtime.state().clone());
+            (result, lifecycle, sleeping_world)
+        };
+        hosted.lifecycle = lifecycle;
+        if let Ok(LifecycleMode::Sleeping) = result {
+            *self.projection_revision.lock() = Arc::new(ProjectionRevision::new(
+                sleeping_world.expect("a sleeping transition captures the durable world"),
+            ));
+            hosted.runtime.take();
+            self.authority.send_replace(WorkerAuthorityStatus::Sleeping);
+            self.lifecycle_signal.notify_waiters();
+        } else if let Ok(LifecycleMode::Background) = result {
+            self.authority
+                .send_replace(WorkerAuthorityStatus::Background);
+            self.lifecycle_signal.notify_waiters();
+        }
+        drop(hosted);
         if let Err(source) = &result {
             self.publish_fenced(source.to_string());
         }
@@ -372,10 +454,34 @@ impl AppState {
     }
 
     pub fn activation_step(&self) -> Result<bool, RuntimeError> {
-        let result = self.runtime.lock().activation_step();
+        let mut hosted = self.runtime.lock();
+        if hosted.runtime.is_none() {
+            let runtime = Runtime::open_for_activation(&hosted.open_config)?;
+            self.publish_projection_revision(&runtime);
+            hosted.lifecycle = runtime.lifecycle_status();
+            hosted.runtime = Some(runtime);
+        }
+        self.authority
+            .send_replace(WorkerAuthorityStatus::Activating);
+        let (result, lifecycle, active_world) = {
+            let runtime = hosted
+                .runtime
+                .as_mut()
+                .expect("sleeping activation installs a runtime");
+            let result = runtime.activation_step();
+            let lifecycle = runtime.lifecycle_status();
+            let active_world = matches!(result, Ok(true)).then(|| runtime.state().clone());
+            (result, lifecycle, active_world)
+        };
+        hosted.lifecycle = lifecycle;
+        if let Some(active_world) = active_world {
+            *self.projection_revision.lock() = Arc::new(ProjectionRevision::new(active_world));
+        }
+        drop(hosted);
         match &result {
             Ok(true) => {
                 self.authority.send_replace(WorkerAuthorityStatus::Active);
+                self.lifecycle_signal.notify_waiters();
             }
             Err(source) => self.publish_fenced(source.to_string()),
             Ok(false) => {}
@@ -383,13 +489,109 @@ impl AppState {
         result
     }
 
+    pub async fn ensure_active(&self) -> Result<(), RuntimeError> {
+        let _activation = self.activation_gate.lock().await;
+        loop {
+            if matches!(&*self.authority.borrow(), WorkerAuthorityStatus::Active) {
+                return Ok(());
+            }
+            if self.activation_step()? {
+                return Ok(());
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    pub fn production_wait_millis(&self) -> Result<Option<u64>, RuntimeError> {
+        let mut hosted = self.runtime.lock();
+        let mode = hosted.lifecycle.observed_mode;
+        hosted
+            .runtime
+            .as_mut()
+            .ok_or(RuntimeError::LifecycleUnavailable { mode })?
+            .production_wait_millis()
+    }
+
+    pub fn background_dispatch_step(&self) -> Result<LifecycleMode, RuntimeError> {
+        let mut hosted = self.runtime.lock();
+        let mode = hosted.lifecycle.observed_mode;
+        let (result, lifecycle, world) = {
+            let runtime = hosted
+                .runtime
+                .as_mut()
+                .ok_or(RuntimeError::LifecycleUnavailable { mode })?;
+            let result = runtime.background_dispatch_step();
+            (result, runtime.lifecycle_status(), runtime.state().clone())
+        };
+        hosted.lifecycle = lifecycle;
+        *self.projection_revision.lock() = Arc::new(ProjectionRevision::new(world));
+        match result {
+            Ok(LifecycleMode::Sleeping) => {
+                hosted.runtime.take();
+                self.authority.send_replace(WorkerAuthorityStatus::Sleeping);
+                self.lifecycle_signal.notify_waiters();
+            }
+            Ok(LifecycleMode::Background) | Err(_) => {}
+            Ok(mode) => return Err(RuntimeError::LifecycleUnavailable { mode }),
+        }
+        drop(hosted);
+        if let Err(source) = &result {
+            self.publish_fenced(source.to_string());
+        }
+        result
+    }
+
+    pub async fn supervise(
+        self: &Arc<Self>,
+        tick_millis: u16,
+        idle_drain_after: Duration,
+    ) -> Result<(), RuntimeError> {
+        let tick_millis = tick_millis.clamp(1, 250);
+        let mut active_interval =
+            tokio::time::interval(Duration::from_millis(u64::from(tick_millis)));
+        active_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            match self.lifecycle_mode() {
+                LifecycleMode::Active => {
+                    active_interval.tick().await;
+                    if self.connected_players.lock().is_empty()
+                        && self.last_player_activity.lock().elapsed() >= idle_drain_after
+                    {
+                        self.drain_to_background_or_sleeping()?;
+                        continue;
+                    }
+                    self.advance(tick_millis)?;
+                }
+                LifecycleMode::Background => {
+                    let wait_millis = self.production_wait_millis()?.unwrap_or(0);
+                    if wait_millis > 0 {
+                        tokio::select! {
+                            () = tokio::time::sleep(Duration::from_millis(wait_millis)) => {}
+                            () = self.lifecycle_signal.notified() => continue,
+                        }
+                    }
+                    self.background_dispatch_step()?;
+                }
+                LifecycleMode::Sleeping => self.lifecycle_signal.notified().await,
+                LifecycleMode::Activating => self.ensure_active().await?,
+                LifecycleMode::Draining => tokio::task::yield_now().await,
+            }
+        }
+    }
+
     pub fn advance(&self, delta_millis: u16) -> Result<bool, RuntimeError> {
-        let mut runtime = self.runtime.lock();
+        let mut hosted = self.runtime.lock();
+        let mode = hosted.lifecycle.observed_mode;
+        let runtime = hosted
+            .runtime
+            .as_mut()
+            .ok_or(RuntimeError::LifecycleUnavailable { mode })?;
         let outcome = match runtime.advance_with_outcome(delta_millis) {
             Ok(outcome) => outcome,
             Err(source) => {
                 let halted = runtime.is_halted();
-                drop(runtime);
+                hosted.lifecycle = runtime.lifecycle_status();
+                drop(hosted);
                 if halted {
                     self.publish_fenced(source.to_string());
                 }
@@ -402,9 +604,10 @@ impl AppState {
             AdvanceImpact::Structural => Some(ReplicationKind::Structural),
         };
         if let Some(update_kind) = update_kind {
-            self.publish_projection_revision(&runtime);
+            self.publish_projection_revision(runtime);
             self.publish_update(update_kind, runtime.state().event_sequence);
         }
+        hosted.lifecycle = runtime.lifecycle_status();
         Ok(outcome.changed())
     }
 
@@ -413,13 +616,19 @@ impl AppState {
         actor_player_id: &str,
         intent: &ClientMessage,
     ) -> Result<IntentReceipt, RuntimeError> {
-        let mut runtime = self.runtime.lock();
+        let mut hosted = self.runtime.lock();
+        let mode = hosted.lifecycle.observed_mode;
+        let runtime = hosted
+            .runtime
+            .as_mut()
+            .ok_or(RuntimeError::LifecycleUnavailable { mode })?;
         let before_event_sequence = runtime.state().event_sequence;
         let receipt = match runtime.execute_as(actor_player_id, intent) {
             Ok(receipt) => receipt,
             Err(source) => {
                 let halted = runtime.is_halted();
-                drop(runtime);
+                hosted.lifecycle = runtime.lifecycle_status();
+                drop(hosted);
                 if halted {
                     self.publish_fenced(source.to_string());
                 }
@@ -436,8 +645,9 @@ impl AppState {
         };
         // Keep mutation and publication in the same runtime critical section so
         // every subscriber observes structural and motion state in event order.
-        self.publish_projection_revision(&runtime);
+        self.publish_projection_revision(runtime);
         self.publish_update(update_kind, runtime.state().event_sequence);
+        hosted.lifecycle = runtime.lifecycle_status();
         Ok(receipt)
     }
 
@@ -462,17 +672,47 @@ impl AppState {
     fn unavailable_reason(&self) -> Option<(&'static str, Arc<str>)> {
         match &*self.authority.borrow() {
             WorkerAuthorityStatus::Active => None,
+            WorkerAuthorityStatus::Sleeping => Some((
+                "cell_not_active",
+                Arc::from("the authoritative cell is sleeping"),
+            )),
+            WorkerAuthorityStatus::Activating => Some((
+                "cell_activating",
+                Arc::from("the authoritative cell is activating"),
+            )),
+            WorkerAuthorityStatus::Background => Some((
+                "cell_not_active",
+                Arc::from("the authoritative cell is running background work"),
+            )),
             WorkerAuthorityStatus::Draining(reason) => Some(("cell_draining", Arc::clone(reason))),
             WorkerAuthorityStatus::Fenced(reason) => Some(("authority_fenced", Arc::clone(reason))),
         }
     }
 
+    fn admission_block_reason(&self) -> Option<(&'static str, Arc<str>)> {
+        match &*self.authority.borrow() {
+            WorkerAuthorityStatus::Draining(reason) => Some(("cell_draining", Arc::clone(reason))),
+            WorkerAuthorityStatus::Fenced(reason) => Some(("authority_fenced", Arc::clone(reason))),
+            WorkerAuthorityStatus::Sleeping
+            | WorkerAuthorityStatus::Activating
+            | WorkerAuthorityStatus::Background
+            | WorkerAuthorityStatus::Active => None,
+        }
+    }
+
     fn claim_player(&self, player_id: &str) -> bool {
-        self.connected_players.lock().insert(player_id.to_owned())
+        let claimed = self.connected_players.lock().insert(player_id.to_owned());
+        if claimed {
+            *self.last_player_activity.lock() = Instant::now();
+            self.lifecycle_signal.notify_waiters();
+        }
+        claimed
     }
 
     fn release_player(&self, player_id: &str) {
         self.connected_players.lock().remove(player_id);
+        *self.last_player_activity.lock() = Instant::now();
+        self.lifecycle_signal.notify_waiters();
     }
 
     fn registry_message(&self) -> ServerMessage {
@@ -718,7 +958,28 @@ struct StatusDocument {
     world_hash: String,
     conservation_valid: bool,
     authoritative_halted: bool,
-    lifecycle: CellLifecycleStatus,
+    lifecycle: PublicLifecycleStatus,
+}
+
+#[derive(Debug, Serialize)]
+struct PublicLifecycleStatus {
+    lifecycle_revision: u64,
+    desired_mode: LifecycleMode,
+    observed_mode: LifecycleMode,
+    last_world_event_sequence: u64,
+    stale: bool,
+}
+
+impl From<&CellLifecycleStatus> for PublicLifecycleStatus {
+    fn from(status: &CellLifecycleStatus) -> Self {
+        Self {
+            lifecycle_revision: status.lifecycle_revision,
+            desired_mode: status.desired_mode,
+            observed_mode: status.observed_mode,
+            last_world_event_sequence: status.last_world_event_sequence,
+            stale: status.observed_mode != LifecycleMode::Active,
+        }
+    }
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -834,7 +1095,7 @@ async fn generated_browser_asset(file_name: &str, content_type: &'static str) ->
 }
 
 async fn health(State(state): State<Arc<AppState>>) -> StatusCode {
-    if state.is_halted() || state.unavailable_reason().is_some() {
+    if state.is_halted() || matches!(&*state.authority.borrow(), WorkerAuthorityStatus::Fenced(_)) {
         StatusCode::SERVICE_UNAVAILABLE
     } else {
         StatusCode::NO_CONTENT
@@ -865,13 +1126,22 @@ async fn status(State(state): State<Arc<AppState>>) -> Response {
             world_hash: snapshot.world_hash,
             conservation_valid: snapshot.conservation.valid,
             authoritative_halted: state.is_halted(),
-            lifecycle,
+            lifecycle: PublicLifecycleStatus::from(&lifecycle),
         })
         .into_response(),
     )
 }
 
 async fn world(State(state): State<Arc<AppState>>) -> Response {
+    if !matches!(&*state.authority.borrow(), WorkerAuthorityStatus::Active) {
+        return no_store(
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the public live view is available only while the cell is active",
+            )
+                .into_response(),
+        );
+    }
     let Ok(_permit) = state.http_projection_admission.clone().try_acquire_owned() else {
         return no_store(
             (
@@ -907,7 +1177,7 @@ async fn websocket_upgrade(
     upgrade: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
 ) -> Response {
-    if state.unavailable_reason().is_some() {
+    if state.admission_block_reason().is_some() {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             "authoritative cell is fenced and cannot admit sessions",
@@ -929,7 +1199,7 @@ async fn websocket_upgrade(
 async fn websocket_session(socket: WebSocket, state: Arc<AppState>, _permit: OwnedSemaphorePermit) {
     let (mut sender, mut receiver) = socket.split();
     let mut authority = state.authority.subscribe();
-    if let Some((code, reason)) = state.unavailable_reason() {
+    if let Some((code, reason)) = state.admission_block_reason() {
         send_fatal_and_close(&mut sender, code, reason.as_ref()).await;
         return;
     }
@@ -1016,7 +1286,17 @@ async fn websocket_session(socket: WebSocket, state: Arc<AppState>, _permit: Own
             changed = authority.changed() => {
                 let reason = match changed {
                     Ok(()) => match &*authority.borrow_and_update() {
-                        WorkerAuthorityStatus::Active => continue,
+                        WorkerAuthorityStatus::Active | WorkerAuthorityStatus::Activating => {
+                            continue;
+                        }
+                        WorkerAuthorityStatus::Sleeping => (
+                            "cell_draining",
+                            Arc::from("the authoritative cell drained to sleep"),
+                        ),
+                        WorkerAuthorityStatus::Background => (
+                            "cell_not_active",
+                            Arc::from("the authoritative cell entered background mode"),
+                        ),
                         WorkerAuthorityStatus::Draining(reason) => {
                             ("cell_draining", Arc::clone(reason))
                         }
@@ -1170,7 +1450,13 @@ async fn complete_handshake(
                         return None;
                     }
                     let binding = match authentication {
-                        ClientAuthentication::Spectator => SessionBinding::Spectator,
+                        ClientAuthentication::Spectator => {
+                            if let Some((code, reason)) = state.unavailable_reason() {
+                                send_fatal_and_close(sender, code, reason.as_ref()).await;
+                                return None;
+                            }
+                            SessionBinding::Spectator
+                        }
                         ClientAuthentication::LocalDevelopment { player_id } => {
                             if !state
                                 .snapshot()
@@ -1191,6 +1477,16 @@ async fn complete_handshake(
                                     sender,
                                     "player_already_connected",
                                     "the requested player already has an active gameplay session",
+                                )
+                                .await;
+                                return None;
+                            }
+                            if let Err(source) = state.ensure_active().await {
+                                state.release_player(&player_id);
+                                send_fatal_and_close(
+                                    sender,
+                                    "cell_activation_failed",
+                                    source.to_string(),
                                 )
                                 .await;
                                 return None;
@@ -2332,8 +2628,15 @@ mod tests {
             .actor_private
             .as_ref()
             .expect("player receives actor-private state");
-        let canonical_progress =
-            state.runtime.lock().state().production_queues["block-refinery"][0].progress_ticks;
+        let canonical_progress = state
+            .runtime
+            .lock()
+            .runtime
+            .as_ref()
+            .expect("production fixture remains active")
+            .state()
+            .production_queues["block-refinery"][0]
+            .progress_ticks;
 
         assert_eq!(actor_player(&after).suit_oxygen_milli, before_oxygen);
         assert_eq!(canonical_progress, 60);
@@ -2344,6 +2647,76 @@ mod tests {
         assert_eq!(feed.latest_structural_sequence, Some(after.event_sequence));
         assert_eq!(feed.latest_motion_sequence, None);
         assert!(after.event_sequence > queued.event_sequence);
+    }
+
+    #[tokio::test]
+    async fn background_host_finishes_due_work_releases_runtime_and_reactivates() {
+        let (state, clock) = production_test_state();
+        state
+            .execute_as(
+                "player-local",
+                &ClientMessage::QueueProduction {
+                    operation_sequence: 1,
+                    operation_id: "background-host-production".into(),
+                    machine_block_id: "block-refinery".into(),
+                    recipe: ProductionRecipeKind::Refining,
+                    batches: 1,
+                    source_inventory_id: "inventory-cargo-industry-starter".into(),
+                    destination_inventory_id: "inventory-cargo-industry-starter".into(),
+                },
+            )
+            .expect("production job queues");
+        assert_eq!(
+            state
+                .drain_to_background_or_sleeping()
+                .expect("runnable cell drains to background"),
+            LifecycleMode::Background
+        );
+        assert!(
+            !state
+                .runtime
+                .lock()
+                .runtime
+                .as_ref()
+                .expect("background host retains the production runtime")
+                .physics_scene_is_initialized()
+        );
+
+        let mut final_mode = LifecycleMode::Background;
+        for second in 1..=60_u64 {
+            clock.set(1_000_000 + second * 1_000);
+            final_mode = state
+                .background_dispatch_step()
+                .expect("background dispatch succeeds");
+            if final_mode == LifecycleMode::Sleeping {
+                break;
+            }
+        }
+        assert_eq!(final_mode, LifecycleMode::Sleeping);
+        assert!(state.runtime.lock().runtime.is_none());
+        assert!(
+            !state
+                .projection_revision
+                .lock()
+                .world
+                .production_queues
+                .contains_key("block-refinery")
+        );
+        assert!(state.snapshot().conservation.valid);
+
+        state
+            .ensure_active()
+            .await
+            .expect("player wake reactivates");
+        assert_eq!(state.lifecycle_mode(), LifecycleMode::Active);
+        assert!(
+            state
+                .runtime
+                .lock()
+                .runtime
+                .as_ref()
+                .is_some_and(Runtime::physics_scene_is_initialized)
+        );
     }
 
     #[test]
@@ -2639,10 +3012,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn draining_closes_sessions_rejects_admission_and_releases_an_idle_cell() {
+    async fn idle_drain_closes_sessions_spectators_do_not_wake_and_players_reactivate() {
         let (mut socket, state, server) = connect_test_socket().await;
         let address = server_address(&socket);
         complete_session(&mut socket, &local_player_hello("draining-session")).await;
+        let first_fence = state.lifecycle_status().fencing_token;
 
         assert_eq!(
             state
@@ -2666,14 +3040,38 @@ mod tests {
             verse_simulation::LifecycleMode::Sleeping
         );
 
-        let error = connect_async(format!("ws://{address}/ws"))
+        let (mut spectator, _) = connect_async(format!("ws://{address}/ws"))
             .await
-            .expect_err("draining authority rejects a new websocket");
+            .expect("sleeping cell accepts a bounded handshake");
+        send_client_message(
+            &mut spectator,
+            &ClientMessage::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                client_name: "sleeping-spectator".into(),
+                authentication: ClientAuthentication::Spectator,
+            },
+        )
+        .await;
         assert!(matches!(
-            error,
-            tokio_tungstenite::tungstenite::Error::Http(response)
-                if response.status() == StatusCode::SERVICE_UNAVAILABLE
+            receive_wire_message(&mut spectator).await,
+            ServerMessage::Fatal { ref code, .. } if code == "cell_not_active"
         ));
+        assert_eq!(
+            state.lifecycle_status().observed_mode,
+            verse_simulation::LifecycleMode::Sleeping
+        );
+        assert_eq!(state.lifecycle_status().fencing_token, first_fence);
+
+        let (mut reactivated, _) = connect_async(format!("ws://{address}/ws"))
+            .await
+            .expect("authenticated player can request activation");
+        complete_session(&mut reactivated, &local_player_hello("reactivated-session")).await;
+        assert_eq!(
+            state.lifecycle_status().observed_mode,
+            verse_simulation::LifecycleMode::Active
+        );
+        assert!(state.lifecycle_status().fencing_token > first_fence);
+        let _ = reactivated.close(None).await;
         let _ = socket.close(None).await;
         server.abort();
     }
@@ -4075,6 +4473,9 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
         assert_eq!(json["conservation_valid"], true);
         assert_eq!(json["protocol_version"], PROTOCOL_VERSION);
+        assert!(json["lifecycle"]["next_production_occurrence"].is_null());
+        assert!(json["lifecycle"]["acknowledged_production_sequence"].is_null());
+        assert!(json["lifecycle"]["expires_at_unix_ms"].is_null());
     }
 
     #[tokio::test]
