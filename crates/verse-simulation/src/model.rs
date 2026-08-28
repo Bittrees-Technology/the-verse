@@ -1068,6 +1068,15 @@ impl WorldState {
     }
 
     pub fn validate_player_roster(&self) -> Result<(), String> {
+        self.validate_player_roster_with_job_frontier(|job| {
+            job.queued_event_sequence <= self.event_sequence
+        })
+    }
+
+    pub(crate) fn validate_player_roster_with_job_frontier(
+        &self,
+        production_job_frontier_is_valid: impl Fn(&ProductionJob) -> bool,
+    ) -> Result<(), String> {
         if self.schema_version != WORLD_SCHEMA_VERSION {
             return Err(format!(
                 "world schema {} does not match required schema {WORLD_SCHEMA_VERSION}",
@@ -1186,7 +1195,7 @@ impl WorldState {
                 );
             }
         }
-        self.validate_authority_graph()?;
+        self.validate_authority_graph_with_job_frontier(production_job_frontier_is_valid)?;
         Ok(())
     }
 
@@ -1194,6 +1203,15 @@ impl WorldState {
     /// state. Grid and drop owners are permitted to be offline, but their IDs,
     /// inventory linkage, and asset identities remain canonical.
     pub fn validate_authority_graph(&self) -> Result<(), String> {
+        self.validate_authority_graph_with_job_frontier(|job| {
+            job.queued_event_sequence <= self.event_sequence
+        })
+    }
+
+    fn validate_authority_graph_with_job_frontier(
+        &self,
+        production_job_frontier_is_valid: impl Fn(&ProductionJob) -> bool,
+    ) -> Result<(), String> {
         let finite_vec =
             |value: Vec3| value.x.is_finite() && value.y.is_finite() && value.z.is_finite();
         let normalized_quat = |orientation: Quat| {
@@ -1365,7 +1383,7 @@ impl WorldState {
                     || !content::machine_supports_recipe(machine.kind, job.recipe)
                     || job.batches == 0
                     || job.queued_event_sequence == 0
-                    || job.queued_event_sequence > self.event_sequence
+                    || !production_job_frontier_is_valid(job)
                     || job.progress_ticks > job.duration_ticks
                     || (queue_index > 0 && job.progress_ticks != 0)
                 {

@@ -153,10 +153,24 @@ exact quarantine receipt, survives successor-worker fencing, and persists
 source and destination precommit-abort witnesses, all through a validated
 directory-v3 authority view. Directory abort cleanup now accepts only the
 matching witness hash, side, nonzero cleanup frontier, and resulting
-draft-world commitment. Export and import remain disabled until durable
-production-job origin and destination eligibility are modeled. Production
-remains pinned to protocol 18/directory 2/package 1 until the complete
-protocol-19 tuple activates together. Production active-player load, the
+draft-world commitment. The package now requires an exact canonical creation
+origin for every production job, preventing equal local event numbers in two
+cells from aliasing one job. The draft-world envelope persists the exact origin
+map, derives package capture from that state instead of caller metadata, and
+accepts an origin-qualified package through a quieter intermediate cell. A
+private import-eligibility map is derived exactly from every packaged machine
+FIFO and binds each queue to its transfer, destination fence, typed import
+authority, production-clock generation, and checked one-second re-arm
+boundary. Its pure planner rejects a substituted current queue or foreign
+occurrence, pauses pre-boundary work, and releases the queue for normal
+power/route evaluation only at or after that boundary. Raw import-authority
+construction is test-only; production construction remains unavailable until
+the import transaction can derive it from validated directory, canonical cell
+event, live-fence, and trusted-clock evidence.
+Committed export/import and scheduler wiring remain disabled until their
+atomic transactions and crash matrix are implemented. Production remains
+pinned to protocol 18/directory 2/package 1 until the complete protocol-19
+tuple activates together. Production active-player load, the
 production binary codec, general multi-cell execution, safe zones, accounts,
 AMMs, and blockchain settlement remain in the
 [delivery roadmap](docs/roadmap/roadmap.md). See [Celestial registry and

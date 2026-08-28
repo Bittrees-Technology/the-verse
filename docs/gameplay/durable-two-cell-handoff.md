@@ -553,9 +553,24 @@ reservation. The directory accepts cleanup only through a dedicated proof that
 binds the exact witness hash, source or destination role, live assignment and
 fence, nonzero cleanup frontier, package/member roots, quarantine receipt, and
 resulting draft-world commitment. Committed export and import are deliberately
-absent until each production job carries durable origin-cell provenance and
-every imported queue has an explicit post-import eligibility boundary. All
-drafts are intentionally unreachable from the production
+absent. The package draft now requires every production job to carry its exact
+canonical creation material: universe, creator cell, event sequence, entity
+kind, and ordinal. This makes the source-local queue frontier unambiguous after
+movement and rejects missing, substituted, or cross-cell-colliding identities.
+The draft-world envelope persists the exact origin map and its authoritative
+capture path replaces caller-supplied origin material before extraction. A
+separate private eligibility map is derived from the exact packaged machine
+set and FIFO order. Each record binds its transfer and package, destination
+assignment and fence, typed import authority, pinned roots,
+production-clock generation, and checked import-time-plus-one-second boundary.
+Its pure occurrence decision rejects a changed live queue, pauses work before
+that time, and releases the boundary for normal power, route, and capacity
+evaluation at the exact eligible time. Raw import-authority construction is
+test-only; no production caller can choose an event, fence, or trusted time
+until the import transaction derives them from validated directory and cell
+evidence. Atomic export/import transactions, the explicit transfer-paused
+production outcome, and crash/replay integration remain to be
+implemented before activation. All drafts are intentionally unreachable from the production
 directory-v2/package-v1 paths until every version in the table above moves in
 one coordinated activation.
 

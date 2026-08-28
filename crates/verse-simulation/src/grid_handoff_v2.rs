@@ -7,6 +7,8 @@
 //! the complete ADR-0024 compatibility tuple activates atomically.
 
 #[allow(dead_code)]
+mod production;
+#[allow(dead_code)]
 pub(crate) mod state;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -24,6 +26,7 @@ use crate::model::{
     valid_blake3_hex, valid_player_id,
 };
 use crate::{celestial, content};
+use production::{DraftProductionJobOriginV2, validate_production_job_origins};
 
 const DRAFT_GRID_TRANSFER_PACKAGE_SCHEMA_VERSION: u32 = 2;
 const DRAFT_GRID_TRANSFER_RECEIPT_SCHEMA_VERSION: u32 = 2;
@@ -60,6 +63,7 @@ struct DraftGridTransferContextV2 {
     source_fencing_token: u64,
     destination_fencing_token: u64,
     placement: BundledPlacementPlan,
+    production_job_origins: BTreeMap<String, DraftProductionJobOriginV2>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -135,6 +139,7 @@ struct DraftGridClosurePackageV2 {
     grid: Grid,
     cargo_inventories: BTreeMap<String, InventoryRecord>,
     production_queues: BTreeMap<String, VecDeque<ProductionJob>>,
+    production_job_origins: BTreeMap<String, DraftProductionJobOriginV2>,
     players: BTreeMap<String, DraftClosurePlayerV2>,
     active_internal_contacts: BTreeSet<ContactPairKey>,
     conservation: DraftGridClosureConservationV2,
@@ -150,6 +155,7 @@ struct ClosureHashMaterial<'a> {
     grid: &'a Grid,
     cargo_inventories: &'a BTreeMap<String, InventoryRecord>,
     production_queues: &'a BTreeMap<String, VecDeque<ProductionJob>>,
+    production_job_origins: &'a BTreeMap<String, DraftProductionJobOriginV2>,
     players: &'a BTreeMap<String, DraftClosurePlayerV2>,
     active_internal_contacts: &'a BTreeSet<ContactPairKey>,
 }
@@ -187,6 +193,7 @@ impl DraftGridClosurePackageV2 {
                 grid: &self.grid,
                 cargo_inventories: &self.cargo_inventories,
                 production_queues: &self.production_queues,
+                production_job_origins: &self.production_job_origins,
                 players: &self.players,
                 active_internal_contacts: &self.active_internal_contacts,
             },
@@ -280,6 +287,13 @@ impl DraftGridClosurePackageV2 {
         validate_package_cargo(self)?;
         validate_inventory_uniqueness(self)?;
         validate_package_queues(self)?;
+        validate_production_job_origins(
+            &self.universe_id,
+            &self.source_cell_id,
+            self.source_event_sequence,
+            &self.production_queues,
+            &self.production_job_origins,
+        )?;
         validate_package_contacts(self)?;
         validate_destination_containment(self)?;
 
@@ -357,6 +371,14 @@ fn extract_draft_grid_closure(
     source
         .validate_player_roster()
         .map_err(DraftGridClosureError::Invalid)?;
+    extract_draft_grid_closure_from_validated_world(source, grid_id, context)
+}
+
+fn extract_draft_grid_closure_from_validated_world(
+    source: &WorldState,
+    grid_id: &str,
+    context: &DraftGridTransferContextV2,
+) -> Result<DraftGridClosurePackageV2, DraftGridClosureError> {
     context.placement.validate().map_err(|source| {
         DraftGridClosureError::Invalid(format!("placement bundle is invalid: {source}"))
     })?;
@@ -600,6 +622,7 @@ fn extract_draft_grid_closure(
         grid,
         cargo_inventories,
         production_queues,
+        production_job_origins: context.production_job_origins.clone(),
         players,
         active_internal_contacts,
         conservation,
@@ -991,7 +1014,6 @@ fn validate_package_queues(
                 || job.progress_ticks > job.duration_ticks
                 || (queue_index > 0 && job.progress_ticks != 0)
                 || job.queued_event_sequence == 0
-                || job.queued_event_sequence > package.source_event_sequence
                 || !escrow_valid
             {
                 return Err(DraftGridClosureError::Unsupported(
@@ -1720,6 +1742,7 @@ mod tests {
             source_fencing_token: 11,
             destination_fencing_token: 13,
             placement,
+            production_job_origins: BTreeMap::new(),
         };
         (source, context)
     }
@@ -1780,7 +1803,7 @@ mod tests {
         assert_eq!(package.conservation.placement_member_count, 2);
         assert_eq!(
             package.package_hash,
-            "fb6e5d4fd46e2a99f16cbbeb4527cc99c6f58ba3c972ece7610aad64116dc17b"
+            "dc06fd2d41b50671dca5189c905e40a9ec364aa0e35413a4c2de22d569862826"
         );
     }
 
@@ -2374,12 +2397,24 @@ mod tests {
         let (reserved_inputs, _, duration_ticks) =
             production_recipe_quantities(ProductionRecipeKind::Refining, 1)
                 .expect("recipe quantities derive");
+        source.ledger.genesis_ore = source
+            .ledger
+            .genesis_ore
+            .checked_add(reserved_inputs.ore)
+            .expect("fixture genesis ore remains bounded");
         source.event_sequence = 1;
         source.last_event_hash = "11".repeat(32);
+        let (job_id, job_origin) = DraftProductionJobOriginV2::new(
+            &source.universe_id,
+            &source.cell_id,
+            source.event_sequence,
+            0,
+        )
+        .expect("canonical production job identity derives");
         source.production_queues.insert(
             "block-refinery".into(),
             VecDeque::from([ProductionJob {
-                job_id: "job-grid-handoff".into(),
+                job_id: job_id.clone(),
                 operation_id: "operation-grid-handoff".into(),
                 owner_player_id: "player-local".into(),
                 machine_block_id: "block-refinery".into(),
@@ -2422,6 +2457,7 @@ mod tests {
             source_fencing_token: 11,
             destination_fencing_token: 13,
             placement,
+            production_job_origins: BTreeMap::from([(job_id.clone(), job_origin)]),
         };
         let unsupported = extract_draft_grid_closure(&source, STARTER_INDUSTRY_GRID_ID, &context);
         assert!(
@@ -2450,9 +2486,18 @@ mod tests {
         player.position =
             celestial::local_position_from_address(&source.cell_address, &player.address)
                 .expect("owner pose hydrates");
-        let package = extract_draft_grid_closure(&source, STARTER_INDUSTRY_GRID_ID, &context)
-            .expect("supported owner and queue transfer together");
+        let authoritative_state = state::DraftGridTransferCellStateV2::new_with_production_origins(
+            source.clone(),
+            context.production_job_origins.clone(),
+        )
+        .expect("draft world persists authoritative job origins");
+        let mut caller_context = context.clone();
+        caller_context.production_job_origins.clear();
+        let package = authoritative_state
+            .capture_grid_closure(STARTER_INDUSTRY_GRID_ID, &caller_context)
+            .expect("supported owner and authoritative queue transfer together");
         assert_eq!(package.production_queues["block-refinery"].len(), 1);
+        assert!(package.production_job_origins.contains_key(&job_id));
         assert_eq!(package.conservation.production_job_count, 1);
         assert_eq!(
             package.conservation.reserved_inputs.ore,
@@ -2462,6 +2507,207 @@ mod tests {
             package.conservation.escrow_mass_grams,
             content::manifest().recipes.refining.ore_input
                 * resource_unit_mass_grams(ResourceKind::Ore)
+        );
+
+        let mut missing_origin = package.clone();
+        missing_origin.production_job_origins.clear();
+        reseal_package(&mut missing_origin);
+        assert!(matches!(
+            missing_origin.validate_wire(),
+            Err(DraftGridClosureError::Invalid(_))
+        ));
+
+        let mut substituted_origin = package.clone();
+        let origin = substituted_origin
+            .production_job_origins
+            .remove(&job_id)
+            .expect("job origin exists");
+        substituted_origin
+            .production_job_origins
+            .insert("production-job-substituted".into(), origin);
+        reseal_package(&mut substituted_origin);
+        assert!(matches!(
+            substituted_origin.validate_wire(),
+            Err(DraftGridClosureError::Invalid(_))
+        ));
+
+        let mut multihop = package.clone();
+        let foreign_cell_id = "ab".repeat(32);
+        let (foreign_job_id, foreign_origin) =
+            DraftProductionJobOriginV2::new(&multihop.universe_id, &foreign_cell_id, 100, 0)
+                .expect("foreign canonical job derives");
+        let foreign_job = multihop
+            .production_queues
+            .get_mut("block-refinery")
+            .expect("queue exists")
+            .front_mut()
+            .expect("queue head exists");
+        foreign_job.job_id = foreign_job_id.clone();
+        foreign_job.operation_id = "operation-foreign-grid-handoff".into();
+        foreign_job.queued_event_sequence = 100;
+        multihop.production_job_origins =
+            BTreeMap::from([(foreign_job_id.clone(), foreign_origin.clone())]);
+        reseal_package(&mut multihop);
+        assert!(
+            multihop.validate_wire().is_ok(),
+            "an origin-qualified job may cross a quieter intermediate cell"
+        );
+
+        let mut intermediate_world = source.clone();
+        let intermediate_job = intermediate_world
+            .production_queues
+            .get_mut("block-refinery")
+            .expect("intermediate queue exists")
+            .front_mut()
+            .expect("intermediate job exists");
+        intermediate_job.job_id = foreign_job_id.clone();
+        intermediate_job.operation_id = "operation-foreign-grid-handoff".into();
+        intermediate_job.queued_event_sequence = 100;
+        let foreign_origins = BTreeMap::from([(foreign_job_id.clone(), foreign_origin.clone())]);
+        let intermediate_state = state::DraftGridTransferCellStateV2::new_with_production_origins(
+            intermediate_world.clone(),
+            foreign_origins.clone(),
+        )
+        .expect("world21 accepts an origin-qualified foreign frontier");
+        let intermediate_bytes = intermediate_state
+            .encode_canonical()
+            .expect("intermediate world encodes");
+        let reopened_intermediate =
+            state::DraftGridTransferCellStateV2::decode_canonical(&intermediate_bytes)
+                .expect("intermediate world reopens");
+        assert_eq!(reopened_intermediate, intermediate_state);
+        let mut second_hop_context = context.clone();
+        second_hop_context.transfer_id = "transfer-grid-production-second-hop".into();
+        second_hop_context.production_job_origins.clear();
+        let second_hop_package = reopened_intermediate
+            .capture_grid_closure(STARTER_INDUSTRY_GRID_ID, &second_hop_context)
+            .expect("authoritative second-hop package captures");
+        assert_eq!(second_hop_package.production_job_origins, foreign_origins);
+        assert_eq!(
+            second_hop_package.production_queues["block-refinery"][0].queued_event_sequence,
+            100
+        );
+        assert!(
+            state::DraftGridTransferCellStateV2::new_with_production_origins(
+                intermediate_world.clone(),
+                BTreeMap::new(),
+            )
+            .is_err()
+        );
+
+        let (local_future_job_id, local_future_origin) = DraftProductionJobOriginV2::new(
+            &intermediate_world.universe_id,
+            &intermediate_world.cell_id,
+            100,
+            0,
+        )
+        .expect("local future job identity derives");
+        let local_future_job = intermediate_world
+            .production_queues
+            .get_mut("block-refinery")
+            .expect("local future queue exists")
+            .front_mut()
+            .expect("local future job exists");
+        local_future_job.job_id = local_future_job_id.clone();
+        assert!(
+            state::DraftGridTransferCellStateV2::new_with_production_origins(
+                intermediate_world,
+                BTreeMap::from([(local_future_job_id, local_future_origin)]),
+            )
+            .is_err(),
+            "a local job cannot claim an uncommitted future event"
+        );
+
+        let mut two_job_package = package.clone();
+        let (second_job_id, second_origin) = DraftProductionJobOriginV2::new(
+            &two_job_package.universe_id,
+            &two_job_package.source_cell_id,
+            two_job_package.source_event_sequence,
+            1,
+        )
+        .expect("second canonical job derives");
+        let mut second_job = two_job_package.production_queues["block-refinery"]
+            .front()
+            .expect("queue head exists")
+            .clone();
+        second_job.job_id = second_job_id.clone();
+        second_job.operation_id = "operation-grid-handoff-second".into();
+        two_job_package
+            .production_queues
+            .get_mut("block-refinery")
+            .expect("queue exists")
+            .push_back(second_job);
+        two_job_package
+            .production_job_origins
+            .insert(second_job_id.clone(), second_origin);
+        reseal_package(&mut two_job_package);
+        two_job_package
+            .validate_wire()
+            .expect("two-job package validates");
+        let import_authority = production::DraftProductionImportAuthorityV2::new(
+            &two_job_package,
+            two_job_package.destination_assignment_generation,
+            two_job_package.destination_fencing_token,
+            7,
+            "cd".repeat(32),
+            1_800_000_000_000,
+            3,
+        )
+        .expect("import authority validates");
+        let eligibilities = production::derive_imported_production_eligibilities(
+            &two_job_package,
+            &import_authority,
+        )
+        .expect("exact eligibility map derives");
+        production::validate_imported_production_eligibilities(
+            &two_job_package,
+            &import_authority,
+            &eligibilities,
+        )
+        .expect("exact eligibility map validates");
+
+        let mut reordered = eligibilities.clone();
+        let record = reordered.get("block-refinery").expect("eligibility exists");
+        let tampered =
+            record.resealed_with_ordered_job_ids_for_test(vec![second_job_id, job_id.clone()]);
+        reordered.insert("block-refinery".into(), tampered);
+        assert!(
+            production::validate_imported_production_eligibilities(
+                &two_job_package,
+                &import_authority,
+                &reordered,
+            )
+            .is_err()
+        );
+
+        let mut missing = eligibilities.clone();
+        missing.clear();
+        assert!(
+            production::validate_imported_production_eligibilities(
+                &two_job_package,
+                &import_authority,
+                &missing,
+            )
+            .is_err()
+        );
+
+        let backdated = production::DraftProductionImportAuthorityV2::new(
+            &two_job_package,
+            two_job_package.destination_assignment_generation,
+            two_job_package.destination_fencing_token,
+            7,
+            "cd".repeat(32),
+            1_799_999_999_000,
+            3,
+        )
+        .expect("alternate authority is internally valid");
+        assert!(
+            production::validate_imported_production_eligibilities(
+                &two_job_package,
+                &backdated,
+                &eligibilities,
+            )
+            .is_err()
         );
     }
 }
