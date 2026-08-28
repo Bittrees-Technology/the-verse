@@ -193,14 +193,21 @@ derives the machine holds from its committed event without ticking production.
 It then seals the pending-activation lock, resulting active world, typed proof,
 and historical record in one cloned-state mutation. Exact retry returns that
 durable result. Restart validation retains the complete pending lock and
-machine-hold set until future authenticated activation and eligibility-release
-witnesses replace them; an unrelated later cell event cannot silently discard
-either authority. Dormant directory v3 persists every typed import-proof field,
-reconstructs and revalidates the exact cell proof after restart, and accepts a
-late imported/finalized retry only when that directory proof equals the local
-historical result. Destination activation, source finalization, scheduler
-wiring, and the crash matrix remain disabled until their atomic transactions
-are implemented. Production remains
+machine-hold set until authenticated activation and later eligibility-release
+witnesses replace them; an unrelated cell event cannot silently discard either
+authority. The pure destination-activation transaction removes only the exact
+pending gameplay lock, advances one event, and records an acyclic historical
+proof without moving assets, ticking production, or changing conservation.
+Restart validation reconstructs the exact pre-activation active world at that
+event. Later gameplay may change the activated grid, and historical evidence
+does not blacklist its root from a future transfer ID. Per-machine holds retain
+the full packaged queue hash and sealed import boundary until a distinct
+release transaction. Dormant directory
+v3 persists and reconstructs both typed import and activation proofs; late
+Imported/Finalized retries require exact equality with the local historical
+results. Source finalization, production eligibility release/scheduler wiring,
+and the crash matrix remain disabled until their atomic transactions are
+implemented. Production remains
 pinned to protocol 18/directory 2/package 1 until the complete protocol-19
 tuple activates together. Production active-player load, the
 production binary codec, general multi-cell execution, safe zones, accounts,

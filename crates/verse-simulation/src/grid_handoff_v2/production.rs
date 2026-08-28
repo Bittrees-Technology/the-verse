@@ -24,6 +24,7 @@ const IMPORTED_PRODUCTION_ELIGIBILITY_HASH_DOMAIN: &[u8] =
     b"the-verse/imported-production-eligibility/v2\0";
 const IMPORTED_PRODUCTION_ELIGIBILITY_MAP_ROOT_DOMAIN: &[u8] =
     b"the-verse/imported-production-eligibility-map/v2\0";
+const IMPORTED_PRODUCTION_QUEUE_HASH_DOMAIN: &[u8] = b"the-verse/imported-production-queue/v2\0";
 const PRODUCTION_IMPORT_REARM_MILLIS: u64 = 1_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -154,6 +155,7 @@ pub(super) struct DraftImportedProductionEligibilityV2 {
     celestial_registry_hash: String,
     machine_block_id: String,
     ordered_job_ids: Vec<String>,
+    queue_hash: String,
     destination_cell_id: String,
     destination_assignment_generation: u64,
     destination_fencing_token: u64,
@@ -203,6 +205,7 @@ impl DraftImportedProductionEligibilityV2 {
             ));
         }
         let ordered_job_ids = queue.iter().map(|job| job.job_id.clone()).collect();
+        let queue_hash = hash_json(IMPORTED_PRODUCTION_QUEUE_HASH_DOMAIN, queue)?;
         let eligible_at_unix_ms = authority
             .trusted_import_unix_ms
             .checked_add(PRODUCTION_IMPORT_REARM_MILLIS)
@@ -220,6 +223,7 @@ impl DraftImportedProductionEligibilityV2 {
             celestial_registry_hash: package.celestial_registry_hash.clone(),
             machine_block_id: machine_block_id.to_owned(),
             ordered_job_ids,
+            queue_hash,
             destination_cell_id: package.destination_cell_id.clone(),
             destination_assignment_generation: authority.destination_assignment_generation,
             destination_fencing_token: authority.destination_fencing_token,
@@ -257,6 +261,7 @@ impl DraftImportedProductionEligibilityV2 {
                 .ordered_job_ids
                 .iter()
                 .any(|job_id| !valid_stable_id(job_id))
+            || !valid_blake3_hex(&self.queue_hash)
             || !valid_blake3_hex(&self.destination_cell_id)
             || self.destination_assignment_generation == 0
             || self.destination_fencing_token == 0
@@ -296,6 +301,7 @@ impl DraftImportedProductionEligibilityV2 {
                 .iter()
                 .map(String::as_str)
                 .ne(current_queue.iter().map(|job| job.job_id.as_str()))
+            || self.queue_hash != hash_json(IMPORTED_PRODUCTION_QUEUE_HASH_DOMAIN, current_queue)?
         {
             return Err(DraftGridClosureError::Invalid(
                 "persisted import eligibility no longer binds its destination world and queue"
@@ -383,6 +389,7 @@ impl DraftImportedProductionEligibilityV2 {
                 .iter()
                 .map(String::as_str)
                 .ne(expected_job_ids)
+            || self.queue_hash != hash_json(IMPORTED_PRODUCTION_QUEUE_HASH_DOMAIN, queue)?
         {
             return Err(DraftGridClosureError::Invalid(
                 "imported production eligibility does not bind the exact package queue and authority"
@@ -435,6 +442,7 @@ impl DraftImportedProductionEligibilityV2 {
             celestial_registry_hash: "33".repeat(32),
             machine_block_id: "block-refinery".into(),
             ordered_job_ids: vec!["production-job-a".into(), "production-job-b".into()],
+            queue_hash: "66".repeat(32),
             destination_cell_id: "44".repeat(32),
             destination_assignment_generation: 7,
             destination_fencing_token: 9,
