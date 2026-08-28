@@ -1630,8 +1630,8 @@ pub(super) struct ValidatedManifestBoundGridAuthorityV3<'authority, 'manifest> {
     manifest: &'manifest crate::manifest_v5::ValidatedUniverseManifestV5,
 }
 
-impl ValidatedManifestBoundGridAuthorityV3<'_, '_> {
-    pub(super) fn authority(&self) -> &ValidatedGridTransferAuthorityV3 {
+impl<'authority> ValidatedManifestBoundGridAuthorityV3<'authority, '_> {
+    pub(super) fn authority(&self) -> &'authority ValidatedGridTransferAuthorityV3 {
         self.authority
     }
 
@@ -1647,8 +1647,8 @@ pub(super) struct ValidatedManifestBoundCellAuthorityV3<'authority, 'manifest> {
     manifest: &'manifest crate::manifest_v5::ValidatedUniverseManifestV5,
 }
 
-impl ValidatedManifestBoundCellAuthorityV3<'_, '_> {
-    pub(super) fn authority(&self) -> &ValidatedCellAuthorityV3 {
+impl<'authority> ValidatedManifestBoundCellAuthorityV3<'authority, '_> {
+    pub(super) fn authority(&self) -> &'authority ValidatedCellAuthorityV3 {
         self.authority
     }
 

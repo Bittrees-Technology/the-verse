@@ -27,7 +27,7 @@ pub(super) const DRAFT_GRID_EVENT_SCHEMA_VERSION: u32 = 17;
 const DRAFT_GRID_EVENT_SCHEMA_NAME: &str = "verse.world_event";
 const DRAFT_GRID_EVENT_PAYLOAD_HASH_DOMAIN: &[u8] = b"the-verse/grid-event-payload/v17\0";
 const DRAFT_GRID_EVENT_HASH_DOMAIN: &[u8] = b"the-verse/world-event/v17\0";
-const MAX_DRAFT_GRID_EVENT_BYTES: usize = 20 * 1_024 * 1_024;
+pub(super) const MAX_DRAFT_GRID_EVENT_BYTES: usize = 20 * 1_024 * 1_024;
 
 /// Serialized production authority is an event commitment, never a capability.
 /// Replay must resolve and compare the exact non-Serde directory capability.
@@ -100,7 +100,7 @@ pub(super) enum ValidatedDraftGridEventAuthorityV17<'a> {
 /// Live authority can only be minted from the locked directory's current
 /// head. The world-21 Store consumes this type; replay uses the separate
 /// historical capability above.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub(super) enum ValidatedCurrentGridEventAuthorityV17<'authority, 'store> {
     Grid(&'authority ValidatedCurrentGridAuthorityV3<'store>),
     Production(&'authority ValidatedCurrentCellAuthorityV3<'store>),
@@ -207,14 +207,15 @@ pub(super) struct ValidatedDraftGridEventContextV17 {
 /// Non-Serde capability proving one event-17 record advances one validated
 /// world-21 state and shares its complete manifest-5 identity.
 #[derive(Debug)]
-pub(super) struct ValidatedManifestBoundGridEventV17<'event, 'state, 'manifest> {
+pub(super) struct ValidatedManifestBoundGridEventV17<'event, 'state, 'manifest, 'authority> {
     event: &'event DraftCanonicalGridEventV17,
     state: &'state DraftGridTransferCellStateV2,
     manifest: &'manifest crate::manifest_v5::ValidatedUniverseManifestV5,
+    authority: ValidatedDraftGridEventAuthorityV17<'authority>,
     context: ValidatedDraftGridEventContextV17,
 }
 
-impl ValidatedManifestBoundGridEventV17<'_, '_, '_> {
+impl ValidatedManifestBoundGridEventV17<'_, '_, '_, '_> {
     pub(super) fn event(&self) -> &DraftCanonicalGridEventV17 {
         self.event
     }
@@ -225,6 +226,14 @@ impl ValidatedManifestBoundGridEventV17<'_, '_, '_> {
 
     pub(super) fn manifest_hash(&self) -> &str {
         self.manifest.manifest_hash()
+    }
+
+    pub(super) fn manifest(&self) -> &crate::manifest_v5::ValidatedUniverseManifestV5 {
+        self.manifest
+    }
+
+    pub(super) fn authority(&self) -> ValidatedDraftGridEventAuthorityV17<'_> {
+        self.authority
     }
 
     pub(super) fn context(&self) -> &ValidatedDraftGridEventContextV17 {
@@ -414,8 +423,32 @@ impl DraftCanonicalGridEventV17 {
         payload: DraftGridEventPayloadV17,
         authority: ValidatedDraftGridEventAuthorityV17<'_>,
     ) -> Result<Self, DraftGridClosureError> {
+        Self::new_proven_system_with_manifest(
+            state,
+            None,
+            event_id,
+            occurred_at_unix_ms,
+            payload,
+            authority,
+        )
+    }
+
+    #[cfg(test)]
+    fn new_proven_system_with_manifest(
+        state: &DraftGridTransferCellStateV2,
+        world_v21_manifest: Option<&crate::manifest_v5::ValidatedUniverseManifestV5>,
+        event_id: impl Into<String>,
+        occurred_at_unix_ms: u64,
+        payload: DraftGridEventPayloadV17,
+        authority: ValidatedDraftGridEventAuthorityV17<'_>,
+    ) -> Result<Self, DraftGridClosureError> {
         let cell_authority = payload.resolved_cell_authority(authority)?;
-        let rebound = state.rebind_validated_cell_authority(&cell_authority)?;
+        let rebound = match world_v21_manifest {
+            Some(manifest) => {
+                state.rebind_world_v21_validated_cell_authority(manifest, &cell_authority)?
+            }
+            None => state.rebind_validated_cell_authority(&cell_authority)?,
+        };
         let base = rebound.base();
         let event_sequence = base.event_sequence.checked_add(1).ok_or_else(|| {
             DraftGridClosureError::Unsupported("draft event-17 sequence exhausted".into())
@@ -455,7 +488,7 @@ impl DraftCanonicalGridEventV17 {
         event_id: impl Into<String>,
         occurred_at_unix_ms: u64,
         payload: DraftGridEventPayloadV17,
-        authority: ValidatedCurrentGridEventAuthorityV17<'_, '_>,
+        authority: &ValidatedCurrentGridEventAuthorityV17<'_, '_>,
     ) -> Result<Self, DraftGridClosureError> {
         match authority {
             ValidatedCurrentGridEventAuthorityV17::Grid(authority) => Self::new_proven_system(
@@ -463,7 +496,7 @@ impl DraftCanonicalGridEventV17 {
                 event_id,
                 occurred_at_unix_ms,
                 payload,
-                ValidatedDraftGridEventAuthorityV17::Grid(authority.validated()),
+                ValidatedDraftGridEventAuthorityV17::Grid((*authority).validated()),
             ),
             ValidatedCurrentGridEventAuthorityV17::Production(authority) => {
                 Self::new_proven_system(
@@ -471,7 +504,40 @@ impl DraftCanonicalGridEventV17 {
                     event_id,
                     occurred_at_unix_ms,
                     payload,
-                    ValidatedDraftGridEventAuthorityV17::Production(authority.validated()),
+                    ValidatedDraftGridEventAuthorityV17::Production((*authority).validated()),
+                )
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn new_live_world_v21_system_for_store(
+        state: &DraftGridTransferCellStateV2,
+        manifest: &crate::manifest_v5::ValidatedUniverseManifestV5,
+        event_id: impl Into<String>,
+        occurred_at_unix_ms: u64,
+        payload: DraftGridEventPayloadV17,
+        authority: &ValidatedCurrentGridEventAuthorityV17<'_, '_>,
+    ) -> Result<Self, DraftGridClosureError> {
+        match authority {
+            ValidatedCurrentGridEventAuthorityV17::Grid(authority) => {
+                Self::new_proven_system_with_manifest(
+                    state,
+                    Some(manifest),
+                    event_id,
+                    occurred_at_unix_ms,
+                    payload,
+                    ValidatedDraftGridEventAuthorityV17::Grid((*authority).validated()),
+                )
+            }
+            ValidatedCurrentGridEventAuthorityV17::Production(authority) => {
+                Self::new_proven_system_with_manifest(
+                    state,
+                    Some(manifest),
+                    event_id,
+                    occurred_at_unix_ms,
+                    payload,
+                    ValidatedDraftGridEventAuthorityV17::Production((*authority).validated()),
                 )
             }
         }
@@ -576,24 +642,30 @@ impl DraftCanonicalGridEventV17 {
         })
     }
 
-    pub(super) fn validate_world_v21<'event, 'state, 'manifest>(
+    pub(super) fn validate_world_v21<'event, 'state, 'manifest, 'authority>(
         &'event self,
         state: &ValidatedDraftGridTransferCellStateV21<'state, 'manifest>,
-        authority: ValidatedManifestBoundGridEventAuthorityV17<'_, '_, '_>,
-    ) -> Result<ValidatedManifestBoundGridEventV17<'event, 'state, 'manifest>, DraftGridClosureError>
-    {
+        authority: ValidatedManifestBoundGridEventAuthorityV17<'_, 'authority, 'manifest>,
+    ) -> Result<
+        ValidatedManifestBoundGridEventV17<'event, 'state, 'manifest, 'authority>,
+        DraftGridClosureError,
+    > {
         let manifest = state.manifest();
-        let context = match authority {
+        let (context, validated_authority) = match authority {
             ValidatedManifestBoundGridEventAuthorityV17::Grid(authority) => {
                 if authority.manifest_hash() != manifest.manifest_hash() {
                     return Err(DraftGridClosureError::Invalid(
                         "event-17 grid authority belongs to another manifest".into(),
                     ));
                 }
-                self.bind_for_state(
-                    state.state(),
-                    ValidatedDraftGridEventAuthorityV17::Grid(authority.authority()),
-                )?
+                let validated = authority.authority();
+                (
+                    self.bind_for_state(
+                        state.state(),
+                        ValidatedDraftGridEventAuthorityV17::Grid(validated),
+                    )?,
+                    ValidatedDraftGridEventAuthorityV17::Grid(validated),
+                )
             }
             ValidatedManifestBoundGridEventAuthorityV17::Production(authority) => {
                 if authority.manifest_hash() != manifest.manifest_hash() {
@@ -601,10 +673,14 @@ impl DraftCanonicalGridEventV17 {
                         "event-17 cell authority belongs to another manifest".into(),
                     ));
                 }
-                self.bind_for_state(
-                    state.state(),
-                    ValidatedDraftGridEventAuthorityV17::Production(authority.authority()),
-                )?
+                let validated = authority.authority();
+                (
+                    self.bind_for_state(
+                        state.state(),
+                        ValidatedDraftGridEventAuthorityV17::Production(validated),
+                    )?,
+                    ValidatedDraftGridEventAuthorityV17::Production(validated),
+                )
             }
         };
         let document = manifest.document();
@@ -643,6 +719,7 @@ impl DraftCanonicalGridEventV17 {
             event: self,
             state: state.state(),
             manifest,
+            authority: validated_authority,
             context,
         })
     }
@@ -745,6 +822,16 @@ impl DraftCanonicalGridEventV17 {
         state.rebind_validated_cell_authority(&cell_authority)
     }
 
+    pub(super) fn rebind_world_v21_for_state(
+        &self,
+        state: &DraftGridTransferCellStateV2,
+        manifest: &crate::manifest_v5::ValidatedUniverseManifestV5,
+        authority: ValidatedDraftGridEventAuthorityV17<'_>,
+    ) -> Result<DraftGridTransferCellStateV2, DraftGridClosureError> {
+        let cell_authority = self.payload.resolved_cell_authority(authority)?;
+        state.rebind_world_v21_validated_cell_authority(manifest, &cell_authority)
+    }
+
     pub(super) fn payload(&self) -> &DraftGridEventPayloadV17 {
         &self.payload
     }
@@ -782,6 +869,14 @@ impl DraftCanonicalGridEventV17 {
 
     pub(super) fn event_hash(&self) -> &str {
         &self.event_hash
+    }
+
+    pub(super) fn previous_event_hash(&self) -> &str {
+        &self.previous_event_hash
+    }
+
+    pub(super) fn cell_id(&self) -> &str {
+        &self.cell_id
     }
 
     pub(super) fn event_payload_hash(&self) -> &str {
@@ -1097,7 +1192,9 @@ mod tests {
             .validate_for_state(&state)
             .expect("wrong-kind envelope validates independently");
         let prior = state.clone();
-        assert!(stage_prepared_grid_event_v17(&state, &package, &authority, &context).is_err());
+        assert!(
+            stage_prepared_grid_event_v17(&state, &package, &authority, &context, None).is_err()
+        );
         assert_eq!(state, prior);
     }
 
@@ -1109,7 +1206,7 @@ mod tests {
             .validate_for_state(&state)
             .expect("prepare context validates");
         let (prepared, proof) =
-            stage_prepared_grid_event_v17(&state, &package, &authority, &context)
+            stage_prepared_grid_event_v17(&state, &package, &authority, &context, None)
                 .expect("prepare applies once");
         assert_eq!(
             prepared.base().event_sequence,

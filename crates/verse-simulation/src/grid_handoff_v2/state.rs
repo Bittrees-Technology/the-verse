@@ -3747,6 +3747,26 @@ impl DraftGridTransferCellStateV2 {
         authority: &ValidatedCellAuthorityV3,
     ) -> Result<Self, DraftGridClosureError> {
         self.validate()?;
+        let next = self.rebind_cell_authority_after_validation(authority)?;
+        next.validate()?;
+        Ok(next)
+    }
+
+    pub(super) fn rebind_world_v21_validated_cell_authority(
+        &self,
+        manifest: &crate::manifest_v5::ValidatedUniverseManifestV5,
+        authority: &ValidatedCellAuthorityV3,
+    ) -> Result<Self, DraftGridClosureError> {
+        self.validate_world_v21(manifest)?;
+        let next = self.rebind_cell_authority_after_validation(authority)?;
+        next.validate_world_v21(manifest)?;
+        Ok(next)
+    }
+
+    fn rebind_cell_authority_after_validation(
+        &self,
+        authority: &ValidatedCellAuthorityV3,
+    ) -> Result<Self, DraftGridClosureError> {
         let prior_event_sequence = self.base.event_sequence;
         let prior_event_hash = self.base.last_event_hash.clone();
         let prior_active_world_hash = self.calculate_active_world_hash()?;
@@ -3772,7 +3792,8 @@ impl DraftGridTransferCellStateV2 {
         }
         let mut next = self.clone();
         next.base.fencing_token = authority.fencing_token();
-        next.seal()?;
+        next.state_hash.clear();
+        next.state_hash = next.calculate_hash()?;
         if next.base.event_sequence != prior_event_sequence
             || next.base.last_event_hash != prior_event_hash
             || next.calculate_active_world_hash()? != prior_active_world_hash
@@ -5175,13 +5196,33 @@ fn insert_grid_transfer_witness(
     Ok(())
 }
 
+fn validate_event_stage_state(
+    state: &DraftGridTransferCellStateV2,
+    world_v21_manifest: Option<&crate::manifest_v5::ValidatedUniverseManifestV5>,
+) -> Result<(), DraftGridClosureError> {
+    match world_v21_manifest {
+        Some(manifest) => state.validate_world_v21(manifest).map(|_| ()),
+        None => state.validate(),
+    }
+}
+
+fn seal_event_stage_state(
+    state: &mut DraftGridTransferCellStateV2,
+    world_v21_manifest: Option<&crate::manifest_v5::ValidatedUniverseManifestV5>,
+) -> Result<(), DraftGridClosureError> {
+    state.state_hash.clear();
+    state.state_hash = state.calculate_hash()?;
+    validate_event_stage_state(state, world_v21_manifest)
+}
+
 pub(super) fn stage_prepared_grid_event_v17(
     state: &DraftGridTransferCellStateV2,
     package: &DraftGridClosurePackageV2,
     authority: &DraftGridDirectoryAuthorityV2,
     event: &ValidatedDraftGridEventContextV17,
+    world_v21_manifest: Option<&crate::manifest_v5::ValidatedUniverseManifestV5>,
 ) -> Result<(DraftGridTransferCellStateV2, DraftGridPrepareProofV2), DraftGridClosureError> {
-    state.validate()?;
+    validate_event_stage_state(state, world_v21_manifest)?;
     package.validate_wire()?;
     authority.validate_package(package)?;
     event.require_payload(&DraftGridEventPayloadV17::GridTransferPrepared {
@@ -5260,7 +5301,7 @@ pub(super) fn stage_prepared_grid_event_v17(
     proof.seal_result(&next)?;
     next.committed_prepares
         .insert(package.transfer_id.clone(), proof.clone());
-    next.seal()?;
+    seal_event_stage_state(&mut next, world_v21_manifest)?;
     Ok((next, proof))
 }
 
@@ -5363,7 +5404,7 @@ fn stage_prepared_grid_lock_v2(
         },
     )?;
     let context = event.validate_for_state(state)?;
-    stage_prepared_grid_event_v17(state, package, authority, &context).map(|(next, _)| next)
+    stage_prepared_grid_event_v17(state, package, authority, &context, None).map(|(next, _)| next)
 }
 
 pub(super) fn stage_grid_quarantine_event_v17(
@@ -5371,6 +5412,7 @@ pub(super) fn stage_grid_quarantine_event_v17(
     package: &DraftGridClosurePackageV2,
     authority: &DraftGridDirectoryAuthorityV2,
     event: &ValidatedDraftGridEventContextV17,
+    world_v21_manifest: Option<&crate::manifest_v5::ValidatedUniverseManifestV5>,
 ) -> Result<
     (
         DraftGridTransferCellStateV2,
@@ -5379,7 +5421,7 @@ pub(super) fn stage_grid_quarantine_event_v17(
     ),
     DraftGridClosureError,
 > {
-    state.validate()?;
+    validate_event_stage_state(state, world_v21_manifest)?;
     package.validate_wire()?;
     authority.validate_package(package)?;
     event.require_payload(&DraftGridEventPayloadV17::GridTransferQuarantined {
@@ -5471,7 +5513,7 @@ pub(super) fn stage_grid_quarantine_event_v17(
     proof.seal_result(&next)?;
     next.committed_quarantines
         .insert(package.transfer_id.clone(), proof.clone());
-    next.seal()?;
+    seal_event_stage_state(&mut next, world_v21_manifest)?;
     Ok((next, receipt, proof))
 }
 
@@ -5598,7 +5640,7 @@ fn stage_grid_quarantine_v2(
         },
     )?;
     let context = event.validate_for_state(state)?;
-    stage_grid_quarantine_event_v17(state, package, authority, &context)
+    stage_grid_quarantine_event_v17(state, package, authority, &context, None)
         .map(|(next, receipt, _)| (next, receipt))
 }
 
@@ -5607,8 +5649,9 @@ pub(super) fn stage_committed_grid_export_event_v17(
     package: &DraftGridClosurePackageV2,
     authority: &DraftGridDirectoryAuthorityV2,
     event: &ValidatedDraftGridEventContextV17,
+    world_v21_manifest: Option<&crate::manifest_v5::ValidatedUniverseManifestV5>,
 ) -> Result<(DraftGridTransferCellStateV2, DraftGridExportProofV2), DraftGridClosureError> {
-    state.validate()?;
+    validate_event_stage_state(state, world_v21_manifest)?;
     package.validate_wire()?;
     authority.validate_package(package)?;
     event.require_payload(&DraftGridEventPayloadV17::GridTransferExported {
@@ -5766,7 +5809,7 @@ pub(super) fn stage_committed_grid_export_event_v17(
     let proof = record.proof();
     next.committed_exports
         .insert(package.transfer_id.clone(), record);
-    next.seal()?;
+    seal_event_stage_state(&mut next, world_v21_manifest)?;
     proof.validate().map_err(DraftGridClosureError::Invalid)?;
     Ok((next, proof))
 }
@@ -5849,7 +5892,7 @@ fn stage_committed_grid_export_v2(
         },
     )?;
     let context = event.validate_for_state(state)?;
-    stage_committed_grid_export_event_v17(state, package, authority, &context)
+    stage_committed_grid_export_event_v17(state, package, authority, &context, None)
 }
 
 pub(super) fn stage_committed_grid_import_event_v17(
@@ -5857,8 +5900,9 @@ pub(super) fn stage_committed_grid_import_event_v17(
     package: &DraftGridClosurePackageV2,
     authority: &DraftGridDirectoryAuthorityV2,
     event: &ValidatedDraftGridEventContextV17,
+    world_v21_manifest: Option<&crate::manifest_v5::ValidatedUniverseManifestV5>,
 ) -> Result<(DraftGridTransferCellStateV2, DraftGridImportProofV2), DraftGridClosureError> {
-    state.validate()?;
+    validate_event_stage_state(state, world_v21_manifest)?;
     package.validate_wire()?;
     authority.validate_package(package)?;
     event.require_payload(&DraftGridEventPayloadV17::GridTransferImported {
@@ -6145,7 +6189,7 @@ pub(super) fn stage_committed_grid_import_event_v17(
             "destination import overwrote historical import evidence".into(),
         ));
     }
-    next.seal()?;
+    seal_event_stage_state(&mut next, world_v21_manifest)?;
     proof.validate().map_err(DraftGridClosureError::Invalid)?;
     Ok((next, proof))
 }
@@ -6229,7 +6273,7 @@ fn stage_committed_grid_import_v2(
         },
     )?;
     let context = event.validate_for_state(state)?;
-    stage_committed_grid_import_event_v17(state, package, authority, &context)
+    stage_committed_grid_import_event_v17(state, package, authority, &context, None)
 }
 
 pub(super) fn stage_imported_grid_activation_event_v17(
@@ -6237,8 +6281,9 @@ pub(super) fn stage_imported_grid_activation_event_v17(
     package: &DraftGridClosurePackageV2,
     authority: &DraftGridDirectoryAuthorityV2,
     event: &ValidatedDraftGridEventContextV17,
+    world_v21_manifest: Option<&crate::manifest_v5::ValidatedUniverseManifestV5>,
 ) -> Result<(DraftGridTransferCellStateV2, DraftGridActivationProofV2), DraftGridClosureError> {
-    state.validate()?;
+    validate_event_stage_state(state, world_v21_manifest)?;
     package.validate_wire()?;
     authority.validate_package(package)?;
     event.require_payload(&DraftGridEventPayloadV17::GridTransferActivated {
@@ -6349,7 +6394,7 @@ pub(super) fn stage_imported_grid_activation_event_v17(
             "destination activation overwrote historical activation evidence".into(),
         ));
     }
-    next.seal()?;
+    seal_event_stage_state(&mut next, world_v21_manifest)?;
     proof.validate().map_err(DraftGridClosureError::Invalid)?;
     Ok((next, proof))
 }
@@ -6435,7 +6480,7 @@ fn stage_imported_grid_activation_v2(
         },
     )?;
     let context = event.validate_for_state(state)?;
-    stage_imported_grid_activation_event_v17(state, package, authority, &context)
+    stage_imported_grid_activation_event_v17(state, package, authority, &context, None)
 }
 
 pub(super) fn stage_finalized_grid_source_event_v17(
@@ -6443,8 +6488,9 @@ pub(super) fn stage_finalized_grid_source_event_v17(
     package: &DraftGridClosurePackageV2,
     authority: &DraftGridDirectoryAuthorityV2,
     event: &ValidatedDraftGridEventContextV17,
+    world_v21_manifest: Option<&crate::manifest_v5::ValidatedUniverseManifestV5>,
 ) -> Result<(DraftGridTransferCellStateV2, DraftGridFinalizationProofV2), DraftGridClosureError> {
-    state.validate()?;
+    validate_event_stage_state(state, world_v21_manifest)?;
     package.validate_wire()?;
     authority.validate_package(package)?;
     event.require_payload(&DraftGridEventPayloadV17::GridTransferFinalized {
@@ -6556,7 +6602,7 @@ pub(super) fn stage_finalized_grid_source_event_v17(
             "source finalization overwrote historical finalization evidence".into(),
         ));
     }
-    next.seal()?;
+    seal_event_stage_state(&mut next, world_v21_manifest)?;
     proof.validate().map_err(DraftGridClosureError::Invalid)?;
     Ok((next, proof))
 }
@@ -6643,7 +6689,7 @@ fn stage_finalized_grid_source_v2(
         },
     )?;
     let context = event.validate_for_state(state)?;
-    stage_finalized_grid_source_event_v17(state, package, authority, &context)
+    stage_finalized_grid_source_event_v17(state, package, authority, &context, None)
 }
 
 fn plan_imported_production_occurrence_v2(
@@ -6684,6 +6730,7 @@ pub(super) fn stage_imported_production_occurrence_event_v17(
     state: &DraftGridTransferCellStateV2,
     occurrence: crate::event::ProductionScheduleOccurrence,
     event: &ValidatedDraftGridEventContextV17,
+    world_v21_manifest: Option<&crate::manifest_v5::ValidatedUniverseManifestV5>,
 ) -> Result<
     (
         DraftGridTransferCellStateV2,
@@ -6692,7 +6739,7 @@ pub(super) fn stage_imported_production_occurrence_event_v17(
     ),
     DraftGridClosureError,
 > {
-    state.validate()?;
+    validate_event_stage_state(state, world_v21_manifest)?;
     let authority = event
         .production_authority_claim()
         .ok_or_else(|| {
@@ -6802,7 +6849,7 @@ pub(super) fn stage_imported_production_occurrence_event_v17(
             "production occurrence overwrote historical gate evidence".into(),
         ));
     }
-    next.seal()?;
+    seal_event_stage_state(&mut next, world_v21_manifest)?;
     proof.validate().map_err(DraftGridClosureError::Invalid)?;
     Ok((next, controls, proof))
 }
@@ -6868,7 +6915,7 @@ fn stage_imported_production_occurrence_v2(
         },
     )?;
     let context = event.validate_for_state(state)?;
-    stage_imported_production_occurrence_event_v17(state, occurrence, &context)
+    stage_imported_production_occurrence_event_v17(state, occurrence, &context, None)
 }
 
 pub(super) fn stage_aborted_grid_cleanup_event_v17(
@@ -6876,8 +6923,9 @@ pub(super) fn stage_aborted_grid_cleanup_event_v17(
     package: &DraftGridClosurePackageV2,
     authority: &DraftGridDirectoryAuthorityV2,
     event: &ValidatedDraftGridEventContextV17,
+    world_v21_manifest: Option<&crate::manifest_v5::ValidatedUniverseManifestV5>,
 ) -> Result<(DraftGridTransferCellStateV2, DraftGridAbortCleanupProofV2), DraftGridClosureError> {
-    state.validate()?;
+    validate_event_stage_state(state, world_v21_manifest)?;
     package.validate_wire()?;
     authority.validate_package(package)?;
     let side = if state.base.cell_id == package.source_cell_id {
@@ -7005,7 +7053,7 @@ pub(super) fn stage_aborted_grid_cleanup_event_v17(
     )?;
     next.abort_witnesses
         .insert(package.transfer_id.clone(), witness.clone());
-    next.seal()?;
+    seal_event_stage_state(&mut next, world_v21_manifest)?;
     let proof = witness.cleanup_proof();
     proof.validate().map_err(DraftGridClosureError::Invalid)?;
     Ok((next, proof))
@@ -7098,7 +7146,7 @@ fn stage_aborted_grid_cleanup_v2(
         },
     )?;
     let context = event.validate_for_state(state)?;
-    stage_aborted_grid_cleanup_event_v17(state, package, authority, &context)
+    stage_aborted_grid_cleanup_event_v17(state, package, authority, &context, None)
 }
 
 fn context_from_package(package: &DraftGridClosurePackageV2) -> DraftGridTransferContextV2 {
@@ -9407,9 +9455,14 @@ mod tests {
         let export_context = export_event
             .validate_for_state(&locked)
             .expect("export event validates");
-        let (exported, export_proof) =
-            stage_committed_grid_export_event_v17(&locked, &package, &authority, &export_context)
-                .expect("export applies once");
+        let (exported, export_proof) = stage_committed_grid_export_event_v17(
+            &locked,
+            &package,
+            &authority,
+            &export_context,
+            None,
+        )
+        .expect("export applies once");
         assert_eq!(export_proof.event_hash, export_context.event_hash);
         assert_eq!(
             export_proof.event_payload_hash,
@@ -9421,6 +9474,7 @@ mod tests {
                 &package,
                 &authority,
                 &export_context,
+                None,
             )
             .is_err()
         );
@@ -9449,9 +9503,14 @@ mod tests {
         let import_context = import_event
             .validate_for_state(&reserved)
             .expect("import event validates");
-        let (imported, import_proof) =
-            stage_committed_grid_import_event_v17(&reserved, &package, &authority, &import_context)
-                .expect("import applies once");
+        let (imported, import_proof) = stage_committed_grid_import_event_v17(
+            &reserved,
+            &package,
+            &authority,
+            &import_context,
+            None,
+        )
+        .expect("import applies once");
         assert_eq!(import_proof.event_hash, import_context.event_hash);
         assert_eq!(
             import_proof.event_payload_hash,
@@ -9463,6 +9522,7 @@ mod tests {
                 &package,
                 &authority,
                 &import_context,
+                None,
             )
             .is_err()
         );
@@ -9495,6 +9555,7 @@ mod tests {
             &package,
             &authority,
             &activation_context,
+            None,
         )
         .expect("activation applies once");
         assert_eq!(activation_proof.event_hash, activation_context.event_hash);
@@ -9508,6 +9569,7 @@ mod tests {
                 &package,
                 &authority,
                 &activation_context,
+                None,
             )
             .is_err()
         );
@@ -9539,6 +9601,7 @@ mod tests {
             &package,
             &authority,
             &finalization_context,
+            None,
         )
         .expect("finalization applies once");
         assert_eq!(
@@ -9555,6 +9618,7 @@ mod tests {
                 &package,
                 &authority,
                 &finalization_context,
+                None,
             )
             .is_err()
         );
@@ -9586,6 +9650,7 @@ mod tests {
             &activated,
             occurrence.clone(),
             &production_context,
+            None,
         )
         .expect("production event applies once");
         assert_eq!(production_proof.event_hash, production_context.event_hash);
@@ -9598,6 +9663,7 @@ mod tests {
                 &produced,
                 occurrence.clone(),
                 &production_context,
+                None,
             )
             .is_err()
         );

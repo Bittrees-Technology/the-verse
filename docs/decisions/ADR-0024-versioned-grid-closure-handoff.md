@@ -138,9 +138,33 @@ known precommit authority files and their temporary files, synchronize that
 cleanup, and retry. An I/O or metadata error while checking the head is not
 absence and fails closed without cleanup. Once a head exists, initialization
 never overwrites it and ordinary recovery must validate every bounded
-canonical file. The recovery-only slice refuses all event-17 records and
-remains test-only until a validated migration-target install capability and
-durable append protocol exist.
+canonical file.
+
+After initialization, a separate atomically replaced event head owns the
+mutable event-17 frontier. It binds the initialization head, identity,
+manifest, cell, retained event-16 predecessor, committed event count and hash,
+resulting state hash, event-journal byte boundary, and an equally counted
+event-boundary journal. Each event-boundary record is replay-derived and binds
+the exact directory revision and document, event and payload hashes, cell,
+transfer/package identity when applicable, proof hash, resulting state hash,
+and prior boundary hash.
+
+Append accepts only a non-serializable current authority borrowed from the
+locked directory head. It validates and applies the event against the same
+manifest-5 capability held by the Store, persists a pending head first, then
+synchronizes the canonical event and replay-derived boundary before replacing
+the committed head. Any uncertain write poisons the open writer until recovery;
+a failure before the first head write remains retryable.
+
+Recovery streams bounded records and reconstructs each committed successor
+through the exact historical directory revision, manifest-5 gate, and trusted
+dispatcher. A pending head with no event or a strictly partial event rolls back
+to the committed frontier. One complete pending event deterministically
+backfills an absent or strictly partial boundary and commits. Tampered prefixes,
+wrong history, unpinned or excess suffixes, and data at or beyond a sealed
+pending range fail closed without truncation. The Store remains test-only until
+a validated migration-target install capability, runtime scheduler/wake path,
+and coordinated protocol-19 activation exist.
 
 Rollback removes the entire unactivated protocol-19 namespace or restores it
 as one matching compatibility set. Copying individual identity, manifest,
@@ -192,6 +216,9 @@ the placement commit, restoring only the old source cell is forbidden.
 - Production advances exactly once around prepare/import/restart.
 - Rebuilt destination physics adds no artificial impulse.
 - Source/destination spectator privacy and verified rider-session convergence.
+- Event-17 append/replay under manifest 5, including a valid successor fence,
+  every pending/event/boundary/head crash point, poisoned-writer recovery,
+  exact boundary backfill, overlong-tail preservation, and tamper rejection.
 - All existing EVA, lifecycle, replay, conservation, and client gates remain
   green.
 

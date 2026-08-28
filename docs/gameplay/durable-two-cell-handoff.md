@@ -611,11 +611,32 @@ then synchronized through that root. A missing head exposes no authority and
 initialization may replace only that known precommit debris, while uncertain
 head metadata fails closed without cleanup.
 
-Recovery performs bounded reads, revalidates the exact routed cell, manifest,
-and world-21 snapshot, refuses any nonempty event-17 journal, and fails closed
-on tampering, swapped cell namespaces, or a second writer. Its constructors
-remain test-only: this slice is not migration-install authority and cannot
-append events or activate the protocol-19 tuple.
+Recovery performs bounded reads and revalidates the exact routed cell,
+manifest, and world-21 snapshot. The recovery-only constructor still refuses a
+nonempty event-17 frontier so no caller can accidentally skip replay. The
+history-aware constructor instead streams the pinned event and boundary
+journals, resolves the exact historical directory revision and document for
+each event, rebinds only an issued successor fence, re-runs the manifest-5
+composite gate and trusted dispatcher, and requires the resulting state and
+proof boundary to equal the committed head.
+
+The Store now has a test-only live append transaction. It accepts only a
+current grid or cell capability borrowed from the locked directory head and
+holds that borrow through committed-head synchronization. A pending event head
+is durable before journal mutation; the canonical event is synchronized before
+its replay-derived boundary, and the committed head is installed last. The
+boundary hash chain retains event kind/frontier, exact directory authority,
+cell and optional transfer/package identity, proof hash, and resulting state
+hash. Any uncertain append poisons that writer until reopen.
+
+Crash recovery yields only the prior or exact successor frontier. A pending
+head with no event or a strictly partial event rolls back; one complete event
+with no or a strictly partial boundary gets the one deterministic boundary
+backfill before commit. Complete mismatches, extra records, unpinned suffixes,
+tampered committed bytes, wrong manifests/history, and unterminated evidence
+at or beyond its sealed pending range fail closed without cleanup. Constructors
+remain test-only: this is not migration-install authority and does not activate
+the protocol-19 tuple.
 
 Implementation is staged behind that boundary. The private directory-v3 draft
 already validates ordered grid-and-rider membership, closure and conservation
@@ -760,18 +781,18 @@ four values. Canonical-but-fabricated claims, generation/fence cross-pairs,
 wrong capability kinds, second application, and successor-document substitution
 reject before mutation. A round-tripped old event still resolves its precise
 historical authority after later directory revisions. Historical authority is
-replay evidence only: live event sealing is test-only until the locked world-21
-store can mint a distinct current-authority append lease. There will be no
+replay evidence only. Live event sealing and append use the distinct
+current-authority borrow from the locked directory head; there is no
 historical-to-live capability conversion.
 The first live-authority seam is now non-serializable and borrows the locked
 directory's exact current head, including its holder, generation, and fence.
 That borrow prevents a successor directory commit while an event is being
-sealed; historical revision lookup cannot construct the capability. The
-world-21 store append lease and manifest-5 identity gate remain deliberately
-absent.
-The active event-17 runtime/store adapter, scheduler and durable wake-up path,
-and whole-world persistence failpoint crash/replay integration remain to be
-implemented before activation. All drafts are
+sealed and durably appended; historical revision lookup cannot construct the
+capability. The Store-owned manifest-5 identity gate is exercised again on
+replay, including the successor-fence path.
+The active event-17 runtime adapter, scheduler and durable wake-up path, a
+validated migration installer, and whole-world process-crash integration
+remain to be implemented before activation. All drafts are
 intentionally unreachable from the production directory-v2/package-v1 paths
 until every version in the table above moves in one coordinated activation.
 The dormant proof harness retains bounded predecessor projections for replay;
