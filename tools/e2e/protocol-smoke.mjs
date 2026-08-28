@@ -542,7 +542,12 @@ async function movePlayerTo(
   return world;
 }
 
-async function aimPlayerAt(world, targetForWorld, description) {
+async function aimPlayerAt(
+  world,
+  targetForWorld,
+  description,
+  alignmentRadians = TARGET_ALIGNMENT_RADIANS,
+) {
   let alignedSamples = 0;
   for (let attempt = 0; attempt < 420; attempt += 1) {
     const player = world.player;
@@ -552,7 +557,7 @@ async function aimPlayerAt(world, targetForWorld, description) {
     const cosine = Math.min(1, Math.max(-1, dotVector(forward, desired)));
     const angle = Math.acos(cosine);
     const angularSpeed = vectorMagnitude(player.angular_velocity);
-    if (angle <= TARGET_ALIGNMENT_RADIANS && angularSpeed <= 0.025) {
+    if (angle <= alignmentRadians && angularSpeed <= 0.025) {
       alignedSamples += 1;
       if (alignedSamples >= 2) return world;
     } else {
@@ -566,7 +571,7 @@ async function aimPlayerAt(world, targetForWorld, description) {
       axis = normalizeVector(axis);
     }
     const desiredAngularSpeed =
-      angle <= TARGET_ALIGNMENT_RADIANS
+      angle <= alignmentRadians
         ? 0
         : Math.min(1.2, Math.max(0.04, angle * 4));
     const desiredWorldAngularVelocity = scaleVector(axis, desiredAngularSpeed);
@@ -1067,23 +1072,21 @@ async function run() {
     cargoBeforeAnchorView,
     "starter cargo remains available for anchor work",
   );
-  const anchorViewEye = addVector(
-    gridBlockWorldPosition(
-      cargoBeforeAnchorView.grid,
-      cargoBeforeAnchorView.block,
-    ),
-    rotateVector(cargoBeforeAnchorView.grid.orientation, {
-      x: -0.6,
-      y: 7.0,
-      z: 0.0,
-    }),
-  );
+  const anchorWorkPosition = (state, localOffset) => {
+    const current = blockAt(state, { x: -1, y: 0, z: 0 }, "cargo");
+    assert.ok(current, "anchor mount remains present while approaching");
+    const desiredEye = addVector(
+      gridBlockWorldPosition(current.grid, current.block),
+      rotateVector(current.grid.orientation, localOffset),
+    );
+    return subtractVector(
+      desiredEye,
+      scaleVector(playerUp(state.player), CHARACTER_EYE_OFFSET),
+    );
+  };
   world = await movePlayerTo(
     world,
-    subtractVector(
-      anchorViewEye,
-      scaleVector(playerUp(world.player), CHARACTER_EYE_OFFSET),
-    ),
+    (state) => anchorWorkPosition(state, { x: -0.6, y: 7, z: 0 }),
     "unobstructed asteroid-side anchor work position",
     0.5,
   );
@@ -1099,10 +1102,11 @@ async function run() {
       assert.ok(current, "anchor mount remains present while aiming");
       return addVector(
         gridBlockWorldPosition(current.grid, current.block),
-        rotateVector(current.grid.orientation, { x: -0.5, y: 0, z: 0 }),
+        rotateVector(current.grid.orientation, { x: -0.5, y: -0.25, z: 0 }),
       );
     },
     "anchor mount face",
+    0.002,
   );
   const anchorMountHit = assertBlockIsCanonicalHit(
     world,
