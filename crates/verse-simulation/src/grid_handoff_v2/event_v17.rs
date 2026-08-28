@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use super::state::{
     DraftGridDirectoryAuthorityV2, DraftGridTransferAbortSideV2, DraftGridTransferCellStateV2,
+    ValidatedDraftGridTransferCellStateV21,
 };
 use super::{
     DraftGridClosureError, DraftGridClosurePackageV2, DraftGridCompatibilityTupleV19, hash_json,
@@ -17,7 +18,8 @@ use super::{
 };
 use crate::cell_directory_v3::{
     ValidatedCellAuthorityV3, ValidatedCurrentCellAuthorityV3, ValidatedCurrentGridAuthorityV3,
-    ValidatedGridTransferAuthorityV3,
+    ValidatedGridTransferAuthorityV3, ValidatedManifestBoundCellAuthorityV3,
+    ValidatedManifestBoundGridAuthorityV3,
 };
 use crate::event::ProductionScheduleOccurrence;
 
@@ -102,6 +104,14 @@ pub(super) enum ValidatedDraftGridEventAuthorityV17<'a> {
 pub(super) enum ValidatedCurrentGridEventAuthorityV17<'authority, 'store> {
     Grid(&'authority ValidatedCurrentGridAuthorityV3<'store>),
     Production(&'authority ValidatedCurrentCellAuthorityV3<'store>),
+}
+
+/// Historical or current directory authority after the same manifest-5
+/// capability has bound it. Replay and append use this instead of raw claims.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum ValidatedManifestBoundGridEventAuthorityV17<'capability, 'authority, 'manifest> {
+    Grid(&'capability ValidatedManifestBoundGridAuthorityV3<'authority, 'manifest>),
+    Production(&'capability ValidatedManifestBoundCellAuthorityV3<'authority, 'manifest>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -192,6 +202,34 @@ pub(super) struct ValidatedDraftGridEventContextV17 {
     pub(super) occurred_at_unix_ms: u64,
     pub(super) authority_fencing_token: u64,
     payload: DraftGridEventPayloadV17,
+}
+
+/// Non-Serde capability proving one event-17 record advances one validated
+/// world-21 state and shares its complete manifest-5 identity.
+#[derive(Debug)]
+pub(super) struct ValidatedManifestBoundGridEventV17<'event, 'state, 'manifest> {
+    event: &'event DraftCanonicalGridEventV17,
+    state: &'state DraftGridTransferCellStateV2,
+    manifest: &'manifest crate::manifest_v5::ValidatedUniverseManifestV5,
+    context: ValidatedDraftGridEventContextV17,
+}
+
+impl ValidatedManifestBoundGridEventV17<'_, '_, '_> {
+    pub(super) fn event(&self) -> &DraftCanonicalGridEventV17 {
+        self.event
+    }
+
+    pub(super) fn state(&self) -> &DraftGridTransferCellStateV2 {
+        self.state
+    }
+
+    pub(super) fn manifest_hash(&self) -> &str {
+        self.manifest.manifest_hash()
+    }
+
+    pub(super) fn context(&self) -> &ValidatedDraftGridEventContextV17 {
+        &self.context
+    }
 }
 
 impl ValidatedDraftGridEventContextV17 {
@@ -538,6 +576,77 @@ impl DraftCanonicalGridEventV17 {
         })
     }
 
+    pub(super) fn validate_world_v21<'event, 'state, 'manifest>(
+        &'event self,
+        state: &ValidatedDraftGridTransferCellStateV21<'state, 'manifest>,
+        authority: ValidatedManifestBoundGridEventAuthorityV17<'_, '_, '_>,
+    ) -> Result<ValidatedManifestBoundGridEventV17<'event, 'state, 'manifest>, DraftGridClosureError>
+    {
+        let manifest = state.manifest();
+        let context = match authority {
+            ValidatedManifestBoundGridEventAuthorityV17::Grid(authority) => {
+                if authority.manifest_hash() != manifest.manifest_hash() {
+                    return Err(DraftGridClosureError::Invalid(
+                        "event-17 grid authority belongs to another manifest".into(),
+                    ));
+                }
+                self.bind_for_state(
+                    state.state(),
+                    ValidatedDraftGridEventAuthorityV17::Grid(authority.authority()),
+                )?
+            }
+            ValidatedManifestBoundGridEventAuthorityV17::Production(authority) => {
+                if authority.manifest_hash() != manifest.manifest_hash() {
+                    return Err(DraftGridClosureError::Invalid(
+                        "event-17 cell authority belongs to another manifest".into(),
+                    ));
+                }
+                self.bind_for_state(
+                    state.state(),
+                    ValidatedDraftGridEventAuthorityV17::Production(authority.authority()),
+                )?
+            }
+        };
+        let document = manifest.document();
+        if self.universe_id != manifest.universe_id()
+            || self.universe_manifest_hash != manifest.manifest_hash()
+            || self.celestial_registry_hash != document.celestial_registry_hash
+            || self.content_manifest_version != document.compatibility.content_manifest_version
+            || self.compatibility != document.compatibility
+        {
+            return Err(DraftGridClosureError::Invalid(
+                "event-17 does not match the validated world-21 manifest identity".into(),
+            ));
+        }
+        match &self.payload {
+            DraftGridEventPayloadV17::GridTransferPrepared { package, .. }
+            | DraftGridEventPayloadV17::GridTransferQuarantined { package, .. }
+            | DraftGridEventPayloadV17::GridTransferExported { package, .. }
+            | DraftGridEventPayloadV17::GridTransferImported { package, .. }
+            | DraftGridEventPayloadV17::GridTransferActivated { package, .. }
+            | DraftGridEventPayloadV17::GridTransferFinalized { package, .. }
+            | DraftGridEventPayloadV17::GridTransferAborted { package, .. } => {
+                package.validate_manifest_v5(manifest)?;
+            }
+            DraftGridEventPayloadV17::ProductionQuantumCommitted { occurrence, .. } => {
+                if occurrence.universe_id != manifest.universe_id()
+                    || occurrence.universe_manifest_hash != manifest.manifest_hash()
+                    || occurrence.celestial_registry_hash != document.celestial_registry_hash
+                {
+                    return Err(DraftGridClosureError::Invalid(
+                        "event-17 production occurrence does not match manifest 5".into(),
+                    ));
+                }
+            }
+        }
+        Ok(ValidatedManifestBoundGridEventV17 {
+            event: self,
+            state: state.state(),
+            manifest,
+            context,
+        })
+    }
+
     #[cfg(test)]
     pub(super) fn validate_for_state(
         &self,
@@ -742,9 +851,12 @@ mod tests {
         DraftGridDirectoryAuthorityV2, DraftGridTransferCellStateV2, reconcile_prepared_grid_v2,
         stage_prepared_grid_event_v17,
     };
-    use super::super::tests::package_fixture;
+    use super::super::tests::{package_fixture, package_v3_directory_fixture};
     use super::*;
     use crate::cell_directory::TransferPhase;
+    use crate::cell_directory_v3::{
+        DraftDirectoryV3AuthorityHarness, DraftDirectoryV3AuthoritySeed,
+    };
     use crate::event::{CanonicalEvent, EventPayload};
 
     fn prepared_fixture() -> (
@@ -778,6 +890,79 @@ mod tests {
             },
         )
         .expect("prepare event seals")
+    }
+
+    #[test]
+    fn event17_requires_the_same_manifest5_state_and_package() {
+        let (source, _, mut package) = package_v3_directory_fixture();
+        let mut state = DraftGridTransferCellStateV2::new_with_production_origins(
+            source,
+            package.production_job_origins.clone(),
+        )
+        .expect("source draft state seals");
+        let manifest = crate::manifest_v5::build_validated_manifest_v5(801)
+            .expect("manifest-5 capability builds");
+        state
+            .rebind_test_manifest_v5(&manifest)
+            .expect("world-21 state binds manifest 5");
+        package.universe_manifest_hash = manifest.manifest_hash().to_owned();
+        package.package_hash = package
+            .calculate_package_hash()
+            .expect("manifest-5 package rehashes");
+        let mut directory = DraftDirectoryV3AuthorityHarness::new(DraftDirectoryV3AuthoritySeed {
+            universe_id: package.universe_id.clone(),
+            universe_manifest_hash: package.universe_manifest_hash.clone(),
+            transfer_id: package.transfer_id.clone(),
+            root_aggregate_id: package.root_aggregate_id.clone(),
+            source_cell_key: package.source_cell_key.clone(),
+            destination_cell_key: package.destination_cell_key.clone(),
+            source_assignment_generation: package.source_assignment_generation,
+            source_fencing_token: package.source_fencing_token,
+            destination_assignment_generation: package.destination_assignment_generation,
+            destination_fencing_token: package.destination_fencing_token,
+            package_schema_version: package.schema_version,
+            receipt_schema_version: package.receipt_schema_version,
+            closure_root: package.closure_root.clone(),
+            conservation_root: package.conservation_root.clone(),
+            package_hash: package.package_hash.clone(),
+            members: package.members.clone(),
+            member_root: package.member_root.clone(),
+        })
+        .expect("manifest-5 directory harness builds");
+        directory.prepare().expect("directory prepares");
+        let grid_authority = directory.authority().expect("grid authority resolves");
+        let claimed = DraftGridDirectoryAuthorityV2::from_validated_v3(&grid_authority);
+        let event = prepare_event(&state, &package, &claimed);
+        let state_capability = state
+            .validate_world_v21(&manifest)
+            .expect("state capability remints");
+        let bound_authority = grid_authority
+            .bind_manifest_v5(&manifest)
+            .expect("directory authority binds manifest 5");
+        let validated = event
+            .validate_world_v21(
+                &state_capability,
+                ValidatedManifestBoundGridEventAuthorityV17::Grid(&bound_authority),
+            )
+            .expect("event, state, package, and manifest bind atomically");
+        assert_eq!(validated.event(), &event);
+        assert_eq!(validated.state(), &state);
+        assert_eq!(validated.manifest_hash(), manifest.manifest_hash());
+        assert_eq!(validated.context().event_hash, event.event_hash);
+
+        let mut substituted_registry = event;
+        substituted_registry.celestial_registry_hash = "ab".repeat(32);
+        substituted_registry.event_hash = substituted_registry
+            .calculate_hash()
+            .expect("substituted event rehashes");
+        assert!(
+            substituted_registry
+                .validate_world_v21(
+                    &state_capability,
+                    ValidatedManifestBoundGridEventAuthorityV17::Grid(&bound_authority),
+                )
+                .is_err()
+        );
     }
 
     #[test]

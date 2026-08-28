@@ -574,6 +574,14 @@ but arbitrary 64-character trust root cannot mint a manifest-bound authority
 borrow. Event-17 sealing and the future Store must consume these bound borrows,
 not their unbound historical counterparts.
 
+Event 17 now performs that composite gate. A canonical event must advance one
+validated world-21 frontier, carry the exact protocol-19 tuple and manifest-5
+roots, bind every embedded package or production occurrence to that manifest,
+and match a directory-v3 grid or cell authority that was independently bound
+to the same capability. The returned event capability borrows the event,
+predecessor state, manifest, and validated context; raw serialized authority
+claims and self-consistent hash substitutions cannot create it.
+
 Implementation is staged behind that boundary. The private directory-v3 draft
 already validates ordered grid-and-rider membership, closure and conservation
 roots, package and receipt schemas, historical cell fences, phase-specific
