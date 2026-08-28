@@ -535,9 +535,16 @@ Implementation is staged behind that boundary. The private directory-v3 draft
 already validates ordered grid-and-rider membership, closure and conservation
 roots, package and receipt schemas, historical cell fences, phase-specific
 cell-event proofs, atomic document identity, exact face adjacency, and terminal
-generation history. It is intentionally unreachable from the production
-directory-v2 open/write path until every version in the table above moves in
-one coordinated activation.
+generation history. A separate private package-v2 draft now derives the exact
+unanchored-grid closure from authoritative state and binds grid topology,
+integrity, motion and controls, cargo, production FIFO and escrow, owner and
+supported riders, their inventories and operation histories, and internal
+contacts. Its strict canonical codec, full-collider destination containment,
+checked conservation, global subject-identity checks, external-edge rejection,
+and source/destination transfer-state conflict guards are covered by golden and
+adversarial tests. Both drafts are intentionally unreachable from the
+production directory-v2/package-v1 paths until every version in the table
+above moves in one coordinated activation.
 
 The first P1.7 proof archives and resets P1.6 data. A later offline migration
 must derive canonical cell keys, install one placement generation for every

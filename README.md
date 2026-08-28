@@ -143,8 +143,12 @@ production, and the current P1.7 checkpoint adds a durable two-cell directory,
 same-session independent-EVA handoff, verified destination routing, and exact
 restart recovery. Ordinary grid closure handoff is the next compatibility
 boundary. Its audited atomic grid-and-rider placement primitive and dormant,
-strict directory-v3 codec are implemented, while production remains pinned to
-protocol 18/directory 2 until the complete protocol-19 tuple activates
+strict directory-v3 codec and package-v2 closure extractor are implemented.
+The private package draft captures exact grid topology and motion, cargo,
+production FIFO/escrow, owner and supported riders, operation histories, and
+internal contacts; it independently checks containment, conservation,
+identity conflicts, and external edges. Production remains pinned to protocol
+18/directory 2/package 1 until the complete protocol-19 tuple activates
 together. Production active-player load, the production binary codec, general
 multi-cell execution, safe zones, accounts, AMMs, and blockchain settlement remain in the
 [delivery roadmap](docs/roadmap/roadmap.md). See [Celestial registry and
