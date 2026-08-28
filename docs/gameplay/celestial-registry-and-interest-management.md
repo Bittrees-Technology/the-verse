@@ -2,9 +2,8 @@
 
 **Feature IDs:** F-003, F-012, F-014, F-038
 
-**Status:** Local proof and independent official-client verification implemented
-and cross-process validated; production-scale and current hosted evidence remain
-open
+**Status:** Implemented, cross-process validated, and hosted verified for P1.5;
+production-scale evidence remains open
 
 **Owner:** Universe, simulation-worker, protocol, native-client, and browser
 maintainers
@@ -94,10 +93,10 @@ presentation before commit, and emit only verifier-owned acknowledgements. A
 real shipped browser-page test proves an in-flight tamper produces no applied
 state and no acknowledgement, while native tests cover exact unsigned values
 beyond Godot's signed integer range and missing-extension failure. [Hosted CI
-run 33112815767](https://github.com/Bittrees-Technology/the-verse/actions/runs/33112815767)
-is the published Linux replay and Linux/Apple Silicon package result for
-implementation revision `bb4ab4e`; hosted evidence for the verifier revision
-is pending. Still open are active-player rather than spectator load
+run 33128613104](https://github.com/Bittrees-Technology/the-verse/actions/runs/33128613104)
+passes the complete Linux replay, Linux container probe, independent browser
+and native verifier suites, and Linux/Apple Silicon packages for implementation
+revision `71e955c`. Still open are active-player rather than spectator load
 distributions, WAN/failure/soak testing, partitioned thousand-participant
 evidence, and the production binary codec.
 

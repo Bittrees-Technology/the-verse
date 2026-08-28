@@ -38,16 +38,16 @@ lock. The local distribution harness has admitted and resynchronized `2`, `8`,
 per session. A synthetic regression adds 2,048 irrelevant far entities and
 proves the queried bucket count, visited candidate count, selected identities,
 and resulting view remain unchanged. These are local correctness and bounded-
-work results, not a production-capacity claim. The latest implementation
-revision passed the complete hosted Linux replay and Linux/Apple Silicon
-packaging in [CI run 33112815767](https://github.com/Bittrees-Technology/the-verse/actions/runs/33112815767).
-The current local revision independently reconstructs and hashes raw native and
-browser frames through one shared verifier, pins all four connection trust
-roots, preserves exact protocol integers, and proves a shipped browser page
-applies and acknowledges an untouched view while rejecting an in-flight tamper
-without either action. Hosted evidence for that verifier revision, active-
-player load, and the partitioned thousand-participant envelope remain open
-gates.
+work results, not a production-capacity claim. The current revision
+independently reconstructs and hashes raw native and browser frames through one
+shared verifier, pins all four connection trust roots, preserves exact protocol
+integers, and proves a shipped browser page applies and acknowledges an
+untouched view while rejecting an in-flight tamper without either action.
+[CI run 33128613104](https://github.com/Bittrees-Technology/the-verse/actions/runs/33128613104)
+passes the complete Linux replay, Linux container probe, those independent
+verifier suites, and Linux/Apple Silicon packaging for implementation revision
+`71e955c`. Active-player load and the partitioned thousand-participant envelope
+remain open gates.
 
 P1.5 deliberately remains inside one active authoritative cell. It does not
 materialize frontier sectors, allocate workers dynamically, hand entities
