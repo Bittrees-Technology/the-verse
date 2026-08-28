@@ -1561,6 +1561,24 @@ impl ValidatedCellAuthorityV3 {
         &self.universe_manifest_hash
     }
 
+    pub(super) fn bind_manifest_v5<'authority, 'manifest>(
+        &'authority self,
+        manifest: &'manifest crate::manifest_v5::ValidatedUniverseManifestV5,
+    ) -> Result<ValidatedManifestBoundCellAuthorityV3<'authority, 'manifest>, CellDirectoryError>
+    {
+        if self.universe_id != manifest.universe_id()
+            || self.universe_manifest_hash != manifest.manifest_hash()
+        {
+            return Err(invalid(
+                "directory-v3 cell authority does not match the validated manifest-5 identity",
+            ));
+        }
+        Ok(ValidatedManifestBoundCellAuthorityV3 {
+            authority: self,
+            manifest,
+        })
+    }
+
     pub(super) fn cell_key(&self) -> &CellKeyV1 {
         &self.assignment.cell_key
     }
@@ -1602,6 +1620,41 @@ pub(super) struct ValidatedGridTransferAuthorityV3 {
     record: CellTransferRecordV3,
     source_assignment: CellAssignmentRecord,
     destination_assignment: CellAssignmentRecord,
+}
+
+/// Non-Serde borrow proving that historical or current grid authority belongs
+/// to the complete manifest-5 universe rather than an arbitrary hash string.
+#[derive(Debug)]
+pub(super) struct ValidatedManifestBoundGridAuthorityV3<'authority, 'manifest> {
+    authority: &'authority ValidatedGridTransferAuthorityV3,
+    manifest: &'manifest crate::manifest_v5::ValidatedUniverseManifestV5,
+}
+
+impl ValidatedManifestBoundGridAuthorityV3<'_, '_> {
+    pub(super) fn authority(&self) -> &ValidatedGridTransferAuthorityV3 {
+        self.authority
+    }
+
+    pub(super) fn manifest_hash(&self) -> &str {
+        self.manifest.manifest_hash()
+    }
+}
+
+/// Manifest-bound equivalent for production and other whole-cell authority.
+#[derive(Debug)]
+pub(super) struct ValidatedManifestBoundCellAuthorityV3<'authority, 'manifest> {
+    authority: &'authority ValidatedCellAuthorityV3,
+    manifest: &'manifest crate::manifest_v5::ValidatedUniverseManifestV5,
+}
+
+impl ValidatedManifestBoundCellAuthorityV3<'_, '_> {
+    pub(super) fn authority(&self) -> &ValidatedCellAuthorityV3 {
+        self.authority
+    }
+
+    pub(super) fn manifest_hash(&self) -> &str {
+        self.manifest.manifest_hash()
+    }
 }
 
 /// Non-Serde live capability for the exact current directory head. Its store
@@ -1647,6 +1700,24 @@ impl ValidatedGridTransferAuthorityV3 {
 
     pub(super) fn universe_manifest_hash(&self) -> &str {
         &self.universe_manifest_hash
+    }
+
+    pub(super) fn bind_manifest_v5<'authority, 'manifest>(
+        &'authority self,
+        manifest: &'manifest crate::manifest_v5::ValidatedUniverseManifestV5,
+    ) -> Result<ValidatedManifestBoundGridAuthorityV3<'authority, 'manifest>, CellDirectoryError>
+    {
+        if self.universe_id != manifest.universe_id()
+            || self.universe_manifest_hash != manifest.manifest_hash()
+        {
+            return Err(invalid(
+                "directory-v3 grid authority does not match the validated manifest-5 identity",
+            ));
+        }
+        Ok(ValidatedManifestBoundGridAuthorityV3 {
+            authority: self,
+            manifest,
+        })
     }
 
     pub(super) fn source_cell_authority(
@@ -5346,6 +5417,52 @@ mod tests {
             destination_abort.side,
             DraftGridTransferAbortSideV2::Destination
         );
+    }
+
+    #[test]
+    fn directory_authorities_require_complete_manifest5_identity() {
+        let manifest = crate::manifest_v5::build_validated_manifest_v5(801)
+            .expect("manifest-5 capability builds");
+        let other_manifest = crate::manifest_v5::build_validated_manifest_v5(802)
+            .expect("other manifest-5 capability builds");
+        let active_bound = prepared_document();
+        let active_authority = active_bound
+            .validated_grid_transfer_authority("transfer-grid-v3-proof")
+            .expect("active-bound authority derives");
+        assert!(active_authority.bind_manifest_v5(&manifest).is_err());
+
+        let mut document = active_bound;
+        document.universe_manifest_hash = manifest.manifest_hash().to_owned();
+        document.seal().expect("manifest-5 directory seals");
+        let grid_authority = document
+            .validated_grid_transfer_authority("transfer-grid-v3-proof")
+            .expect("grid authority derives");
+        let bound_grid = grid_authority
+            .bind_manifest_v5(&manifest)
+            .expect("grid authority binds manifest 5");
+        assert_eq!(bound_grid.authority(), &grid_authority);
+        assert_eq!(bound_grid.manifest_hash(), manifest.manifest_hash());
+        assert!(grid_authority.bind_manifest_v5(&other_manifest).is_err());
+
+        let source_cell = grid_authority
+            .source_cell_authority()
+            .expect("source cell authority derives");
+        let bound_cell = source_cell
+            .bind_manifest_v5(&manifest)
+            .expect("cell authority binds manifest 5");
+        assert_eq!(bound_cell.authority(), &source_cell);
+        assert_eq!(bound_cell.manifest_hash(), manifest.manifest_hash());
+        assert!(source_cell.bind_manifest_v5(&other_manifest).is_err());
+
+        let mut arbitrary_root = document;
+        arbitrary_root.universe_manifest_hash = "ab".repeat(32);
+        arbitrary_root
+            .seal()
+            .expect("syntactically valid arbitrary root seals");
+        let arbitrary = arbitrary_root
+            .validated_grid_transfer_authority("transfer-grid-v3-proof")
+            .expect("arbitrary-root authority derives");
+        assert!(arbitrary.bind_manifest_v5(&manifest).is_err());
     }
 
     #[test]

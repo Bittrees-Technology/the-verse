@@ -565,6 +565,15 @@ cannot mint it. Existing encode/decode and transaction entry points remain on
 their isolated test path until the migration receipt and world-21 Store consume
 this capability.
 
+Package-v2 documents and directory-v3 grid/cell authority now expose the same
+capability-only binding step. Their ordinary codecs still reject malformed or
+unsealed material, while the new step additionally compares universe,
+manifest, registry, content, package, and receipt identity with the complete
+validated manifest-5 document. A directory or package carrying a well-formed
+but arbitrary 64-character trust root cannot mint a manifest-bound authority
+borrow. Event-17 sealing and the future Store must consume these bound borrows,
+not their unbound historical counterparts.
+
 Implementation is staged behind that boundary. The private directory-v3 draft
 already validates ordered grid-and-rider membership, closure and conservation
 roots, package and receipt schemas, historical cell fences, phase-specific
