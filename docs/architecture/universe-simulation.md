@@ -1,7 +1,7 @@
 # Universe simulation
 
 **Status:** P1.5 address/registry proof published; P1.6 one-cell lifecycle
-contract accepted; multi-cell runtime proposed
+verified; multi-cell runtime proposed
 
 ## Coordinate model
 
@@ -143,7 +143,7 @@ production occurrence wakes the fixed proof cell. Public spectators do not
 wake it or keep it Active. Attacks, travel arrivals, other expiring timers,
 cleanup and market-linked work remain later lifecycle triggers.
 
-P1.5 implements only the active local cell. P1.6 is the bounded next slice
+P1.5 implements only the active local cell. P1.6 is the bounded implemented slice
 defined in [the durable single-cell lifecycle contract](../gameplay/durable-single-cell-lifecycle.md):
 one fixed cell, one local coordinator, renewable single-host fencing, and
 production-only background execution. It does not complete dynamic assignment,

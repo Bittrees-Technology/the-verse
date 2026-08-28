@@ -101,12 +101,15 @@ spectator cameras, or establish a thousands-of-players capacity claim. Its
 encoding-independent correctness contract may continue over the inspectable
 transport while the production binary codec remains a later P1 exit item.
 
-F-060 is the bounded P1.6 lifecycle slice. It proves one fixed cell can drain,
-sleep, wake for a durable production occurrence, process a bounded backlog
-through the same whole-cell quantum used while active, and reject stale writers
-through a renewable fenced lease. It does not complete F-013 or WORLD-008:
-multi-cell assignment, handoff, distributed control-plane availability, and
-background physics remain separate milestones.
+F-060 is implemented and verified for the bounded P1.6 lifecycle slice at
+revision `0664130`. The complete local gate and
+[hosted CI run 33137371577](https://github.com/Bittrees-Technology/the-verse/actions/runs/33137371577)
+prove one fixed cell can drain, sleep, wake for a durable production
+occurrence, process a bounded backlog through the same whole-cell quantum used
+while active, and reject stale writers through a renewable fenced lease. It
+does not complete F-013 or WORLD-008: multi-cell assignment, handoff,
+distributed control-plane availability, and background physics remain separate
+milestones.
 
 ## Definition of specification-ready
 
