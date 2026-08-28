@@ -34,14 +34,6 @@ pub fn planet_surface_radius_m() -> f64 {
     celestial::body_surface_radius_m(celestial::GRAVITY_BODY_ID)
 }
 
-pub fn planet_atmosphere_height_m() -> f64 {
-    celestial::body_atmosphere_height_m(celestial::GRAVITY_BODY_ID)
-}
-
-pub fn planet_surface_gravity_m_s2() -> f64 {
-    celestial::body_surface_gravity_m_s2(celestial::GRAVITY_BODY_ID)
-}
-
 pub fn valid_player_id(player_id: &str) -> bool {
     !player_id.is_empty()
         && player_id.len() <= 128
@@ -2203,7 +2195,6 @@ impl WorldState {
     }
 
     pub fn environment_at(&self, position: Vec3) -> EnvironmentSnapshot {
-        let gravity_body = celestial::body_snapshot(self.world_seed, &self.gravity_body_id);
         let registry = celestial::registry_snapshot(self.world_seed)
             .expect("the world-bound celestial registry remains valid");
         let nearest_body = registry
@@ -2211,8 +2202,8 @@ impl WorldState {
             .iter()
             .filter(|body| body.kind != verse_protocol::CelestialBodyKind::AsteroidField)
             .min_by(|left, right| {
-                let left_center = celestial::body_center_m(&left.body_id);
-                let right_center = celestial::body_center_m(&right.body_id);
+                let left_center = local_body_center(&self.cell_address, &left.center);
+                let right_center = local_body_center(&self.cell_address, &right.center);
                 let left_distance = (position - left_center).magnitude()
                     - left.surface_radius_um as f64 / 1_000_000.0;
                 let right_distance = (position - right_center).magnitude()
@@ -2220,38 +2211,62 @@ impl WorldState {
                 left_distance.total_cmp(&right_distance)
             })
             .expect("the registry always contains the proof bodies");
+        let gravity_body = (!self.gravity_body_id.is_empty()).then(|| {
+            registry
+                .bodies
+                .iter()
+                .find(|body| body.body_id == self.gravity_body_id)
+                .expect("validated world gravity body remains registered")
+        });
+        let environment_body = gravity_body.unwrap_or(nearest_body);
+        let body_center = local_body_center(&self.cell_address, &environment_body.center);
         let radial = Vec3::new(
-            position.x - planet_center().x,
-            position.y - planet_center().y,
-            position.z - planet_center().z,
+            position.x - body_center.x,
+            position.y - body_center.y,
+            position.z - body_center.z,
         );
         let distance = radial.magnitude().max(1.0);
-        let altitude_m = (distance - planet_surface_radius_m()).max(0.0);
-        let gravity_m_s2 = (planet_surface_gravity_m_s2()
-            * (planet_surface_radius_m() / distance).powi(2))
-        .min(planet_surface_gravity_m_s2() * 1.25);
-        let gravity = Vec3::new(
-            -radial.x / distance * gravity_m_s2,
-            -radial.y / distance * gravity_m_s2,
-            -radial.z / distance * gravity_m_s2,
-        );
-        let atmosphere_density = (1.0 - altitude_m / planet_atmosphere_height_m()).clamp(0.0, 1.0);
-        let oxygen_fraction = if atmosphere_density > 0.0 {
-            f64::from(gravity_body.oxygen_parts_per_million) / 1_000_000.0
+        let surface_radius_m = environment_body.surface_radius_um as f64 / 1_000_000.0;
+        let altitude_m = (distance - surface_radius_m).max(0.0);
+        let (gravity_m_s2, atmosphere_density, oxygen_fraction) =
+            gravity_body.map_or((0.0, 0.0, 0.0), |body| {
+                let surface_gravity =
+                    body.surface_gravity_millimetres_per_second_squared as f64 / 1_000.0;
+                let gravity = (surface_gravity * (surface_radius_m / distance).powi(2))
+                    .min(surface_gravity * 1.25);
+                let atmosphere_height_m = body.atmosphere_height_um as f64 / 1_000_000.0;
+                let density = if atmosphere_height_m > 0.0 {
+                    (1.0 - altitude_m / atmosphere_height_m).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let oxygen = if density > 0.0 {
+                    f64::from(body.oxygen_parts_per_million) / 1_000_000.0
+                } else {
+                    0.0
+                };
+                (gravity, density, oxygen)
+            });
+        let gravity = if gravity_m_s2 > 0.0 {
+            Vec3::new(
+                -radial.x / distance * gravity_m_s2,
+                -radial.y / distance * gravity_m_s2,
+                -radial.z / distance * gravity_m_s2,
+            )
         } else {
-            0.0
+            Vec3::ZERO
         };
 
         EnvironmentSnapshot {
-            celestial_body_id: gravity_body.body_id,
-            celestial_body_name: gravity_body.display_name,
-            celestial_scale_class: gravity_body.scale_class,
+            celestial_body_id: environment_body.body_id.clone(),
+            celestial_body_name: environment_body.display_name.clone(),
+            celestial_scale_class: environment_body.scale_class,
             nearest_body_id: nearest_body.body_id.clone(),
             nearest_body_name: nearest_body.display_name.clone(),
-            planet_center: planet_center(),
-            surface_radius_m: planet_surface_radius_m(),
+            planet_center: body_center,
+            surface_radius_m,
             distance_to_center_m: distance,
-            distance_to_surface_m: distance - planet_surface_radius_m(),
+            distance_to_surface_m: distance - surface_radius_m,
             altitude_m,
             gravity,
             gravity_m_s2,
@@ -2260,6 +2275,16 @@ impl WorldState {
             breathable: atmosphere_density >= 0.35 && oxygen_fraction >= 0.18,
         }
     }
+}
+
+fn local_body_center(origin: &UniverseAddress, body_center: &UniverseAddress) -> Vec3 {
+    let offset = celestial::relative_offset_um(origin, body_center)
+        .expect("validated universe addresses have a bounded i128 relative offset");
+    Vec3::new(
+        offset[0] as f64 / 1_000_000.0,
+        offset[1] as f64 / 1_000_000.0,
+        offset[2] as f64 / 1_000_000.0,
+    )
 }
 
 fn processed_operation_record_bytes(record: &ProcessedOperationRecord) -> usize {
@@ -2337,6 +2362,13 @@ mod tests {
         assert!(world.voxels.ferrite_ore.is_empty());
         assert!(world.gravity_body_id.is_empty());
         assert!(world.voxel_body_id.is_empty());
+        let vacuum = world.environment_at(Vec3::ZERO);
+        assert_eq!(vacuum.gravity, Vec3::ZERO);
+        assert!(vacuum.gravity_m_s2.abs() < f64::EPSILON);
+        assert!(vacuum.atmosphere_density.abs() < f64::EPSILON);
+        assert!(vacuum.oxygen_fraction.abs() < f64::EPSILON);
+        assert!(!vacuum.breathable);
+        assert!(!vacuum.nearest_body_id.is_empty());
         assert!(world.conservation().valid);
         assert!(world.validate_player_roster().is_ok());
     }

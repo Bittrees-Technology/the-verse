@@ -97,12 +97,6 @@ impl AdapterSession {
     }
 
     fn stage(&mut self, raw: &[u8]) -> Result<StagedFrame, BridgeError> {
-        if self.pending.is_some() {
-            return Err(BridgeError::new(
-                "pending_stage",
-                "the Godot adapter already has a pending stage",
-            ));
-        }
         let verifier = self.verifier.as_mut().ok_or_else(|| {
             BridgeError::new(
                 "unexpected_message",
@@ -110,6 +104,9 @@ impl AdapterSession {
             )
         })?;
         let core_token = verifier.stage(raw).map_err(BridgeError::from)?;
+        // A preparing handoff can atomically supersede an older staged source
+        // frame inside the core verifier, so its bridge token must disappear too.
+        self.pending = None;
         let kind = verifier
             .pending_kind()
             .map(stage_kind_name)
@@ -234,6 +231,7 @@ fn stage_kind_name(kind: StageKind) -> &'static str {
     match kind {
         StageKind::Welcome => "welcome",
         StageKind::Registry => "registry",
+        StageKind::Handoff => "handoff",
         StageKind::Baseline => "baseline",
         StageKind::Delta => "delta",
         StageKind::IntentAccepted => "intent_accepted",

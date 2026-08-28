@@ -1084,6 +1084,24 @@ pub enum SessionRole {
     Player { player_id: String },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HandoffPhase {
+    Preparing,
+    Importing,
+    VerifyingDestination,
+}
+
+/// Private, bounded gateway presentation state for one immutable handoff.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HandoffStatus {
+    pub transfer_id: String,
+    pub phase: HandoffPhase,
+    pub destination_cell_key: CellKeyV1,
+    pub placement_generation: u64,
+}
+
 /// Commands sent by all P0 clients. Every mutating command carries a contiguous
 /// actor-local operation sequence for durable idempotency plus a diagnostic ID.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1342,6 +1360,9 @@ pub enum ServerMessage {
     InterestDelta {
         delta: Box<ProjectedInterestDelta>,
     },
+    Handoff {
+        handoff: HandoffStatus,
+    },
     /// Legacy compatibility shape. Protocol-18 official clients must use
     /// `interest_baseline` and `interest_delta` and workers must never mix the
     /// two state-stream families within one session.
@@ -1492,6 +1513,28 @@ mod tests {
             .expect("interest object")
             .insert("unexpected".into(), serde_json::json!(true));
         assert!(serde_json::from_value::<InterestSnapshot>(interest_value).is_err());
+
+        let handoff = ServerMessage::Handoff {
+            handoff: HandoffStatus {
+                transfer_id: "transfer-proof".into(),
+                phase: HandoffPhase::VerifyingDestination,
+                destination_cell_key: CellKeyV1 {
+                    schema_version: CELL_KEY_SCHEMA_VERSION,
+                    universe_id: "the-verse-local".into(),
+                    sector: test_address().sector,
+                    cell: test_address().cell,
+                },
+                placement_generation: 2,
+            },
+        };
+        let mut handoff_value = serde_json::to_value(handoff).expect("handoff serializes");
+        assert_eq!(handoff_value["type"], "handoff");
+        assert_eq!(handoff_value["handoff"]["phase"], "verifying_destination");
+        handoff_value["handoff"]
+            .as_object_mut()
+            .expect("handoff object")
+            .insert("unexpected".into(), serde_json::json!(true));
+        assert!(serde_json::from_value::<ServerMessage>(handoff_value).is_err());
     }
 
     fn test_environment(altitude_m: f64) -> EnvironmentSnapshot {

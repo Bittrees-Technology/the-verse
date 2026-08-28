@@ -21,14 +21,14 @@ pub use error::{ErrorCode, VerifyError};
 use serde::Serialize;
 use verse_protocol::{
     ActorPrivateSnapshot, BlockKind, CELESTIAL_REGISTRY_SCHEMA_VERSION, CELL_KEY_SCHEMA_VERSION,
-    CelestialRegistrySnapshot, EnvironmentSnapshot, I64Vec3, INTEREST_SCHEMA_VERSION,
-    InterestEntityKind, InterestEntityPayload, InterestEntityProjection, InterestFrameKind,
-    InterestObserverClass, InterestSnapshot, InterestTransferLink, InventoryDomain,
-    InventorySnapshot, PROJECTION_SCHEMA_VERSION, PROTOCOL_VERSION, PlayerMotionSnapshot,
-    ProductionRecipeKind, ProjectedInterestDelta, ProjectedWorldSnapshot, PublicBlockSnapshot,
-    PublicDeathDropSnapshot, PublicGridSnapshot, PublicPlayerSnapshot, PublicVoxelChunkSnapshot,
-    ServerMessage, SessionRole, UNIVERSE_MANIFEST_SCHEMA_VERSION, UniverseAddress,
-    UniverseManifestSnapshot,
+    CelestialRegistrySnapshot, CellKeyV1, EnvironmentSnapshot, HandoffPhase, HandoffStatus,
+    I64Vec3, INTEREST_SCHEMA_VERSION, InterestEntityKind, InterestEntityPayload,
+    InterestEntityProjection, InterestFrameKind, InterestObserverClass, InterestSnapshot,
+    InterestTransferLink, InventoryDomain, InventorySnapshot, PROJECTION_SCHEMA_VERSION,
+    PROTOCOL_VERSION, PlayerMotionSnapshot, ProductionRecipeKind, ProjectedInterestDelta,
+    ProjectedWorldSnapshot, PublicBlockSnapshot, PublicDeathDropSnapshot, PublicGridSnapshot,
+    PublicPlayerSnapshot, PublicVoxelChunkSnapshot, ServerMessage, SessionRole,
+    UNIVERSE_MANIFEST_SCHEMA_VERSION, UniverseAddress, UniverseManifestSnapshot,
 };
 
 use crate::error::Result;
@@ -119,6 +119,7 @@ impl VerifierConfig {
 pub enum StageKind {
     Welcome,
     Registry,
+    Handoff,
     Baseline,
     Delta,
     IntentAccepted,
@@ -191,6 +192,13 @@ struct ViewState {
     view_hash: String,
 }
 
+#[derive(Debug, Clone)]
+struct HandoffBinding {
+    status: HandoffStatus,
+    session_epoch: String,
+    prior_interest_epoch: u64,
+}
+
 impl ViewState {
     fn summary(&self) -> VerifiedView {
         VerifiedView {
@@ -210,6 +218,7 @@ struct CommittedState {
     welcome: Option<WelcomeBinding>,
     registry: Option<RegistryBinding>,
     view: Option<ViewState>,
+    handoff: Option<HandoffBinding>,
 }
 
 #[derive(Debug, Clone)]
@@ -258,13 +267,27 @@ impl InterestVerifier {
 
     /// Parse, validate, and hash one original wire frame without committing it.
     pub fn stage(&mut self, raw_json: &[u8]) -> Result<StageToken> {
-        if self.pending.is_some() {
+        let message: ServerMessage = strict_json::parse_exact(raw_json, &self.config.limits)?;
+        let handoff_supersedes_pending = matches!(
+            &message,
+            ServerMessage::Handoff {
+                handoff: HandoffStatus {
+                    phase: HandoffPhase::Preparing,
+                    ..
+                }
+            }
+        );
+        if self.pending.is_some() && !handoff_supersedes_pending {
             return Err(VerifyError::new(
                 ErrorCode::PendingStage,
                 "a transition is already pending",
             ));
         }
-        let message: ServerMessage = strict_json::parse_exact(raw_json, &self.config.limits)?;
+        if self.pending.take().is_some() {
+            // A source frame staged immediately before the authoritative
+            // prepare boundary must never remain committable afterward.
+            self.advance_generation();
+        }
         let presentation_message = message.clone();
         let sanitized_json = serde_json::to_string(&presentation_message).map_err(|error| {
             VerifyError::new(
@@ -334,6 +357,45 @@ impl InterestVerifier {
                 next.registry = Some(binding);
                 StageKind::Registry
             }
+            ServerMessage::Handoff { handoff } => {
+                let welcome = self
+                    .committed
+                    .welcome
+                    .as_ref()
+                    .ok_or_else(|| unexpected("handoff"))?;
+                let binding = self
+                    .committed
+                    .registry
+                    .as_ref()
+                    .ok_or_else(|| unexpected("handoff"))?;
+                if !matches!(welcome.role, SessionRole::Player { .. }) {
+                    return Err(unexpected("handoff"));
+                }
+                if let Some(current) = &self.committed.handoff {
+                    validate_handoff_progress(current, &handoff)?;
+                    next.handoff = Some(HandoffBinding {
+                        status: handoff,
+                        session_epoch: current.session_epoch.clone(),
+                        prior_interest_epoch: current.prior_interest_epoch,
+                    });
+                } else {
+                    let view = self
+                        .committed
+                        .view
+                        .as_ref()
+                        .ok_or_else(|| unexpected("handoff"))?;
+                    validate_initial_handoff(&handoff, view, binding)?;
+                    next.handoff = Some(HandoffBinding {
+                        status: handoff,
+                        session_epoch: view.session_epoch.clone(),
+                        prior_interest_epoch: view.interest_epoch,
+                    });
+                }
+                // The old cell stops being presentable as soon as preparation
+                // is committed. No source delta or receipt can revive it.
+                next.view = None;
+                StageKind::Handoff
+            }
             ServerMessage::InterestBaseline { baseline } => {
                 let welcome = self
                     .committed
@@ -346,7 +408,15 @@ impl InterestVerifier {
                     .as_ref()
                     .ok_or_else(|| unexpected("baseline"))?;
                 let candidate = self.validate_baseline(welcome, binding, &baseline)?;
-                if let Some(current) = &self.committed.view {
+                if let Some(handoff) = &self.committed.handoff {
+                    validate_destination_baseline(handoff, &candidate)?;
+                    next.handoff = None;
+                } else if candidate.transfer_link.is_some() {
+                    return Err(VerifyError::new(
+                        ErrorCode::InvalidBaseline,
+                        "a transfer-linked baseline requires a committed handoff",
+                    ));
+                } else if let Some(current) = &self.committed.view {
                     validate_recovery_baseline(current, &candidate)?;
                 }
                 next.view = Some(candidate);
@@ -842,8 +912,12 @@ fn validate_outer_baseline(
         ));
     }
     binding.validate_address(&baseline.cell_address, "baseline cell address")?;
-    binding.require_body(&baseline.gravity_body_id, "baseline gravity_body_id")?;
-    binding.require_body(&baseline.voxel_body_id, "baseline voxel_body_id")?;
+    validate_cell_body_bindings(
+        binding,
+        &baseline.gravity_body_id,
+        &baseline.voxel_body_id,
+        "baseline",
+    )?;
     binding.validate_environment(&baseline.environment, "baseline environment")?;
     Ok(())
 }
@@ -867,12 +941,35 @@ fn validate_outer_delta(
         ));
     }
     binding.validate_address(&delta.cell_address, "delta cell address")?;
-    binding.require_body(&delta.gravity_body_id, "delta gravity_body_id")?;
-    binding.require_body(&delta.voxel_body_id, "delta voxel_body_id")?;
+    validate_cell_body_bindings(
+        binding,
+        &delta.gravity_body_id,
+        &delta.voxel_body_id,
+        "delta",
+    )?;
     if let Some(environment) = &delta.environment {
         binding.validate_environment(environment, "delta environment")?;
     }
     Ok(())
+}
+
+fn validate_cell_body_bindings(
+    binding: &RegistryBinding,
+    gravity_body_id: &str,
+    voxel_body_id: &str,
+    label: &str,
+) -> Result<()> {
+    match (gravity_body_id.is_empty(), voxel_body_id.is_empty()) {
+        (true, true) => Ok(()),
+        (false, false) => {
+            binding.require_body(gravity_body_id, &format!("{label} gravity_body_id"))?;
+            binding.require_body(voxel_body_id, &format!("{label} voxel_body_id"))
+        }
+        _ => Err(VerifyError::new(
+            ErrorCode::BindingMismatch,
+            format!("{label} gravity and voxel body bindings must both be present or both absent"),
+        )),
+    }
 }
 
 fn validate_interest_header(
@@ -950,6 +1047,108 @@ fn validate_transfer_link(
         ));
     }
     Ok(())
+}
+
+fn validate_initial_handoff(
+    status: &HandoffStatus,
+    source: &ViewState,
+    binding: &RegistryBinding,
+) -> Result<()> {
+    if status.phase != HandoffPhase::Preparing {
+        return Err(VerifyError::new(
+            ErrorCode::UnexpectedMessage,
+            "the first handoff status must be preparing",
+        ));
+    }
+    validate_handoff_material(status, binding)?;
+    let destination_cell_id = cell_id_for_key(&status.destination_cell_key)?;
+    if destination_cell_id == source.cell_id {
+        return Err(VerifyError::new(
+            ErrorCode::BindingMismatch,
+            "handoff destination must differ from the committed source cell",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_handoff_progress(current: &HandoffBinding, candidate: &HandoffStatus) -> Result<()> {
+    let same_material = candidate.transfer_id == current.status.transfer_id
+        && candidate.destination_cell_key == current.status.destination_cell_key
+        && candidate.placement_generation == current.status.placement_generation;
+    let valid_phase = candidate.phase == current.status.phase
+        || matches!(
+            (current.status.phase, candidate.phase),
+            (HandoffPhase::Preparing, HandoffPhase::Importing)
+                | (HandoffPhase::Importing, HandoffPhase::VerifyingDestination)
+        );
+    if !same_material || !valid_phase {
+        return Err(VerifyError::new(
+            ErrorCode::FrontierMismatch,
+            "handoff identity changed or phase did not advance monotonically",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_destination_baseline(handoff: &HandoffBinding, candidate: &ViewState) -> Result<()> {
+    let Some(link) = candidate.transfer_link.as_ref() else {
+        return Err(VerifyError::new(
+            ErrorCode::InvalidBaseline,
+            "handoff completion requires a transfer-linked destination baseline",
+        ));
+    };
+    let expected_interest_epoch = handoff
+        .prior_interest_epoch
+        .checked_add(1)
+        .ok_or_else(|| VerifyError::new(ErrorCode::FrontierMismatch, "interest epoch overflow"))?;
+    let valid = handoff.status.phase == HandoffPhase::VerifyingDestination
+        && link.transfer_id == handoff.status.transfer_id
+        && link.destination_cell_key == handoff.status.destination_cell_key
+        && link.placement_generation == handoff.status.placement_generation
+        && candidate.session_epoch == handoff.session_epoch
+        && candidate.interest_epoch == expected_interest_epoch;
+    if !valid {
+        return Err(VerifyError::new(
+            ErrorCode::FrontierMismatch,
+            "destination baseline does not complete the committed handoff frontier",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_handoff_material(status: &HandoffStatus, binding: &RegistryBinding) -> Result<()> {
+    let valid_identifier = !status.transfer_id.is_empty()
+        && status.transfer_id.len() <= 128
+        && status
+            .transfer_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'));
+    if !valid_identifier
+        || status.placement_generation == 0
+        || status.destination_cell_key.schema_version != CELL_KEY_SCHEMA_VERSION
+    {
+        return Err(VerifyError::new(
+            ErrorCode::BindingMismatch,
+            "handoff identity, cell-key schema, or placement generation is invalid",
+        ));
+    }
+    let address = UniverseAddress {
+        universe_id: status.destination_cell_key.universe_id.clone(),
+        sector: status.destination_cell_key.sector.clone(),
+        cell: status.destination_cell_key.cell,
+        local_um: I64Vec3::ZERO,
+    };
+    binding.validate_address(&address, "handoff destination cell key")?;
+    cell_id_for_key(&status.destination_cell_key)?;
+    Ok(())
+}
+
+fn cell_id_for_key(key: &CellKeyV1) -> Result<String> {
+    let canonical = canonical::fixed_json(key)?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"the-verse/cell-key/v1\0");
+    hasher.update(&canonical);
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 fn repeated_baseline_headers(baseline: &ProjectedWorldSnapshot) -> Result<()> {

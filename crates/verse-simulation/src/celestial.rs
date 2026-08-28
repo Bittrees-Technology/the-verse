@@ -999,28 +999,6 @@ pub fn body_surface_radius_m(body_id: &str) -> f64 {
         )
 }
 
-pub fn body_atmosphere_height_m(body_id: &str) -> f64 {
-    definition()
-        .bodies
-        .iter()
-        .find(|body| body.body_id == body_id)
-        .map_or_else(
-            || panic!("embedded registry body {body_id} exists"),
-            |body| body.atmosphere_height_um as f64 / 1_000_000.0,
-        )
-}
-
-pub fn body_surface_gravity_m_s2(body_id: &str) -> f64 {
-    definition()
-        .bodies
-        .iter()
-        .find(|body| body.body_id == body_id)
-        .map_or_else(
-            || panic!("embedded registry body {body_id} exists"),
-            |body| body.surface_gravity_millimetres_per_second_squared as f64 / 1_000.0,
-        )
-}
-
 #[cfg(test)]
 mod tests {
     use proptest::prelude::*;
