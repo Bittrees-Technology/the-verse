@@ -1,5 +1,5 @@
 shader_type spatial;
-render_mode blend_mix, diffuse_burley, specular_schlick_ggx, cull_back, depth_prepass_alpha;
+render_mode blend_mix, diffuse_burley, specular_schlick_ggx, cull_disabled, depth_prepass_alpha;
 
 float hash21(vec2 point) {
 	point = fract(point * vec2(123.34, 456.21));

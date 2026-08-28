@@ -6,13 +6,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use tokio::net::TcpListener;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 use verse_protocol::CellKeyV1;
 use verse_simulation::{LifecycleMode, LocalTwoCellRuntime, Runtime, cell_origin_key};
 use verse_simulation_worker::{AppState, router};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum GenesisProfile {
+    Orbital,
+    EarthStart,
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -32,6 +38,15 @@ struct Arguments {
 
     #[arg(long, env = "VERSE_WORLD_SEED", default_value_t = 20260826)]
     world_seed: u64,
+
+    /// Development-only fixture selected before the first canonical event.
+    #[arg(
+        long,
+        env = "VERSE_GENESIS_PROFILE",
+        value_enum,
+        default_value = "orbital"
+    )]
+    genesis_profile: GenesisProfile,
 
     #[arg(long, env = "VERSE_SNAPSHOT_EVERY", default_value_t = 25)]
     snapshot_every: u64,
@@ -81,9 +96,12 @@ async fn main() -> Result<()> {
         );
     }
     let state = if arguments.two_cell_universe {
-        if arguments.pause_simulation || arguments.cell_key_json.is_some() {
+        if arguments.pause_simulation
+            || arguments.cell_key_json.is_some()
+            || arguments.genesis_profile != GenesisProfile::Orbital
+        {
             bail!(
-                "the two-cell universe owns both cell routes and does not accept pause or a standalone cell key"
+                "the two-cell universe owns both cell routes and does not accept pause, a standalone cell key, or a development genesis profile"
             );
         }
         let coordinator = LocalTwoCellRuntime::open(
@@ -111,6 +129,7 @@ async fn main() -> Result<()> {
                 serde_json::from_str::<CellKeyV1>(json).context("VERSE_CELL_KEY_JSON is invalid")
             },
         )?;
+        let is_origin_cell = cell_key == cell_origin_key();
         let mut runtime = if arguments.pause_simulation {
             Runtime::open_for_cell(
                 &arguments.data_directory,
@@ -132,6 +151,19 @@ async fn main() -> Result<()> {
                 arguments.data_directory.display()
             )
         })?;
+        if arguments.genesis_profile == GenesisProfile::EarthStart {
+            if !is_origin_cell {
+                bail!(
+                    "the Earthlike surface playtest profile is available only in the origin cell"
+                );
+            }
+            if runtime.state().event_sequence == 0 {
+                let configured = runtime
+                    .configure_earth_start_playtest()
+                    .context("failed to configure the fresh Earthlike surface playtest")?;
+                info!(configured, "Earthlike surface playtest profile is ready");
+            }
+        }
         if runtime.state().player.by_id.is_empty() {
             if !arguments.development_players.is_empty() {
                 info!(
@@ -246,6 +278,17 @@ mod tests {
         assert_eq!(arguments.idle_drain_seconds, 30);
         assert_eq!(arguments.development_players, ["player-remote"]);
         assert!(arguments.cell_key_json.is_none());
+        assert_eq!(arguments.genesis_profile, GenesisProfile::Orbital);
         assert!(f64::from(arguments.tick_millis) <= 1_000.0 / 60.0);
+    }
+
+    #[test]
+    fn earth_start_profile_is_explicitly_selectable() {
+        let arguments = Arguments::parse_from([
+            "verse-simulation-worker",
+            "--genesis-profile",
+            "earth-start",
+        ]);
+        assert_eq!(arguments.genesis_profile, GenesisProfile::EarthStart);
     }
 }
