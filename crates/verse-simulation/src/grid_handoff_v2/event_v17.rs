@@ -839,6 +839,19 @@ mod tests {
         reject_tuple_change!(directory_schema_version);
         reject_tuple_change!(transfer_package_schema_version);
 
+        let mut changed_content = event.clone();
+        changed_content
+            .compatibility
+            .content_manifest_version
+            .push_str("-substituted");
+        changed_content.event_hash = changed_content
+            .calculate_hash()
+            .expect("changed event rehashes");
+        let changed_content_bytes = changed_content
+            .encode_canonical()
+            .expect("changed event encodes");
+        assert!(DraftCanonicalGridEventV17::decode_canonical(&changed_content_bytes).is_err());
+
         let mut human = event.clone();
         human.actor_player_id = Some("player-local".into());
         human.actor_type = "human".into();

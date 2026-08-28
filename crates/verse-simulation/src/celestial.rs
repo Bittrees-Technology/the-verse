@@ -940,7 +940,7 @@ pub fn universe_manifest(
     })
 }
 
-fn lifecycle_policy_hash() -> Result<String, CelestialError> {
+pub(crate) fn lifecycle_policy_hash() -> Result<String, CelestialError> {
     let material = LifecyclePolicyHashMaterial {
         lifecycle_control_schema_version: LIFECYCLE_CONTROL_SCHEMA_VERSION,
         production_schedule_occurrence_schema_version:

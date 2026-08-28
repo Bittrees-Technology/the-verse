@@ -536,6 +536,16 @@ grid closures. Upgrade refuses nonterminal transfers; incompatible roots stay
 archive/read-only unless an explicit offline migration proves the complete
 tuple transition.
 
+The dormant tuple now has one shared protocol wire declaration, including the
+exact `p1.5.0` content-manifest version. A separate manifest-5 codec derives the
+immutable registry, content, lifecycle, address, and frontier roots with the
+`the-verse/universe-manifest/v5` hash domain and returns a non-serializable
+validation capability. It rejects manifest 4, a manifest-4 document built with
+world 21 and event 17, noncanonical bytes, and any rehashed tuple or identity
+substitution. This does not activate the tuple: the world-21 envelope's nested
+gameplay body must still be migrated from its manifest-4 validation path before
+directory-v3 or the world-21 Store may accept the capability.
+
 Implementation is staged behind that boundary. The private directory-v3 draft
 already validates ordered grid-and-rider membership, closure and conservation
 roots, package and receipt schemas, historical cell fences, phase-specific
