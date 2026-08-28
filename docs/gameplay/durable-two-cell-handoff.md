@@ -682,6 +682,12 @@ historical authority after later directory revisions. Historical authority is
 replay evidence only: live event sealing is test-only until the locked world-21
 store can mint a distinct current-authority append lease. There will be no
 historical-to-live capability conversion.
+The first live-authority seam is now non-serializable and borrows the locked
+directory's exact current head, including its holder, generation, and fence.
+That borrow prevents a successor directory commit while an event is being
+sealed; historical revision lookup cannot construct the capability. The
+world-21 store append lease and manifest-5 identity gate remain deliberately
+absent.
 The active event-17 runtime/store adapter, scheduler and durable wake-up path,
 and whole-world persistence failpoint crash/replay integration remain to be
 implemented before activation. All drafts are

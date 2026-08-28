@@ -9,6 +9,7 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 
 use fs2::FileExt;
@@ -798,6 +799,33 @@ impl DraftCellDirectoryHistoryStoreV3 {
             .validated_cell_authority(cell_id)
     }
 
+    /// Borrows the locked directory store so the current head cannot advance
+    /// while a live grid capability is in use. There is deliberately no
+    /// historical-to-current conversion.
+    pub(super) fn current_grid_authority(
+        &self,
+        transfer_id: &str,
+    ) -> Result<ValidatedCurrentGridAuthorityV3<'_>, CellDirectoryError> {
+        Ok(ValidatedCurrentGridAuthorityV3 {
+            authority: self
+                .current()?
+                .validated_grid_transfer_authority(transfer_id)?,
+            _store_guard: PhantomData,
+        })
+    }
+
+    /// Borrows the locked directory store so the current head cannot advance
+    /// while a live cell capability is in use.
+    pub(super) fn current_cell_authority(
+        &self,
+        cell_id: &str,
+    ) -> Result<ValidatedCurrentCellAuthorityV3<'_>, CellDirectoryError> {
+        Ok(ValidatedCurrentCellAuthorityV3 {
+            authority: self.current()?.validated_cell_authority(cell_id)?,
+            _store_guard: PhantomData,
+        })
+    }
+
     fn append_document(
         &mut self,
         expected_revision: Option<u64>,
@@ -1549,6 +1577,13 @@ impl ValidatedCellAuthorityV3 {
         self.assignment.authority_fencing_token
     }
 
+    pub(super) fn holder_id(&self) -> &str {
+        self.assignment
+            .holder_id
+            .as_deref()
+            .expect("validated current cell authority has a holder")
+    }
+
     pub(super) fn fencing_history(&self) -> &BTreeMap<u64, u64> {
         &self.assignment.fencing_history
     }
@@ -1567,6 +1602,34 @@ pub(super) struct ValidatedGridTransferAuthorityV3 {
     record: CellTransferRecordV3,
     source_assignment: CellAssignmentRecord,
     destination_assignment: CellAssignmentRecord,
+}
+
+/// Non-Serde live capability for the exact current directory head. Its store
+/// lifetime prevents the writer from committing a successor while it is held.
+#[derive(Debug)]
+pub(super) struct ValidatedCurrentGridAuthorityV3<'store> {
+    authority: ValidatedGridTransferAuthorityV3,
+    _store_guard: PhantomData<&'store DraftCellDirectoryHistoryStoreV3>,
+}
+
+impl ValidatedCurrentGridAuthorityV3<'_> {
+    pub(super) fn validated(&self) -> &ValidatedGridTransferAuthorityV3 {
+        &self.authority
+    }
+}
+
+/// Non-Serde live capability for one assigned cell at the exact current
+/// directory head. Historical cell evidence cannot construct this type.
+#[derive(Debug)]
+pub(super) struct ValidatedCurrentCellAuthorityV3<'store> {
+    authority: ValidatedCellAuthorityV3,
+    _store_guard: PhantomData<&'store DraftCellDirectoryHistoryStoreV3>,
+}
+
+impl ValidatedCurrentCellAuthorityV3<'_> {
+    pub(super) fn validated(&self) -> &ValidatedCellAuthorityV3 {
+        &self.authority
+    }
 }
 
 impl ValidatedGridTransferAuthorityV3 {
@@ -1827,6 +1890,10 @@ impl ValidatedGridTransferAuthorityV3 {
         self.source_assignment.authority_fencing_token
     }
 
+    pub(super) fn live_source_holder_id(&self) -> Option<&str> {
+        self.source_assignment.holder_id.as_deref()
+    }
+
     pub(super) fn live_destination_assignment_generation(&self) -> u64 {
         self.destination_assignment.assignment_generation
     }
@@ -1837,6 +1904,10 @@ impl ValidatedGridTransferAuthorityV3 {
 
     pub(super) fn live_destination_fencing_token(&self) -> u64 {
         self.destination_assignment.authority_fencing_token
+    }
+
+    pub(super) fn live_destination_holder_id(&self) -> Option<&str> {
+        self.destination_assignment.holder_id.as_deref()
     }
 }
 
@@ -5341,6 +5412,25 @@ mod tests {
         assert_eq!(live.assignment_generation(), 2);
         assert_eq!(live.fencing_token(), old.fencing_token() + 1);
         assert_eq!(live.fencing_history().get(&1), Some(&old.fencing_token()));
+        let current = store
+            .current_cell_authority(&source_id)
+            .expect("current-head cell authority resolves");
+        assert_eq!(
+            current.validated().directory_revision(),
+            successor.directory_revision
+        );
+        assert_eq!(
+            current.validated().directory_document_hash(),
+            successor.document_hash
+        );
+        assert_eq!(
+            current.validated().holder_id(),
+            successor.assignments[&source_id]
+                .holder_id
+                .as_deref()
+                .expect("successor assignment has a holder")
+        );
+        drop(current);
 
         let mut sleeping = successor;
         let assignment = sleeping
@@ -6281,6 +6371,15 @@ mod tests {
                 document.transfers["transfer-grid-v3-proof"].phase
             );
         }
+        let current = store
+            .current_grid_authority("transfer-grid-v3-proof")
+            .expect("current-head grid authority resolves");
+        assert_eq!(
+            current.validated().directory_revision(),
+            documents.last().unwrap().directory_revision
+        );
+        assert!(current.validated().live_destination_holder_id().is_some());
+        drop(current);
         assert!(
             store
                 .resolve_historical_grid_authority(
