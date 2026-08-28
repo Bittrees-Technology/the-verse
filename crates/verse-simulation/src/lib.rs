@@ -18,6 +18,8 @@ mod manifest_v5;
 mod model;
 mod persistence;
 mod projection;
+#[allow(dead_code)]
+mod protocol19_migration;
 mod targeting;
 mod two_cell;
 
