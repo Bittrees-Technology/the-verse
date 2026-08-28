@@ -77,19 +77,10 @@ pub enum EventPayload {
     ProductionQueued {
         job: ProductionJob,
     },
-    ProductionAdvanced {
-        machine_block_id: String,
-        job_id: String,
-        previous_progress_ticks: u64,
-        new_progress_ticks: u64,
-        completed: bool,
-        output_delivered: bool,
-    },
-    ProductionOutputDelivered {
-        machine_block_id: String,
-        job_id: String,
-        destination_inventory_id: String,
-        outputs: InventoryContents,
+    ProductionQuantumCommitted {
+        occurrence: ProductionScheduleOccurrence,
+        elapsed_ticks: u64,
+        outcomes: Vec<ProductionMachineOutcome>,
     },
     InventoryTransferred {
         source_inventory_id: String,
@@ -135,6 +126,59 @@ pub enum EventPayload {
         contacts: Vec<PhysicsContactOutcome>,
         active_contacts_after: Vec<ContactPairKey>,
     },
+}
+
+pub const PRODUCTION_SCHEDULE_OCCURRENCE_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProductionScheduleOccurrence {
+    pub schema_version: u32,
+    pub universe_id: String,
+    pub cell_id: String,
+    pub lifecycle_generation: u64,
+    pub production_quantum_sequence: u64,
+    pub scheduled_for_unix_ms: u64,
+    pub universe_manifest_hash: String,
+    pub celestial_registry_hash: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProductionMachineOutcomeKind {
+    Advanced,
+    Completed,
+    CompletedAndDelivered,
+    OutputDelivered,
+    PausedPower,
+    PausedRoute,
+    PausedMachine,
+    OutputBlocked,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProductionMachineOutcome {
+    pub grid_id: String,
+    pub machine_block_id: String,
+    pub job_id: String,
+    pub kind: ProductionMachineOutcomeKind,
+    pub previous_progress_ticks: u64,
+    pub new_progress_ticks: u64,
+    pub destination_inventory_id: String,
+    pub outputs: InventoryContents,
+}
+
+impl ProductionMachineOutcome {
+    pub fn changes_state(&self) -> bool {
+        matches!(
+            self.kind,
+            ProductionMachineOutcomeKind::Advanced
+                | ProductionMachineOutcomeKind::Completed
+                | ProductionMachineOutcomeKind::CompletedAndDelivered
+                | ProductionMachineOutcomeKind::OutputDelivered
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -242,8 +286,7 @@ impl EventPayload {
             | Self::OreRefined { .. }
             | Self::ComponentCrafted { .. }
             | Self::ProductionQueued { .. }
-            | Self::ProductionAdvanced { .. }
-            | Self::ProductionOutputDelivered { .. }
+            | Self::ProductionQuantumCommitted { .. }
             | Self::InventoryTransferred { .. }
             | Self::BlockBuilt { .. }
             | Self::BlockWelded { .. }
@@ -287,8 +330,7 @@ impl EventPayload {
             | Self::PlayerIncapacitated { .. }
             | Self::PlayerRespawned { .. }
             | Self::ProductionQueued { .. }
-            | Self::ProductionAdvanced { .. }
-            | Self::ProductionOutputDelivered { .. }
+            | Self::ProductionQuantumCommitted { .. }
             | Self::GridControlSet { .. }
             | Self::GridAnchorSet { .. }
             | Self::PhysicsStepCommitted { .. } => 0,
@@ -349,16 +391,20 @@ impl EventPayload {
                 "production_queued",
                 format!("Queued {:?} batch(es): {}", job.recipe, job.batches),
             ),
-            Self::ProductionAdvanced {
-                completed: true, ..
-            } => ("production_completed", "Machine work completed".into()),
-            Self::ProductionAdvanced { .. } => {
-                ("production_advanced", "Machine work advanced".into())
+            Self::ProductionQuantumCommitted { outcomes, .. } => {
+                let completed = outcomes.iter().filter(|outcome| {
+                    matches!(
+                        outcome.kind,
+                        ProductionMachineOutcomeKind::Completed
+                            | ProductionMachineOutcomeKind::CompletedAndDelivered
+                    )
+                });
+                if completed.count() > 0 {
+                    ("production_completed", "Machine work completed".into())
+                } else {
+                    ("production_advanced", "Machine work advanced".into())
+                }
             }
-            Self::ProductionOutputDelivered { .. } => (
-                "production_output_delivered",
-                "Machine output delivered to cargo".into(),
-            ),
             Self::InventoryTransferred {
                 resource, quantity, ..
             } => (

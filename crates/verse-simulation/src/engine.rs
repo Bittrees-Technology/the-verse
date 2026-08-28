@@ -19,8 +19,10 @@ use verse_protocol::{
 
 use crate::content;
 use crate::event::{
-    CanonicalEvent, EVENT_SCHEMA_NAME, EVENT_SCHEMA_VERSION, EventPayload, PhysicsBodyOutcome,
-    PhysicsContactOutcome, PhysicsContactPhase, PlayerPhysicsOutcome,
+    CanonicalEvent, EVENT_SCHEMA_NAME, EVENT_SCHEMA_VERSION, EventPayload,
+    PRODUCTION_SCHEDULE_OCCURRENCE_SCHEMA_VERSION, PhysicsBodyOutcome, PhysicsContactOutcome,
+    PhysicsContactPhase, PlayerPhysicsOutcome, ProductionMachineOutcome,
+    ProductionMachineOutcomeKind, ProductionScheduleOccurrence,
 };
 #[cfg(test)]
 use crate::model::PLAYER_INVENTORY_ID;
@@ -903,20 +905,13 @@ impl Runtime {
         let production_seconds = self.production_elapsed_millis / 1_000;
         self.production_elapsed_millis %= 1_000;
         for _ in 0..production_seconds {
-            let machine_ids = self
-                .state
-                .production_queues
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>();
-            for machine_block_id in machine_ids {
-                let Some(payload) = self
-                    .state
-                    .production_payload_after_one_second(&machine_block_id)?
-                else {
-                    continue;
-                };
-                self.commit_system_event(payload)?;
+            let occurrence = self.state.next_active_production_occurrence()?;
+            let payload = self.state.production_quantum_payload(occurrence)?;
+            let EventPayload::ProductionQuantumCommitted { outcomes, .. } = &payload else {
+                unreachable!("production planner returns a production quantum");
+            };
+            if outcomes.iter().any(ProductionMachineOutcome::changes_state) {
+                self.commit_production_quantum(payload)?;
                 outcome.record(AdvanceImpact::Structural);
             }
         }
@@ -925,8 +920,17 @@ impl Runtime {
 
     fn commit_system_event(&mut self, payload: EventPayload) -> Result<(), RuntimeError> {
         let event = self.state.prepare_system_event(payload);
+        self.commit_prepared_system_event(&event)
+    }
+
+    fn commit_production_quantum(&mut self, payload: EventPayload) -> Result<(), RuntimeError> {
+        let event = self.state.prepare_production_quantum_event(payload)?;
+        self.commit_prepared_system_event(&event)
+    }
+
+    fn commit_prepared_system_event(&mut self, event: &CanonicalEvent) -> Result<(), RuntimeError> {
         let mut next_state = self.state.clone();
-        next_state.apply_event(&event)?;
+        next_state.apply_event(event)?;
         if event_changes_physics_scene(&event.payload) {
             self.physics.rebuild(&physics_body_specs(&next_state))?;
             #[cfg(test)]
@@ -934,7 +938,7 @@ impl Runtime {
                 self.physics_full_rebuilds += 1;
             }
         }
-        if let Err(source) = self.store.append_event(&event) {
+        if let Err(source) = self.store.append_event(event) {
             self.halted = true;
             return Err(source.into());
         }
@@ -955,6 +959,24 @@ impl Runtime {
         Ok(())
     }
 
+    /// Commits one scheduler-delivered production occurrence without stepping
+    /// physics, life support, controls, damage, or replication state. Exact
+    /// redelivery of the already committed frontier is an idempotent no-op.
+    pub fn advance_background_production_occurrence(
+        &mut self,
+        occurrence: ProductionScheduleOccurrence,
+    ) -> Result<bool, RuntimeError> {
+        if self.halted {
+            return Err(RuntimeError::Halted);
+        }
+        if self.state.production_occurrence_is_committed(&occurrence) {
+            return Ok(false);
+        }
+        let payload = self.state.production_quantum_payload(occurrence)?;
+        self.commit_production_quantum(payload)?;
+        Ok(true)
+    }
+
     fn after_event(&mut self) -> Result<(), RuntimeError> {
         self.events_since_snapshot += 1;
         if self.events_since_snapshot >= self.snapshot_every {
@@ -965,16 +987,164 @@ impl Runtime {
 }
 
 impl WorldState {
-    fn production_payload_after_one_second(
+    fn production_occurrence_is_committed(
+        &self,
+        occurrence: &ProductionScheduleOccurrence,
+    ) -> bool {
+        occurrence.schema_version == PRODUCTION_SCHEDULE_OCCURRENCE_SCHEMA_VERSION
+            && occurrence.universe_id == self.universe_id
+            && occurrence.cell_id == self.cell_id
+            && occurrence.lifecycle_generation == self.production_clock.lifecycle_generation
+            && occurrence.production_quantum_sequence
+                == self.production_clock.last_committed_quantum_sequence
+            && occurrence.scheduled_for_unix_ms == self.production_clock.last_scheduled_for_unix_ms
+            && occurrence.universe_manifest_hash == self.universe_manifest_hash
+            && occurrence.celestial_registry_hash == self.celestial_registry_hash
+    }
+
+    fn next_active_production_occurrence(
+        &self,
+    ) -> Result<ProductionScheduleOccurrence, IntentError> {
+        let production_quantum_sequence = self
+            .production_clock
+            .last_committed_quantum_sequence
+            .checked_add(1)
+            .ok_or_else(|| {
+                IntentError::rejected(
+                    "production_occurrence_exhausted",
+                    "production occurrence sequence is exhausted",
+                )
+            })?;
+        let scheduled_for_unix_ms = if self.production_clock.last_scheduled_for_unix_ms == 0 {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|_| {
+                    IntentError::rejected(
+                        "production_clock_invalid",
+                        "system time is before the Unix epoch",
+                    )
+                })?
+                .as_millis()
+                .try_into()
+                .map_err(|_| {
+                    IntentError::rejected(
+                        "production_clock_invalid",
+                        "system time cannot be represented by the production clock",
+                    )
+                })?
+        } else {
+            self.production_clock
+                .last_scheduled_for_unix_ms
+                .checked_add(1_000)
+                .ok_or_else(|| {
+                    IntentError::rejected(
+                        "production_clock_exhausted",
+                        "production scheduled time is exhausted",
+                    )
+                })?
+        };
+        Ok(ProductionScheduleOccurrence {
+            schema_version: PRODUCTION_SCHEDULE_OCCURRENCE_SCHEMA_VERSION,
+            universe_id: self.universe_id.clone(),
+            cell_id: self.cell_id.clone(),
+            lifecycle_generation: self.production_clock.lifecycle_generation,
+            production_quantum_sequence,
+            scheduled_for_unix_ms,
+            universe_manifest_hash: self.universe_manifest_hash.clone(),
+            celestial_registry_hash: self.celestial_registry_hash.clone(),
+        })
+    }
+
+    fn production_quantum_payload(
+        &self,
+        occurrence: ProductionScheduleOccurrence,
+    ) -> Result<EventPayload, IntentError> {
+        self.validate_next_production_occurrence(&occurrence)?;
+        let mut scheduled = self
+            .production_queues
+            .keys()
+            .map(|machine_block_id| {
+                self.block_grid(machine_block_id)
+                    .map(|(grid, _)| (grid.grid_id.clone(), machine_block_id.clone()))
+                    .ok_or_else(|| {
+                        IntentError::rejected(
+                            "production_machine_missing",
+                            "a queued production machine is missing from canonical state",
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        scheduled.sort();
+
+        let mut planning_state = self.clone();
+        let mut outcomes = Vec::with_capacity(scheduled.len());
+        for (_, machine_block_id) in scheduled {
+            let outcome =
+                planning_state.production_machine_outcome_after_one_second(&machine_block_id)?;
+            if outcome.changes_state() {
+                planning_state.apply_production_machine_outcome(&outcome)?;
+            }
+            outcomes.push(outcome);
+        }
+        Ok(EventPayload::ProductionQuantumCommitted {
+            occurrence,
+            elapsed_ticks: u64::from(content::manifest().physics.fixed_step_hz),
+            outcomes,
+        })
+    }
+
+    fn validate_next_production_occurrence(
+        &self,
+        occurrence: &ProductionScheduleOccurrence,
+    ) -> Result<(), IntentError> {
+        let expected_sequence = self
+            .production_clock
+            .last_committed_quantum_sequence
+            .checked_add(1)
+            .ok_or_else(|| {
+                IntentError::rejected(
+                    "production_occurrence_exhausted",
+                    "production occurrence sequence is exhausted",
+                )
+            })?;
+        let time_is_valid = if self.production_clock.last_committed_quantum_sequence == 0 {
+            occurrence.scheduled_for_unix_ms > 0
+        } else {
+            self.production_clock
+                .last_scheduled_for_unix_ms
+                .checked_add(1_000)
+                .is_some_and(|expected| occurrence.scheduled_for_unix_ms == expected)
+        };
+        if occurrence.schema_version != PRODUCTION_SCHEDULE_OCCURRENCE_SCHEMA_VERSION
+            || occurrence.universe_id != self.universe_id
+            || occurrence.cell_id != self.cell_id
+            || occurrence.lifecycle_generation != self.production_clock.lifecycle_generation
+            || occurrence.production_quantum_sequence != expected_sequence
+            || occurrence.universe_manifest_hash != self.universe_manifest_hash
+            || occurrence.celestial_registry_hash != self.celestial_registry_hash
+            || !time_is_valid
+        {
+            return Err(IntentError::rejected(
+                "production_occurrence_invalid",
+                "production occurrence is not the exact next trusted cell quantum",
+            ));
+        }
+        Ok(())
+    }
+
+    fn production_machine_outcome_after_one_second(
         &self,
         machine_block_id: &str,
-    ) -> Result<Option<EventPayload>, IntentError> {
+    ) -> Result<ProductionMachineOutcome, IntentError> {
         let Some(job) = self
             .production_queues
             .get(machine_block_id)
             .and_then(|queue| queue.front())
         else {
-            return Ok(None);
+            return Err(IntentError::rejected(
+                "production_job_missing",
+                "a scheduled production machine has no queue head",
+            ));
         };
         let Some((grid, machine)) = self.block_grid(machine_block_id) else {
             return Err(IntentError::rejected(
@@ -982,26 +1152,54 @@ impl WorldState {
                 "a queued production machine is missing from canonical state",
             ));
         };
-        if !machine.is_complete()
-            || !content::machine_supports_recipe(machine.kind, job.recipe)
-            || !grid.power().online
-            || !self.production_route_exists(machine_block_id, &job.source_inventory_id)
+        let base = |kind, new_progress_ticks, outputs| ProductionMachineOutcome {
+            grid_id: grid.grid_id.clone(),
+            machine_block_id: machine_block_id.to_owned(),
+            job_id: job.job_id.clone(),
+            kind,
+            previous_progress_ticks: job.progress_ticks,
+            new_progress_ticks,
+            destination_inventory_id: job.destination_inventory_id.clone(),
+            outputs,
+        };
+        if !machine.is_complete() || !content::machine_supports_recipe(machine.kind, job.recipe) {
+            return Ok(base(
+                ProductionMachineOutcomeKind::PausedMachine,
+                job.progress_ticks,
+                InventoryContents::default(),
+            ));
+        }
+        if !grid.power().online {
+            return Ok(base(
+                ProductionMachineOutcomeKind::PausedPower,
+                job.progress_ticks,
+                InventoryContents::default(),
+            ));
+        }
+        if !self.production_route_exists(machine_block_id, &job.source_inventory_id)
             || !self.production_route_exists(machine_block_id, &job.destination_inventory_id)
         {
-            return Ok(None);
+            return Ok(base(
+                ProductionMachineOutcomeKind::PausedRoute,
+                job.progress_ticks,
+                InventoryContents::default(),
+            ));
         }
 
         if job.progress_ticks == job.duration_ticks {
             let destination = self.inventory(&job.destination_inventory_id)?;
             if !inventory_can_add_contents(destination, &job.pending_outputs) {
-                return Ok(None);
+                return Ok(base(
+                    ProductionMachineOutcomeKind::OutputBlocked,
+                    job.progress_ticks,
+                    job.pending_outputs.clone(),
+                ));
             }
-            return Ok(Some(EventPayload::ProductionOutputDelivered {
-                machine_block_id: machine_block_id.to_owned(),
-                job_id: job.job_id.clone(),
-                destination_inventory_id: job.destination_inventory_id.clone(),
-                outputs: job.pending_outputs.clone(),
-            }));
+            return Ok(base(
+                ProductionMachineOutcomeKind::OutputDelivered,
+                job.progress_ticks,
+                job.pending_outputs.clone(),
+            ));
         }
 
         let elapsed_ticks = u64::from(content::manifest().physics.fixed_step_hz);
@@ -1009,27 +1207,155 @@ impl WorldState {
             .progress_ticks
             .saturating_add(elapsed_ticks)
             .min(job.duration_ticks);
-        let completed = new_progress_ticks == job.duration_ticks;
-        let output_delivered = if completed {
-            let (_, outputs, _) = production_recipe_quantities(job.recipe, job.batches)
-                .ok_or_else(|| {
+        if new_progress_ticks != job.duration_ticks {
+            return Ok(base(
+                ProductionMachineOutcomeKind::Advanced,
+                new_progress_ticks,
+                InventoryContents::default(),
+            ));
+        }
+        let (_, outputs, _) =
+            production_recipe_quantities(job.recipe, job.batches).ok_or_else(|| {
+                IntentError::rejected(
+                    "production_job_invalid",
+                    "queued production quantities no longer match registered content",
+                )
+            })?;
+        let kind =
+            if inventory_can_add_contents(self.inventory(&job.destination_inventory_id)?, &outputs)
+            {
+                ProductionMachineOutcomeKind::CompletedAndDelivered
+            } else {
+                ProductionMachineOutcomeKind::Completed
+            };
+        Ok(base(kind, new_progress_ticks, outputs))
+    }
+
+    fn apply_production_machine_outcome(
+        &mut self,
+        outcome: &ProductionMachineOutcome,
+    ) -> Result<(), IntentError> {
+        match outcome.kind {
+            ProductionMachineOutcomeKind::PausedPower
+            | ProductionMachineOutcomeKind::PausedRoute
+            | ProductionMachineOutcomeKind::PausedMachine
+            | ProductionMachineOutcomeKind::OutputBlocked => Ok(()),
+            ProductionMachineOutcomeKind::Advanced => {
+                self.production_queues
+                    .get_mut(&outcome.machine_block_id)
+                    .and_then(|queue| queue.front_mut())
+                    .expect("validated production queue head exists")
+                    .progress_ticks = outcome.new_progress_ticks;
+                Ok(())
+            }
+            ProductionMachineOutcomeKind::Completed
+            | ProductionMachineOutcomeKind::CompletedAndDelivered => {
+                let job = self.production_queues[&outcome.machine_block_id]
+                    .front()
+                    .expect("validated production completion has a queue head")
+                    .clone();
+                match job.recipe {
+                    ProductionRecipeKind::Refining => {
+                        self.ledger.refine_batches = self
+                            .ledger
+                            .refine_batches
+                            .checked_add(job.batches)
+                            .ok_or_else(|| {
+                                IntentError::rejected(
+                                    "replay_production_ledger_invalid",
+                                    "refining completion overflows the canonical ledger",
+                                )
+                            })?;
+                    }
+                    ProductionRecipeKind::Component => {
+                        self.ledger.crafted_components = self
+                            .ledger
+                            .crafted_components
+                            .checked_add(job.batches)
+                            .ok_or_else(|| {
+                                IntentError::rejected(
+                                    "replay_production_ledger_invalid",
+                                    "component completion overflows the canonical ledger",
+                                )
+                            })?;
+                    }
+                }
+                let (experience_reward, refining_batches, components_crafted) = match job.recipe {
+                    ProductionRecipeKind::Refining => (
+                        job.batches
+                            .saturating_mul(content::manifest().experience_rewards.refining_batch),
+                        job.batches,
+                        0,
+                    ),
+                    ProductionRecipeKind::Component => (
+                        job.batches.saturating_mul(
+                            content::manifest().experience_rewards.crafted_component,
+                        ),
+                        0,
+                        job.batches,
+                    ),
+                };
+                let owner = self.player.get_mut(&job.owner_player_id).ok_or_else(|| {
                     IntentError::rejected(
-                        "production_job_invalid",
-                        "queued production quantities no longer match registered content",
+                        "replay_production_owner_missing",
+                        "production completion owner is not present in the canonical roster",
                     )
                 })?;
-            inventory_can_add_contents(self.inventory(&job.destination_inventory_id)?, &outputs)
-        } else {
-            false
-        };
-        Ok(Some(EventPayload::ProductionAdvanced {
-            machine_block_id: machine_block_id.to_owned(),
-            job_id: job.job_id.clone(),
-            previous_progress_ticks: job.progress_ticks,
-            new_progress_ticks,
-            completed,
-            output_delivered,
-        }))
+                owner.experience = owner.experience.saturating_add(experience_reward);
+                owner.career.refining_batches = owner
+                    .career
+                    .refining_batches
+                    .saturating_add(refining_batches);
+                owner.career.components_crafted = owner
+                    .career
+                    .components_crafted
+                    .saturating_add(components_crafted);
+
+                if matches!(
+                    outcome.kind,
+                    ProductionMachineOutcomeKind::CompletedAndDelivered
+                ) {
+                    add_contents(
+                        &mut self
+                            .inventory_mut(&outcome.destination_inventory_id)?
+                            .contents,
+                        &outcome.outputs,
+                    )?;
+                    self.pop_production_queue_head(&outcome.machine_block_id);
+                } else {
+                    let head = self
+                        .production_queues
+                        .get_mut(&outcome.machine_block_id)
+                        .and_then(|queue| queue.front_mut())
+                        .expect("validated production queue head exists");
+                    head.progress_ticks = outcome.new_progress_ticks;
+                    head.reserved_inputs = InventoryContents::default();
+                    head.pending_outputs.clone_from(&outcome.outputs);
+                }
+                Ok(())
+            }
+            ProductionMachineOutcomeKind::OutputDelivered => {
+                add_contents(
+                    &mut self
+                        .inventory_mut(&outcome.destination_inventory_id)?
+                        .contents,
+                    &outcome.outputs,
+                )?;
+                self.pop_production_queue_head(&outcome.machine_block_id);
+                Ok(())
+            }
+        }
+    }
+
+    fn pop_production_queue_head(&mut self, machine_block_id: &str) {
+        let queue = self
+            .production_queues
+            .get_mut(machine_block_id)
+            .expect("validated production queue exists");
+        queue.pop_front();
+        if queue.is_empty() {
+            self.production_queues.remove(machine_block_id);
+        }
     }
 
     fn next_suit_oxygen_after_one_second_for(&self, player_id: &str) -> Result<u16, IntentError> {
@@ -1486,8 +1812,7 @@ impl WorldState {
                     "physics payload cannot use a human client envelope",
                 ));
             }
-            EventPayload::ProductionAdvanced { .. }
-            | EventPayload::ProductionOutputDelivered { .. } => {
+            EventPayload::ProductionQuantumCommitted { .. } => {
                 return Err(IntentError::rejected(
                     "replay_production_envelope_invalid",
                     "automatic production payload cannot use a human client envelope",
@@ -2151,6 +2476,26 @@ impl WorldState {
         self.new_event(None, "system", None, payload)
     }
 
+    fn prepare_production_quantum_event(
+        &self,
+        payload: EventPayload,
+    ) -> Result<CanonicalEvent, IntentError> {
+        let EventPayload::ProductionQuantumCommitted { occurrence, .. } = &payload else {
+            return Err(IntentError::rejected(
+                "production_payload_invalid",
+                "production commit requires a whole-cell quantum payload",
+            ));
+        };
+        self.validate_next_production_occurrence(occurrence)?;
+        let event_id = production_occurrence_event_id(occurrence);
+        let occurred_at_unix_ms = occurrence.scheduled_for_unix_ms;
+        let mut event = self.new_event(None, "system", None, payload);
+        event.event_id = event_id;
+        event.occurred_at_unix_ms = occurred_at_unix_ms;
+        event.event_hash = event.calculate_hash();
+        Ok(event)
+    }
+
     fn new_event(
         &self,
         actor_player_id: Option<&str>,
@@ -2384,15 +2729,14 @@ impl WorldState {
                     "industry, construction, grid control, anchoring, and hand-tool damage require an authenticated player actor and operation ID",
                 ));
             }
-            EventPayload::ProductionAdvanced { .. }
-            | EventPayload::ProductionOutputDelivered { .. }
+            EventPayload::ProductionQuantumCommitted { .. }
                 if event.actor_player_id.is_some()
                     || event.actor_type != "system"
                     || event.operation_id.is_some() =>
             {
                 return Err(IntentError::rejected(
                     "replay_production_envelope_invalid",
-                    "production advancement and delivery require the system actor and no operation ID",
+                    "production quanta require the system actor and no operation ID",
                 ));
             }
             EventPayload::PhysicsStepCommitted { .. }
@@ -2823,141 +3167,35 @@ impl WorldState {
                     .or_default()
                     .push_back(job.clone());
             }
-            EventPayload::ProductionAdvanced {
-                machine_block_id,
-                new_progress_ticks,
-                completed,
-                output_delivered,
-                ..
+            EventPayload::ProductionQuantumCommitted {
+                occurrence,
+                elapsed_ticks,
+                outcomes,
             } => {
-                let expected = self.production_payload_after_one_second(machine_block_id)?;
-                if expected.as_ref() != Some(&event.payload) {
+                if *elapsed_ticks != u64::from(content::manifest().physics.fixed_step_hz)
+                    || event.event_id != production_occurrence_event_id(occurrence)
+                    || event.occurred_at_unix_ms != occurrence.scheduled_for_unix_ms
+                {
                     return Err(IntentError::rejected(
-                        "replay_production_advance_invalid",
-                        "production advance does not match the exact authoritative one-second outcome",
+                        "replay_production_quantum_envelope_invalid",
+                        "production quantum identity, time, or elapsed ticks are invalid",
                     ));
                 }
-                let job = self.production_queues[machine_block_id]
-                    .front()
-                    .expect("validated production advance has a queue head")
-                    .clone();
-                if *completed {
-                    let (_, outputs, _) = production_recipe_quantities(job.recipe, job.batches)
-                        .expect("validated production job quantities remain registered");
-                    match job.recipe {
-                        ProductionRecipeKind::Refining => {
-                            self.ledger.refine_batches = self
-                                .ledger
-                                .refine_batches
-                                .checked_add(job.batches)
-                                .ok_or_else(|| {
-                                    IntentError::rejected(
-                                        "replay_production_ledger_invalid",
-                                        "refining completion overflows the canonical ledger",
-                                    )
-                                })?;
-                        }
-                        ProductionRecipeKind::Component => {
-                            self.ledger.crafted_components = self
-                                .ledger
-                                .crafted_components
-                                .checked_add(job.batches)
-                                .ok_or_else(|| {
-                                    IntentError::rejected(
-                                        "replay_production_ledger_invalid",
-                                        "component completion overflows the canonical ledger",
-                                    )
-                                })?;
-                        }
-                    }
-                    let (experience_reward, refining_batches, components_crafted) = match job.recipe
-                    {
-                        ProductionRecipeKind::Refining => (
-                            job.batches.saturating_mul(
-                                content::manifest().experience_rewards.refining_batch,
-                            ),
-                            job.batches,
-                            0,
-                        ),
-                        ProductionRecipeKind::Component => (
-                            job.batches.saturating_mul(
-                                content::manifest().experience_rewards.crafted_component,
-                            ),
-                            0,
-                            job.batches,
-                        ),
-                    };
-                    let owner = self.player.get_mut(&job.owner_player_id).ok_or_else(|| {
-                        IntentError::rejected(
-                            "replay_production_owner_missing",
-                            "production completion owner is not present in the canonical roster",
-                        )
-                    })?;
-                    owner.experience = owner.experience.saturating_add(experience_reward);
-                    owner.career.refining_batches = owner
-                        .career
-                        .refining_batches
-                        .saturating_add(refining_batches);
-                    owner.career.components_crafted = owner
-                        .career
-                        .components_crafted
-                        .saturating_add(components_crafted);
-                    if *output_delivered {
-                        add_contents(
-                            &mut self.inventory_mut(&job.destination_inventory_id)?.contents,
-                            &outputs,
-                        )?;
-                        let queue = self
-                            .production_queues
-                            .get_mut(machine_block_id)
-                            .expect("queue exists");
-                        queue.pop_front();
-                        if queue.is_empty() {
-                            self.production_queues.remove(machine_block_id);
-                        }
-                    } else {
-                        let head = self
-                            .production_queues
-                            .get_mut(machine_block_id)
-                            .and_then(|queue| queue.front_mut())
-                            .expect("validated production queue head exists");
-                        head.progress_ticks = *new_progress_ticks;
-                        head.reserved_inputs = InventoryContents::default();
-                        head.pending_outputs = outputs;
-                    }
-                } else {
-                    self.production_queues
-                        .get_mut(machine_block_id)
-                        .and_then(|queue| queue.front_mut())
-                        .expect("validated production queue head exists")
-                        .progress_ticks = *new_progress_ticks;
-                }
-            }
-            EventPayload::ProductionOutputDelivered {
-                machine_block_id,
-                destination_inventory_id,
-                outputs,
-                ..
-            } => {
-                let expected = self.production_payload_after_one_second(machine_block_id)?;
-                if expected.as_ref() != Some(&event.payload) {
+                let expected = self.production_quantum_payload(occurrence.clone())?;
+                if expected != event.payload {
                     return Err(IntentError::rejected(
-                        "replay_production_delivery_invalid",
-                        "production output delivery does not match authoritative route and capacity",
+                        "replay_production_quantum_invalid",
+                        "production quantum does not match the complete authoritative one-second outcome",
                     ));
                 }
-                add_contents(
-                    &mut self.inventory_mut(destination_inventory_id)?.contents,
-                    outputs,
-                )?;
-                let queue = self
-                    .production_queues
-                    .get_mut(machine_block_id)
-                    .expect("queue exists");
-                queue.pop_front();
-                if queue.is_empty() {
-                    self.production_queues.remove(machine_block_id);
+                for outcome in outcomes {
+                    if outcome.changes_state() {
+                        self.apply_production_machine_outcome(outcome)?;
+                    }
                 }
+                self.production_clock.last_committed_quantum_sequence =
+                    occurrence.production_quantum_sequence;
+                self.production_clock.last_scheduled_for_unix_ms = occurrence.scheduled_for_unix_ms;
             }
             EventPayload::OreRefined {
                 inventory_id,
@@ -3941,8 +4179,7 @@ impl WorldState {
             | EventPayload::PlayerIncapacitated { .. }
             | EventPayload::PlayerRespawned { .. }
             | EventPayload::ProductionQueued { .. }
-            | EventPayload::ProductionAdvanced { .. }
-            | EventPayload::ProductionOutputDelivered { .. }
+            | EventPayload::ProductionQuantumCommitted { .. }
             | EventPayload::InventoryTransferred { .. }
             | EventPayload::BlockBuilt { .. }
             | EventPayload::BlockWelded { .. }
@@ -4975,11 +5212,19 @@ fn event_changes_physics_scene(payload: &EventPayload) -> bool {
             | EventPayload::SuitModeChanged { .. }
             | EventPayload::SuitOxygenChanged { .. }
             | EventPayload::ProductionQueued { .. }
-            | EventPayload::ProductionAdvanced { .. }
-            | EventPayload::ProductionOutputDelivered { .. }
+            | EventPayload::ProductionQuantumCommitted { .. }
             | EventPayload::GridControlSet { .. }
             | EventPayload::PhysicsStepCommitted { .. }
     )
+}
+
+fn production_occurrence_event_id(occurrence: &ProductionScheduleOccurrence) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"the-verse/production-occurrence/v1\0");
+    hasher.update(
+        &serde_json::to_vec(occurrence).expect("production occurrence serialization cannot fail"),
+    );
+    hasher.finalize().to_hex().to_string()
 }
 
 fn voxel_collision_chunk_edge_cells() -> i32 {
@@ -6466,6 +6711,226 @@ mod tests {
     fn advance_whole_seconds(runtime: &mut Runtime, seconds: usize) {
         for _ in 0..seconds * 4 {
             runtime.advance(250).expect("authoritative second advances");
+        }
+    }
+
+    fn two_machine_production_runtime(directory: &Path) -> Runtime {
+        let mut runtime = Runtime::open(directory, 499, 100).expect("runtime opens");
+        seed_industry_cargo(
+            &mut runtime,
+            InventoryContents {
+                ore: 2,
+                refined_material: 1,
+                ..InventoryContents::default()
+            },
+        );
+        runtime
+            .execute_next_for_fixture(&production_intent(
+                "atomic-refine",
+                "block-refinery",
+                ProductionRecipeKind::Refining,
+                1,
+            ))
+            .expect("refinery queue accepts");
+        runtime
+            .execute_next_for_fixture(&production_intent(
+                "atomic-component",
+                "block-assembler",
+                ProductionRecipeKind::Component,
+                1,
+            ))
+            .expect("assembler queue accepts");
+        runtime
+    }
+
+    fn last_journal_event(directory: &Path) -> CanonicalEvent {
+        let journal =
+            fs::read_to_string(directory.join("events.ndjson")).expect("production journal reads");
+        serde_json::from_str(
+            journal
+                .lines()
+                .last()
+                .expect("production journal contains an event"),
+        )
+        .expect("production event parses")
+    }
+
+    #[test]
+    fn whole_cell_production_quantum_is_one_ordered_atomic_event() {
+        let directory = tempdir().expect("tempdir");
+        let mut runtime = two_machine_production_runtime(directory.path());
+        let before_sequence = runtime.state().event_sequence;
+        let occurrence = runtime
+            .state()
+            .next_active_production_occurrence()
+            .expect("next occurrence exists");
+
+        assert!(
+            runtime
+                .advance_background_production_occurrence(occurrence)
+                .expect("whole-cell quantum commits")
+        );
+
+        assert_eq!(runtime.state().event_sequence, before_sequence + 1);
+        assert_eq!(
+            runtime
+                .state()
+                .production_queues
+                .values()
+                .map(|queue| queue.front().expect("queue head").progress_ticks)
+                .collect::<Vec<_>>(),
+            vec![60, 60]
+        );
+        assert_eq!(
+            runtime
+                .state()
+                .production_clock
+                .last_committed_quantum_sequence,
+            1
+        );
+        let event = last_journal_event(directory.path());
+        let EventPayload::ProductionQuantumCommitted {
+            occurrence,
+            elapsed_ticks,
+            outcomes,
+        } = event.payload
+        else {
+            panic!("last event must be the atomic production quantum");
+        };
+        assert_eq!(event.event_id, production_occurrence_event_id(&occurrence));
+        assert_eq!(event.occurred_at_unix_ms, occurrence.scheduled_for_unix_ms);
+        assert_eq!(occurrence.production_quantum_sequence, 1);
+        assert_eq!(elapsed_ticks, 60);
+        assert_eq!(outcomes.len(), 2);
+        assert_eq!(outcomes[0].grid_id, STARTER_INDUSTRY_GRID_ID);
+        assert_eq!(outcomes[0].machine_block_id, "block-assembler");
+        assert_eq!(outcomes[1].grid_id, STARTER_INDUSTRY_GRID_ID);
+        assert_eq!(outcomes[1].machine_block_id, "block-refinery");
+        assert!(
+            outcomes
+                .iter()
+                .all(|outcome| outcome.kind == ProductionMachineOutcomeKind::Advanced)
+        );
+        assert!(runtime.state().conservation().valid);
+    }
+
+    #[test]
+    fn production_quantum_replay_rejects_any_outcome_tamper_before_mutation() {
+        let directory = tempdir().expect("tempdir");
+        let mut runtime = two_machine_production_runtime(directory.path());
+        let prior = runtime.state().clone();
+        let occurrence = runtime
+            .state()
+            .next_active_production_occurrence()
+            .expect("next occurrence exists");
+        runtime
+            .advance_background_production_occurrence(occurrence)
+            .expect("whole-cell quantum commits");
+        let mut event = last_journal_event(directory.path());
+        let EventPayload::ProductionQuantumCommitted { outcomes, .. } = &mut event.payload else {
+            panic!("last event must be a production quantum");
+        };
+        outcomes[0].new_progress_ticks += 1;
+        event.event_hash = event.calculate_hash();
+
+        let mut replay = prior.clone();
+        assert!(matches!(
+            replay.apply_event(&event),
+            Err(IntentError::Rejected { code, .. }) if code == "replay_production_quantum_invalid"
+        ));
+        assert_eq!(replay, prior);
+    }
+
+    #[test]
+    fn background_occurrence_is_idempotent_and_changes_no_physics_or_life_state() {
+        let directory = tempdir().expect("tempdir");
+        let mut runtime = two_machine_production_runtime(directory.path());
+        let occurrence = runtime
+            .state()
+            .next_active_production_occurrence()
+            .expect("next occurrence exists");
+        let prior_sequence = runtime.state().event_sequence;
+        let prior_tick = runtime.state().simulation_tick;
+        let prior_phase = runtime.state().physics_step_phase;
+        let prior_players = runtime.state().player.clone();
+
+        assert!(
+            runtime
+                .advance_background_production_occurrence(occurrence.clone())
+                .expect("background occurrence commits")
+        );
+        assert_eq!(runtime.state().event_sequence, prior_sequence + 1);
+        assert_eq!(runtime.state().simulation_tick, prior_tick);
+        assert_eq!(runtime.state().physics_step_phase, prior_phase);
+        assert_eq!(runtime.state().player, prior_players);
+        let committed_hash = runtime.state().state_hash();
+
+        assert!(
+            !runtime
+                .advance_background_production_occurrence(occurrence)
+                .expect("duplicate occurrence reconciles")
+        );
+        assert_eq!(runtime.state().event_sequence, prior_sequence + 1);
+        assert_eq!(runtime.state().state_hash(), committed_hash);
+    }
+
+    #[test]
+    fn production_quantum_failpoints_recover_none_or_the_complete_vector() {
+        for (failpoint, durable) in [
+            (AppendFailpoint::BeforeWrite, false),
+            (AppendFailpoint::AfterSync, true),
+        ] {
+            let directory = tempdir().expect("tempdir");
+            let mut runtime = two_machine_production_runtime(directory.path());
+            let occurrence = runtime
+                .state()
+                .next_active_production_occurrence()
+                .expect("next occurrence exists");
+            let prior_hash = runtime.state().state_hash();
+            let prior_sequence = runtime.state().event_sequence;
+            runtime.store.set_append_failpoint(failpoint);
+
+            assert!(matches!(
+                runtime.advance_background_production_occurrence(occurrence),
+                Err(RuntimeError::Persistence(
+                    PersistenceError::InjectedFailure(_)
+                ))
+            ));
+            assert!(runtime.is_halted());
+            assert_eq!(runtime.state().state_hash(), prior_hash);
+            assert_eq!(runtime.state().event_sequence, prior_sequence);
+            drop(runtime);
+
+            let recovered =
+                Runtime::open(directory.path(), 499, 100).expect("failed quantum recovers");
+            let progress = recovered
+                .state()
+                .production_queues
+                .values()
+                .map(|queue| queue.front().expect("queue head").progress_ticks)
+                .collect::<Vec<_>>();
+            if durable {
+                assert_eq!(recovered.state().event_sequence, prior_sequence + 1);
+                assert_eq!(progress, vec![60, 60]);
+                assert_eq!(
+                    recovered
+                        .state()
+                        .production_clock
+                        .last_committed_quantum_sequence,
+                    1
+                );
+            } else {
+                assert_eq!(recovered.state().event_sequence, prior_sequence);
+                assert_eq!(progress, vec![0, 0]);
+                assert_eq!(
+                    recovered
+                        .state()
+                        .production_clock
+                        .last_committed_quantum_sequence,
+                    0
+                );
+            }
+            assert!(recovered.state().conservation().valid);
         }
     }
 
