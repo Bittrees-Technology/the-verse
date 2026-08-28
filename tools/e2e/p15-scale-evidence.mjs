@@ -349,7 +349,7 @@ async function collectEvidence() {
       "single local simulation-worker process",
       "paused deterministic proof universe",
       "public-origin spectator observers only",
-      "JSON WebSocket protocol-16 proof transport",
+      "JSON WebSocket protocol-17 proof transport",
       "no WAN latency, packet loss, multi-region, or failover",
       "not evidence of thousand-player or production capacity",
     ],

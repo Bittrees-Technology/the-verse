@@ -15,7 +15,7 @@ use verse_protocol::{
 
 use crate::{celestial, content};
 
-pub const WORLD_SCHEMA_VERSION: u32 = 18;
+pub const WORLD_SCHEMA_VERSION: u32 = 19;
 pub const PROCESSED_OPERATION_RETENTION_LIMIT: usize = 128;
 pub const PROCESSED_OPERATION_RETAINED_BYTES_LIMIT: usize = 131_072;
 pub const PROCESSED_OPERATION_RECORD_BYTES_LIMIT: usize = 4_096;
@@ -416,6 +416,24 @@ pub struct ProductionJob {
     pub queued_event_sequence: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProductionClock {
+    pub lifecycle_generation: u64,
+    pub last_committed_quantum_sequence: u64,
+    pub last_scheduled_for_unix_ms: u64,
+}
+
+impl Default for ProductionClock {
+    fn default() -> Self {
+        Self {
+            lifecycle_generation: 1,
+            last_committed_quantum_sequence: 0,
+            last_scheduled_for_unix_ms: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeathDrop {
@@ -783,6 +801,7 @@ pub struct WorldState {
     pub grids: BTreeMap<String, Grid>,
     pub inventories: BTreeMap<String, InventoryRecord>,
     pub production_queues: BTreeMap<String, VecDeque<ProductionJob>>,
+    pub production_clock: ProductionClock,
     pub death_drops: BTreeMap<String, DeathDrop>,
     pub ledger: Ledger,
     pub processed_operations: BTreeMap<String, ActorOperationHistory>,
@@ -934,6 +953,14 @@ impl WorldState {
         }
         if self.content_manifest_version != content::manifest().manifest_version {
             return Err("world content manifest does not match the active rules".into());
+        }
+        if self.production_clock.lifecycle_generation == 0
+            || (self.production_clock.last_committed_quantum_sequence == 0
+                && self.production_clock.last_scheduled_for_unix_ms != 0)
+            || (self.production_clock.last_committed_quantum_sequence > 0
+                && self.production_clock.last_scheduled_for_unix_ms == 0)
+        {
+            return Err("world production clock frontier is invalid".into());
         }
         let registry = celestial::registry_snapshot(self.world_seed)
             .map_err(|source| format!("world celestial registry is invalid: {source}"))?;
@@ -1686,6 +1713,7 @@ impl WorldState {
                 ),
             ]),
             production_queues: BTreeMap::new(),
+            production_clock: ProductionClock::default(),
             death_drops: BTreeMap::new(),
             ledger: Ledger {
                 genesis_components: 24,

@@ -391,19 +391,19 @@ mod tests {
     use verse_interest_verifier::{InterestVerifier, VerifierConfig};
     use verse_protocol::SessionRole;
 
-    const WELCOME: &[u8] = br#"{"type":"welcome","protocol_version":16,"projection_schema_version":3,"world_schema_version":18,"event_schema_version":14,"content_schema_version":11,"content_manifest_version":"p1.5.0","celestial_registry_schema_version":1,"universe_manifest_schema_version":2,"interest_schema_version":1,"server_name":"adapter-test","session_role":{"kind":"player","player_id":"player-local"}}"#;
+    const WELCOME: &[u8] = br#"{"type":"welcome","protocol_version":17,"projection_schema_version":3,"world_schema_version":19,"event_schema_version":15,"content_schema_version":11,"content_manifest_version":"p1.5.0","celestial_registry_schema_version":1,"universe_manifest_schema_version":3,"interest_schema_version":1,"server_name":"adapter-test","session_role":{"kind":"player","player_id":"player-local"}}"#;
     const CONTENT_HASH: &str = "fc61c05b335fb951868010ecf2942a92ec4f03d00d0a75d3acba8c6f5162b6bd";
     const UNIVERSE_ID: &str = "the-verse-local";
     const REGISTRY_HASH: &str = "4c367bbfa04218ece14104f0a3a7ec2c7e9fefcc37d4cf78a265df2d711a59da";
-    const MANIFEST_HASH: &str = "08f96738abee769d2f9998a9666970ef6cd8474f3270977aec1a50672aad814e";
+    const MANIFEST_HASH: &str = "c9bfd3baa1e64ab7665e60c4f989491e745e9af0d2512989f41625b57b546ace";
 
     fn session() -> AdapterSession {
         let mut session = AdapterSession::default();
         session
             .reset_player(
                 "player-local",
-                18,
-                14,
+                19,
+                15,
                 11,
                 "p1.5.0",
                 CONTENT_HASH,
@@ -428,14 +428,14 @@ mod tests {
                     SessionRole::Player {
                         player_id: "player-vector".to_owned(),
                     },
-                    18,
-                    14,
+                    19,
+                    15,
                     11,
                     "p1.5.0",
                     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                     "universe-vector",
                     "f00517b0fbef09d7924fde2cb11f2c74066627992ab900a6a9e0bd3ac3dc7311",
-                    "a3c80a0f93da41f3409918795a5a11a5369fe4046e48993c887d3cd60ade7975",
+                    "5b54eedd8dfe2cae6f5bdc9f4f09ab8131873b12f28d2faaba5cf98012d72bab",
                 ))
                 .expect("vector verifier config"),
             ),
@@ -482,7 +482,7 @@ mod tests {
         let mut session = session();
         let tampered = String::from_utf8(WELCOME.to_vec())
             .expect("fixture is UTF-8")
-            .replace("\"world_schema_version\":18", "\"world_schema_version\":19");
+            .replace("\"world_schema_version\":19", "\"world_schema_version\":20");
         let error = session
             .stage(tampered.as_bytes())
             .expect_err("tampered tuple must be rejected");
@@ -492,7 +492,7 @@ mod tests {
             .stage(WELCOME)
             .expect("valid welcome must still stage after rejection");
         assert_eq!(staged.kind, "welcome");
-        assert!(staged.sanitized_json.contains("\"protocol_version\":16"));
+        assert!(staged.sanitized_json.contains("\"protocol_version\":17"));
         let committed = session.commit(staged.token).expect("welcome commit");
         assert_eq!(committed.kind, "welcome");
         assert_eq!(committed.acknowledgement, None);
@@ -512,8 +512,8 @@ mod tests {
         session
             .reset_player(
                 "player-local",
-                18,
-                14,
+                19,
+                15,
                 11,
                 "p1.5.0",
                 CONTENT_HASH,

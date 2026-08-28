@@ -7,7 +7,12 @@ These invariants are higher priority than convenience or performance.
 ## Authority
 
 - Exactly one active writer owns a simulation aggregate at a time.
-- A stale cell lease cannot commit events.
+- A stale, expired, uncertain, wrong-holder, or wrong-root cell lease cannot
+  append events, write snapshots, acknowledge work, publish state, or report
+  healthy.
+- Every live append and snapshot uses the store's exact current nonzero fencing
+  token. Historical event fences are positive and nondecreasing; a replacement
+  token is strictly greater than the recovered maximum and cannot wrap.
 - Clients and public applications never write canonical state directly.
 - Administrative actions identify their authority and reason.
 - Spatial interest and client-loaded state never grant intent, ownership,
@@ -85,6 +90,29 @@ These invariants are higher priority than convenience or performance.
   one coordinated set.
 - Upgrade and rollback drain incompatible sessions. Older executables never
   reinterpret newer worlds, journals, registries, baselines, or deltas.
+
+## P1.6 lifecycle and compatibility
+
+- The production-clock generation survives ordinary lifecycle transitions,
+  process restart, lease renewal and worker replacement. Only an explicit
+  reset or audited migration may increment it and restart its contiguous
+  occurrence sequence.
+- One due production occurrence commits at most one atomic whole-cell quantum.
+  Duplicate delivery cannot repeat progress, output, loss, ledger credit, or
+  experience; missing, reordered, future or conflicting delivery cannot mutate.
+- Active and Background recompute the same canonically ordered production
+  outcomes from the same prior state. Background advances no physics tick,
+  pose, controls, contacts, oxygen, damage, combat, AI, cleanup or interest.
+- Catch-up is exact, sequential and bounded. It never skips or coalesces overdue
+  quanta, and paused/empty production does not create a one-second busy poll.
+- P1.6 admits only protocol `17`, projection schema `3`, world schema `19`,
+  event schema `15`, content schema `11`, content manifest `p1.5.0`, registry
+  schema `1`, universe manifest schema `3`, interest schema `1`, operation
+  fingerprint schema `1`, lifecycle-control schema `1`, and schedule-occurrence
+  schema `1` as one coordinated set.
+- Activation admits no gameplay state before occurrence catch-up through its
+  wake cut-off, invariant validation, snapshot, and a fresh session/interest
+  baseline. Public spectators cannot wake or retain a sleeping proof cell.
 
 ## Assets
 
