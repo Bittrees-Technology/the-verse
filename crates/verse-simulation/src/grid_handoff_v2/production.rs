@@ -578,26 +578,23 @@ impl DraftImportedProductionOccurrenceControlsV2 {
     }
 
     pub(super) fn validate_canonical(&self) -> Result<(), DraftGridClosureError> {
-        if self.machines.is_empty()
-            || self.machines.iter().any(|control| {
-                !valid_stable_id(&control.grid_id)
-                    || !valid_stable_id(&control.machine_block_id)
-                    || match control.kind {
-                        DraftProductionMachineControlKindV2::Evaluate => {
-                            control.eligibility_hash.is_some()
-                        }
-                        DraftProductionMachineControlKindV2::TransferPaused
-                        | DraftProductionMachineControlKindV2::ReleaseAndEvaluate => control
-                            .eligibility_hash
-                            .as_ref()
-                            .is_none_or(|hash| !valid_blake3_hex(hash)),
+        if self.machines.iter().any(|control| {
+            !valid_stable_id(&control.grid_id)
+                || !valid_stable_id(&control.machine_block_id)
+                || match control.kind {
+                    DraftProductionMachineControlKindV2::Evaluate => {
+                        control.eligibility_hash.is_some()
                     }
-            })
-            || self.machines.windows(2).any(|pair| {
-                (&pair[0].grid_id, &pair[0].machine_block_id)
-                    >= (&pair[1].grid_id, &pair[1].machine_block_id)
-            })
-            || !valid_blake3_hex(&self.controls_root)
+                    DraftProductionMachineControlKindV2::TransferPaused
+                    | DraftProductionMachineControlKindV2::ReleaseAndEvaluate => control
+                        .eligibility_hash
+                        .as_ref()
+                        .is_none_or(|hash| !valid_blake3_hex(hash)),
+                }
+        }) || self.machines.windows(2).any(|pair| {
+            (&pair[0].grid_id, &pair[0].machine_block_id)
+                >= (&pair[1].grid_id, &pair[1].machine_block_id)
+        }) || !valid_blake3_hex(&self.controls_root)
             || self.controls_root != self.calculate_root()?
         {
             return Err(DraftGridClosureError::Invalid(

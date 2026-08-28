@@ -645,13 +645,17 @@ a directory-finalized transfer with no local finalization event fails closed.
 The private event-17 envelope now binds the complete protocol-19 compatibility
 tuple and has distinct typed payloads for prepare, quarantine, export, import,
 activation, finalization, side-specific abort, and production occurrence.
-Prepare, quarantine, and abort already apply through that canonical envelope;
-their retained proofs round-trip through directory v3 with its document
-identity and complete assignment-generation-to-cell-fence histories. Validation
-requires every proof to use an authority pair the directory actually issued,
-and rejects a resealed cross-pair even when its individual numbers are in
-range. Successor workers use separate event-free reconciliation transactions,
-so an already committed event is never invented again during recovery.
+All eight draft operations now apply through that canonical envelope. Every
+retained proof binds the canonical event and payload hashes; source export also
+retains its exact predecessor event and draft-world commitment. Handoff proofs
+round-trip through directory v3 with its document identity and complete
+assignment-generation-to-cell-fence histories. Validation requires every proof
+to use an authority pair the directory actually issued, and rejects a resealed
+cross-pair even when its individual numbers are in range. Successor workers use
+separate event-free reconciliation transactions, so an already committed event
+is never invented again during recovery. A proof-only replay dispatcher must
+resolve the exact historical directory revision externally and compare it with
+the event payload; serialized authority is not itself a trust root.
 The active event-17 runtime/store adapter, scheduler and durable wake-up path,
 and persistence failpoint crash/replay integration remain to be implemented
 before activation. All drafts are
