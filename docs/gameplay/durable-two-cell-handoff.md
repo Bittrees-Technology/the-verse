@@ -531,6 +531,14 @@ grid closures. Upgrade refuses nonterminal transfers; incompatible roots stay
 archive/read-only unless an explicit offline migration proves the complete
 tuple transition.
 
+Implementation is staged behind that boundary. The private directory-v3 draft
+already validates ordered grid-and-rider membership, closure and conservation
+roots, package and receipt schemas, historical cell fences, phase-specific
+cell-event proofs, atomic document identity, exact face adjacency, and terminal
+generation history. It is intentionally unreachable from the production
+directory-v2 open/write path until every version in the table above moves in
+one coordinated activation.
+
 The first P1.7 proof archives and resets P1.6 data. A later offline migration
 must derive canonical cell keys, install one placement generation for every
 mobile aggregate, replace cell-bound operation fingerprints without weakening

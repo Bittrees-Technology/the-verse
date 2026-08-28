@@ -142,9 +142,11 @@ revision `71e955c`. The later P1.6 checkpoint adds fenced sleeping-cell
 production, and the current P1.7 checkpoint adds a durable two-cell directory,
 same-session independent-EVA handoff, verified destination routing, and exact
 restart recovery. Ordinary grid closure handoff is the next compatibility
-boundary; it is specified but not yet implemented. Production active-player
-load, the production binary codec, general multi-cell execution, safe zones,
-accounts, AMMs, and blockchain settlement remain in the
+boundary. Its audited atomic grid-and-rider placement primitive and dormant,
+strict directory-v3 codec are implemented, while production remains pinned to
+protocol 18/directory 2 until the complete protocol-19 tuple activates
+together. Production active-player load, the production binary codec, general
+multi-cell execution, safe zones, accounts, AMMs, and blockchain settlement remain in the
 [delivery roadmap](docs/roadmap/roadmap.md). See [Celestial registry and
 interest-managed visibility](docs/gameplay/celestial-registry-and-interest-management.md),
 [Physical refining and manufacturing](docs/gameplay/physical-industry.md),
