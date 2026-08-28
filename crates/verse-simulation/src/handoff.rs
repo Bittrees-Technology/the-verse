@@ -19,7 +19,7 @@ use crate::model::{
     TransferConservationWitness, TransferWitnessDirection, WorldState, valid_blake3_hex,
 };
 
-pub const TRANSFER_PACKAGE_SCHEMA_VERSION: u32 = 1;
+pub const TRANSFER_PACKAGE_SCHEMA_VERSION: u32 = verse_protocol::TRANSFER_PACKAGE_SCHEMA_VERSION;
 pub const MAX_TRANSFER_ARTIFACT_BYTES: usize = 2 * 1_024 * 1_024;
 
 const PACKAGE_FILE: &str = "package.json";
@@ -1136,8 +1136,8 @@ mod tests {
     use super::*;
     use crate::model::WORLD_SCHEMA_VERSION;
     use crate::{
-        EVENT_SCHEMA_VERSION, LocalCellDirectory, MobileAggregateKind, neighbor_cell_key,
-        proof_cell_keys, universe_manifest,
+        EVENT_SCHEMA_VERSION, EventPayload, LocalCellDirectory, MobileAggregateKind,
+        neighbor_cell_key, proof_cell_keys, universe_manifest,
     };
     use tempfile::tempdir;
     use verse_protocol::ClientMessage;
@@ -1564,5 +1564,116 @@ mod tests {
             artifacts.persist_quarantine_receipt(&receipt_conflict),
             Err(HandoffArtifactError::Conflict(_))
         ));
+    }
+
+    #[test]
+    fn canonical_transfer_events_replay_exact_lock_reservation_export_and_import() {
+        let (source, destination, context) = crossing_fixture();
+        let package = prepare_eva_player_transfer(&source, "player-local", &context)
+            .expect("EVA package prepares");
+        let prepared = CellTransferRecord {
+            transfer_id: package.transfer_id.clone(),
+            aggregate_id: package.aggregate_id.clone(),
+            aggregate_kind: MobileAggregateKind::Player,
+            source_cell_key: package.source_cell_key.clone(),
+            source_cell_id: package.source_cell_id.clone(),
+            destination_cell_key: package.destination_cell_key.clone(),
+            destination_cell_id: package.destination_cell_id.clone(),
+            source_assignment_generation: package.source_assignment_generation,
+            destination_assignment_generation: package.destination_assignment_generation,
+            prior_placement_generation: package.prior_placement_generation,
+            resulting_placement_generation: package.resulting_placement_generation,
+            package_hash: package.package_hash.clone(),
+            quarantine_receipt_hash: None,
+            phase: TransferPhase::Prepared,
+        };
+        let prepare_event = source.prepare_system_event(EventPayload::PlayerTransferPrepared {
+            package: package.clone(),
+            directory_transfer: prepared.clone(),
+        });
+        let mut locked_source = source.clone();
+        locked_source
+            .apply_event(&round_trip_event(&prepare_event))
+            .expect("prepare event replays");
+        assert!(
+            locked_source
+                .player_transfer_locks
+                .contains_key("player-local")
+        );
+
+        let receipt =
+            quarantine_eva_player_transfer(&destination, destination.fencing_token, &package)
+                .expect("receipt prepares");
+        let quarantine_event =
+            destination.prepare_system_event(EventPayload::PlayerTransferQuarantined {
+                package: package.clone(),
+                receipt: receipt.clone(),
+            });
+        let mut reserved_destination = destination.clone();
+        reserved_destination
+            .apply_event(&round_trip_event(&quarantine_event))
+            .expect("quarantine event replays");
+        assert!(
+            reserved_destination
+                .player_transfer_reservations
+                .contains_key(&package.transfer_id)
+        );
+
+        let committed = CellTransferRecord {
+            quarantine_receipt_hash: Some(receipt.receipt_hash.clone()),
+            phase: TransferPhase::Committed,
+            ..prepared
+        };
+        let export_event =
+            locked_source.prepare_system_event(EventPayload::PlayerTransferExported {
+                package: package.clone(),
+                directory_transfer: committed.clone(),
+            });
+        let import_event =
+            reserved_destination.prepare_system_event(EventPayload::PlayerTransferImported {
+                package: package.clone(),
+                receipt: receipt.clone(),
+                directory_transfer: committed,
+            });
+        locked_source
+            .apply_event(&round_trip_event(&export_event))
+            .expect("export event replays");
+        reserved_destination
+            .apply_event(&round_trip_event(&import_event))
+            .expect("import event replays");
+        assert!(locked_source.player.get("player-local").is_none());
+        assert_eq!(
+            reserved_destination.player.get("player-local"),
+            Some(&package.destination_player)
+        );
+        assert_eq!(locked_source.event_sequence, 2);
+        assert_eq!(reserved_destination.event_sequence, 2);
+        assert!(locked_source.conservation().valid);
+        assert!(reserved_destination.conservation().valid);
+
+        let mut replayed_source = source;
+        replayed_source
+            .apply_event(&round_trip_event(&prepare_event))
+            .expect("prepare replays from prior source");
+        replayed_source
+            .apply_event(&round_trip_event(&export_event))
+            .expect("export replays from prepared source");
+        assert_eq!(replayed_source, locked_source);
+
+        let mut replayed_destination = destination;
+        replayed_destination
+            .apply_event(&round_trip_event(&quarantine_event))
+            .expect("quarantine replays from prior destination");
+        replayed_destination
+            .apply_event(&round_trip_event(&import_event))
+            .expect("import replays from reserved destination");
+        assert_eq!(replayed_destination, reserved_destination);
+    }
+
+    fn round_trip_event(event: &crate::CanonicalEvent) -> crate::CanonicalEvent {
+        serde_json::from_slice(
+            &serde_json::to_vec(event).expect("canonical transfer event serializes"),
+        )
+        .expect("canonical transfer event deserializes")
     }
 }

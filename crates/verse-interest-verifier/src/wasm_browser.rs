@@ -308,8 +308,8 @@ mod tests {
     fn verifier() -> BrowserInterestVerifier {
         let config = json!({
             "expected_role": "spectator",
-            "world_schema_version": "19",
-            "event_schema_version": "15",
+            "world_schema_version": "20",
+            "event_schema_version": "16",
             "content_schema_version": "11",
             "content_manifest_version": "p1.5.0",
             "expected_content_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -338,8 +338,8 @@ mod tests {
             &json!({
                 "expected_role": "player",
                 "expected_player_id": "player-local",
-                "world_schema_version": "19",
-                "event_schema_version": "15",
+                "world_schema_version": "20",
+                "event_schema_version": "16",
                 "content_schema_version": "11",
                 "content_manifest_version": "p1.5.0",
                 "expected_content_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -355,8 +355,8 @@ mod tests {
             &json!({
                 "expected_role": "spectator",
                 "expected_player_id": "player-local",
-                "world_schema_version": "19",
-                "event_schema_version": "15",
+                "world_schema_version": "20",
+                "event_schema_version": "16",
                 "content_schema_version": "11",
                 "content_manifest_version": "p1.5.0",
                 "expected_content_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -374,15 +374,15 @@ mod tests {
         let mut verifier = verifier();
         let welcome = json!({
             "type": "welcome",
-            "protocol_version": 17,
-            "projection_schema_version": 3,
-            "world_schema_version": 19,
-            "event_schema_version": 15,
+            "protocol_version": 18,
+            "projection_schema_version": 4,
+            "world_schema_version": 20,
+            "event_schema_version": 16,
             "content_schema_version": 11,
             "content_manifest_version": "p1.5.0",
             "celestial_registry_schema_version": 1,
-            "universe_manifest_schema_version": 3,
-            "interest_schema_version": 1,
+            "universe_manifest_schema_version": 4,
+            "interest_schema_version": 2,
             "session_role": {"kind": "spectator"},
             "server_name": "test"
         });
@@ -420,15 +420,15 @@ mod tests {
         let mut verifier = verifier();
         let welcome = json!({
             "type": "welcome",
-            "protocol_version": 17,
-            "projection_schema_version": 3,
-            "world_schema_version": 19,
-            "event_schema_version": 15,
+            "protocol_version": 18,
+            "projection_schema_version": 4,
+            "world_schema_version": 20,
+            "event_schema_version": 16,
             "content_schema_version": 11,
             "content_manifest_version": "p1.5.0",
             "celestial_registry_schema_version": 1,
-            "universe_manifest_schema_version": 3,
-            "interest_schema_version": 1,
+            "universe_manifest_schema_version": 4,
+            "interest_schema_version": 2,
             "session_role": {"kind": "spectator"},
             "server_name": "test"
         });

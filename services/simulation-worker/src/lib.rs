@@ -3077,7 +3077,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn protocol17_orders_full_compatibility_registry_then_interest_baseline() {
+    async fn protocol18_orders_full_compatibility_registry_then_interest_baseline() {
         let (mut socket, state, server) = connect_test_socket().await;
         send_client_message(
             &mut socket,

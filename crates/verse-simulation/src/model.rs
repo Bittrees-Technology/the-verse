@@ -15,7 +15,7 @@ use verse_protocol::{
 
 use crate::{celestial, content};
 
-pub const WORLD_SCHEMA_VERSION: u32 = 19;
+pub const WORLD_SCHEMA_VERSION: u32 = 20;
 pub const PROCESSED_OPERATION_RETENTION_LIMIT: usize = 128;
 pub const PROCESSED_OPERATION_RETAINED_BYTES_LIMIT: usize = 131_072;
 pub const PROCESSED_OPERATION_RECORD_BYTES_LIMIT: usize = 4_096;
@@ -825,6 +825,7 @@ pub struct ContactPairKey {
 pub struct ProcessedOperationRecord {
     pub operation_id: String,
     pub intent_fingerprint: String,
+    pub receipt_origin_cell_id: String,
     pub receipt: IntentReceipt,
 }
 
@@ -848,6 +849,7 @@ struct OperationCompactionMaterial<'a> {
     prior_hash: &'a str,
     operation_sequence: u64,
     intent_fingerprint: &'a str,
+    receipt_origin_cell_id: &'a str,
     receipt: &'a IntentReceipt,
 }
 
@@ -971,10 +973,11 @@ impl WorldState {
         if record.operation_id.trim().is_empty()
             || record.operation_id.len() > 128
             || !valid_blake3_hex(&record.intent_fingerprint)
+            || !valid_blake3_hex(&record.receipt_origin_cell_id)
             || record.receipt.operation_id != record.operation_id
             || record.receipt.event_sequence == 0
-            || record.receipt.event_sequence < record.receipt.operation_sequence
-            || record.receipt.event_sequence > self.event_sequence
+            || (record.receipt_origin_cell_id == self.cell_id
+                && record.receipt.event_sequence > self.event_sequence)
             || record.receipt.code.trim().is_empty()
         {
             return Err("processed operation record identity is invalid".into());
@@ -993,14 +996,11 @@ impl WorldState {
                 record.receipt.operation_sequence
             ));
         }
-        if history
-            .retained
-            .last_key_value()
-            .is_some_and(|(_, prior)| prior.receipt.event_sequence >= record.receipt.event_sequence)
-        {
-            return Err(
-                "processed operation receipt event sequences must advance monotonically".into(),
-            );
+        if history.retained.values().rev().any(|prior| {
+            prior.receipt_origin_cell_id == record.receipt_origin_cell_id
+                && prior.receipt.event_sequence >= record.receipt.event_sequence
+        }) {
+            return Err("processed operation receipt event sequences must advance monotonically within each origin cell".into());
         }
         history.committed_through = expected;
         history.retained.insert(expected, record);
@@ -1014,6 +1014,7 @@ impl WorldState {
                 prior_hash: &history.compacted_history_hash,
                 operation_sequence: sequence,
                 intent_fingerprint: &compacted.intent_fingerprint,
+                receipt_origin_cell_id: &compacted.receipt_origin_cell_id,
                 receipt: &compacted.receipt,
             };
             let bytes = serde_json::to_vec(&material)
@@ -1405,7 +1406,6 @@ impl WorldState {
             let retained_bytes = processed_operation_retained_bytes(&history.retained);
             if history.committed_through == 0
                 || history.compacted_through > history.committed_through
-                || history.committed_through > self.event_sequence
                 || history.retained.len() > PROCESSED_OPERATION_RETENTION_LIMIT
                 || retained_bytes > PROCESSED_OPERATION_RETAINED_BYTES_LIMIT
                 || (history.compacted_through == 0 && !history.compacted_history_hash.is_empty())
@@ -1415,7 +1415,7 @@ impl WorldState {
                 return Err("operation history bounds and commitment must remain canonical".into());
             }
             let mut last_seen = history.compacted_through;
-            let mut last_receipt_event_sequence = 0;
+            let mut last_receipt_event_sequence_by_cell = BTreeMap::new();
             for (operation_sequence, record) in &history.retained {
                 let expected_sequence = last_seen
                     .checked_add(1)
@@ -1424,20 +1424,26 @@ impl WorldState {
                     || record.operation_id.trim().is_empty()
                     || record.operation_id.len() > 128
                     || !valid_blake3_hex(&record.intent_fingerprint)
+                    || !valid_blake3_hex(&record.receipt_origin_cell_id)
                     || processed_operation_record_bytes(record)
                         > PROCESSED_OPERATION_RECORD_BYTES_LIMIT
                     || record.receipt.operation_sequence != *operation_sequence
                     || record.receipt.operation_id != record.operation_id
                     || record.receipt.event_sequence == 0
-                    || record.receipt.event_sequence < *operation_sequence
-                    || record.receipt.event_sequence <= last_receipt_event_sequence
-                    || record.receipt.event_sequence > self.event_sequence
+                    || last_receipt_event_sequence_by_cell
+                        .get(&record.receipt_origin_cell_id)
+                        .is_some_and(|prior| record.receipt.event_sequence <= *prior)
+                    || (record.receipt_origin_cell_id == self.cell_id
+                        && record.receipt.event_sequence > self.event_sequence)
                     || record.receipt.code.trim().is_empty()
                 {
                     return Err("processed operations must form one bounded contiguous suffix with canonical receipts and fingerprints".into());
                 }
                 last_seen = *operation_sequence;
-                last_receipt_event_sequence = record.receipt.event_sequence;
+                last_receipt_event_sequence_by_cell.insert(
+                    record.receipt_origin_cell_id.clone(),
+                    record.receipt.event_sequence,
+                );
             }
             if last_seen != history.committed_through {
                 return Err(
@@ -2501,6 +2507,8 @@ mod tests {
         ProcessedOperationRecord {
             operation_id: operation_id.clone(),
             intent_fingerprint: blake3::hash(operation_id.as_bytes()).to_hex().to_string(),
+            receipt_origin_cell_id: celestial::cell_id(&celestial::cell_origin_key())
+                .expect("origin cell ID derives"),
             receipt: IntentReceipt {
                 operation_sequence,
                 operation_id,
@@ -2576,10 +2584,10 @@ mod tests {
     }
 
     #[test]
-    fn operation_history_rejects_impossible_global_and_receipt_frontiers() {
-        let mut impossible_compacted = WorldState::genesis(103);
-        impossible_compacted.event_sequence = 1;
-        impossible_compacted.processed_operations.insert(
+    fn operation_history_is_actor_contiguous_and_orders_receipts_per_origin_cell() {
+        let mut imported_compacted = WorldState::genesis(103);
+        imported_compacted.event_sequence = 1;
+        imported_compacted.processed_operations.insert(
             "player-local".into(),
             ActorOperationHistory {
                 committed_through: 100,
@@ -2588,12 +2596,9 @@ mod tests {
                 retained: BTreeMap::new(),
             },
         );
-        assert!(
-            impossible_compacted
-                .validate_player_roster()
-                .expect_err("an actor frontier cannot exceed the global event frontier")
-                .contains("operation history bounds")
-        );
+        imported_compacted
+            .validate_player_roster()
+            .expect("an imported actor frontier is independent of the destination journal");
 
         let mut first = synthetic_operation_record(1);
         first.receipt.event_sequence = 3;
@@ -2616,6 +2621,27 @@ mod tests {
                 .expect_err("retained receipt events must advance with actor operations")
                 .contains("canonical receipts")
         );
+
+        let mut cross_cell = WorldState::genesis(108);
+        cross_cell.event_sequence = 3;
+        let mut source_receipt = synthetic_operation_record(1);
+        source_receipt.receipt.event_sequence = 99;
+        source_receipt.receipt_origin_cell_id = "a".repeat(64);
+        let mut destination_receipt = synthetic_operation_record(2);
+        destination_receipt.receipt.event_sequence = 2;
+        destination_receipt.receipt_origin_cell_id = cross_cell.cell_id.clone();
+        cross_cell.processed_operations.insert(
+            "player-local".into(),
+            ActorOperationHistory {
+                committed_through: 2,
+                compacted_through: 0,
+                compacted_history_hash: String::new(),
+                retained: BTreeMap::from([(1, source_receipt), (2, destination_receipt)]),
+            },
+        );
+        cross_cell
+            .validate_player_roster()
+            .expect("receipt event sequences are ordered only within their origin cell");
 
         let mut zero_receipt = WorldState::genesis(109);
         zero_receipt.event_sequence = 1;
@@ -2684,6 +2710,7 @@ mod tests {
                 ProcessedOperationRecord {
                     operation_id: operation_id.clone(),
                     intent_fingerprint: blake3::hash(b"oversized").to_hex().to_string(),
+                    receipt_origin_cell_id: world.cell_id.clone(),
                     receipt: IntentReceipt {
                         operation_sequence: 1,
                         operation_id,

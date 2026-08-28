@@ -8,10 +8,11 @@ use std::sync::OnceLock;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use verse_protocol::{
-    CELESTIAL_REGISTRY_SCHEMA_VERSION, CELL_KEY_SCHEMA_VERSION, CelestialBodyKind,
-    CelestialBodySnapshot, CelestialRegistrySnapshot, CelestialScaleClass, CellCoordinate,
-    CellKeyV1, I64Vec3, LIFECYCLE_CONTROL_SCHEMA_VERSION,
-    PRODUCTION_SCHEDULE_OCCURRENCE_SCHEMA_VERSION, SectorCoordinate,
+    CELESTIAL_REGISTRY_SCHEMA_VERSION, CELL_DIRECTORY_SCHEMA_VERSION, CELL_KEY_SCHEMA_VERSION,
+    CelestialBodyKind, CelestialBodySnapshot, CelestialRegistrySnapshot, CelestialScaleClass,
+    CellCoordinate, CellKeyV1, I64Vec3, INTENT_FINGERPRINT_SCHEMA_VERSION, INTEREST_SCHEMA_VERSION,
+    LIFECYCLE_CONTROL_SCHEMA_VERSION, PRODUCTION_SCHEDULE_OCCURRENCE_SCHEMA_VERSION,
+    PROJECTION_SCHEMA_VERSION, SectorCoordinate, TRANSFER_PACKAGE_SCHEMA_VERSION,
     UNIVERSE_MANIFEST_SCHEMA_VERSION, UniverseAddress, UniverseManifestSnapshot, Vec3,
 };
 
@@ -115,6 +116,12 @@ struct UniverseManifestHashMaterial<'a> {
     content_hash: &'a str,
     world_schema_version: u32,
     event_schema_version: u32,
+    projection_schema_version: u32,
+    interest_schema_version: u32,
+    operation_fingerprint_schema_version: u32,
+    cell_key_schema_version: u32,
+    cell_directory_schema_version: u32,
+    transfer_package_schema_version: u32,
     lifecycle_control_schema_version: u32,
     production_schedule_occurrence_schema_version: u32,
     lifecycle_policy_hash: &'a str,
@@ -886,6 +893,12 @@ pub fn universe_manifest(
         content_hash: content::manifest_hash(),
         world_schema_version,
         event_schema_version,
+        projection_schema_version: PROJECTION_SCHEMA_VERSION,
+        interest_schema_version: INTEREST_SCHEMA_VERSION,
+        operation_fingerprint_schema_version: INTENT_FINGERPRINT_SCHEMA_VERSION,
+        cell_key_schema_version: CELL_KEY_SCHEMA_VERSION,
+        cell_directory_schema_version: CELL_DIRECTORY_SCHEMA_VERSION,
+        transfer_package_schema_version: TRANSFER_PACKAGE_SCHEMA_VERSION,
         lifecycle_control_schema_version: LIFECYCLE_CONTROL_SCHEMA_VERSION,
         production_schedule_occurrence_schema_version:
             PRODUCTION_SCHEDULE_OCCURRENCE_SCHEMA_VERSION,
@@ -893,7 +906,7 @@ pub fn universe_manifest(
     };
     let bytes = canonical_json_bytes(&material)?;
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"the-verse/universe-manifest/v3\0");
+    hasher.update(b"the-verse/universe-manifest/v4\0");
     hasher.update(&bytes);
     let manifest_hash = hasher.finalize().to_hex().to_string();
     Ok(UniverseManifestSnapshot {
@@ -914,6 +927,12 @@ pub fn universe_manifest(
         content_hash: content::manifest_hash().into(),
         world_schema_version,
         event_schema_version,
+        projection_schema_version: PROJECTION_SCHEMA_VERSION,
+        interest_schema_version: INTEREST_SCHEMA_VERSION,
+        operation_fingerprint_schema_version: INTENT_FINGERPRINT_SCHEMA_VERSION,
+        cell_key_schema_version: CELL_KEY_SCHEMA_VERSION,
+        cell_directory_schema_version: CELL_DIRECTORY_SCHEMA_VERSION,
+        transfer_package_schema_version: TRANSFER_PACKAGE_SCHEMA_VERSION,
         lifecycle_control_schema_version: LIFECYCLE_CONTROL_SCHEMA_VERSION,
         production_schedule_occurrence_schema_version:
             PRODUCTION_SCHEDULE_OCCURRENCE_SCHEMA_VERSION,
@@ -1060,7 +1079,12 @@ mod tests {
     fn registry_and_universe_manifest_match_cross_platform_golden_hashes() {
         let seed = 20_260_826;
         let registry = registry_snapshot(seed).expect("golden registry builds");
-        let manifest = universe_manifest(seed, 19, 15).expect("golden manifest builds");
+        let manifest = universe_manifest(
+            seed,
+            crate::WORLD_SCHEMA_VERSION,
+            crate::EVENT_SCHEMA_VERSION,
+        )
+        .expect("golden manifest builds");
         assert_eq!(
             manifest.lifecycle_policy_hash,
             "5bc077cc8a2eb101fcaecdce5513c13aa243e1f68a5af839a602dd689859ff3a"
@@ -1071,7 +1095,7 @@ mod tests {
         );
         assert_eq!(
             manifest.manifest_hash,
-            "c9bfd3baa1e64ab7665e60c4f989491e745e9af0d2512989f41625b57b546ace"
+            "ce89422bd5d0c4a2ddc50f22883439a7ee1ecd7dd14165a46bb500623fd0b7eb"
         );
     }
 

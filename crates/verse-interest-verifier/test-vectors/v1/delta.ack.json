@@ -1,1 +1,1 @@
-{"type":"acknowledge_interest","session_epoch":"session-vector","interest_epoch":9007199254740993,"baseline_id":"baseline-vector","delta_sequence":1,"view_hash":"f6b653bed0c182571f161d22687ed701e4385a5cdc2b95a8b4339e2b58060c52"}
+{"type":"acknowledge_interest","session_epoch":"session-vector","interest_epoch":9007199254740993,"baseline_id":"baseline-vector","delta_sequence":1,"view_hash":"4cb9ff8804f86af5387c21e9e81511445b3364069b8d1ac5a1c2dba11cbbb5e5"}

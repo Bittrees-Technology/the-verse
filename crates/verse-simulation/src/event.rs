@@ -8,10 +8,12 @@ use verse_protocol::{
 };
 
 use crate::celestial;
+use crate::cell_directory::CellTransferRecord;
+use crate::handoff::{PlayerTransferPackage, PlayerTransferQuarantineReceipt};
 use crate::model::{Block, ContactPairKey, DeathDrop, InventoryRecord, ProductionJob};
 
 pub const EVENT_SCHEMA_NAME: &str = "verse.world_event";
-pub const EVENT_SCHEMA_VERSION: u32 = 15;
+pub const EVENT_SCHEMA_VERSION: u32 = 16;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event_type", rename_all = "snake_case", deny_unknown_fields)]
@@ -125,6 +127,27 @@ pub enum EventPayload {
         players: Vec<PlayerPhysicsOutcome>,
         contacts: Vec<PhysicsContactOutcome>,
         active_contacts_after: Vec<ContactPairKey>,
+    },
+    PlayerTransferPrepared {
+        package: PlayerTransferPackage,
+        directory_transfer: CellTransferRecord,
+    },
+    PlayerTransferQuarantined {
+        package: PlayerTransferPackage,
+        receipt: PlayerTransferQuarantineReceipt,
+    },
+    PlayerTransferAborted {
+        package: PlayerTransferPackage,
+        directory_transfer: CellTransferRecord,
+    },
+    PlayerTransferExported {
+        package: PlayerTransferPackage,
+        directory_transfer: CellTransferRecord,
+    },
+    PlayerTransferImported {
+        package: PlayerTransferPackage,
+        receipt: PlayerTransferQuarantineReceipt,
+        directory_transfer: CellTransferRecord,
     },
 }
 
@@ -280,6 +303,15 @@ impl EventPayload {
                     contact.point = hydrate(&contact.point_address)?;
                 }
             }
+            Self::PlayerTransferPrepared { package, .. }
+            | Self::PlayerTransferQuarantined { package, .. }
+            | Self::PlayerTransferAborted { package, .. }
+            | Self::PlayerTransferExported { package, .. }
+            | Self::PlayerTransferImported { package, .. } => {
+                package
+                    .hydrate_spatial_poses()
+                    .map_err(|source| source.to_string())?;
+            }
             Self::PlayerControlSet { .. }
             | Self::SuitModeChanged { .. }
             | Self::SuitOxygenChanged { .. }
@@ -334,7 +366,12 @@ impl EventPayload {
             | Self::ProductionQuantumCommitted { .. }
             | Self::GridControlSet { .. }
             | Self::GridAnchorSet { .. }
-            | Self::PhysicsStepCommitted { .. } => 0,
+            | Self::PhysicsStepCommitted { .. }
+            | Self::PlayerTransferPrepared { .. }
+            | Self::PlayerTransferQuarantined { .. }
+            | Self::PlayerTransferAborted { .. }
+            | Self::PlayerTransferExported { .. }
+            | Self::PlayerTransferImported { .. } => 0,
         }
     }
 
@@ -440,6 +477,25 @@ impl EventPayload {
             Self::PhysicsStepCommitted { .. } => {
                 ("physics_step_committed", "Physics step committed".into())
             }
+            Self::PlayerTransferPrepared { .. } => (
+                "player_transfer_prepared",
+                "Player transfer prepared".into(),
+            ),
+            Self::PlayerTransferQuarantined { .. } => (
+                "player_transfer_quarantined",
+                "Player transfer quarantined".into(),
+            ),
+            Self::PlayerTransferAborted { .. } => {
+                ("player_transfer_aborted", "Player transfer aborted".into())
+            }
+            Self::PlayerTransferExported { .. } => (
+                "player_transfer_exported",
+                "Player transfer exported".into(),
+            ),
+            Self::PlayerTransferImported { .. } => (
+                "player_transfer_imported",
+                "Player transfer imported".into(),
+            ),
         }
     }
 }

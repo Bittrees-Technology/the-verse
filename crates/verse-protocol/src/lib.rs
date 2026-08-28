@@ -9,17 +9,19 @@
 use serde::{Deserialize, Serialize};
 
 /// The only protocol version accepted by this build.
-pub const PROTOCOL_VERSION: u32 = 17;
+pub const PROTOCOL_VERSION: u32 = 18;
 
-/// The actor-aware, interest-managed projection contract carried by protocol 17.
-pub const PROJECTION_SCHEMA_VERSION: u32 = 3;
+/// The transfer-aware, actor-scoped projection contract carried by protocol 18.
+pub const PROJECTION_SCHEMA_VERSION: u32 = 4;
 pub const CELESTIAL_REGISTRY_SCHEMA_VERSION: u32 = 1;
-pub const UNIVERSE_MANIFEST_SCHEMA_VERSION: u32 = 3;
-pub const INTEREST_SCHEMA_VERSION: u32 = 1;
-pub const INTENT_FINGERPRINT_SCHEMA_VERSION: u32 = 1;
+pub const UNIVERSE_MANIFEST_SCHEMA_VERSION: u32 = 4;
+pub const INTEREST_SCHEMA_VERSION: u32 = 2;
+pub const INTENT_FINGERPRINT_SCHEMA_VERSION: u32 = 2;
 pub const LIFECYCLE_CONTROL_SCHEMA_VERSION: u32 = 1;
 pub const PRODUCTION_SCHEDULE_OCCURRENCE_SCHEMA_VERSION: u32 = 1;
 pub const CELL_KEY_SCHEMA_VERSION: u32 = 1;
+pub const CELL_DIRECTORY_SCHEMA_VERSION: u32 = 1;
+pub const TRANSFER_PACKAGE_SCHEMA_VERSION: u32 = 1;
 
 /// An exact bounded local coordinate in integer micrometres.
 #[derive(
@@ -169,6 +171,12 @@ pub struct UniverseManifestSnapshot {
     pub content_hash: String,
     pub world_schema_version: u32,
     pub event_schema_version: u32,
+    pub projection_schema_version: u32,
+    pub interest_schema_version: u32,
+    pub operation_fingerprint_schema_version: u32,
+    pub cell_key_schema_version: u32,
+    pub cell_directory_schema_version: u32,
+    pub transfer_package_schema_version: u32,
     pub lifecycle_control_schema_version: u32,
     pub production_schedule_occurrence_schema_version: u32,
     pub lifecycle_policy_hash: String,
@@ -1322,7 +1330,7 @@ pub enum ServerMessage {
     InterestDelta {
         delta: Box<ProjectedInterestDelta>,
     },
-    /// Protocol-15 compatibility shape. Protocol-16 official clients must use
+    /// Legacy compatibility shape. Protocol-18 official clients must use
     /// `interest_baseline` and `interest_delta` and workers must never mix the
     /// two state-stream families within one session.
     Snapshot {
@@ -1384,7 +1392,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v17_registry_manifest_and_interest_reject_unknown_fields() {
+    fn protocol_v18_registry_manifest_and_interest_reject_unknown_fields() {
         let body = CelestialBodySnapshot {
             body_id: "body-test".into(),
             display_name: "Body Test".into(),
@@ -1445,8 +1453,14 @@ mod tests {
             content_schema_version: 11,
             content_manifest_version: "p1.5.0".into(),
             content_hash: "content-hash".into(),
-            world_schema_version: 19,
-            event_schema_version: 15,
+            world_schema_version: 20,
+            event_schema_version: 16,
+            projection_schema_version: PROJECTION_SCHEMA_VERSION,
+            interest_schema_version: INTEREST_SCHEMA_VERSION,
+            operation_fingerprint_schema_version: INTENT_FINGERPRINT_SCHEMA_VERSION,
+            cell_key_schema_version: CELL_KEY_SCHEMA_VERSION,
+            cell_directory_schema_version: CELL_DIRECTORY_SCHEMA_VERSION,
+            transfer_package_schema_version: TRANSFER_PACKAGE_SCHEMA_VERSION,
             lifecycle_control_schema_version: LIFECYCLE_CONTROL_SCHEMA_VERSION,
             production_schedule_occurrence_schema_version:
                 PRODUCTION_SCHEDULE_OCCURRENCE_SCHEMA_VERSION,
@@ -1634,9 +1648,9 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v17_preserves_tagged_life_state_and_death_cause() {
-        assert_eq!(PROTOCOL_VERSION, 17);
-        assert_eq!(PROJECTION_SCHEMA_VERSION, 3);
+    fn protocol_v18_preserves_tagged_life_state_and_death_cause() {
+        assert_eq!(PROTOCOL_VERSION, 18);
+        assert_eq!(PROJECTION_SCHEMA_VERSION, 4);
         let life_state = PlayerLifeState::Incapacitated {
             death_id: "death-player-local-42".into(),
             cause: PlayerDeathCause::OxygenDepleted,

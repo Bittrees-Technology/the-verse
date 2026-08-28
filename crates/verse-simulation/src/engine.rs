@@ -25,6 +25,10 @@ use crate::event::{
     PhysicsContactPhase, PlayerPhysicsOutcome, ProductionMachineOutcome,
     ProductionMachineOutcomeKind, ProductionScheduleOccurrence,
 };
+use crate::handoff::{
+    stage_aborted_eva_unlock, stage_committed_eva_export, stage_committed_eva_import,
+    stage_eva_player_quarantine, stage_prepared_eva_lock,
+};
 #[cfg(test)]
 use crate::model::PLAYER_INVENTORY_ID;
 use crate::model::{
@@ -77,7 +81,6 @@ struct IntentFingerprintMaterial<'a> {
     world_schema_version: u32,
     event_schema_version: u32,
     universe_id: &'a str,
-    cell_id: &'a str,
     actor_player_id: &'a str,
     message: &'a serde_json::Value,
 }
@@ -2109,13 +2112,12 @@ impl WorldState {
         })?;
         normalize_json_signed_zero(&mut canonical_message);
         let material = IntentFingerprintMaterial {
-            domain: "the-verse-client-intent-v1",
+            domain: "the-verse-client-intent-v2",
             protocol_version: PROTOCOL_VERSION,
             fingerprint_schema_version: INTENT_FINGERPRINT_SCHEMA_VERSION,
             world_schema_version: WORLD_SCHEMA_VERSION,
             event_schema_version: EVENT_SCHEMA_VERSION,
             universe_id: &self.universe_id,
-            cell_id: &self.cell_id,
             actor_player_id,
             message: &canonical_message,
         };
@@ -2335,6 +2337,16 @@ impl WorldState {
                 return Err(IntentError::rejected(
                     "replay_production_envelope_invalid",
                     "automatic production payload cannot use a human client envelope",
+                ));
+            }
+            EventPayload::PlayerTransferPrepared { .. }
+            | EventPayload::PlayerTransferQuarantined { .. }
+            | EventPayload::PlayerTransferAborted { .. }
+            | EventPayload::PlayerTransferExported { .. }
+            | EventPayload::PlayerTransferImported { .. } => {
+                return Err(IntentError::rejected(
+                    "replay_transfer_envelope_invalid",
+                    "cross-cell transfer payload cannot use a human client envelope",
                 ));
             }
         };
@@ -4669,6 +4681,63 @@ impl WorldState {
                 self.physics_step_phase = u64::from(*remaining_step_phase);
                 self.simulation_tick = self.simulation_tick.saturating_add(u64::from(*step_count));
             }
+            EventPayload::PlayerTransferPrepared {
+                package,
+                directory_transfer,
+            } => {
+                *self = stage_prepared_eva_lock(self, package, directory_transfer).map_err(
+                    |source| {
+                        IntentError::rejected("replay_transfer_prepare_invalid", source.to_string())
+                    },
+                )?;
+            }
+            EventPayload::PlayerTransferQuarantined { package, receipt } => {
+                let (staged, expected_receipt) =
+                    stage_eva_player_quarantine(self, receipt.destination_fencing_token, package)
+                        .map_err(|source| {
+                        IntentError::rejected(
+                            "replay_transfer_quarantine_invalid",
+                            source.to_string(),
+                        )
+                    })?;
+                if &expected_receipt != receipt {
+                    return Err(IntentError::rejected(
+                        "replay_transfer_quarantine_invalid",
+                        "quarantine event does not contain the canonical receipt",
+                    ));
+                }
+                *self = staged;
+            }
+            EventPayload::PlayerTransferAborted {
+                package,
+                directory_transfer,
+            } => {
+                *self = stage_aborted_eva_unlock(self, package, directory_transfer).map_err(
+                    |source| {
+                        IntentError::rejected("replay_transfer_abort_invalid", source.to_string())
+                    },
+                )?;
+            }
+            EventPayload::PlayerTransferExported {
+                package,
+                directory_transfer,
+            } => {
+                *self = stage_committed_eva_export(self, package, directory_transfer).map_err(
+                    |source| {
+                        IntentError::rejected("replay_transfer_export_invalid", source.to_string())
+                    },
+                )?;
+            }
+            EventPayload::PlayerTransferImported {
+                package,
+                receipt,
+                directory_transfer,
+            } => {
+                *self = stage_committed_eva_import(self, package, receipt, directory_transfer)
+                    .map_err(|source| {
+                        IntentError::rejected("replay_transfer_import_invalid", source.to_string())
+                    })?;
+            }
         }
 
         let experience_reward = event.payload.experience_reward();
@@ -4757,7 +4826,12 @@ impl WorldState {
                 anchored: false, ..
             }
             | EventPayload::BlockDamaged { .. }
-            | EventPayload::PhysicsStepCommitted { .. } => {}
+            | EventPayload::PhysicsStepCommitted { .. }
+            | EventPayload::PlayerTransferPrepared { .. }
+            | EventPayload::PlayerTransferQuarantined { .. }
+            | EventPayload::PlayerTransferAborted { .. }
+            | EventPayload::PlayerTransferExported { .. }
+            | EventPayload::PlayerTransferImported { .. } => {}
         }
 
         self.event_sequence = event.event_sequence;
@@ -4780,6 +4854,7 @@ impl WorldState {
                 ProcessedOperationRecord {
                     operation_id: operation_id.clone(),
                     intent_fingerprint: intent_fingerprint.clone(),
+                    receipt_origin_cell_id: self.cell_id.clone(),
                     receipt: IntentReceipt {
                         operation_sequence,
                         operation_id: operation_id.clone(),
@@ -9061,6 +9136,139 @@ mod tests {
                 .code(),
             "invalid_vector"
         );
+    }
+
+    #[test]
+    fn lost_receipt_and_next_operation_survive_a_lower_frontier_destination() {
+        use crate::cell_directory::{CellTransferRecord, MobileAggregateKind, TransferPhase};
+        use crate::handoff::{
+            PlayerTransferContext, prepare_eva_player_transfer, stage_committed_eva_import,
+            stage_eva_player_quarantine,
+        };
+
+        let mut source = WorldState::genesis(8_011);
+        source.fencing_token = 11;
+        let first = sequenced_suit_message(1, "source-operation", false);
+        let first_event = source
+            .prepare_client_event_as("player-local", &first)
+            .expect("source operation prepares");
+        source
+            .apply_event(&first_event)
+            .expect("source operation commits");
+        let first_receipt = source
+            .processed_operation_record("player-local", 1)
+            .expect("source receipt is retained")
+            .receipt
+            .clone();
+
+        let source_key = celestial::cell_origin_key();
+        let destination_key =
+            celestial::neighbor_cell_key(&source_key, [1, 0, 0]).expect("destination cell derives");
+        let boundary_address = celestial::address_from_origin_offset_um(
+            &source.cell_address,
+            [i128::from(celestial::CELL_EDGE_UM / 2), 0, 0],
+        )
+        .expect("boundary address canonicalizes");
+        let boundary_position =
+            celestial::local_position_from_address(&source.cell_address, &boundary_address)
+                .expect("boundary position hydrates");
+        let player = source
+            .player
+            .get_mut("player-local")
+            .expect("source player exists");
+        player.address = boundary_address;
+        player.position = boundary_position;
+        player.locomotion.kind = LocomotionKind::Eva;
+        player.locomotion.support = None;
+        player.locomotion.magnetic_boots_enabled = false;
+        source
+            .validate_player_roster()
+            .expect("source operation history remains canonical at the boundary");
+
+        let mut destination =
+            WorldState::genesis_for_cell(8_011, &destination_key).expect("destination cell builds");
+        destination.fencing_token = 17;
+        assert!(
+            destination.event_sequence < source.event_sequence,
+            "proof exercises unrelated cell journal frontiers"
+        );
+        assert_eq!(
+            source
+                .client_intent_fingerprint("player-local", &first)
+                .expect("source fingerprint derives"),
+            destination
+                .client_intent_fingerprint("player-local", &first)
+                .expect("destination fingerprint derives"),
+            "routing must not change one canonical client operation"
+        );
+
+        let context = PlayerTransferContext {
+            transfer_id: "transfer-operation-frontier".into(),
+            source_cell_key: source_key,
+            destination_cell_key: destination_key,
+            source_assignment_generation: 3,
+            destination_assignment_generation: 5,
+            source_fencing_token: 11,
+            prior_placement_generation: 7,
+            resulting_placement_generation: 8,
+        };
+        let package = prepare_eva_player_transfer(&source, "player-local", &context)
+            .expect("player package carries source operation history");
+        let (reserved_destination, receipt) =
+            stage_eva_player_quarantine(&destination, destination.fencing_token, &package)
+                .expect("destination reserves the package");
+        let committed = CellTransferRecord {
+            transfer_id: package.transfer_id.clone(),
+            aggregate_id: package.aggregate_id.clone(),
+            aggregate_kind: MobileAggregateKind::Player,
+            source_cell_key: package.source_cell_key.clone(),
+            source_cell_id: package.source_cell_id.clone(),
+            destination_cell_key: package.destination_cell_key.clone(),
+            destination_cell_id: package.destination_cell_id.clone(),
+            source_assignment_generation: package.source_assignment_generation,
+            destination_assignment_generation: package.destination_assignment_generation,
+            prior_placement_generation: package.prior_placement_generation,
+            resulting_placement_generation: package.resulting_placement_generation,
+            package_hash: package.package_hash.clone(),
+            quarantine_receipt_hash: Some(receipt.receipt_hash.clone()),
+            phase: TransferPhase::Committed,
+        };
+        let mut imported =
+            stage_committed_eva_import(&reserved_destination, &package, &receipt, &committed)
+                .expect("committed player imports");
+        let first_fingerprint = imported
+            .client_intent_fingerprint("player-local", &first)
+            .expect("imported retry fingerprints");
+        assert_eq!(
+            imported
+                .validate_operation_attempt("player-local", 1, &first_fingerprint)
+                .expect("lost source response reconciles"),
+            Some(first_receipt.clone())
+        );
+
+        let second = sequenced_suit_message(2, "destination-operation", true);
+        let second_event = imported
+            .prepare_client_event_as("player-local", &second)
+            .expect("next operation prepares on the destination");
+        imported
+            .apply_event(&second_event)
+            .expect("next operation commits on the lower destination frontier");
+        let second_record = imported
+            .processed_operation_record("player-local", 2)
+            .expect("destination receipt is retained");
+        assert_eq!(second_record.receipt_origin_cell_id, imported.cell_id);
+        assert_eq!(second_record.receipt.operation_sequence, 2);
+        assert_eq!(second_record.receipt.event_sequence, 1);
+        assert_eq!(
+            imported
+                .processed_operation_record("player-local", 1)
+                .expect("source receipt remains retained")
+                .receipt,
+            first_receipt
+        );
+        imported
+            .validate_player_roster()
+            .expect("cross-cell operation history remains canonical");
     }
 
     #[test]
