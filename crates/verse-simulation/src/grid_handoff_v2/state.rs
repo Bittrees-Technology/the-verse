@@ -4714,6 +4714,21 @@ impl DraftGridTransferCellStateV2 {
         })
     }
 
+    pub(super) fn encode_world_v21_canonical(
+        capability: &ValidatedDraftGridTransferCellStateV21<'_, '_>,
+    ) -> Result<Vec<u8>, DraftGridClosureError> {
+        capability
+            .state()
+            .validate_world_v21(capability.manifest())?;
+        let bytes = serde_json::to_vec(capability.state()).map_err(|source| {
+            DraftGridClosureError::Invalid(format!("world-21 cell state cannot encode: {source}"))
+        })?;
+        if bytes.len() > MAX_DRAFT_GRID_CELL_STATE_BYTES {
+            return Err(DraftGridClosureError::TooLarge);
+        }
+        Ok(bytes)
+    }
+
     pub(super) fn decode_canonical(bytes: &[u8]) -> Result<Self, DraftGridClosureError> {
         if bytes.len() > MAX_DRAFT_GRID_CELL_STATE_BYTES {
             return Err(DraftGridClosureError::TooLarge);
@@ -4732,6 +4747,34 @@ impl DraftGridTransferCellStateV2 {
         if canonical != bytes {
             return Err(DraftGridClosureError::Invalid(
                 "draft cell state bytes are not the exact canonical encoding".into(),
+            ));
+        }
+        Ok(state)
+    }
+
+    pub(super) fn decode_world_v21_canonical(
+        bytes: &[u8],
+        manifest: &crate::manifest_v5::ValidatedUniverseManifestV5,
+    ) -> Result<Self, DraftGridClosureError> {
+        if bytes.is_empty() || bytes.len() > MAX_DRAFT_GRID_CELL_STATE_BYTES {
+            return Err(DraftGridClosureError::TooLarge);
+        }
+        let mut state = serde_json::from_slice::<Self>(bytes).map_err(|source| {
+            DraftGridClosureError::Invalid(format!("world-21 cell state JSON is invalid: {source}"))
+        })?;
+        state
+            .base
+            .hydrate_spatial_poses()
+            .map_err(DraftGridClosureError::Invalid)?;
+        state.validate_world_v21(manifest)?;
+        let canonical = serde_json::to_vec(&state).map_err(|source| {
+            DraftGridClosureError::Invalid(format!(
+                "world-21 cell state cannot re-encode: {source}"
+            ))
+        })?;
+        if canonical != bytes {
+            return Err(DraftGridClosureError::Invalid(
+                "world-21 cell state bytes are not the exact canonical encoding".into(),
             ));
         }
         Ok(state)
@@ -7125,6 +7168,11 @@ mod tests {
             .expect("other manifest-5 capability builds");
         assert!(active.validate().is_ok());
         assert!(active.validate_world_v21(&manifest).is_err());
+        let active_bytes = active.encode_canonical().expect("active fixture encodes");
+        assert!(
+            DraftGridTransferCellStateV2::decode_world_v21_canonical(&active_bytes, &manifest)
+                .is_err()
+        );
 
         let mut world21 = active;
         world21.base.universe_manifest_hash = manifest.manifest_hash().to_owned();
@@ -7136,6 +7184,19 @@ mod tests {
         assert_eq!(validated.state(), &world21);
         assert_eq!(validated.manifest_hash(), manifest.manifest_hash());
         assert!(world21.validate_world_v21(&other_manifest).is_err());
+        let world21_bytes = DraftGridTransferCellStateV2::encode_world_v21_canonical(&validated)
+            .expect("world-21 snapshot encodes");
+        let reopened =
+            DraftGridTransferCellStateV2::decode_world_v21_canonical(&world21_bytes, &manifest)
+                .expect("world-21 snapshot reopens");
+        assert_eq!(reopened, world21);
+        assert!(DraftGridTransferCellStateV2::decode_canonical(&world21_bytes).is_err());
+        let mut whitespace = vec![b' '];
+        whitespace.extend_from_slice(&world21_bytes);
+        assert!(
+            DraftGridTransferCellStateV2::decode_world_v21_canonical(&whitespace, &manifest)
+                .is_err()
+        );
 
         let mut wrong_inner_schema = world21.clone();
         wrong_inner_schema.base.schema_version = DRAFT_GRID_CELL_STATE_SCHEMA_VERSION;

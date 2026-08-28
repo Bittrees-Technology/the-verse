@@ -593,6 +593,13 @@ an empty event-17 journal at that same frontier, and must accept its first event
 explicitly not an install capability; live source locks, terminal-state proof,
 staged target reopening, and policy approval remain required.
 
+World-21 snapshots now have a separate bounded canonical encode/decode path
+that requires manifest 5 before serialization and after pose hydration on
+reopen. The active manifest-4 decoder rejects those bytes, while the world-21
+decoder rejects active snapshots, wrong manifests, whitespace aliases, and
+resealed schema/identity changes. This is the snapshot boundary the isolated
+protocol-19 Store will use; it does not modify the active Store.
+
 Implementation is staged behind that boundary. The private directory-v3 draft
 already validates ordered grid-and-rider membership, closure and conservation
 roots, package and receipt schemas, historical cell fences, phase-specific
