@@ -125,6 +125,12 @@ var interest_local_origin: Dictionary = {}
 var baseline_request_pending := false
 var interest_verifier: Object
 var interest_recovery_used := false
+var handoff_phase := "live"
+var handoff_transfer_id := ""
+var handoff_destination_cell_key: Dictionary = {}
+var handoff_placement_generation := -1
+var handoff_source_session_epoch := ""
+var handoff_source_interest_epoch := -1
 var connection_generation := 0
 var auto_reconnect_attempts := 0
 var auto_reconnect_elapsed := 0.0
@@ -282,6 +288,9 @@ var critical_oxygen_label: Label
 var incapacitated_overlay: Control
 var incapacitated_detail_label: Label
 var recovery_button: Button
+var handoff_overlay: Control
+var handoff_title_label: Label
+var handoff_detail_label: Label
 
 var rock_material: Material
 var block_materials: Dictionary = {}
@@ -348,6 +357,8 @@ func _input(event: InputEvent) -> void:
 	if event is InputEventKey and _reconnect_shortcut(event):
 		_connect_to_server(true)
 		get_viewport().set_input_as_handled()
+		return
+	if handoff_phase != "live":
 		return
 
 	if _local_player_incapacitated():
@@ -1395,6 +1406,57 @@ func _build_interface() -> void:
 	bottom_bar.add_child(message_label)
 	_build_inventory_terminal(canvas)
 	_build_life_support_interface(canvas)
+	_build_handoff_interface(canvas)
+
+
+func _build_handoff_interface(canvas: CanvasLayer) -> void:
+	handoff_overlay = Control.new()
+	handoff_overlay.name = "CellHandoffOverlay"
+	handoff_overlay.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	handoff_overlay.mouse_filter = Control.MOUSE_FILTER_STOP
+	handoff_overlay.visible = false
+	canvas.add_child(handoff_overlay)
+
+	var veil := ColorRect.new()
+	veil.color = Color(0.002, 0.009, 0.018, 0.82)
+	veil.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	handoff_overlay.add_child(veil)
+
+	var panel := ColorRect.new()
+	panel.anchor_left = 0.5
+	panel.anchor_top = 0.5
+	panel.anchor_right = 0.5
+	panel.anchor_bottom = 0.5
+	panel.offset_left = -340.0
+	panel.offset_top = -108.0
+	panel.offset_right = 340.0
+	panel.offset_bottom = 108.0
+	panel.color = Color(0.025, 0.065, 0.095, 0.98)
+	handoff_overlay.add_child(panel)
+
+	var accent := ColorRect.new()
+	accent.color = Color(0.10, 0.76, 1.0)
+	accent.anchor_right = 1.0
+	accent.offset_bottom = 3.0
+	panel.add_child(accent)
+
+	handoff_title_label = Label.new()
+	handoff_title_label.text = "CROSSING CELL AUTHORITY"
+	handoff_title_label.position = Vector2(24.0, 28.0)
+	handoff_title_label.size = Vector2(632.0, 42.0)
+	handoff_title_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	handoff_title_label.add_theme_font_size_override("font_size", 25)
+	handoff_title_label.add_theme_color_override("font_color", Color(0.63, 0.91, 1.0))
+	panel.add_child(handoff_title_label)
+
+	handoff_detail_label = Label.new()
+	handoff_detail_label.position = Vector2(34.0, 84.0)
+	handoff_detail_label.size = Vector2(612.0, 86.0)
+	handoff_detail_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	handoff_detail_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	handoff_detail_label.add_theme_font_size_override("font_size", 14)
+	handoff_detail_label.add_theme_color_override("font_color", Color(0.73, 0.82, 0.87))
+	panel.add_child(handoff_detail_label)
 
 
 func _build_life_support_interface(canvas: CanvasLayer) -> void:
@@ -2118,10 +2180,16 @@ func _verify_and_handle_packet(packet: PackedByteArray) -> void:
 func _finalize_committed_interest(
 	candidate: Dictionary, acknowledgement: PackedByteArray
 ) -> bool:
+	var completes_handoff := handoff_phase != "live"
+	if completes_handoff and not _handoff_destination_baseline_matches(candidate):
+		_client_fatal("DESTINATION BASELINE DOES NOT MATCH THE COMMITTED HANDOFF")
+		return false
 	_install_verified_interest_model(candidate)
 	if not _send_verifier_acknowledgement(acknowledgement):
 		_client_fatal("VERIFIER ACKNOWLEDGEMENT SEND FAILED")
 		return false
+	if completes_handoff:
+		_complete_handoff_presentation()
 	replication_state = "ready"
 	replication_detail = "INTEREST VIEW CURRENT"
 	auto_reconnect_attempts = 0
@@ -2190,6 +2258,9 @@ func _handle_server_message(message: Dictionary) -> void:
 			registry_received = true
 			replication_detail = "WAITING FOR INTEREST BASELINE"
 			_set_message("CELESTIAL REGISTRY VERIFIED // WAITING FOR LOCAL VIEW")
+		"handoff":
+			if not _handle_handoff_status(message.get("handoff", {})):
+				_client_fatal("INVALID HANDOFF PRESENTATION SEQUENCE")
 		"interest_baseline":
 			_client_fatal("UNVERIFIED INTEREST BASELINE BYPASSED NATIVE VERIFIER")
 		"interest_delta":
@@ -2246,6 +2317,124 @@ func _welcome_tuple_valid(message: Dictionary) -> bool:
 		== UNIVERSE_MANIFEST_SCHEMA_VERSION
 		and int(message.get("interest_schema_version", -1)) == INTEREST_SCHEMA_VERSION
 	)
+
+
+func _handle_handoff_status(status_value: Variant) -> bool:
+	if not status_value is Dictionary:
+		return false
+	var status: Dictionary = status_value
+	var phase := String(status.get("phase", ""))
+	var transfer_id := String(status.get("transfer_id", ""))
+	var destination_value: Variant = status.get("destination_cell_key", {})
+	var placement_generation := _protocol_nonnegative_integer(
+		status.get("placement_generation", null)
+	)
+	if (
+		not phase in ["preparing", "importing", "verifying_destination"]
+		or transfer_id.is_empty()
+		or not destination_value is Dictionary
+		or destination_value.is_empty()
+		or placement_generation <= 0
+	):
+		return false
+	var destination: Dictionary = destination_value
+	if handoff_phase == "live":
+		if phase != "preparing" or interest_session_epoch.is_empty() or interest_epoch < 0:
+			return false
+		handoff_transfer_id = transfer_id
+		handoff_destination_cell_key = destination.duplicate(true)
+		handoff_placement_generation = placement_generation
+		handoff_source_session_epoch = interest_session_epoch
+		handoff_source_interest_epoch = interest_epoch
+		_discard_source_view_for_handoff()
+	else:
+		if (
+			transfer_id != handoff_transfer_id
+			or destination != handoff_destination_cell_key
+			or placement_generation != handoff_placement_generation
+			or _handoff_phase_rank(phase) < _handoff_phase_rank(handoff_phase)
+			or _handoff_phase_rank(phase) > _handoff_phase_rank(handoff_phase) + 1
+		):
+			return false
+	handoff_phase = phase
+	replication_state = "handoff"
+	match phase:
+		"preparing":
+			replication_detail = "HANDOFF PREPARING // CONTROLS NEUTRALIZED"
+		"importing":
+			replication_detail = "HANDOFF IMPORTING // DESTINATION AUTHORITY COMMITTED"
+		"verifying_destination":
+			replication_detail = "VERIFYING DESTINATION // WAITING FOR TRUSTED BASELINE"
+	_set_message(replication_detail)
+	return true
+
+
+func _handoff_phase_rank(phase: String) -> int:
+	return ["preparing", "importing", "verifying_destination"].find(phase)
+
+
+func _discard_source_view_for_handoff() -> void:
+	authoritative_player_ready = false
+	operation_frontier_ready = false
+	mutation_resync_required = true
+	awaiting_reconnect_baseline = true
+	stream_family = ""
+	interest_entities = _empty_interest_entities()
+	interest_session_epoch = ""
+	interest_epoch = -1
+	interest_baseline_id = ""
+	interest_delta_sequence = -1
+	interest_view_hash = ""
+	interest_local_origin = {}
+	baseline_request_pending = false
+	snapshot = {}
+	_clear_actor_private_state()
+	active_grid_control_id = ""
+	inventory_open = false
+	prediction_history.clear()
+	pending_controls.clear()
+	prediction_history_invalid = false
+	prediction_gravity_model_ready = false
+	prediction_gravity_fallback = Vector3.ZERO
+	last_sent_control = {}
+	control_send_elapsed = 0.0
+	_clear_transient_character_input()
+	presentation_position_offset = Vector3.ZERO
+	presentation_orientation_offset = Quaternion.IDENTITY
+	require_neutral_baseline = true
+	last_authoritative_event_sequence = -1
+	last_authoritative_simulation_tick = 0
+	_sync_remote_players([])
+	_sync_voxel_projection([], [])
+	_rebuild_grids([])
+
+
+func _handoff_destination_baseline_matches(candidate: Dictionary) -> bool:
+	if handoff_phase != "verifying_destination" or not bool(candidate.get("baseline", false)):
+		return false
+	var link_value: Variant = candidate.get("transfer_link", null)
+	if not link_value is Dictionary:
+		return false
+	var link: Dictionary = link_value
+	return (
+		String(candidate.get("session_epoch", "")) == handoff_source_session_epoch
+		and int(candidate.get("interest_epoch", -1)) == handoff_source_interest_epoch + 1
+		and String(link.get("transfer_id", "")) == handoff_transfer_id
+		and link.get("destination_cell_key", {}) == handoff_destination_cell_key
+		and _protocol_nonnegative_integer(link.get("placement_generation", null))
+		== handoff_placement_generation
+	)
+
+
+func _complete_handoff_presentation() -> void:
+	handoff_phase = "live"
+	handoff_transfer_id = ""
+	handoff_destination_cell_key = {}
+	handoff_placement_generation = -1
+	handoff_source_session_epoch = ""
+	handoff_source_interest_epoch = -1
+	replication_detail = "INTEREST VIEW CURRENT // DESTINATION VERIFIED"
+	_set_message("DESTINATION CELL VERIFIED // EVA CONTROL RESTORED")
 
 
 func _install_registry(message: Dictionary) -> bool:
@@ -2400,6 +2589,7 @@ func _prepare_interest_baseline(authoritative: Dictionary) -> Dictionary:
 		"baseline_id": String(interest.get("baseline_id", "")),
 		"delta_sequence": 0,
 		"view_hash": String(interest.get("view_hash", "")),
+		"transfer_link": interest.get("transfer_link", null),
 	}
 
 
@@ -3281,6 +3471,12 @@ func _begin_player_resync() -> void:
 	interest_view_hash = ""
 	interest_local_origin = {}
 	baseline_request_pending = false
+	handoff_phase = "live"
+	handoff_transfer_id = ""
+	handoff_destination_cell_key = {}
+	handoff_placement_generation = -1
+	handoff_source_session_epoch = ""
+	handoff_source_interest_epoch = -1
 	bound_player_id = ""
 	session_role_kind = ""
 	_clear_actor_private_state()
@@ -6376,6 +6572,8 @@ func _update_interface() -> void:
 		match replication_state:
 			"ready":
 				link_text = "● LINKED // INTEREST VIEW %d" % interest_delta_sequence
+			"handoff":
+				link_text = "◆ CELL HANDOFF // %s" % handoff_phase.to_upper()
 			"stale":
 				link_text = "◐ LINK STALE // SAFE RESYNC IN PROGRESS"
 			"fatal":
@@ -6388,9 +6586,30 @@ func _update_interface() -> void:
 		Color(0.35, 0.95, 0.62)
 		if connected and replication_state == "ready"
 		else Color(1.0, 0.72, 0.24)
-		if connected and replication_state in ["loading", "stale"]
+		if connected and replication_state in ["loading", "stale", "handoff"]
 		else Color(1.0, 0.38, 0.25)
 	)
+	if handoff_overlay != null:
+		handoff_overlay.visible = handoff_phase != "live"
+		if handoff_overlay.visible:
+			var destination: Dictionary = handoff_destination_cell_key.get("cell", {})
+			var destination_text := "%s / %s / %s" % [
+				destination.get("x", "?"),
+				destination.get("y", "?"),
+				destination.get("z", "?"),
+			]
+			handoff_title_label.text = (
+				"VERIFYING DESTINATION"
+				if handoff_phase == "verifying_destination"
+				else "IMPORTING PLAYER AND CARGO"
+				if handoff_phase == "importing"
+				else "CROSSING CELL AUTHORITY"
+			)
+			handoff_detail_label.text = "%s\nCELL %s  //  PLACEMENT %d" % [
+				replication_detail,
+				destination_text,
+				handoff_placement_generation,
+			]
 	var player := _local_player()
 	_update_life_support_interface(player)
 	var level := int(player.get("level", 1))

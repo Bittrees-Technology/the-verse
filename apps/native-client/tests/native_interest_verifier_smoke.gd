@@ -253,6 +253,37 @@ func _test_portable_player_vector() -> void:
 		== ["interest_ack", "interest_ack"],
 		"portable >2^53 baseline and delta pass the complete verified model install before ACK",
 	)
+	var handoff := {
+		"type": "handoff",
+		"handoff": {
+			"transfer_id": "transfer-native-adapter",
+			"phase": "preparing",
+			"destination_cell_key": {
+				"schema_version": 1,
+				"universe_id": "universe-vector",
+				"sector": {"x": "0", "y": "0", "z": "0"},
+				"cell": {"x": 2, "y": 2, "z": 3},
+			},
+			"placement_generation": 2,
+		},
+	}
+	for phase in ["preparing", "importing", "verifying_destination"]:
+		handoff["handoff"]["phase"] = phase
+		integrated_client.call(
+			"_verify_and_handle_packet", JSON.stringify(handoff).to_utf8_buffer()
+		)
+		_check(
+			String(integrated_client.get("replication_state")) != "fatal"
+			and String(integrated_client.get("handoff_phase")) == phase,
+			"native adapter commits %s handoff presentation" % phase,
+		)
+	_check(
+		(integrated_client.get("snapshot") as Dictionary).is_empty()
+		and not bool(integrated_client.get("authoritative_player_ready"))
+		and (integrated_client.get("test_outbound_trace") as Array)
+		== ["interest_ack", "interest_ack"],
+		"handoff phases discard source presentation without emitting a state ACK",
+	)
 	integrated_client.free()
 
 
