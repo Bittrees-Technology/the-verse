@@ -552,8 +552,10 @@ cleanup evidence for crash recovery even when a side had no lock or
 reservation. The directory accepts cleanup only through a dedicated proof that
 binds the exact witness hash, source or destination role, live assignment and
 fence, nonzero cleanup frontier, package/member roots, quarantine receipt, and
-resulting draft-world commitment. Committed export and import are deliberately
-absent. The package draft now requires every production job to carry its exact
+resulting draft-world commitment. Directory v3 now also persists a typed
+source-export proof before allowing destination import and requires a distinct
+destination-activation proof before source finalization. The package draft now
+requires every production job to carry its exact
 canonical creation material: universe, creator cell, event sequence, entity
 kind, and ordinal. This makes the source-local queue frontier unambiguous after
 movement and rejects missing, substituted, or cross-cell-colliding identities.
@@ -568,11 +570,17 @@ that time, and releases the boundary for normal power, route, and capacity
 evaluation at the exact eligible time. Raw import-authority construction is
 test-only; no production caller can choose an event, fence, or trusted time
 until the import transaction derives them from validated directory and cell
-evidence. Atomic export/import transactions, the explicit transfer-paused
-production outcome, and crash/replay integration remain to be
-implemented before activation. All drafts are intentionally unreachable from the production
-directory-v2/package-v1 paths until every version in the table above moves in
-one coordinated activation.
+evidence. A private draft-world-21 source-export transaction now atomically
+removes every frozen closure family, records one checked transfer witness that
+includes installed components, advances a draft cell-event frontier, and seals
+acyclic mutation, event, resulting-world, and final proof hashes. It rejects
+partial state, ledger or witness tampering, proof substitution, overflow, and
+later-phase retries without the exact directory-retained final proof hash.
+Destination materialization/import, destination activation, source
+finalization, the explicit transfer-paused production outcome, and crash/replay
+integration remain to be implemented before activation. All drafts are
+intentionally unreachable from the production directory-v2/package-v1 paths
+until every version in the table above moves in one coordinated activation.
 
 The first P1.7 proof archives and resets P1.6 data. A later offline migration
 must derive canonical cell keys, install one placement generation for every

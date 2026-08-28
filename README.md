@@ -167,8 +167,17 @@ power/route evaluation only at or after that boundary. Raw import-authority
 construction is test-only; production construction remains unavailable until
 the import transaction can derive it from validated directory, canonical cell
 event, live-fence, and trusted-clock evidence.
-Committed export/import and scheduler wiring remain disabled until their
-atomic transactions and crash matrix are implemented. Production remains
+The dormant world-21 source-export transaction now removes the exact frozen
+grid, riders, inventories, queues, provenance, and contacts in one cloned-state
+mutation. Its checked conservation witness includes carried and escrowed
+resources plus installed block components, advances one draft event frontier,
+and produces separate acyclic mutation, event, resulting-world, and final proof
+commitments. Exact retries survive later directory phases only when the
+directory retains the matching final proof hash. Directory v3 now requires
+that durable source-export proof before import and a destination-activation
+proof before source finalization. Destination materialization, activation,
+source finalization, scheduler wiring, and the crash matrix remain disabled
+until their atomic transactions are implemented. Production remains
 pinned to protocol 18/directory 2/package 1 until the complete protocol-19
 tuple activates together. Production active-player load, the
 production binary codec, general multi-cell execution, safe zones, accounts,
