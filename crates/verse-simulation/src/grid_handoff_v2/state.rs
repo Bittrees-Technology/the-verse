@@ -641,6 +641,25 @@ pub(super) struct DraftGridTransferCellStateV2 {
     state_hash: String,
 }
 
+/// Non-serializable borrow proving that one exact outer schema-21 state and
+/// its nested schema-20 gameplay body were validated against the same
+/// manifest-5 capability.
+#[derive(Debug)]
+pub(super) struct ValidatedDraftGridTransferCellStateV21<'state, 'manifest> {
+    state: &'state DraftGridTransferCellStateV2,
+    manifest: &'manifest crate::manifest_v5::ValidatedUniverseManifestV5,
+}
+
+impl ValidatedDraftGridTransferCellStateV21<'_, '_> {
+    pub(super) fn state(&self) -> &DraftGridTransferCellStateV2 {
+        self.state
+    }
+
+    pub(super) fn manifest_hash(&self) -> &str {
+        self.manifest.manifest_hash()
+    }
+}
+
 #[derive(Serialize)]
 struct DraftActiveWorldHashMaterialV2<'a> {
     schema_version: u32,
@@ -3863,6 +3882,35 @@ impl DraftGridTransferCellStateV2 {
                     })
             })
             .map_err(DraftGridClosureError::Invalid)?;
+        self.validate_after_gameplay_body()
+    }
+
+    pub(super) fn validate_world_v21<'state, 'manifest>(
+        &'state self,
+        manifest: &'manifest crate::manifest_v5::ValidatedUniverseManifestV5,
+    ) -> Result<ValidatedDraftGridTransferCellStateV21<'state, 'manifest>, DraftGridClosureError>
+    {
+        self.base
+            .validate_world_v21_gameplay_body_with_job_frontier(manifest, |job| {
+                self.production_job_origins
+                    .get(&job.job_id)
+                    .is_some_and(|origin| {
+                        origin.frontier_is_valid_in_cell(
+                            &self.base.cell_id,
+                            self.base.event_sequence,
+                            job,
+                        )
+                    })
+            })
+            .map_err(DraftGridClosureError::Invalid)?;
+        self.validate_after_gameplay_body()?;
+        Ok(ValidatedDraftGridTransferCellStateV21 {
+            state: self,
+            manifest,
+        })
+    }
+
+    fn validate_after_gameplay_body(&self) -> Result<(), DraftGridClosureError> {
         validate_production_job_origins(
             &self.base.universe_id,
             &self.base.cell_id,
@@ -7049,6 +7097,51 @@ mod tests {
         committed.phase = TransferPhase::Committed;
         committed.record_test_destination_quarantine(&reserved, &package.transfer_id);
         (locked, committed)
+    }
+
+    #[test]
+    fn world21_state_gate_requires_exact_manifest5_and_schema_split() {
+        let (source, _, _) = package_fixture();
+        let active =
+            DraftGridTransferCellStateV2::new(source).expect("active-context draft fixture seals");
+        let manifest = crate::manifest_v5::build_validated_manifest_v5(801)
+            .expect("manifest-5 capability builds");
+        let other_manifest = crate::manifest_v5::build_validated_manifest_v5(802)
+            .expect("other manifest-5 capability builds");
+        assert!(active.validate().is_ok());
+        assert!(active.validate_world_v21(&manifest).is_err());
+
+        let mut world21 = active;
+        world21.base.universe_manifest_hash = manifest.manifest_hash().to_owned();
+        world21.state_hash = world21.calculate_hash().expect("world-21 state rehashes");
+        assert!(world21.validate().is_err());
+        let validated = world21
+            .validate_world_v21(&manifest)
+            .expect("schema-20 body inside schema-21 envelope validates");
+        assert_eq!(validated.state(), &world21);
+        assert_eq!(validated.manifest_hash(), manifest.manifest_hash());
+        assert!(world21.validate_world_v21(&other_manifest).is_err());
+
+        let mut wrong_inner_schema = world21.clone();
+        wrong_inner_schema.base.schema_version = DRAFT_GRID_CELL_STATE_SCHEMA_VERSION;
+        wrong_inner_schema.state_hash = wrong_inner_schema
+            .calculate_hash()
+            .expect("wrong inner schema rehashes");
+        assert!(wrong_inner_schema.validate_world_v21(&manifest).is_err());
+
+        let mut wrong_outer_schema = world21.clone();
+        wrong_outer_schema.schema_version = crate::model::WORLD_SCHEMA_VERSION;
+        wrong_outer_schema.state_hash = wrong_outer_schema
+            .calculate_hash()
+            .expect("wrong outer schema rehashes");
+        assert!(wrong_outer_schema.validate_world_v21(&manifest).is_err());
+
+        let mut wrong_cell = world21;
+        wrong_cell.base.cell_id = "ab".repeat(32);
+        wrong_cell.state_hash = wrong_cell
+            .calculate_hash()
+            .expect("wrong-cell state rehashes");
+        assert!(wrong_cell.validate_world_v21(&manifest).is_err());
     }
 
     fn production_package_fixture() -> (WorldState, DraftGridClosurePackageV2) {
