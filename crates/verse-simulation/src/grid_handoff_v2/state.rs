@@ -645,7 +645,7 @@ pub(super) struct DraftGridTransferCellStateV2 {
 /// its nested schema-20 gameplay body were validated against the same
 /// manifest-5 capability.
 #[derive(Debug)]
-pub(super) struct ValidatedDraftGridTransferCellStateV21<'state, 'manifest> {
+pub(crate) struct ValidatedDraftGridTransferCellStateV21<'state, 'manifest> {
     state: &'state DraftGridTransferCellStateV2,
     manifest: &'manifest crate::manifest_v5::ValidatedUniverseManifestV5,
 }
@@ -3844,7 +3844,7 @@ impl DraftGridTransferCellStateV2 {
         hash_json(DRAFT_CELL_STATE_HASH_DOMAIN, &material)
     }
 
-    fn calculate_active_world_hash(&self) -> Result<String, DraftGridClosureError> {
+    pub(super) fn calculate_active_world_hash(&self) -> Result<String, DraftGridClosureError> {
         // The fencing token is an operational lease, not gameplay state. A
         // successor worker must be able to verify the same active-world root
         // while presenting a newer directory fence.

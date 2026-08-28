@@ -123,9 +123,16 @@ player.
 Protocol-19 cell state uses the isolated `protocol-19-world-v21` namespace;
 the active protocol-18 Store never reads it. Initialization holds one exclusive
 writer lock and persists a canonical identity, manifest-5 document, world-21
-snapshot, empty event-17 journal, and a sealed initialization head. The head is
-the commit marker and is written last. It binds the complete protocol tuple,
-identity, manifest, migration anchor, snapshot, and zero-length event frontier.
+snapshot, immutable lifecycle-v2 genesis, empty event-17 journal, and a sealed
+initialization head. The lifecycle genesis is derived from the canonical
+migration receipt. It binds staged-unactivated mode, the exact directory-v3
+genesis, assignment and fence, trusted cut-off, target state and active-world
+hashes, retained event-16 predecessor, empty event-17 frontier, production
+cursor root, production-origin root, and identity-subset root. Its hash must
+equal the receipt's target lifecycle commitment. The initialization head is the
+per-cell commit marker and is written last. It binds the complete protocol
+tuple, identity, manifest, migration anchor and receipt, lifecycle genesis,
+snapshot, and zero-length event frontier.
 The caller must supply an already durable per-cell root. The namespace
 directory is committed by synchronizing that root, and each authority
 replacement is synchronized before the head is installed.
@@ -138,7 +145,11 @@ known precommit authority files and their temporary files, synchronize that
 cleanup, and retry. An I/O or metadata error while checking the head is not
 absence and fails closed without cleanup. Once a head exists, initialization
 never overwrites it and ordinary recovery must validate every bounded
-canonical file.
+canonical file. A non-Serde staging capability is minted only when a canonical
+receipt identifies the exact validated manifest-5/world-21 state, cell route,
+active-world root, fence, and legacy frontier. The Store stages through that
+capability rather than accepting an arbitrary anchor hash. This proves the
+target cell binding, not the source archives or authority to activate it.
 
 After initialization, a separate atomically replaced event head owns the
 mutable event-17 frontier. It binds the initialization head, identity,
@@ -162,9 +173,10 @@ dispatcher. A pending head with no event or a strictly partial event rolls back
 to the committed frontier. One complete pending event deterministically
 backfills an absent or strictly partial boundary and commits. Tampered prefixes,
 wrong history, unpinned or excess suffixes, and data at or beyond a sealed
-pending range fail closed without truncation. The Store remains test-only until
-a validated migration-target install capability, runtime scheduler/wake path,
-and coordinated protocol-19 activation exist.
+pending range fail closed without truncation. The receipt-bound staging path is
+compiled as dormant code but has no worker, runtime, or public entry point.
+Source-evidence validation, a universe-wide install commit, the runtime
+scheduler/wake path, and coordinated protocol-19 activation remain required.
 
 Rollback removes the entire unactivated protocol-19 namespace or restores it
 as one matching compatibility set. Copying individual identity, manifest,
