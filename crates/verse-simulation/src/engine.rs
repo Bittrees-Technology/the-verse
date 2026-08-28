@@ -924,183 +924,9 @@ impl Runtime {
         if self.halted {
             return Err(RuntimeError::Halted);
         }
-        if self.state.event_sequence != 0 {
-            return Err(IntentError::rejected(
-                "earth_start_requires_fresh_world",
-                "the Earthlike surface start can be selected only before the first canonical event",
-            )
-            .into());
-        }
-        if self
-            .state
-            .grids
-            .get(STARTER_INDUSTRY_GRID_ID)
-            .is_some_and(|grid| {
-                grid.blocks
-                    .contains_key(EARTH_START_PROFILE_MARKER_BLOCK_ID)
-            })
-        {
-            return Ok(false);
-        }
-
         let mut next_state = self.state.clone();
-        let center = planet_center();
-        let surface_radius = planet_surface_radius_m();
-        let player_position = Vec3::new(center.x, center.y + surface_radius + 0.92, center.z + 6.5);
-        let player_address = next_state
-            .address_for_active_position(player_position)
-            .map_err(|message| {
-                IntentError::rejected("earth_start_player_address_invalid", message)
-            })?;
-        {
-            let player = next_state.player.primary_mut();
-            player.address = player_address;
-            player.position = player_position;
-            // Identity looks toward local -Z, placing the open outpost directly
-            // in front of the player at this north-pole tangent patch.
-            player.orientation = Quat::IDENTITY;
-            player.linear_velocity = Vec3::ZERO;
-            player.angular_velocity = Vec3::ZERO;
-            player.surface_contact = false;
-            player.locomotion.kind = LocomotionKind::Airborne;
-            player.locomotion.up = radial_up(player_position);
-            player.locomotion.view_pitch_radians = 0.0;
-            player.locomotion.support = None;
-            player.locomotion.jump_held = false;
-            player.locomotion.jump_buffer_expires_at_simulation_tick = 0;
-            player.locomotion.support_grace_expires_at_simulation_tick = 0;
-            player.locomotion.magnetic_boots_enabled = false;
-            player.locomotion.magnetic_reattach_after_simulation_tick = 0;
-            player.pending_control_frames.clear();
-            player.control_linear_input = Vec3::ZERO;
-            player.control_angular_input = Vec3::ZERO;
-            player.boost = false;
-            player.dampeners = true;
-            player.jump = false;
-            player.control_expires_at_simulation_tick = 0;
-            player.helmet_closed = false;
-            player.jetpack_enabled = false;
-        }
-
-        let skiff_position = Vec3::new(
-            center.x + 9.0,
-            center.y + surface_radius + 0.52,
-            center.z - 1.0,
-        );
-        let skiff_address = next_state
-            .address_for_active_position(skiff_position)
-            .map_err(|message| {
-                IntentError::rejected("earth_start_skiff_address_invalid", message)
-            })?;
-        let skiff = next_state
-            .grids
-            .get_mut(STARTER_GRID_ID)
-            .expect("genesis always contains the starter skiff");
-        skiff.address = skiff_address;
-        skiff.position = skiff_position;
-        skiff.orientation = Quat::IDENTITY;
-        skiff.linear_velocity = Vec3::ZERO;
-        skiff.angular_velocity = Vec3::ZERO;
-        skiff.control_linear_input = Vec3::ZERO;
-        skiff.control_angular_input = Vec3::ZERO;
-        skiff.dampeners = true;
-        skiff.anchored = false;
-
-        let outpost_position = Vec3::new(center.x, center.y + surface_radius + 0.52, center.z);
-        let outpost_address = next_state
-            .address_for_active_position(outpost_position)
-            .map_err(|message| {
-                IntentError::rejected("earth_start_outpost_address_invalid", message)
-            })?;
-        let outpost = next_state
-            .grids
-            .get_mut(STARTER_INDUSTRY_GRID_ID)
-            .expect("genesis always contains the starter industry grid");
-        outpost.address = outpost_address;
-        outpost.position = outpost_position;
-        outpost.orientation = Quat::IDENTITY;
-        outpost.linear_velocity = Vec3::ZERO;
-        outpost.angular_velocity = Vec3::ZERO;
-        outpost.control_linear_input = Vec3::ZERO;
-        outpost.control_angular_input = Vec3::ZERO;
-        outpost.dampeners = true;
-        outpost.anchored = false;
-
-        for (block_id, coordinate) in [
-            ("block-industry-core", IVec3::new(-2, 1, -1)),
-            ("block-industry-power", IVec3::new(-1, 1, -1)),
-            ("block-industry-cargo", IVec3::new(-2, 1, 0)),
-            ("block-conveyor", IVec3::new(-1, 1, 0)),
-            ("block-refinery", IVec3::new(0, 1, 0)),
-            ("block-assembler", IVec3::new(1, 1, 0)),
-        ] {
-            outpost
-                .blocks
-                .get_mut(block_id)
-                .expect("genesis industry block exists")
-                .coordinate = coordinate;
-        }
-
-        let mut added_installed_components = 0_u64;
-        let mut add_structure = |block_id: String, coordinate: IVec3| {
-            let block = Block::new(block_id.clone(), coordinate, BlockKind::Structural);
-            added_installed_components =
-                added_installed_components.saturating_add(block.component_cost);
-            assert!(outpost.blocks.insert(block_id, block).is_none());
-        };
-        for x in -4..=4 {
-            for z in -3..=3 {
-                add_structure(
-                    format!("block-outpost-floor-x{x}-z{z}"),
-                    IVec3::new(x, 0, z),
-                );
-            }
-        }
-        for x in -4..=4 {
-            for y in 1..=2 {
-                add_structure(
-                    format!("block-outpost-back-x{x}-y{y}"),
-                    IVec3::new(x, y, -3),
-                );
-            }
-        }
-        for x in [-4, 4] {
-            for z in -2..=1 {
-                for y in 1..=2 {
-                    add_structure(
-                        format!("block-outpost-side-x{x}-y{y}-z{z}"),
-                        IVec3::new(x, y, z),
-                    );
-                }
-            }
-        }
-        // A low front rail frames the entrance while keeping the player's
-        // first route into the workshop completely open.
-        for x in [-4, -3, 3, 4] {
-            add_structure(
-                format!("block-outpost-front-rail-x{x}"),
-                IVec3::new(x, 1, 2),
-            );
-        }
-        next_state.ledger.genesis_installed_components = next_state
-            .ledger
-            .genesis_installed_components
-            .checked_add(added_installed_components)
-            .ok_or_else(|| {
-                IntentError::rejected(
-                    "earth_start_component_ledger_overflow",
-                    "surface outpost installed components exceed the canonical ledger",
-                )
-            })?;
-
-        next_state
-            .validate_player_roster()
-            .map_err(|message| IntentError::rejected("earth_start_authority_invalid", message))?;
-        if !next_state.conservation().valid {
-            return Err(IntentError::ConservationViolation {
-                event_sequence: next_state.event_sequence,
-            }
-            .into());
+        if !next_state.configure_earth_start_profile()? {
+            return Ok(false);
         }
         let next_physics =
             if self.store.lifecycle_mode() == crate::persistence::LifecycleMode::Active {
@@ -2194,6 +2020,189 @@ impl Runtime {
 }
 
 impl WorldState {
+    /// Applies the one canonical event-zero surface profile without touching
+    /// persistence or runtime authority. Keeping this transformation pure lets
+    /// offline migration validation reconstruct the exact same allowed origin.
+    pub(crate) fn configure_earth_start_profile(&mut self) -> Result<bool, IntentError> {
+        if self.event_sequence != 0 {
+            return Err(IntentError::rejected(
+                "earth_start_requires_fresh_world",
+                "the Earthlike surface start can be selected only before the first canonical event",
+            ));
+        }
+        if self
+            .grids
+            .get(STARTER_INDUSTRY_GRID_ID)
+            .is_some_and(|grid| {
+                grid.blocks
+                    .contains_key(EARTH_START_PROFILE_MARKER_BLOCK_ID)
+            })
+        {
+            return Ok(false);
+        }
+
+        let mut next_state = self.clone();
+        let center = planet_center();
+        let surface_radius = planet_surface_radius_m();
+        let player_position = Vec3::new(center.x, center.y + surface_radius + 0.92, center.z + 6.5);
+        let player_address = next_state
+            .address_for_active_position(player_position)
+            .map_err(|message| {
+                IntentError::rejected("earth_start_player_address_invalid", message)
+            })?;
+        {
+            let player = next_state.player.primary_mut();
+            player.address = player_address;
+            player.position = player_position;
+            // Identity looks toward local -Z, placing the open outpost directly
+            // in front of the player at this north-pole tangent patch.
+            player.orientation = Quat::IDENTITY;
+            player.linear_velocity = Vec3::ZERO;
+            player.angular_velocity = Vec3::ZERO;
+            player.surface_contact = false;
+            player.locomotion.kind = LocomotionKind::Airborne;
+            player.locomotion.up = radial_up(player_position);
+            player.locomotion.view_pitch_radians = 0.0;
+            player.locomotion.support = None;
+            player.locomotion.jump_held = false;
+            player.locomotion.jump_buffer_expires_at_simulation_tick = 0;
+            player.locomotion.support_grace_expires_at_simulation_tick = 0;
+            player.locomotion.magnetic_boots_enabled = false;
+            player.locomotion.magnetic_reattach_after_simulation_tick = 0;
+            player.pending_control_frames.clear();
+            player.control_linear_input = Vec3::ZERO;
+            player.control_angular_input = Vec3::ZERO;
+            player.boost = false;
+            player.dampeners = true;
+            player.jump = false;
+            player.control_expires_at_simulation_tick = 0;
+            player.helmet_closed = false;
+            player.jetpack_enabled = false;
+        }
+
+        let skiff_position = Vec3::new(
+            center.x + 9.0,
+            center.y + surface_radius + 0.52,
+            center.z - 1.0,
+        );
+        let skiff_address = next_state
+            .address_for_active_position(skiff_position)
+            .map_err(|message| {
+                IntentError::rejected("earth_start_skiff_address_invalid", message)
+            })?;
+        let skiff = next_state
+            .grids
+            .get_mut(STARTER_GRID_ID)
+            .expect("genesis always contains the starter skiff");
+        skiff.address = skiff_address;
+        skiff.position = skiff_position;
+        skiff.orientation = Quat::IDENTITY;
+        skiff.linear_velocity = Vec3::ZERO;
+        skiff.angular_velocity = Vec3::ZERO;
+        skiff.control_linear_input = Vec3::ZERO;
+        skiff.control_angular_input = Vec3::ZERO;
+        skiff.dampeners = true;
+        skiff.anchored = false;
+
+        let outpost_position = Vec3::new(center.x, center.y + surface_radius + 0.52, center.z);
+        let outpost_address = next_state
+            .address_for_active_position(outpost_position)
+            .map_err(|message| {
+                IntentError::rejected("earth_start_outpost_address_invalid", message)
+            })?;
+        let outpost = next_state
+            .grids
+            .get_mut(STARTER_INDUSTRY_GRID_ID)
+            .expect("genesis always contains the starter industry grid");
+        outpost.address = outpost_address;
+        outpost.position = outpost_position;
+        outpost.orientation = Quat::IDENTITY;
+        outpost.linear_velocity = Vec3::ZERO;
+        outpost.angular_velocity = Vec3::ZERO;
+        outpost.control_linear_input = Vec3::ZERO;
+        outpost.control_angular_input = Vec3::ZERO;
+        outpost.dampeners = true;
+        outpost.anchored = false;
+
+        for (block_id, coordinate) in [
+            ("block-industry-core", IVec3::new(-2, 1, -1)),
+            ("block-industry-power", IVec3::new(-1, 1, -1)),
+            ("block-industry-cargo", IVec3::new(-2, 1, 0)),
+            ("block-conveyor", IVec3::new(-1, 1, 0)),
+            ("block-refinery", IVec3::new(0, 1, 0)),
+            ("block-assembler", IVec3::new(1, 1, 0)),
+        ] {
+            outpost
+                .blocks
+                .get_mut(block_id)
+                .expect("genesis industry block exists")
+                .coordinate = coordinate;
+        }
+
+        let mut added_installed_components = 0_u64;
+        let mut add_structure = |block_id: String, coordinate: IVec3| {
+            let block = Block::new(block_id.clone(), coordinate, BlockKind::Structural);
+            added_installed_components =
+                added_installed_components.saturating_add(block.component_cost);
+            assert!(outpost.blocks.insert(block_id, block).is_none());
+        };
+        for x in -4..=4 {
+            for z in -3..=3 {
+                add_structure(
+                    format!("block-outpost-floor-x{x}-z{z}"),
+                    IVec3::new(x, 0, z),
+                );
+            }
+        }
+        for x in -4..=4 {
+            for y in 1..=2 {
+                add_structure(
+                    format!("block-outpost-back-x{x}-y{y}"),
+                    IVec3::new(x, y, -3),
+                );
+            }
+        }
+        for x in [-4, 4] {
+            for z in -2..=1 {
+                for y in 1..=2 {
+                    add_structure(
+                        format!("block-outpost-side-x{x}-y{y}-z{z}"),
+                        IVec3::new(x, y, z),
+                    );
+                }
+            }
+        }
+        // A low front rail frames the entrance while keeping the player's
+        // first route into the workshop completely open.
+        for x in [-4, -3, 3, 4] {
+            add_structure(
+                format!("block-outpost-front-rail-x{x}"),
+                IVec3::new(x, 1, 2),
+            );
+        }
+        next_state.ledger.genesis_installed_components = next_state
+            .ledger
+            .genesis_installed_components
+            .checked_add(added_installed_components)
+            .ok_or_else(|| {
+                IntentError::rejected(
+                    "earth_start_component_ledger_overflow",
+                    "surface outpost installed components exceed the canonical ledger",
+                )
+            })?;
+
+        next_state
+            .validate_player_roster()
+            .map_err(|message| IntentError::rejected("earth_start_authority_invalid", message))?;
+        if !next_state.conservation().valid {
+            return Err(IntentError::ConservationViolation {
+                event_sequence: next_state.event_sequence,
+            });
+        }
+        *self = next_state;
+        Ok(true)
+    }
+
     fn production_occurrence_is_committed(
         &self,
         occurrence: &ProductionScheduleOccurrence,

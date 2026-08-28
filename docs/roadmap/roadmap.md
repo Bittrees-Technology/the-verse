@@ -184,6 +184,17 @@ hybrid world and may not invent, duplicate, omit, or reseal conserved state.
 After this bridge is green, the next playable slice prioritizes F-062 and
 F-063 before broader construction breadth.
 
+The first P1.8 source-validation slice acquires only existing directory-v2 and
+cell-store locks, in directory-then-ordered-cell order, and returns a
+non-serializable frozen-source capability. It requires both proof cells and
+their directory assignments to be released sleeping, all transfers terminal,
+and every event-16 and transfer-boundary record to be exact, canonical, fully
+replayable, and backed by issued fencing history. It never creates, truncates,
+backfills, recovers, advances, or rewrites a source artifact. Identity and
+production-origin transforms, global conservation/gameplay roots, receipt
+issuance, archive copying, target validation, the universe install head, and
+activation remain later P1.8 gates.
+
 P1.5 acceptance requires:
 
 - Deterministic registry identity, normalized addresses, minimum-separation

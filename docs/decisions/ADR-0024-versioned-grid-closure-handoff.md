@@ -175,8 +175,17 @@ backfills an absent or strictly partial boundary and commits. Tampered prefixes,
 wrong history, unpinned or excess suffixes, and data at or beyond a sealed
 pending range fail closed without truncation. The receipt-bound staging path is
 compiled as dormant code but has no worker, runtime, or public entry point.
-Source-evidence validation, a universe-wide install commit, the runtime
-scheduler/wake path, and coordinated protocol-19 activation remain required.
+The source-side validator now acquires the existing directory-v2 lock followed
+by existing cell writer locks in canonical cell-ID order and mints one
+non-Serde frozen-source capability. It requires sleeping assignments and
+lifecycles, terminal transfers, exact full event replay, canonical bounded
+archives, matching lifecycle/snapshot/production frontiers, issued historical
+fences, and exact directory-to-cell transfer proofs. Validation is read-only:
+it does not create, truncate, backfill, heal, advance a fence, or sample trusted
+time. Identity and production-origin transforms, global conservation and
+normalized-gameplay roots, receipt binding, durable archive copying, a
+universe-wide install commit, the runtime scheduler/wake path, and coordinated
+protocol-19 activation remain required.
 
 Rollback removes the entire unactivated protocol-19 namespace or restores it
 as one matching compatibility set. Copying individual identity, manifest,

@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use fs2::FileExt;
@@ -19,6 +19,17 @@ pub const CELL_DIRECTORY_SCHEMA_VERSION: u32 = verse_protocol::CELL_DIRECTORY_SC
 
 const DIRECTORY_FILE: &str = "cell-directory.json";
 const DIRECTORY_LOCK_FILE: &str = "cell-directory.lock";
+const MAX_FROZEN_DIRECTORY_BYTES: u64 = 64 * 1_024 * 1_024;
+const FROZEN_DIRECTORY_DOCUMENT_HASH_DOMAIN: &[u8] =
+    b"the-verse/protocol-18-frozen-directory-document/v1\0";
+const FROZEN_DIRECTORY_ASSIGNMENT_ROOT_DOMAIN: &[u8] =
+    b"the-verse/protocol-18-frozen-directory-assignments/v1\0";
+const FROZEN_DIRECTORY_PLACEMENT_ROOT_DOMAIN: &[u8] =
+    b"the-verse/protocol-18-frozen-directory-placements/v1\0";
+const FROZEN_DIRECTORY_TRANSFER_ROOT_DOMAIN: &[u8] =
+    b"the-verse/protocol-18-frozen-directory-terminal-transfers/v1\0";
+const FROZEN_DIRECTORY_FENCING_HISTORY_ROOT_DOMAIN: &[u8] =
+    b"the-verse/protocol-18-frozen-directory-fencing-history/v1\0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -492,6 +503,173 @@ pub struct LocalCellDirectory {
     root: PathBuf,
     lock_file: File,
     document: CellDirectoryDocument,
+}
+
+/// Non-serializable read-only proof that the complete protocol-18 directory
+/// was locked and validated without creating, repairing, or rewriting it.
+/// Holding this value keeps the directory writer lock for the migration
+/// validator's lifetime.
+#[derive(Debug)]
+pub(crate) struct FrozenProtocol18Directory {
+    root: PathBuf,
+    document: CellDirectoryDocument,
+    document_hash: String,
+    assignment_root: String,
+    placement_root: String,
+    terminal_transfer_root: String,
+    _lock_file: File,
+}
+
+impl FrozenProtocol18Directory {
+    pub(crate) fn lock_existing(
+        root: impl AsRef<Path>,
+        universe_manifest: &UniverseManifestSnapshot,
+        proof_cells: impl IntoIterator<Item = CellKeyV1>,
+    ) -> Result<Self, CellDirectoryError> {
+        let root = root.as_ref().to_path_buf();
+        if !root.is_dir() {
+            return Err(CellDirectoryError::InvalidDirectory(
+                "frozen protocol-18 source directory does not exist".into(),
+            ));
+        }
+        let lock_path = root.join(DIRECTORY_LOCK_FILE);
+        let lock_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|source| io_error(&lock_path, source))?;
+        FileExt::try_lock_exclusive(&lock_file).map_err(|source| {
+            if source.kind() == std::io::ErrorKind::WouldBlock {
+                CellDirectoryError::WriterAlreadyActive(root.clone())
+            } else {
+                io_error(&lock_path, source)
+            }
+        })?;
+
+        let expected_assignments = canonical_assignments(universe_manifest, proof_cells)?;
+        let directory_path = root.join(DIRECTORY_FILE);
+        let mut directory_file =
+            File::open(&directory_path).map_err(|source| io_error(&directory_path, source))?;
+        let mut bytes = Vec::new();
+        Read::by_ref(&mut directory_file)
+            .take(MAX_FROZEN_DIRECTORY_BYTES.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(|source| io_error(&directory_path, source))?;
+        if u64::try_from(bytes.len()).map_or(true, |length| length > MAX_FROZEN_DIRECTORY_BYTES) {
+            return Err(CellDirectoryError::InvalidDirectory(format!(
+                "frozen protocol-18 directory exceeds {MAX_FROZEN_DIRECTORY_BYTES} bytes"
+            )));
+        }
+        let document =
+            serde_json::from_slice::<CellDirectoryDocument>(&bytes).map_err(|source| {
+                CellDirectoryError::Json {
+                    path: directory_path.clone(),
+                    source,
+                }
+            })?;
+        validate_document(&document, universe_manifest, &expected_assignments)?;
+        let canonical =
+            serde_json::to_vec_pretty(&document).map_err(|source| CellDirectoryError::Json {
+                path: directory_path,
+                source,
+            })?;
+        if canonical != bytes {
+            return Err(CellDirectoryError::InvalidDirectory(
+                "frozen protocol-18 directory bytes are not canonical".into(),
+            ));
+        }
+        if document.transfers.values().any(|transfer| {
+            !matches!(
+                transfer.phase,
+                TransferPhase::Finalized | TransferPhase::Aborted
+            )
+        }) {
+            return Err(CellDirectoryError::InvalidDirectory(
+                "frozen protocol-18 directory retains a nonterminal transfer".into(),
+            ));
+        }
+        if document.assignments.values().any(|assignment| {
+            assignment.assignment_generation == 0
+                || assignment.authority_fencing_token == 0
+                || assignment.state != CellAssignmentState::Sleeping
+                || assignment.holder_id.is_some()
+        }) {
+            return Err(CellDirectoryError::InvalidDirectory(
+                "frozen protocol-18 directory requires every cell released to sleeping".into(),
+            ));
+        }
+
+        let document_hash = hash_frozen_material(FROZEN_DIRECTORY_DOCUMENT_HASH_DOMAIN, &bytes);
+        let assignment_root = hash_frozen_json(
+            FROZEN_DIRECTORY_ASSIGNMENT_ROOT_DOMAIN,
+            &document.assignments,
+        )?;
+        let placement_root =
+            hash_frozen_json(FROZEN_DIRECTORY_PLACEMENT_ROOT_DOMAIN, &document.placements)?;
+        let terminal_transfer_root =
+            hash_frozen_json(FROZEN_DIRECTORY_TRANSFER_ROOT_DOMAIN, &document.transfers)?;
+        Ok(Self {
+            root,
+            document,
+            document_hash,
+            assignment_root,
+            placement_root,
+            terminal_transfer_root,
+            _lock_file: lock_file,
+        })
+    }
+
+    pub(crate) const fn directory_revision(&self) -> u64 {
+        self.document.directory_revision
+    }
+
+    pub(crate) fn document_hash(&self) -> &str {
+        &self.document_hash
+    }
+
+    pub(crate) fn assignment_root(&self) -> &str {
+        &self.assignment_root
+    }
+
+    pub(crate) fn placement_root(&self) -> &str {
+        &self.placement_root
+    }
+
+    pub(crate) fn terminal_transfer_root(&self) -> &str {
+        &self.terminal_transfer_root
+    }
+
+    pub(crate) fn terminal_transfer_count(&self) -> u64 {
+        u64::try_from(self.document.transfers.len()).expect("directory transfer count fits u64")
+    }
+
+    pub(crate) fn assignments(&self) -> impl Iterator<Item = &CellAssignmentRecord> {
+        self.document.assignments.values()
+    }
+
+    pub(crate) fn transfers(&self) -> impl Iterator<Item = &CellTransferRecord> {
+        self.document.transfers.values()
+    }
+
+    pub(crate) fn fencing_history_root(
+        &self,
+        assignment: &CellAssignmentRecord,
+    ) -> Result<String, CellDirectoryError> {
+        let current = self.document.assignments.get(&assignment.cell_id);
+        if current != Some(assignment) {
+            return Err(CellDirectoryError::InvalidDirectory(
+                "fencing-history root requested for a foreign assignment".into(),
+            ));
+        }
+        hash_frozen_json(
+            FROZEN_DIRECTORY_FENCING_HISTORY_ROOT_DOMAIN,
+            &assignment.fencing_history,
+        )
+    }
+
+    pub(crate) fn cell_store_root(&self, assignment: &CellAssignmentRecord) -> PathBuf {
+        self.root.join("cells").join(&assignment.cell_id)
+    }
 }
 
 impl LocalCellDirectory {
@@ -1896,6 +2074,22 @@ fn validate_abort_proof(
 
 fn validate_holder(holder_id: &str) -> Result<(), CellDirectoryError> {
     validate_stable_id(holder_id, "assignment holder")
+}
+
+fn hash_frozen_material(domain: &[u8], bytes: &[u8]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(domain);
+    hasher.update(bytes);
+    hasher.finalize().to_hex().to_string()
+}
+
+fn hash_frozen_json<T: Serialize>(domain: &[u8], value: &T) -> Result<String, CellDirectoryError> {
+    let bytes = serde_json::to_vec(value).map_err(|source| {
+        CellDirectoryError::InvalidDirectory(format!(
+            "frozen directory commitment cannot be encoded: {source}"
+        ))
+    })?;
+    Ok(hash_frozen_material(domain, &bytes))
 }
 
 pub(crate) fn write_json_atomic<T: Serialize>(
