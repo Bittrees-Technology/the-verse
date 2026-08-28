@@ -5,7 +5,7 @@ use std::ops::{Deref, DerefMut};
 
 use serde::{Deserialize, Serialize};
 use verse_protocol::{
-    BlockKind, BlockSnapshot, CareerSnapshot, ConservationSnapshot, DeathDropSnapshot,
+    BlockKind, BlockSnapshot, CareerSnapshot, CellKeyV1, ConservationSnapshot, DeathDropSnapshot,
     EnvironmentSnapshot, GridMotionSnapshot, GridSnapshot, IVec3, IntentReceipt, InventoryContents,
     InventoryDomain, InventorySnapshot, LocomotionKind, MotionSnapshot, PlayerDeathCause,
     PlayerLifeState, PlayerLocomotionSnapshot, PlayerMotionSnapshot, PlayerSnapshot, PowerSnapshot,
@@ -15,7 +15,7 @@ use verse_protocol::{
 
 use crate::{celestial, content};
 
-pub const WORLD_SCHEMA_VERSION: u32 = 19;
+pub const WORLD_SCHEMA_VERSION: u32 = 20;
 pub const PROCESSED_OPERATION_RETENTION_LIMIT: usize = 128;
 pub const PROCESSED_OPERATION_RETAINED_BYTES_LIMIT: usize = 131_072;
 pub const PROCESSED_OPERATION_RECORD_BYTES_LIMIT: usize = 4_096;
@@ -34,14 +34,6 @@ pub fn planet_surface_radius_m() -> f64 {
     celestial::body_surface_radius_m(celestial::GRAVITY_BODY_ID)
 }
 
-pub fn planet_atmosphere_height_m() -> f64 {
-    celestial::body_atmosphere_height_m(celestial::GRAVITY_BODY_ID)
-}
-
-pub fn planet_surface_gravity_m_s2() -> f64 {
-    celestial::body_surface_gravity_m_s2(celestial::GRAVITY_BODY_ID)
-}
-
 pub fn valid_player_id(player_id: &str) -> bool {
     !player_id.is_empty()
         && player_id.len() <= 128
@@ -55,6 +47,14 @@ pub fn valid_blake3_hex(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn valid_transfer_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
 }
 
 pub fn radial_up(position: Vec3) -> Vec3 {
@@ -238,6 +238,13 @@ pub struct PlayerRoster {
 }
 
 impl PlayerRoster {
+    pub fn empty() -> Self {
+        Self {
+            primary_player_id: String::new(),
+            by_id: BTreeMap::new(),
+        }
+    }
+
     pub fn from_primary(player: Player) -> Self {
         let primary_player_id = player.player_id.clone();
         Self {
@@ -259,6 +266,9 @@ impl PlayerRoster {
     }
 
     pub fn validate(&self) -> Result<(), &'static str> {
+        if self.primary_player_id.is_empty() && self.by_id.is_empty() {
+            return Ok(());
+        }
         if self.primary_player_id.trim().is_empty()
             || !self.by_id.contains_key(&self.primary_player_id)
         {
@@ -736,6 +746,63 @@ pub struct Ledger {
     pub built_blocks: u64,
     pub destroyed_blocks: u64,
     pub destroyed_components: u64,
+    #[serde(default)]
+    pub transfer_imported_ore: u64,
+    #[serde(default)]
+    pub transfer_imported_refined: u64,
+    #[serde(default)]
+    pub transfer_imported_components: u64,
+    #[serde(default)]
+    pub transfer_exported_ore: u64,
+    #[serde(default)]
+    pub transfer_exported_refined: u64,
+    #[serde(default)]
+    pub transfer_exported_components: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferWitnessDirection {
+    Import,
+    Export,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TransferConservationWitness {
+    pub transfer_id: String,
+    pub package_hash: String,
+    pub counterparty_cell_id: String,
+    pub direction: TransferWitnessDirection,
+    pub contents: InventoryContents,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlayerTransferLock {
+    pub transfer_id: String,
+    pub package_hash: String,
+    pub destination_cell_id: String,
+    pub prior_placement_generation: u64,
+    pub resulting_placement_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlayerTransferReservation {
+    pub transfer_id: String,
+    pub package_hash: String,
+    pub receipt_hash: String,
+    pub source_cell_id: String,
+    pub destination_cell_id: String,
+    pub player_id: String,
+    pub inventory_id: String,
+    pub destination_assignment_generation: u64,
+    pub destination_fencing_token: u64,
+    pub destination_event_sequence: u64,
+    pub destination_world_hash: String,
+    pub prior_placement_generation: u64,
+    pub resulting_placement_generation: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -750,6 +817,7 @@ pub struct ContactPairKey {
 pub struct ProcessedOperationRecord {
     pub operation_id: String,
     pub intent_fingerprint: String,
+    pub receipt_origin_cell_id: String,
     pub receipt: IntentReceipt,
 }
 
@@ -758,7 +826,56 @@ pub struct ActorOperationHistory {
     pub committed_through: u64,
     pub compacted_through: u64,
     pub compacted_history_hash: String,
+    #[serde(with = "retained_operation_records")]
     pub retained: BTreeMap<u64, ProcessedOperationRecord>,
+}
+
+mod retained_operation_records {
+    use std::collections::BTreeMap;
+
+    use serde::de::Error as _;
+    use serde::ser::SerializeMap as _;
+    use serde::{Deserialize as _, Deserializer, Serializer};
+
+    use super::ProcessedOperationRecord;
+
+    pub fn serialize<S>(
+        records: &BTreeMap<u64, ProcessedOperationRecord>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(records.len()))?;
+        for (sequence, record) in records {
+            map.serialize_entry(&sequence.to_string(), record)?;
+        }
+        map.end()
+    }
+
+    pub fn deserialize<'de, D>(
+        deserializer: D,
+    ) -> Result<BTreeMap<u64, ProcessedOperationRecord>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let encoded = BTreeMap::<String, ProcessedOperationRecord>::deserialize(deserializer)?;
+        let mut records = BTreeMap::new();
+        for (key, record) in encoded {
+            let sequence = key.parse::<u64>().map_err(D::Error::custom)?;
+            if sequence.to_string() != key {
+                return Err(D::Error::custom(
+                    "retained operation sequence keys must be canonical unsigned integers",
+                ));
+            }
+            if records.insert(sequence, record).is_some() {
+                return Err(D::Error::custom(
+                    "retained operation sequence keys must be unique",
+                ));
+            }
+        }
+        Ok(records)
+    }
 }
 
 impl ActorOperationHistory {
@@ -773,6 +890,7 @@ struct OperationCompactionMaterial<'a> {
     prior_hash: &'a str,
     operation_sequence: u64,
     intent_fingerprint: &'a str,
+    receipt_origin_cell_id: &'a str,
     receipt: &'a IntentReceipt,
 }
 
@@ -804,6 +922,12 @@ pub struct WorldState {
     pub production_clock: ProductionClock,
     pub death_drops: BTreeMap<String, DeathDrop>,
     pub ledger: Ledger,
+    #[serde(default)]
+    pub transfer_witnesses: BTreeMap<String, TransferConservationWitness>,
+    #[serde(default)]
+    pub player_transfer_locks: BTreeMap<String, PlayerTransferLock>,
+    #[serde(default)]
+    pub player_transfer_reservations: BTreeMap<String, PlayerTransferReservation>,
     pub processed_operations: BTreeMap<String, ActorOperationHistory>,
 }
 
@@ -890,10 +1014,11 @@ impl WorldState {
         if record.operation_id.trim().is_empty()
             || record.operation_id.len() > 128
             || !valid_blake3_hex(&record.intent_fingerprint)
+            || !valid_blake3_hex(&record.receipt_origin_cell_id)
             || record.receipt.operation_id != record.operation_id
             || record.receipt.event_sequence == 0
-            || record.receipt.event_sequence < record.receipt.operation_sequence
-            || record.receipt.event_sequence > self.event_sequence
+            || (record.receipt_origin_cell_id == self.cell_id
+                && record.receipt.event_sequence > self.event_sequence)
             || record.receipt.code.trim().is_empty()
         {
             return Err("processed operation record identity is invalid".into());
@@ -912,14 +1037,11 @@ impl WorldState {
                 record.receipt.operation_sequence
             ));
         }
-        if history
-            .retained
-            .last_key_value()
-            .is_some_and(|(_, prior)| prior.receipt.event_sequence >= record.receipt.event_sequence)
-        {
-            return Err(
-                "processed operation receipt event sequences must advance monotonically".into(),
-            );
+        if history.retained.values().rev().any(|prior| {
+            prior.receipt_origin_cell_id == record.receipt_origin_cell_id
+                && prior.receipt.event_sequence >= record.receipt.event_sequence
+        }) {
+            return Err("processed operation receipt event sequences must advance monotonically within each origin cell".into());
         }
         history.committed_through = expected;
         history.retained.insert(expected, record);
@@ -933,6 +1055,7 @@ impl WorldState {
                 prior_hash: &history.compacted_history_hash,
                 operation_sequence: sequence,
                 intent_fingerprint: &compacted.intent_fingerprint,
+                receipt_origin_cell_id: &compacted.receipt_origin_cell_id,
                 receipt: &compacted.receipt,
             };
             let bytes = serde_json::to_vec(&material)
@@ -945,6 +1068,41 @@ impl WorldState {
     }
 
     pub fn validate_player_roster(&self) -> Result<(), String> {
+        self.validate_player_roster_with_job_frontier(|job| {
+            job.queued_event_sequence <= self.event_sequence
+        })
+    }
+
+    pub(crate) fn validate_player_roster_with_job_frontier(
+        &self,
+        production_job_frontier_is_valid: impl Fn(&ProductionJob) -> bool,
+    ) -> Result<(), String> {
+        self.validate_player_roster_with_identity_and_job_frontier(
+            WorldIdentityExpectation::ActiveProtocol18,
+            production_job_frontier_is_valid,
+        )
+    }
+
+    /// Validates a schema-20 gameplay body only in its dormant schema-21
+    /// envelope context. The opaque manifest capability prevents a caller from
+    /// supplying a raw hash or a manifest-4/world-21 hybrid.
+    #[allow(dead_code)]
+    pub(crate) fn validate_world_v21_gameplay_body_with_job_frontier(
+        &self,
+        manifest: &crate::manifest_v5::ValidatedUniverseManifestV5,
+        production_job_frontier_is_valid: impl Fn(&ProductionJob) -> bool,
+    ) -> Result<(), String> {
+        self.validate_player_roster_with_identity_and_job_frontier(
+            WorldIdentityExpectation::DormantProtocol19(manifest),
+            production_job_frontier_is_valid,
+        )
+    }
+
+    fn validate_player_roster_with_identity_and_job_frontier(
+        &self,
+        identity: WorldIdentityExpectation<'_>,
+        production_job_frontier_is_valid: impl Fn(&ProductionJob) -> bool,
+    ) -> Result<(), String> {
         if self.schema_version != WORLD_SCHEMA_VERSION {
             return Err(format!(
                 "world schema {} does not match required schema {WORLD_SCHEMA_VERSION}",
@@ -964,26 +1122,56 @@ impl WorldState {
         }
         let registry = celestial::registry_snapshot(self.world_seed)
             .map_err(|source| format!("world celestial registry is invalid: {source}"))?;
-        let universe_manifest = celestial::universe_manifest(
-            self.world_seed,
-            WORLD_SCHEMA_VERSION,
-            crate::event::EVENT_SCHEMA_VERSION,
-        )
-        .map_err(|source| format!("world universe manifest is invalid: {source}"))?;
+        let expected_manifest_hash = match identity {
+            WorldIdentityExpectation::ActiveProtocol18 => {
+                celestial::universe_manifest(
+                    self.world_seed,
+                    WORLD_SCHEMA_VERSION,
+                    crate::event::EVENT_SCHEMA_VERSION,
+                )
+                .map_err(|source| format!("world universe manifest is invalid: {source}"))?
+                .manifest_hash
+            }
+            WorldIdentityExpectation::DormantProtocol19(manifest) => {
+                if manifest.world_seed() != self.world_seed
+                    || manifest.universe_id() != self.universe_id
+                    || manifest.document().celestial_registry_hash != registry.registry_hash
+                {
+                    return Err(
+                        "world-21 gameplay body does not match its validated manifest-5 identity"
+                            .into(),
+                    );
+                }
+                manifest.manifest_hash().to_owned()
+            }
+        };
+        let cell_key = celestial::cell_key_from_address(&self.cell_address)
+            .map_err(|source| format!("world cell key is invalid: {source}"))?;
+        let expected_cell_id = celestial::cell_id(&cell_key)
+            .map_err(|source| format!("world cell ID is invalid: {source}"))?;
+        let origin_cell = cell_key == celestial::cell_origin_key();
+        let body_binding_valid = if origin_cell {
+            self.gravity_body_id == celestial::GRAVITY_BODY_ID
+                && self.voxel_body_id == celestial::VOXEL_BODY_ID
+                && registry
+                    .bodies
+                    .iter()
+                    .any(|body| body.body_id == self.gravity_body_id)
+                && registry
+                    .bodies
+                    .iter()
+                    .any(|body| body.body_id == self.voxel_body_id && body.voxel_field_id.is_some())
+        } else {
+            self.gravity_body_id.is_empty()
+                && self.voxel_body_id.is_empty()
+                && self.voxels.occupied.is_empty()
+                && self.voxels.ferrite_ore.is_empty()
+        };
         if self.universe_id != registry.universe_id
-            || self.universe_manifest_hash != universe_manifest.manifest_hash
+            || self.universe_manifest_hash != expected_manifest_hash
             || self.celestial_registry_hash != registry.registry_hash
-            || self.cell_address != celestial::cell_origin_address()
-            || self.gravity_body_id != celestial::GRAVITY_BODY_ID
-            || self.voxel_body_id != celestial::VOXEL_BODY_ID
-            || !registry
-                .bodies
-                .iter()
-                .any(|body| body.body_id == self.gravity_body_id)
-            || !registry
-                .bodies
-                .iter()
-                .any(|body| body.body_id == self.voxel_body_id && body.voxel_field_id.is_some())
+            || self.cell_id != expected_cell_id
+            || !body_binding_valid
         {
             return Err(
                 "world identity must match the immutable universe manifest and celestial registry"
@@ -1050,7 +1238,7 @@ impl WorldState {
                 );
             }
         }
-        self.validate_authority_graph()?;
+        self.validate_authority_graph_with_job_frontier(production_job_frontier_is_valid)?;
         Ok(())
     }
 
@@ -1058,6 +1246,15 @@ impl WorldState {
     /// state. Grid and drop owners are permitted to be offline, but their IDs,
     /// inventory linkage, and asset identities remain canonical.
     pub fn validate_authority_graph(&self) -> Result<(), String> {
+        self.validate_authority_graph_with_job_frontier(|job| {
+            job.queued_event_sequence <= self.event_sequence
+        })
+    }
+
+    fn validate_authority_graph_with_job_frontier(
+        &self,
+        production_job_frontier_is_valid: impl Fn(&ProductionJob) -> bool,
+    ) -> Result<(), String> {
         let finite_vec =
             |value: Vec3| value.x.is_finite() && value.y.is_finite() && value.z.is_finite();
         let normalized_quat = |orientation: Quat| {
@@ -1229,7 +1426,7 @@ impl WorldState {
                     || !content::machine_supports_recipe(machine.kind, job.recipe)
                     || job.batches == 0
                     || job.queued_event_sequence == 0
-                    || job.queued_event_sequence > self.event_sequence
+                    || !production_job_frontier_is_valid(job)
                     || job.progress_ticks > job.duration_ticks
                     || (queue_index > 0 && job.progress_ticks != 0)
                 {
@@ -1311,7 +1508,6 @@ impl WorldState {
             let retained_bytes = processed_operation_retained_bytes(&history.retained);
             if history.committed_through == 0
                 || history.compacted_through > history.committed_through
-                || history.committed_through > self.event_sequence
                 || history.retained.len() > PROCESSED_OPERATION_RETENTION_LIMIT
                 || retained_bytes > PROCESSED_OPERATION_RETAINED_BYTES_LIMIT
                 || (history.compacted_through == 0 && !history.compacted_history_hash.is_empty())
@@ -1321,7 +1517,7 @@ impl WorldState {
                 return Err("operation history bounds and commitment must remain canonical".into());
             }
             let mut last_seen = history.compacted_through;
-            let mut last_receipt_event_sequence = 0;
+            let mut last_receipt_event_sequence_by_cell = BTreeMap::new();
             for (operation_sequence, record) in &history.retained {
                 let expected_sequence = last_seen
                     .checked_add(1)
@@ -1330,20 +1526,26 @@ impl WorldState {
                     || record.operation_id.trim().is_empty()
                     || record.operation_id.len() > 128
                     || !valid_blake3_hex(&record.intent_fingerprint)
+                    || !valid_blake3_hex(&record.receipt_origin_cell_id)
                     || processed_operation_record_bytes(record)
                         > PROCESSED_OPERATION_RECORD_BYTES_LIMIT
                     || record.receipt.operation_sequence != *operation_sequence
                     || record.receipt.operation_id != record.operation_id
                     || record.receipt.event_sequence == 0
-                    || record.receipt.event_sequence < *operation_sequence
-                    || record.receipt.event_sequence <= last_receipt_event_sequence
-                    || record.receipt.event_sequence > self.event_sequence
+                    || last_receipt_event_sequence_by_cell
+                        .get(&record.receipt_origin_cell_id)
+                        .is_some_and(|prior| record.receipt.event_sequence <= *prior)
+                    || (record.receipt_origin_cell_id == self.cell_id
+                        && record.receipt.event_sequence > self.event_sequence)
                     || record.receipt.code.trim().is_empty()
                 {
                     return Err("processed operations must form one bounded contiguous suffix with canonical receipts and fingerprints".into());
                 }
                 last_seen = *operation_sequence;
-                last_receipt_event_sequence = record.receipt.event_sequence;
+                last_receipt_event_sequence_by_cell.insert(
+                    record.receipt_origin_cell_id.clone(),
+                    record.receipt.event_sequence,
+                );
             }
             if last_seen != history.committed_through {
                 return Err(
@@ -1351,6 +1553,91 @@ impl WorldState {
                         .into(),
                 );
             }
+        }
+
+        let mut locked_transfer_ids = BTreeSet::new();
+        for (player_id, lock) in &self.player_transfer_locks {
+            if !valid_player_id(player_id)
+                || self.player.get(player_id).is_none()
+                || !valid_transfer_id(&lock.transfer_id)
+                || !valid_blake3_hex(&lock.package_hash)
+                || !valid_blake3_hex(&lock.destination_cell_id)
+                || lock.prior_placement_generation == 0
+                || lock.prior_placement_generation.checked_add(1)
+                    != Some(lock.resulting_placement_generation)
+                || !locked_transfer_ids.insert(lock.transfer_id.as_str())
+                || self.transfer_witnesses.contains_key(&lock.transfer_id)
+            {
+                return Err("player transfer locks must bind one present player and canonical package generation".into());
+            }
+        }
+
+        let mut reserved_player_ids = BTreeSet::new();
+        let mut reserved_inventory_ids = BTreeSet::new();
+        for (transfer_id, reservation) in &self.player_transfer_reservations {
+            if transfer_id != &reservation.transfer_id
+                || !valid_transfer_id(transfer_id)
+                || !valid_blake3_hex(&reservation.package_hash)
+                || !valid_blake3_hex(&reservation.receipt_hash)
+                || !valid_blake3_hex(&reservation.source_cell_id)
+                || !valid_blake3_hex(&reservation.destination_cell_id)
+                || !valid_player_id(&reservation.player_id)
+                || !valid_transfer_id(&reservation.inventory_id)
+                || reservation.destination_assignment_generation == 0
+                || reservation.destination_fencing_token == 0
+                || !valid_blake3_hex(&reservation.destination_world_hash)
+                || reservation.prior_placement_generation == 0
+                || reservation.prior_placement_generation.checked_add(1)
+                    != Some(reservation.resulting_placement_generation)
+                || self.player.get(&reservation.player_id).is_some()
+                || self.inventories.contains_key(&reservation.inventory_id)
+                || !reserved_player_ids.insert(reservation.player_id.as_str())
+                || !reserved_inventory_ids.insert(reservation.inventory_id.as_str())
+                || self.transfer_witnesses.contains_key(transfer_id)
+            {
+                return Err("player transfer reservations must bind unique absent subject IDs and canonical quarantine material".into());
+            }
+        }
+
+        let mut imported = InventoryContents::default();
+        let mut exported = InventoryContents::default();
+        for (transfer_id, witness) in &self.transfer_witnesses {
+            if transfer_id != &witness.transfer_id
+                || transfer_id.is_empty()
+                || transfer_id.len() > 128
+                || !transfer_id.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':')
+                })
+                || !valid_blake3_hex(&witness.package_hash)
+                || !valid_blake3_hex(&witness.counterparty_cell_id)
+            {
+                return Err("transfer conservation witness identity is invalid".into());
+            }
+            let totals = match witness.direction {
+                TransferWitnessDirection::Import => &mut imported,
+                TransferWitnessDirection::Export => &mut exported,
+            };
+            totals.ore = totals
+                .ore
+                .checked_add(witness.contents.ore)
+                .ok_or_else(|| "transfer ore witness total overflowed".to_owned())?;
+            totals.refined_material = totals
+                .refined_material
+                .checked_add(witness.contents.refined_material)
+                .ok_or_else(|| "transfer refined witness total overflowed".to_owned())?;
+            totals.components = totals
+                .components
+                .checked_add(witness.contents.components)
+                .ok_or_else(|| "transfer component witness total overflowed".to_owned())?;
+        }
+        if imported.ore != self.ledger.transfer_imported_ore
+            || imported.refined_material != self.ledger.transfer_imported_refined
+            || imported.components != self.ledger.transfer_imported_components
+            || exported.ore != self.ledger.transfer_exported_ore
+            || exported.refined_material != self.ledger.transfer_exported_refined
+            || exported.components != self.ledger.transfer_exported_components
+        {
+            return Err("transfer conservation witnesses do not match the cell ledger".into());
         }
         Ok(())
     }
@@ -1649,7 +1936,8 @@ impl WorldState {
             schema_version: WORLD_SCHEMA_VERSION,
             content_manifest_version: content::manifest().manifest_version.clone(),
             universe_id: registry.universe_id,
-            cell_id: celestial::ACTIVE_CELL_ID.into(),
+            cell_id: celestial::cell_id(&celestial::cell_origin_key())
+                .expect("embedded origin cell ID is valid"),
             universe_manifest_hash: universe_manifest.manifest_hash,
             celestial_registry_hash: registry.registry_hash,
             cell_address,
@@ -1720,8 +2008,68 @@ impl WorldState {
                 genesis_installed_components: 37,
                 ..Ledger::default()
             },
+            transfer_witnesses: BTreeMap::new(),
+            player_transfer_locks: BTreeMap::new(),
+            player_transfer_reservations: BTreeMap::new(),
             processed_operations: BTreeMap::new(),
         }
+    }
+
+    pub fn genesis_for_cell(seed: u64, cell_key: &CellKeyV1) -> Result<Self, String> {
+        celestial::validate_cell_key(cell_key)
+            .map_err(|source| format!("cell key is invalid: {source}"))?;
+        if cell_key == &celestial::cell_origin_key() {
+            return Ok(Self::genesis(seed));
+        }
+
+        let registry = celestial::registry_snapshot(seed)
+            .map_err(|source| format!("celestial registry is invalid: {source}"))?;
+        if cell_key.universe_id != registry.universe_id {
+            return Err("cell key belongs to a different universe".into());
+        }
+        let universe_manifest = celestial::universe_manifest(
+            seed,
+            WORLD_SCHEMA_VERSION,
+            crate::event::EVENT_SCHEMA_VERSION,
+        )
+        .map_err(|source| format!("universe manifest is invalid: {source}"))?;
+        let state = Self {
+            schema_version: WORLD_SCHEMA_VERSION,
+            content_manifest_version: content::manifest().manifest_version.clone(),
+            universe_id: registry.universe_id,
+            cell_id: celestial::cell_id(cell_key)
+                .map_err(|source| format!("cell ID is invalid: {source}"))?,
+            universe_manifest_hash: universe_manifest.manifest_hash,
+            celestial_registry_hash: registry.registry_hash,
+            cell_address: celestial::cell_address_from_key(cell_key)
+                .map_err(|source| format!("cell address is invalid: {source}"))?,
+            gravity_body_id: String::new(),
+            voxel_body_id: String::new(),
+            world_seed: seed,
+            event_sequence: 0,
+            simulation_tick: 0,
+            physics_step_phase: 0,
+            active_contact_pairs: BTreeSet::new(),
+            fencing_token: 0,
+            last_event_hash: String::new(),
+            player: PlayerRoster::empty(),
+            voxels: VoxelField {
+                occupied: BTreeSet::new(),
+                ferrite_ore: BTreeSet::new(),
+            },
+            grids: BTreeMap::new(),
+            inventories: BTreeMap::new(),
+            production_queues: BTreeMap::new(),
+            production_clock: ProductionClock::default(),
+            death_drops: BTreeMap::new(),
+            ledger: Ledger::default(),
+            transfer_witnesses: BTreeMap::new(),
+            player_transfer_locks: BTreeMap::new(),
+            player_transfer_reservations: BTreeMap::new(),
+            processed_operations: BTreeMap::new(),
+        };
+        state.validate_player_roster()?;
+        Ok(state)
     }
 
     pub fn state_hash(&self) -> String {
@@ -1763,16 +2111,23 @@ impl WorldState {
             .map(|block| block.component_cost)
             .sum::<u64>();
         let recipes = &content::manifest().recipes;
-        let ore_sources = self.ledger.genesis_ore + self.ledger.mined_ore;
-        let ore_consumed = self.ledger.refine_batches * recipes.refining.ore_input;
+        let ore_sources =
+            self.ledger.genesis_ore + self.ledger.mined_ore + self.ledger.transfer_imported_ore;
+        let ore_consumed = self.ledger.refine_batches * recipes.refining.ore_input
+            + self.ledger.transfer_exported_ore;
         let refined_sources = self.ledger.genesis_refined
-            + self.ledger.refine_batches * recipes.refining.refined_output;
-        let refined_consumed =
-            self.ledger.crafted_components * recipes.component_crafting.refined_input;
+            + self.ledger.refine_batches * recipes.refining.refined_output
+            + self.ledger.transfer_imported_refined;
+        let refined_consumed = self.ledger.crafted_components
+            * recipes.component_crafting.refined_input
+            + self.ledger.transfer_exported_refined;
         let component_sources = self.ledger.genesis_components
             + self.ledger.genesis_installed_components
-            + self.ledger.crafted_components * recipes.component_crafting.component_output;
-        let components_installed_or_destroyed = live_blocks + self.ledger.destroyed_components;
+            + self.ledger.crafted_components * recipes.component_crafting.component_output
+            + self.ledger.transfer_imported_components;
+        let components_installed_or_destroyed = live_blocks
+            + self.ledger.destroyed_components
+            + self.ledger.transfer_exported_components;
 
         ConservationSnapshot {
             ore_sources,
@@ -1919,6 +2274,32 @@ impl WorldState {
         }
     }
 
+    /// Builds the legacy-shaped canonical material consumed only by the P1.7
+    /// projection layer. An empty frontier cell has no canonical primary
+    /// player, while `WorldSnapshot::player` remains required for older P0
+    /// callers. The compatibility placeholder is removed from `players` and
+    /// is never copied into protocol-18 public or private projections.
+    pub(crate) fn projection_snapshot(&self) -> WorldSnapshot {
+        if !self.player.by_id.is_empty() {
+            return self.snapshot();
+        }
+        let mut bridge = self.clone();
+        let mut placeholder = Self::genesis(self.world_seed).player.primary().clone();
+        placeholder.player_id = "projection-empty-cell-placeholder".into();
+        placeholder.inventory_id = "projection-empty-cell-inventory-placeholder".into();
+        placeholder.address = self.cell_address.clone();
+        placeholder.position = Vec3::ZERO;
+        placeholder.orientation = Quat::IDENTITY;
+        placeholder.linear_velocity = Vec3::ZERO;
+        placeholder.angular_velocity = Vec3::ZERO;
+        placeholder.surface_contact = false;
+        bridge.player = PlayerRoster::from_primary(placeholder);
+        let mut snapshot = bridge.snapshot();
+        snapshot.players.clear();
+        snapshot.world_hash = self.state_hash();
+        snapshot
+    }
+
     pub fn motion_snapshot(&self) -> MotionSnapshot {
         let primary_environment = self.environment_at(self.player.position);
         MotionSnapshot {
@@ -1950,7 +2331,6 @@ impl WorldState {
     }
 
     pub fn environment_at(&self, position: Vec3) -> EnvironmentSnapshot {
-        let gravity_body = celestial::body_snapshot(self.world_seed, &self.gravity_body_id);
         let registry = celestial::registry_snapshot(self.world_seed)
             .expect("the world-bound celestial registry remains valid");
         let nearest_body = registry
@@ -1958,8 +2338,8 @@ impl WorldState {
             .iter()
             .filter(|body| body.kind != verse_protocol::CelestialBodyKind::AsteroidField)
             .min_by(|left, right| {
-                let left_center = celestial::body_center_m(&left.body_id);
-                let right_center = celestial::body_center_m(&right.body_id);
+                let left_center = local_body_center(&self.cell_address, &left.center);
+                let right_center = local_body_center(&self.cell_address, &right.center);
                 let left_distance = (position - left_center).magnitude()
                     - left.surface_radius_um as f64 / 1_000_000.0;
                 let right_distance = (position - right_center).magnitude()
@@ -1967,38 +2347,62 @@ impl WorldState {
                 left_distance.total_cmp(&right_distance)
             })
             .expect("the registry always contains the proof bodies");
+        let gravity_body = (!self.gravity_body_id.is_empty()).then(|| {
+            registry
+                .bodies
+                .iter()
+                .find(|body| body.body_id == self.gravity_body_id)
+                .expect("validated world gravity body remains registered")
+        });
+        let environment_body = gravity_body.unwrap_or(nearest_body);
+        let body_center = local_body_center(&self.cell_address, &environment_body.center);
         let radial = Vec3::new(
-            position.x - planet_center().x,
-            position.y - planet_center().y,
-            position.z - planet_center().z,
+            position.x - body_center.x,
+            position.y - body_center.y,
+            position.z - body_center.z,
         );
         let distance = radial.magnitude().max(1.0);
-        let altitude_m = (distance - planet_surface_radius_m()).max(0.0);
-        let gravity_m_s2 = (planet_surface_gravity_m_s2()
-            * (planet_surface_radius_m() / distance).powi(2))
-        .min(planet_surface_gravity_m_s2() * 1.25);
-        let gravity = Vec3::new(
-            -radial.x / distance * gravity_m_s2,
-            -radial.y / distance * gravity_m_s2,
-            -radial.z / distance * gravity_m_s2,
-        );
-        let atmosphere_density = (1.0 - altitude_m / planet_atmosphere_height_m()).clamp(0.0, 1.0);
-        let oxygen_fraction = if atmosphere_density > 0.0 {
-            f64::from(gravity_body.oxygen_parts_per_million) / 1_000_000.0
+        let surface_radius_m = environment_body.surface_radius_um as f64 / 1_000_000.0;
+        let altitude_m = (distance - surface_radius_m).max(0.0);
+        let (gravity_m_s2, atmosphere_density, oxygen_fraction) =
+            gravity_body.map_or((0.0, 0.0, 0.0), |body| {
+                let surface_gravity =
+                    body.surface_gravity_millimetres_per_second_squared as f64 / 1_000.0;
+                let gravity = (surface_gravity * (surface_radius_m / distance).powi(2))
+                    .min(surface_gravity * 1.25);
+                let atmosphere_height_m = body.atmosphere_height_um as f64 / 1_000_000.0;
+                let density = if atmosphere_height_m > 0.0 {
+                    (1.0 - altitude_m / atmosphere_height_m).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let oxygen = if density > 0.0 {
+                    f64::from(body.oxygen_parts_per_million) / 1_000_000.0
+                } else {
+                    0.0
+                };
+                (gravity, density, oxygen)
+            });
+        let gravity = if gravity_m_s2 > 0.0 {
+            Vec3::new(
+                -radial.x / distance * gravity_m_s2,
+                -radial.y / distance * gravity_m_s2,
+                -radial.z / distance * gravity_m_s2,
+            )
         } else {
-            0.0
+            Vec3::ZERO
         };
 
         EnvironmentSnapshot {
-            celestial_body_id: gravity_body.body_id,
-            celestial_body_name: gravity_body.display_name,
-            celestial_scale_class: gravity_body.scale_class,
+            celestial_body_id: environment_body.body_id.clone(),
+            celestial_body_name: environment_body.display_name.clone(),
+            celestial_scale_class: environment_body.scale_class,
             nearest_body_id: nearest_body.body_id.clone(),
             nearest_body_name: nearest_body.display_name.clone(),
-            planet_center: planet_center(),
-            surface_radius_m: planet_surface_radius_m(),
+            planet_center: body_center,
+            surface_radius_m,
             distance_to_center_m: distance,
-            distance_to_surface_m: distance - planet_surface_radius_m(),
+            distance_to_surface_m: distance - surface_radius_m,
             altitude_m,
             gravity,
             gravity_m_s2,
@@ -2007,6 +2411,23 @@ impl WorldState {
             breathable: atmosphere_density >= 0.35 && oxygen_fraction >= 0.18,
         }
     }
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+enum WorldIdentityExpectation<'a> {
+    ActiveProtocol18,
+    DormantProtocol19(&'a crate::manifest_v5::ValidatedUniverseManifestV5),
+}
+
+fn local_body_center(origin: &UniverseAddress, body_center: &UniverseAddress) -> Vec3 {
+    let offset = celestial::relative_offset_um(origin, body_center)
+        .expect("validated universe addresses have a bounded i128 relative offset");
+    Vec3::new(
+        offset[0] as f64 / 1_000_000.0,
+        offset[1] as f64 / 1_000_000.0,
+        offset[2] as f64 / 1_000_000.0,
+    )
 }
 
 fn processed_operation_record_bytes(record: &ProcessedOperationRecord) -> usize {
@@ -2053,8 +2474,45 @@ mod tests {
         assert_eq!(world.universe_manifest_hash, manifest.manifest_hash);
         assert_eq!(world.celestial_registry_hash, registry.registry_hash);
         assert_eq!(world.cell_address, celestial::cell_origin_address());
+        assert_eq!(
+            world.cell_id,
+            celestial::cell_id(&celestial::cell_origin_key()).expect("origin cell ID derives")
+        );
         assert_eq!(world.gravity_body_id, celestial::GRAVITY_BODY_ID);
         assert_eq!(world.voxel_body_id, celestial::VOXEL_BODY_ID);
+        assert!(world.validate_player_roster().is_ok());
+    }
+
+    #[test]
+    fn adjacent_cell_genesis_is_empty_canonical_and_conserved() {
+        let origin = celestial::cell_origin_key();
+        let east =
+            celestial::neighbor_cell_key(&origin, [1, 0, 0]).expect("adjacent proof cell derives");
+        let world = WorldState::genesis_for_cell(128, &east).expect("empty cell builds");
+
+        assert_eq!(
+            world.cell_id,
+            celestial::cell_id(&east).expect("east cell ID derives")
+        );
+        assert_eq!(
+            celestial::cell_key_from_address(&world.cell_address).expect("world key derives"),
+            east
+        );
+        assert!(world.player.by_id.is_empty());
+        assert!(world.grids.is_empty());
+        assert!(world.inventories.is_empty());
+        assert!(world.voxels.occupied.is_empty());
+        assert!(world.voxels.ferrite_ore.is_empty());
+        assert!(world.gravity_body_id.is_empty());
+        assert!(world.voxel_body_id.is_empty());
+        let vacuum = world.environment_at(Vec3::ZERO);
+        assert_eq!(vacuum.gravity, Vec3::ZERO);
+        assert!(vacuum.gravity_m_s2.abs() < f64::EPSILON);
+        assert!(vacuum.atmosphere_density.abs() < f64::EPSILON);
+        assert!(vacuum.oxygen_fraction.abs() < f64::EPSILON);
+        assert!(!vacuum.breathable);
+        assert!(!vacuum.nearest_body_id.is_empty());
+        assert!(world.conservation().valid);
         assert!(world.validate_player_roster().is_ok());
     }
 
@@ -2224,6 +2682,8 @@ mod tests {
         ProcessedOperationRecord {
             operation_id: operation_id.clone(),
             intent_fingerprint: blake3::hash(operation_id.as_bytes()).to_hex().to_string(),
+            receipt_origin_cell_id: celestial::cell_id(&celestial::cell_origin_key())
+                .expect("origin cell ID derives"),
             receipt: IntentReceipt {
                 operation_sequence,
                 operation_id,
@@ -2299,10 +2759,10 @@ mod tests {
     }
 
     #[test]
-    fn operation_history_rejects_impossible_global_and_receipt_frontiers() {
-        let mut impossible_compacted = WorldState::genesis(103);
-        impossible_compacted.event_sequence = 1;
-        impossible_compacted.processed_operations.insert(
+    fn operation_history_is_actor_contiguous_and_orders_receipts_per_origin_cell() {
+        let mut imported_compacted = WorldState::genesis(103);
+        imported_compacted.event_sequence = 1;
+        imported_compacted.processed_operations.insert(
             "player-local".into(),
             ActorOperationHistory {
                 committed_through: 100,
@@ -2311,12 +2771,9 @@ mod tests {
                 retained: BTreeMap::new(),
             },
         );
-        assert!(
-            impossible_compacted
-                .validate_player_roster()
-                .expect_err("an actor frontier cannot exceed the global event frontier")
-                .contains("operation history bounds")
-        );
+        imported_compacted
+            .validate_player_roster()
+            .expect("an imported actor frontier is independent of the destination journal");
 
         let mut first = synthetic_operation_record(1);
         first.receipt.event_sequence = 3;
@@ -2339,6 +2796,27 @@ mod tests {
                 .expect_err("retained receipt events must advance with actor operations")
                 .contains("canonical receipts")
         );
+
+        let mut cross_cell = WorldState::genesis(108);
+        cross_cell.event_sequence = 3;
+        let mut source_receipt = synthetic_operation_record(1);
+        source_receipt.receipt.event_sequence = 99;
+        source_receipt.receipt_origin_cell_id = "a".repeat(64);
+        let mut destination_receipt = synthetic_operation_record(2);
+        destination_receipt.receipt.event_sequence = 2;
+        destination_receipt.receipt_origin_cell_id = cross_cell.cell_id.clone();
+        cross_cell.processed_operations.insert(
+            "player-local".into(),
+            ActorOperationHistory {
+                committed_through: 2,
+                compacted_through: 0,
+                compacted_history_hash: String::new(),
+                retained: BTreeMap::from([(1, source_receipt), (2, destination_receipt)]),
+            },
+        );
+        cross_cell
+            .validate_player_roster()
+            .expect("receipt event sequences are ordered only within their origin cell");
 
         let mut zero_receipt = WorldState::genesis(109);
         zero_receipt.event_sequence = 1;
@@ -2407,6 +2885,7 @@ mod tests {
                 ProcessedOperationRecord {
                     operation_id: operation_id.clone(),
                     intent_fingerprint: blake3::hash(b"oversized").to_hex().to_string(),
+                    receipt_origin_cell_id: world.cell_id.clone(),
                     receipt: IntentReceipt {
                         operation_sequence: 1,
                         operation_id,

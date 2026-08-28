@@ -18,6 +18,7 @@ func _initialize() -> void:
 func _run() -> void:
 	_test_exact_address_projection()
 	_test_registry_and_contiguous_interest_stream()
+	_test_handoff_presentation_freezes_and_restores_control()
 	_test_legacy_family_fails_closed()
 	if not failures.is_empty():
 		for failure in failures:
@@ -26,7 +27,7 @@ func _run() -> void:
 		return
 	print(
 		"VERSE_NATIVE_P15_OK tuple=validated registry=bound address=exact "
-		+ "baseline=atomic delta=contiguous removals=explicit stale=fail_closed legacy=rejected"
+		+ "baseline=atomic delta=contiguous removals=explicit handoff=bounded stale=fail_closed legacy=rejected"
 	)
 	quit(0)
 
@@ -256,6 +257,80 @@ func _install_presentation_frame(client: Node3D, authoritative: Dictionary, base
 	))
 
 
+func _test_handoff_presentation_freezes_and_restores_control() -> void:
+	var client := _new_client()
+	client.call("_handle_server_message", _wire(_welcome()))
+	client.call("_handle_server_message", _wire({
+		"type": "registry", "registry": _registry(), "universe_manifest": _manifest(),
+	}))
+	_check(_install_presentation_frame(client, _baseline(), true), "handoff source baseline installs")
+	var destination_key := {
+		"schema_version": 1,
+		"universe_id": "the-verse-local",
+		"sector": {"x": "0", "y": "0", "z": "0"},
+		"cell": {"x": 501, "y": 500, "z": 500},
+	}
+	var handoff := {
+		"transfer_id": "transfer-native-proof",
+		"phase": "preparing",
+		"destination_cell_key": destination_key,
+		"placement_generation": 2,
+	}
+	client.call("_handle_server_message", _wire({"type": "handoff", "handoff": handoff}))
+	_check(
+		String(client.get("handoff_phase")) == "preparing"
+		and String(client.get("replication_state")) == "handoff"
+		and not bool(client.get("authoritative_player_ready"))
+		and (client.get("snapshot") as Dictionary).is_empty()
+		and (client.get("grid_node_lookup") as Dictionary).is_empty(),
+		"preparing handoff atomically discards the source view and freezes controls",
+	)
+	handoff["phase"] = "importing"
+	client.call("_handle_server_message", _wire({"type": "handoff", "handoff": handoff}))
+	_check(String(client.get("handoff_phase")) == "importing", "handoff advances to importing")
+	handoff["phase"] = "verifying_destination"
+	client.call("_handle_server_message", _wire({"type": "handoff", "handoff": handoff}))
+	_check(
+		String(client.get("handoff_phase")) == "verifying_destination",
+		"handoff advances to destination verification",
+	)
+
+	var destination := _baseline()
+	destination["cell_id"] = "destination-proof"
+	destination["cell_address"] = _address("0", 501, 0)
+	destination["players"][0]["address"] = _address("0", 501, 0)
+	destination["grids"][0]["address"] = _address("0", 501, 2_000_000)
+	destination["actor_private"]["player"]["movement_epoch"] = 2
+	destination["actor_private"]["player"]["address"] = _address("0", 501, 0)
+	var interest: Dictionary = destination["interest"]
+	interest["session_epoch"] = "session-a"
+	interest["interest_epoch"] = 2
+	interest["baseline_id"] = "baseline-destination"
+	interest["cell_address"] = _address("0", 501, 0)
+	interest["local_origin_address"] = _address("0", 501, 0)
+	interest["entered"][0]["payload"]["value"]["address"] = _address("0", 501, 0)
+	interest["entered"][1]["payload"]["value"]["address"] = _address("0", 501, 2_000_000)
+	interest["transfer_link"] = {
+		"transfer_id": "transfer-native-proof",
+		"destination_cell_key": destination_key,
+		"placement_generation": 2,
+	}
+	_check(
+		_install_presentation_frame(client, destination, true),
+		"transfer-linked destination baseline commits and acknowledges",
+	)
+	_check(
+		String(client.get("handoff_phase")) == "live"
+		and String(client.get("replication_state")) == "ready"
+		and int(client.get("interest_epoch")) == 2
+		and int(client.get("movement_epoch")) == 2
+		and bool(client.get("authoritative_player_ready"))
+		and bool(client.get("operation_frontier_ready")),
+		"verified destination baseline restores control with new epochs",
+	)
+	client.free()
+
+
 func _test_legacy_family_fails_closed() -> void:
 	var client := _new_client()
 	client.call("_handle_server_message", {"type": "snapshot", "snapshot": {}})
@@ -271,15 +346,15 @@ func _wire(value: Dictionary) -> Dictionary:
 func _welcome() -> Dictionary:
 	return {
 		"type": "welcome",
-		"protocol_version": 17,
-		"projection_schema_version": 3,
-		"world_schema_version": 19,
-		"event_schema_version": 15,
+		"protocol_version": 18,
+		"projection_schema_version": 4,
+		"world_schema_version": 20,
+		"event_schema_version": 16,
 		"content_schema_version": 11,
 		"content_manifest_version": "p1.5.0",
 		"celestial_registry_schema_version": 1,
-		"universe_manifest_schema_version": 3,
-		"interest_schema_version": 1,
+		"universe_manifest_schema_version": 4,
+		"interest_schema_version": 2,
 		"server_name": "test",
 		"session_role": {"kind": "player", "player_id": "player-local"},
 	}
@@ -287,7 +362,7 @@ func _welcome() -> Dictionary:
 
 func _manifest() -> Dictionary:
 	return {
-		"schema_version": 3,
+		"schema_version": 4,
 		"manifest_hash": HASH_A,
 		"universe_id": "the-verse-local",
 		"world_seed": "test",
@@ -302,11 +377,11 @@ func _manifest() -> Dictionary:
 		"content_schema_version": 11,
 		"content_manifest_version": "p1.5.0",
 		"content_hash": HASH_C,
-		"world_schema_version": 19,
-		"event_schema_version": 15,
-		"lifecycle_control_schema_version": 1,
+		"world_schema_version": 20,
+		"event_schema_version": 16,
+		"lifecycle_control_schema_version": 2,
 		"production_schedule_occurrence_schema_version": 1,
-		"lifecycle_policy_hash": "5bc077cc8a2eb101fcaecdce5513c13aa243e1f68a5af839a602dd689859ff3a",
+		"lifecycle_policy_hash": "8abc99b5e076bd89a8914c3727560baaa82433b1b1b4191b2379355ac7d81471",
 	}
 
 
@@ -350,8 +425,8 @@ func _baseline() -> Dictionary:
 	var grid := _grid(2_000_000)
 	var chunk := _chunk(1, 0, "rock")
 	return {
-		"projection_schema_version": 3,
-		"schema_version": 19,
+		"projection_schema_version": 4,
+		"schema_version": 20,
 		"content_manifest_version": "p1.5.0",
 		"universe_id": "the-verse-local",
 		"cell_id": "origin",
@@ -377,8 +452,8 @@ func _baseline() -> Dictionary:
 
 func _delta(sequence: int, previous_hash: String, view_hash: String) -> Dictionary:
 	return {
-		"projection_schema_version": 3,
-		"schema_version": 19,
+		"projection_schema_version": 4,
+		"schema_version": 20,
 		"content_manifest_version": "p1.5.0",
 		"universe_id": "the-verse-local",
 		"cell_id": "origin",
@@ -399,7 +474,7 @@ func _delta(sequence: int, previous_hash: String, view_hash: String) -> Dictiona
 
 func _interest(kind: String, sequence: int, previous_hash: String, view_hash: String) -> Dictionary:
 	var interest := {
-		"schema_version": 1,
+		"schema_version": 2,
 		"frame_kind": kind,
 		"session_epoch": "session-a",
 		"interest_epoch": 1,
@@ -437,7 +512,7 @@ func _projection(kind: String, entity_id: String, value: Dictionary, revision: i
 		"entity_id": entity_id,
 		"kind": kind,
 		"projected_revision": revision,
-		"component_schema_version": 3,
+		"component_schema_version": 4,
 		"payload": {"entity_kind": kind, "value": value},
 	}
 

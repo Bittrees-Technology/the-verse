@@ -29,6 +29,7 @@ These documents form the initial specification baseline.
 - [P1.4 Physical Refining and Manufacturing](gameplay/physical-industry.md)
 - [P1.5 Celestial Registry and Interest-managed Visibility](gameplay/celestial-registry-and-interest-management.md)
 - [P1.6 Durable Single-cell Lifecycle](gameplay/durable-single-cell-lifecycle.md)
+- [P1.7 Durable Two-cell Handoff](gameplay/durable-two-cell-handoff.md)
 - [Authoritative Hand-tool Targeting](gameplay/authoritative-hand-tool-targeting.md)
 
 ## Research

@@ -1,7 +1,7 @@
 # Universe simulation
 
 **Status:** P1.5 address/registry proof published; P1.6 one-cell lifecycle
-verified; multi-cell runtime proposed
+verified; P1.7 two-cell handoff contract accepted
 
 ## Coordinate model
 
@@ -151,16 +151,44 @@ multi-cell scheduling, handoff, distributed availability, or WORLD-008.
 
 ## Player and grid handoff
 
-Cross-cell movement uses:
+P1.7 binds each cell to a canonical normalized `CellKeyV1` and deterministic
+cell ID. A durable local universe directory owns cell assignment generations
+and mobile-aggregate placement generations; each cell independently retains
+its P1.6 lease and fencing token. Both fences are required because valid leases
+for two different cells cannot alone prevent both from claiming one grid.
 
-1. Source freezes the transferable entity at a tick boundary.
-2. Source writes a transfer package and prepare event.
-3. Destination validates schema, ownership, and capacity.
-4. Universe coordinator commits the destination lease.
-5. Destination activates the entity.
-6. Source writes completion and removes its active copy.
+Cross-cell movement follows this durable saga:
 
-A transfer operation is idempotent. At no time may two cells have write authority over the same grid.
+1. The source derives boundary crossing, freezes the complete isolated closure
+   at an atomic tick/production boundary, and synchronizes a content-addressed
+   package.
+2. The destination validates that exact package into durable non-live
+   quarantine.
+3. The directory compare-and-swap validates both assignments, source prepare,
+   destination receipt, package hash, and prior placement generation. It moves
+   placement to the destination at generation `N+1`; this commit is the only
+   authority-transfer point.
+4. The destination imports idempotently, reconstructs physics and schedules,
+   validates and snapshots.
+5. The source finalizes an audit tombstone and can never unlock the old
+   placement.
+6. The gateway replaces all source movement/interest state with one
+   transfer-linked, independently verified destination baseline before controls
+   resume.
+
+Before directory commit recovery may abort back to the exact source state.
+After commit it is roll-forward only. Duplicate or reordered delivery cannot
+create a second mutation, and the package conserves cargo, installed
+components, production queues and escrow, ownership, actor history, physics,
+and lineage. Unsupported anchored, externally constrained, boundary-spanning,
+or oversized aggregates remain source-authoritative and report a specific
+retryable condition.
+
+The bounded proof and its exclusions are specified by
+[F-061](../gameplay/durable-two-cell-handoff.md) and
+[ADR-0023](../decisions/ADR-0023-durable-two-cell-handoff.md). It does not yet
+solve general cross-cell physics, static structures, or partitioned capital
+ships.
 
 ## Dynamic and static grids
 
@@ -259,6 +287,17 @@ world schema `19`, event schema `15`, content schema `11`, content manifest
 Universe manifest `3` binds the lifecycle/schedule policy. The first proof
 archives and resets P1.5 data; any later offline migration must introduce an
 unambiguous occurrence frontier and prove replay equality.
+
+P1.7 is a third coordinated boundary: protocol `18`, projection schema `4`,
+world schema `20`, event schema `16`, content schema `11`, content manifest
+`p1.5.0`, registry schema `1`, universe manifest schema `4`, interest schema
+`2`, operation fingerprint schema `2`, lifecycle-control schema `2`,
+production-occurrence schema `1`, cell-directory schema `2`, and transfer
+schema `1`. Manifest `4` binds the cell-key, directory, placement, package,
+projection, interest, and retry policies. The first proof archives and resets
+P1.6 data; a later migration must create stable cell keys and placements,
+issue universe-unique subject IDs, preserve retained operation conflicts, and
+prove replay and cross-cell conservation equality.
 
 ## Prototype gates
 

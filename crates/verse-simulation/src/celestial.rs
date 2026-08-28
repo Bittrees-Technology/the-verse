@@ -8,11 +8,12 @@ use std::sync::OnceLock;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use verse_protocol::{
-    CELESTIAL_REGISTRY_SCHEMA_VERSION, CelestialBodyKind, CelestialBodySnapshot,
-    CelestialRegistrySnapshot, CelestialScaleClass, CellCoordinate, I64Vec3,
+    CELESTIAL_REGISTRY_SCHEMA_VERSION, CELL_DIRECTORY_SCHEMA_VERSION, CELL_KEY_SCHEMA_VERSION,
+    CelestialBodyKind, CelestialBodySnapshot, CelestialRegistrySnapshot, CelestialScaleClass,
+    CellCoordinate, CellKeyV1, I64Vec3, INTENT_FINGERPRINT_SCHEMA_VERSION, INTEREST_SCHEMA_VERSION,
     LIFECYCLE_CONTROL_SCHEMA_VERSION, PRODUCTION_SCHEDULE_OCCURRENCE_SCHEMA_VERSION,
-    SectorCoordinate, UNIVERSE_MANIFEST_SCHEMA_VERSION, UniverseAddress, UniverseManifestSnapshot,
-    Vec3,
+    PROJECTION_SCHEMA_VERSION, SectorCoordinate, TRANSFER_PACKAGE_SCHEMA_VERSION,
+    UNIVERSE_MANIFEST_SCHEMA_VERSION, UniverseAddress, UniverseManifestSnapshot, Vec3,
 };
 
 use crate::content;
@@ -23,7 +24,6 @@ pub const ADDRESS_SCHEMA_VERSION: u32 = 1;
 pub const SECTOR_EDGE_UM: u64 = 20_000_000_000_000;
 pub const CELL_EDGE_UM: u64 = 20_000_000_000;
 pub const CELLS_PER_SECTOR_AXIS: u32 = 1_000;
-pub const ACTIVE_CELL_ID: &str = "cell-origin";
 pub const GRAVITY_BODY_ID: &str = "khepri-prime";
 pub const VOXEL_BODY_ID: &str = "origin-asteroid";
 const MICROMETRES_PER_METRE: f64 = 1_000_000.0;
@@ -116,6 +116,12 @@ struct UniverseManifestHashMaterial<'a> {
     content_hash: &'a str,
     world_schema_version: u32,
     event_schema_version: u32,
+    projection_schema_version: u32,
+    interest_schema_version: u32,
+    operation_fingerprint_schema_version: u32,
+    cell_key_schema_version: u32,
+    cell_directory_schema_version: u32,
+    transfer_package_schema_version: u32,
     lifecycle_control_schema_version: u32,
     production_schedule_occurrence_schema_version: u32,
     lifecycle_policy_hash: &'a str,
@@ -193,6 +199,88 @@ pub fn cell_origin_address() -> UniverseAddress {
         },
         local_um: I64Vec3::ZERO,
     }
+}
+
+pub fn cell_origin_key() -> CellKeyV1 {
+    cell_key_from_address(&cell_origin_address())
+        .expect("embedded origin address is a canonical cell key")
+}
+
+pub fn cell_key_from_address(address: &UniverseAddress) -> Result<CellKeyV1, CelestialError> {
+    validate_universe_address(address, &address.universe_id)?;
+    Ok(CellKeyV1 {
+        schema_version: CELL_KEY_SCHEMA_VERSION,
+        universe_id: address.universe_id.clone(),
+        sector: address.sector.clone(),
+        cell: address.cell,
+    })
+}
+
+pub fn cell_address_from_key(key: &CellKeyV1) -> Result<UniverseAddress, CelestialError> {
+    validate_cell_key(key)?;
+    Ok(cell_address_from_parts(key))
+}
+
+pub fn validate_cell_key(key: &CellKeyV1) -> Result<(), CelestialError> {
+    if key.schema_version != CELL_KEY_SCHEMA_VERSION {
+        return Err(CelestialError::InvalidAddress(format!(
+            "cell-key schema {} does not match required schema {CELL_KEY_SCHEMA_VERSION}",
+            key.schema_version
+        )));
+    }
+    validate_universe_address(&cell_address_from_parts(key), &key.universe_id)
+}
+
+fn cell_address_from_parts(key: &CellKeyV1) -> UniverseAddress {
+    UniverseAddress {
+        universe_id: key.universe_id.clone(),
+        sector: key.sector.clone(),
+        cell: key.cell,
+        local_um: I64Vec3::ZERO,
+    }
+}
+
+pub fn neighbor_cell_key(key: &CellKeyV1, delta: [i32; 3]) -> Result<CellKeyV1, CelestialError> {
+    validate_cell_key(key)?;
+    let sectors = [&key.sector.x, &key.sector.y, &key.sector.z];
+    let cells = [key.cell.x, key.cell.y, key.cell.z];
+    let mut normalized_sectors = [0_i128; 3];
+    let mut normalized_cells = [0_u32; 3];
+    for axis in 0..3 {
+        let sector = sectors[axis]
+            .parse::<i128>()
+            .map_err(|_| CelestialError::AddressOverflow)?;
+        let requested_cell = i128::from(cells[axis])
+            .checked_add(i128::from(delta[axis]))
+            .ok_or(CelestialError::AddressOverflow)?;
+        let (sector, cell, local_um) = normalize_axis(sector, requested_cell, 0)?;
+        debug_assert_eq!(local_um, 0);
+        normalized_sectors[axis] = sector;
+        normalized_cells[axis] = cell;
+    }
+    Ok(CellKeyV1 {
+        schema_version: CELL_KEY_SCHEMA_VERSION,
+        universe_id: key.universe_id.clone(),
+        sector: SectorCoordinate {
+            x: normalized_sectors[0].to_string(),
+            y: normalized_sectors[1].to_string(),
+            z: normalized_sectors[2].to_string(),
+        },
+        cell: CellCoordinate {
+            x: normalized_cells[0],
+            y: normalized_cells[1],
+            z: normalized_cells[2],
+        },
+    })
+}
+
+pub fn cell_id(key: &CellKeyV1) -> Result<String, CelestialError> {
+    validate_cell_key(key)?;
+    let bytes = canonical_json_bytes(key)?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"the-verse/cell-key/v1\0");
+    hasher.update(&bytes);
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 pub fn validate_universe_address(
@@ -805,6 +893,12 @@ pub fn universe_manifest(
         content_hash: content::manifest_hash(),
         world_schema_version,
         event_schema_version,
+        projection_schema_version: PROJECTION_SCHEMA_VERSION,
+        interest_schema_version: INTEREST_SCHEMA_VERSION,
+        operation_fingerprint_schema_version: INTENT_FINGERPRINT_SCHEMA_VERSION,
+        cell_key_schema_version: CELL_KEY_SCHEMA_VERSION,
+        cell_directory_schema_version: CELL_DIRECTORY_SCHEMA_VERSION,
+        transfer_package_schema_version: TRANSFER_PACKAGE_SCHEMA_VERSION,
         lifecycle_control_schema_version: LIFECYCLE_CONTROL_SCHEMA_VERSION,
         production_schedule_occurrence_schema_version:
             PRODUCTION_SCHEDULE_OCCURRENCE_SCHEMA_VERSION,
@@ -812,7 +906,7 @@ pub fn universe_manifest(
     };
     let bytes = canonical_json_bytes(&material)?;
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"the-verse/universe-manifest/v3\0");
+    hasher.update(b"the-verse/universe-manifest/v4\0");
     hasher.update(&bytes);
     let manifest_hash = hasher.finalize().to_hex().to_string();
     Ok(UniverseManifestSnapshot {
@@ -833,6 +927,12 @@ pub fn universe_manifest(
         content_hash: content::manifest_hash().into(),
         world_schema_version,
         event_schema_version,
+        projection_schema_version: PROJECTION_SCHEMA_VERSION,
+        interest_schema_version: INTEREST_SCHEMA_VERSION,
+        operation_fingerprint_schema_version: INTENT_FINGERPRINT_SCHEMA_VERSION,
+        cell_key_schema_version: CELL_KEY_SCHEMA_VERSION,
+        cell_directory_schema_version: CELL_DIRECTORY_SCHEMA_VERSION,
+        transfer_package_schema_version: TRANSFER_PACKAGE_SCHEMA_VERSION,
         lifecycle_control_schema_version: LIFECYCLE_CONTROL_SCHEMA_VERSION,
         production_schedule_occurrence_schema_version:
             PRODUCTION_SCHEDULE_OCCURRENCE_SCHEMA_VERSION,
@@ -840,7 +940,7 @@ pub fn universe_manifest(
     })
 }
 
-fn lifecycle_policy_hash() -> Result<String, CelestialError> {
+pub(crate) fn lifecycle_policy_hash() -> Result<String, CelestialError> {
     let material = LifecyclePolicyHashMaterial {
         lifecycle_control_schema_version: LIFECYCLE_CONTROL_SCHEMA_VERSION,
         production_schedule_occurrence_schema_version:
@@ -896,28 +996,6 @@ pub fn body_surface_radius_m(body_id: &str) -> f64 {
         .map_or_else(
             || panic!("embedded registry body {body_id} exists"),
             |body| body.surface_radius_um as f64 / 1_000_000.0,
-        )
-}
-
-pub fn body_atmosphere_height_m(body_id: &str) -> f64 {
-    definition()
-        .bodies
-        .iter()
-        .find(|body| body.body_id == body_id)
-        .map_or_else(
-            || panic!("embedded registry body {body_id} exists"),
-            |body| body.atmosphere_height_um as f64 / 1_000_000.0,
-        )
-}
-
-pub fn body_surface_gravity_m_s2(body_id: &str) -> f64 {
-    definition()
-        .bodies
-        .iter()
-        .find(|body| body.body_id == body_id)
-        .map_or_else(
-            || panic!("embedded registry body {body_id} exists"),
-            |body| body.surface_gravity_millimetres_per_second_squared as f64 / 1_000.0,
         )
 }
 
@@ -979,10 +1057,15 @@ mod tests {
     fn registry_and_universe_manifest_match_cross_platform_golden_hashes() {
         let seed = 20_260_826;
         let registry = registry_snapshot(seed).expect("golden registry builds");
-        let manifest = universe_manifest(seed, 19, 15).expect("golden manifest builds");
+        let manifest = universe_manifest(
+            seed,
+            crate::WORLD_SCHEMA_VERSION,
+            crate::EVENT_SCHEMA_VERSION,
+        )
+        .expect("golden manifest builds");
         assert_eq!(
             manifest.lifecycle_policy_hash,
-            "5bc077cc8a2eb101fcaecdce5513c13aa243e1f68a5af839a602dd689859ff3a"
+            "8abc99b5e076bd89a8914c3727560baaa82433b1b1b4191b2379355ac7d81471"
         );
         assert_eq!(
             registry.registry_hash,
@@ -990,7 +1073,7 @@ mod tests {
         );
         assert_eq!(
             manifest.manifest_hash,
-            "c9bfd3baa1e64ab7665e60c4f989491e745e9af0d2512989f41625b57b546ace"
+            "3e93c305169eeecee44f2630e57ad183b319375197547344c45e1509e8aaf76b"
         );
     }
 
@@ -1006,6 +1089,66 @@ mod tests {
             Ok((-1, 999, 9_999_999_999))
         );
         assert!(normalize_axis(i128::MAX, 999, i128::from(CELL_EDGE_UM)).is_err());
+    }
+
+    #[test]
+    fn cell_keys_have_stable_identity_and_neighbor_carries() {
+        let origin = cell_origin_key();
+        assert_eq!(origin.schema_version, CELL_KEY_SCHEMA_VERSION);
+        assert_eq!(origin.sector.x, "0");
+        assert_eq!(origin.cell.x, 500);
+        assert_eq!(
+            cell_address_from_key(&origin).expect("origin key becomes an address"),
+            cell_origin_address()
+        );
+
+        let east = neighbor_cell_key(&origin, [1, 0, 0]).expect("east neighbor derives");
+        assert_eq!(east.sector.x, "0");
+        assert_eq!(east.cell.x, 501);
+        assert_ne!(cell_id(&origin), cell_id(&east));
+
+        let mut low = origin.clone();
+        low.sector.x = "0".into();
+        low.cell.x = 0;
+        let west = neighbor_cell_key(&low, [-1, 0, 0]).expect("west neighbor carries");
+        assert_eq!(west.sector.x, "-1");
+        assert_eq!(west.cell.x, 999);
+
+        let mut high = origin.clone();
+        high.sector.y = "-2".into();
+        high.cell.y = 999;
+        let north = neighbor_cell_key(&high, [0, 1, 0]).expect("north neighbor carries");
+        assert_eq!(north.sector.y, "-1");
+        assert_eq!(north.cell.y, 0);
+    }
+
+    #[test]
+    fn cell_key_identity_has_cross_platform_golden_hashes() {
+        let origin = cell_origin_key();
+        let east = neighbor_cell_key(&origin, [1, 0, 0]).expect("east neighbor derives");
+        assert_eq!(
+            cell_id(&origin).expect("origin cell hashes"),
+            "5110e8ef07316dc5fc8cd48210915d3e879779c67dc3e11a9da0402656c76d17"
+        );
+        assert_eq!(
+            cell_id(&east).expect("east cell hashes"),
+            "e24242afc42c71a9629093e0c82b1779e306e92c52804ebc105ef373fa5a8f4d"
+        );
+    }
+
+    #[test]
+    fn cell_keys_reject_noncanonical_or_wrong_schema_material() {
+        let mut key = cell_origin_key();
+        key.sector.x = "-0".into();
+        assert!(validate_cell_key(&key).is_err());
+
+        let mut key = cell_origin_key();
+        key.cell.z = CELLS_PER_SECTOR_AXIS;
+        assert!(validate_cell_key(&key).is_err());
+
+        let mut key = cell_origin_key();
+        key.schema_version += 1;
+        assert!(validate_cell_key(&key).is_err());
     }
 
     #[test]

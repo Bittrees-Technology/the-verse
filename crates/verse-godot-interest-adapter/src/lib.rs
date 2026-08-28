@@ -97,12 +97,6 @@ impl AdapterSession {
     }
 
     fn stage(&mut self, raw: &[u8]) -> Result<StagedFrame, BridgeError> {
-        if self.pending.is_some() {
-            return Err(BridgeError::new(
-                "pending_stage",
-                "the Godot adapter already has a pending stage",
-            ));
-        }
         let verifier = self.verifier.as_mut().ok_or_else(|| {
             BridgeError::new(
                 "unexpected_message",
@@ -110,6 +104,9 @@ impl AdapterSession {
             )
         })?;
         let core_token = verifier.stage(raw).map_err(BridgeError::from)?;
+        // A preparing handoff can atomically supersede an older staged source
+        // frame inside the core verifier, so its bridge token must disappear too.
+        self.pending = None;
         let kind = verifier
             .pending_kind()
             .map(stage_kind_name)
@@ -234,6 +231,7 @@ fn stage_kind_name(kind: StageKind) -> &'static str {
     match kind {
         StageKind::Welcome => "welcome",
         StageKind::Registry => "registry",
+        StageKind::Handoff => "handoff",
         StageKind::Baseline => "baseline",
         StageKind::Delta => "delta",
         StageKind::IntentAccepted => "intent_accepted",
@@ -391,19 +389,19 @@ mod tests {
     use verse_interest_verifier::{InterestVerifier, VerifierConfig};
     use verse_protocol::SessionRole;
 
-    const WELCOME: &[u8] = br#"{"type":"welcome","protocol_version":17,"projection_schema_version":3,"world_schema_version":19,"event_schema_version":15,"content_schema_version":11,"content_manifest_version":"p1.5.0","celestial_registry_schema_version":1,"universe_manifest_schema_version":3,"interest_schema_version":1,"server_name":"adapter-test","session_role":{"kind":"player","player_id":"player-local"}}"#;
+    const WELCOME: &[u8] = br#"{"type":"welcome","protocol_version":18,"projection_schema_version":4,"world_schema_version":20,"event_schema_version":16,"content_schema_version":11,"content_manifest_version":"p1.5.0","celestial_registry_schema_version":1,"universe_manifest_schema_version":4,"interest_schema_version":2,"server_name":"adapter-test","session_role":{"kind":"player","player_id":"player-local"}}"#;
     const CONTENT_HASH: &str = "fc61c05b335fb951868010ecf2942a92ec4f03d00d0a75d3acba8c6f5162b6bd";
     const UNIVERSE_ID: &str = "the-verse-local";
     const REGISTRY_HASH: &str = "4c367bbfa04218ece14104f0a3a7ec2c7e9fefcc37d4cf78a265df2d711a59da";
-    const MANIFEST_HASH: &str = "c9bfd3baa1e64ab7665e60c4f989491e745e9af0d2512989f41625b57b546ace";
+    const MANIFEST_HASH: &str = "3e93c305169eeecee44f2630e57ad183b319375197547344c45e1509e8aaf76b";
 
     fn session() -> AdapterSession {
         let mut session = AdapterSession::default();
         session
             .reset_player(
                 "player-local",
-                19,
-                15,
+                20,
+                16,
                 11,
                 "p1.5.0",
                 CONTENT_HASH,
@@ -428,14 +426,14 @@ mod tests {
                     SessionRole::Player {
                         player_id: "player-vector".to_owned(),
                     },
-                    19,
-                    15,
+                    20,
+                    16,
                     11,
                     "p1.5.0",
                     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                     "universe-vector",
                     "f00517b0fbef09d7924fde2cb11f2c74066627992ab900a6a9e0bd3ac3dc7311",
-                    "5b54eedd8dfe2cae6f5bdc9f4f09ab8131873b12f28d2faaba5cf98012d72bab",
+                    "551b4f30761a3fe8eed2bc3a9525e46f81d16563f9118b305bf5f2a3b9e63346",
                 ))
                 .expect("vector verifier config"),
             ),
@@ -482,7 +480,7 @@ mod tests {
         let mut session = session();
         let tampered = String::from_utf8(WELCOME.to_vec())
             .expect("fixture is UTF-8")
-            .replace("\"world_schema_version\":19", "\"world_schema_version\":20");
+            .replace("\"world_schema_version\":20", "\"world_schema_version\":21");
         let error = session
             .stage(tampered.as_bytes())
             .expect_err("tampered tuple must be rejected");
@@ -492,7 +490,7 @@ mod tests {
             .stage(WELCOME)
             .expect("valid welcome must still stage after rejection");
         assert_eq!(staged.kind, "welcome");
-        assert!(staged.sanitized_json.contains("\"protocol_version\":17"));
+        assert!(staged.sanitized_json.contains("\"protocol_version\":18"));
         let committed = session.commit(staged.token).expect("welcome commit");
         assert_eq!(committed.kind, "welcome");
         assert_eq!(committed.acknowledgement, None);
@@ -512,8 +510,8 @@ mod tests {
         session
             .reset_player(
                 "player-local",
-                19,
-                15,
+                20,
+                16,
                 11,
                 "p1.5.0",
                 CONTENT_HASH,

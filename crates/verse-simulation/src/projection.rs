@@ -16,16 +16,17 @@ use serde::ser::{
 use serde_json::Value;
 use thiserror::Error;
 use verse_protocol::{
-    ActorPrivateSnapshot, BlockKind, BlockSnapshot, DeathDropSnapshot, EnvironmentSnapshot,
-    GridMotionSnapshot, GridSnapshot, INTEREST_SCHEMA_VERSION, InterestEntityKind,
-    InterestEntityPayload, InterestEntityProjection, InterestEntityRef, InterestFrameKind,
-    InterestObserverClass, InterestRemoval, InterestRemovalReason, InterestSnapshot,
-    InventoryDomain, InventorySnapshot, OwnedGridMassSnapshot, PROJECTION_SCHEMA_VERSION,
-    PlayerLifeState, PlayerMotionSnapshot, PlayerSnapshot, ProductionJobSnapshot,
-    ProductionJobStatus, ProductionQueueSnapshot, ProjectedInterestDelta, ProjectedMotionSnapshot,
-    ProjectedWorldSnapshot, PublicBlockSnapshot, PublicDeathDropSnapshot, PublicGridMotionSnapshot,
-    PublicGridSnapshot, PublicMachineState, PublicPlayerLifeState, PublicPlayerMotionSnapshot,
-    PublicPlayerSnapshot, PublicVoxelChunkSnapshot, UniverseAddress, Vec3, VoxelSnapshot,
+    ActorPrivateSnapshot, BlockKind, BlockSnapshot, CellKeyV1, DeathDropSnapshot,
+    EnvironmentSnapshot, GridMotionSnapshot, GridSnapshot, INTEREST_SCHEMA_VERSION,
+    InterestEntityKind, InterestEntityPayload, InterestEntityProjection, InterestEntityRef,
+    InterestFrameKind, InterestObserverClass, InterestRemoval, InterestRemovalReason,
+    InterestSnapshot, InterestTransferLink, InventoryDomain, InventorySnapshot,
+    OwnedGridMassSnapshot, PROJECTION_SCHEMA_VERSION, PlayerLifeState, PlayerMotionSnapshot,
+    PlayerSnapshot, ProductionJobSnapshot, ProductionJobStatus, ProductionQueueSnapshot,
+    ProjectedInterestDelta, ProjectedMotionSnapshot, ProjectedWorldSnapshot, PublicBlockSnapshot,
+    PublicDeathDropSnapshot, PublicGridMotionSnapshot, PublicGridSnapshot, PublicMachineState,
+    PublicPlayerLifeState, PublicPlayerMotionSnapshot, PublicPlayerSnapshot,
+    PublicVoxelChunkSnapshot, UniverseAddress, Vec3, VoxelSnapshot,
 };
 
 use crate::{celestial, content, model::WorldState};
@@ -90,6 +91,7 @@ pub struct InterestProjectionState {
     last_evaluated_tick: Option<u64>,
     environment: Option<EnvironmentSnapshot>,
     actor_private: Option<ActorPrivateSnapshot>,
+    transfer_link: Option<InterestTransferLink>,
 }
 
 impl InterestProjectionState {
@@ -125,6 +127,7 @@ impl InterestProjectionState {
             last_evaluated_tick: None,
             environment: None,
             actor_private: None,
+            transfer_link: None,
         }
     }
 
@@ -185,6 +188,41 @@ impl InterestProjectionState {
         self.last_evaluated_tick = None;
         self.environment = None;
         self.actor_private = None;
+        self.transfer_link = None;
+        Ok(())
+    }
+
+    /// Invalidate the source replication frontier and bind the next complete
+    /// baseline to one committed destination placement. The link is emitted
+    /// once and cleared from the cursor after that baseline is projected.
+    pub fn fresh_transfer_baseline(
+        &mut self,
+        transfer_id: impl Into<String>,
+        destination_cell_key: CellKeyV1,
+        placement_generation: u64,
+    ) -> Result<(), ProjectionError> {
+        if !matches!(self.observer, InterestObserver::BoundPlayer { .. }) {
+            return Err(ProjectionError::InvalidSession(
+                "only a bound player session can install a transfer baseline".into(),
+            ));
+        }
+        let transfer_id = transfer_id.into();
+        if !valid_transfer_identifier(&transfer_id) || placement_generation == 0 {
+            return Err(ProjectionError::InvalidSession(
+                "transfer baseline identity or placement generation is invalid".into(),
+            ));
+        }
+        celestial::validate_cell_key(&destination_cell_key).map_err(|source| {
+            ProjectionError::InvalidSession(format!(
+                "transfer baseline destination cell is invalid: {source}"
+            ))
+        })?;
+        self.fresh_baseline()?;
+        self.transfer_link = Some(InterestTransferLink {
+            transfer_id,
+            destination_cell_key,
+            placement_generation,
+        });
         Ok(())
     }
 
@@ -288,7 +326,7 @@ struct Selection {
     previous_view_hash: Option<String>,
 }
 
-/// Official protocol-16 state stream result. A session begins with one
+/// Official protocol-18 state stream result. A session begins with one
 /// baseline and then emits only deltas from the same cursor.
 #[derive(Debug, Clone, PartialEq)]
 #[allow(clippy::large_enum_variant)]
@@ -298,7 +336,7 @@ pub enum ProjectedInterestFrame {
 }
 
 impl ProjectionSource {
-    /// Projects the next protocol-16 frame while reusing this source's
+    /// Projects the next protocol-18 frame while reusing this source's
     /// canonical snapshot, public payloads, and spatial index.
     pub fn project_interest_frame(
         &self,
@@ -437,6 +475,7 @@ impl ProjectionSource {
             .map(|entity| complete_entity_projection(entity, &selection.payloads))
             .collect::<Result<Vec<_>, _>>()?;
         let observer_class = observer_class(&cursor.observer);
+        let transfer_link = transfer_link_for_frame(cursor, canonical, selection.frame_kind)?;
         let view_hash = fixed_hash(&ViewHashMaterial {
             projection_schema_version: PROJECTION_SCHEMA_VERSION,
             interest_schema_version: INTEREST_SCHEMA_VERSION,
@@ -454,6 +493,7 @@ impl ProjectionSource {
             interest_epoch: cursor.interest_epoch,
             baseline_id: &cursor.baseline_id,
             delta_sequence: selection.delta_sequence,
+            transfer_link: transfer_link.as_ref(),
             entities: &complete_view_entities,
             environment: &observer_environment,
             conservation_valid: canonical.conservation.valid,
@@ -481,6 +521,7 @@ impl ProjectionSource {
             local_origin_address: local_origin,
             registry_hash: canonical.celestial_registry_hash.clone(),
             universe_manifest_hash: canonical.universe_manifest_hash.clone(),
+            transfer_link,
             canonical_event_sequence: canonical.event_sequence,
             canonical_tick: canonical.simulation_tick,
             canonical_world_hash: canonical.world_hash.clone(),
@@ -497,6 +538,7 @@ impl ProjectionSource {
         cursor.last_evaluated_tick = Some(canonical.simulation_tick);
         cursor.environment = Some(observer_environment.clone());
         cursor.actor_private.clone_from(&actor_private);
+        cursor.transfer_link = None;
 
         Ok(ProjectedWorldSnapshot {
             projection_schema_version: PROJECTION_SCHEMA_VERSION,
@@ -685,7 +727,7 @@ impl WorldState {
     /// Builds public projection material once so a worker can reuse it for all
     /// sessions projected from the same immutable authoritative state.
     pub fn projection_source(&self) -> Result<ProjectionSource, ProjectionError> {
-        let canonical = self.snapshot();
+        let canonical = self.projection_snapshot();
         let mut candidates = BTreeMap::new();
         let mut support_entities = BTreeMap::new();
         for player in &canonical.players {
@@ -811,7 +853,7 @@ impl WorldState {
         self.project_interest_world_snapshot_with_removals(cursor, &BTreeMap::new())
     }
 
-    /// Emits the explicit protocol-16 stream family. Callers must not mix this
+    /// Emits the explicit protocol-18 stream family. Callers must not mix this
     /// with the protocol-15 `Snapshot`/`MotionState` compatibility family.
     pub fn project_interest_frame(
         &self,
@@ -936,6 +978,7 @@ impl WorldState {
             .map(|entity| complete_entity_projection(entity, &selection.payloads))
             .collect::<Result<Vec<_>, _>>()?;
         let observer_class = observer_class(&cursor.observer);
+        let transfer_link = transfer_link_for_frame(cursor, canonical, selection.frame_kind)?;
         let view_hash = fixed_hash(&ViewHashMaterial {
             projection_schema_version: PROJECTION_SCHEMA_VERSION,
             interest_schema_version: INTEREST_SCHEMA_VERSION,
@@ -953,6 +996,7 @@ impl WorldState {
             interest_epoch: cursor.interest_epoch,
             baseline_id: &cursor.baseline_id,
             delta_sequence: selection.delta_sequence,
+            transfer_link: transfer_link.as_ref(),
             entities: &complete_view_entities,
             environment: &observer_environment,
             conservation_valid: canonical.conservation.valid,
@@ -980,6 +1024,7 @@ impl WorldState {
             local_origin_address: local_origin,
             registry_hash: canonical.celestial_registry_hash.clone(),
             universe_manifest_hash: canonical.universe_manifest_hash.clone(),
+            transfer_link,
             canonical_event_sequence: canonical.event_sequence,
             canonical_tick: canonical.simulation_tick,
             canonical_world_hash: canonical.world_hash.clone(),
@@ -996,6 +1041,7 @@ impl WorldState {
         cursor.last_evaluated_tick = Some(canonical.simulation_tick);
         cursor.environment = Some(observer_environment.clone());
         cursor.actor_private.clone_from(&actor_private);
+        cursor.transfer_link = None;
 
         Ok(ProjectedWorldSnapshot {
             projection_schema_version: PROJECTION_SCHEMA_VERSION,
@@ -1244,6 +1290,8 @@ struct ViewHashMaterial<'a> {
     interest_epoch: u64,
     baseline_id: &'a str,
     delta_sequence: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transfer_link: Option<&'a InterestTransferLink>,
     entities: &'a [InterestEntityProjection],
     environment: &'a verse_protocol::EnvironmentSnapshot,
     conservation_valid: bool,
@@ -1289,6 +1337,57 @@ fn validate_session(cursor: &InterestProjectionState) -> Result<(), ProjectionEr
         ));
     }
     Ok(())
+}
+
+fn transfer_link_for_frame(
+    cursor: &InterestProjectionState,
+    canonical: &verse_protocol::WorldSnapshot,
+    frame_kind: InterestFrameKind,
+) -> Result<Option<InterestTransferLink>, ProjectionError> {
+    let Some(link) = cursor.transfer_link.as_ref() else {
+        return Ok(None);
+    };
+    if frame_kind != InterestFrameKind::Baseline
+        || !matches!(cursor.observer, InterestObserver::BoundPlayer { .. })
+        || !valid_transfer_identifier(&link.transfer_id)
+        || link.placement_generation == 0
+    {
+        return Err(ProjectionError::InvalidSession(
+            "transfer linkage is valid only on one bound-player baseline".into(),
+        ));
+    }
+    celestial::validate_cell_key(&link.destination_cell_key).map_err(|source| {
+        ProjectionError::InvalidSession(format!(
+            "transfer destination cell key is invalid: {source}"
+        ))
+    })?;
+    let destination_cell_id = celestial::cell_id(&link.destination_cell_key).map_err(|source| {
+        ProjectionError::InvalidSession(format!(
+            "transfer destination cell identity is invalid: {source}"
+        ))
+    })?;
+    let destination_cell_address = celestial::cell_address_from_key(&link.destination_cell_key)
+        .map_err(|source| {
+            ProjectionError::InvalidSession(format!(
+                "transfer destination cell address is invalid: {source}"
+            ))
+        })?;
+    if destination_cell_id != canonical.cell_id
+        || destination_cell_address != canonical.cell_address
+    {
+        return Err(ProjectionError::InvalidSession(
+            "transfer link does not name the projected destination cell".into(),
+        ));
+    }
+    Ok(Some(link.clone()))
+}
+
+fn valid_transfer_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
 }
 
 fn visible_ids(
@@ -2350,9 +2449,9 @@ mod tests {
 
     use verse_interest_verifier::{ErrorCode, InterestVerifier, StageKind, VerifierConfig};
     use verse_protocol::{
-        BlockKind, CELESTIAL_REGISTRY_SCHEMA_VERSION, IVec3, InventoryContents, InventoryDomain,
-        PROTOCOL_VERSION, PlayerDeathCause, Quat, ServerMessage, SessionRole,
-        UNIVERSE_MANIFEST_SCHEMA_VERSION,
+        BlockKind, CELESTIAL_REGISTRY_SCHEMA_VERSION, HandoffPhase, HandoffStatus, IVec3,
+        InventoryContents, InventoryDomain, LocomotionKind, PROTOCOL_VERSION, PlayerDeathCause,
+        Quat, ServerMessage, SessionRole, UNIVERSE_MANIFEST_SCHEMA_VERSION,
     };
 
     use super::*;
@@ -2618,6 +2717,374 @@ mod tests {
         assert_eq!(
             commit_wire(&mut verifier, &receipt),
             StageKind::IntentAccepted
+        );
+    }
+
+    #[test]
+    fn transfer_link_is_one_time_destination_bound_and_independently_verified() {
+        let mut world = WorldState::genesis(41);
+        world.fencing_token = 11;
+        let source_key = celestial::cell_origin_key();
+        let destination_key =
+            celestial::neighbor_cell_key(&source_key, [1, 0, 0]).expect("destination cell derives");
+        let boundary_address = celestial::address_from_origin_offset_um(
+            &world.cell_address,
+            [i128::from(celestial::CELL_EDGE_UM / 2), 0, 0],
+        )
+        .expect("boundary address canonicalizes");
+        let boundary_position =
+            celestial::local_position_from_address(&world.cell_address, &boundary_address)
+                .expect("source boundary position hydrates");
+        let player = world.player.get_mut("player-local").expect("source player");
+        player.address = boundary_address;
+        player.position = boundary_position;
+        player.locomotion.kind = LocomotionKind::Eva;
+        player.locomotion.support = None;
+        player.locomotion.magnetic_boots_enabled = false;
+        world
+            .validate_player_roster()
+            .expect("source crossing remains canonical");
+
+        let role = SessionRole::Player {
+            player_id: "player-local".into(),
+        };
+        let mut verifier = verifier_for(&world, role.clone());
+        establish_verifier(&mut verifier, &world, role);
+        let mut cursor = InterestProjectionState::bound_player("transfer-session", "player-local");
+        let initial = world
+            .project_interest_baseline(&mut cursor)
+            .expect("initial baseline projects");
+        assert_eq!(
+            commit_wire(
+                &mut verifier,
+                &ServerMessage::InterestBaseline {
+                    baseline: Box::new(initial),
+                },
+            ),
+            StageKind::Baseline
+        );
+        let initial_epoch = verifier
+            .committed_view()
+            .expect("initial view commits")
+            .interest_epoch;
+
+        let context = crate::PlayerTransferContext {
+            transfer_id: "transfer-session-proof".into(),
+            source_cell_key: source_key.clone(),
+            destination_cell_key: destination_key.clone(),
+            source_assignment_generation: 1,
+            destination_assignment_generation: 1,
+            source_fencing_token: world.fencing_token,
+            prior_placement_generation: 1,
+            resulting_placement_generation: 2,
+        };
+        let package = crate::prepare_eva_player_transfer(&world, "player-local", &context)
+            .expect("cross-cell package prepares");
+        let mut destination =
+            WorldState::genesis_for_cell(41, &destination_key).expect("destination cell builds");
+        destination.fencing_token = 17;
+        let directory_root = tempfile::tempdir().expect("temporary directory");
+        let manifest =
+            crate::universe_manifest(41, crate::WORLD_SCHEMA_VERSION, crate::EVENT_SCHEMA_VERSION)
+                .expect("universe manifest");
+        let mut directory = crate::LocalCellDirectory::open(
+            directory_root.path(),
+            &manifest,
+            [source_key.clone(), destination_key.clone()],
+        )
+        .expect("cell directory opens");
+        directory
+            .claim(&source_key, 0, "worker-source", world.fencing_token)
+            .expect("source cell claims");
+        directory
+            .claim(
+                &destination_key,
+                0,
+                "worker-destination",
+                destination.fencing_token,
+            )
+            .expect("destination cell claims");
+        directory
+            .register_placement(
+                "player-local",
+                crate::MobileAggregateKind::Player,
+                &source_key,
+            )
+            .expect("source placement registers");
+        let prepared = directory
+            .prepare_transfer(
+                "player-local",
+                1,
+                &package.transfer_id,
+                &destination_key,
+                &package.package_hash,
+            )
+            .expect("directory prepare commits");
+        let locked_source = crate::stage_prepared_eva_lock(&world, &package, &prepared)
+            .expect("source closure locks");
+        let (reserved_destination, receipt) =
+            crate::stage_eva_player_quarantine(&destination, destination.fencing_token, &package)
+                .expect("destination quarantine commits");
+        let prepare_proof = crate::CellTransferPrepareProof {
+            transfer_id: package.transfer_id.clone(),
+            package_hash: package.package_hash.clone(),
+            source_cell_id: package.source_cell_id.clone(),
+            source_assignment_generation: package.source_assignment_generation,
+            prior_placement_generation: package.prior_placement_generation,
+            source_fencing_token: locked_source.fencing_token,
+            source_event_sequence: locked_source.event_sequence.max(1),
+            source_event_hash: blake3::hash(b"projection-source-prepare")
+                .to_hex()
+                .to_string(),
+            source_world_hash: locked_source.state_hash(),
+        };
+        directory
+            .record_source_prepared(&package.transfer_id, &prepare_proof)
+            .expect("directory records source proof");
+        let quarantine_proof = crate::CellTransferQuarantineProof {
+            transfer_id: package.transfer_id.clone(),
+            package_hash: package.package_hash.clone(),
+            quarantine_receipt_hash: receipt.receipt_hash.clone(),
+            destination_cell_id: package.destination_cell_id.clone(),
+            destination_assignment_generation: package.destination_assignment_generation,
+            resulting_placement_generation: package.resulting_placement_generation,
+            destination_fencing_token: reserved_destination.fencing_token,
+            destination_event_sequence: reserved_destination.event_sequence.max(1),
+            destination_event_hash: blake3::hash(b"projection-destination-quarantine")
+                .to_hex()
+                .to_string(),
+            destination_world_hash: reserved_destination.state_hash(),
+        };
+        directory
+            .record_quarantine(
+                &package.transfer_id,
+                &package.package_hash,
+                &receipt.receipt_hash,
+                &quarantine_proof,
+            )
+            .expect("directory records quarantine");
+        let committed = directory
+            .commit_transfer(&package.transfer_id, 1)
+            .expect("directory placement CAS commits");
+        let exported = crate::stage_committed_eva_export(&locked_source, &package, &committed)
+            .expect("source export commits");
+        let imported = crate::stage_committed_eva_import(
+            &reserved_destination,
+            &package,
+            &receipt,
+            &committed,
+        )
+        .expect("destination import commits");
+        assert!(exported.player.get("player-local").is_none());
+        assert_eq!(
+            imported.player.get("player-local"),
+            Some(&package.destination_player)
+        );
+
+        let mut stale_source_cursor = cursor.clone();
+        let stale_source_delta = world
+            .project_interest_delta(&mut stale_source_cursor, &BTreeMap::new())
+            .expect("source can form a delta before handoff");
+        cursor
+            .fresh_transfer_baseline(
+                &package.transfer_id,
+                destination_key.clone(),
+                context.resulting_placement_generation,
+            )
+            .expect("committed placement installs a fresh transfer baseline");
+        let linked = imported
+            .project_interest_baseline(&mut cursor)
+            .expect("linked destination baseline projects");
+        let link = linked
+            .interest
+            .transfer_link
+            .as_ref()
+            .expect("destination baseline carries the one-time link");
+        assert_eq!(link.transfer_id, "transfer-session-proof");
+        assert_eq!(link.placement_generation, 2);
+        assert_eq!(linked.interest.interest_epoch, initial_epoch + 1);
+
+        let handoff = |phase| ServerMessage::Handoff {
+            handoff: HandoffStatus {
+                transfer_id: package.transfer_id.clone(),
+                phase,
+                destination_cell_key: destination_key.clone(),
+                placement_generation: context.resulting_placement_generation,
+            },
+        };
+        let stale_source_raw = serde_json::to_vec(&ServerMessage::InterestDelta {
+            delta: Box::new(stale_source_delta.clone()),
+        })
+        .expect("stale source delta serializes");
+        let stale_source_token = verifier
+            .stage(&stale_source_raw)
+            .expect("source delta stages before the prepare boundary");
+        let preparing_raw =
+            serde_json::to_vec(&handoff(HandoffPhase::Preparing)).expect("handoff serializes");
+        let preparing_token = verifier
+            .stage(&preparing_raw)
+            .expect("handoff supersedes an uncommitted source frame");
+        assert_eq!(verifier.pending_kind(), Some(StageKind::Handoff),);
+        assert_eq!(
+            verifier
+                .commit(stale_source_token)
+                .expect_err("superseded source token is invalid")
+                .code(),
+            ErrorCode::InvalidStageToken
+        );
+        assert_eq!(
+            verifier
+                .commit(preparing_token)
+                .expect("preparing handoff commits")
+                .kind,
+            StageKind::Handoff
+        );
+        assert!(
+            verifier.committed_view().is_none(),
+            "preparing immediately discards the source presentation"
+        );
+        assert_eq!(
+            verifier
+                .stage(
+                    &serde_json::to_vec(&ServerMessage::InterestDelta {
+                        delta: Box::new(stale_source_delta),
+                    })
+                    .expect("stale source delta serializes"),
+                )
+                .expect_err("old-cell deltas are rejected during handoff")
+                .code(),
+            ErrorCode::UnexpectedMessage
+        );
+        assert_eq!(
+            verifier
+                .stage(
+                    &serde_json::to_vec(&ServerMessage::InterestBaseline {
+                        baseline: Box::new(linked.clone()),
+                    })
+                    .expect("premature destination serializes"),
+                )
+                .expect_err("destination cannot appear before its verification phase")
+                .code(),
+            ErrorCode::FrontierMismatch
+        );
+        assert_eq!(
+            commit_wire(&mut verifier, &handoff(HandoffPhase::Importing)),
+            StageKind::Handoff
+        );
+        assert_eq!(
+            verifier
+                .stage(
+                    &serde_json::to_vec(&handoff(HandoffPhase::Preparing))
+                        .expect("regressed phase serializes"),
+                )
+                .expect_err("handoff phase cannot regress")
+                .code(),
+            ErrorCode::FrontierMismatch
+        );
+        assert_eq!(
+            commit_wire(&mut verifier, &handoff(HandoffPhase::VerifyingDestination),),
+            StageKind::Handoff
+        );
+
+        let mut tampered = linked.clone();
+        tampered
+            .interest
+            .transfer_link
+            .as_mut()
+            .expect("link exists")
+            .placement_generation += 1;
+        assert_eq!(
+            verifier
+                .stage(
+                    &serde_json::to_vec(&ServerMessage::InterestBaseline {
+                        baseline: Box::new(tampered),
+                    })
+                    .expect("tampered link serializes"),
+                )
+                .expect_err("unhashed transfer substitution is rejected")
+                .code(),
+            ErrorCode::HashMismatch
+        );
+        assert_eq!(
+            commit_wire(
+                &mut verifier,
+                &ServerMessage::InterestBaseline {
+                    baseline: Box::new(linked),
+                },
+            ),
+            StageKind::Baseline
+        );
+
+        let delta = imported
+            .project_interest_delta(&mut cursor, &BTreeMap::new())
+            .expect("post-handoff delta projects");
+        assert!(
+            delta.interest.transfer_link.is_none(),
+            "the link is emitted only on the destination baseline"
+        );
+        assert_eq!(
+            commit_wire(
+                &mut verifier,
+                &ServerMessage::InterestDelta {
+                    delta: Box::new(delta),
+                },
+            ),
+            StageKind::Delta
+        );
+
+        let mut spectator = InterestProjectionState::public_origin_spectator("spectator");
+        assert!(
+            spectator
+                .fresh_transfer_baseline("transfer-private", celestial::cell_origin_key(), 8)
+                .is_err()
+        );
+        let mut wrong_cell = InterestProjectionState::bound_player("wrong-cell", "player-local");
+        wrong_cell
+            .fresh_transfer_baseline(
+                "transfer-wrong-cell",
+                celestial::neighbor_cell_key(&destination_key, [1, 0, 0])
+                    .expect("neighbor derives"),
+                2,
+            )
+            .expect("well-formed link installs before world binding");
+        assert!(imported.project_interest_baseline(&mut wrong_cell).is_err());
+    }
+
+    #[test]
+    fn empty_frontier_cell_projects_a_verified_public_vacuum_baseline() {
+        let origin = celestial::cell_origin_key();
+        let east =
+            celestial::neighbor_cell_key(&origin, [1, 0, 0]).expect("adjacent proof cell derives");
+        let world = WorldState::genesis_for_cell(42, &east).expect("frontier cell builds");
+        let mut cursor = InterestProjectionState::public_origin_spectator("empty-frontier-session");
+        let baseline = world
+            .project_interest_baseline(&mut cursor)
+            .expect("empty frontier baseline projects");
+        assert!(baseline.interest.entered.is_empty());
+        assert!(baseline.actor_private.is_none());
+        assert!(baseline.gravity_body_id.is_empty());
+        assert!(baseline.voxel_body_id.is_empty());
+        assert_eq!(baseline.environment.gravity, Vec3::ZERO);
+        assert!(!baseline.environment.breathable);
+
+        let role = SessionRole::Spectator;
+        let mut verifier = verifier_for(&world, role.clone());
+        establish_verifier(&mut verifier, &world, role);
+        assert_eq!(
+            commit_wire(
+                &mut verifier,
+                &ServerMessage::InterestBaseline {
+                    baseline: Box::new(baseline),
+                },
+            ),
+            StageKind::Baseline
+        );
+        assert_eq!(
+            verifier
+                .committed_view()
+                .expect("empty frontier view commits")
+                .entity_count,
+            0
         );
     }
 
@@ -3344,6 +3811,39 @@ mod tests {
             removed_reason(&delta, "player-remote"),
             InterestRemovalReason::Destroyed
         );
+    }
+
+    #[test]
+    fn public_spectator_uses_worker_evidence_for_a_visible_player_transfer() {
+        let mut world = world_with_two_actors();
+        let origin_address = world.cell_address.clone();
+        let player = world
+            .player
+            .get_mut("player-remote")
+            .expect("remote player exists");
+        player.address = origin_address;
+        player.position = Vec3::ZERO;
+        let mut cursor = InterestProjectionState::public_origin_spectator("spectator-transfer");
+        world
+            .project_interest_baseline(&mut cursor)
+            .expect("public baseline");
+        assert!(cursor.contains(InterestEntityKind::Player, "player-remote"));
+
+        world.player.by_id.remove("player-remote");
+        world.inventories.remove("inventory-player-remote");
+        world.simulation_tick += 1;
+        let identity = InterestEntityIdentity::new(InterestEntityKind::Player, "player-remote");
+        let delta = world
+            .project_interest_delta(
+                &mut cursor,
+                &BTreeMap::from([(identity, InterestRemovalReason::Transferred)]),
+            )
+            .expect("public transfer delta");
+        assert_eq!(
+            removed_reason(&delta, "player-remote"),
+            InterestRemovalReason::Transferred
+        );
+        assert!(delta.actor_private.is_none());
     }
 
     #[test]

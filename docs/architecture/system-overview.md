@@ -1,7 +1,7 @@
 # System architecture
 
-**Status:** Proposed production baseline with published P1.5 and verified P1.6
-single-cell contracts
+**Status:** Proposed production baseline with published P1.5, verified P1.6,
+and accepted P1.7 two-cell contract
 
 ## Architectural goals
 
@@ -68,9 +68,9 @@ entity never grants authority and never changes simulation ownership.
 
 - Celestial and sector registry.
 - Content-addressed universe manifest and canonical address normalization.
-- Dynamic cell scheduler.
+- Durable cell directory and assignment scheduler.
 - Cell lease and fencing service.
-- Player/grid transfer coordinator.
+- Player/grid placement and transfer coordinator.
 - Route and autopilot service.
 - Content-manifest registry.
 - Configuration and feature-policy service.
@@ -124,7 +124,10 @@ entity never grants authority and never changes simulation ownership.
 - A P1.6 worker must verify universe manifest schema `3`, celestial registry
   schema `1`, lifecycle-control schema `1`, schedule-occurrence schema `1`, and
   their hashes before opening world schema `19` or event schema `15`.
-- Cross-cell transfers use an idempotent prepare/commit protocol.
+- Cross-cell transfer uses a content-addressed prepare/quarantine saga. A
+  directory compare-and-swap over the prior placement generation is the sole
+  authority-transfer point; cell fencing and aggregate placement fencing are
+  both required.
 - Economic writes use stable operation IDs and double-entry accounting.
 - Blockchain consumers wait for chain-specific confirmation policy and tolerate reorganization.
 - Mainnet is never a dependency for player movement, mining, combat, or machine ticks.
@@ -171,6 +174,99 @@ verified baseline only after activation catch-up and snapshot complete.
 This local proof does not implement a universe directory, multiple-cell
 placement, handoff, multi-host lease availability, frontier expansion, or a
 thousand-player capacity envelope.
+
+## P1.7 durable two-cell handoff slice
+
+The accepted bounded slice creates two adjacent proof cells under one local
+durable directory. Each cell has an independent P1.6 lifecycle, store root,
+assignment generation, lease, and fencing token. A canonical `CellKeyV1`
+derives stable routing identity without depending on worker names or paths.
+
+The cell store is fenced before a directory assignment advances, and the
+directory retains the immutable assignment-generation-to-store-fence mapping.
+Every transfer phase is admitted from an exact canonical cell event proof in a
+lifecycle-anchored transfer-boundary hash chain, rather than from mutable
+current world state.
+
+Directory-managed cell roots reject the standalone runtime constructor. Only
+the universe coordinator holds the internal open capability, and it completes
+assignment binding, transfer reconciliation, and resident registration before
+the bounded local gateway admits a gameplay session. The worker's explicit
+`--two-cell-universe` mode hosts both proof cells behind that coordinator; the
+ordinary one-cell mode cannot open either managed root.
+
+The accepted contract carries an EVA actor or isolated ordinary unanchored grid
+through one durable handoff saga. The current executable checkpoint exercises
+the EVA closure only. The source locks the complete dependency closure and
+publishes an immutable package, the destination validates it into non-live
+quarantine, and the directory atomically advances the aggregate placement
+generation. Before that commit recovery may abort to the source; afterward
+only destination roll-forward is legal. Import, source finalization, operation
+retry history, and the transfer-linked destination view are all idempotent.
+
+The dormant protocol-19 grid path now models source finalization as a distinct
+post-activation cell event. It cannot be folded into export or inferred from a
+directory-only terminal phase: the source must retain its exact export proof,
+the directory must retain matching destination import and activation proofs,
+and the source writes an active audit tombstone plus restart-verifiable history.
+This model is not production-reachable until event schema 17, directory schema
+3, package schema 2, and the rest of the protocol-19 tuple activate together.
+
+Abort is a two-cell cleanup saga: the directory first enters `Aborting`, pins
+both assignments, collects canonical source and destination cleanup proofs,
+and only then restores source residency as terminal `Aborted`.
+
+The coordinated P1.7 boundary is protocol `18`, projection schema `4`, world
+schema `20`, event schema `16`, content schema `11`, content manifest
+`p1.5.0`, registry schema `1`, universe manifest schema `4`, interest schema
+`2`, operation fingerprint schema `2`, lifecycle-control schema `2`,
+production-occurrence schema `1`, cell-directory schema `2`, and transfer
+schema `1`.
+
+This slice does not establish multi-host control-plane availability,
+cross-cell physics or systems, arbitrary cell counts, static/oversized
+structure partitioning, frontier materialization, or a production-capacity
+claim. The complete contract is
+[F-061](../gameplay/durable-two-cell-handoff.md).
+
+This proof also does not yet implement bounded compaction of terminal transfer
+records, assignment-fence history, transfer-boundary journals, or world
+witnesses. Production-scale retention requires a future hash-chained archival
+and compaction design that preserves verification of retained roots.
+
+The implemented gateway checkpoint routes an EVA player's WebSocket session
+with a cell-key/placement-generation permit. Terminal durable completion
+presents `Preparing`, `Importing`, and `VerifyingDestination` in order, then a
+transfer-linked destination baseline. The old permit remains the mutation
+permit until the exact baseline acknowledgement, so queued source controls
+fail without consuming their operation sequence. An unacknowledged initial
+source baseline, skipped placement generation, or unrelated completion closes
+the session for directory-routed reconnect. Grid transfer, arbitrary-cell
+routing, multi-host operation, and retention bounds remain release gates.
+Fresh connection setup recognizes an exact retained completion that already
+produced its directory route, preventing that completion from being replayed
+as a second in-session handoff. Route, immutable world revision, and retained
+completion are captured under one coordinator lock; completion publication
+uses that same lock, so setup cannot observe a new route without its marker.
+The assembled process-restart gate reopens the exact roots after a live transfer
+and requires the recovered pilot to retain the destination route, carried
+inventory, movement epoch, and operation frontier. Transfer-event indexing
+therefore decodes the retained numeric operation-history keys explicitly even
+when the tagged event envelope buffers JSON object keys as strings.
+
+Player and public-spectator replication use separate cell-scoped update
+frontiers. The public feed remains pinned to the origin cell, receives the
+source structural change, and supplies canonical `transferred` evidence for a
+previously visible departing player without exposing the destination or an
+actor-private overlay. Origin world revision and removal evidence are one
+versioned projection bundle rather than independently sampled state.
+
+Physics is also topology-contained before durability: a player outcome may
+enter only one of the hosted proof cells, and a grid outcome must remain in its
+source cell until grid handoff exists. An unsupported outcome is discarded
+before the physics event is appended and native physics is rebuilt from the
+unchanged canonical world. This is a correctness barrier, not the final
+player-facing boundary response or a general multi-cell traversal claim.
 
 ## Initial implementation choice
 

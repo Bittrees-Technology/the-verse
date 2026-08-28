@@ -4,6 +4,7 @@ set -euo pipefail
 
 package_directory="$(cd "$(dirname "$0")" && pwd)"
 universe_directory="${VERSE_DATA_DIR:-${XDG_DATA_HOME:-${HOME}/.local/share}/the-verse/universe}"
+snapshot_every="${VERSE_SNAPSHOT_EVERY:-600}"
 export VERSE_BROWSER_VERIFIER_ASSET_DIR="${package_directory}/browser-verifier"
 server_pid=""
 
@@ -18,6 +19,7 @@ trap cleanup EXIT INT TERM
 mkdir -p "${universe_directory}"
 "${package_directory}/verse-simulation-worker" \
   --data-directory "${universe_directory}" \
+  --snapshot-every "${snapshot_every}" \
   --bind 127.0.0.1:7777 \
   >"${universe_directory}/server.log" 2>&1 &
 server_pid="$!"

@@ -72,6 +72,7 @@ Priorities:
 | F-058 | Server-authoritative grounded and magnetic locomotion | P0 | F-057, F-006, SIM-010 |
 | F-059 | Deterministic single-cell spatial interest replication | P1 | F-012, SIM-013/014 |
 | F-060 | Fenced single-cell lifecycle and background production | P1 | F-011, F-023, SIM-006/015 |
+| F-061 | Durable two-cell assignment and mobile-aggregate handoff | P1 | F-011–F-014, F-059/060, WORLD-010, SIM-016–018 |
 
 ## Current implementation readiness
 
@@ -110,6 +111,19 @@ while active, and reject stale writers through a renewable fenced lease. It
 does not complete F-013 or WORLD-008: multi-cell assignment, handoff,
 distributed control-plane availability, and background physics remain separate
 milestones.
+
+F-061 has an implemented independent-EVA checkpoint under protocol `18`. Its
+[accepted gameplay contract](../gameplay/durable-two-cell-handoff.md) and
+[ADR-0023](../decisions/ADR-0023-durable-two-cell-handoff.md) define two
+adjacent proof cells, stable cell keys, durable assignment generations, a
+separate aggregate placement fence, content-addressed prepare/quarantine,
+directory compare-and-swap commit, exact transfer conservation, and a
+same-session verified destination baseline. The promised ordinary-grid closure
+remains an implementation gate under the versioned boundary in
+[ADR-0024](../decisions/ADR-0024-versioned-grid-closure-handoff.md). P1.7 does
+not complete arbitrary
+multi-cell placement, cross-cell physics, multi-host availability, static
+megastructure partitioning, or the public-scale concurrency envelope.
 
 ## Definition of specification-ready
 

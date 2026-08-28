@@ -12,33 +12,44 @@ use verse_physics::{
     SphereColliderSpec, Vec3 as PhysicsVec3,
 };
 use verse_protocol::{
-    BlockKind, CareerSnapshot, ClientMessage, INTENT_FINGERPRINT_SCHEMA_VERSION, IVec3,
+    BlockKind, CareerSnapshot, CellKeyV1, ClientMessage, INTENT_FINGERPRINT_SCHEMA_VERSION, IVec3,
     IntentReceipt, InventoryContents, InventoryDomain, LocomotionKind, LocomotionSupportSnapshot,
     MotionSnapshot, PROTOCOL_VERSION, PlayerDeathCause, PlayerLifeState, PlayerLocomotionSnapshot,
-    ProductionRecipeKind, Quat, ResourceKind, Vec3, WorldSnapshot,
+    ProductionRecipeKind, Quat, ResourceKind, UniverseAddress, Vec3, WorldSnapshot,
 };
 
-use crate::content;
+use crate::cell_directory::{
+    CellTransferAbortProof, CellTransferFinalizationProof, CellTransferImportProof,
+    CellTransferPrepareProof, CellTransferQuarantineProof, CellTransferRecord, TransferAbortRole,
+};
 use crate::event::{
     CanonicalEvent, EVENT_SCHEMA_NAME, EVENT_SCHEMA_VERSION, EventPayload,
     PRODUCTION_SCHEDULE_OCCURRENCE_SCHEMA_VERSION, PhysicsBodyOutcome, PhysicsContactOutcome,
     PhysicsContactPhase, PlayerPhysicsOutcome, ProductionMachineOutcome,
     ProductionMachineOutcomeKind, ProductionScheduleOccurrence,
 };
+use crate::handoff::{
+    HandoffError, PlayerTransferPackage, PlayerTransferQuarantineReceipt, stage_aborted_eva_unlock,
+    stage_committed_eva_export, stage_committed_eva_import, stage_eva_player_quarantine,
+    stage_prepared_eva_lock,
+};
 #[cfg(test)]
 use crate::model::PLAYER_INVENTORY_ID;
 use crate::model::{
     Block, CARGO_INVENTORY_CAPACITY_LITERS, ContactPairKey, DeathDrop, Grid, InventoryRecord,
-    Player, PlayerControlFrame, ProcessedOperationRecord, ProductionJob, WORLD_SCHEMA_VERSION,
-    WorldState, inventory_can_add_contents, planet_center, planet_surface_radius_m,
-    production_recipe_quantities, radial_up, valid_blake3_hex,
+    Player, PlayerControlFrame, ProcessedOperationRecord, ProductionJob, STARTER_GRID_ID,
+    STARTER_INDUSTRY_GRID_ID, WORLD_SCHEMA_VERSION, WorldState, inventory_can_add_contents,
+    planet_center, planet_surface_radius_m, production_recipe_quantities, radial_up,
+    valid_blake3_hex,
 };
 use crate::persistence::{
-    CellLifecycleStatus, PersistenceError, Store, SystemTrustedClock, TrustedClock,
+    CellLifecycleStatus, DurableTransferBoundary, PersistenceError, Store, SystemTrustedClock,
+    TransferBoundaryKind, TrustedClock,
 };
 #[cfg(test)]
 use crate::targeting::{TOOL_SURFACE_RANGE_M, ToolHit};
 use crate::targeting::{ToolTarget, closest_tool_hit};
+use crate::{celestial, content};
 
 pub const MAX_BACKGROUND_QUEUE_BEARING_MACHINES: usize = 256;
 pub const MAX_PRODUCTION_CATCH_UP_QUANTA: usize = 60;
@@ -48,8 +59,9 @@ pub const MAX_PRODUCTION_CATCH_UP_MILLIS: u128 = 250;
 const PLAYER_BODY_ID: &str = "player-body-player-local";
 #[cfg(test)]
 const PLAYER_COLLIDER_ID: &str = "player-collider-player-local";
-const PLANET_BODY_ID: &str = "planet-body-khepri-prime";
+pub(crate) const PLANET_BODY_ID: &str = "planet-body-khepri-prime";
 const PLANET_COLLIDER_ID: &str = "planet-collider-khepri-prime";
+const EARTH_START_PROFILE_MARKER_BLOCK_ID: &str = "block-outpost-floor-x0-z0";
 const MAX_GRID_CONTROL_INPUT: f64 = 1.0;
 const CONTROL_INPUT_EPSILON: f64 = 1.0e-9;
 // Godot's standard Vector3 uses float32 components. Normalizing in float32 and
@@ -77,7 +89,6 @@ struct IntentFingerprintMaterial<'a> {
     world_schema_version: u32,
     event_schema_version: u32,
     universe_id: &'a str,
-    cell_id: &'a str,
     actor_player_id: &'a str,
     message: &'a serde_json::Value,
 }
@@ -197,6 +208,10 @@ impl IntentError {
     }
 }
 
+fn transfer_runtime_error(source: &HandoffError) -> RuntimeError {
+    IntentError::rejected("player_transfer_rejected", source.to_string()).into()
+}
+
 #[derive(Debug, Error)]
 pub enum RuntimeError {
     #[error(transparent)]
@@ -211,6 +226,8 @@ pub enum RuntimeError {
     LifecycleUnavailable {
         mode: crate::persistence::LifecycleMode,
     },
+    #[error("directory-managed cell storage must be opened through the universe coordinator")]
+    DirectoryManagedCellRequiresCoordinator,
     #[error("canonical world invariant failed: {0}")]
     CanonicalInvariant(String),
 }
@@ -254,6 +271,7 @@ pub struct ProductionDispatchOutcome {
 pub struct RuntimeOpenConfig {
     data_directory: PathBuf,
     requested_seed: u64,
+    cell_key: verse_protocol::CellKeyV1,
     snapshot_every: u64,
     clock: Arc<dyn TrustedClock>,
 }
@@ -285,15 +303,46 @@ pub struct Runtime {
     physics_chunk_replacements: u64,
 }
 
+fn reject_standalone_directory_managed_open(path: &Path) -> Result<(), RuntimeError> {
+    let is_directory_root = path.join("cell-directory.json").is_file();
+    let is_managed_cell_root = path
+        .parent()
+        .filter(|parent| parent.file_name().is_some_and(|name| name == "cells"))
+        .and_then(Path::parent)
+        .is_some_and(|universe_root| universe_root.join("cell-directory.json").is_file());
+    if is_directory_root || is_managed_cell_root {
+        return Err(RuntimeError::DirectoryManagedCellRequiresCoordinator);
+    }
+    Ok(())
+}
+
 impl Runtime {
     pub fn open(
         data_directory: impl AsRef<Path>,
         requested_seed: u64,
         snapshot_every: u64,
     ) -> Result<Self, RuntimeError> {
-        Self::open_with_clock(
+        reject_standalone_directory_managed_open(data_directory.as_ref())?;
+        Self::open_for_cell_with_clock(
             data_directory,
             requested_seed,
+            celestial::cell_origin_key(),
+            snapshot_every,
+            Arc::new(SystemTrustedClock),
+        )
+    }
+
+    pub fn open_for_cell(
+        data_directory: impl AsRef<Path>,
+        requested_seed: u64,
+        cell_key: verse_protocol::CellKeyV1,
+        snapshot_every: u64,
+    ) -> Result<Self, RuntimeError> {
+        reject_standalone_directory_managed_open(data_directory.as_ref())?;
+        Self::open_for_cell_with_clock(
+            data_directory,
+            requested_seed,
+            cell_key,
             snapshot_every,
             Arc::new(SystemTrustedClock),
         )
@@ -304,9 +353,27 @@ impl Runtime {
         requested_seed: u64,
         snapshot_every: u64,
     ) -> Result<Self, RuntimeError> {
-        Self::open_hosted_with_clock(
+        reject_standalone_directory_managed_open(data_directory.as_ref())?;
+        Self::open_hosted_for_cell_with_clock(
             data_directory,
             requested_seed,
+            celestial::cell_origin_key(),
+            snapshot_every,
+            Arc::new(SystemTrustedClock),
+        )
+    }
+
+    pub fn open_hosted_for_cell(
+        data_directory: impl AsRef<Path>,
+        requested_seed: u64,
+        cell_key: verse_protocol::CellKeyV1,
+        snapshot_every: u64,
+    ) -> Result<Self, RuntimeError> {
+        reject_standalone_directory_managed_open(data_directory.as_ref())?;
+        Self::open_hosted_for_cell_with_clock(
+            data_directory,
+            requested_seed,
+            cell_key,
             snapshot_every,
             Arc::new(SystemTrustedClock),
         )
@@ -318,9 +385,27 @@ impl Runtime {
         snapshot_every: u64,
         clock: Arc<dyn TrustedClock>,
     ) -> Result<Self, RuntimeError> {
-        let mut runtime = Self::open_for_activation_with_clock(
+        reject_standalone_directory_managed_open(data_directory.as_ref())?;
+        Self::open_hosted_for_cell_with_clock(
             data_directory,
             requested_seed,
+            celestial::cell_origin_key(),
+            snapshot_every,
+            clock,
+        )
+    }
+
+    fn open_hosted_for_cell_with_clock(
+        data_directory: impl AsRef<Path>,
+        requested_seed: u64,
+        cell_key: verse_protocol::CellKeyV1,
+        snapshot_every: u64,
+        clock: Arc<dyn TrustedClock>,
+    ) -> Result<Self, RuntimeError> {
+        let mut runtime = Self::open_for_activation_for_cell_with_clock(
+            data_directory,
+            requested_seed,
+            cell_key,
             snapshot_every,
             clock,
         )?;
@@ -334,9 +419,27 @@ impl Runtime {
         snapshot_every: u64,
         clock: Arc<dyn TrustedClock>,
     ) -> Result<Self, RuntimeError> {
-        let mut runtime = Self::open_for_activation_with_clock(
+        reject_standalone_directory_managed_open(data_directory.as_ref())?;
+        Self::open_for_cell_with_clock(
             data_directory,
             requested_seed,
+            celestial::cell_origin_key(),
+            snapshot_every,
+            clock,
+        )
+    }
+
+    fn open_for_cell_with_clock(
+        data_directory: impl AsRef<Path>,
+        requested_seed: u64,
+        cell_key: verse_protocol::CellKeyV1,
+        snapshot_every: u64,
+        clock: Arc<dyn TrustedClock>,
+    ) -> Result<Self, RuntimeError> {
+        let mut runtime = Self::open_for_activation_for_cell_with_clock(
+            data_directory,
+            requested_seed,
+            cell_key,
             snapshot_every,
             clock,
         )?;
@@ -344,22 +447,40 @@ impl Runtime {
         Ok(runtime)
     }
 
+    pub(crate) fn open_directory_managed_for_cell(
+        data_directory: impl AsRef<Path>,
+        requested_seed: u64,
+        cell_key: verse_protocol::CellKeyV1,
+        snapshot_every: u64,
+    ) -> Result<Self, RuntimeError> {
+        Self::open_for_cell_with_clock(
+            data_directory,
+            requested_seed,
+            cell_key,
+            snapshot_every,
+            Arc::new(SystemTrustedClock),
+        )
+    }
+
     pub fn open_for_activation(config: &RuntimeOpenConfig) -> Result<Self, RuntimeError> {
-        Self::open_for_activation_with_clock(
+        Self::open_for_activation_for_cell_with_clock(
             &config.data_directory,
             config.requested_seed,
+            config.cell_key.clone(),
             config.snapshot_every,
             Arc::clone(&config.clock),
         )
     }
 
-    fn open_for_activation_with_clock(
+    fn open_for_activation_for_cell_with_clock(
         data_directory: impl AsRef<Path>,
         requested_seed: u64,
+        cell_key: verse_protocol::CellKeyV1,
         snapshot_every: u64,
         clock: Arc<dyn TrustedClock>,
     ) -> Result<Self, RuntimeError> {
-        let mut store = Store::open_with_clock(data_directory, requested_seed, clock)?;
+        let mut store =
+            Store::open_for_cell_with_clock(data_directory, requested_seed, cell_key, clock)?;
         let mut state = store.load_world()?;
         state.fencing_token = store.fencing_token();
 
@@ -426,6 +547,7 @@ impl Runtime {
         RuntimeOpenConfig {
             data_directory: self.store.root_path().to_path_buf(),
             requested_seed: self.state.world_seed,
+            cell_key: self.store.cell_key().clone(),
             snapshot_every: self.snapshot_every,
             clock: self.store.clock(),
         }
@@ -435,8 +557,563 @@ impl Runtime {
         &self.state
     }
 
+    pub(crate) fn commit_player_transfer_prepared(
+        &mut self,
+        package: &PlayerTransferPackage,
+        directory_transfer: &CellTransferRecord,
+    ) -> Result<CellTransferPrepareProof, RuntimeError> {
+        let already_committed = self
+            .store
+            .transfer_boundary(&package.transfer_id, TransferBoundaryKind::Prepare)
+            .is_some();
+        if !already_committed {
+            stage_prepared_eva_lock(&self.state, package, directory_transfer)
+                .map_err(|source| transfer_runtime_error(&source))?;
+            self.ensure_transfer_mutation_enabled()?;
+            self.commit_system_event_recorded(EventPayload::PlayerTransferPrepared {
+                package: package.clone(),
+                directory_transfer: directory_transfer.clone(),
+            })?;
+        }
+        let boundary = self.transfer_boundary(package, None, TransferBoundaryKind::Prepare)?;
+        Ok(CellTransferPrepareProof {
+            transfer_id: package.transfer_id.clone(),
+            package_hash: package.package_hash.clone(),
+            source_cell_id: package.source_cell_id.clone(),
+            source_assignment_generation: 0,
+            prior_placement_generation: package.prior_placement_generation,
+            source_fencing_token: boundary.authority_fencing_token,
+            source_event_sequence: boundary.event_sequence,
+            source_event_hash: boundary.event_hash,
+            source_world_hash: boundary.resulting_world_hash,
+        })
+    }
+
+    pub(crate) fn commit_player_transfer_quarantined(
+        &mut self,
+        package: &PlayerTransferPackage,
+        receipt: &PlayerTransferQuarantineReceipt,
+    ) -> Result<CellTransferQuarantineProof, RuntimeError> {
+        let already_committed = self
+            .store
+            .transfer_boundary(&package.transfer_id, TransferBoundaryKind::Quarantine)
+            .is_some();
+        if !already_committed {
+            stage_eva_player_quarantine(&self.state, self.state.fencing_token, package)
+                .map_err(|source| transfer_runtime_error(&source))?;
+            self.ensure_transfer_mutation_enabled()?;
+            self.commit_system_event_recorded(EventPayload::PlayerTransferQuarantined {
+                package: package.clone(),
+                receipt: receipt.clone(),
+            })?;
+        }
+        let boundary = self.transfer_boundary(
+            package,
+            Some(&receipt.receipt_hash),
+            TransferBoundaryKind::Quarantine,
+        )?;
+        Ok(CellTransferQuarantineProof {
+            transfer_id: package.transfer_id.clone(),
+            package_hash: package.package_hash.clone(),
+            quarantine_receipt_hash: receipt.receipt_hash.clone(),
+            destination_cell_id: package.destination_cell_id.clone(),
+            destination_assignment_generation: 0,
+            resulting_placement_generation: package.resulting_placement_generation,
+            destination_fencing_token: boundary.authority_fencing_token,
+            destination_event_sequence: boundary.event_sequence,
+            destination_event_hash: boundary.event_hash,
+            destination_world_hash: boundary.resulting_world_hash,
+        })
+    }
+
+    pub(crate) fn commit_player_transfer_aborted(
+        &mut self,
+        package: &PlayerTransferPackage,
+        directory_transfer: &CellTransferRecord,
+    ) -> Result<CellTransferAbortProof, RuntimeError> {
+        let (_, kind) = if self.state.cell_id == package.source_cell_id {
+            (TransferAbortRole::Source, TransferBoundaryKind::AbortSource)
+        } else if self.state.cell_id == package.destination_cell_id {
+            (
+                TransferAbortRole::Destination,
+                TransferBoundaryKind::AbortDestination,
+            )
+        } else {
+            return Err(transfer_runtime_error(
+                &HandoffError::CommittedStateRejected(
+                    "abort proof requested from an unrelated cell".into(),
+                ),
+            ));
+        };
+        if self
+            .store
+            .transfer_boundary(&package.transfer_id, kind)
+            .is_none()
+        {
+            stage_aborted_eva_unlock(&self.state, package, directory_transfer)
+                .map_err(|source| transfer_runtime_error(&source))?;
+            self.ensure_transfer_mutation_enabled()?;
+            self.commit_system_event_recorded(EventPayload::PlayerTransferAborted {
+                package: package.clone(),
+                directory_transfer: directory_transfer.clone(),
+            })?;
+        }
+        let (role, kind) = if self.state.cell_id == package.source_cell_id {
+            (TransferAbortRole::Source, TransferBoundaryKind::AbortSource)
+        } else if self.state.cell_id == package.destination_cell_id {
+            (
+                TransferAbortRole::Destination,
+                TransferBoundaryKind::AbortDestination,
+            )
+        } else {
+            return Err(transfer_runtime_error(
+                &HandoffError::CommittedStateRejected(
+                    "abort proof requested from an unrelated cell".into(),
+                ),
+            ));
+        };
+        let boundary = self.transfer_boundary(package, None, kind)?;
+        Ok(CellTransferAbortProof {
+            transfer_id: package.transfer_id.clone(),
+            package_hash: package.package_hash.clone(),
+            cell_id: boundary.cell_id,
+            assignment_generation: 0,
+            role,
+            fencing_token: boundary.authority_fencing_token,
+            event_sequence: boundary.event_sequence,
+            event_hash: boundary.event_hash,
+            world_hash: boundary.resulting_world_hash,
+        })
+    }
+
+    pub(crate) fn commit_player_transfer_exported(
+        &mut self,
+        package: &PlayerTransferPackage,
+        directory_transfer: &CellTransferRecord,
+    ) -> Result<CellTransferFinalizationProof, RuntimeError> {
+        let already_committed = self
+            .store
+            .transfer_boundary(&package.transfer_id, TransferBoundaryKind::Export)
+            .is_some();
+        if !already_committed {
+            stage_committed_eva_export(&self.state, package, directory_transfer)
+                .map_err(|source| transfer_runtime_error(&source))?;
+            self.ensure_transfer_mutation_enabled()?;
+            self.commit_system_event_recorded(EventPayload::PlayerTransferExported {
+                package: package.clone(),
+                directory_transfer: directory_transfer.clone(),
+            })?;
+        }
+        let boundary = self.transfer_boundary(package, None, TransferBoundaryKind::Export)?;
+        Ok(CellTransferFinalizationProof {
+            transfer_id: package.transfer_id.clone(),
+            package_hash: package.package_hash.clone(),
+            source_cell_id: package.source_cell_id.clone(),
+            source_assignment_generation: 0,
+            resulting_placement_generation: package.resulting_placement_generation,
+            source_fencing_token: boundary.authority_fencing_token,
+            source_event_sequence: boundary.event_sequence,
+            source_event_hash: boundary.event_hash,
+            source_world_hash: boundary.resulting_world_hash,
+        })
+    }
+
+    pub(crate) fn commit_player_transfer_imported(
+        &mut self,
+        package: &PlayerTransferPackage,
+        receipt: &PlayerTransferQuarantineReceipt,
+        directory_transfer: &CellTransferRecord,
+    ) -> Result<CellTransferImportProof, RuntimeError> {
+        let already_committed = self
+            .store
+            .transfer_boundary(&package.transfer_id, TransferBoundaryKind::Import)
+            .is_some();
+        if !already_committed {
+            stage_committed_eva_import(&self.state, package, receipt, directory_transfer)
+                .map_err(|source| transfer_runtime_error(&source))?;
+            self.ensure_transfer_mutation_enabled()?;
+            self.commit_system_event_recorded(EventPayload::PlayerTransferImported {
+                package: package.clone(),
+                receipt: receipt.clone(),
+                directory_transfer: directory_transfer.clone(),
+            })?;
+        }
+        let boundary = self.transfer_boundary(
+            package,
+            Some(&receipt.receipt_hash),
+            TransferBoundaryKind::Import,
+        )?;
+        Ok(CellTransferImportProof {
+            transfer_id: package.transfer_id.clone(),
+            package_hash: package.package_hash.clone(),
+            quarantine_receipt_hash: receipt.receipt_hash.clone(),
+            destination_cell_id: package.destination_cell_id.clone(),
+            destination_assignment_generation: 0,
+            resulting_placement_generation: package.resulting_placement_generation,
+            destination_fencing_token: boundary.authority_fencing_token,
+            destination_event_sequence: boundary.event_sequence,
+            destination_event_hash: boundary.event_hash,
+            destination_world_hash: boundary.resulting_world_hash,
+        })
+    }
+
+    fn ensure_transfer_mutation_enabled(&self) -> Result<(), RuntimeError> {
+        if self.halted {
+            Err(RuntimeError::Halted)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn transfer_boundary(
+        &self,
+        package: &PlayerTransferPackage,
+        receipt_hash: Option<&str>,
+        kind: TransferBoundaryKind,
+    ) -> Result<DurableTransferBoundary, RuntimeError> {
+        let boundary = self
+            .store
+            .transfer_boundary(&package.transfer_id, kind)
+            .cloned()
+            .ok_or_else(|| {
+                transfer_runtime_error(&HandoffError::CommittedStateRejected(format!(
+                    "transfer {} has no durable {:?} boundary",
+                    package.transfer_id, kind
+                )))
+            })?;
+        if boundary.package_hash != package.package_hash
+            || boundary.cell_id != self.state.cell_id
+            || boundary.receipt_hash.as_deref() != receipt_hash
+            || boundary.authority_fencing_token == 0
+            || boundary.event_sequence == 0
+            || !valid_blake3_hex(&boundary.event_hash)
+            || !valid_blake3_hex(&boundary.resulting_world_hash)
+        {
+            return Err(transfer_runtime_error(
+                &HandoffError::CommittedStateRejected(format!(
+                    "transfer {} durable {:?} boundary is invalid",
+                    package.transfer_id, kind
+                )),
+            ));
+        }
+        Ok(boundary)
+    }
+
+    pub(crate) fn verify_transfer_record_proofs(
+        &self,
+        transfer: &CellTransferRecord,
+    ) -> Result<(), RuntimeError> {
+        let verify = |kind: TransferBoundaryKind,
+                      event_sequence: u64,
+                      event_hash: &str,
+                      fencing_token: u64,
+                      world_hash: &str,
+                      cell_id: &str,
+                      receipt_hash: Option<&str>|
+         -> Result<(), RuntimeError> {
+            let boundary = self
+                .store
+                .transfer_boundary(&transfer.transfer_id, kind)
+                .ok_or_else(|| {
+                    transfer_runtime_error(&HandoffError::CommittedStateRejected(format!(
+                        "transfer {} directory proof has no durable {:?} cell event",
+                        transfer.transfer_id, kind
+                    )))
+                })?;
+            if boundary.package_hash != transfer.package_hash
+                || boundary.receipt_hash.as_deref() != receipt_hash
+                || boundary.cell_id != cell_id
+                || boundary.event_sequence != event_sequence
+                || boundary.event_hash != event_hash
+                || boundary.authority_fencing_token != fencing_token
+                || boundary.resulting_world_hash != world_hash
+            {
+                return Err(transfer_runtime_error(
+                    &HandoffError::CommittedStateRejected(format!(
+                        "transfer {} directory {:?} proof disagrees with its durable cell event",
+                        transfer.transfer_id, kind
+                    )),
+                ));
+            }
+            Ok(())
+        };
+        if self.state.cell_id == transfer.source_cell_id
+            && let Some(proof) = &transfer.source_prepare_proof
+        {
+            verify(
+                TransferBoundaryKind::Prepare,
+                proof.source_event_sequence,
+                &proof.source_event_hash,
+                proof.source_fencing_token,
+                &proof.source_world_hash,
+                &transfer.source_cell_id,
+                None,
+            )?;
+        }
+        if self.state.cell_id == transfer.destination_cell_id
+            && let Some(proof) = &transfer.destination_quarantine_proof
+        {
+            verify(
+                TransferBoundaryKind::Quarantine,
+                proof.destination_event_sequence,
+                &proof.destination_event_hash,
+                proof.destination_fencing_token,
+                &proof.destination_world_hash,
+                &transfer.destination_cell_id,
+                Some(&proof.quarantine_receipt_hash),
+            )?;
+        }
+        if self.state.cell_id == transfer.destination_cell_id
+            && let Some(proof) = &transfer.import_proof
+        {
+            verify(
+                TransferBoundaryKind::Import,
+                proof.destination_event_sequence,
+                &proof.destination_event_hash,
+                proof.destination_fencing_token,
+                &proof.destination_world_hash,
+                &transfer.destination_cell_id,
+                Some(&proof.quarantine_receipt_hash),
+            )?;
+        }
+        if self.state.cell_id == transfer.source_cell_id
+            && let Some(proof) = &transfer.finalization_proof
+        {
+            verify(
+                TransferBoundaryKind::Export,
+                proof.source_event_sequence,
+                &proof.source_event_hash,
+                proof.source_fencing_token,
+                &proof.source_world_hash,
+                &transfer.source_cell_id,
+                None,
+            )?;
+        }
+        for proof in [
+            transfer.source_abort_proof.as_ref(),
+            transfer.destination_abort_proof.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|proof| proof.cell_id == self.state.cell_id)
+        {
+            verify(
+                match proof.role {
+                    TransferAbortRole::Source => TransferBoundaryKind::AbortSource,
+                    TransferAbortRole::Destination => TransferBoundaryKind::AbortDestination,
+                },
+                proof.event_sequence,
+                &proof.event_hash,
+                proof.fencing_token,
+                &proof.world_hash,
+                &proof.cell_id,
+                None,
+            )?;
+        }
+        Ok(())
+    }
+
     pub const fn physics_scene_is_initialized(&self) -> bool {
         self.physics.is_some()
+    }
+
+    /// Replaces only the event-zero development fixture with a canonical
+    /// surface outpost. The profile is opt-in so ordinary genesis, established
+    /// universes, and the orbital proof remain unchanged.
+    pub fn configure_earth_start_playtest(&mut self) -> Result<bool, RuntimeError> {
+        if self.halted {
+            return Err(RuntimeError::Halted);
+        }
+        if self.state.event_sequence != 0 {
+            return Err(IntentError::rejected(
+                "earth_start_requires_fresh_world",
+                "the Earthlike surface start can be selected only before the first canonical event",
+            )
+            .into());
+        }
+        if self
+            .state
+            .grids
+            .get(STARTER_INDUSTRY_GRID_ID)
+            .is_some_and(|grid| {
+                grid.blocks
+                    .contains_key(EARTH_START_PROFILE_MARKER_BLOCK_ID)
+            })
+        {
+            return Ok(false);
+        }
+
+        let mut next_state = self.state.clone();
+        let center = planet_center();
+        let surface_radius = planet_surface_radius_m();
+        let player_position = Vec3::new(center.x, center.y + surface_radius + 0.92, center.z + 6.5);
+        let player_address = next_state
+            .address_for_active_position(player_position)
+            .map_err(|message| {
+                IntentError::rejected("earth_start_player_address_invalid", message)
+            })?;
+        {
+            let player = next_state.player.primary_mut();
+            player.address = player_address;
+            player.position = player_position;
+            // Identity looks toward local -Z, placing the open outpost directly
+            // in front of the player at this north-pole tangent patch.
+            player.orientation = Quat::IDENTITY;
+            player.linear_velocity = Vec3::ZERO;
+            player.angular_velocity = Vec3::ZERO;
+            player.surface_contact = false;
+            player.locomotion.kind = LocomotionKind::Airborne;
+            player.locomotion.up = radial_up(player_position);
+            player.locomotion.view_pitch_radians = 0.0;
+            player.locomotion.support = None;
+            player.locomotion.jump_held = false;
+            player.locomotion.jump_buffer_expires_at_simulation_tick = 0;
+            player.locomotion.support_grace_expires_at_simulation_tick = 0;
+            player.locomotion.magnetic_boots_enabled = false;
+            player.locomotion.magnetic_reattach_after_simulation_tick = 0;
+            player.pending_control_frames.clear();
+            player.control_linear_input = Vec3::ZERO;
+            player.control_angular_input = Vec3::ZERO;
+            player.boost = false;
+            player.dampeners = true;
+            player.jump = false;
+            player.control_expires_at_simulation_tick = 0;
+            player.helmet_closed = false;
+            player.jetpack_enabled = false;
+        }
+
+        let skiff_position = Vec3::new(
+            center.x + 9.0,
+            center.y + surface_radius + 0.52,
+            center.z - 1.0,
+        );
+        let skiff_address = next_state
+            .address_for_active_position(skiff_position)
+            .map_err(|message| {
+                IntentError::rejected("earth_start_skiff_address_invalid", message)
+            })?;
+        let skiff = next_state
+            .grids
+            .get_mut(STARTER_GRID_ID)
+            .expect("genesis always contains the starter skiff");
+        skiff.address = skiff_address;
+        skiff.position = skiff_position;
+        skiff.orientation = Quat::IDENTITY;
+        skiff.linear_velocity = Vec3::ZERO;
+        skiff.angular_velocity = Vec3::ZERO;
+        skiff.control_linear_input = Vec3::ZERO;
+        skiff.control_angular_input = Vec3::ZERO;
+        skiff.dampeners = true;
+        skiff.anchored = false;
+
+        let outpost_position = Vec3::new(center.x, center.y + surface_radius + 0.52, center.z);
+        let outpost_address = next_state
+            .address_for_active_position(outpost_position)
+            .map_err(|message| {
+                IntentError::rejected("earth_start_outpost_address_invalid", message)
+            })?;
+        let outpost = next_state
+            .grids
+            .get_mut(STARTER_INDUSTRY_GRID_ID)
+            .expect("genesis always contains the starter industry grid");
+        outpost.address = outpost_address;
+        outpost.position = outpost_position;
+        outpost.orientation = Quat::IDENTITY;
+        outpost.linear_velocity = Vec3::ZERO;
+        outpost.angular_velocity = Vec3::ZERO;
+        outpost.control_linear_input = Vec3::ZERO;
+        outpost.control_angular_input = Vec3::ZERO;
+        outpost.dampeners = true;
+        outpost.anchored = false;
+
+        for (block_id, coordinate) in [
+            ("block-industry-core", IVec3::new(-2, 1, -1)),
+            ("block-industry-power", IVec3::new(-1, 1, -1)),
+            ("block-industry-cargo", IVec3::new(-2, 1, 0)),
+            ("block-conveyor", IVec3::new(-1, 1, 0)),
+            ("block-refinery", IVec3::new(0, 1, 0)),
+            ("block-assembler", IVec3::new(1, 1, 0)),
+        ] {
+            outpost
+                .blocks
+                .get_mut(block_id)
+                .expect("genesis industry block exists")
+                .coordinate = coordinate;
+        }
+
+        let mut added_installed_components = 0_u64;
+        let mut add_structure = |block_id: String, coordinate: IVec3| {
+            let block = Block::new(block_id.clone(), coordinate, BlockKind::Structural);
+            added_installed_components =
+                added_installed_components.saturating_add(block.component_cost);
+            assert!(outpost.blocks.insert(block_id, block).is_none());
+        };
+        for x in -4..=4 {
+            for z in -3..=3 {
+                add_structure(
+                    format!("block-outpost-floor-x{x}-z{z}"),
+                    IVec3::new(x, 0, z),
+                );
+            }
+        }
+        for x in -4..=4 {
+            for y in 1..=2 {
+                add_structure(
+                    format!("block-outpost-back-x{x}-y{y}"),
+                    IVec3::new(x, y, -3),
+                );
+            }
+        }
+        for x in [-4, 4] {
+            for z in -2..=1 {
+                for y in 1..=2 {
+                    add_structure(
+                        format!("block-outpost-side-x{x}-y{y}-z{z}"),
+                        IVec3::new(x, y, z),
+                    );
+                }
+            }
+        }
+        // A low front rail frames the entrance while keeping the player's
+        // first route into the workshop completely open.
+        for x in [-4, -3, 3, 4] {
+            add_structure(
+                format!("block-outpost-front-rail-x{x}"),
+                IVec3::new(x, 1, 2),
+            );
+        }
+        next_state.ledger.genesis_installed_components = next_state
+            .ledger
+            .genesis_installed_components
+            .checked_add(added_installed_components)
+            .ok_or_else(|| {
+                IntentError::rejected(
+                    "earth_start_component_ledger_overflow",
+                    "surface outpost installed components exceed the canonical ledger",
+                )
+            })?;
+
+        next_state
+            .validate_player_roster()
+            .map_err(|message| IntentError::rejected("earth_start_authority_invalid", message))?;
+        if !next_state.conservation().valid {
+            return Err(IntentError::ConservationViolation {
+                event_sequence: next_state.event_sequence,
+            }
+            .into());
+        }
+        let next_physics =
+            if self.store.lifecycle_mode() == crate::persistence::LifecycleMode::Active {
+                let mut physics = Scene::new(physics_scene_config())?;
+                physics.rebuild(&physics_body_specs(&next_state))?;
+                Some(physics)
+            } else {
+                None
+            };
+        self.store.save_snapshot(&next_state)?;
+        self.state = next_state;
+        self.physics = next_physics;
+        Ok(true)
     }
 
     pub fn next_production_occurrence(&self) -> Option<&ProductionScheduleOccurrence> {
@@ -482,10 +1159,10 @@ impl Runtime {
         player_id.clone_into(&mut player.player_id);
         let roster_offset =
             u32::try_from(next_state.player.by_id.len()).map_or(f64::from(u32::MAX), f64::from);
-        // Keep the loopback co-op fixture inside the starter asteroid's hand-
-        // tool envelope while giving each suit a visibly distinct spawn. The
-        // character collision layer already prevents these nearby capsules
-        // from pushing or becoming locomotion support for one another.
+        // Keep the loopback co-op fixture inside the same local encounter while
+        // giving each suit a visibly distinct spawn. The character collision
+        // layer already prevents these nearby capsules from pushing or becoming
+        // locomotion support for one another.
         player.position.y += 1.5 * roster_offset;
         player.address = next_state
             .address_for_active_position(player.position)
@@ -496,7 +1173,11 @@ impl Runtime {
         player.linear_velocity = Vec3::ZERO;
         player.angular_velocity = Vec3::ZERO;
         player.surface_contact = false;
-        player.locomotion.kind = LocomotionKind::Eva;
+        player.locomotion.kind = if player.jetpack_enabled {
+            LocomotionKind::Eva
+        } else {
+            LocomotionKind::Airborne
+        };
         player.locomotion.up = radial_up(player.position);
         player.locomotion.view_pitch_radians = 0.0;
         player.locomotion.support = None;
@@ -519,8 +1200,6 @@ impl Runtime {
         player.experience = 0;
         player.career = CareerSnapshot::default();
         player.suit_oxygen_milli = 1_000;
-        player.helmet_closed = true;
-        player.jetpack_enabled = true;
         player.life_state = PlayerLifeState::Alive;
         next_state.player.by_id.insert(player_id.to_owned(), player);
         next_state.inventories.insert(
@@ -658,6 +1337,17 @@ impl Runtime {
             return Err(IntentError::rejected(
                 "actor_not_present",
                 "the authenticated player is not present in this simulation cell",
+            )
+            .into());
+        }
+        if self
+            .state
+            .player_transfer_locks
+            .contains_key(actor_player_id)
+        {
+            return Err(IntentError::rejected(
+                "actor_transfer_locked",
+                "the player is in an authoritative cross-cell handoff",
             )
             .into());
         }
@@ -806,6 +1496,22 @@ impl Runtime {
         &mut self,
         delta_millis: u16,
     ) -> Result<AdvanceOutcome, RuntimeError> {
+        self.advance_with_outcome_in_topology(delta_millis, None)
+    }
+
+    pub(crate) fn advance_with_outcome_in_cells(
+        &mut self,
+        delta_millis: u16,
+        hosted_cells: &BTreeSet<CellKeyV1>,
+    ) -> Result<AdvanceOutcome, RuntimeError> {
+        self.advance_with_outcome_in_topology(delta_millis, Some(hosted_cells))
+    }
+
+    fn advance_with_outcome_in_topology(
+        &mut self,
+        delta_millis: u16,
+        hosted_cells: Option<&BTreeSet<CellKeyV1>>,
+    ) -> Result<AdvanceOutcome, RuntimeError> {
         if self.halted {
             return Err(RuntimeError::Halted);
         }
@@ -825,8 +1531,9 @@ impl Runtime {
                     || grid.control_linear_input.magnitude() > f64::EPSILON
                     || grid.control_angular_input.magnitude() > f64::EPSILON)
         });
-        let player_physics_active = self.state.player.iter().any(|(_, player)| {
-            matches!(player.life_state, PlayerLifeState::Alive)
+        let player_physics_active = self.state.player.iter().any(|(player_id, player)| {
+            !self.state.player_transfer_locks.contains_key(player_id)
+                && matches!(player.life_state, PlayerLifeState::Alive)
                 && (player.linear_velocity.magnitude() > f64::EPSILON
                     || player.angular_velocity.magnitude() > f64::EPSILON
                     || player.control_linear_input.magnitude() > f64::EPSILON
@@ -841,6 +1548,7 @@ impl Runtime {
         let delta_millis = delta_millis.clamp(1, 250);
         let mut outcome = AdvanceOutcome::default();
         if physics_active {
+            let physics_step_phase_before = self.physics_step_phase;
             let fixed_step_hz = content::manifest().physics.fixed_step_hz;
             self.physics_step_phase = self
                 .physics_step_phase
@@ -866,6 +1574,9 @@ impl Runtime {
                 let mut contacts = Vec::new();
                 let mut active_contacts = self.state.active_contact_pairs.clone();
                 let mut scheduled_players = self.state.player.by_id.clone();
+                scheduled_players.retain(|player_id, _| {
+                    !self.state.player_transfer_locks.contains_key(player_id)
+                });
                 for substep_index in 0..step_count {
                     let substep_simulation_tick =
                         self.state.simulation_tick.saturating_add(substep_index);
@@ -1012,9 +1723,35 @@ impl Runtime {
                     contacts,
                     active_contacts_after: active_contacts.into_iter().collect(),
                 };
-                if let Err(source) = self.commit_system_event(payload) {
-                    self.halted = true;
-                    return Err(source);
+                let topology_admits = match hosted_cells {
+                    None => true,
+                    Some(hosted_cells) => match physics_outcome_is_within_hosted_topology(
+                        &payload,
+                        &self.state.cell_address,
+                        hosted_cells,
+                    ) {
+                        Ok(admits) => admits,
+                        Err(source) => {
+                            self.halted = true;
+                            return Err(RuntimeError::CanonicalInvariant(format!(
+                                "physics topology address is invalid: {source}"
+                            )));
+                        }
+                    },
+                };
+                if topology_admits {
+                    if let Err(source) = self.commit_system_event(payload) {
+                        self.halted = true;
+                        return Err(source);
+                    }
+                } else {
+                    // The bounded coordinator hosts only an explicit topology.
+                    // Discard an unsupported final physics pose before it can
+                    // become canonical, restore the exact fractional phase,
+                    // and rebuild native physics from the unchanged world.
+                    // The player may submit a new inward control without an
+                    // out-of-topology address ever entering the journal.
+                    self.physics_step_phase = physics_step_phase_before;
                 }
                 let lifecycle_mode = self.store.lifecycle_mode();
                 let physics = self
@@ -1031,11 +1768,20 @@ impl Runtime {
                 {
                     self.physics_full_rebuilds += 1;
                 }
-                outcome.record(AdvanceImpact::Motion);
+                if topology_admits {
+                    outcome.record(AdvanceImpact::Motion);
+                }
             }
         }
 
-        let player_ids = self.state.player.by_id.keys().cloned().collect::<Vec<_>>();
+        let player_ids = self
+            .state
+            .player
+            .by_id
+            .keys()
+            .filter(|player_id| !self.state.player_transfer_locks.contains_key(*player_id))
+            .cloned()
+            .collect::<Vec<_>>();
         let mut elapsed_seconds_by_player = BTreeMap::new();
         for player_id in &player_ids {
             let player = self
@@ -1056,7 +1802,10 @@ impl Runtime {
             }
         }
         self.life_support_elapsed_millis_by_player
-            .retain(|player_id, _| self.state.player.by_id.contains_key(player_id));
+            .retain(|player_id, _| {
+                self.state.player.by_id.contains_key(player_id)
+                    && !self.state.player_transfer_locks.contains_key(player_id)
+            });
 
         let max_elapsed_seconds = elapsed_seconds_by_player
             .values()
@@ -1102,6 +1851,13 @@ impl Runtime {
     }
 
     fn commit_system_event(&mut self, payload: EventPayload) -> Result<(), RuntimeError> {
+        self.commit_system_event_recorded(payload).map(drop)
+    }
+
+    fn commit_system_event_recorded(
+        &mut self,
+        payload: EventPayload,
+    ) -> Result<CanonicalEvent, RuntimeError> {
         let mut event = self.state.prepare_system_event(payload);
         let occurred_at_unix_ms = match self.store.accepted_trusted_time() {
             Ok(now) => now,
@@ -1111,7 +1867,8 @@ impl Runtime {
             }
         };
         event.retime_and_rehash(occurred_at_unix_ms);
-        self.commit_prepared_system_event(&event)
+        self.commit_prepared_system_event(&event)?;
+        Ok(event)
     }
 
     fn commit_production_quantum(&mut self, payload: EventPayload) -> Result<(), RuntimeError> {
@@ -1626,7 +2383,7 @@ impl WorldState {
         Ok(())
     }
 
-    fn production_machine_outcome_after_one_second(
+    pub(crate) fn production_machine_outcome_after_one_second(
         &self,
         machine_block_id: &str,
     ) -> Result<ProductionMachineOutcome, IntentError> {
@@ -1725,7 +2482,7 @@ impl WorldState {
         Ok(base(kind, new_progress_ticks, outputs))
     }
 
-    fn apply_production_machine_outcome(
+    pub(crate) fn apply_production_machine_outcome(
         &mut self,
         outcome: &ProductionMachineOutcome,
     ) -> Result<(), IntentError> {
@@ -2084,13 +2841,12 @@ impl WorldState {
         })?;
         normalize_json_signed_zero(&mut canonical_message);
         let material = IntentFingerprintMaterial {
-            domain: "the-verse-client-intent-v1",
+            domain: "the-verse-client-intent-v2",
             protocol_version: PROTOCOL_VERSION,
             fingerprint_schema_version: INTENT_FINGERPRINT_SCHEMA_VERSION,
             world_schema_version: WORLD_SCHEMA_VERSION,
             event_schema_version: EVENT_SCHEMA_VERSION,
             universe_id: &self.universe_id,
-            cell_id: &self.cell_id,
             actor_player_id,
             message: &canonical_message,
         };
@@ -2312,6 +3068,16 @@ impl WorldState {
                     "automatic production payload cannot use a human client envelope",
                 ));
             }
+            EventPayload::PlayerTransferPrepared { .. }
+            | EventPayload::PlayerTransferQuarantined { .. }
+            | EventPayload::PlayerTransferAborted { .. }
+            | EventPayload::PlayerTransferExported { .. }
+            | EventPayload::PlayerTransferImported { .. } => {
+                return Err(IntentError::rejected(
+                    "replay_transfer_envelope_invalid",
+                    "cross-cell transfer payload cannot use a human client envelope",
+                ));
+            }
         };
         Ok(message)
     }
@@ -2359,6 +3125,12 @@ impl WorldState {
                 "the authenticated player is not present in this simulation cell",
             )
         })?;
+        if self.player_transfer_locks.contains_key(actor_player_id) {
+            return Err(IntentError::rejected(
+                "actor_transfer_locked",
+                "the player is in an authoritative cross-cell handoff",
+            ));
+        }
         let operation_id = message.operation_id().ok_or_else(|| {
             IntentError::rejected("not_a_mutating_intent", "message has no operation ID")
         })?;
@@ -3180,6 +3952,38 @@ impl WorldState {
                     "event intent fingerprint does not bind its typed client request",
                 ));
             }
+        }
+        if event
+            .actor_player_id
+            .as_ref()
+            .is_some_and(|player_id| self.player_transfer_locks.contains_key(player_id))
+        {
+            return Err(IntentError::rejected(
+                "replay_actor_transfer_locked",
+                "a transfer-locked player cannot commit gameplay mutations",
+            ));
+        }
+        match &event.payload {
+            EventPayload::SuitOxygenChanged { player_id, .. }
+            | EventPayload::PlayerIncapacitated { player_id, .. }
+                if self.player_transfer_locks.contains_key(player_id) =>
+            {
+                return Err(IntentError::rejected(
+                    "replay_actor_transfer_locked",
+                    "life support cannot mutate a transfer-locked player",
+                ));
+            }
+            EventPayload::PhysicsStepCommitted { players, .. }
+                if players
+                    .iter()
+                    .any(|player| self.player_transfer_locks.contains_key(&player.player_id)) =>
+            {
+                return Err(IntentError::rejected(
+                    "replay_actor_transfer_locked",
+                    "physics cannot mutate a transfer-locked player",
+                ));
+            }
+            _ => {}
         }
         match &event.payload {
             EventPayload::PlayerControlSet { .. }
@@ -4187,7 +4991,10 @@ impl WorldState {
                 let living_player_count = self
                     .player
                     .iter()
-                    .filter(|(_, player)| matches!(player.life_state, PlayerLifeState::Alive))
+                    .filter(|(player_id, player)| {
+                        !self.player_transfer_locks.contains_key(*player_id)
+                            && matches!(player.life_state, PlayerLifeState::Alive)
+                    })
                     .count();
                 if players.len() != living_player_count {
                     return Err(IntentError::rejected(
@@ -4196,6 +5003,8 @@ impl WorldState {
                     ));
                 }
                 let mut scheduled_players = self.player.by_id.clone();
+                scheduled_players
+                    .retain(|player_id, _| !self.player_transfer_locks.contains_key(player_id));
                 for scheduled_player in scheduled_players
                     .values_mut()
                     .filter(|player| matches!(player.life_state, PlayerLifeState::Alive))
@@ -4601,6 +5410,63 @@ impl WorldState {
                 self.physics_step_phase = u64::from(*remaining_step_phase);
                 self.simulation_tick = self.simulation_tick.saturating_add(u64::from(*step_count));
             }
+            EventPayload::PlayerTransferPrepared {
+                package,
+                directory_transfer,
+            } => {
+                *self = stage_prepared_eva_lock(self, package, directory_transfer).map_err(
+                    |source| {
+                        IntentError::rejected("replay_transfer_prepare_invalid", source.to_string())
+                    },
+                )?;
+            }
+            EventPayload::PlayerTransferQuarantined { package, receipt } => {
+                let (staged, expected_receipt) =
+                    stage_eva_player_quarantine(self, receipt.destination_fencing_token, package)
+                        .map_err(|source| {
+                        IntentError::rejected(
+                            "replay_transfer_quarantine_invalid",
+                            source.to_string(),
+                        )
+                    })?;
+                if &expected_receipt != receipt {
+                    return Err(IntentError::rejected(
+                        "replay_transfer_quarantine_invalid",
+                        "quarantine event does not contain the canonical receipt",
+                    ));
+                }
+                *self = staged;
+            }
+            EventPayload::PlayerTransferAborted {
+                package,
+                directory_transfer,
+            } => {
+                *self = stage_aborted_eva_unlock(self, package, directory_transfer).map_err(
+                    |source| {
+                        IntentError::rejected("replay_transfer_abort_invalid", source.to_string())
+                    },
+                )?;
+            }
+            EventPayload::PlayerTransferExported {
+                package,
+                directory_transfer,
+            } => {
+                *self = stage_committed_eva_export(self, package, directory_transfer).map_err(
+                    |source| {
+                        IntentError::rejected("replay_transfer_export_invalid", source.to_string())
+                    },
+                )?;
+            }
+            EventPayload::PlayerTransferImported {
+                package,
+                receipt,
+                directory_transfer,
+            } => {
+                *self = stage_committed_eva_import(self, package, receipt, directory_transfer)
+                    .map_err(|source| {
+                        IntentError::rejected("replay_transfer_import_invalid", source.to_string())
+                    })?;
+            }
         }
 
         let experience_reward = event.payload.experience_reward();
@@ -4689,7 +5555,12 @@ impl WorldState {
                 anchored: false, ..
             }
             | EventPayload::BlockDamaged { .. }
-            | EventPayload::PhysicsStepCommitted { .. } => {}
+            | EventPayload::PhysicsStepCommitted { .. }
+            | EventPayload::PlayerTransferPrepared { .. }
+            | EventPayload::PlayerTransferQuarantined { .. }
+            | EventPayload::PlayerTransferAborted { .. }
+            | EventPayload::PlayerTransferExported { .. }
+            | EventPayload::PlayerTransferImported { .. } => {}
         }
 
         self.event_sequence = event.event_sequence;
@@ -4712,6 +5583,7 @@ impl WorldState {
                 ProcessedOperationRecord {
                     operation_id: operation_id.clone(),
                     intent_fingerprint: intent_fingerprint.clone(),
+                    receipt_origin_cell_id: self.cell_id.clone(),
                     receipt: IntentReceipt {
                         operation_sequence,
                         operation_id: operation_id.clone(),
@@ -5737,7 +6609,7 @@ fn voxel_collision_chunk_cell_count() -> usize {
     usize::from(content::manifest().physics.voxel_collision_chunk_edge_cells).pow(3)
 }
 
-fn voxel_collision_chunk_coordinate(coordinate: IVec3) -> IVec3 {
+pub(crate) fn voxel_collision_chunk_coordinate(coordinate: IVec3) -> IVec3 {
     let edge = voxel_collision_chunk_edge_cells();
     IVec3::new(
         coordinate.x.div_euclid(edge),
@@ -5751,7 +6623,7 @@ fn voxel_collision_chunk_origin(chunk: IVec3) -> IVec3 {
     IVec3::new(chunk.x * edge, chunk.y * edge, chunk.z * edge)
 }
 
-fn voxel_collision_chunk_body_id(chunk: IVec3) -> String {
+pub(crate) fn voxel_collision_chunk_body_id(chunk: IVec3) -> String {
     format!(
         "voxel-chunk-{x}-{y}-{z}",
         x = chunk.x,
@@ -5859,11 +6731,10 @@ fn physics_body_specs(state: &WorldState) -> Vec<BodySpec> {
     planet.friction = physics.friction;
     planet.restitution = physics.restitution;
     bodies.push(planet);
-    for (_, canonical_player) in state
-        .player
-        .iter()
-        .filter(|(_, player)| matches!(player.life_state, PlayerLifeState::Alive))
-    {
+    for (_, canonical_player) in state.player.iter().filter(|(player_id, player)| {
+        !state.player_transfer_locks.contains_key(*player_id)
+            && matches!(player.life_state, PlayerLifeState::Alive)
+    }) {
         let character = &content::manifest().character;
         let radius = character.collision_radius_m;
         let half_height_of_cylinder = (character.standing_height_m - 2.0 * radius) * 0.5;
@@ -6755,6 +7626,34 @@ fn physics_body_outcome(
     })
 }
 
+fn physics_outcome_is_within_hosted_topology(
+    payload: &EventPayload,
+    source_cell_address: &UniverseAddress,
+    hosted_cells: &BTreeSet<CellKeyV1>,
+) -> Result<bool, celestial::CelestialError> {
+    let source_cell = celestial::cell_key_from_address(source_cell_address)?;
+    let EventPayload::PhysicsStepCommitted {
+        bodies, players, ..
+    } = payload
+    else {
+        return Ok(true);
+    };
+    for player in players {
+        let addressed_cell = celestial::cell_key_from_address(&player.address)?;
+        if !hosted_cells.contains(&addressed_cell) {
+            return Ok(false);
+        }
+    }
+    for body in bodies {
+        let addressed_cell = celestial::cell_key_from_address(&body.address)?;
+        if addressed_cell != source_cell {
+            // Grid handoff is not part of the implemented EVA checkpoint.
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn player_physics_outcome(
     state: &WorldState,
     player: &Player,
@@ -7312,6 +8211,129 @@ mod tests {
     }
 
     #[test]
+    fn earth_start_profile_builds_a_valid_breathable_surface_outpost() {
+        let mut runtime = runtime();
+        let installed_before = runtime.state().ledger.genesis_installed_components;
+
+        assert!(
+            runtime
+                .configure_earth_start_playtest()
+                .expect("fresh surface profile configures")
+        );
+
+        let state = runtime.state();
+        let player = state.player.primary();
+        let environment = state.environment_at(player.position);
+        let outpost = state
+            .grids
+            .get(STARTER_INDUSTRY_GRID_ID)
+            .expect("surface outpost exists");
+        let skiff = state
+            .grids
+            .get(STARTER_GRID_ID)
+            .expect("surface skiff exists");
+        assert!(environment.breathable);
+        assert!(!player.jetpack_enabled);
+        assert!(!player.helmet_closed);
+        assert_eq!(player.locomotion.kind, LocomotionKind::Airborne);
+        assert!(
+            outpost
+                .blocks
+                .contains_key(EARTH_START_PROFILE_MARKER_BLOCK_ID)
+        );
+        assert_eq!(outpost.blocks.len(), 107);
+        assert!(!outpost.anchored);
+        assert!(!skiff.anchored);
+        assert_eq!(
+            state.ledger.genesis_installed_components,
+            installed_before + 101
+        );
+        assert!(state.validate_player_roster().is_ok());
+        assert!(state.conservation().valid);
+        assert!(
+            !runtime
+                .configure_earth_start_playtest()
+                .expect("surface profile is idempotent")
+        );
+    }
+
+    #[test]
+    fn earth_start_profile_persists_before_gameplay() {
+        let directory = tempdir().expect("tempdir");
+        let expected_hash = {
+            let mut runtime = Runtime::open(directory.path(), 42, 5).expect("fresh runtime opens");
+            runtime
+                .configure_earth_start_playtest()
+                .expect("surface profile configures");
+            runtime.state().state_hash()
+        };
+
+        let recovered = Runtime::open(directory.path(), 42, 5).expect("surface profile reopens");
+        assert_eq!(recovered.state().state_hash(), expected_hash);
+        assert!(
+            recovered
+                .state()
+                .grids
+                .get(STARTER_INDUSTRY_GRID_ID)
+                .is_some_and(|grid| grid
+                    .blocks
+                    .contains_key(EARTH_START_PROFILE_MARKER_BLOCK_ID))
+        );
+    }
+
+    #[test]
+    fn earth_start_player_settles_into_server_authoritative_grounded_motion() {
+        let mut runtime = runtime();
+        runtime
+            .configure_earth_start_playtest()
+            .expect("surface profile configures");
+
+        for _ in 0..120 {
+            runtime.advance(16).expect("surface physics advances");
+        }
+
+        let player = runtime.state().player.primary();
+        let character = &content::manifest().character;
+        assert_eq!(player.locomotion.kind, LocomotionKind::Grounded);
+        assert!(
+            player
+                .locomotion
+                .support
+                .as_ref()
+                .is_some_and(|support| support.body_id == PLANET_BODY_ID)
+        );
+        assert!(
+            (player.position - planet_center()).magnitude()
+                >= planet_surface_radius_m() + character.standing_height_m * 0.5 - 0.08
+        );
+        assert!(runtime.state().conservation().valid);
+    }
+
+    #[test]
+    fn earth_start_profile_cannot_rewrite_canonical_history() {
+        let mut runtime = runtime();
+        runtime.state.event_sequence = 1;
+
+        let error = runtime
+            .configure_earth_start_playtest()
+            .expect_err("played universe cannot be rewritten");
+        assert!(
+            error
+                .to_string()
+                .contains("before the first canonical event")
+        );
+        assert!(
+            !runtime
+                .state()
+                .grids
+                .get(STARTER_INDUSTRY_GRID_ID)
+                .expect("orbital industry fixture remains")
+                .blocks
+                .contains_key(EARTH_START_PROFILE_MARKER_BLOCK_ID)
+        );
+    }
+
+    #[test]
     fn whole_cell_production_quantum_is_one_ordered_atomic_event() {
         let directory = tempdir().expect("tempdir");
         let mut runtime = two_machine_production_runtime(directory.path());
@@ -7428,6 +8450,48 @@ mod tests {
         );
         assert_eq!(runtime.state().event_sequence, prior_sequence + 1);
         assert_eq!(runtime.state().state_hash(), committed_hash);
+    }
+
+    #[test]
+    fn runtime_startup_and_recovery_preserve_the_requested_frontier_cell() {
+        let directory = tempdir().expect("tempdir");
+        let origin = celestial::cell_origin_key();
+        let east =
+            celestial::neighbor_cell_key(&origin, [1, 0, 0]).expect("adjacent proof cell derives");
+        let expected_id = celestial::cell_id(&east).expect("cell ID derives");
+        let first_fence;
+        let open_config;
+        {
+            let runtime = Runtime::open_for_cell(directory.path(), 700, east.clone(), 100)
+                .expect("adjacent runtime opens");
+            assert_eq!(runtime.state().cell_id, expected_id);
+            assert_eq!(
+                celestial::cell_key_from_address(&runtime.state().cell_address)
+                    .expect("runtime key derives"),
+                east
+            );
+            assert!(runtime.state().player.by_id.is_empty());
+            assert!(runtime.physics_scene_is_initialized());
+            first_fence = runtime.state().fencing_token;
+            open_config = runtime.open_config();
+        }
+
+        let mut recovered = Runtime::open_for_activation(&open_config)
+            .expect("adjacent runtime recovers for activation");
+        while !recovered
+            .activation_step()
+            .expect("adjacent activation advances")
+        {}
+        assert_eq!(recovered.state().cell_id, expected_id);
+        assert!(recovered.state().fencing_token > first_fence);
+        drop(recovered);
+
+        assert!(matches!(
+            Runtime::open_for_cell(directory.path(), 700, origin, 100),
+            Err(RuntimeError::Persistence(
+                PersistenceError::InvalidLifecycleControl(_)
+            ))
+        ));
     }
 
     #[test]
@@ -8994,6 +10058,145 @@ mod tests {
                 .code(),
             "invalid_vector"
         );
+    }
+
+    #[test]
+    fn lost_receipt_and_next_operation_survive_a_lower_frontier_destination() {
+        use crate::cell_directory::{CellTransferRecord, MobileAggregateKind, TransferPhase};
+        use crate::handoff::{
+            PlayerTransferContext, prepare_eva_player_transfer, stage_committed_eva_import,
+            stage_eva_player_quarantine,
+        };
+
+        let mut source = WorldState::genesis(8_011);
+        source.fencing_token = 11;
+        let first = sequenced_suit_message(1, "source-operation", false);
+        let first_event = source
+            .prepare_client_event_as("player-local", &first)
+            .expect("source operation prepares");
+        source
+            .apply_event(&first_event)
+            .expect("source operation commits");
+        let first_receipt = source
+            .processed_operation_record("player-local", 1)
+            .expect("source receipt is retained")
+            .receipt
+            .clone();
+
+        let source_key = celestial::cell_origin_key();
+        let destination_key =
+            celestial::neighbor_cell_key(&source_key, [1, 0, 0]).expect("destination cell derives");
+        let boundary_address = celestial::address_from_origin_offset_um(
+            &source.cell_address,
+            [i128::from(celestial::CELL_EDGE_UM / 2), 0, 0],
+        )
+        .expect("boundary address canonicalizes");
+        let boundary_position =
+            celestial::local_position_from_address(&source.cell_address, &boundary_address)
+                .expect("boundary position hydrates");
+        let player = source
+            .player
+            .get_mut("player-local")
+            .expect("source player exists");
+        player.address = boundary_address;
+        player.position = boundary_position;
+        player.locomotion.kind = LocomotionKind::Eva;
+        player.locomotion.support = None;
+        player.locomotion.magnetic_boots_enabled = false;
+        source
+            .validate_player_roster()
+            .expect("source operation history remains canonical at the boundary");
+
+        let mut destination =
+            WorldState::genesis_for_cell(8_011, &destination_key).expect("destination cell builds");
+        destination.fencing_token = 17;
+        assert!(
+            destination.event_sequence < source.event_sequence,
+            "proof exercises unrelated cell journal frontiers"
+        );
+        assert_eq!(
+            source
+                .client_intent_fingerprint("player-local", &first)
+                .expect("source fingerprint derives"),
+            destination
+                .client_intent_fingerprint("player-local", &first)
+                .expect("destination fingerprint derives"),
+            "routing must not change one canonical client operation"
+        );
+
+        let context = PlayerTransferContext {
+            transfer_id: "transfer-operation-frontier".into(),
+            source_cell_key: source_key,
+            destination_cell_key: destination_key,
+            source_assignment_generation: 3,
+            destination_assignment_generation: 5,
+            source_fencing_token: 11,
+            prior_placement_generation: 7,
+            resulting_placement_generation: 8,
+        };
+        let package = prepare_eva_player_transfer(&source, "player-local", &context)
+            .expect("player package carries source operation history");
+        let (reserved_destination, receipt) =
+            stage_eva_player_quarantine(&destination, destination.fencing_token, &package)
+                .expect("destination reserves the package");
+        let committed = CellTransferRecord {
+            transfer_id: package.transfer_id.clone(),
+            aggregate_id: package.aggregate_id.clone(),
+            aggregate_kind: MobileAggregateKind::Player,
+            source_cell_key: package.source_cell_key.clone(),
+            source_cell_id: package.source_cell_id.clone(),
+            destination_cell_key: package.destination_cell_key.clone(),
+            destination_cell_id: package.destination_cell_id.clone(),
+            source_assignment_generation: package.source_assignment_generation,
+            destination_assignment_generation: package.destination_assignment_generation,
+            prior_placement_generation: package.prior_placement_generation,
+            resulting_placement_generation: package.resulting_placement_generation,
+            package_hash: package.package_hash.clone(),
+            quarantine_receipt_hash: Some(receipt.receipt_hash.clone()),
+            source_prepare_proof: None,
+            destination_quarantine_proof: None,
+            import_proof: None,
+            finalization_proof: None,
+            source_abort_proof: None,
+            destination_abort_proof: None,
+            phase: TransferPhase::Committed,
+        };
+        let mut imported =
+            stage_committed_eva_import(&reserved_destination, &package, &receipt, &committed)
+                .expect("committed player imports");
+        let first_fingerprint = imported
+            .client_intent_fingerprint("player-local", &first)
+            .expect("imported retry fingerprints");
+        assert_eq!(
+            imported
+                .validate_operation_attempt("player-local", 1, &first_fingerprint)
+                .expect("lost source response reconciles"),
+            Some(first_receipt.clone())
+        );
+
+        let second = sequenced_suit_message(2, "destination-operation", true);
+        let second_event = imported
+            .prepare_client_event_as("player-local", &second)
+            .expect("next operation prepares on the destination");
+        imported
+            .apply_event(&second_event)
+            .expect("next operation commits on the lower destination frontier");
+        let second_record = imported
+            .processed_operation_record("player-local", 2)
+            .expect("destination receipt is retained");
+        assert_eq!(second_record.receipt_origin_cell_id, imported.cell_id);
+        assert_eq!(second_record.receipt.operation_sequence, 2);
+        assert_eq!(second_record.receipt.event_sequence, 1);
+        assert_eq!(
+            imported
+                .processed_operation_record("player-local", 1)
+                .expect("source receipt remains retained")
+                .receipt,
+            first_receipt
+        );
+        imported
+            .validate_player_roster()
+            .expect("cross-cell operation history remains canonical");
     }
 
     #[test]
@@ -13783,7 +14986,7 @@ mod tests {
     #[test]
     fn industry_and_grid_replay_require_authenticated_human_envelopes() {
         let state = WorldState::genesis(171);
-        let payloads = [
+        let payloads = vec![
             EventPayload::OreRefined {
                 inventory_id: PLAYER_INVENTORY_ID.into(),
                 batches: 1,

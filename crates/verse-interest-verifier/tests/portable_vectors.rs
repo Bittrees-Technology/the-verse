@@ -6,10 +6,10 @@ use verse_protocol::SessionRole;
 
 const DOMAIN: &[u8] = b"the-verse/interest-view/v1\0";
 const REGISTRY_HASH: &str = "f00517b0fbef09d7924fde2cb11f2c74066627992ab900a6a9e0bd3ac3dc7311";
-const MANIFEST_HASH: &str = "5b54eedd8dfe2cae6f5bdc9f4f09ab8131873b12f28d2faaba5cf98012d72bab";
+const MANIFEST_HASH: &str = "551b4f30761a3fe8eed2bc3a9525e46f81d16563f9118b305bf5f2a3b9e63346";
 const CONTENT_HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const BASELINE_HASH: &str = "7eb9ca5329a935133fda304be1a2fa32eafb3b39f8aed341c89fb6875e153761";
-const DELTA_HASH: &str = "f6b653bed0c182571f161d22687ed701e4385a5cdc2b95a8b4339e2b58060c52";
+const BASELINE_HASH: &str = "ca8c95c5c3500737da44f85803f14847d56a92ccde59e0d9bb1a4db361d015d0";
+const DELTA_HASH: &str = "b28bacc07723afd4f02cf9ad93d4e2b5113bf2db63b76d374191b09b05a82532";
 
 fn payload(bytes: &'static [u8]) -> &'static [u8] {
     bytes
@@ -22,8 +22,8 @@ fn verifier() -> InterestVerifier {
         SessionRole::Player {
             player_id: "player-vector".to_owned(),
         },
-        19,
-        15,
+        20,
+        16,
         11,
         "p1.5.0",
         CONTENT_HASH,
@@ -154,7 +154,7 @@ fn document_commitments(frame: &serde_json::Value) -> (String, String) {
     manifest["celestial_registry_hash"] = serde_json::Value::String(registry_hash.clone());
     let manifest_bytes = serde_json::to_vec(&manifest).expect("manifest canonical integers");
     let manifest_hash =
-        independent_domain_digest(b"the-verse/universe-manifest/v3\0", &manifest_bytes);
+        independent_domain_digest(b"the-verse/universe-manifest/v4\0", &manifest_bytes);
     (registry_hash, manifest_hash)
 }
 
@@ -335,8 +335,8 @@ fn published_v1_vectors_verify_commit_and_ack_exactly() {
         manifest["verifier_config"]["expected_role"]["player_id"],
         "player-vector"
     );
-    assert_eq!(manifest["verifier_config"]["world_schema_version"], 19);
-    assert_eq!(manifest["verifier_config"]["event_schema_version"], 15);
+    assert_eq!(manifest["verifier_config"]["world_schema_version"], 20);
+    assert_eq!(manifest["verifier_config"]["event_schema_version"], 16);
     assert_eq!(manifest["verifier_config"]["content_schema_version"], 11);
     assert_eq!(
         manifest["verifier_config"]["content_manifest_version"],

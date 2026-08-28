@@ -4,7 +4,7 @@ set -euo pipefail
 
 verse_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 godot_binary="${GODOT_BIN:-}"
-release_version="${VERSE_RELEASE_VERSION:-p1.5.0-dev}"
+release_version="${VERSE_RELEASE_VERSION:-p1.7.0-dev}"
 release_root="${verse_root}/artifacts/release"
 staging_root="${release_root}/staging"
 
@@ -86,6 +86,11 @@ if [[ "${release_platform}" == "macos-arm64" ]]; then
     --headless \
     --path apps/native-client \
     --export-release "${export_preset}" "${staging_directory}/The Verse.app"
+  client_binary="${staging_directory}/The Verse.app/Contents/MacOS/The Verse"
+  arm64_client_binary="${client_binary}.arm64"
+  lipo -thin arm64 "${client_binary}" -output "${arm64_client_binary}"
+  mv "${arm64_client_binary}" "${client_binary}"
+  chmod 755 "${client_binary}"
   cp target/release/verse-simulation-worker "${staging_directory}/verse-simulation-worker"
   cp tools/release/runtime/launch-macos.command "${staging_directory}/Launch The Verse.command"
   chmod 755 \
@@ -113,13 +118,16 @@ printf '%s\n' \
   "Source revision: ${source_revision}" \
   "Content manifest: p1.5.0" \
   "Content schema: 11" \
-  "Protocol: 16" \
-  "Projection schema: 3" \
-  "World schema: 18" \
-  "Event schema: 14" \
+  "Protocol: 18" \
+  "Projection schema: 4" \
+  "World schema: 20" \
+  "Event schema: 16" \
   "Celestial registry schema: 1" \
-  "Universe manifest schema: 2" \
-  "Interest schema: 1" \
+  "Universe manifest schema: 4" \
+  "Interest schema: 2" \
+  "Operation fingerprint schema: 2" \
+  "Cell directory schema: 2" \
+  "Transfer package schema: 1" \
   "Interest verifier encoding: 1" \
   "Browser verifier generator: wasm-bindgen 0.2.127" \
   "Package: ${release_platform}" \

@@ -5,27 +5,29 @@ const ARMOR_TEXTURE: Texture2D = preload("res://assets/materials/verse_armor_alb
 const ASTEROID_TEXTURE: Texture2D = preload(
 	"res://assets/materials/verse_asteroid_regolith_albedo.png"
 )
-const PLANET_TEXTURE: Texture2D = preload("res://assets/materials/khepri_prime_albedo.png")
+const PLANET_TEXTURE: Texture2D = preload(
+	"res://assets/materials/khepri_prime_earthlike_albedo_v2.png"
+)
 const ASTEROID_SHADER: Shader = preload("res://shaders/asteroid_surface.gdshader")
 const PLANET_SHADER: Shader = preload("res://shaders/planet_surface.gdshader")
 const ATMOSPHERE_SHADER: Shader = preload("res://shaders/planet_atmosphere.gdshader")
 const CLOUD_SHADER: Shader = preload("res://shaders/planet_clouds.gdshader")
 const BLOCK_DAMAGE_SHADER: Shader = preload("res://shaders/block_damage.gdshader")
-const PROTOCOL_VERSION := 17
-const PROJECTION_SCHEMA_VERSION := 3
-const WORLD_SCHEMA_VERSION := 19
-const EVENT_SCHEMA_VERSION := 15
+const PROTOCOL_VERSION := 18
+const PROJECTION_SCHEMA_VERSION := 4
+const WORLD_SCHEMA_VERSION := 20
+const EVENT_SCHEMA_VERSION := 16
 const CONTENT_SCHEMA_VERSION := 11
 const CONTENT_MANIFEST_VERSION := "p1.5.0"
 const CELESTIAL_REGISTRY_SCHEMA_VERSION := 1
-const UNIVERSE_MANIFEST_SCHEMA_VERSION := 3
-const LIFECYCLE_CONTROL_SCHEMA_VERSION := 1
+const UNIVERSE_MANIFEST_SCHEMA_VERSION := 4
+const LIFECYCLE_CONTROL_SCHEMA_VERSION := 2
 const PRODUCTION_SCHEDULE_OCCURRENCE_SCHEMA_VERSION := 1
-const LIFECYCLE_POLICY_HASH := "5bc077cc8a2eb101fcaecdce5513c13aa243e1f68a5af839a602dd689859ff3a"
-const INTEREST_SCHEMA_VERSION := 1
+const LIFECYCLE_POLICY_HASH := "8abc99b5e076bd89a8914c3727560baaa82433b1b1b4191b2379355ac7d81471"
+const INTEREST_SCHEMA_VERSION := 2
 const EXPECTED_UNIVERSE_ID := "the-verse-local"
 const EXPECTED_CELESTIAL_REGISTRY_HASH := "4c367bbfa04218ece14104f0a3a7ec2c7e9fefcc37d4cf78a265df2d711a59da"
-const EXPECTED_UNIVERSE_MANIFEST_HASH := "c9bfd3baa1e64ab7665e60c4f989491e745e9af0d2512989f41625b57b546ace"
+const EXPECTED_UNIVERSE_MANIFEST_HASH := "3e93c305169eeecee44f2630e57ad183b319375197547344c45e1509e8aaf76b"
 const EXPECTED_CONTENT_HASH := "fc61c05b335fb951868010ecf2942a92ec4f03d00d0a75d3acba8c6f5162b6bd"
 const DEFAULT_SERVER := "ws://127.0.0.1:7777/ws"
 const DEFAULT_PLAYER_ID := "player-local"
@@ -65,6 +67,7 @@ const CHARACTER_ANGULAR_DAMPENER_ACCELERATION := 7.0
 const CHARACTER_MAXIMUM_SPEED := 12.0
 const CHARACTER_BOOST_MAXIMUM_SPEED := 24.0
 const CHARACTER_MAXIMUM_ANGULAR_SPEED := 2.5
+const CHARACTER_MAXIMUM_VIEW_PITCH := 85.0 * PI / 180.0
 const CHARACTER_UPRIGHT_ALIGNMENT_ACCELERATION := 28.0
 const CHARACTER_WALK_SPEED := 4.5
 const CHARACTER_SPRINT_SPEED := 7.5
@@ -125,6 +128,12 @@ var interest_local_origin: Dictionary = {}
 var baseline_request_pending := false
 var interest_verifier: Object
 var interest_recovery_used := false
+var handoff_phase := "live"
+var handoff_transfer_id := ""
+var handoff_destination_cell_key: Dictionary = {}
+var handoff_placement_generation := -1
+var handoff_source_session_epoch := ""
+var handoff_source_interest_epoch := -1
 var connection_generation := 0
 var auto_reconnect_attempts := 0
 var auto_reconnect_elapsed := 0.0
@@ -154,6 +163,11 @@ var last_authoritative_simulation_tick := 0
 var predicted_simulation_tick := 0
 var predicted_position := Vector3.ZERO
 var predicted_orientation := Quaternion.IDENTITY
+var previous_predicted_position := Vector3.ZERO
+var previous_predicted_orientation := Quaternion.IDENTITY
+var predicted_view_pitch_radians := 0.0
+var previous_predicted_view_pitch_radians := 0.0
+var prediction_presentation_ready := false
 var predicted_linear_velocity := Vector3.ZERO
 var predicted_angular_velocity := Vector3.ZERO
 var predicted_surface_contact := false
@@ -176,6 +190,7 @@ var roll_right_held := false
 var pending_roll_transitions: Array[float] = []
 var presentation_position_offset := Vector3.ZERO
 var presentation_orientation_offset := Quaternion.IDENTITY
+var last_presented_eye_offset := Vector3.UP * CHARACTER_EYE_OFFSET
 var require_neutral_baseline := true
 var last_player_id := ""
 var last_player_life_state := ""
@@ -257,6 +272,8 @@ var message_label: Label
 var connection_label: Label
 var selected_label: Label
 var mission_label: Label
+var operation_title_label: Label
+var contract_title_label: Label
 var level_label: Label
 var telemetry_label: Label
 var interaction_label: Label
@@ -274,6 +291,7 @@ var mining_fragments: GPUParticles3D
 var suit_light: SpotLight3D
 var inventory_overlay: Control
 var planet_cloud_layer: MeshInstance3D
+var planet_high_cloud_layer: MeshInstance3D
 var celestial_visuals: Dictionary = {}
 var rendered_celestial_registry_hash := ""
 var rendered_celestial_origin: Dictionary = {}
@@ -282,6 +300,10 @@ var critical_oxygen_label: Label
 var incapacitated_overlay: Control
 var incapacitated_detail_label: Label
 var recovery_button: Button
+var handoff_overlay: Control
+var handoff_title_label: Label
+var handoff_detail_label: Label
+var scene_environment: Environment
 
 var rock_material: Material
 var block_materials: Dictionary = {}
@@ -309,10 +331,13 @@ func _process(delta: float) -> void:
 	elapsed_time += delta
 	_advance_auto_reconnect(delta)
 	if planet_cloud_layer != null:
-		planet_cloud_layer.rotation.y += delta * 0.0025
+		planet_cloud_layer.rotation.y += delta * 0.0018
+	if planet_high_cloud_layer != null:
+		planet_high_cloud_layer.rotation.y += delta * 0.0042
 	_poll_socket()
 	_advance_mutation_transport(delta)
 	_update_player_presentation(delta)
+	_update_environment_presentation(delta)
 	_update_target()
 	_update_tool_action(delta)
 	_update_viewmodel(delta)
@@ -341,6 +366,7 @@ func _physics_process(delta: float) -> void:
 		if _should_send_player_control(control) and _send_player_control(control, false):
 			if sampled_roll_transition and not pending_roll_transitions.is_empty():
 				pending_roll_transitions.pop_front()
+	_capture_prediction_presentation_step()
 	_predict_player_step(control, CHARACTER_FIXED_DELTA, true)
 
 
@@ -348,6 +374,8 @@ func _input(event: InputEvent) -> void:
 	if event is InputEventKey and _reconnect_shortcut(event):
 		_connect_to_server(true)
 		get_viewport().set_input_as_handled()
+		return
+	if handoff_phase != "live":
 		return
 
 	if _local_player_incapacitated():
@@ -700,7 +728,7 @@ func _actor_private_matches(candidate: Variant, event_sequence: int) -> bool:
 		) < 0
 	):
 		return false
-	# Protocol 16 nests the overlay in the outer interest frame, making the
+	# Protocol 18 nests the overlay in the outer interest frame, making the
 	# outer sequence authoritative. Honor a future explicit sequence only when
 	# it agrees, so malformed extensions still fail closed.
 	return (
@@ -775,19 +803,19 @@ func _add_key_action(action: StringName, keycode: Key) -> void:
 
 func _build_environment() -> void:
 	var world_environment := WorldEnvironment.new()
-	var environment := Environment.new()
-	environment.background_mode = Environment.BG_COLOR
-	environment.background_color = Color(0.006, 0.016, 0.032)
-	environment.ambient_light_source = Environment.AMBIENT_SOURCE_COLOR
-	environment.ambient_light_color = Color(0.20, 0.28, 0.42)
-	environment.ambient_light_energy = 0.38
-	environment.tonemap_mode = Environment.TONE_MAPPER_FILMIC
-	environment.fog_enabled = true
-	environment.fog_light_color = Color(0.055, 0.11, 0.16)
-	environment.fog_light_energy = 0.34
-	environment.fog_density = 0.00004
-	environment.fog_sky_affect = 0.18
-	world_environment.environment = environment
+	scene_environment = Environment.new()
+	scene_environment.background_mode = Environment.BG_COLOR
+	scene_environment.background_color = Color(0.006, 0.016, 0.032)
+	scene_environment.ambient_light_source = Environment.AMBIENT_SOURCE_COLOR
+	scene_environment.ambient_light_color = Color(0.20, 0.28, 0.42)
+	scene_environment.ambient_light_energy = 0.38
+	scene_environment.tonemap_mode = Environment.TONE_MAPPER_FILMIC
+	scene_environment.fog_enabled = true
+	scene_environment.fog_light_color = Color(0.055, 0.11, 0.16)
+	scene_environment.fog_light_energy = 0.34
+	scene_environment.fog_density = 0.00004
+	scene_environment.fog_sky_affect = 0.18
+	world_environment.environment = scene_environment
 	add_child(world_environment)
 
 	var key_light := DirectionalLight3D.new()
@@ -871,6 +899,55 @@ func _build_environment() -> void:
 	_build_action_feedback()
 
 
+func _update_environment_presentation(delta: float) -> void:
+	if scene_environment == null:
+		return
+	var environment := _local_environment()
+	var density := clampf(float(environment.get("atmosphere_density", 0.0)), 0.0, 1.0)
+	var atmosphere_blend := smoothstep(0.08, 0.55, density)
+	var response := 1.0 - exp(-maxf(delta, 0.0) * 3.5)
+	var space_background := Color(0.006, 0.016, 0.032)
+	var surface_sky := Color(0.12, 0.39, 0.72)
+	var space_ambient := Color(0.20, 0.28, 0.42)
+	var surface_ambient := Color(0.48, 0.63, 0.78)
+	var space_fog := Color(0.055, 0.11, 0.16)
+	var surface_haze := Color(0.23, 0.50, 0.72)
+	var target_background := space_background.lerp(surface_sky, atmosphere_blend)
+	var target_ambient := space_ambient.lerp(surface_ambient, atmosphere_blend)
+	var target_fog := space_fog.lerp(surface_haze, atmosphere_blend)
+	scene_environment.background_color = scene_environment.background_color.lerp(
+		target_background, response
+	)
+	scene_environment.ambient_light_color = scene_environment.ambient_light_color.lerp(
+		target_ambient, response
+	)
+	scene_environment.ambient_light_energy = lerpf(
+		scene_environment.ambient_light_energy,
+		lerpf(0.38, 0.82, atmosphere_blend),
+		response,
+	)
+	scene_environment.fog_light_color = scene_environment.fog_light_color.lerp(
+		target_fog, response
+	)
+	scene_environment.fog_light_energy = lerpf(
+		scene_environment.fog_light_energy,
+		lerpf(0.34, 0.92, atmosphere_blend),
+		response,
+	)
+	scene_environment.fog_density = lerpf(
+		scene_environment.fog_density,
+		lerpf(0.00004, 0.0012, atmosphere_blend),
+		response,
+	)
+	scene_environment.fog_sky_affect = lerpf(
+		scene_environment.fog_sky_affect,
+		lerpf(0.18, 0.88, atmosphere_blend),
+		response,
+	)
+	if stars_root != null:
+		stars_root.visible = atmosphere_blend < 0.55
+
+
 func _material(color: Color, roughness: float, metallic: float) -> StandardMaterial3D:
 	var material := StandardMaterial3D.new()
 	material.albedo_color = color
@@ -933,6 +1010,7 @@ func _rebuild_registered_celestials() -> void:
 		child.queue_free()
 	celestial_visuals.clear()
 	planet_cloud_layer = null
+	planet_high_cloud_layer = null
 	if asteroid_root != null:
 		var voxel_body := _registered_body(String(snapshot.get("voxel_body_id", "")))
 		var voxel_center: Variant = _address_relative_m(voxel_body.get("center", {}), interest_local_origin)
@@ -963,8 +1041,9 @@ func _rebuild_registered_celestials() -> void:
 		mesh.height = radius * 2.0
 		mesh.radial_segments = 192 if body.get("kind", "") == "planet" else 64
 		mesh.rings = 96 if body.get("kind", "") == "planet" else 32
+		var surface_material: ShaderMaterial = null
 		if descriptor == "khepri-prime-terrestrial-v1":
-			var surface_material := ShaderMaterial.new()
+			surface_material = ShaderMaterial.new()
 			surface_material.shader = PLANET_SHADER
 			surface_material.set_shader_parameter("planet_albedo", PLANET_TEXTURE)
 			mesh.material = surface_material
@@ -983,15 +1062,27 @@ func _rebuild_registered_celestials() -> void:
 			float(orientation.get("y", 0)) / 1_000_000.0,
 			float(orientation.get("z", 0)) / 1_000_000.0
 		)
+		if surface_material != null:
+			var outpost_direction := visual.basis.inverse() * Vector3.UP
+			surface_material.set_shader_parameter(
+				"outpost_direction", outpost_direction.normalized()
+			)
 		planet_root.add_child(visual)
 		celestial_visuals[String(body.get("body_id", ""))] = visual
 		var atmosphere_height := float(body.get("atmosphere_height_um", 0)) / 1_000_000.0
 		if atmosphere_height <= 0.0:
 			continue
+		# Registry atmosphere height remains authoritative for survival and
+		# interest. Presentation compresses the shell to a believable limb so
+		# the proof-scale planet does not look like a blue bubble from orbit.
+		var visual_atmosphere_height := minf(
+			atmosphere_height,
+			maxf(18.0, radius * 0.035),
+		)
 		var atmosphere := MeshInstance3D.new()
 		atmosphere.name = "%s_Atmosphere" % visual.name
 		var atmosphere_mesh := SphereMesh.new()
-		atmosphere_mesh.radius = radius + atmosphere_height
+		atmosphere_mesh.radius = radius + visual_atmosphere_height
 		atmosphere_mesh.height = atmosphere_mesh.radius * 2.0
 		atmosphere_mesh.radial_segments = 128
 		atmosphere_mesh.rings = 64
@@ -1002,21 +1093,57 @@ func _rebuild_registered_celestials() -> void:
 		atmosphere.position = center
 		planet_root.add_child(atmosphere)
 		if descriptor == "khepri-prime-terrestrial-v1":
-			planet_cloud_layer = MeshInstance3D.new()
-			planet_cloud_layer.name = "%s_Clouds" % visual.name
-			var cloud_mesh := SphereMesh.new()
-			cloud_mesh.radius = radius + minf(12.0, atmosphere_height * 0.2)
-			cloud_mesh.height = cloud_mesh.radius * 2.0
-			cloud_mesh.radial_segments = 160
-			cloud_mesh.rings = 80
-			var cloud_material := ShaderMaterial.new()
-			cloud_material.shader = CLOUD_SHADER
-			cloud_mesh.material = cloud_material
-			planet_cloud_layer.mesh = cloud_mesh
-			planet_cloud_layer.position = center
+			planet_cloud_layer = _create_planet_cloud_layer(
+				"%s_Weather" % visual.name,
+				center,
+				radius + minf(10.0, atmosphere_height * 0.12),
+				2.35,
+				0.63,
+				0.50,
+				Vector3(5.4, 11.7, 2.9),
+			)
 			planet_root.add_child(planet_cloud_layer)
+			planet_high_cloud_layer = _create_planet_cloud_layer(
+				"%s_HighClouds" % visual.name,
+				center,
+				radius + minf(18.0, atmosphere_height * 0.22),
+				3.65,
+				0.70,
+				0.26,
+				Vector3(18.1, 3.2, 9.6),
+			)
+			planet_high_cloud_layer.rotation_degrees.y = 27.0
+			planet_root.add_child(planet_high_cloud_layer)
 	rendered_celestial_registry_hash = registry_hash
 	rendered_celestial_origin = interest_local_origin.duplicate(true)
+
+
+func _create_planet_cloud_layer(
+	layer_name: String,
+	center: Vector3,
+	radius: float,
+	cloud_scale: float,
+	coverage: float,
+	opacity: float,
+	noise_offset: Vector3,
+) -> MeshInstance3D:
+	var layer := MeshInstance3D.new()
+	layer.name = layer_name
+	var mesh := SphereMesh.new()
+	mesh.radius = radius
+	mesh.height = radius * 2.0
+	mesh.radial_segments = 192
+	mesh.rings = 96
+	var material := ShaderMaterial.new()
+	material.shader = CLOUD_SHADER
+	material.set_shader_parameter("cloud_scale", cloud_scale)
+	material.set_shader_parameter("coverage", coverage)
+	material.set_shader_parameter("opacity", opacity)
+	material.set_shader_parameter("noise_offset", noise_offset)
+	mesh.material = material
+	layer.mesh = mesh
+	layer.position = center
+	return layer
 
 
 func _build_orbital_dust() -> void:
@@ -1270,12 +1397,12 @@ func _build_interface() -> void:
 	accent.size = Vector2(430.0, 2.0)
 	top_bar.add_child(accent)
 
-	var title := Label.new()
-	title.text = "THE VERSE  //  ORBITAL OPERATIONS"
-	title.position = Vector2(24.0, 13.0)
-	title.add_theme_font_size_override("font_size", 19)
-	title.add_theme_color_override("font_color", Color(0.78, 0.91, 0.98))
-	top_bar.add_child(title)
+	operation_title_label = Label.new()
+	operation_title_label.text = "THE VERSE  //  ORBITAL OPERATIONS"
+	operation_title_label.position = Vector2(24.0, 13.0)
+	operation_title_label.add_theme_font_size_override("font_size", 19)
+	operation_title_label.add_theme_color_override("font_color", Color(0.78, 0.91, 0.98))
+	top_bar.add_child(operation_title_label)
 
 	connection_label = Label.new()
 	connection_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
@@ -1317,9 +1444,9 @@ func _build_interface() -> void:
 	var mission_heading := _hud_label("ACTIVE CONTRACT // PRIORITY", Vector2(17.0, 14.0), 11)
 	mission_heading.add_theme_color_override("font_color", Color(1.0, 0.35, 0.12))
 	mission_panel.add_child(mission_heading)
-	var contract_name := _hud_label("WAKE THE KHEPRI RELAY", Vector2(17.0, 39.0), 18)
-	contract_name.add_theme_color_override("font_color", Color(0.90, 0.94, 0.96))
-	mission_panel.add_child(contract_name)
+	contract_title_label = _hud_label("WAKE THE KHEPRI RELAY", Vector2(17.0, 39.0), 18)
+	contract_title_label.add_theme_color_override("font_color", Color(0.90, 0.94, 0.96))
+	mission_panel.add_child(contract_title_label)
 	mission_label = _hud_label("Awaiting authoritative career record…", Vector2(17.0, 76.0), 14)
 	mission_label.size = Vector2(350.0, 145.0)
 	mission_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
@@ -1395,6 +1522,57 @@ func _build_interface() -> void:
 	bottom_bar.add_child(message_label)
 	_build_inventory_terminal(canvas)
 	_build_life_support_interface(canvas)
+	_build_handoff_interface(canvas)
+
+
+func _build_handoff_interface(canvas: CanvasLayer) -> void:
+	handoff_overlay = Control.new()
+	handoff_overlay.name = "CellHandoffOverlay"
+	handoff_overlay.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	handoff_overlay.mouse_filter = Control.MOUSE_FILTER_STOP
+	handoff_overlay.visible = false
+	canvas.add_child(handoff_overlay)
+
+	var veil := ColorRect.new()
+	veil.color = Color(0.002, 0.009, 0.018, 0.82)
+	veil.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	handoff_overlay.add_child(veil)
+
+	var panel := ColorRect.new()
+	panel.anchor_left = 0.5
+	panel.anchor_top = 0.5
+	panel.anchor_right = 0.5
+	panel.anchor_bottom = 0.5
+	panel.offset_left = -340.0
+	panel.offset_top = -108.0
+	panel.offset_right = 340.0
+	panel.offset_bottom = 108.0
+	panel.color = Color(0.025, 0.065, 0.095, 0.98)
+	handoff_overlay.add_child(panel)
+
+	var accent := ColorRect.new()
+	accent.color = Color(0.10, 0.76, 1.0)
+	accent.anchor_right = 1.0
+	accent.offset_bottom = 3.0
+	panel.add_child(accent)
+
+	handoff_title_label = Label.new()
+	handoff_title_label.text = "CROSSING CELL AUTHORITY"
+	handoff_title_label.position = Vector2(24.0, 28.0)
+	handoff_title_label.size = Vector2(632.0, 42.0)
+	handoff_title_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	handoff_title_label.add_theme_font_size_override("font_size", 25)
+	handoff_title_label.add_theme_color_override("font_color", Color(0.63, 0.91, 1.0))
+	panel.add_child(handoff_title_label)
+
+	handoff_detail_label = Label.new()
+	handoff_detail_label.position = Vector2(34.0, 84.0)
+	handoff_detail_label.size = Vector2(612.0, 86.0)
+	handoff_detail_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	handoff_detail_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	handoff_detail_label.add_theme_font_size_override("font_size", 14)
+	handoff_detail_label.add_theme_color_override("font_color", Color(0.73, 0.82, 0.87))
+	panel.add_child(handoff_detail_label)
 
 
 func _build_life_support_interface(canvas: CanvasLayer) -> void:
@@ -2118,10 +2296,16 @@ func _verify_and_handle_packet(packet: PackedByteArray) -> void:
 func _finalize_committed_interest(
 	candidate: Dictionary, acknowledgement: PackedByteArray
 ) -> bool:
+	var completes_handoff := handoff_phase != "live"
+	if completes_handoff and not _handoff_destination_baseline_matches(candidate):
+		_client_fatal("DESTINATION BASELINE DOES NOT MATCH THE COMMITTED HANDOFF")
+		return false
 	_install_verified_interest_model(candidate)
 	if not _send_verifier_acknowledgement(acknowledgement):
 		_client_fatal("VERIFIER ACKNOWLEDGEMENT SEND FAILED")
 		return false
+	if completes_handoff:
+		_complete_handoff_presentation()
 	replication_state = "ready"
 	replication_detail = "INTEREST VIEW CURRENT"
 	auto_reconnect_attempts = 0
@@ -2177,7 +2361,7 @@ func _handle_server_message(message: Dictionary) -> void:
 				operation_frontier_observed = false
 				observed_operation_frontier = -1
 			_set_message(
-				"Protocol 16 linked to %s // %s // loading registry"
+				"Protocol 18 linked to %s // %s // loading registry"
 				% [message.get("server_name", "The Verse"), _controlled_player_id()]
 			)
 		"registry":
@@ -2190,6 +2374,9 @@ func _handle_server_message(message: Dictionary) -> void:
 			registry_received = true
 			replication_detail = "WAITING FOR INTEREST BASELINE"
 			_set_message("CELESTIAL REGISTRY VERIFIED // WAITING FOR LOCAL VIEW")
+		"handoff":
+			if not _handle_handoff_status(message.get("handoff", {})):
+				_client_fatal("INVALID HANDOFF PRESENTATION SEQUENCE")
 		"interest_baseline":
 			_client_fatal("UNVERIFIED INTEREST BASELINE BYPASSED NATIVE VERIFIER")
 		"interest_delta":
@@ -2246,6 +2433,125 @@ func _welcome_tuple_valid(message: Dictionary) -> bool:
 		== UNIVERSE_MANIFEST_SCHEMA_VERSION
 		and int(message.get("interest_schema_version", -1)) == INTEREST_SCHEMA_VERSION
 	)
+
+
+func _handle_handoff_status(status_value: Variant) -> bool:
+	if not status_value is Dictionary:
+		return false
+	var status: Dictionary = status_value
+	var phase := String(status.get("phase", ""))
+	var transfer_id := String(status.get("transfer_id", ""))
+	var destination_value: Variant = status.get("destination_cell_key", {})
+	var placement_generation := _protocol_nonnegative_integer(
+		status.get("placement_generation", null)
+	)
+	if (
+		not phase in ["preparing", "importing", "verifying_destination"]
+		or transfer_id.is_empty()
+		or not destination_value is Dictionary
+		or destination_value.is_empty()
+		or placement_generation <= 0
+	):
+		return false
+	var destination: Dictionary = destination_value
+	if handoff_phase == "live":
+		if phase != "preparing" or interest_session_epoch.is_empty() or interest_epoch < 0:
+			return false
+		handoff_transfer_id = transfer_id
+		handoff_destination_cell_key = destination.duplicate(true)
+		handoff_placement_generation = placement_generation
+		handoff_source_session_epoch = interest_session_epoch
+		handoff_source_interest_epoch = interest_epoch
+		_discard_source_view_for_handoff()
+	else:
+		if (
+			transfer_id != handoff_transfer_id
+			or destination != handoff_destination_cell_key
+			or placement_generation != handoff_placement_generation
+			or _handoff_phase_rank(phase) < _handoff_phase_rank(handoff_phase)
+			or _handoff_phase_rank(phase) > _handoff_phase_rank(handoff_phase) + 1
+		):
+			return false
+	handoff_phase = phase
+	replication_state = "handoff"
+	match phase:
+		"preparing":
+			replication_detail = "HANDOFF PREPARING // CONTROLS NEUTRALIZED"
+		"importing":
+			replication_detail = "HANDOFF IMPORTING // DESTINATION AUTHORITY COMMITTED"
+		"verifying_destination":
+			replication_detail = "VERIFYING DESTINATION // WAITING FOR TRUSTED BASELINE"
+	_set_message(replication_detail)
+	return true
+
+
+func _handoff_phase_rank(phase: String) -> int:
+	return ["preparing", "importing", "verifying_destination"].find(phase)
+
+
+func _discard_source_view_for_handoff() -> void:
+	authoritative_player_ready = false
+	operation_frontier_ready = false
+	mutation_resync_required = true
+	awaiting_reconnect_baseline = true
+	stream_family = ""
+	interest_entities = _empty_interest_entities()
+	interest_session_epoch = ""
+	interest_epoch = -1
+	interest_baseline_id = ""
+	interest_delta_sequence = -1
+	interest_view_hash = ""
+	interest_local_origin = {}
+	baseline_request_pending = false
+	snapshot = {}
+	_clear_actor_private_state()
+	active_grid_control_id = ""
+	inventory_open = false
+	prediction_history.clear()
+	pending_controls.clear()
+	prediction_history_invalid = false
+	prediction_gravity_model_ready = false
+	prediction_gravity_fallback = Vector3.ZERO
+	last_sent_control = {}
+	control_send_elapsed = 0.0
+	_clear_transient_character_input()
+	presentation_position_offset = Vector3.ZERO
+	presentation_orientation_offset = Quaternion.IDENTITY
+	prediction_presentation_ready = false
+	require_neutral_baseline = true
+	last_authoritative_event_sequence = -1
+	last_authoritative_simulation_tick = 0
+	_sync_remote_players([])
+	_sync_voxel_projection([], [])
+	_rebuild_grids([])
+
+
+func _handoff_destination_baseline_matches(candidate: Dictionary) -> bool:
+	if handoff_phase != "verifying_destination" or not bool(candidate.get("baseline", false)):
+		return false
+	var link_value: Variant = candidate.get("transfer_link", null)
+	if not link_value is Dictionary:
+		return false
+	var link: Dictionary = link_value
+	return (
+		String(candidate.get("session_epoch", "")) == handoff_source_session_epoch
+		and int(candidate.get("interest_epoch", -1)) == handoff_source_interest_epoch + 1
+		and String(link.get("transfer_id", "")) == handoff_transfer_id
+		and link.get("destination_cell_key", {}) == handoff_destination_cell_key
+		and _protocol_nonnegative_integer(link.get("placement_generation", null))
+		== handoff_placement_generation
+	)
+
+
+func _complete_handoff_presentation() -> void:
+	handoff_phase = "live"
+	handoff_transfer_id = ""
+	handoff_destination_cell_key = {}
+	handoff_placement_generation = -1
+	handoff_source_session_epoch = ""
+	handoff_source_interest_epoch = -1
+	replication_detail = "INTEREST VIEW CURRENT // DESTINATION VERIFIED"
+	_set_message("DESTINATION CELL VERIFIED // EVA CONTROL RESTORED")
 
 
 func _install_registry(message: Dictionary) -> bool:
@@ -2400,6 +2706,7 @@ func _prepare_interest_baseline(authoritative: Dictionary) -> Dictionary:
 		"baseline_id": String(interest.get("baseline_id", "")),
 		"delta_sequence": 0,
 		"view_hash": String(interest.get("view_hash", "")),
+		"transfer_link": interest.get("transfer_link", null),
 	}
 
 
@@ -3089,7 +3396,7 @@ func _apply_authoritative_player(
 		or incoming_epoch != movement_epoch
 		or source == "reconnect"
 	)
-	var old_present_position := camera.position - _camera_eye_offset()
+	var old_present_position := camera.position - last_presented_eye_offset
 	var old_present_orientation := camera.quaternion
 	var old_history := prediction_history.duplicate(true)
 	var old_predicted_simulation_tick := predicted_simulation_tick
@@ -3106,6 +3413,11 @@ func _apply_authoritative_player(
 
 	predicted_position = _vec3(player.get("position", {}))
 	predicted_orientation = _quat(player.get("orientation", {}))
+	predicted_view_pitch_radians = clampf(
+		float(incoming_locomotion.get("view_pitch_radians", 0.0)),
+		-CHARACTER_MAXIMUM_VIEW_PITCH,
+		CHARACTER_MAXIMUM_VIEW_PITCH
+	)
 	predicted_linear_velocity = _vec3(player.get("linear_velocity", {}))
 	predicted_angular_velocity = _vec3(player.get("angular_velocity", {}))
 	predicted_surface_contact = bool(player.get("surface_contact", false))
@@ -3170,7 +3482,7 @@ func _apply_authoritative_player(
 		desired_magnetic_boots = bool(incoming_locomotion.get("magnetic_boots_enabled", false))
 
 	var correction_distance := old_present_position.distance_to(predicted_position)
-	var target_view_orientation := _player_view_orientation(
+	var target_view_orientation := _predicted_player_view_orientation(
 		predicted_orientation, incoming_locomotion
 	)
 	var correction_angle := _quaternion_angular_distance(
@@ -3181,13 +3493,15 @@ func _apply_authoritative_player(
 	):
 		presentation_position_offset = Vector3.ZERO
 		presentation_orientation_offset = Quaternion.IDENTITY
-		camera.position = predicted_position + _camera_eye_offset()
+		last_presented_eye_offset = _prediction_camera_eye_offset(predicted_orientation)
+		camera.position = predicted_position + last_presented_eye_offset
 		camera.quaternion = target_view_orientation
 	else:
 		presentation_position_offset = old_present_position - predicted_position
 		presentation_orientation_offset = (
 			old_present_orientation * target_view_orientation.inverse()
 		).normalized()
+	_reset_prediction_presentation_baseline()
 
 	authoritative_player_ready = true
 	awaiting_reconnect_baseline = false
@@ -3281,6 +3595,12 @@ func _begin_player_resync() -> void:
 	interest_view_hash = ""
 	interest_local_origin = {}
 	baseline_request_pending = false
+	handoff_phase = "live"
+	handoff_transfer_id = ""
+	handoff_destination_cell_key = {}
+	handoff_placement_generation = -1
+	handoff_source_session_epoch = ""
+	handoff_source_interest_epoch = -1
 	bound_player_id = ""
 	session_role_kind = ""
 	_clear_actor_private_state()
@@ -3296,6 +3616,7 @@ func _begin_player_resync() -> void:
 	_clear_transient_character_input()
 	presentation_position_offset = Vector3.ZERO
 	presentation_orientation_offset = Quaternion.IDENTITY
+	prediction_presentation_ready = false
 	require_neutral_baseline = true
 	last_authoritative_event_sequence = -1
 	_sync_remote_players([])
@@ -3310,6 +3631,7 @@ func _reset_control_prediction_after_rejection() -> void:
 	last_sent_control = {}
 	control_send_elapsed = 0.0
 	_clear_transient_character_input()
+	prediction_presentation_ready = false
 	require_neutral_baseline = true
 
 
@@ -4143,6 +4465,20 @@ func _player_control_message(
 	}
 
 
+func _capture_prediction_presentation_step() -> void:
+	previous_predicted_position = predicted_position
+	previous_predicted_orientation = predicted_orientation
+	previous_predicted_view_pitch_radians = predicted_view_pitch_radians
+	prediction_presentation_ready = true
+
+
+func _reset_prediction_presentation_baseline() -> void:
+	previous_predicted_position = predicted_position
+	previous_predicted_orientation = predicted_orientation
+	previous_predicted_view_pitch_radians = predicted_view_pitch_radians
+	prediction_presentation_ready = true
+
+
 func _predict_player_step(control: Dictionary, delta: float, record_history: bool) -> void:
 	var player := _local_player()
 	var locomotion: Dictionary = player.get("locomotion", {})
@@ -4150,6 +4486,14 @@ func _predict_player_step(control: Dictionary, delta: float, record_history: boo
 	var jump_held := bool(control.get("jump", false))
 	prediction_control["jump"] = jump_held and not predicted_jump_held
 	predicted_jump_held = jump_held
+	if not bool(player.get("jetpack_enabled", true)):
+		var angular_input: Vector3 = prediction_control.get("angular_input", Vector3.ZERO)
+		predicted_view_pitch_radians = clampf(
+			predicted_view_pitch_radians
+			+ angular_input.x * CHARACTER_MAXIMUM_ANGULAR_SPEED * delta,
+			-CHARACTER_MAXIMUM_VIEW_PITCH,
+			CHARACTER_MAXIMUM_VIEW_PITCH
+		)
 	var result := _integrate_player_motion(
 		predicted_position,
 		predicted_orientation,
@@ -4438,14 +4782,23 @@ func _player_position_is_clear(position: Vector3) -> bool:
 func _update_player_presentation(delta: float) -> void:
 	if not authoritative_player_ready:
 		return
-	var blend := clampf(delta * 12.0, 0.0, 1.0)
+	var blend := 1.0 - exp(-12.0 * maxf(delta, 0.0))
 	presentation_position_offset = presentation_position_offset.lerp(Vector3.ZERO, blend)
 	presentation_orientation_offset = _shortest_slerp(
 		presentation_orientation_offset, Quaternion.IDENTITY, blend
 	)
 	var locomotion: Dictionary = _local_player().get("locomotion", {})
-	var view_orientation := _player_view_orientation(predicted_orientation, locomotion)
-	camera.position = predicted_position + presentation_position_offset + _camera_eye_offset()
+	var interpolation_fraction := clampf(
+		Engine.get_physics_interpolation_fraction(), 0.0, 1.0
+	)
+	var render_position := _interpolated_prediction_position(interpolation_fraction)
+	var render_orientation := _interpolated_prediction_orientation(interpolation_fraction)
+	var render_view_pitch := _interpolated_prediction_view_pitch(interpolation_fraction)
+	var view_orientation := _view_orientation(
+		render_orientation, locomotion, render_view_pitch
+	)
+	last_presented_eye_offset = _prediction_camera_eye_offset(render_orientation)
+	camera.position = render_position + presentation_position_offset + last_presented_eye_offset
 	camera.quaternion = (presentation_orientation_offset * view_orientation).normalized()
 	var boost_amount := clampf(
 		predicted_linear_velocity.length() / CHARACTER_BOOST_MAXIMUM_SPEED, 0.0, 1.0
@@ -4468,10 +4821,61 @@ func _camera_eye_offset() -> Vector3:
 	return _camera_up() * CHARACTER_EYE_OFFSET
 
 
+func _prediction_camera_eye_offset(body_orientation: Quaternion) -> Vector3:
+	var up := (Basis(body_orientation) * Vector3.UP).normalized()
+	if up.length_squared() <= 0.000001:
+		up = _camera_up()
+	return up * CHARACTER_EYE_OFFSET
+
+
+func _interpolated_prediction_position(fraction: float) -> Vector3:
+	if not prediction_presentation_ready:
+		return predicted_position
+	return previous_predicted_position.lerp(predicted_position, clampf(fraction, 0.0, 1.0))
+
+
+func _interpolated_prediction_orientation(fraction: float) -> Quaternion:
+	if not prediction_presentation_ready:
+		return predicted_orientation
+	return _shortest_slerp(
+		previous_predicted_orientation,
+		predicted_orientation,
+		clampf(fraction, 0.0, 1.0)
+	)
+
+
+func _interpolated_prediction_view_pitch(fraction: float) -> float:
+	if not prediction_presentation_ready:
+		return predicted_view_pitch_radians
+	return lerpf(
+		previous_predicted_view_pitch_radians,
+		predicted_view_pitch_radians,
+		clampf(fraction, 0.0, 1.0)
+	)
+
+
 func _player_view_orientation(body_orientation: Quaternion, locomotion: Dictionary) -> Quaternion:
+	return _view_orientation(
+		body_orientation,
+		locomotion,
+		float(locomotion.get("view_pitch_radians", 0.0))
+	)
+
+
+func _predicted_player_view_orientation(
+	body_orientation: Quaternion, locomotion: Dictionary
+) -> Quaternion:
+	return _view_orientation(body_orientation, locomotion, predicted_view_pitch_radians)
+
+
+func _view_orientation(
+	body_orientation: Quaternion, locomotion: Dictionary, view_pitch_radians: float
+) -> Quaternion:
 	if String(locomotion.get("kind", "eva")) == "eva":
 		return body_orientation
-	var pitch := float(locomotion.get("view_pitch_radians", 0.0))
+	var pitch := clampf(
+		view_pitch_radians, -CHARACTER_MAXIMUM_VIEW_PITCH, CHARACTER_MAXIMUM_VIEW_PITCH
+	)
 	return (body_orientation * Quaternion(Vector3.RIGHT, pitch)).normalized()
 
 
@@ -6371,11 +6775,30 @@ func _owned_death_drop_recorded(player: Dictionary) -> bool:
 
 
 func _update_interface() -> void:
+	var environment := _local_environment()
+	var surface_operations := (
+		bool(environment.get("breathable", false))
+		and float(environment.get("altitude_m", INF)) < 25.0
+	)
+	if operation_title_label != null:
+		operation_title_label.text = (
+			"THE VERSE  //  KHEPRI SURFACE OPERATIONS"
+			if surface_operations
+			else "THE VERSE  //  ORBITAL OPERATIONS"
+		)
+	if contract_title_label != null:
+		contract_title_label.text = (
+			"KHEPRI OUTPOST COMMISSIONING"
+			if surface_operations
+			else "WAKE THE KHEPRI RELAY"
+		)
 	var link_text := "○ RELAY OFFLINE // F5 TO RETRY"
 	if connected:
 		match replication_state:
 			"ready":
 				link_text = "● LINKED // INTEREST VIEW %d" % interest_delta_sequence
+			"handoff":
+				link_text = "◆ CELL HANDOFF // %s" % handoff_phase.to_upper()
 			"stale":
 				link_text = "◐ LINK STALE // SAFE RESYNC IN PROGRESS"
 			"fatal":
@@ -6388,9 +6811,30 @@ func _update_interface() -> void:
 		Color(0.35, 0.95, 0.62)
 		if connected and replication_state == "ready"
 		else Color(1.0, 0.72, 0.24)
-		if connected and replication_state in ["loading", "stale"]
+		if connected and replication_state in ["loading", "stale", "handoff"]
 		else Color(1.0, 0.38, 0.25)
 	)
+	if handoff_overlay != null:
+		handoff_overlay.visible = handoff_phase != "live"
+		if handoff_overlay.visible:
+			var destination: Dictionary = handoff_destination_cell_key.get("cell", {})
+			var destination_text := "%s / %s / %s" % [
+				destination.get("x", "?"),
+				destination.get("y", "?"),
+				destination.get("z", "?"),
+			]
+			handoff_title_label.text = (
+				"VERIFYING DESTINATION"
+				if handoff_phase == "verifying_destination"
+				else "IMPORTING PLAYER AND CARGO"
+				if handoff_phase == "importing"
+				else "CROSSING CELL AUTHORITY"
+			)
+			handoff_detail_label.text = "%s\nCELL %s  //  PLACEMENT %d" % [
+				replication_detail,
+				destination_text,
+				handoff_placement_generation,
+			]
 	var player := _local_player()
 	_update_life_support_interface(player)
 	var level := int(player.get("level", 1))
@@ -6425,7 +6869,6 @@ func _update_interface() -> void:
 		if life_support_state != "normal"
 		else Color(0.64, 0.90, 0.94)
 	)
-	var environment := _local_environment()
 	var gravity_g := float(environment.get("gravity_m_s2", 0.0)) / 9.80665
 	var atmosphere_percent := roundi(float(environment.get("atmosphere_density", 0.0)) * 100.0)
 	status_label.text = (
