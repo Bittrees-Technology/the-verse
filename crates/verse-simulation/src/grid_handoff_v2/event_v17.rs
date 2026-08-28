@@ -12,60 +12,16 @@ use super::state::{
     DraftGridDirectoryAuthorityV2, DraftGridTransferAbortSideV2, DraftGridTransferCellStateV2,
 };
 use super::{
-    DRAFT_GRID_TRANSFER_PACKAGE_SCHEMA_VERSION, DraftGridClosureError, DraftGridClosurePackageV2,
-    hash_json, valid_blake3_hex, valid_stable_id,
+    DraftGridClosureError, DraftGridClosurePackageV2, DraftGridCompatibilityTupleV19, hash_json,
+    valid_blake3_hex, valid_stable_id,
 };
 use crate::event::ProductionScheduleOccurrence;
 
 pub(super) const DRAFT_GRID_EVENT_SCHEMA_VERSION: u32 = 17;
 const DRAFT_GRID_EVENT_SCHEMA_NAME: &str = "verse.world_event";
-const DRAFT_GRID_PROTOCOL_VERSION: u32 = 19;
-const DRAFT_GRID_WORLD_SCHEMA_VERSION: u32 = 21;
-const DRAFT_GRID_UNIVERSE_MANIFEST_SCHEMA_VERSION: u32 = 5;
-const DRAFT_GRID_DIRECTORY_SCHEMA_VERSION: u32 = 3;
 const DRAFT_GRID_EVENT_PAYLOAD_HASH_DOMAIN: &[u8] = b"the-verse/grid-event-payload/v17\0";
 const DRAFT_GRID_EVENT_HASH_DOMAIN: &[u8] = b"the-verse/world-event/v17\0";
 const MAX_DRAFT_GRID_EVENT_BYTES: usize = 20 * 1_024 * 1_024;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DraftGridCompatibilityTupleV17 {
-    protocol_version: u32,
-    projection_schema_version: u32,
-    world_schema_version: u32,
-    event_schema_version: u32,
-    content_schema_version: u32,
-    celestial_registry_schema_version: u32,
-    universe_manifest_schema_version: u32,
-    interest_schema_version: u32,
-    operation_fingerprint_schema_version: u32,
-    lifecycle_control_schema_version: u32,
-    production_occurrence_schema_version: u32,
-    cell_key_schema_version: u32,
-    directory_schema_version: u32,
-    transfer_package_schema_version: u32,
-}
-
-impl DraftGridCompatibilityTupleV17 {
-    const fn canonical() -> Self {
-        Self {
-            protocol_version: DRAFT_GRID_PROTOCOL_VERSION,
-            projection_schema_version: 5,
-            world_schema_version: DRAFT_GRID_WORLD_SCHEMA_VERSION,
-            event_schema_version: DRAFT_GRID_EVENT_SCHEMA_VERSION,
-            content_schema_version: 11,
-            celestial_registry_schema_version: 1,
-            universe_manifest_schema_version: DRAFT_GRID_UNIVERSE_MANIFEST_SCHEMA_VERSION,
-            interest_schema_version: 3,
-            operation_fingerprint_schema_version: 2,
-            lifecycle_control_schema_version: 2,
-            production_occurrence_schema_version: 1,
-            cell_key_schema_version: 1,
-            directory_schema_version: DRAFT_GRID_DIRECTORY_SCHEMA_VERSION,
-            transfer_package_schema_version: DRAFT_GRID_TRANSFER_PACKAGE_SCHEMA_VERSION,
-        }
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event_type", rename_all = "snake_case", deny_unknown_fields)]
@@ -110,7 +66,7 @@ pub(super) enum DraftGridEventPayloadV17 {
 pub(super) struct DraftCanonicalGridEventV17 {
     schema_name: String,
     schema_version: u32,
-    compatibility: DraftGridCompatibilityTupleV17,
+    compatibility: DraftGridCompatibilityTupleV19,
     content_manifest_version: String,
     universe_manifest_hash: String,
     celestial_registry_hash: String,
@@ -232,7 +188,7 @@ impl DraftCanonicalGridEventV17 {
         let mut event = Self {
             schema_name: DRAFT_GRID_EVENT_SCHEMA_NAME.into(),
             schema_version: DRAFT_GRID_EVENT_SCHEMA_VERSION,
-            compatibility: DraftGridCompatibilityTupleV17::canonical(),
+            compatibility: DraftGridCompatibilityTupleV19::canonical(),
             content_manifest_version: base.content_manifest_version.clone(),
             universe_manifest_hash: base.universe_manifest_hash.clone(),
             celestial_registry_hash: base.celestial_registry_hash.clone(),
@@ -297,7 +253,7 @@ impl DraftCanonicalGridEventV17 {
         };
         if self.schema_name != DRAFT_GRID_EVENT_SCHEMA_NAME
             || self.schema_version != DRAFT_GRID_EVENT_SCHEMA_VERSION
-            || self.compatibility != DraftGridCompatibilityTupleV17::canonical()
+            || self.compatibility != DraftGridCompatibilityTupleV19::canonical()
             || !valid_stable_id(&self.event_id)
             || self.event_sequence != expected_sequence
             || self.occurred_at_unix_ms == 0
@@ -386,7 +342,7 @@ impl DraftCanonicalGridEventV17 {
         }
         if event.schema_name != DRAFT_GRID_EVENT_SCHEMA_NAME
             || event.schema_version != DRAFT_GRID_EVENT_SCHEMA_VERSION
-            || event.compatibility != DraftGridCompatibilityTupleV17::canonical()
+            || event.compatibility != DraftGridCompatibilityTupleV19::canonical()
             || !valid_stable_id(&event.event_id)
             || event.event_sequence == 0
             || event.occurred_at_unix_ms == 0
