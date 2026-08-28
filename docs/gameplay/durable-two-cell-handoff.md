@@ -598,15 +598,21 @@ and job-origin closure; rebases only derived destination poses; records the
 checked import witness; advances one event; and derives the exact machine holds
 without advancing the production clock or any job. It then seals the pending
 lock, active-world result, typed proof, and historical record atomically, with
-an exact no-op retry. Until distinct authenticated activation and
-eligibility-release witnesses exist, restart validation requires every
-committed import to retain its exact pending lock and complete machine-hold
-set; advancing an unrelated event cannot erase either authority. Dormant
-directory v3 persists and revalidates the complete typed destination-import
-proof and requires imported/finalized retries to match the local historical
-proof exactly. Destination activation, source finalization, the explicit
-transfer-paused production outcome, and crash/replay integration remain to be
-implemented before activation. All drafts are
+an exact no-op retry. Before activation, restart validation requires the exact
+pending lock and complete machine-hold set. The pure activation transaction
+removes only that pending gameplay lock, advances one event, and seals the
+prior/resulting active worlds, exact import proof, trusted time, mutation, and
+final proof in historical evidence. At the activation frontier, validation
+reconstructs the pre-removal active world; after later events it permits
+ordinary motion, damage, rider changes, and a new transfer ID for the same grid.
+Production remains independently held: every eligibility binds the exact
+import boundary and full packaged queue hash, so even a same-job-ID queue-body
+change fails until an authenticated release transaction exists. Dormant
+directory v3 persists and reconstructs both typed destination import and
+activation proofs, and Imported/Finalized retries must match the local
+historical results exactly. Source finalization, eligibility release and the
+explicit transfer-paused scheduler outcome, plus crash/replay integration,
+remain to be implemented before activation. All drafts are
 intentionally unreachable from the production directory-v2/package-v1 paths
 until every version in the table above moves in one coordinated activation.
 

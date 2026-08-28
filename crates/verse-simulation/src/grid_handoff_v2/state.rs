@@ -44,6 +44,10 @@ const IMPORT_WITNESS_HASH_DOMAIN: &[u8] = b"the-verse/grid-transfer-import-witne
 const IMPORT_EVENT_HASH_DOMAIN: &[u8] = b"the-verse/grid-transfer-import-event/v2\0";
 const IMPORT_PROOF_HASH_DOMAIN: &[u8] = b"the-verse/grid-transfer-import-proof/v2\0";
 const IMPORT_RECORD_HASH_DOMAIN: &[u8] = b"the-verse/grid-transfer-import-record/v2\0";
+const ACTIVATION_WITNESS_HASH_DOMAIN: &[u8] = b"the-verse/grid-transfer-activation-witness/v2\0";
+const ACTIVATION_EVENT_HASH_DOMAIN: &[u8] = b"the-verse/grid-transfer-activation-event/v2\0";
+const ACTIVATION_PROOF_HASH_DOMAIN: &[u8] = b"the-verse/grid-transfer-activation-proof/v2\0";
+const ACTIVATION_RECORD_HASH_DOMAIN: &[u8] = b"the-verse/grid-transfer-activation-record/v2\0";
 const DRAFT_ACTIVE_WORLD_HASH_DOMAIN: &[u8] = b"the-verse/grid-transfer-active-world/v21\0";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -226,6 +230,29 @@ struct DraftGridImportRecordV2 {
     record_hash: String,
 }
 
+/// Historical proof that the destination released the imported closure for
+/// ordinary gameplay. Imported production eligibility remains independently
+/// held until its exact one-second boundary is processed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DraftGridActivationRecordV2 {
+    schema_version: u32,
+    pending: DraftPendingGridImportV2,
+    destination_assignment_generation: u64,
+    live_fencing_token: u64,
+    prior_event_sequence: u64,
+    prior_event_hash: String,
+    activation_event_sequence: u64,
+    activation_event_hash: String,
+    prior_active_world_hash: String,
+    resulting_active_world_hash: String,
+    destination_import_proof_hash: String,
+    activated_at_unix_ms: u64,
+    mutation_witness_hash: String,
+    proof_hash: String,
+    record_hash: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DraftGridExportProofV2 {
@@ -274,6 +301,30 @@ pub(crate) struct DraftGridImportProofV2 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct DraftGridActivationProofV2 {
+    pub(crate) transfer_id: String,
+    pub(crate) root_aggregate_id: String,
+    pub(crate) member_root: String,
+    pub(crate) package_hash: String,
+    pub(crate) destination_cell_id: String,
+    pub(crate) assignment_generation: u64,
+    pub(crate) fencing_token: u64,
+    pub(crate) prior_event_sequence: u64,
+    pub(crate) prior_event_hash: String,
+    pub(crate) event_sequence: u64,
+    pub(crate) event_hash: String,
+    pub(crate) prior_active_world_hash: String,
+    pub(crate) resulting_active_world_hash: String,
+    pub(crate) quarantine_receipt_hash: String,
+    pub(crate) destination_import_proof_hash: String,
+    pub(crate) imported_at_unix_ms: u64,
+    pub(crate) activated_at_unix_ms: u64,
+    pub(crate) production_eligibility_root: String,
+    pub(crate) mutation_witness_hash: String,
+    pub(crate) proof_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct DraftGridAbortCleanupProofV2 {
     pub(crate) side: DraftGridTransferAbortSideV2,
     pub(crate) transfer_id: String,
@@ -302,6 +353,7 @@ pub(super) struct DraftGridTransferCellStateV2 {
     imported_production_eligibilities: BTreeMap<String, DraftImportedProductionEligibilityV2>,
     committed_exports: BTreeMap<String, DraftGridExportRecordV2>,
     committed_imports: BTreeMap<String, DraftGridImportRecordV2>,
+    committed_activations: BTreeMap<String, DraftGridActivationRecordV2>,
     abort_witnesses: BTreeMap<String, DraftGridTransferAbortWitnessV2>,
     state_hash: String,
 }
@@ -338,6 +390,26 @@ struct DraftGridImportEventHashMaterialV2<'a> {
     mutation_witness_hash: &'a str,
 }
 
+#[derive(Serialize)]
+struct DraftGridActivationEventHashMaterialV2<'a> {
+    transfer_id: &'a str,
+    root_aggregate_id: &'a str,
+    member_root: &'a str,
+    package_hash: &'a str,
+    destination_cell_id: &'a str,
+    assignment_generation: u64,
+    fencing_token: u64,
+    prior_event_sequence: u64,
+    prior_event_hash: &'a str,
+    event_sequence: u64,
+    quarantine_receipt_hash: &'a str,
+    destination_import_proof_hash: &'a str,
+    imported_at_unix_ms: u64,
+    activated_at_unix_ms: u64,
+    production_eligibility_root: &'a str,
+    mutation_witness_hash: &'a str,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum DraftGridDirectoryProofKindV2 {
     SourcePrepare,
@@ -359,6 +431,7 @@ struct DraftGridDirectoryAuthorityV2 {
     source_exported_at_unix_ms: Option<u64>,
     source_export_proof: Option<DraftGridExportProofV2>,
     destination_import_proof: Option<DraftGridImportProofV2>,
+    destination_activation_proof: Option<DraftGridActivationProofV2>,
     proofs: BTreeSet<DraftGridDirectoryProofKindV2>,
     live_source_assignment_generation: u64,
     live_source_fencing_token: u64,
@@ -519,6 +592,7 @@ impl DraftGridDirectoryAuthorityV2 {
     fn from_validated_v3(authority: &ValidatedGridTransferAuthorityV3) -> Self {
         let source_export_proof = authority.source_export_cell_proof();
         let destination_import_proof = authority.destination_import_cell_proof();
+        let destination_activation_proof = authority.destination_activation_cell_proof();
         let proofs = [
             (
                 authority.source_prepare_proven(),
@@ -569,6 +643,7 @@ impl DraftGridDirectoryAuthorityV2 {
                 .and_then(DirectoryPhaseProofV3::trusted_time_unix_ms),
             source_export_proof,
             destination_import_proof,
+            destination_activation_proof,
             proofs,
             live_source_assignment_generation: authority.live_source_assignment_generation(),
             live_source_fencing_token: authority.live_source_fencing_token(),
@@ -588,6 +663,7 @@ impl DraftGridDirectoryAuthorityV2 {
             source_exported_at_unix_ms: None,
             source_export_proof: None,
             destination_import_proof: None,
+            destination_activation_proof: None,
             proofs: BTreeSet::new(),
             live_source_assignment_generation: package.source_assignment_generation,
             live_source_fencing_token: package.source_fencing_token,
@@ -684,6 +760,7 @@ impl DraftGridDirectoryAuthorityV2 {
             && (has_export == self.source_exported_at_unix_ms.is_some())
             && (has_export == self.source_export_proof.is_some())
             && (has_import == self.destination_import_proof.is_some())
+            && (has_activation == self.destination_activation_proof.is_some())
             && self.source_export_proof.as_ref().is_none_or(|proof| {
                 self.source_export_proof_hash.as_deref() == Some(proof.proof_hash.as_str())
                     && self.source_exported_at_unix_ms == Some(proof.exported_at_unix_ms)
@@ -695,6 +772,19 @@ impl DraftGridDirectoryAuthorityV2 {
                         == Some(proof.source_export_proof_hash.as_str())
                     && self.source_exported_at_unix_ms == Some(proof.source_exported_at_unix_ms)
             })
+            && self
+                .destination_activation_proof
+                .as_ref()
+                .is_none_or(|proof| {
+                    self.quarantine_receipt_hash.as_deref()
+                        == Some(proof.quarantine_receipt_hash.as_str())
+                        && self
+                            .destination_import_proof
+                            .as_ref()
+                            .is_some_and(|import| {
+                                import.proof_hash == proof.destination_import_proof_hash
+                            })
+                })
             && (!has_import || has_export)
             && (!has_activation || has_import)
             && (!has_finalization || has_activation);
@@ -757,6 +847,27 @@ impl DraftGridDirectoryAuthorityV2 {
                     || self.source_exported_at_unix_ms != Some(proof.source_exported_at_unix_ms)
                     || proof.ledger_vector != expected_ledger_vector
             })
+            || self
+                .destination_activation_proof
+                .as_ref()
+                .is_some_and(|proof| {
+                    proof.validate().is_err()
+                        || proof.transfer_id != package.transfer_id
+                        || proof.root_aggregate_id != package.root_aggregate_id
+                        || proof.member_root != package.member_root
+                        || proof.package_hash != package.package_hash
+                        || proof.destination_cell_id != package.destination_cell_id
+                        || proof.assignment_generation < package.destination_assignment_generation
+                        || proof.fencing_token < package.destination_fencing_token
+                        || self.quarantine_receipt_hash.as_deref()
+                            != Some(proof.quarantine_receipt_hash.as_str())
+                        || self.destination_import_proof.as_ref().is_none_or(|import| {
+                            import.proof_hash != proof.destination_import_proof_hash
+                                || import.imported_at_unix_ms != proof.imported_at_unix_ms
+                                || import.production_eligibility_root
+                                    != proof.production_eligibility_root
+                        })
+                })
         {
             return Err(DraftGridClosureError::Invalid(
                 "directory authority does not bind the exact grid package".into(),
@@ -1511,6 +1622,210 @@ impl DraftGridImportProofV2 {
     }
 }
 
+impl DraftGridActivationRecordV2 {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        pending: DraftPendingGridImportV2,
+        destination_assignment_generation: u64,
+        live_fencing_token: u64,
+        prior_event_sequence: u64,
+        prior_event_hash: String,
+        prior_active_world_hash: String,
+        destination_import_proof_hash: String,
+        activated_at_unix_ms: u64,
+    ) -> Result<Self, DraftGridClosureError> {
+        let activation_event_sequence = prior_event_sequence.checked_add(1).ok_or_else(|| {
+            DraftGridClosureError::Unsupported(
+                "destination activation event sequence exhausted".into(),
+            )
+        })?;
+        let mut record = Self {
+            schema_version: DRAFT_GRID_TRANSFER_RECEIPT_SCHEMA_VERSION,
+            pending,
+            destination_assignment_generation,
+            live_fencing_token,
+            prior_event_sequence,
+            prior_event_hash,
+            activation_event_sequence,
+            activation_event_hash: String::new(),
+            prior_active_world_hash,
+            resulting_active_world_hash: String::new(),
+            destination_import_proof_hash,
+            activated_at_unix_ms,
+            mutation_witness_hash: String::new(),
+            proof_hash: String::new(),
+            record_hash: String::new(),
+        };
+        record.mutation_witness_hash = record.calculate_mutation_hash()?;
+        record.activation_event_hash = record.proof().calculate_event_hash()?;
+        Ok(record)
+    }
+
+    fn seal_resulting_active_world_hash(
+        &mut self,
+        state: &DraftGridTransferCellStateV2,
+    ) -> Result<(), DraftGridClosureError> {
+        self.resulting_active_world_hash = state.calculate_active_world_hash()?;
+        self.proof_hash = self.proof().calculate_hash()?;
+        self.record_hash = self.calculate_hash()?;
+        Ok(())
+    }
+
+    fn calculate_mutation_hash(&self) -> Result<String, DraftGridClosureError> {
+        let mut material = self.clone();
+        material.activation_event_hash.clear();
+        material.resulting_active_world_hash.clear();
+        material.mutation_witness_hash.clear();
+        material.proof_hash.clear();
+        material.record_hash.clear();
+        hash_json(ACTIVATION_WITNESS_HASH_DOMAIN, &material)
+    }
+
+    fn calculate_hash(&self) -> Result<String, DraftGridClosureError> {
+        let mut material = self.clone();
+        material.record_hash.clear();
+        hash_json(ACTIVATION_RECORD_HASH_DOMAIN, &material)
+    }
+
+    fn proof(&self) -> DraftGridActivationProofV2 {
+        DraftGridActivationProofV2 {
+            transfer_id: self.pending.reservation.binding.transfer_id.clone(),
+            root_aggregate_id: self.pending.reservation.binding.root_aggregate_id.clone(),
+            member_root: self.pending.reservation.binding.member_root.clone(),
+            package_hash: self.pending.reservation.binding.package_hash.clone(),
+            destination_cell_id: self.pending.reservation.binding.destination_cell_id.clone(),
+            assignment_generation: self.destination_assignment_generation,
+            fencing_token: self.live_fencing_token,
+            prior_event_sequence: self.prior_event_sequence,
+            prior_event_hash: self.prior_event_hash.clone(),
+            event_sequence: self.activation_event_sequence,
+            event_hash: self.activation_event_hash.clone(),
+            prior_active_world_hash: self.prior_active_world_hash.clone(),
+            resulting_active_world_hash: self.resulting_active_world_hash.clone(),
+            quarantine_receipt_hash: self.pending.reservation.receipt_hash.clone(),
+            destination_import_proof_hash: self.destination_import_proof_hash.clone(),
+            imported_at_unix_ms: self.pending.imported_at_unix_ms,
+            activated_at_unix_ms: self.activated_at_unix_ms,
+            production_eligibility_root: self.pending.production_eligibility_root.clone(),
+            mutation_witness_hash: self.mutation_witness_hash.clone(),
+            proof_hash: self.proof_hash.clone(),
+        }
+    }
+
+    fn validate_with_import(
+        &self,
+        import: &DraftGridImportRecordV2,
+    ) -> Result<(), DraftGridClosureError> {
+        self.pending.validate()?;
+        let proof = self.proof();
+        if self.schema_version != DRAFT_GRID_TRANSFER_RECEIPT_SCHEMA_VERSION
+            || import.pending != self.pending
+            || self.destination_import_proof_hash != import.proof_hash
+            || self.destination_assignment_generation
+                < self.pending.destination_assignment_generation
+            || self.live_fencing_token < self.pending.live_fencing_token
+            || self.prior_event_sequence < self.pending.import_event_sequence
+            || (self.prior_event_sequence == self.pending.import_event_sequence
+                && (self.prior_event_hash != self.pending.import_event_hash
+                    || self.prior_active_world_hash != import.resulting_active_world_hash))
+            || (self.prior_event_sequence == 0 && !self.prior_event_hash.is_empty())
+            || (self.prior_event_sequence > 0 && !valid_blake3_hex(&self.prior_event_hash))
+            || self.prior_event_sequence.checked_add(1) != Some(self.activation_event_sequence)
+            || !valid_blake3_hex(&self.prior_active_world_hash)
+            || !valid_blake3_hex(&self.resulting_active_world_hash)
+            || self.activated_at_unix_ms < self.pending.imported_at_unix_ms
+            || !valid_blake3_hex(&self.mutation_witness_hash)
+            || self.mutation_witness_hash != self.calculate_mutation_hash()?
+            || !valid_blake3_hex(&self.activation_event_hash)
+            || self.activation_event_hash != proof.calculate_event_hash()?
+            || !valid_blake3_hex(&self.proof_hash)
+            || self.proof_hash != proof.calculate_hash()?
+            || !valid_blake3_hex(&self.record_hash)
+            || self.record_hash != self.calculate_hash()?
+        {
+            return Err(DraftGridClosureError::Invalid(
+                "grid activation record identity, frontier, or hash is invalid".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl DraftGridActivationProofV2 {
+    fn calculate_event_hash(&self) -> Result<String, DraftGridClosureError> {
+        hash_json(
+            ACTIVATION_EVENT_HASH_DOMAIN,
+            &DraftGridActivationEventHashMaterialV2 {
+                transfer_id: &self.transfer_id,
+                root_aggregate_id: &self.root_aggregate_id,
+                member_root: &self.member_root,
+                package_hash: &self.package_hash,
+                destination_cell_id: &self.destination_cell_id,
+                assignment_generation: self.assignment_generation,
+                fencing_token: self.fencing_token,
+                prior_event_sequence: self.prior_event_sequence,
+                prior_event_hash: &self.prior_event_hash,
+                event_sequence: self.event_sequence,
+                quarantine_receipt_hash: &self.quarantine_receipt_hash,
+                destination_import_proof_hash: &self.destination_import_proof_hash,
+                imported_at_unix_ms: self.imported_at_unix_ms,
+                activated_at_unix_ms: self.activated_at_unix_ms,
+                production_eligibility_root: &self.production_eligibility_root,
+                mutation_witness_hash: &self.mutation_witness_hash,
+            },
+        )
+    }
+
+    fn calculate_hash(&self) -> Result<String, DraftGridClosureError> {
+        let mut material = self.clone();
+        material.proof_hash.clear();
+        hash_json(ACTIVATION_PROOF_HASH_DOMAIN, &material)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seal_hashes_for_test(&mut self) -> Result<(), String> {
+        self.event_hash = self
+            .calculate_event_hash()
+            .map_err(|source| source.to_string())?;
+        self.proof_hash = self.calculate_hash().map_err(|source| source.to_string())?;
+        Ok(())
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if !valid_stable_id(&self.transfer_id)
+            || !valid_stable_id(&self.root_aggregate_id)
+            || !valid_blake3_hex(&self.member_root)
+            || !valid_blake3_hex(&self.package_hash)
+            || !valid_blake3_hex(&self.destination_cell_id)
+            || self.assignment_generation == 0
+            || self.fencing_token == 0
+            || (self.prior_event_sequence == 0 && !self.prior_event_hash.is_empty())
+            || (self.prior_event_sequence > 0 && !valid_blake3_hex(&self.prior_event_hash))
+            || self.prior_event_sequence.checked_add(1) != Some(self.event_sequence)
+            || !valid_blake3_hex(&self.event_hash)
+            || self.event_hash
+                != self
+                    .calculate_event_hash()
+                    .map_err(|source| source.to_string())?
+            || !valid_blake3_hex(&self.prior_active_world_hash)
+            || !valid_blake3_hex(&self.resulting_active_world_hash)
+            || !valid_blake3_hex(&self.quarantine_receipt_hash)
+            || !valid_blake3_hex(&self.destination_import_proof_hash)
+            || self.imported_at_unix_ms == 0
+            || self.activated_at_unix_ms < self.imported_at_unix_ms
+            || !valid_blake3_hex(&self.production_eligibility_root)
+            || !valid_blake3_hex(&self.mutation_witness_hash)
+            || !valid_blake3_hex(&self.proof_hash)
+            || self.proof_hash != self.calculate_hash().map_err(|source| source.to_string())?
+        {
+            return Err(
+                "grid destination-activation proof is not canonical fenced material".into(),
+            );
+        }
+        Ok(())
+    }
+}
+
 impl DraftGridTransferAbortWitnessV2 {
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -1718,6 +2033,7 @@ impl DraftGridTransferCellStateV2 {
             imported_production_eligibilities: BTreeMap::new(),
             committed_exports: BTreeMap::new(),
             committed_imports: BTreeMap::new(),
+            committed_activations: BTreeMap::new(),
             abort_witnesses: BTreeMap::new(),
             state_hash: String::new(),
         };
@@ -1778,6 +2094,7 @@ impl DraftGridTransferCellStateV2 {
             || self.aggregate_locks.len() > MAX_DRAFT_TRANSFERS_PER_CELL
             || self.aggregate_reservations.len() > MAX_DRAFT_TRANSFERS_PER_CELL
             || self.pending_imports.len() > MAX_DRAFT_TRANSFERS_PER_CELL
+            || self.committed_activations.len() > MAX_DRAFT_TRANSFERS_PER_CELL
             || self.imported_production_eligibilities.len()
                 > MAX_DRAFT_IMPORTED_PRODUCTION_ELIGIBILITIES_PER_CELL
             || self.committed_exports.len() > MAX_DRAFT_TRANSFERS_PER_CELL
@@ -1859,6 +2176,7 @@ impl DraftGridTransferCellStateV2 {
                     .contains_key(&pending.reservation.binding.root_aggregate_id)
                 || self.aggregate_reservations.contains_key(transfer_id)
                 || self.committed_exports.contains_key(transfer_id)
+                || self.committed_activations.contains_key(transfer_id)
                 || self.abort_witnesses.contains_key(transfer_id)
                 || self
                     .base
@@ -1948,6 +2266,14 @@ impl DraftGridTransferCellStateV2 {
         }
         for (transfer_id, import) in &self.committed_imports {
             import.validate()?;
+            let pending_matches = self
+                .pending_imports
+                .get(transfer_id)
+                .is_some_and(|pending| pending == &import.pending);
+            let activation_matches = self
+                .committed_activations
+                .get(transfer_id)
+                .is_some_and(|activation| activation.pending == import.pending);
             if transfer_id != &import.pending.reservation.binding.transfer_id
                 || import.pending.reservation.binding.destination_cell_id != self.base.cell_id
                 || self.base.fencing_token < import.pending.live_fencing_token
@@ -1958,15 +2284,11 @@ impl DraftGridTransferCellStateV2 {
                     && self.calculate_active_world_hash()? != import.resulting_active_world_hash)
                 || self.base.transfer_witnesses.get(transfer_id)
                     != Some(&import.pending.conservation_witness)
+                || pending_matches == activation_matches
                 || self
-                    .pending_imports
-                    .get(transfer_id)
-                    .is_none_or(|pending| pending != &import.pending)
-                || self.aggregate_locks.values().any(|lock| {
-                    lock.binding.transfer_id == *transfer_id
-                        || lock.binding.root_aggregate_id
-                            == import.pending.reservation.binding.root_aggregate_id
-                })
+                    .aggregate_locks
+                    .values()
+                    .any(|lock| lock.binding.transfer_id == *transfer_id)
                 || self.aggregate_reservations.contains_key(transfer_id)
                 || self.committed_exports.contains_key(transfer_id)
                 || self.abort_witnesses.contains_key(transfer_id)
@@ -1974,6 +2296,89 @@ impl DraftGridTransferCellStateV2 {
                 return Err(DraftGridClosureError::Invalid(
                     "committed import does not bind one exact historical destination result".into(),
                 ));
+            }
+        }
+        for (transfer_id, activation) in &self.committed_activations {
+            let import = self.committed_imports.get(transfer_id).ok_or_else(|| {
+                DraftGridClosureError::Invalid(
+                    "committed activation has no historical destination import".into(),
+                )
+            })?;
+            activation.validate_with_import(import)?;
+            let import_boundary = activation.pending.import_boundary();
+            let at_activation_frontier =
+                self.base.event_sequence == activation.activation_event_sequence;
+            let prior_active_world_matches = if at_activation_frontier {
+                let mut prior = self.clone();
+                prior.committed_activations.remove(transfer_id);
+                prior
+                    .pending_imports
+                    .insert(transfer_id.clone(), activation.pending.clone());
+                prior.base.event_sequence = activation.prior_event_sequence;
+                prior
+                    .base
+                    .last_event_hash
+                    .clone_from(&activation.prior_event_hash);
+                prior.calculate_active_world_hash()? == activation.prior_active_world_hash
+            } else {
+                true
+            };
+            let eligibilities = self
+                .imported_production_eligibilities
+                .iter()
+                .filter(|(_, eligibility)| eligibility.transfer_id() == transfer_id)
+                .map(|(machine_id, eligibility)| (machine_id.clone(), eligibility.clone()))
+                .collect::<BTreeMap<_, _>>();
+            if transfer_id != &activation.pending.reservation.binding.transfer_id
+                || activation.pending.reservation.binding.destination_cell_id != self.base.cell_id
+                || self.base.fencing_token < activation.live_fencing_token
+                || self.base.event_sequence < activation.activation_event_sequence
+                || (at_activation_frontier
+                    && self.base.last_event_hash != activation.activation_event_hash)
+                || (at_activation_frontier
+                    && self.calculate_active_world_hash()?
+                        != activation.resulting_active_world_hash)
+                || !prior_active_world_matches
+                || self.pending_imports.contains_key(transfer_id)
+                || (at_activation_frontier
+                    && !frozen_closure_is_present(
+                        &self.base,
+                        &activation.pending.reservation.frozen,
+                    ))
+                || self.base.transfer_witnesses.get(transfer_id)
+                    != Some(&activation.pending.conservation_witness)
+                || self
+                    .aggregate_locks
+                    .values()
+                    .any(|lock| lock.binding.transfer_id == *transfer_id)
+                || self.aggregate_reservations.contains_key(transfer_id)
+                || self.committed_exports.contains_key(transfer_id)
+                || self.abort_witnesses.contains_key(transfer_id)
+                || eligibilities.keys().ne(activation
+                    .pending
+                    .reservation
+                    .frozen
+                    .machine_block_ids
+                    .iter())
+                || imported_production_eligibility_map_root(&eligibilities)?
+                    != activation.pending.production_eligibility_root
+            {
+                return Err(DraftGridClosureError::Invalid(
+                    "committed activation does not release one exact imported closure".into(),
+                ));
+            }
+            for (machine_id, eligibility) in &eligibilities {
+                let queue = self.base.production_queues.get(machine_id).ok_or_else(|| {
+                    DraftGridClosureError::Invalid(
+                        "activated import eligibility lost its resident machine queue".into(),
+                    )
+                })?;
+                eligibility.validate_persisted_in_world(&self.base, queue)?;
+                eligibility.validate_persisted_import_boundary(
+                    transfer_id,
+                    &activation.pending.reservation.binding.package_hash,
+                    &import_boundary,
+                )?;
             }
         }
         for (machine_id, eligibility) in &self.imported_production_eligibilities {
@@ -2135,6 +2540,7 @@ fn draft_transfer_count(state: &DraftGridTransferCellStateV2) -> usize {
         .chain(state.pending_imports.keys().map(String::as_str))
         .chain(state.committed_exports.keys().map(String::as_str))
         .chain(state.committed_imports.keys().map(String::as_str))
+        .chain(state.committed_activations.keys().map(String::as_str))
         .chain(state.abort_witnesses.keys().map(String::as_str))
         .collect::<BTreeSet<_>>()
         .len()
@@ -2813,7 +3219,13 @@ fn stage_committed_grid_import_v2(
             ));
         }
         existing.validate_request(package, authority)?;
-        if state.pending_imports.get(&package.transfer_id) != Some(&existing.pending)
+        let pending_matches =
+            state.pending_imports.get(&package.transfer_id) == Some(&existing.pending);
+        let activation_matches = state
+            .committed_activations
+            .get(&package.transfer_id)
+            .is_some_and(|activation| activation.pending == existing.pending);
+        if pending_matches == activation_matches
             || state.base.transfer_witnesses.get(&package.transfer_id)
                 != Some(&existing.pending.conservation_witness)
         {
@@ -3071,6 +3483,137 @@ fn stage_committed_grid_import_v2(
     {
         return Err(DraftGridClosureError::Changed(
             "destination import overwrote historical import evidence".into(),
+        ));
+    }
+    next.seal()?;
+    proof.validate().map_err(DraftGridClosureError::Invalid)?;
+    Ok((next, proof))
+}
+
+fn stage_imported_grid_activation_v2(
+    state: &DraftGridTransferCellStateV2,
+    trusted_now_unix_ms: u64,
+    package: &DraftGridClosurePackageV2,
+    authority: &DraftGridDirectoryAuthorityV2,
+) -> Result<(DraftGridTransferCellStateV2, DraftGridActivationProofV2), DraftGridClosureError> {
+    state.validate()?;
+    package.validate_wire()?;
+    authority.validate_package(package)?;
+    if !authority.has_proof(DraftGridDirectoryProofKindV2::SourcePrepare)
+        || !authority.has_proof(DraftGridDirectoryProofKindV2::DestinationQuarantine)
+        || !authority.has_proof(DraftGridDirectoryProofKindV2::SourceExport)
+        || !authority.has_proof(DraftGridDirectoryProofKindV2::DestinationImport)
+        || authority.has_proof(DraftGridDirectoryProofKindV2::SourceAbort)
+        || authority.has_proof(DraftGridDirectoryProofKindV2::DestinationAbort)
+        || state.base.cell_id != package.destination_cell_id
+        || state.base.fencing_token != authority.live_destination_fencing_token
+    {
+        return Err(DraftGridClosureError::Invalid(
+            "destination activation lacks exact imported directory and live-fence authority".into(),
+        ));
+    }
+    let import = state
+        .committed_imports
+        .get(&package.transfer_id)
+        .cloned()
+        .ok_or_else(|| {
+            DraftGridClosureError::Changed(
+                "destination activation lost its historical import evidence".into(),
+            )
+        })?;
+    let import_proof = import.proof();
+    if authority.destination_import_proof.as_ref() != Some(&import_proof) {
+        return Err(DraftGridClosureError::Changed(
+            "destination activation changed its directory-retained import proof".into(),
+        ));
+    }
+    if let Some(existing) = state.committed_activations.get(&package.transfer_id) {
+        existing.validate_with_import(&import)?;
+        let existing_proof = existing.proof();
+        let directory_retry_matches = match authority.phase {
+            TransferPhase::Imported => {
+                if authority.has_proof(DraftGridDirectoryProofKindV2::DestinationActivation) {
+                    authority.destination_activation_proof.as_ref() == Some(&existing_proof)
+                } else {
+                    authority.destination_activation_proof.is_none()
+                }
+            }
+            TransferPhase::Finalized => {
+                authority.destination_activation_proof.as_ref() == Some(&existing_proof)
+            }
+            _ => false,
+        };
+        if !directory_retry_matches
+            || state.pending_imports.contains_key(&package.transfer_id)
+            || state.base.transfer_witnesses.get(&package.transfer_id)
+                != Some(&existing.pending.conservation_witness)
+        {
+            return Err(DraftGridClosureError::Changed(
+                "destination-activation retry conflicts with durable cell or directory evidence"
+                    .into(),
+            ));
+        }
+        return Ok((state.clone(), existing_proof));
+    }
+    if authority.phase != TransferPhase::Imported
+        || authority.has_proof(DraftGridDirectoryProofKindV2::DestinationActivation)
+        || authority.has_proof(DraftGridDirectoryProofKindV2::SourceFinalization)
+        || authority.destination_activation_proof.is_some()
+        || trusted_now_unix_ms < import.pending.imported_at_unix_ms
+    {
+        return Err(DraftGridClosureError::Invalid(
+            "first destination activation requires the exact pre-activation imported boundary"
+                .into(),
+        ));
+    }
+    let pending = state
+        .pending_imports
+        .get(&package.transfer_id)
+        .cloned()
+        .ok_or_else(|| {
+            DraftGridClosureError::Changed(
+                "destination activation lost its pending imported closure".into(),
+            )
+        })?;
+    if pending != import.pending
+        || pending.reservation.binding != DraftGridTransferBindingV2::from_package(package)
+        || pending.reservation.frozen != DraftFrozenClosureIdsV2::from_package(package)
+    {
+        return Err(DraftGridClosureError::Changed(
+            "destination activation changed its exact imported closure".into(),
+        ));
+    }
+
+    let mut record = DraftGridActivationRecordV2::new(
+        pending.clone(),
+        authority.live_destination_assignment_generation,
+        authority.live_destination_fencing_token,
+        state.base.event_sequence,
+        state.base.last_event_hash.clone(),
+        state.calculate_active_world_hash()?,
+        import.proof_hash.clone(),
+        trusted_now_unix_ms,
+    )?;
+    let mut next = state.clone();
+    if next.pending_imports.remove(&package.transfer_id).as_ref() != Some(&pending) {
+        return Err(DraftGridClosureError::Changed(
+            "destination activation could not release its exact pending lock".into(),
+        ));
+    }
+    next.base.event_sequence = record.activation_event_sequence;
+    next.base
+        .last_event_hash
+        .clone_from(&record.activation_event_hash);
+    record.seal_resulting_active_world_hash(&next)?;
+    record.validate_with_import(&import)?;
+    let proof = record.proof();
+    if next
+        .committed_activations
+        .insert(package.transfer_id.clone(), record)
+        .is_some()
+    {
+        return Err(DraftGridClosureError::Changed(
+            "destination activation overwrote historical activation evidence".into(),
         ));
     }
     next.seal()?;
@@ -3394,6 +3937,42 @@ mod tests {
         proof
     }
 
+    fn synthetic_activation_proof(
+        package: &DraftGridClosurePackageV2,
+        import: &DraftGridImportProofV2,
+    ) -> DraftGridActivationProofV2 {
+        let mut proof = DraftGridActivationProofV2 {
+            transfer_id: package.transfer_id.clone(),
+            root_aggregate_id: package.root_aggregate_id.clone(),
+            member_root: package.member_root.clone(),
+            package_hash: package.package_hash.clone(),
+            destination_cell_id: package.destination_cell_id.clone(),
+            assignment_generation: package.destination_assignment_generation,
+            fencing_token: package.destination_fencing_token,
+            prior_event_sequence: import.event_sequence,
+            prior_event_hash: import.event_hash.clone(),
+            event_sequence: import.event_sequence + 1,
+            event_hash: String::new(),
+            prior_active_world_hash: import.resulting_active_world_hash.clone(),
+            resulting_active_world_hash: blake3::hash(b"synthetic activation active world")
+                .to_hex()
+                .to_string(),
+            quarantine_receipt_hash: import.quarantine_receipt_hash.clone(),
+            destination_import_proof_hash: import.proof_hash.clone(),
+            imported_at_unix_ms: import.imported_at_unix_ms,
+            activated_at_unix_ms: import.imported_at_unix_ms + 1,
+            production_eligibility_root: import.production_eligibility_root.clone(),
+            mutation_witness_hash: blake3::hash(b"synthetic activation mutation")
+                .to_hex()
+                .to_string(),
+            proof_hash: String::new(),
+        };
+        proof
+            .seal_hashes_for_test()
+            .expect("synthetic activation proof seals");
+        proof
+    }
+
     fn import_record_fixture() -> (
         DraftGridTransferCellStateV2,
         DraftGridClosurePackageV2,
@@ -3492,13 +4071,26 @@ mod tests {
         (reserved, package, pending, record, committed)
     }
 
-    fn materialized_import_state_fixture() -> DraftGridTransferCellStateV2 {
-        let (reserved, package, _, _, authority) = import_record_fixture();
+    fn materialized_import_fixture() -> (
+        DraftGridTransferCellStateV2,
+        DraftGridClosurePackageV2,
+        DraftGridDirectoryAuthorityV2,
+    ) {
+        let (reserved, package, _, _, mut authority) = import_record_fixture();
         let (imported, proof) =
             stage_committed_grid_import_v2(&reserved, 1_800_000_020_000, &package, &authority)
                 .expect("exact destination import commits");
         proof.validate().expect("import proof validates");
-        imported
+        authority.phase = TransferPhase::Imported;
+        authority
+            .proofs
+            .insert(DraftGridDirectoryProofKindV2::DestinationImport);
+        authority.destination_import_proof = Some(proof);
+        (imported, package, authority)
+    }
+
+    fn materialized_import_state_fixture() -> DraftGridTransferCellStateV2 {
+        materialized_import_fixture().0
     }
 
     #[test]
@@ -3666,6 +4258,297 @@ mod tests {
     }
 
     #[test]
+    fn imported_activation_releases_only_gameplay_lock_and_retries_through_finalization() {
+        let (imported, package, authority) = materialized_import_fixture();
+        let prior_clock = imported.base.production_clock.clone();
+        let prior_queues = imported.base.production_queues.clone();
+        let prior_grid = imported.base.grids[&package.root_aggregate_id].clone();
+        assert_eq!(
+            imported.locked_transfer_for_subject(&package.root_aggregate_id),
+            Some(package.transfer_id.as_str())
+        );
+
+        let (activated, proof) =
+            stage_imported_grid_activation_v2(&imported, 1_800_000_020_001, &package, &authority)
+                .expect("destination activation commits");
+        proof.validate().expect("activation proof validates");
+        assert!(activated.pending_imports.is_empty());
+        assert_eq!(activated.committed_activations.len(), 1);
+        assert_eq!(
+            activated.base.event_sequence,
+            imported.base.event_sequence + 1
+        );
+        assert_eq!(activated.base.last_event_hash, proof.event_hash);
+        assert_eq!(activated.base.production_clock, prior_clock);
+        assert_eq!(activated.base.production_queues, prior_queues);
+        assert_eq!(activated.base.grids[&package.root_aggregate_id], prior_grid);
+        assert_eq!(
+            activated.imported_production_eligibilities,
+            imported.imported_production_eligibilities
+        );
+        assert_eq!(
+            activated.locked_transfer_for_subject(&package.root_aggregate_id),
+            None
+        );
+        assert_eq!(
+            DraftGridTransferCellStateV2::decode_canonical(
+                &activated
+                    .encode_canonical()
+                    .expect("activated state encodes"),
+            )
+            .expect("activated state restarts"),
+            activated
+        );
+
+        let (cell_first_retry, cell_first_proof) =
+            stage_imported_grid_activation_v2(&activated, 1_800_000_020_002, &package, &authority)
+                .expect("cell-first activation retry is exact");
+        assert_eq!(cell_first_retry, activated);
+        assert_eq!(cell_first_proof, proof);
+
+        let mut directory_proven = authority.clone();
+        directory_proven
+            .proofs
+            .insert(DraftGridDirectoryProofKindV2::DestinationActivation);
+        directory_proven.destination_activation_proof = Some(proof.clone());
+        let (directory_retry, directory_retry_proof) = stage_imported_grid_activation_v2(
+            &activated,
+            1_800_000_020_003,
+            &package,
+            &directory_proven,
+        )
+        .expect("directory-proven activation retry is exact");
+        assert_eq!(directory_retry, activated);
+        assert_eq!(directory_retry_proof, proof);
+
+        let mut finalized = directory_proven.clone();
+        finalized.phase = TransferPhase::Finalized;
+        finalized
+            .proofs
+            .insert(DraftGridDirectoryProofKindV2::SourceFinalization);
+        let (finalized_retry, finalized_retry_proof) =
+            stage_imported_grid_activation_v2(&activated, 1_800_000_020_004, &package, &finalized)
+                .expect("finalized activation retry is exact");
+        assert_eq!(finalized_retry, activated);
+        assert_eq!(finalized_retry_proof, proof);
+
+        let mut changed_directory = directory_proven;
+        changed_directory
+            .destination_activation_proof
+            .as_mut()
+            .expect("activation proof exists")
+            .resulting_active_world_hash = "ab".repeat(32);
+        assert!(
+            stage_imported_grid_activation_v2(
+                &activated,
+                1_800_000_020_005,
+                &package,
+                &changed_directory,
+            )
+            .is_err()
+        );
+
+        let mut queue_body_tamper = activated.clone();
+        queue_body_tamper
+            .base
+            .production_queues
+            .values_mut()
+            .next()
+            .and_then(|queue| queue.front_mut())
+            .expect("imported production job exists")
+            .progress_ticks += 1;
+        assert!(queue_body_tamper.seal().is_err());
+
+        let mut prior_hash_tamper = activated.clone();
+        let mut activation = prior_hash_tamper
+            .committed_activations
+            .remove(&package.transfer_id)
+            .expect("activation record exists");
+        activation.prior_active_world_hash = "ac".repeat(32);
+        activation.mutation_witness_hash = activation
+            .calculate_mutation_hash()
+            .expect("tampered mutation reseals");
+        activation.activation_event_hash = activation
+            .proof()
+            .calculate_event_hash()
+            .expect("tampered event reseals");
+        prior_hash_tamper
+            .base
+            .last_event_hash
+            .clone_from(&activation.activation_event_hash);
+        activation.resulting_active_world_hash = prior_hash_tamper
+            .calculate_active_world_hash()
+            .expect("tampered result derives");
+        activation.proof_hash = activation
+            .proof()
+            .calculate_hash()
+            .expect("tampered proof reseals");
+        activation.record_hash = activation
+            .calculate_hash()
+            .expect("tampered record reseals");
+        prior_hash_tamper
+            .committed_activations
+            .insert(package.transfer_id.clone(), activation);
+        assert!(prior_hash_tamper.seal().is_err());
+
+        let mut forked_frontier = activated.clone();
+        let mut activation = forked_frontier
+            .committed_activations
+            .remove(&package.transfer_id)
+            .expect("activation record exists");
+        activation.prior_event_hash = blake3::hash(b"forked import predecessor")
+            .to_hex()
+            .to_string();
+        let mut claimed_prior = forked_frontier.clone();
+        claimed_prior
+            .pending_imports
+            .insert(package.transfer_id.clone(), activation.pending.clone());
+        claimed_prior.base.event_sequence = activation.prior_event_sequence;
+        claimed_prior
+            .base
+            .last_event_hash
+            .clone_from(&activation.prior_event_hash);
+        activation.prior_active_world_hash = claimed_prior
+            .calculate_active_world_hash()
+            .expect("forked prior world derives");
+        activation.mutation_witness_hash = activation
+            .calculate_mutation_hash()
+            .expect("forked mutation reseals");
+        activation.activation_event_hash = activation
+            .proof()
+            .calculate_event_hash()
+            .expect("forked event reseals");
+        forked_frontier
+            .base
+            .last_event_hash
+            .clone_from(&activation.activation_event_hash);
+        activation.resulting_active_world_hash = forked_frontier
+            .calculate_active_world_hash()
+            .expect("forked result derives");
+        activation.proof_hash = activation
+            .proof()
+            .calculate_hash()
+            .expect("forked proof reseals");
+        activation.record_hash = activation.calculate_hash().expect("forked record reseals");
+        forked_frontier
+            .committed_activations
+            .insert(package.transfer_id.clone(), activation);
+        assert!(forked_frontier.seal().is_err());
+
+        let next_cell = celestial::neighbor_cell_key(&package.destination_cell_key, [1, 0, 0])
+            .expect("next destination cell derives");
+        let next_members = package
+            .members
+            .iter()
+            .map(|member| BundledPlacementMember {
+                aggregate_id: member.aggregate_id.clone(),
+                aggregate_kind: member.aggregate_kind,
+                prior_placement_generation: member.resulting_placement_generation,
+                resulting_placement_generation: member
+                    .resulting_placement_generation
+                    .checked_add(1)
+                    .expect("next placement generation advances"),
+            })
+            .collect();
+        let next_plan = BundledPlacementPlan::new(
+            package.root_aggregate_id.clone(),
+            package.destination_cell_key.clone(),
+            next_cell.clone(),
+            next_members,
+        )
+        .expect("next placement plan derives");
+        let current_origin = celestial::cell_address_from_key(&package.destination_cell_key)
+            .expect("current destination origin derives");
+        let crossed_address =
+            celestial::cell_address_from_key(&next_cell).expect("crossed address derives");
+        let crossed_local_position =
+            celestial::local_position_from_address(&current_origin, &crossed_address)
+                .expect("crossed local position derives");
+        let mut transfer_ready = activated.clone();
+        transfer_ready.base.event_sequence += 1;
+        transfer_ready.base.last_event_hash = blake3::hash(b"later transfer boundary crossing")
+            .to_hex()
+            .to_string();
+        let grid = transfer_ready
+            .base
+            .grids
+            .get_mut(&package.root_aggregate_id)
+            .expect("activated grid exists");
+        grid.address = crossed_address.clone();
+        grid.position = crossed_local_position;
+        for player_id in package.players.keys() {
+            let player = transfer_ready
+                .base
+                .player
+                .get_mut(player_id)
+                .expect("activated rider exists");
+            player.address = crossed_address.clone();
+            player.position = crossed_local_position;
+        }
+        transfer_ready
+            .seal()
+            .expect("activated closure may reach a later transfer boundary");
+        let next_context = DraftGridTransferContextV2 {
+            transfer_id: "transfer-grid-v2-next".into(),
+            source_assignment_generation: package.destination_assignment_generation,
+            destination_assignment_generation: package.destination_assignment_generation + 1,
+            source_fencing_token: transfer_ready.base.fencing_token,
+            destination_fencing_token: transfer_ready.base.fencing_token + 1,
+            placement: next_plan,
+            production_job_origins: BTreeMap::new(),
+        };
+        let next_package = transfer_ready
+            .capture_grid_closure(&package.root_aggregate_id, &next_context)
+            .expect("activated grid can form a later transfer under a new ID");
+        let next_authority =
+            DraftGridDirectoryAuthorityV2::for_package(&next_package, TransferPhase::Prepared);
+        let relocked = stage_prepared_grid_lock_v2(&transfer_ready, &next_package, &next_authority)
+            .expect("historical activation does not blacklist the grid root");
+        assert_eq!(
+            relocked.locked_transfer_for_subject(&package.root_aggregate_id),
+            Some("transfer-grid-v2-next")
+        );
+
+        let mut later_gameplay = activated;
+        later_gameplay.base.event_sequence += 1;
+        later_gameplay.base.last_event_hash = blake3::hash(b"ordinary post-activation motion")
+            .to_hex()
+            .to_string();
+        later_gameplay
+            .base
+            .grids
+            .get_mut(&package.root_aggregate_id)
+            .expect("activated grid exists")
+            .linear_velocity
+            .x += 0.25;
+        later_gameplay
+            .seal()
+            .expect("ordinary gameplay may advance after activation");
+
+        let mut successor_state = later_gameplay;
+        successor_state.base.fencing_token += 1;
+        successor_state.base.event_sequence += 1;
+        successor_state.base.last_event_hash = blake3::hash(b"activation successor fence")
+            .to_hex()
+            .to_string();
+        successor_state
+            .seal()
+            .expect("successor fence preserves historical activation");
+        let mut successor_authority = finalized;
+        successor_authority.live_destination_assignment_generation += 1;
+        successor_authority.live_destination_fencing_token += 1;
+        let (successor_retry, successor_proof) = stage_imported_grid_activation_v2(
+            &successor_state,
+            1_800_000_020_006,
+            &package,
+            &successor_authority,
+        )
+        .expect("successor retries historical activation under its live fence");
+        assert_eq!(successor_retry, successor_state);
+        assert_eq!(successor_proof, proof);
+    }
+
+    #[test]
     fn committed_import_materializes_exact_closure_without_ticking_production() {
         let (reserved, package, _, _, authority) = import_record_fixture();
         let initial_ledger = reserved.base.ledger.clone();
@@ -3775,6 +4658,8 @@ mod tests {
         finalized_authority
             .proofs
             .insert(DraftGridDirectoryProofKindV2::DestinationActivation);
+        finalized_authority.destination_activation_proof =
+            Some(synthetic_activation_proof(&package, &proof));
         finalized_authority
             .proofs
             .insert(DraftGridDirectoryProofKindV2::SourceFinalization);
@@ -3911,7 +4796,7 @@ mod tests {
         assert_eq!(receipt.destination_draft_world_hash, state.state_hash);
         assert_eq!(
             receipt.receipt_hash,
-            "d231353eda5592bf4e8e0a8d25ffdc846a3331132102a456019342ec0db5e0df"
+            "682436ef198cf9a198cc6cbcbda1627db76a57665392b2d5726f2afc7b62e253"
         );
 
         let (retry_state, retry_receipt) =
@@ -4168,6 +5053,13 @@ mod tests {
         finalized
             .proofs
             .insert(DraftGridDirectoryProofKindV2::DestinationActivation);
+        let imported_proof = imported
+            .destination_import_proof
+            .as_ref()
+            .expect("imported authority carries its typed import proof")
+            .clone();
+        finalized.destination_activation_proof =
+            Some(synthetic_activation_proof(&package, &imported_proof));
         finalized
             .proofs
             .insert(DraftGridDirectoryProofKindV2::SourceFinalization);
