@@ -6,6 +6,8 @@
 //! until event-17 append durability, migration installation, and the complete
 //! protocol-19 activation gate exist.
 
+mod event_journal;
+
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -33,7 +35,6 @@ const MAX_INITIALIZATION_HEAD_BYTES: usize = 64 * 1_024;
 const MAX_IDENTITY_BYTES: usize = 64 * 1_024;
 const MAX_MANIFEST_BYTES: usize = 64 * 1_024;
 const MAX_SNAPSHOT_BYTES: usize = 256 * 1_024 * 1_024;
-const MAX_RECOVERY_EVENT_JOURNAL_BYTES: usize = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -209,6 +210,8 @@ enum DraftWorld21InitializationFailpoint {
     ManifestSynced,
     SnapshotSynced,
     EventJournalSynced,
+    EventBoundaryJournalSynced,
+    EventHeadSynced,
     HeadTempSyncedBeforeRename,
     HeadRenamedBeforeDirectorySync,
     HeadDirectorySyncedBeforeMemory,
@@ -230,6 +233,8 @@ enum DraftWorld21StoreError {
     WriterConflict,
     #[error("world-21 Store injected initialization failure: {0:?}")]
     Injected(DraftWorld21InitializationFailpoint),
+    #[error("world-21 Store injected append failure: {0}")]
+    InjectedAppend(&'static str),
 }
 
 #[derive(Debug)]
@@ -237,7 +242,9 @@ struct DraftWorld21Store {
     root: PathBuf,
     initialization_head: DraftWorld21InitializationHead,
     identity: DraftWorld21StoreIdentity,
+    manifest: crate::manifest_v5::ValidatedUniverseManifestV5,
     state: DraftGridTransferCellStateV2,
+    events: event_journal::DraftWorld21EventJournal,
     _writer_lock: File,
 }
 
@@ -331,6 +338,21 @@ impl DraftWorld21Store {
             &mut failpoint,
             DraftWorld21InitializationFailpoint::EventJournalSynced,
         )?;
+        create_synced_empty(&root.join(event_journal::EVENT_BOUNDARY_FILE))?;
+        sync_directory(&root)?;
+        inject_initialization_failure(
+            &mut failpoint,
+            DraftWorld21InitializationFailpoint::EventBoundaryJournalSynced,
+        )?;
+        event_journal::DraftWorld21EventJournal::initialize_head_file(
+            &root,
+            &identity,
+            &initialization_head,
+        )?;
+        inject_initialization_failure(
+            &mut failpoint,
+            DraftWorld21InitializationFailpoint::EventHeadSynced,
+        )?;
         persist_initialization_head(&root, &initialization_head_bytes, &mut failpoint)?;
         Self::recover_locked(
             root,
@@ -338,6 +360,7 @@ impl DraftWorld21Store {
             state.manifest(),
             expected_cell_key,
             migration_anchor_hash,
+            None,
         )
     }
 
@@ -355,6 +378,26 @@ impl DraftWorld21Store {
             manifest,
             expected_cell_key,
             migration_anchor_hash,
+            None,
+        )
+    }
+
+    fn open_with_event_replay_for_test(
+        root: impl AsRef<Path>,
+        manifest: &crate::manifest_v5::ValidatedUniverseManifestV5,
+        expected_cell_key: &CellKeyV1,
+        migration_anchor_hash: &str,
+        directory_history: &crate::cell_directory_v3::DraftCellDirectoryHistoryStoreV3,
+    ) -> Result<Self, DraftWorld21StoreError> {
+        let root = root.as_ref().join(STORE_DIRECTORY);
+        let writer_lock = acquire_writer_lock(&root)?;
+        Self::recover_locked(
+            root,
+            writer_lock,
+            manifest,
+            expected_cell_key,
+            migration_anchor_hash,
+            Some(directory_history),
         )
     }
 
@@ -364,6 +407,7 @@ impl DraftWorld21Store {
         manifest: &crate::manifest_v5::ValidatedUniverseManifestV5,
         expected_cell_key: &CellKeyV1,
         migration_anchor_hash: &str,
+        directory_history: Option<&crate::cell_directory_v3::DraftCellDirectoryHistoryStoreV3>,
     ) -> Result<Self, DraftWorld21StoreError> {
         if !valid_hash(migration_anchor_hash) {
             return Err(DraftWorld21StoreError::Invalid(
@@ -415,26 +459,60 @@ impl DraftWorld21Store {
             expected_cell_key,
             migration_anchor_hash,
         )?;
-        let event_bytes = read_bounded(
-            &root.join(EVENT_JOURNAL_FILE),
-            MAX_RECOVERY_EVENT_JOURNAL_BYTES,
-        )?;
-        if !event_bytes.is_empty() {
-            return Err(DraftWorld21StoreError::Invalid(
-                "recovery-only world-21 Store refuses event-17 records".into(),
-            ));
-        }
-        initialization_head.validate(
-            &identity,
-            u64::try_from(event_bytes.len()).unwrap_or(u64::MAX),
-        )?;
+        initialization_head.validate(&identity, 0)?;
+        let (events, state) = match directory_history {
+            Some(directory_history) => {
+                event_journal::DraftWorld21EventJournal::recover_with_history(
+                    &root,
+                    &identity,
+                    &initialization_head,
+                    &state,
+                    &reopened_manifest,
+                    directory_history,
+                )?
+            }
+            None => (
+                event_journal::DraftWorld21EventJournal::recover_empty(
+                    &root,
+                    &identity,
+                    &initialization_head,
+                    &state,
+                )?,
+                state,
+            ),
+        };
         Ok(Self {
             root,
             initialization_head,
             identity,
+            manifest: reopened_manifest,
             state,
+            events,
             _writer_lock: writer_lock,
         })
+    }
+
+    fn append_live_event_for_test(
+        &mut self,
+        event: &super::event_v17::DraftCanonicalGridEventV17,
+        authority: &super::event_v17::ValidatedCurrentGridEventAuthorityV17<'_, '_>,
+    ) -> Result<super::dispatcher_v17::DraftGridEventProofV17, DraftWorld21StoreError> {
+        let application = self
+            .events
+            .append_live(&self.state, &self.manifest, event, authority)?;
+        self.state = application.next_state;
+        Ok(application.proof)
+    }
+
+    fn set_append_failpoint_for_test(
+        &mut self,
+        failpoint: event_journal::DraftWorld21AppendFailpoint,
+    ) {
+        self.events.set_failpoint(failpoint);
+    }
+
+    fn committed_event17_count(&self) -> u64 {
+        self.events.committed_event_count()
     }
 
     fn state(&self) -> &DraftGridTransferCellStateV2 {
@@ -460,6 +538,8 @@ fn reset_incomplete_initialization(root: &Path) -> Result<(), DraftWorld21StoreE
         MANIFEST_FILE,
         SNAPSHOT_FILE,
         EVENT_JOURNAL_FILE,
+        event_journal::EVENT_BOUNDARY_FILE,
+        event_journal::EVENT_HEAD_FILE,
     ] {
         let path = root.join(file);
         match fs::remove_file(&path) {
@@ -482,6 +562,7 @@ fn reset_incomplete_initialization(root: &Path) -> Result<(), DraftWorld21StoreE
             IDENTITY_FILE,
             MANIFEST_FILE,
             SNAPSHOT_FILE,
+            event_journal::EVENT_HEAD_FILE,
         ]
         .iter()
         .any(|authority| file_name.starts_with(&format!(".{authority}.tmp-")));
@@ -656,6 +737,14 @@ mod tests {
     use super::super::state::DraftGridTransferCellStateV2;
     use super::super::tests::package_v3_directory_fixture;
     use super::*;
+    use crate::cell_directory_v3::{
+        DraftCellDirectoryHistoryStoreV3, DraftDirectoryV3AuthorityHarness,
+        DraftDirectoryV3AuthoritySeed,
+    };
+    use crate::grid_handoff_v2::event_v17::{
+        DraftCanonicalGridEventV17, DraftGridEventPayloadV17, ValidatedCurrentGridEventAuthorityV17,
+    };
+    use crate::grid_handoff_v2::state::DraftGridDirectoryAuthorityV2;
     use crate::model::WorldState;
     use tempfile::tempdir;
 
@@ -686,6 +775,106 @@ mod tests {
     fn state_cell_key(state: &DraftGridTransferCellStateV2) -> CellKeyV1 {
         crate::celestial::cell_key_from_address(&state.base().cell_address)
             .expect("state cell key derives")
+    }
+
+    fn manifest_event_fixture(
+        directory_root: &Path,
+    ) -> (
+        crate::manifest_v5::ValidatedUniverseManifestV5,
+        DraftGridTransferCellStateV2,
+        super::super::DraftGridClosurePackageV2,
+        DraftCellDirectoryHistoryStoreV3,
+    ) {
+        manifest_event_fixture_with_successor_fence(directory_root, false)
+    }
+
+    fn manifest_event_fixture_with_successor_fence(
+        directory_root: &Path,
+        successor_fence: bool,
+    ) -> (
+        crate::manifest_v5::ValidatedUniverseManifestV5,
+        DraftGridTransferCellStateV2,
+        super::super::DraftGridClosurePackageV2,
+        DraftCellDirectoryHistoryStoreV3,
+    ) {
+        let manifest = crate::manifest_v5::build_validated_manifest_v5(801)
+            .expect("manifest-5 capability builds");
+        let (source, context, legacy_package) = package_v3_directory_fixture();
+        let mut manifest_source = source.clone();
+        manifest_source.universe_manifest_hash = manifest.manifest_hash().to_owned();
+        let package = super::super::extract_draft_grid_closure_from_validated_world(
+            &manifest_source,
+            &legacy_package.root_aggregate_id,
+            &context,
+        )
+        .expect("manifest-5 package recaptures its exact source body");
+        package
+            .validate_manifest_v5(&manifest)
+            .expect("recaptured package binds manifest 5");
+        let mut state = DraftGridTransferCellStateV2::new_with_production_origins(
+            source,
+            package.production_job_origins.clone(),
+        )
+        .expect("event source state seals");
+        state
+            .rebind_test_manifest_v5(&manifest)
+            .expect("event source binds manifest 5");
+        let mut directory = DraftDirectoryV3AuthorityHarness::new(DraftDirectoryV3AuthoritySeed {
+            universe_id: package.universe_id.clone(),
+            universe_manifest_hash: package.universe_manifest_hash.clone(),
+            transfer_id: package.transfer_id.clone(),
+            root_aggregate_id: package.root_aggregate_id.clone(),
+            source_cell_key: package.source_cell_key.clone(),
+            destination_cell_key: package.destination_cell_key.clone(),
+            source_assignment_generation: package.source_assignment_generation,
+            source_fencing_token: package.source_fencing_token,
+            destination_assignment_generation: package.destination_assignment_generation,
+            destination_fencing_token: package.destination_fencing_token,
+            package_schema_version: package.schema_version,
+            receipt_schema_version: package.receipt_schema_version,
+            closure_root: package.closure_root.clone(),
+            conservation_root: package.conservation_root.clone(),
+            package_hash: package.package_hash.clone(),
+            members: package.members.clone(),
+            member_root: package.member_root.clone(),
+        })
+        .expect("manifest-5 directory authority builds");
+        directory
+            .prepare()
+            .expect("directory prepares event authority");
+        if successor_fence {
+            directory
+                .advance_cell_authority(&package.source_cell_id)
+                .expect("directory advances the source fence");
+        }
+        let history = directory
+            .persist_history(directory_root)
+            .expect("directory history persists");
+        (manifest, state, package, history)
+    }
+
+    fn live_prepare_event(
+        state: &DraftGridTransferCellStateV2,
+        manifest: &crate::manifest_v5::ValidatedUniverseManifestV5,
+        package: &super::super::DraftGridClosurePackageV2,
+        directory: &DraftCellDirectoryHistoryStoreV3,
+        event_id: &str,
+    ) -> DraftCanonicalGridEventV17 {
+        let capability = directory
+            .current_grid_authority(&package.transfer_id)
+            .expect("current grid authority resolves");
+        DraftCanonicalGridEventV17::new_live_world_v21_system_for_store(
+            state,
+            manifest,
+            event_id,
+            1_800_000_040_000,
+            DraftGridEventPayloadV17::GridTransferPrepared {
+                package: package.clone(),
+                authority: DraftGridDirectoryAuthorityV2::from_validated_v3(capability.validated()),
+            },
+            &ValidatedCurrentGridEventAuthorityV17::Grid(&capability),
+        )
+        .expect("live prepare event seals")
     }
 
     #[test]
@@ -744,6 +933,8 @@ mod tests {
             MANIFEST_FILE,
             SNAPSHOT_FILE,
             EVENT_JOURNAL_FILE,
+            event_journal::EVENT_BOUNDARY_FILE,
+            event_journal::EVENT_HEAD_FILE,
         ] {
             let root = tempdir().expect("temporary root");
             let (manifest, state) = manifest_state();
@@ -825,6 +1016,11 @@ mod tests {
                 DraftWorld21InitializationFailpoint::EventJournalSynced,
                 false,
             ),
+            (
+                DraftWorld21InitializationFailpoint::EventBoundaryJournalSynced,
+                false,
+            ),
+            (DraftWorld21InitializationFailpoint::EventHeadSynced, false),
             (
                 DraftWorld21InitializationFailpoint::HeadTempSyncedBeforeRename,
                 false,
@@ -1003,5 +1199,491 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn event17_append_replays_exact_state_and_requires_directory_history() {
+        let root = tempdir().expect("temporary Store root");
+        let directory_root = tempdir().expect("temporary directory root");
+        let (manifest, state, package, directory) = manifest_event_fixture(directory_root.path());
+        let cell_key = state_cell_key(&state);
+        let capability = state
+            .validate_world_v21(&manifest)
+            .expect("state capability mints");
+        let mut store = DraftWorld21Store::create_for_test(
+            root.path(),
+            &capability,
+            &cell_key,
+            &migration_anchor(),
+        )
+        .expect("world-21 Store creates");
+        let event = live_prepare_event(
+            store.state(),
+            &manifest,
+            &package,
+            &directory,
+            "store-prepare-1",
+        );
+        assert_eq!(event.event_sequence(), state.base().event_sequence + 1);
+        assert_eq!(event.previous_event_hash(), state.base().last_event_hash);
+        let current = directory
+            .current_grid_authority(&package.transfer_id)
+            .expect("current authority remains locked");
+        let proof = store
+            .append_live_event_for_test(
+                &event,
+                &ValidatedCurrentGridEventAuthorityV17::Grid(&current),
+            )
+            .expect("event append commits");
+        assert!(valid_hash(event_journal::proof_hash(&proof)));
+        assert_eq!(store.committed_event17_count(), 1);
+        let expected_state = store.state().clone();
+        drop(current);
+        drop(store);
+
+        assert!(
+            DraftWorld21Store::open_for_test(
+                root.path(),
+                &manifest,
+                &cell_key,
+                &migration_anchor(),
+            )
+            .is_err(),
+            "the recovery-only constructor must not silently trust a nonempty journal"
+        );
+        let reopened = DraftWorld21Store::open_with_event_replay_for_test(
+            root.path(),
+            &manifest,
+            &cell_key,
+            &migration_anchor(),
+            &directory,
+        )
+        .expect("manifest-aware event replay reopens");
+        assert_eq!(reopened.state(), &expected_state);
+        assert_eq!(reopened.committed_event17_count(), 1);
+    }
+
+    #[test]
+    fn event17_append_rebinds_and_replays_a_valid_successor_fence() {
+        let root = tempdir().expect("temporary Store root");
+        let directory_root = tempdir().expect("temporary directory root");
+        let (manifest, state, package, directory) =
+            manifest_event_fixture_with_successor_fence(directory_root.path(), true);
+        let cell_key = state_cell_key(&state);
+        let capability = state
+            .validate_world_v21(&manifest)
+            .expect("state capability mints");
+        let mut store = DraftWorld21Store::create_for_test(
+            root.path(),
+            &capability,
+            &cell_key,
+            &migration_anchor(),
+        )
+        .expect("world-21 Store creates");
+        let event = live_prepare_event(
+            store.state(),
+            &manifest,
+            &package,
+            &directory,
+            "store-successor-fence",
+        );
+        let current = directory
+            .current_grid_authority(&package.transfer_id)
+            .expect("successor authority remains current");
+        assert!(current.validated().live_source_fencing_token() > state.base().fencing_token);
+        store
+            .append_live_event_for_test(
+                &event,
+                &ValidatedCurrentGridEventAuthorityV17::Grid(&current),
+            )
+            .expect("successor-fence append commits");
+        let expected = store.state().clone();
+        assert_eq!(
+            expected.base().fencing_token,
+            current.validated().live_source_fencing_token()
+        );
+        drop(current);
+        drop(store);
+        let reopened = DraftWorld21Store::open_with_event_replay_for_test(
+            root.path(),
+            &manifest,
+            &cell_key,
+            &migration_anchor(),
+            &directory,
+        )
+        .expect("successor-fence history replays");
+        assert_eq!(reopened.state(), &expected);
+    }
+
+    #[test]
+    fn event17_append_failpoints_recover_only_prior_or_exact_successor() {
+        use event_journal::DraftWorld21AppendFailpoint as Failpoint;
+
+        for (failpoint, successor_is_visible) in [
+            (Failpoint::PendingHeadTempSyncedBeforeRename, false),
+            (Failpoint::PendingHeadRenamedBeforeDirectorySync, false),
+            (Failpoint::PendingHeadDirectorySyncedBeforeEvent, false),
+            (Failpoint::PendingHeadSynced, false),
+            (Failpoint::PartialEventWritten, false),
+            (Failpoint::EventLineWrittenBeforeSync, true),
+            (Failpoint::EventSyncedBeforeCommitHead, true),
+            (Failpoint::PartialBoundaryWritten, true),
+            (Failpoint::BoundaryLineWrittenBeforeSync, true),
+            (Failpoint::BoundarySyncedBeforeCommitHead, true),
+            (Failpoint::CommitHeadTempSyncedBeforeRename, true),
+            (Failpoint::CommitHeadRenamedBeforeDirectorySync, true),
+            (Failpoint::CommitHeadDirectorySyncedBeforeMemory, true),
+        ] {
+            let root = tempdir().expect("temporary Store root");
+            let directory_root = tempdir().expect("temporary directory root");
+            let (manifest, state, package, directory) =
+                manifest_event_fixture(directory_root.path());
+            let cell_key = state_cell_key(&state);
+            let capability = state
+                .validate_world_v21(&manifest)
+                .expect("state capability mints");
+            let mut store = DraftWorld21Store::create_for_test(
+                root.path(),
+                &capability,
+                &cell_key,
+                &migration_anchor(),
+            )
+            .expect("world-21 Store creates");
+            let event = live_prepare_event(
+                store.state(),
+                &manifest,
+                &package,
+                &directory,
+                &format!("store-failpoint-{failpoint:?}"),
+            );
+            let current = directory
+                .current_grid_authority(&package.transfer_id)
+                .expect("current authority remains locked");
+            store.set_append_failpoint_for_test(failpoint);
+            assert!(matches!(
+                store.append_live_event_for_test(
+                    &event,
+                    &ValidatedCurrentGridEventAuthorityV17::Grid(&current),
+                ),
+                Err(DraftWorld21StoreError::InjectedAppend(_))
+            ));
+            assert!(
+                store
+                    .append_live_event_for_test(
+                        &event,
+                        &ValidatedCurrentGridEventAuthorityV17::Grid(&current),
+                    )
+                    .is_err(),
+                "an uncertain {failpoint:?} outcome must poison the old writer"
+            );
+            drop(current);
+            drop(store);
+
+            let reopened = DraftWorld21Store::open_with_event_replay_for_test(
+                root.path(),
+                &manifest,
+                &cell_key,
+                &migration_anchor(),
+                &directory,
+            )
+            .unwrap_or_else(|error| panic!("{failpoint:?} must recover: {error}"));
+            let expected_count = u64::from(successor_is_visible);
+            assert_eq!(reopened.committed_event17_count(), expected_count);
+            assert_eq!(
+                reopened.state().base().event_sequence,
+                state.base().event_sequence + expected_count,
+                "{failpoint:?} recovered the wrong frontier"
+            );
+            if successor_is_visible {
+                assert_eq!(reopened.state().base().last_event_hash, event.event_hash());
+            } else {
+                assert_eq!(reopened.state(), &state);
+            }
+        }
+    }
+
+    #[test]
+    fn event17_precommit_failpoint_keeps_the_writer_retryable() {
+        let root = tempdir().expect("temporary Store root");
+        let directory_root = tempdir().expect("temporary directory root");
+        let (manifest, state, package, directory) = manifest_event_fixture(directory_root.path());
+        let cell_key = state_cell_key(&state);
+        let capability = state
+            .validate_world_v21(&manifest)
+            .expect("state capability mints");
+        let mut store = DraftWorld21Store::create_for_test(
+            root.path(),
+            &capability,
+            &cell_key,
+            &migration_anchor(),
+        )
+        .expect("world-21 Store creates");
+        let event = live_prepare_event(
+            store.state(),
+            &manifest,
+            &package,
+            &directory,
+            "store-precommit",
+        );
+        let current = directory
+            .current_grid_authority(&package.transfer_id)
+            .expect("current authority remains locked");
+        store.set_append_failpoint_for_test(
+            event_journal::DraftWorld21AppendFailpoint::BeforePendingHeadWrite,
+        );
+        assert!(matches!(
+            store.append_live_event_for_test(
+                &event,
+                &ValidatedCurrentGridEventAuthorityV17::Grid(&current),
+            ),
+            Err(DraftWorld21StoreError::InjectedAppend(_))
+        ));
+        assert_eq!(store.committed_event17_count(), 0);
+        store
+            .append_live_event_for_test(
+                &event,
+                &ValidatedCurrentGridEventAuthorityV17::Grid(&current),
+            )
+            .expect("a failure before any durable write remains retryable");
+        assert_eq!(store.committed_event17_count(), 1);
+    }
+
+    #[test]
+    fn event17_recovery_never_truncates_beyond_a_sealed_pending_range() {
+        use event_journal::DraftWorld21AppendFailpoint as Failpoint;
+
+        for (failpoint, target, pending_end_field) in [
+            (
+                Failpoint::PartialEventWritten,
+                EVENT_JOURNAL_FILE,
+                "journal_end",
+            ),
+            (
+                Failpoint::PartialBoundaryWritten,
+                event_journal::EVENT_BOUNDARY_FILE,
+                "boundary_end",
+            ),
+        ] {
+            let root = tempdir().expect("temporary Store root");
+            let directory_root = tempdir().expect("temporary directory root");
+            let (manifest, state, package, directory) =
+                manifest_event_fixture(directory_root.path());
+            let cell_key = state_cell_key(&state);
+            let capability = state
+                .validate_world_v21(&manifest)
+                .expect("state capability mints");
+            let mut store = DraftWorld21Store::create_for_test(
+                root.path(),
+                &capability,
+                &cell_key,
+                &migration_anchor(),
+            )
+            .expect("world-21 Store creates");
+            let event = live_prepare_event(
+                store.state(),
+                &manifest,
+                &package,
+                &directory,
+                &format!("store-overlong-{failpoint:?}"),
+            );
+            let current = directory
+                .current_grid_authority(&package.transfer_id)
+                .expect("current authority remains locked");
+            store.set_append_failpoint_for_test(failpoint);
+            assert!(matches!(
+                store.append_live_event_for_test(
+                    &event,
+                    &ValidatedCurrentGridEventAuthorityV17::Grid(&current),
+                ),
+                Err(DraftWorld21StoreError::InjectedAppend(_))
+            ));
+            let namespace = store.root().to_owned();
+            drop(current);
+            drop(store);
+
+            let head = serde_json::from_slice::<serde_json::Value>(
+                &fs::read(namespace.join(event_journal::EVENT_HEAD_FILE))
+                    .expect("pending head reads"),
+            )
+            .expect("pending head decodes");
+            let sealed_end = head["pending_event"][pending_end_field]
+                .as_u64()
+                .expect("pending range end exists");
+            let path = namespace.join(target);
+            let partial_length = fs::metadata(&path).expect("partial suffix exists").len();
+            assert!(partial_length < sealed_end);
+            let extension = usize::try_from(sealed_end - partial_length)
+                .expect("sealed test range fits memory");
+            OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("partial authority opens")
+                .write_all(&vec![b'x'; extension])
+                .expect("overlong authority reaches the sealed end without a newline");
+            let overlong_length = fs::metadata(&path).expect("overlong suffix exists").len();
+            assert_eq!(overlong_length, sealed_end);
+
+            assert!(
+                DraftWorld21Store::open_with_event_replay_for_test(
+                    root.path(),
+                    &manifest,
+                    &cell_key,
+                    &migration_anchor(),
+                    &directory,
+                )
+                .is_err(),
+                "{failpoint:?} data outside the possible crash range must fail closed"
+            );
+            assert_eq!(
+                fs::metadata(&path)
+                    .expect("failed recovery preserves evidence")
+                    .len(),
+                overlong_length,
+                "failed recovery must not truncate suspicious evidence"
+            );
+        }
+    }
+
+    #[test]
+    fn resealed_event17_head_cannot_substitute_its_manifest_identity() {
+        let root = tempdir().expect("temporary Store root");
+        let (manifest, state) = manifest_state();
+        let cell_key = state_cell_key(&state);
+        let capability = state
+            .validate_world_v21(&manifest)
+            .expect("state capability mints");
+        let store = DraftWorld21Store::create_for_test(
+            root.path(),
+            &capability,
+            &cell_key,
+            &migration_anchor(),
+        )
+        .expect("world-21 Store creates");
+        let namespace = store.root().to_owned();
+        drop(store);
+        event_journal::substitute_head_manifest_for_test(&namespace, "ab".repeat(32))
+            .expect("test substitution reseals the head");
+        assert!(
+            DraftWorld21Store::open_for_test(
+                root.path(),
+                &manifest,
+                &cell_key,
+                &migration_anchor(),
+            )
+            .is_err(),
+            "a syntactically valid but substituted head manifest must fail closed"
+        );
+    }
+
+    #[test]
+    fn committed_event17_authority_and_unpinned_suffix_tamper_fail_closed() {
+        for target in [
+            EVENT_JOURNAL_FILE,
+            event_journal::EVENT_BOUNDARY_FILE,
+            event_journal::EVENT_HEAD_FILE,
+        ] {
+            let root = tempdir().expect("temporary Store root");
+            let directory_root = tempdir().expect("temporary directory root");
+            let (manifest, state, package, directory) =
+                manifest_event_fixture(directory_root.path());
+            let cell_key = state_cell_key(&state);
+            let capability = state
+                .validate_world_v21(&manifest)
+                .expect("state capability mints");
+            let mut store = DraftWorld21Store::create_for_test(
+                root.path(),
+                &capability,
+                &cell_key,
+                &migration_anchor(),
+            )
+            .expect("world-21 Store creates");
+            let event = live_prepare_event(
+                store.state(),
+                &manifest,
+                &package,
+                &directory,
+                "store-tamper",
+            );
+            let current = directory
+                .current_grid_authority(&package.transfer_id)
+                .expect("current authority remains locked");
+            store
+                .append_live_event_for_test(
+                    &event,
+                    &ValidatedCurrentGridEventAuthorityV17::Grid(&current),
+                )
+                .expect("event append commits");
+            let path = store.root().join(target);
+            drop(current);
+            drop(store);
+            let mut bytes = fs::read(&path).expect("committed authority reads");
+            bytes[0] ^= 1;
+            fs::write(&path, bytes).expect("committed authority tampers");
+            assert!(
+                DraftWorld21Store::open_with_event_replay_for_test(
+                    root.path(),
+                    &manifest,
+                    &cell_key,
+                    &migration_anchor(),
+                    &directory,
+                )
+                .is_err(),
+                "tampered committed {target} must fail closed"
+            );
+        }
+
+        for target in [EVENT_JOURNAL_FILE, event_journal::EVENT_BOUNDARY_FILE] {
+            let root = tempdir().expect("temporary Store root");
+            let directory_root = tempdir().expect("temporary directory root");
+            let (manifest, state, package, directory) =
+                manifest_event_fixture(directory_root.path());
+            let cell_key = state_cell_key(&state);
+            let capability = state
+                .validate_world_v21(&manifest)
+                .expect("state capability mints");
+            let mut store = DraftWorld21Store::create_for_test(
+                root.path(),
+                &capability,
+                &cell_key,
+                &migration_anchor(),
+            )
+            .expect("world-21 Store creates");
+            let event = live_prepare_event(
+                store.state(),
+                &manifest,
+                &package,
+                &directory,
+                "store-suffix",
+            );
+            let current = directory
+                .current_grid_authority(&package.transfer_id)
+                .expect("current authority remains locked");
+            store
+                .append_live_event_for_test(
+                    &event,
+                    &ValidatedCurrentGridEventAuthorityV17::Grid(&current),
+                )
+                .expect("event append commits");
+            let path = store.root().join(target);
+            drop(current);
+            drop(store);
+            OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("authority opens for suffix")
+                .write_all(b"\n")
+                .expect("unpinned suffix writes");
+            assert!(
+                DraftWorld21Store::open_with_event_replay_for_test(
+                    root.path(),
+                    &manifest,
+                    &cell_key,
+                    &migration_anchor(),
+                    &directory,
+                )
+                .is_err(),
+                "unpinned {target} suffix must fail closed"
+            );
+        }
     }
 }

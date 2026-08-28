@@ -11,7 +11,7 @@
 use super::DraftGridClosureError;
 use super::event_v17::{
     DraftCanonicalGridEventV17, DraftGridEventAuthorityLookupV17, DraftGridEventPayloadV17,
-    ValidatedDraftGridEventAuthorityV17,
+    ValidatedDraftGridEventAuthorityV17, ValidatedManifestBoundGridEventV17,
 };
 use super::production::DraftImportedProductionOccurrenceControlsV2;
 use super::state::{
@@ -57,14 +57,41 @@ pub(super) fn apply_proven_event_v17(
 ) -> Result<DraftGridEventApplicationV17, DraftGridClosureError> {
     let rebound = event.rebind_for_state(state, authority)?;
     let context = event.bind_for_state(&rebound, authority)?;
+    dispatch_rebound_event_v17(&rebound, event, &context, authority, None)
+}
+
+pub(super) fn apply_manifest_bound_event_v17(
+    validated: &ValidatedManifestBoundGridEventV17<'_, '_, '_, '_>,
+) -> Result<DraftGridEventApplicationV17, DraftGridClosureError> {
+    dispatch_rebound_event_v17(
+        validated.state(),
+        validated.event(),
+        validated.context(),
+        validated.authority(),
+        Some(validated.manifest()),
+    )
+}
+
+fn dispatch_rebound_event_v17(
+    rebound: &DraftGridTransferCellStateV2,
+    event: &DraftCanonicalGridEventV17,
+    context: &super::event_v17::ValidatedDraftGridEventContextV17,
+    authority: ValidatedDraftGridEventAuthorityV17<'_>,
+    world_v21_manifest: Option<&crate::manifest_v5::ValidatedUniverseManifestV5>,
+) -> Result<DraftGridEventApplicationV17, DraftGridClosureError> {
     match (event.payload(), authority) {
         (
             DraftGridEventPayloadV17::GridTransferPrepared { package, .. },
             ValidatedDraftGridEventAuthorityV17::Grid(validated),
         ) => {
             let trusted = DraftGridDirectoryAuthorityV2::from_validated_v3(validated);
-            let (next_state, proof) =
-                stage_prepared_grid_event_v17(&rebound, package, &trusted, &context)?;
+            let (next_state, proof) = stage_prepared_grid_event_v17(
+                rebound,
+                package,
+                &trusted,
+                context,
+                world_v21_manifest,
+            )?;
             Ok(DraftGridEventApplicationV17 {
                 next_state,
                 proof: DraftGridEventProofV17::Prepared(proof),
@@ -75,8 +102,13 @@ pub(super) fn apply_proven_event_v17(
             ValidatedDraftGridEventAuthorityV17::Grid(validated),
         ) => {
             let trusted = DraftGridDirectoryAuthorityV2::from_validated_v3(validated);
-            let (next_state, receipt, proof) =
-                stage_grid_quarantine_event_v17(&rebound, package, &trusted, &context)?;
+            let (next_state, receipt, proof) = stage_grid_quarantine_event_v17(
+                rebound,
+                package,
+                &trusted,
+                context,
+                world_v21_manifest,
+            )?;
             Ok(DraftGridEventApplicationV17 {
                 next_state,
                 proof: DraftGridEventProofV17::Quarantined { receipt, proof },
@@ -87,8 +119,13 @@ pub(super) fn apply_proven_event_v17(
             ValidatedDraftGridEventAuthorityV17::Grid(validated),
         ) => {
             let trusted = DraftGridDirectoryAuthorityV2::from_validated_v3(validated);
-            let (next_state, proof) =
-                stage_committed_grid_export_event_v17(&rebound, package, &trusted, &context)?;
+            let (next_state, proof) = stage_committed_grid_export_event_v17(
+                rebound,
+                package,
+                &trusted,
+                context,
+                world_v21_manifest,
+            )?;
             Ok(DraftGridEventApplicationV17 {
                 next_state,
                 proof: DraftGridEventProofV17::Exported(proof),
@@ -99,8 +136,13 @@ pub(super) fn apply_proven_event_v17(
             ValidatedDraftGridEventAuthorityV17::Grid(validated),
         ) => {
             let trusted = DraftGridDirectoryAuthorityV2::from_validated_v3(validated);
-            let (next_state, proof) =
-                stage_committed_grid_import_event_v17(&rebound, package, &trusted, &context)?;
+            let (next_state, proof) = stage_committed_grid_import_event_v17(
+                rebound,
+                package,
+                &trusted,
+                context,
+                world_v21_manifest,
+            )?;
             Ok(DraftGridEventApplicationV17 {
                 next_state,
                 proof: DraftGridEventProofV17::Imported(proof),
@@ -111,8 +153,13 @@ pub(super) fn apply_proven_event_v17(
             ValidatedDraftGridEventAuthorityV17::Grid(validated),
         ) => {
             let trusted = DraftGridDirectoryAuthorityV2::from_validated_v3(validated);
-            let (next_state, proof) =
-                stage_imported_grid_activation_event_v17(&rebound, package, &trusted, &context)?;
+            let (next_state, proof) = stage_imported_grid_activation_event_v17(
+                rebound,
+                package,
+                &trusted,
+                context,
+                world_v21_manifest,
+            )?;
             Ok(DraftGridEventApplicationV17 {
                 next_state,
                 proof: DraftGridEventProofV17::Activated(proof),
@@ -123,8 +170,13 @@ pub(super) fn apply_proven_event_v17(
             ValidatedDraftGridEventAuthorityV17::Grid(validated),
         ) => {
             let trusted = DraftGridDirectoryAuthorityV2::from_validated_v3(validated);
-            let (next_state, proof) =
-                stage_finalized_grid_source_event_v17(&rebound, package, &trusted, &context)?;
+            let (next_state, proof) = stage_finalized_grid_source_event_v17(
+                rebound,
+                package,
+                &trusted,
+                context,
+                world_v21_manifest,
+            )?;
             Ok(DraftGridEventApplicationV17 {
                 next_state,
                 proof: DraftGridEventProofV17::Finalized(proof),
@@ -135,8 +187,13 @@ pub(super) fn apply_proven_event_v17(
             ValidatedDraftGridEventAuthorityV17::Grid(validated),
         ) => {
             let trusted = DraftGridDirectoryAuthorityV2::from_validated_v3(validated);
-            let (next_state, proof) =
-                stage_aborted_grid_cleanup_event_v17(&rebound, package, &trusted, &context)?;
+            let (next_state, proof) = stage_aborted_grid_cleanup_event_v17(
+                rebound,
+                package,
+                &trusted,
+                context,
+                world_v21_manifest,
+            )?;
             Ok(DraftGridEventApplicationV17 {
                 next_state,
                 proof: DraftGridEventProofV17::Aborted(proof),
@@ -147,9 +204,10 @@ pub(super) fn apply_proven_event_v17(
             ValidatedDraftGridEventAuthorityV17::Production(_),
         ) => {
             let (next_state, controls, proof) = stage_imported_production_occurrence_event_v17(
-                &rebound,
+                rebound,
                 occurrence.clone(),
-                &context,
+                context,
+                world_v21_manifest,
             )?;
             Ok(DraftGridEventApplicationV17 {
                 next_state,
@@ -840,7 +898,7 @@ mod tests {
                 package,
                 authority: DraftGridDirectoryAuthorityV2::from_validated_v3(capability.validated()),
             },
-            ValidatedCurrentGridEventAuthorityV17::Grid(&capability),
+            &ValidatedCurrentGridEventAuthorityV17::Grid(&capability),
         )
         .expect("live event seals only through current-head authority");
         let applied = apply_proven_event_v17(
