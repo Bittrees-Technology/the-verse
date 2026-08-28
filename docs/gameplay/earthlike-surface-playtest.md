@@ -56,6 +56,11 @@ packaging cadence without changing canonical simulation rules.
   60 Hz accumulator to catch up rather than slowing the universe.
 - The native camera interpolates fixed-step position, body orientation, and
   grounded view pitch between rendered frames.
+- Grounded prediction follows the registered spherical support instead of
+  drifting along a flat tangent plane, small reconciliation noise settles more
+  gently than meaningful corrections, and ordinary walking no longer pulses
+  the field of view. Four-sample geometry antialiasing reduces edge shimmer
+  while moving through the outpost.
 - The Earthlike albedo remains an exact 2:1 equirectangular map, the planet
   shader exposes its albedo and outpost-biome inputs, and the two cloud layers
   expose independent scale, coverage, opacity, and spherical-noise offsets.

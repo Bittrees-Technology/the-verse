@@ -1714,6 +1714,90 @@ func _test_render_interpolation_and_grounded_pitch_prediction() -> void:
 		),
 		"grounded pitch predicts before authoritative motion arrives"
 	)
+
+	var spherical_player := grounded.duplicate(true)
+	spherical_player["position"] = _protocol_vec3(Vector3(0.0, 1200.901, 0.0))
+	spherical_player["locomotion"] = {
+		"kind": "grounded",
+		"up": _protocol_vec3(Vector3.UP),
+		"view_pitch_radians": 0.0,
+		"jump_held": false,
+		"support": {"body_id": "planet-body-khepri-prime"},
+	}
+	client.set("actor_private_snapshot", _private_snapshot(spherical_player))
+	client.set("snapshot", {
+		"environment": {
+			"celestial_body_id": "planet-body-khepri-prime",
+			"planet_center": _protocol_vec3(Vector3.ZERO),
+			"surface_radius_m": 1200.0,
+			"gravity": _protocol_vec3(Vector3(0.0, -9.81, 0.0)),
+		},
+		"players": [_public_player(spherical_player)],
+		"grids": [],
+		"voxels": [],
+	})
+	client.set("predicted_position", Vector3(0.0, 1200.901, 0.0))
+	client.set("predicted_orientation", Quaternion.IDENTITY)
+	client.set("predicted_linear_velocity", Vector3.ZERO)
+	client.set("predicted_angular_velocity", Vector3.ZERO)
+	client.set("prediction_planet_center", Vector3.ZERO)
+	client.set("prediction_surface_radius", 1200.0)
+	client.set("prediction_gravitational_parameter", 9.81 * 1200.901 * 1200.901)
+	client.set("prediction_gravity_model_ready", true)
+	var starting_radius := (client.get("predicted_position") as Vector3).length()
+	for _step in 600:
+		client.call("_predict_player_step", {
+			"linear_input": Vector3(0.0, 0.0, -1.0),
+			"angular_input": Vector3.ZERO,
+			"boost": false,
+			"jump": false,
+			"dampeners": true,
+		}, FIXED_DELTA, false)
+	var curved_position: Vector3 = client.get("predicted_position")
+	_check(
+		absf(curved_position.length() - starting_radius) < 0.001,
+		"grounded planet prediction follows the curved support radius",
+	)
+	_check(
+		absf(curved_position.z) > 30.0,
+		"grounded planet prediction still advances tangentially",
+	)
+
+	var micro_position_blend := float(client.call(
+		"_presentation_position_correction_blend", Vector3(0.01, 0.0, 0.0), 0.016
+	))
+	var material_position_blend := float(client.call(
+		"_presentation_position_correction_blend", Vector3(0.5, 0.0, 0.0), 0.016
+	))
+	_check(
+		micro_position_blend < material_position_blend,
+		"sub-visual position reconciliation decays more gently",
+	)
+	var micro_orientation_blend := float(client.call(
+		"_presentation_orientation_correction_blend",
+		Quaternion(Vector3.UP, 0.002),
+		0.016,
+	))
+	var material_orientation_blend := float(client.call(
+		"_presentation_orientation_correction_blend",
+		Quaternion(Vector3.UP, 0.2),
+		0.016,
+	))
+	_check(
+		micro_orientation_blend < material_orientation_blend,
+		"sub-visual orientation reconciliation decays more gently",
+	)
+	var camera: Camera3D = client.get("camera")
+	camera.fov = 74.0
+	client.set("predicted_linear_velocity", Vector3(0.0, 0.0, -7.5))
+	client.call("_update_player_presentation", FIXED_DELTA)
+	_check(
+		is_equal_approx(camera.fov, 74.0),
+		"ordinary grounded sprint does not pulse the field of view",
+	)
+	client.set("predicted_linear_velocity", Vector3(0.0, 0.0, -24.0))
+	client.call("_update_player_presentation", FIXED_DELTA)
+	_check(camera.fov > 74.0, "true boost retains readable field-of-view feedback")
 	client.free()
 
 
