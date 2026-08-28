@@ -6,7 +6,7 @@
 //! entry point. The active protocol-18/package-v1 path remains EVA-only until
 //! the complete ADR-0024 compatibility tuple activates atomically.
 
-#[cfg(test)]
+#[allow(dead_code)]
 mod dispatcher_v17;
 #[allow(dead_code)]
 mod event_v17;
@@ -14,7 +14,7 @@ mod event_v17;
 mod production;
 #[allow(dead_code)]
 pub(crate) mod state;
-#[cfg(test)]
+#[allow(dead_code)]
 mod store_v21;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};

@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Recovery-only first slice of the isolated world-21 Store.
+//! Dormant staged/recovery slice of the isolated world-21 Store.
 //!
-//! The active Store never reads this namespace. Constructors remain test-only
-//! until event-17 append durability, migration installation, and the complete
-//! protocol-19 activation gate exist.
+//! The active Store never reads this namespace. The production-compiled staging
+//! seam requires a receipt-bound non-Serde target capability but has no worker
+//! entry point. Test-only constructors remain separate until source-evidence
+//! validation, the universe install head, and coordinated activation exist.
 
 mod event_journal;
 
@@ -19,11 +20,16 @@ use uuid::Uuid;
 use verse_protocol::{CellKeyV1, protocol_v19::Protocol19CompatibilityTuple};
 
 use super::state::{DraftGridTransferCellStateV2, ValidatedDraftGridTransferCellStateV21};
+use crate::protocol19_migration::{
+    Protocol19TargetLifecycleGenesisV2, Protocol19World21StagingCommitment,
+    Protocol19World21StagingEvidence,
+};
 
 const STORE_DIRECTORY: &str = "protocol-19-world-v21";
 const INITIALIZATION_HEAD_FILE: &str = "initialization-v21.head.json";
 const IDENTITY_FILE: &str = "identity-v19.json";
 const MANIFEST_FILE: &str = "manifest-v5.json";
+const LIFECYCLE_GENESIS_FILE: &str = "lifecycle-v2.genesis.json";
 const SNAPSHOT_FILE: &str = "snapshot-v21.json";
 const EVENT_JOURNAL_FILE: &str = "events-v17.ndjson";
 const WRITER_LOCK_FILE: &str = "writer-v21.lock";
@@ -47,7 +53,12 @@ struct DraftWorld21StoreIdentity {
     cell_id: String,
     manifest_hash: String,
     migration_anchor_hash: String,
+    migration_receipt_hash: String,
+    lifecycle_record_hash: String,
     snapshot_state_hash: String,
+    active_world_hash: String,
+    production_origin_root: String,
+    identity_subset_root: String,
     legacy_event_schema_version: u32,
     legacy_event_sequence: u64,
     legacy_event_head_hash: String,
@@ -59,9 +70,10 @@ impl DraftWorld21StoreIdentity {
         state: &DraftGridTransferCellStateV2,
         manifest: &crate::manifest_v5::ValidatedUniverseManifestV5,
         expected_cell_key: &CellKeyV1,
-        migration_anchor_hash: &str,
+        staging: &Protocol19World21StagingCommitment,
     ) -> Result<Self, DraftWorld21StoreError> {
         let base = state.base();
+        let lifecycle = staging.lifecycle();
         let mut identity = Self {
             schema_version: STORE_IDENTITY_SCHEMA_VERSION,
             compatibility: Protocol19CompatibilityTuple::canonical(),
@@ -70,15 +82,22 @@ impl DraftWorld21StoreIdentity {
             cell_key: expected_cell_key.clone(),
             cell_id: base.cell_id.clone(),
             manifest_hash: manifest.manifest_hash().to_owned(),
-            migration_anchor_hash: migration_anchor_hash.to_owned(),
+            migration_anchor_hash: lifecycle.migration_anchor_hash().to_owned(),
+            migration_receipt_hash: staging.migration_receipt_hash().to_owned(),
+            lifecycle_record_hash: lifecycle.record_hash().to_owned(),
             snapshot_state_hash: state.state_hash().to_owned(),
+            active_world_hash: state
+                .calculate_active_world_hash()
+                .map_err(|source| DraftWorld21StoreError::Invalid(source.to_string()))?,
+            production_origin_root: staging.production_origin_root().to_owned(),
+            identity_subset_root: staging.identity_subset_root().to_owned(),
             legacy_event_schema_version: crate::event::EVENT_SCHEMA_VERSION,
             legacy_event_sequence: base.event_sequence,
             legacy_event_head_hash: base.last_event_hash.clone(),
             identity_hash: String::new(),
         };
         identity.identity_hash = identity.calculate_hash()?;
-        identity.validate(state, manifest, expected_cell_key, migration_anchor_hash)?;
+        identity.validate(state, manifest, expected_cell_key, lifecycle)?;
         Ok(identity)
     }
 
@@ -93,7 +112,7 @@ impl DraftWorld21StoreIdentity {
         state: &DraftGridTransferCellStateV2,
         manifest: &crate::manifest_v5::ValidatedUniverseManifestV5,
         expected_cell_key: &CellKeyV1,
-        migration_anchor_hash: &str,
+        lifecycle: &Protocol19TargetLifecycleGenesisV2,
     ) -> Result<(), DraftWorld21StoreError> {
         let base = state.base();
         crate::celestial::validate_cell_key(expected_cell_key)
@@ -119,13 +138,33 @@ impl DraftWorld21StoreIdentity {
             || self.cell_id != base.cell_id
             || self.manifest_hash != manifest.manifest_hash()
             || self.manifest_hash != base.universe_manifest_hash
-            || self.migration_anchor_hash != migration_anchor_hash
+            || self.migration_anchor_hash != lifecycle.migration_anchor_hash()
             || !valid_hash(&self.migration_anchor_hash)
+            || !valid_hash(&self.migration_receipt_hash)
+            || self.lifecycle_record_hash != lifecycle.record_hash()
+            || !valid_hash(&self.lifecycle_record_hash)
             || self.snapshot_state_hash != state.state_hash()
             || !valid_hash(&self.snapshot_state_hash)
+            || self.active_world_hash
+                != state
+                    .calculate_active_world_hash()
+                    .map_err(|source| DraftWorld21StoreError::Invalid(source.to_string()))?
+            || self.active_world_hash != lifecycle.active_world_hash()
+            || !valid_hash(&self.active_world_hash)
+            || self.production_origin_root != lifecycle.production_origin_root()
+            || !valid_hash(&self.production_origin_root)
+            || self.identity_subset_root != lifecycle.identity_subset_root()
+            || !valid_hash(&self.identity_subset_root)
             || self.legacy_event_schema_version != crate::event::EVENT_SCHEMA_VERSION
             || self.legacy_event_sequence != base.event_sequence
             || self.legacy_event_head_hash != base.last_event_hash
+            || lifecycle.manifest_hash() != self.manifest_hash
+            || lifecycle.cell_key() != expected_cell_key
+            || lifecycle.cell_id() != self.cell_id
+            || lifecycle.snapshot_state_hash() != self.snapshot_state_hash
+            || lifecycle.authority_fencing_token() != base.fencing_token
+            || lifecycle.legacy_event_sequence() != self.legacy_event_sequence
+            || lifecycle.legacy_event_head_hash() != self.legacy_event_head_hash
             || !(empty_frontier || populated_frontier)
             || !valid_hash(&self.identity_hash)
             || self.identity_hash != self.calculate_hash()?
@@ -147,6 +186,8 @@ struct DraftWorld21InitializationHead {
     identity_hash: String,
     manifest_hash: String,
     migration_anchor_hash: String,
+    migration_receipt_hash: String,
+    lifecycle_record_hash: String,
     snapshot_state_hash: String,
     event_journal_byte_length: u64,
     head_hash: String,
@@ -160,6 +201,8 @@ impl DraftWorld21InitializationHead {
             identity_hash: identity.identity_hash.clone(),
             manifest_hash: identity.manifest_hash.clone(),
             migration_anchor_hash: identity.migration_anchor_hash.clone(),
+            migration_receipt_hash: identity.migration_receipt_hash.clone(),
+            lifecycle_record_hash: identity.lifecycle_record_hash.clone(),
             snapshot_state_hash: identity.snapshot_state_hash.clone(),
             event_journal_byte_length: 0,
             head_hash: String::new(),
@@ -185,12 +228,16 @@ impl DraftWorld21InitializationHead {
             || self.identity_hash != identity.identity_hash
             || self.manifest_hash != identity.manifest_hash
             || self.migration_anchor_hash != identity.migration_anchor_hash
+            || self.migration_receipt_hash != identity.migration_receipt_hash
+            || self.lifecycle_record_hash != identity.lifecycle_record_hash
             || self.snapshot_state_hash != identity.snapshot_state_hash
             || self.event_journal_byte_length != event_journal_byte_length
             || self.event_journal_byte_length != 0
             || !valid_hash(&self.identity_hash)
             || !valid_hash(&self.manifest_hash)
             || !valid_hash(&self.migration_anchor_hash)
+            || !valid_hash(&self.migration_receipt_hash)
+            || !valid_hash(&self.lifecycle_record_hash)
             || !valid_hash(&self.snapshot_state_hash)
             || !valid_hash(&self.head_hash)
             || self.head_hash != self.calculate_hash()?
@@ -204,10 +251,11 @@ impl DraftWorld21InitializationHead {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DraftWorld21InitializationFailpoint {
+pub(crate) enum DraftWorld21InitializationFailpoint {
     NamespaceDirectorySynced,
     IdentitySynced,
     ManifestSynced,
+    LifecycleGenesisSynced,
     SnapshotSynced,
     EventJournalSynced,
     EventBoundaryJournalSynced,
@@ -218,7 +266,7 @@ enum DraftWorld21InitializationFailpoint {
 }
 
 #[derive(Debug, Error)]
-enum DraftWorld21StoreError {
+pub(crate) enum DraftWorld21StoreError {
     #[error("world-21 Store is invalid: {0}")]
     Invalid(String),
     #[error("world-21 Store file is too large: {0}")]
@@ -237,11 +285,97 @@ enum DraftWorld21StoreError {
     InjectedAppend(&'static str),
 }
 
+/// Non-Serde target capability that couples one validated world-21 state to
+/// the exact cell commitment in a canonical migration receipt. Staging this
+/// target remains dormant and cannot activate protocol 19.
 #[derive(Debug)]
-struct DraftWorld21Store {
+pub(crate) struct ValidatedWorld21StagingTarget<'state, 'manifest> {
+    state: &'state DraftGridTransferCellStateV2,
+    manifest: &'manifest crate::manifest_v5::ValidatedUniverseManifestV5,
+    commitment: Protocol19World21StagingCommitment,
+}
+
+impl<'state, 'manifest> ValidatedWorld21StagingTarget<'state, 'manifest> {
+    pub(crate) fn from_receipt(
+        receipt_bytes: &[u8],
+        state: &ValidatedDraftGridTransferCellStateV21<'state, 'manifest>,
+        expected_cell_key: &CellKeyV1,
+    ) -> Result<Self, DraftWorld21StoreError> {
+        let base = state.state().base();
+        let state_cell_key = crate::celestial::cell_key_from_address(&base.cell_address)
+            .map_err(|source| DraftWorld21StoreError::Invalid(source.to_string()))?;
+        if &state_cell_key != expected_cell_key {
+            return Err(DraftWorld21StoreError::Invalid(
+                "world-21 staging route does not match the validated target state".into(),
+            ));
+        }
+        let active_world_hash = state
+            .state()
+            .calculate_active_world_hash()
+            .map_err(|source| DraftWorld21StoreError::Invalid(source.to_string()))?;
+        let evidence = Protocol19World21StagingEvidence {
+            manifest_hash: state.manifest_hash(),
+            universe_id: &base.universe_id,
+            world_seed: base.world_seed,
+            cell_key: expected_cell_key,
+            cell_id: &base.cell_id,
+            authority_fencing_token: base.fencing_token,
+            snapshot_state_hash: state.state().state_hash(),
+            active_world_hash: &active_world_hash,
+            legacy_event_sequence: base.event_sequence,
+            legacy_event_head_hash: &base.last_event_hash,
+        };
+        let commitment =
+            crate::protocol19_migration::bind_world21_staging_target(receipt_bytes, &evidence)
+                .map_err(|source| DraftWorld21StoreError::Invalid(source.to_string()))?;
+        Ok(Self {
+            state: state.state(),
+            manifest: state.manifest(),
+            commitment,
+        })
+    }
+
+    #[cfg(test)]
+    fn for_test(
+        state: &ValidatedDraftGridTransferCellStateV21<'state, 'manifest>,
+        expected_cell_key: &CellKeyV1,
+        migration_anchor_hash: &str,
+    ) -> Result<Self, DraftWorld21StoreError> {
+        let base = state.state().base();
+        let active_world_hash = state
+            .state()
+            .calculate_active_world_hash()
+            .map_err(|source| DraftWorld21StoreError::Invalid(source.to_string()))?;
+        let evidence = Protocol19World21StagingEvidence {
+            manifest_hash: state.manifest_hash(),
+            universe_id: &base.universe_id,
+            world_seed: base.world_seed,
+            cell_key: expected_cell_key,
+            cell_id: &base.cell_id,
+            authority_fencing_token: base.fencing_token,
+            snapshot_state_hash: state.state().state_hash(),
+            active_world_hash: &active_world_hash,
+            legacy_event_sequence: base.event_sequence,
+            legacy_event_head_hash: &base.last_event_hash,
+        };
+        let commitment = crate::protocol19_migration::test_world21_staging_commitment(
+            &evidence,
+            migration_anchor_hash,
+        );
+        Ok(Self {
+            state: state.state(),
+            manifest: state.manifest(),
+            commitment,
+        })
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct DraftWorld21Store {
     root: PathBuf,
     initialization_head: DraftWorld21InitializationHead,
     identity: DraftWorld21StoreIdentity,
+    lifecycle: Protocol19TargetLifecycleGenesisV2,
     manifest: crate::manifest_v5::ValidatedUniverseManifestV5,
     state: DraftGridTransferCellStateV2,
     events: event_journal::DraftWorld21EventJournal,
@@ -249,33 +383,54 @@ struct DraftWorld21Store {
 }
 
 impl DraftWorld21Store {
+    pub(crate) fn stage_from_migration(
+        root: impl AsRef<Path>,
+        target: &ValidatedWorld21StagingTarget<'_, '_>,
+    ) -> Result<Self, DraftWorld21StoreError> {
+        Self::stage_from_migration_with_failpoint(root, target, None)
+    }
+
+    #[cfg(test)]
     fn create_for_test(
         root: impl AsRef<Path>,
         state: &ValidatedDraftGridTransferCellStateV21<'_, '_>,
         expected_cell_key: &CellKeyV1,
         migration_anchor_hash: &str,
     ) -> Result<Self, DraftWorld21StoreError> {
-        Self::create_for_test_with_failpoint(
-            root,
+        let target = ValidatedWorld21StagingTarget::for_test(
             state,
             expected_cell_key,
             migration_anchor_hash,
-            None,
-        )
+        )?;
+        Self::stage_from_migration(root, &target)
     }
 
+    #[cfg(test)]
     fn create_for_test_with_failpoint(
         root: impl AsRef<Path>,
         state: &ValidatedDraftGridTransferCellStateV21<'_, '_>,
         expected_cell_key: &CellKeyV1,
         migration_anchor_hash: &str,
+        failpoint: Option<DraftWorld21InitializationFailpoint>,
+    ) -> Result<Self, DraftWorld21StoreError> {
+        let target = ValidatedWorld21StagingTarget::for_test(
+            state,
+            expected_cell_key,
+            migration_anchor_hash,
+        )?;
+        Self::stage_from_migration_with_failpoint(root, &target, failpoint)
+    }
+
+    fn stage_from_migration_with_failpoint(
+        root: impl AsRef<Path>,
+        target: &ValidatedWorld21StagingTarget<'_, '_>,
         mut failpoint: Option<DraftWorld21InitializationFailpoint>,
     ) -> Result<Self, DraftWorld21StoreError> {
-        if !valid_hash(migration_anchor_hash) {
-            return Err(DraftWorld21StoreError::Invalid(
-                "migration anchor hash is not canonical BLAKE3 text".into(),
-            ));
-        }
+        let state = target.state;
+        let manifest = target.manifest;
+        let lifecycle = target.commitment.lifecycle();
+        let expected_cell_key = lifecycle.cell_key();
+        let migration_anchor_hash = lifecycle.migration_anchor_hash();
         let base_root = root.as_ref();
         let base_metadata =
             fs::metadata(base_root).map_err(|source| io_error(base_root, source))?;
@@ -302,21 +457,24 @@ impl DraftWorld21Store {
             ));
         }
         reset_incomplete_initialization(&root)?;
-        let identity = DraftWorld21StoreIdentity::new(
-            state.state(),
-            state.manifest(),
-            expected_cell_key,
-            migration_anchor_hash,
-        )?;
+        let identity =
+            DraftWorld21StoreIdentity::new(state, manifest, expected_cell_key, &target.commitment)?;
         let initialization_head = DraftWorld21InitializationHead::new(&identity)?;
         let identity_bytes = serde_json::to_vec(&identity)
             .map_err(|source| DraftWorld21StoreError::Invalid(source.to_string()))?;
         let initialization_head_bytes = serde_json::to_vec(&initialization_head)
             .map_err(|source| DraftWorld21StoreError::Invalid(source.to_string()))?;
-        let manifest_bytes = crate::manifest_v5::encode_manifest_v5(state.manifest())
+        let manifest_bytes = crate::manifest_v5::encode_manifest_v5(manifest)
             .map_err(|source| DraftWorld21StoreError::Invalid(source.to_string()))?;
-        let snapshot_bytes = DraftGridTransferCellStateV2::encode_world_v21_canonical(state)
+        let lifecycle_bytes = lifecycle
+            .encode_canonical()
             .map_err(|source| DraftWorld21StoreError::Invalid(source.to_string()))?;
+        let validated_state = state
+            .validate_world_v21(manifest)
+            .map_err(|source| DraftWorld21StoreError::Invalid(source.to_string()))?;
+        let snapshot_bytes =
+            DraftGridTransferCellStateV2::encode_world_v21_canonical(&validated_state)
+                .map_err(|source| DraftWorld21StoreError::Invalid(source.to_string()))?;
         atomic_write(&root.join(IDENTITY_FILE), &identity_bytes)?;
         inject_initialization_failure(
             &mut failpoint,
@@ -326,6 +484,11 @@ impl DraftWorld21Store {
         inject_initialization_failure(
             &mut failpoint,
             DraftWorld21InitializationFailpoint::ManifestSynced,
+        )?;
+        atomic_write(&root.join(LIFECYCLE_GENESIS_FILE), &lifecycle_bytes)?;
+        inject_initialization_failure(
+            &mut failpoint,
+            DraftWorld21InitializationFailpoint::LifecycleGenesisSynced,
         )?;
         atomic_write(&root.join(SNAPSHOT_FILE), &snapshot_bytes)?;
         inject_initialization_failure(
@@ -357,7 +520,7 @@ impl DraftWorld21Store {
         Self::recover_locked(
             root,
             writer_lock,
-            state.manifest(),
+            manifest,
             expected_cell_key,
             migration_anchor_hash,
             None,
@@ -437,6 +600,21 @@ impl DraftWorld21Store {
                 "persisted manifest 5 differs from the expected capability".into(),
             ));
         }
+        let lifecycle_bytes = read_bounded(
+            &root.join(LIFECYCLE_GENESIS_FILE),
+            crate::protocol19_migration::MAX_TARGET_LIFECYCLE_BYTES,
+        )?;
+        let lifecycle =
+            crate::protocol19_migration::decode_target_lifecycle_genesis(&lifecycle_bytes)
+                .map_err(|source| DraftWorld21StoreError::Invalid(source.to_string()))?;
+        if lifecycle.migration_anchor_hash() != migration_anchor_hash
+            || lifecycle.manifest_hash() != reopened_manifest.manifest_hash()
+            || lifecycle.cell_key() != expected_cell_key
+        {
+            return Err(DraftWorld21StoreError::Invalid(
+                "persisted lifecycle genesis differs from the routed migration target".into(),
+            ));
+        }
         let snapshot_bytes = read_bounded(&root.join(SNAPSHOT_FILE), MAX_SNAPSHOT_BYTES)?;
         let state = DraftGridTransferCellStateV2::decode_world_v21_canonical(
             &snapshot_bytes,
@@ -453,12 +631,7 @@ impl DraftWorld21Store {
                 "world-21 Store identity bytes are not canonical".into(),
             ));
         }
-        identity.validate(
-            &state,
-            &reopened_manifest,
-            expected_cell_key,
-            migration_anchor_hash,
-        )?;
+        identity.validate(&state, &reopened_manifest, expected_cell_key, &lifecycle)?;
         initialization_head.validate(&identity, 0)?;
         let (events, state) = match directory_history {
             Some(directory_history) => {
@@ -485,6 +658,7 @@ impl DraftWorld21Store {
             root,
             initialization_head,
             identity,
+            lifecycle,
             manifest: reopened_manifest,
             state,
             events,
@@ -536,6 +710,7 @@ fn reset_incomplete_initialization(root: &Path) -> Result<(), DraftWorld21StoreE
     for file in [
         IDENTITY_FILE,
         MANIFEST_FILE,
+        LIFECYCLE_GENESIS_FILE,
         SNAPSHOT_FILE,
         EVENT_JOURNAL_FILE,
         event_journal::EVENT_BOUNDARY_FILE,
@@ -561,6 +736,7 @@ fn reset_incomplete_initialization(root: &Path) -> Result<(), DraftWorld21StoreE
             INITIALIZATION_HEAD_FILE,
             IDENTITY_FILE,
             MANIFEST_FILE,
+            LIFECYCLE_GENESIS_FILE,
             SNAPSHOT_FILE,
             event_journal::EVENT_HEAD_FILE,
         ]
@@ -777,6 +953,30 @@ mod tests {
             .expect("state cell key derives")
     }
 
+    fn canonical_receipt_for_state(
+        state: &DraftGridTransferCellStateV2,
+        manifest: &crate::manifest_v5::ValidatedUniverseManifestV5,
+        cell_key: &CellKeyV1,
+    ) -> Vec<u8> {
+        let active_world_hash = state
+            .calculate_active_world_hash()
+            .expect("active world hashes");
+        crate::protocol19_migration::test_canonical_receipt_bytes_for_world21_target(
+            &Protocol19World21StagingEvidence {
+                manifest_hash: manifest.manifest_hash(),
+                universe_id: &state.base().universe_id,
+                world_seed: state.base().world_seed,
+                cell_key,
+                cell_id: &state.base().cell_id,
+                authority_fencing_token: state.base().fencing_token,
+                snapshot_state_hash: state.state_hash(),
+                active_world_hash: &active_world_hash,
+                legacy_event_sequence: state.base().event_sequence,
+                legacy_event_head_hash: &state.base().last_event_hash,
+            },
+        )
+    }
+
     fn manifest_event_fixture(
         directory_root: &Path,
     ) -> (
@@ -926,11 +1126,57 @@ mod tests {
     }
 
     #[test]
+    fn canonical_receipt_stages_and_reopens_its_exact_lifecycle_bound_cell() {
+        let root = tempdir().expect("temporary root");
+        let (manifest, state) = manifest_state();
+        let capability = state
+            .validate_world_v21(&manifest)
+            .expect("state capability mints");
+        let cell_key = state_cell_key(&state);
+        let receipt_bytes = canonical_receipt_for_state(&state, &manifest, &cell_key);
+        let target =
+            ValidatedWorld21StagingTarget::from_receipt(&receipt_bytes, &capability, &cell_key)
+                .expect("receipt binds exact staging target");
+        let store = DraftWorld21Store::stage_from_migration(root.path(), &target)
+            .expect("receipt-bound Store stages");
+        let migration_anchor_hash = store.identity().migration_anchor_hash.clone();
+        assert_eq!(
+            store.lifecycle.record_hash(),
+            store.identity().lifecycle_record_hash
+        );
+        assert_eq!(
+            fs::read(store.root().join(LIFECYCLE_GENESIS_FILE)).expect("lifecycle genesis reads"),
+            store
+                .lifecycle
+                .encode_canonical()
+                .expect("lifecycle genesis encodes")
+        );
+        drop(store);
+
+        let reopened = DraftWorld21Store::open_for_test(
+            root.path(),
+            &manifest,
+            &cell_key,
+            &migration_anchor_hash,
+        )
+        .expect("receipt-bound Store reopens");
+        assert_eq!(reopened.state(), &state);
+
+        let wrong_key =
+            crate::celestial::neighbor_cell_key(&cell_key, [1, 0, 0]).expect("wrong route derives");
+        assert!(
+            ValidatedWorld21StagingTarget::from_receipt(&receipt_bytes, &capability, &wrong_key,)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn recovery_only_store_fails_closed_on_every_authority_file_tamper() {
         for target in [
             INITIALIZATION_HEAD_FILE,
             IDENTITY_FILE,
             MANIFEST_FILE,
+            LIFECYCLE_GENESIS_FILE,
             SNAPSHOT_FILE,
             EVENT_JOURNAL_FILE,
             event_journal::EVENT_BOUNDARY_FILE,
@@ -1011,6 +1257,10 @@ mod tests {
             ),
             (DraftWorld21InitializationFailpoint::IdentitySynced, false),
             (DraftWorld21InitializationFailpoint::ManifestSynced, false),
+            (
+                DraftWorld21InitializationFailpoint::LifecycleGenesisSynced,
+                false,
+            ),
             (DraftWorld21InitializationFailpoint::SnapshotSynced, false),
             (
                 DraftWorld21InitializationFailpoint::EventJournalSynced,
@@ -1139,8 +1389,9 @@ mod tests {
         let source_cell_key = state_cell_key(&source_state);
         let (_, context, _) = package_v3_directory_fixture();
         let destination_cell_key = context.placement.destination_cell_key;
-        let destination_base = WorldState::genesis_for_cell(801, &destination_cell_key)
+        let mut destination_base = WorldState::genesis_for_cell(801, &destination_cell_key)
             .expect("destination genesis builds");
+        destination_base.fencing_token = 1;
         let mut destination_state = DraftGridTransferCellStateV2::new_with_production_origins(
             destination_base,
             std::collections::BTreeMap::default(),

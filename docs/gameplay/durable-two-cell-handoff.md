@@ -593,6 +593,15 @@ an empty event-17 journal at that same frontier, and must accept its first event
 explicitly not an install capability; live source locks, terminal-state proof,
 staged target reopening, and policy approval remain required.
 
+The receipt's target lifecycle commitment is now concrete rather than an
+opaque hash. Each cell derives one canonical lifecycle-v2 genesis in
+`staged_unactivated` mode from the receipt's manifest, migration anchor,
+directory-v3 genesis, assignment and fence, trusted cut-off, state and
+active-world hashes, retained event-16 frontier, empty event-17 frontier,
+production cursor, production-origin root, and identity-subset root. Unknown
+fields, noncanonical bytes, a changed target frontier, or any resealed
+lifecycle field fail closed.
+
 World-21 snapshots now have a separate bounded canonical encode/decode path
 that requires manifest 5 before serialization and after pose hydration on
 reopen. The active manifest-4 decoder rejects those bytes, while the world-21
@@ -603,13 +612,24 @@ protocol-19 Store will use; it does not modify the active Store.
 The first recovery-only world-21 Store slice now uses a separate
 `protocol-19-world-v21` namespace and an exclusive writer lock. Its canonical
 identity binds the complete protocol-19 tuple, externally expected cell key,
-manifest 5, cell and universe identity, migration-anchor hash, snapshot state
-hash, and retained event-16 frontier. A sealed initialization head is written
-last after the identity, manifest, snapshot, and empty event journal. The
+manifest 5, cell and universe identity, migration anchor and receipt,
+lifecycle-v2 genesis, snapshot and active-world hashes, per-cell production and
+identity roots, and retained event-16 frontier. A sealed initialization head is
+written last after the identity, manifest, lifecycle, snapshot, and empty event
+journal. The
 caller supplies an already durable per-cell root; the new namespace entry is
 then synchronized through that root. A missing head exposes no authority and
 initialization may replace only that known precommit debris, while uncertain
 head metadata fails closed without cleanup.
+
+The production-compiled staging seam accepts only a non-Serde target
+capability minted by matching canonical receipt bytes to an already validated
+manifest-5/world-21 state. It rejects a changed route, cell, fence, snapshot,
+active-world hash, or legacy event frontier before writing. It remains dormant:
+there is no worker entry point or global install head yet, and receipt source
+roots are not treated as proven merely because their JSON is internally
+consistent. The committed target directory hash also does not prove the
+directory document bytes until the offline installer validates that artifact.
 
 Recovery performs bounded reads and revalidates the exact routed cell,
 manifest, and world-21 snapshot. The recovery-only constructor still refuses a
@@ -634,9 +654,10 @@ head with no event or a strictly partial event rolls back; one complete event
 with no or a strictly partial boundary gets the one deterministic boundary
 backfill before commit. Complete mismatches, extra records, unpinned suffixes,
 tampered committed bytes, wrong manifests/history, and unterminated evidence
-at or beyond its sealed pending range fail closed without cleanup. Constructors
-remain test-only: this is not migration-install authority and does not activate
-the protocol-19 tuple.
+at or beyond its sealed pending range fail closed without cleanup. Test-only
+constructors remain separate from the dormant receipt-bound staging seam. A
+staged cell is not migration-install authority and does not activate the
+protocol-19 tuple.
 
 Implementation is staged behind that boundary. The private directory-v3 draft
 already validates ordered grid-and-rider membership, closure and conservation
@@ -790,8 +811,9 @@ That borrow prevents a successor directory commit while an event is being
 sealed and durably appended; historical revision lookup cannot construct the
 capability. The Store-owned manifest-5 identity gate is exercised again on
 replay, including the successor-fence path.
-The active event-17 runtime adapter, scheduler and durable wake-up path, a
-validated migration installer, and whole-world process-crash integration
+The active event-17 runtime adapter, scheduler and durable wake-up path, the
+source-evidence validators and universe-wide migration install head, and
+whole-world process-crash integration
 remain to be implemented before activation. All drafts are
 intentionally unreachable from the production directory-v2/package-v1 paths
 until every version in the table above moves in one coordinated activation.
