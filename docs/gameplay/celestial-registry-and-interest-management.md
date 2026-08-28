@@ -491,7 +491,7 @@ event, and schema versions without publishing private inventory or queue data.
    constrained, and fatal projection states.
 9. Originality review confirms that maps, HUD, transitions, celestial assets,
    terminology, silhouettes, colors, audio, and interaction layout do not copy
-   protected expression from third-party or another franchise.
+   protected expression from any third-party franchise.
 
 ## Rollout and rollback
 

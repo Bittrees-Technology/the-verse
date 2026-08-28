@@ -32,10 +32,6 @@ These documents form the initial specification baseline.
 - [P1.7 Durable Two-cell Handoff](gameplay/durable-two-cell-handoff.md)
 - [Authoritative Hand-tool Targeting](gameplay/authoritative-hand-tool-targeting.md)
 
-## Research
-
-- [Space-engineering reference study](research/space-engineering-reference.md)
-
 ## Architecture
 
 - [System overview](architecture/system-overview.md)

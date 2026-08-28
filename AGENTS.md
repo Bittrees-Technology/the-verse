@@ -8,7 +8,7 @@ These instructions apply to human and AI contributors.
 - Do not implement a subsystem while its requirements are marked unresolved.
 - Record durable architecture changes as ADRs under `docs/decisions/`.
 - Update requirement IDs and the feature catalog when scope changes.
-- Never copy third-party or other third-party source code, assets, UI, names, sounds, or protected visual designs.
+- Never copy third-party source code, assets, UI, names, sounds, or protected visual designs.
 
 ## Safety and economy
 

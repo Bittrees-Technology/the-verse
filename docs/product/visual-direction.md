@@ -15,7 +15,7 @@ The desired mood combines:
 - Lived-in interiors and visible maintenance.
 - The isolation and scale of deep space.
 
-The Verse will not reproduce protected creatures, ships, uniforms, architecture, symbols, interfaces, sounds, names, or story elements from Alien, Stargate, Starship Troopers, third-party, or any other franchise.
+The Verse will not reproduce protected creatures, ships, uniforms, architecture, symbols, interfaces, sounds, names, or story elements from any third-party franchise.
 
 ## Original visual pillars
 

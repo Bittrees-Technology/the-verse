@@ -177,5 +177,5 @@ Requirement IDs are stable references for issues, pull requests, tests, and rele
 - **OSS-001 — Game license:** Game and authoritative server code shall use AGPL-3.0-or-later.
 - **OSS-002 — SDK license:** SDKs and public schemas shall use Apache-2.0.
 - **OSS-003 — Reusable asset license:** Designated reusable assets shall use CC BY-SA 4.0.
-- **OSS-004 — Clean-room implementation:** No third-party or franchise source code or extracted assets may enter the project.
+- **OSS-004 — Clean-room implementation:** No third-party proprietary source code or extracted assets may enter the project.
 - **OSS-005 — Original identity:** The Verse shall use original names, visual designs, interface, lore, audio, and content.

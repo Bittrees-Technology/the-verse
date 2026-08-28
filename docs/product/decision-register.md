@@ -6,7 +6,7 @@ This register reconciles the planning conversations into explicit project decisi
 
 | ID | Decision | Disposition | Canonical location |
 | --- | --- | --- | --- |
-| D-001 | Build an original third-party-like voxel industrial universe | Qualified: mechanics and genre goals accepted; code/assets/distinctive expression cannot be copied | Vision, OSS-004/005 |
+| D-001 | Build an original voxel-based industrial universe | Qualified: mechanics and genre goals accepted; code/assets/distinctive expression cannot be copied | Vision, OSS-004/005 |
 | D-002 | Native macOS first | Accepted | PLAT-001 |
 | D-003 | Native Linux and Linux servers | Accepted; Ubuntu 26.04 LTS initial target | PLAT-002/003 |
 | D-004 | Browser management, spectating, Web3 apps, optional cloud streaming | Accepted; P1 provides bounded public-cell viewing, while production delayed/permissioned/global spectating remains later | PLAT-004/005/007, F-017/041 |
