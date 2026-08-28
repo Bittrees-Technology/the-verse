@@ -54,6 +54,12 @@ const I64_MIN_MAGNITUDE_DECIMAL := "9223372036854775808"
 const U64_MAX_DECIMAL := "18446744073709551615"
 const POSITION_SNAP_DISTANCE := 2.0
 const ORIENTATION_SNAP_ANGLE := PI / 3.0
+const PRESENTATION_MICRO_POSITION_M := 0.025
+const PRESENTATION_FULL_POSITION_M := 0.35
+const PRESENTATION_MICRO_ORIENTATION_RADIANS := 0.008
+const PRESENTATION_FULL_ORIENTATION_RADIANS := 0.09
+const PRESENTATION_MICRO_CORRECTION_RATE := 2.2
+const PRESENTATION_FULL_CORRECTION_RATE := 10.0
 const CHARACTER_COLLISION_RADIUS := 0.34
 const CHARACTER_STANDING_HEIGHT := 1.8
 const CHARACTER_EYE_HEIGHT := 1.62
@@ -4481,11 +4487,16 @@ func _reset_prediction_presentation_baseline() -> void:
 
 func _predict_player_step(control: Dictionary, delta: float, record_history: bool) -> void:
 	var player := _local_player()
-	var locomotion: Dictionary = player.get("locomotion", {})
+	var locomotion: Dictionary = player.get("locomotion", {}).duplicate(true)
 	var prediction_control := control.duplicate(true)
 	var jump_held := bool(control.get("jump", false))
 	prediction_control["jump"] = jump_held and not predicted_jump_held
 	predicted_jump_held = jump_held
+	var spherical_ground_up := _prediction_spherical_ground_up(predicted_position, locomotion)
+	var spherical_ground_radius := 0.0
+	if spherical_ground_up.length_squared() > 0.000001:
+		spherical_ground_radius = predicted_position.distance_to(prediction_planet_center)
+		locomotion["up"] = _protocol_vec3(spherical_ground_up)
 	if not bool(player.get("jetpack_enabled", true)):
 		var angular_input: Vector3 = prediction_control.get("angular_input", Vector3.ZERO)
 		predicted_view_pitch_radians = clampf(
@@ -4510,6 +4521,19 @@ func _predict_player_step(control: Dictionary, delta: float, record_history: boo
 	var supported := locomotion_kind in ["grounded", "magnetic"] and not bool(
 		prediction_control.get("jump", false)
 	)
+	if supported and spherical_ground_radius > 0.0:
+		var proposed_radial := proposed_position - prediction_planet_center
+		if proposed_radial.length_squared() > 0.000001:
+			var proposed_up := proposed_radial.normalized()
+			proposed_position = (
+				prediction_planet_center + proposed_up * spherical_ground_radius
+			)
+			var proposed_velocity: Vector3 = result.get(
+				"linear_velocity", predicted_linear_velocity
+			)
+			result["linear_velocity"] = (
+				proposed_velocity - proposed_up * proposed_velocity.dot(proposed_up)
+			)
 	var sweep := (
 		{"position": proposed_position, "collided": true}
 		if supported
@@ -4531,6 +4555,25 @@ func _predict_player_step(control: Dictionary, delta: float, record_history: boo
 			"simulation_tick": predicted_simulation_tick,
 			"control": control.duplicate(true),
 		})
+
+
+func _prediction_spherical_ground_up(
+	position: Vector3, locomotion: Dictionary
+) -> Vector3:
+	if (
+		not prediction_gravity_model_ready
+		or String(locomotion.get("kind", "")) != "grounded"
+	):
+		return Vector3.ZERO
+	var support: Dictionary = locomotion.get("support", {})
+	var celestial_body_id := String(_local_environment().get("celestial_body_id", ""))
+	if (
+		celestial_body_id.is_empty()
+		or String(support.get("body_id", "")) != celestial_body_id
+	):
+		return Vector3.ZERO
+	var radial := position - prediction_planet_center
+	return radial.normalized() if radial.length_squared() > 0.000001 else Vector3.ZERO
 
 
 func _integrate_player_motion(
@@ -4782,10 +4825,17 @@ func _player_position_is_clear(position: Vector3) -> bool:
 func _update_player_presentation(delta: float) -> void:
 	if not authoritative_player_ready:
 		return
-	var blend := 1.0 - exp(-12.0 * maxf(delta, 0.0))
-	presentation_position_offset = presentation_position_offset.lerp(Vector3.ZERO, blend)
+	var position_blend := _presentation_position_correction_blend(
+		presentation_position_offset, delta
+	)
+	var orientation_blend := _presentation_orientation_correction_blend(
+		presentation_orientation_offset, delta
+	)
+	presentation_position_offset = presentation_position_offset.lerp(
+		Vector3.ZERO, position_blend
+	)
 	presentation_orientation_offset = _shortest_slerp(
-		presentation_orientation_offset, Quaternion.IDENTITY, blend
+		presentation_orientation_offset, Quaternion.IDENTITY, orientation_blend
 	)
 	var locomotion: Dictionary = _local_player().get("locomotion", {})
 	var interpolation_fraction := clampf(
@@ -4800,10 +4850,51 @@ func _update_player_presentation(delta: float) -> void:
 	last_presented_eye_offset = _prediction_camera_eye_offset(render_orientation)
 	camera.position = render_position + presentation_position_offset + last_presented_eye_offset
 	camera.quaternion = (presentation_orientation_offset * view_orientation).normalized()
-	var boost_amount := clampf(
-		predicted_linear_velocity.length() / CHARACTER_BOOST_MAXIMUM_SPEED, 0.0, 1.0
+	var ordinary_speed := (
+		CHARACTER_SPRINT_SPEED
+		if String(locomotion.get("kind", "eva")) in ["grounded", "magnetic"]
+		else CHARACTER_MAXIMUM_SPEED
 	)
-	camera.fov = lerpf(camera.fov, 74.0 + boost_amount * 8.0, minf(delta * 5.0, 1.0))
+	var boost_amount := clampf(
+		(predicted_linear_velocity.length() - ordinary_speed)
+		/ maxf(CHARACTER_BOOST_MAXIMUM_SPEED - ordinary_speed, 0.001),
+		0.0,
+		1.0,
+	)
+	camera.fov = lerpf(
+		camera.fov,
+		74.0 + boost_amount * 8.0,
+		1.0 - exp(-5.0 * maxf(delta, 0.0)),
+	)
+
+
+func _presentation_position_correction_blend(offset: Vector3, delta: float) -> float:
+	var response := smoothstep(
+		PRESENTATION_MICRO_POSITION_M,
+		PRESENTATION_FULL_POSITION_M,
+		offset.length(),
+	)
+	return _presentation_correction_blend(response, delta)
+
+
+func _presentation_orientation_correction_blend(
+	offset: Quaternion, delta: float
+) -> float:
+	var response := smoothstep(
+		PRESENTATION_MICRO_ORIENTATION_RADIANS,
+		PRESENTATION_FULL_ORIENTATION_RADIANS,
+		_quaternion_angular_distance(offset, Quaternion.IDENTITY),
+	)
+	return _presentation_correction_blend(response, delta)
+
+
+func _presentation_correction_blend(response: float, delta: float) -> float:
+	var rate := lerpf(
+		PRESENTATION_MICRO_CORRECTION_RATE,
+		PRESENTATION_FULL_CORRECTION_RATE,
+		clampf(response, 0.0, 1.0),
+	)
+	return 1.0 - exp(-rate * maxf(delta, 0.0))
 
 
 func _camera_up() -> Vector3:

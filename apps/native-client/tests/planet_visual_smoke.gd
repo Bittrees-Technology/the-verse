@@ -17,6 +17,10 @@ func _initialize() -> void:
 
 func _run() -> void:
 	_check(
+		int(ProjectSettings.get_setting("rendering/anti_aliasing/quality/msaa_3d", 0)) == 2,
+		"native presentation keeps four-sample geometry antialiasing",
+	)
+	_check(
 		PLANET_TEXTURE.get_width() == 1774 and PLANET_TEXTURE.get_height() == 887,
 		"Earthlike albedo stays at its exact 2:1 source dimensions",
 	)
