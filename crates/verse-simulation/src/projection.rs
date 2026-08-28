@@ -727,7 +727,7 @@ impl WorldState {
     /// Builds public projection material once so a worker can reuse it for all
     /// sessions projected from the same immutable authoritative state.
     pub fn projection_source(&self) -> Result<ProjectionSource, ProjectionError> {
-        let canonical = self.snapshot();
+        let canonical = self.projection_snapshot();
         let mut candidates = BTreeMap::new();
         let mut support_entities = BTreeMap::new();
         for player in &canonical.players {
@@ -3012,6 +3012,44 @@ mod tests {
             )
             .expect("well-formed link installs before world binding");
         assert!(imported.project_interest_baseline(&mut wrong_cell).is_err());
+    }
+
+    #[test]
+    fn empty_frontier_cell_projects_a_verified_public_vacuum_baseline() {
+        let origin = celestial::cell_origin_key();
+        let east =
+            celestial::neighbor_cell_key(&origin, [1, 0, 0]).expect("adjacent proof cell derives");
+        let world = WorldState::genesis_for_cell(42, &east).expect("frontier cell builds");
+        let mut cursor = InterestProjectionState::public_origin_spectator("empty-frontier-session");
+        let baseline = world
+            .project_interest_baseline(&mut cursor)
+            .expect("empty frontier baseline projects");
+        assert!(baseline.interest.entered.is_empty());
+        assert!(baseline.actor_private.is_none());
+        assert!(baseline.gravity_body_id.is_empty());
+        assert!(baseline.voxel_body_id.is_empty());
+        assert_eq!(baseline.environment.gravity, Vec3::ZERO);
+        assert!(!baseline.environment.breathable);
+
+        let role = SessionRole::Spectator;
+        let mut verifier = verifier_for(&world, role.clone());
+        establish_verifier(&mut verifier, &world, role);
+        assert_eq!(
+            commit_wire(
+                &mut verifier,
+                &ServerMessage::InterestBaseline {
+                    baseline: Box::new(baseline),
+                },
+            ),
+            StageKind::Baseline
+        );
+        assert_eq!(
+            verifier
+                .committed_view()
+                .expect("empty frontier view commits")
+                .entity_count,
+            0
+        );
     }
 
     #[test]

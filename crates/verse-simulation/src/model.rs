@@ -2164,6 +2164,32 @@ impl WorldState {
         }
     }
 
+    /// Builds the legacy-shaped canonical material consumed only by the P1.7
+    /// projection layer. An empty frontier cell has no canonical primary
+    /// player, while `WorldSnapshot::player` remains required for older P0
+    /// callers. The compatibility placeholder is removed from `players` and
+    /// is never copied into protocol-18 public or private projections.
+    pub(crate) fn projection_snapshot(&self) -> WorldSnapshot {
+        if !self.player.by_id.is_empty() {
+            return self.snapshot();
+        }
+        let mut bridge = self.clone();
+        let mut placeholder = Self::genesis(self.world_seed).player.primary().clone();
+        placeholder.player_id = "projection-empty-cell-placeholder".into();
+        placeholder.inventory_id = "projection-empty-cell-inventory-placeholder".into();
+        placeholder.address = self.cell_address.clone();
+        placeholder.position = Vec3::ZERO;
+        placeholder.orientation = Quat::IDENTITY;
+        placeholder.linear_velocity = Vec3::ZERO;
+        placeholder.angular_velocity = Vec3::ZERO;
+        placeholder.surface_contact = false;
+        bridge.player = PlayerRoster::from_primary(placeholder);
+        let mut snapshot = bridge.snapshot();
+        snapshot.players.clear();
+        snapshot.world_hash = self.state_hash();
+        snapshot
+    }
+
     pub fn motion_snapshot(&self) -> MotionSnapshot {
         let primary_environment = self.environment_at(self.player.position);
         MotionSnapshot {

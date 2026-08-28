@@ -10,13 +10,14 @@ use clap::Parser;
 use tokio::net::TcpListener;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
-use verse_simulation::{LifecycleMode, Runtime};
+use verse_protocol::CellKeyV1;
+use verse_simulation::{LifecycleMode, Runtime, cell_origin_key};
 use verse_simulation_worker::{AppState, router};
 
 #[derive(Debug, Parser)]
 #[command(
     name = "verse-simulation-worker",
-    about = "The Verse authoritative local P0 universe"
+    about = "The Verse authoritative simulation cell"
 )]
 struct Arguments {
     #[arg(long, env = "VERSE_BIND", default_value = "127.0.0.1:7777")]
@@ -24,6 +25,10 @@ struct Arguments {
 
     #[arg(long, env = "VERSE_DATA_DIR", default_value = "data/local-universe")]
     data_directory: PathBuf,
+
+    /// Canonical `CellKeyV1` JSON for this worker. Omission selects the origin cell.
+    #[arg(long, env = "VERSE_CELL_KEY_JSON")]
+    cell_key_json: Option<String>,
 
     #[arg(long, env = "VERSE_WORLD_SEED", default_value_t = 20260826)]
     world_seed: u64,
@@ -70,16 +75,22 @@ async fn main() -> Result<()> {
             "protocol 11 local-development player authentication is restricted to a loopback bind; use 127.0.0.1 or wait for the configured session authority"
         );
     }
+    let cell_key = arguments.cell_key_json.as_deref().map_or_else(
+        || Ok(cell_origin_key()),
+        |json| serde_json::from_str::<CellKeyV1>(json).context("VERSE_CELL_KEY_JSON is invalid"),
+    )?;
     let mut runtime = if arguments.pause_simulation {
-        Runtime::open(
+        Runtime::open_for_cell(
             &arguments.data_directory,
             arguments.world_seed,
+            cell_key,
             arguments.snapshot_every,
         )
     } else {
-        Runtime::open_hosted(
+        Runtime::open_hosted_for_cell(
             &arguments.data_directory,
             arguments.world_seed,
+            cell_key,
             arguments.snapshot_every,
         )
     }
@@ -89,10 +100,18 @@ async fn main() -> Result<()> {
             arguments.data_directory.display()
         )
     })?;
-    for player_id in &arguments.development_players {
-        runtime
-            .admit_development_player(player_id)
-            .with_context(|| format!("failed to pre-admit development player {player_id}"))?;
+    if runtime.state().player.by_id.is_empty() {
+        if !arguments.development_players.is_empty() {
+            info!(
+                "empty frontier cells ignore development-player admission until a canonical transfer arrives"
+            );
+        }
+    } else {
+        for player_id in &arguments.development_players {
+            runtime
+                .admit_development_player(player_id)
+                .with_context(|| format!("failed to pre-admit development player {player_id}"))?;
+        }
     }
     let state = AppState::new(runtime);
     let lifecycle_task = if arguments.pause_simulation {
@@ -191,6 +210,7 @@ mod tests {
         assert_eq!(arguments.tick_millis, 16);
         assert_eq!(arguments.idle_drain_seconds, 30);
         assert_eq!(arguments.development_players, ["player-remote"]);
+        assert!(arguments.cell_key_json.is_none());
         assert!(f64::from(arguments.tick_millis) <= 1_000.0 / 60.0);
     }
 }

@@ -30,7 +30,7 @@ use tracing::{error, info, warn};
 #[cfg(test)]
 use verse_protocol::ProjectedMotionSnapshot;
 use verse_protocol::{
-    CELESTIAL_REGISTRY_SCHEMA_VERSION, CelestialRegistrySnapshot, ClientAuthentication,
+    CELESTIAL_REGISTRY_SCHEMA_VERSION, CelestialRegistrySnapshot, CellKeyV1, ClientAuthentication,
     ClientMessage, INTEREST_SCHEMA_VERSION, IntentReceipt, InterestSnapshot, MotionSnapshot,
     PROJECTION_SCHEMA_VERSION, PROTOCOL_VERSION, ProjectedWorldSnapshot, ServerMessage,
     SessionRole, UNIVERSE_MANIFEST_SCHEMA_VERSION, UniverseManifestSnapshot, WorldSnapshot,
@@ -306,6 +306,15 @@ impl AppState {
 
     pub fn snapshot(&self) -> WorldSnapshot {
         self.projection_revision.lock().world.snapshot()
+    }
+
+    fn player_is_present(&self, player_id: &str) -> bool {
+        self.projection_revision
+            .lock()
+            .world
+            .player
+            .get(player_id)
+            .is_some()
     }
 
     pub fn motion_snapshot(&self) -> MotionSnapshot {
@@ -952,6 +961,7 @@ struct StatusDocument {
     content_manifest_version: String,
     universe_id: String,
     cell_id: String,
+    cell_key: CellKeyV1,
     event_sequence: u64,
     simulation_tick: u64,
     fencing_token: u64,
@@ -1111,20 +1121,46 @@ fn no_store(mut response: Response) -> Response {
 }
 
 async fn status(State(state): State<Arc<AppState>>) -> Response {
-    let snapshot = state.snapshot();
+    let (
+        content_manifest_version,
+        universe_id,
+        cell_id,
+        cell_key,
+        event_sequence,
+        simulation_tick,
+        fencing_token,
+        world_hash,
+        conservation_valid,
+    ) = {
+        let revision = state.projection_revision.lock();
+        let world = &revision.world;
+        (
+            world.content_manifest_version.clone(),
+            world.universe_id.clone(),
+            world.cell_id.clone(),
+            verse_simulation::cell_key_from_address(&world.cell_address)
+                .expect("canonical worker world always has a valid cell key"),
+            world.event_sequence,
+            world.simulation_tick,
+            world.fencing_token,
+            world.state_hash(),
+            world.conservation().valid,
+        )
+    };
     let lifecycle = state.lifecycle_status();
     no_store(
         Json(StatusDocument {
             service: "verse-simulation-worker",
             protocol_version: PROTOCOL_VERSION,
-            content_manifest_version: snapshot.content_manifest_version,
-            universe_id: snapshot.universe_id,
-            cell_id: snapshot.cell_id,
-            event_sequence: snapshot.event_sequence,
-            simulation_tick: snapshot.simulation_tick,
-            fencing_token: snapshot.fencing_token,
-            world_hash: snapshot.world_hash,
-            conservation_valid: snapshot.conservation.valid,
+            content_manifest_version,
+            universe_id,
+            cell_id,
+            cell_key,
+            event_sequence,
+            simulation_tick,
+            fencing_token,
+            world_hash,
+            conservation_valid,
             authoritative_halted: state.is_halted(),
             lifecycle: PublicLifecycleStatus::from(&lifecycle),
         })
@@ -1458,12 +1494,7 @@ async fn complete_handshake(
                             SessionBinding::Spectator
                         }
                         ClientAuthentication::LocalDevelopment { player_id } => {
-                            if !state
-                                .snapshot()
-                                .players
-                                .iter()
-                                .any(|player| player.player_id == player_id)
-                            {
+                            if !state.player_is_present(&player_id) {
                                 send_fatal_and_close(
                                     sender,
                                     "actor_not_present",
@@ -4473,9 +4504,68 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
         assert_eq!(json["conservation_valid"], true);
         assert_eq!(json["protocol_version"], PROTOCOL_VERSION);
+        assert_eq!(json["cell_key"]["schema_version"], 1);
+        assert_eq!(json["cell_key"]["universe_id"], "the-verse-local");
+        assert_eq!(json["cell_key"]["cell"]["x"], 500);
         assert!(json["lifecycle"]["next_production_occurrence"].is_null());
         assert!(json["lifecycle"]["acknowledged_production_sequence"].is_null());
         assert!(json["lifecycle"]["expires_at_unix_ms"].is_null());
+    }
+
+    #[tokio::test]
+    async fn empty_frontier_worker_serves_status_and_public_vacuum_without_a_primary_player() {
+        let directory = tempdir().expect("tempdir");
+        let origin = verse_simulation::cell_origin_key();
+        let east = verse_simulation::neighbor_cell_key(&origin, [1, 0, 0])
+            .expect("adjacent proof cell derives");
+        let runtime = Runtime::open_for_cell(directory.path(), 100, east, 20)
+            .expect("empty frontier runtime opens");
+        let app = router(AppState::new(runtime));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/status")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("status JSON");
+        assert_eq!(json["cell_key"]["cell"]["x"], 501);
+        assert_eq!(json["conservation_valid"], true);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/world")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("world JSON");
+        assert_eq!(json["cell_address"]["cell"]["x"], 501);
+        assert_eq!(json["gravity_body_id"], "");
+        assert_eq!(json["voxel_body_id"], "");
+        assert_eq!(json["environment"]["gravity_m_s2"], 0.0);
+        assert_eq!(json["environment"]["breathable"], false);
+        assert_eq!(
+            json["interest"]["entered"]
+                .as_array()
+                .expect("entered entities")
+                .len(),
+            0
+        );
     }
 
     #[tokio::test]
