@@ -37,7 +37,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 run_client_smoke() {
-  "${client_binary}" \
+  "${client_command[@]}" \
     --headless \
     -- \
     "--server=ws://127.0.0.1:${smoke_port}/ws" \
@@ -63,10 +63,12 @@ run_client_smoke() {
 case "$(uname -s)-$(uname -m)" in
   Darwin-arm64)
     client_binary="${staging_directory}/The Verse.app/Contents/MacOS/The Verse"
+    client_command=(/usr/bin/arch -arm64 "${client_binary}")
     checksum_command=(shasum -a 256 -c)
     ;;
   Linux-x86_64)
     client_binary="${staging_directory}/TheVerse.x86_64"
+    client_command=("${client_binary}")
     checksum_command=(sha256sum -c)
     ;;
   *)
@@ -106,6 +108,11 @@ if [[ "$(uname -s)-$(uname -m)" == "Darwin-arm64" ]]; then
         ;;
     esac
   done
+  client_architectures="$(lipo -archs "${client_binary}")"
+  if [[ " ${client_architectures} " == *" x86_64 "* ]]; then
+    echo "The staged macOS client may select x86_64, but the mandatory verifier is arm64-only." >&2
+    exit 1
+  fi
 fi
 if [[ ! -s "${staging_directory}/licenses/MPL-2.0.txt" ]]; then
   echo "The staged package is missing the godot-rust MPL-2.0 notice." >&2

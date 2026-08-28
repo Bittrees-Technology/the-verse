@@ -27,19 +27,22 @@ use tower_http::{
     trace::{DefaultMakeSpan, TraceLayer},
 };
 use tracing::{error, info, warn};
-#[cfg(test)]
-use verse_protocol::ProjectedMotionSnapshot;
 use verse_protocol::{
-    CELESTIAL_REGISTRY_SCHEMA_VERSION, CelestialRegistrySnapshot, ClientAuthentication,
-    ClientMessage, INTEREST_SCHEMA_VERSION, IntentReceipt, InterestSnapshot, MotionSnapshot,
-    PROJECTION_SCHEMA_VERSION, PROTOCOL_VERSION, ProjectedWorldSnapshot, ServerMessage,
-    SessionRole, UNIVERSE_MANIFEST_SCHEMA_VERSION, UniverseManifestSnapshot, WorldSnapshot,
+    CELESTIAL_REGISTRY_SCHEMA_VERSION, CelestialRegistrySnapshot, CellKeyV1, ClientAuthentication,
+    ClientMessage, HandoffPhase, HandoffStatus, INTEREST_SCHEMA_VERSION, IntentReceipt,
+    InterestEntityKind, InterestRemovalReason, InterestSnapshot, MotionSnapshot,
+    PROJECTION_SCHEMA_VERSION, PROTOCOL_VERSION, ServerMessage, SessionRole,
+    UNIVERSE_MANIFEST_SCHEMA_VERSION, UniverseManifestSnapshot, WorldSnapshot,
 };
+#[cfg(test)]
+use verse_protocol::{ProjectedMotionSnapshot, ProjectedWorldSnapshot};
 use verse_simulation::{
-    AdvanceImpact, CellLifecycleStatus, EVENT_SCHEMA_VERSION, IntentError, InterestEntityIdentity,
-    InterestProjectionState, LifecycleMode, ProjectedInterestFrame, ProjectionError,
-    ProjectionSource, Runtime, RuntimeError, RuntimeOpenConfig, WORLD_SCHEMA_VERSION, WorldState,
-    registry_snapshot, universe_manifest,
+    AdvanceImpact, CellDirectoryError, CellLifecycleStatus, CompletedPlayerHandoff,
+    EVENT_SCHEMA_VERSION, IntentError, InterestEntityIdentity, InterestObserver,
+    InterestProjectionState, LifecycleMode, LocalTwoCellRuntime, ProjectedInterestFrame,
+    ProjectionError, ProjectionSource, ResidentPlayerRoute, Runtime, RuntimeError,
+    RuntimeOpenConfig, TwoCellRuntimeError, WORLD_SCHEMA_VERSION, WorldState, registry_snapshot,
+    universe_manifest,
 };
 
 const COMMAND_CENTER_HTML: &str = include_str!("../../../apps/web-command-center/index.html");
@@ -50,6 +53,7 @@ const VERIFIER_WORKER_JS: &str =
 const VERIFIER_WORKER_CORE_JS: &str =
     include_str!("../../../apps/web-command-center/verifier-worker-core.js");
 const REPLICATION_PERIOD: Duration = Duration::from_nanos(16_666_667);
+const MAX_ACTIVE_ELAPSED_MILLIS: u16 = 250;
 const DYNAMIC_CACHE_CONTROL: &str = "no-store";
 const MAX_CLIENT_NAME_BYTES: usize = 128;
 const MAX_SERVER_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
@@ -203,9 +207,13 @@ fn replication_interest(message: &ServerMessage) -> Option<&InterestSnapshot> {
 #[derive(Debug)]
 pub struct AppState {
     runtime: Mutex<HostedRuntime>,
+    two_cell: bool,
     activation_gate: AsyncMutex<()>,
     lifecycle_signal: Notify,
     updates: watch::Sender<ReplicationFeed>,
+    public_updates: watch::Sender<ReplicationFeed>,
+    handoffs: watch::Sender<BTreeMap<String, CompletedPlayerHandoff>>,
+    public_origin_projection: Mutex<PublicOriginProjection>,
     authority: watch::Sender<WorkerAuthorityStatus>,
     connected_players: Mutex<BTreeSet<String>>,
     last_player_activity: Mutex<Instant>,
@@ -220,8 +228,46 @@ pub struct AppState {
 #[derive(Debug)]
 struct HostedRuntime {
     runtime: Option<Runtime>,
-    open_config: RuntimeOpenConfig,
+    coordinator: Option<LocalTwoCellRuntime>,
+    open_config: Option<RuntimeOpenConfig>,
     lifecycle: CellLifecycleStatus,
+}
+
+fn coordinator_runtime_error(source: TwoCellRuntimeError) -> RuntimeError {
+    match source {
+        TwoCellRuntimeError::Runtime(source) => source,
+        source @ TwoCellRuntimeError::StalePlayerRoute { .. } => {
+            RuntimeError::Intent(IntentError::Rejected {
+                code: "player_route_stale".into(),
+                message: source.to_string(),
+            })
+        }
+        source => RuntimeError::CanonicalInvariant(source.to_string()),
+    }
+}
+
+fn coordinator_error_requires_fence(source: &TwoCellRuntimeError) -> bool {
+    !matches!(
+        source,
+        TwoCellRuntimeError::StalePlayerRoute { .. }
+            | TwoCellRuntimeError::Runtime(RuntimeError::Intent(_))
+    )
+}
+
+fn apply_public_origin_handoff(
+    removals: &mut BTreeMap<InterestEntityIdentity, InterestRemovalReason>,
+    handoff: &CompletedPlayerHandoff,
+) {
+    let identity = InterestEntityIdentity {
+        entity_id: handoff.player_id.clone(),
+        kind: InterestEntityKind::Player,
+    };
+    let origin = verse_simulation::cell_origin_key();
+    if handoff.source_cell_key == origin {
+        removals.insert(identity, InterestRemovalReason::Transferred);
+    } else if handoff.destination_cell_key == origin {
+        removals.remove(&identity);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -235,6 +281,20 @@ struct CachedPublicWorld {
 struct ProjectionRevision {
     world: WorldState,
     source: OnceLock<Result<Arc<ProjectionSource>, String>>,
+}
+
+#[derive(Debug, Clone)]
+struct PublicOriginProjection {
+    revision: Arc<ProjectionRevision>,
+    removals: BTreeMap<InterestEntityIdentity, InterestRemovalReason>,
+}
+
+#[derive(Debug, Clone)]
+struct InitialSessionProjection {
+    resident_route: Option<ResidentPlayerRoute>,
+    revision: Arc<ProjectionRevision>,
+    removals: BTreeMap<InterestEntityIdentity, InterestRemovalReason>,
+    completed_transfer_id: String,
 }
 
 impl ProjectionRevision {
@@ -257,6 +317,13 @@ impl ProjectionRevision {
             .cloned()
             .map_err(|source| ProjectionError::InvalidCanonicalSnapshot(source.clone()))
     }
+}
+
+fn bounded_active_elapsed(elapsed: Duration) -> u16 {
+    let elapsed_millis = elapsed
+        .as_millis()
+        .clamp(1, u128::from(MAX_ACTIVE_ELAPSED_MILLIS));
+    u16::try_from(elapsed_millis).expect("bounded active elapsed milliseconds fit u16")
 }
 
 impl AppState {
@@ -282,16 +349,69 @@ impl AppState {
         };
         let hosted_runtime = (observed_mode != LifecycleMode::Sleeping).then_some(runtime);
         let (updates, _) = watch::channel(ReplicationFeed::default());
+        let (public_updates, _) = watch::channel(ReplicationFeed::default());
+        let (handoffs, _) = watch::channel(BTreeMap::new());
         let (authority, _) = watch::channel(authority_status);
         Arc::new(Self {
             runtime: Mutex::new(HostedRuntime {
                 runtime: hosted_runtime,
-                open_config,
+                coordinator: None,
+                open_config: Some(open_config),
                 lifecycle,
             }),
+            two_cell: false,
             activation_gate: AsyncMutex::new(()),
             lifecycle_signal: Notify::new(),
             updates,
+            public_updates,
+            handoffs,
+            public_origin_projection: Mutex::new(PublicOriginProjection {
+                revision: projection_revision.clone(),
+                removals: BTreeMap::new(),
+            }),
+            authority,
+            connected_players: Mutex::new(BTreeSet::new()),
+            last_player_activity: Mutex::new(Instant::now()),
+            session_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS)),
+            http_projection_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_HTTP_PROJECTIONS)),
+            public_world_cache: Mutex::new(None),
+            projection_revision: Mutex::new(projection_revision),
+            registry,
+            universe_manifest,
+        })
+    }
+
+    pub fn new_two_cell(coordinator: LocalTwoCellRuntime) -> Arc<Self> {
+        let world = coordinator.public_origin_runtime().state().clone();
+        let world_seed = world.world_seed;
+        let lifecycle = coordinator.lifecycle_status();
+        let registry = registry_snapshot(world_seed)
+            .expect("the coordinator's validated celestial registry remains available");
+        let universe_manifest =
+            universe_manifest(world_seed, WORLD_SCHEMA_VERSION, EVENT_SCHEMA_VERSION)
+                .expect("the coordinator's validated universe manifest remains available");
+        let projection_revision = Arc::new(ProjectionRevision::new(world));
+        let (updates, _) = watch::channel(ReplicationFeed::default());
+        let (public_updates, _) = watch::channel(ReplicationFeed::default());
+        let (handoffs, _) = watch::channel(BTreeMap::new());
+        let (authority, _) = watch::channel(WorkerAuthorityStatus::Active);
+        Arc::new(Self {
+            runtime: Mutex::new(HostedRuntime {
+                runtime: None,
+                coordinator: Some(coordinator),
+                open_config: None,
+                lifecycle,
+            }),
+            two_cell: true,
+            activation_gate: AsyncMutex::new(()),
+            lifecycle_signal: Notify::new(),
+            updates,
+            public_updates,
+            handoffs,
+            public_origin_projection: Mutex::new(PublicOriginProjection {
+                revision: projection_revision.clone(),
+                removals: BTreeMap::new(),
+            }),
             authority,
             connected_players: Mutex::new(BTreeSet::new()),
             last_player_activity: Mutex::new(Instant::now()),
@@ -308,6 +428,70 @@ impl AppState {
         self.projection_revision.lock().world.snapshot()
     }
 
+    fn player_is_present(&self, player_id: &str) -> Result<bool, RuntimeError> {
+        if let Some(coordinator) = self.runtime.lock().coordinator.as_ref() {
+            let result = coordinator.runtime_for_player(player_id);
+            return match result {
+                Ok(_) => Ok(true),
+                Err(TwoCellRuntimeError::Directory(CellDirectoryError::UnknownAggregate(_))) => {
+                    Ok(false)
+                }
+                Err(source) => {
+                    let source = coordinator_runtime_error(source);
+                    self.publish_fenced(source.to_string());
+                    Err(source)
+                }
+            };
+        }
+        Ok(self
+            .projection_revision
+            .lock()
+            .world
+            .player
+            .get(player_id)
+            .is_some())
+    }
+
+    fn resident_player_route(
+        &self,
+        player_id: &str,
+    ) -> Result<Option<ResidentPlayerRoute>, RuntimeError> {
+        let hosted = self.runtime.lock();
+        let result = hosted
+            .coordinator
+            .as_ref()
+            .map(|coordinator| coordinator.resident_player_route(player_id))
+            .transpose();
+        drop(hosted);
+        match result {
+            Ok(route) => Ok(route),
+            Err(source) => {
+                let fence = coordinator_error_requires_fence(&source);
+                let source = coordinator_runtime_error(source);
+                if fence {
+                    self.publish_fenced(source.to_string());
+                }
+                Err(source)
+            }
+        }
+    }
+
+    fn resident_route_is_stale(
+        &self,
+        player_id: Option<&str>,
+        expected: Option<&ResidentPlayerRoute>,
+    ) -> Result<bool, RuntimeError> {
+        if !self.two_cell {
+            return Ok(false);
+        }
+        let (Some(player_id), Some(expected)) = (player_id, expected) else {
+            return Ok(false);
+        };
+        Ok(self
+            .resident_player_route(player_id)?
+            .is_some_and(|current| &current != expected))
+    }
+
     pub fn motion_snapshot(&self) -> MotionSnapshot {
         self.projection_revision.lock().world.motion_snapshot()
     }
@@ -320,12 +504,12 @@ impl AppState {
         self.runtime.lock().lifecycle.observed_mode
     }
 
+    #[cfg(test)]
     fn projected_snapshot(
         &self,
         actor_player_id: Option<&str>,
     ) -> Result<ProjectedWorldSnapshot, ProjectionError> {
-        self.projection_revision
-            .lock()
+        self.projection_revision_for(actor_player_id)?
             .world
             .project_world_snapshot(actor_player_id)
     }
@@ -335,23 +519,170 @@ impl AppState {
         &self,
         actor_player_id: Option<&str>,
     ) -> Result<ProjectedMotionSnapshot, ProjectionError> {
-        self.projection_revision
-            .lock()
+        self.projection_revision_for(actor_player_id)?
             .world
             .project_motion_snapshot(actor_player_id)
     }
 
+    #[cfg(test)]
     fn projected_interest_frame(
         &self,
         projection: &mut InterestProjectionState,
     ) -> Result<ProjectedInterestFrame, ProjectionError> {
-        let revision = self.projection_revision.lock().clone();
+        self.projected_interest_frame_at(projection, None)
+    }
+
+    fn projected_interest_frame_at(
+        &self,
+        projection: &mut InterestProjectionState,
+        resident_route: Option<&ResidentPlayerRoute>,
+    ) -> Result<ProjectedInterestFrame, ProjectionError> {
+        let actor_player_id = match projection.observer() {
+            InterestObserver::BoundPlayer { player_id } => Some(player_id.as_str()),
+            InterestObserver::PublicOriginSpectator => None,
+        };
+        if self.two_cell && actor_player_id.is_none() {
+            let public = self.public_origin_projection.lock().clone();
+            let source = public.revision.source()?;
+            return source.project_interest_frame(projection, &public.removals);
+        }
+        let revision = self.projection_revision_for_at(actor_player_id, resident_route)?;
         let source = revision.source()?;
-        source.project_interest_frame(projection, &BTreeMap::<InterestEntityIdentity, _>::new())
+        source.project_interest_frame(projection, &BTreeMap::new())
+    }
+
+    #[cfg(test)]
+    fn projection_revision_for(
+        &self,
+        actor_player_id: Option<&str>,
+    ) -> Result<Arc<ProjectionRevision>, ProjectionError> {
+        self.projection_revision_for_at(actor_player_id, None)
+    }
+
+    fn projection_revision_for_at(
+        &self,
+        actor_player_id: Option<&str>,
+        resident_route: Option<&ResidentPlayerRoute>,
+    ) -> Result<Arc<ProjectionRevision>, ProjectionError> {
+        if !self.two_cell {
+            return Ok(self.projection_revision.lock().clone());
+        }
+        if actor_player_id.is_none() {
+            return Ok(self.public_origin_projection.lock().revision.clone());
+        }
+        let hosted = self.runtime.lock();
+        let coordinator = hosted
+            .coordinator
+            .as_ref()
+            .expect("two-cell state always retains its coordinator");
+        let player_id = actor_player_id.expect("the public origin returned above");
+        let route = resident_route.ok_or_else(|| {
+            ProjectionError::InvalidCanonicalSnapshot(
+                "bound-player projection requires a resident route permit".into(),
+            )
+        })?;
+        let runtime = coordinator
+            .runtime_for_player_at(player_id, route)
+            .map_err(|source| ProjectionError::InvalidCanonicalSnapshot(source.to_string()))?;
+        Ok(Arc::new(ProjectionRevision::new(runtime.state().clone())))
+    }
+
+    fn initial_session_projection(
+        &self,
+        binding: &SessionBinding,
+    ) -> Result<InitialSessionProjection, RuntimeError> {
+        if !self.two_cell {
+            return Ok(InitialSessionProjection {
+                resident_route: None,
+                revision: self.projection_revision.lock().clone(),
+                removals: BTreeMap::new(),
+                completed_transfer_id: String::new(),
+            });
+        }
+        let Some(player_id) = binding.player_id() else {
+            let public = self.public_origin_projection.lock().clone();
+            return Ok(InitialSessionProjection {
+                resident_route: None,
+                revision: public.revision,
+                removals: public.removals,
+                completed_transfer_id: String::new(),
+            });
+        };
+
+        // The coordinator lock makes route, immutable world revision, and the
+        // retained completion frontier one bootstrap cut. Handoff publication
+        // is performed under this same lock in `advance`.
+        let hosted = self.runtime.lock();
+        let result = (|| {
+            let coordinator = hosted.coordinator.as_ref().ok_or_else(|| {
+                TwoCellRuntimeError::Invalid("two-cell coordinator is unavailable".into())
+            })?;
+            let route = coordinator.resident_player_route(player_id)?;
+            let runtime = coordinator.runtime_for_player_at(player_id, &route)?;
+            let completed_transfer_id = self
+                .handoffs
+                .borrow()
+                .get(player_id)
+                .filter(|handoff| {
+                    handoff.destination_cell_key == route.cell_key
+                        && handoff.placement_generation == route.placement_generation
+                })
+                .map_or_else(String::new, |handoff| handoff.transfer_id.clone());
+            Ok(InitialSessionProjection {
+                resident_route: Some(route),
+                revision: Arc::new(ProjectionRevision::new(runtime.state().clone())),
+                removals: BTreeMap::new(),
+                completed_transfer_id,
+            })
+        })();
+        drop(hosted);
+        match result {
+            Ok(material) => Ok(material),
+            Err(source) => {
+                let fence = coordinator_error_requires_fence(&source);
+                let source = coordinator_runtime_error(source);
+                if fence {
+                    self.publish_fenced(source.to_string());
+                }
+                Err(source)
+            }
+        }
+    }
+
+    fn validate_current_session_projection(
+        &self,
+        binding: &SessionBinding,
+    ) -> Result<(), RuntimeError> {
+        let material = self.initial_session_projection(binding)?;
+        let result = (|| {
+            let source = material.revision.source()?;
+            let mut projection = match binding {
+                SessionBinding::Spectator => InterestProjectionState::public_origin_spectator(
+                    uuid::Uuid::new_v4().to_string(),
+                ),
+                SessionBinding::Player(player_id) => InterestProjectionState::bound_player(
+                    uuid::Uuid::new_v4().to_string(),
+                    player_id.clone(),
+                ),
+            };
+            source.project_interest_frame(&mut projection, &material.removals)?;
+            Ok::<(), ProjectionError>(())
+        })();
+        match result {
+            Ok(()) => Ok(()),
+            Err(source) => {
+                let source = RuntimeError::CanonicalInvariant(source.to_string());
+                self.publish_fenced(source.to_string());
+                Err(source)
+            }
+        }
     }
 
     fn bounded_public_world_json(&self) -> Result<Arc<str>, String> {
-        let current_sequence = self.projection_revision.lock().world.event_sequence;
+        let revision = self
+            .projection_revision_for_at(None, None)
+            .map_err(|source| source.to_string())?;
+        let current_sequence = revision.world.event_sequence;
         if let Some(cached) = self.public_world_cache.lock().as_ref()
             && (cached.event_sequence == current_sequence
                 || cached.generated_at.elapsed() < HTTP_PROJECTION_MIN_REFRESH)
@@ -359,8 +690,9 @@ impl AppState {
             return Ok(cached.encoded.clone());
         }
 
-        let snapshot = self
-            .projected_snapshot(None)
+        let snapshot = revision
+            .world
+            .project_world_snapshot(None)
             .map_err(|source| source.to_string())?;
         let event_sequence = snapshot.event_sequence;
         let encoded = encode_bounded_json(&snapshot).map_err(|source| source.to_string())?;
@@ -375,6 +707,17 @@ impl AppState {
 
     pub fn persist_snapshot(&self) -> Result<(), RuntimeError> {
         let mut hosted = self.runtime.lock();
+        if let Some(coordinator) = hosted.coordinator.as_mut() {
+            let result = coordinator
+                .persist_snapshots()
+                .map_err(coordinator_runtime_error);
+            hosted.lifecycle = coordinator.lifecycle_status();
+            drop(hosted);
+            if let Err(source) = &result {
+                self.publish_fenced(source.to_string());
+            }
+            return result;
+        }
         let mode = hosted.lifecycle.observed_mode;
         let runtime = hosted
             .runtime
@@ -387,6 +730,21 @@ impl AppState {
 
     pub fn renew_lease(&self) -> Result<(), RuntimeError> {
         let mut hosted = self.runtime.lock();
+        if let Some(coordinator) = hosted.coordinator.as_mut() {
+            let result = coordinator
+                .renew_leases()
+                .map_err(coordinator_runtime_error);
+            let halted = coordinator.is_halted();
+            hosted.lifecycle = coordinator.lifecycle_status();
+            drop(hosted);
+            if halted || result.is_err() {
+                self.publish_fenced(result.as_ref().err().map_or_else(
+                    || "authoritative coordinator halted".into(),
+                    ToString::to_string,
+                ));
+            }
+            return result;
+        }
         let mode = hosted.lifecycle.observed_mode;
         let runtime = hosted
             .runtime
@@ -406,11 +764,12 @@ impl AppState {
     }
 
     pub fn is_halted(&self) -> bool {
-        self.runtime
-            .lock()
-            .runtime
-            .as_ref()
-            .is_some_and(Runtime::is_halted)
+        let hosted = self.runtime.lock();
+        hosted.runtime.as_ref().is_some_and(Runtime::is_halted)
+            || hosted
+                .coordinator
+                .as_ref()
+                .is_some_and(LocalTwoCellRuntime::is_halted)
     }
 
     pub fn drain_to_background_or_sleeping(
@@ -421,6 +780,26 @@ impl AppState {
                 "the authoritative cell is draining",
             )));
         let mut hosted = self.runtime.lock();
+        if let Some(coordinator) = hosted.coordinator.as_mut() {
+            let result = coordinator
+                .persist_snapshots()
+                .map_err(coordinator_runtime_error);
+            if let Err(source) = result {
+                hosted.lifecycle = coordinator.lifecycle_status();
+                drop(hosted);
+                self.publish_fenced(source.to_string());
+                return Err(source);
+            }
+            let mut lifecycle = coordinator.lifecycle_status();
+            lifecycle.desired_mode = LifecycleMode::Background;
+            lifecycle.observed_mode = LifecycleMode::Background;
+            hosted.lifecycle = lifecycle;
+            drop(hosted);
+            self.authority
+                .send_replace(WorkerAuthorityStatus::Background);
+            self.lifecycle_signal.notify_waiters();
+            return Ok(LifecycleMode::Background);
+        }
         let mode = hosted.lifecycle.observed_mode;
         let (result, lifecycle, sleeping_world) = {
             let runtime = hosted
@@ -455,8 +834,19 @@ impl AppState {
 
     pub fn activation_step(&self) -> Result<bool, RuntimeError> {
         let mut hosted = self.runtime.lock();
+        if hosted.coordinator.is_some() {
+            hosted.lifecycle.observed_mode = LifecycleMode::Active;
+            hosted.lifecycle.desired_mode = LifecycleMode::Active;
+            self.authority.send_replace(WorkerAuthorityStatus::Active);
+            return Ok(true);
+        }
         if hosted.runtime.is_none() {
-            let runtime = Runtime::open_for_activation(&hosted.open_config)?;
+            let runtime = Runtime::open_for_activation(
+                hosted
+                    .open_config
+                    .as_ref()
+                    .expect("single-cell sleeping host retains its open configuration"),
+            )?;
             self.publish_projection_revision(&runtime);
             hosted.lifecycle = runtime.lifecycle_status();
             hosted.runtime = Some(runtime);
@@ -504,6 +894,11 @@ impl AppState {
 
     pub fn production_wait_millis(&self) -> Result<Option<u64>, RuntimeError> {
         let mut hosted = self.runtime.lock();
+        if hosted.coordinator.is_some() {
+            return Err(RuntimeError::LifecycleUnavailable {
+                mode: LifecycleMode::Active,
+            });
+        }
         let mode = hosted.lifecycle.observed_mode;
         hosted
             .runtime
@@ -514,6 +909,11 @@ impl AppState {
 
     pub fn background_dispatch_step(&self) -> Result<LifecycleMode, RuntimeError> {
         let mut hosted = self.runtime.lock();
+        if hosted.coordinator.is_some() {
+            return Err(RuntimeError::LifecycleUnavailable {
+                mode: LifecycleMode::Active,
+            });
+        }
         let mode = hosted.lifecycle.observed_mode;
         let (result, lifecycle, world) = {
             let runtime = hosted
@@ -550,19 +950,34 @@ impl AppState {
         let mut active_interval =
             tokio::time::interval(Duration::from_millis(u64::from(tick_millis)));
         active_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last_active_advance = None;
         loop {
             match self.lifecycle_mode() {
                 LifecycleMode::Active => {
                     active_interval.tick().await;
-                    if self.connected_players.lock().is_empty()
+                    let advance_started_at = Instant::now();
+                    let elapsed_millis = last_active_advance
+                        .replace(advance_started_at)
+                        .map_or(tick_millis, |prior| {
+                            bounded_active_elapsed(advance_started_at.duration_since(prior))
+                        });
+                    let coordinator_managed = self.runtime.lock().coordinator.is_some();
+                    if !coordinator_managed
+                        && self.connected_players.lock().is_empty()
                         && self.last_player_activity.lock().elapsed() >= idle_drain_after
                     {
                         self.drain_to_background_or_sleeping()?;
+                        last_active_advance = None;
                         continue;
                     }
-                    self.advance(tick_millis)?;
+                    // Persistence and snapshot synchronization can take longer than the
+                    // configured poll interval. Feed the authoritative runtime the real
+                    // elapsed wall time so its fixed-step accumulator catches up instead
+                    // of slowing the universe and producing uneven motion.
+                    self.advance(elapsed_millis)?;
                 }
                 LifecycleMode::Background => {
+                    last_active_advance = None;
                     let wait_millis = self.production_wait_millis()?.unwrap_or(0);
                     if wait_millis > 0 {
                         tokio::select! {
@@ -572,15 +987,95 @@ impl AppState {
                     }
                     self.background_dispatch_step()?;
                 }
-                LifecycleMode::Sleeping => self.lifecycle_signal.notified().await,
-                LifecycleMode::Activating => self.ensure_active().await?,
-                LifecycleMode::Draining => tokio::task::yield_now().await,
+                LifecycleMode::Sleeping => {
+                    last_active_advance = None;
+                    self.lifecycle_signal.notified().await;
+                }
+                LifecycleMode::Activating => {
+                    last_active_advance = None;
+                    self.ensure_active().await?;
+                }
+                LifecycleMode::Draining => {
+                    last_active_advance = None;
+                    tokio::task::yield_now().await;
+                }
             }
         }
     }
 
     pub fn advance(&self, delta_millis: u16) -> Result<bool, RuntimeError> {
         let mut hosted = self.runtime.lock();
+        if let Some(coordinator) = hosted.coordinator.as_mut() {
+            let origin_before_event_sequence =
+                coordinator.public_origin_runtime().state().event_sequence;
+            let outcome = match coordinator.advance_with_outcome(delta_millis) {
+                Ok(outcome) => outcome,
+                Err(source) => {
+                    let halted = coordinator.is_halted();
+                    hosted.lifecycle = coordinator.lifecycle_status();
+                    drop(hosted);
+                    let source = coordinator_runtime_error(source);
+                    if halted {
+                        self.publish_fenced(source.to_string());
+                    }
+                    return Err(source);
+                }
+            };
+            let runtime = match coordinator.runtime_for_player("player-local") {
+                Ok(runtime) => runtime,
+                Err(source) => {
+                    hosted.lifecycle = coordinator.lifecycle_status();
+                    let source = coordinator_runtime_error(source);
+                    drop(hosted);
+                    self.publish_fenced(source.to_string());
+                    return Err(source);
+                }
+            };
+            let world = runtime.state().clone();
+            let event_sequence = world.event_sequence;
+            let origin_world = coordinator.public_origin_runtime().state().clone();
+            let origin_event_sequence = origin_world.event_sequence;
+            hosted.lifecycle = coordinator.lifecycle_status();
+            let changed = outcome.changed();
+            let crossed_cell = !outcome.handoffs.is_empty();
+            if crossed_cell {
+                self.updates.send_replace(ReplicationFeed::default());
+            }
+            if !matches!(outcome.impact, AdvanceImpact::None) {
+                *self.projection_revision.lock() = Arc::new(ProjectionRevision::new(world));
+                let kind = if matches!(outcome.impact, AdvanceImpact::Structural) {
+                    ReplicationKind::Structural
+                } else {
+                    ReplicationKind::Motion
+                };
+                self.publish_player_update(kind, event_sequence);
+            }
+            if origin_event_sequence != origin_before_event_sequence {
+                let mut public = self.public_origin_projection.lock();
+                for handoff in &outcome.handoffs {
+                    apply_public_origin_handoff(&mut public.removals, handoff);
+                }
+                public.revision = Arc::new(ProjectionRevision::new(origin_world));
+                let kind = if matches!(outcome.impact, AdvanceImpact::Structural)
+                    || outcome.handoffs.iter().any(|handoff| {
+                        handoff.source_cell_key == verse_simulation::cell_origin_key()
+                            || handoff.destination_cell_key == verse_simulation::cell_origin_key()
+                    }) {
+                    ReplicationKind::Structural
+                } else {
+                    ReplicationKind::Motion
+                };
+                self.publish_public_update(kind, origin_event_sequence);
+            }
+            for handoff in outcome.handoffs {
+                self.handoffs.send_if_modified(|handoffs| {
+                    handoffs.insert(handoff.player_id.clone(), handoff.clone());
+                    true
+                });
+            }
+            drop(hosted);
+            return Ok(changed);
+        }
         let mode = hosted.lifecycle.observed_mode;
         let runtime = hosted
             .runtime
@@ -611,12 +1106,92 @@ impl AppState {
         Ok(outcome.changed())
     }
 
+    #[cfg(test)]
     fn execute_as(
         &self,
         actor_player_id: &str,
         intent: &ClientMessage,
     ) -> Result<IntentReceipt, RuntimeError> {
+        let route = self.resident_player_route(actor_player_id)?;
+        self.execute_as_at(actor_player_id, route.as_ref(), intent)
+    }
+
+    fn execute_as_at(
+        &self,
+        actor_player_id: &str,
+        resident_route: Option<&ResidentPlayerRoute>,
+        intent: &ClientMessage,
+    ) -> Result<IntentReceipt, RuntimeError> {
         let mut hosted = self.runtime.lock();
+        if let Some(coordinator) = hosted.coordinator.as_mut() {
+            let route = resident_route.ok_or_else(|| {
+                RuntimeError::Intent(IntentError::Rejected {
+                    code: "player_route_unacknowledged".into(),
+                    message: "acknowledge the current cell baseline before submitting controls"
+                        .into(),
+                })
+            })?;
+            let origin_before_event_sequence =
+                coordinator.public_origin_runtime().state().event_sequence;
+            let before_event_sequence =
+                match coordinator.runtime_for_player_at(actor_player_id, route) {
+                    Ok(runtime) => runtime.state().event_sequence,
+                    Err(source) => {
+                        let fence = coordinator_error_requires_fence(&source);
+                        let source = coordinator_runtime_error(source);
+                        drop(hosted);
+                        if fence {
+                            self.publish_fenced(source.to_string());
+                        }
+                        return Err(source);
+                    }
+                };
+            let receipt = match coordinator.execute_as_at(actor_player_id, route, intent) {
+                Ok(receipt) => receipt,
+                Err(source) => {
+                    let fence = coordinator_error_requires_fence(&source);
+                    let source = coordinator_runtime_error(source);
+                    drop(hosted);
+                    if fence {
+                        self.publish_fenced(source.to_string());
+                    }
+                    return Err(source);
+                }
+            };
+            let runtime = match coordinator.runtime_for_player_at(actor_player_id, route) {
+                Ok(runtime) => runtime,
+                Err(source) => {
+                    let fence = coordinator_error_requires_fence(&source);
+                    let source = coordinator_runtime_error(source);
+                    drop(hosted);
+                    if fence {
+                        self.publish_fenced(source.to_string());
+                    }
+                    return Err(source);
+                }
+            };
+            let world = runtime.state().clone();
+            let event_sequence = world.event_sequence;
+            let origin_world = coordinator.public_origin_runtime().state().clone();
+            let origin_event_sequence = origin_world.event_sequence;
+            hosted.lifecycle = coordinator.lifecycle_status();
+            if event_sequence != before_event_sequence {
+                *self.projection_revision.lock() = Arc::new(ProjectionRevision::new(world));
+                let kind = if matches!(intent, ClientMessage::SetPlayerControl { .. }) {
+                    ReplicationKind::Motion
+                } else {
+                    ReplicationKind::Structural
+                };
+                self.publish_player_update(kind, event_sequence);
+                if origin_event_sequence != origin_before_event_sequence {
+                    self.public_origin_projection.lock().revision =
+                        Arc::new(ProjectionRevision::new(origin_world));
+                    self.publish_public_update(kind, origin_event_sequence);
+                }
+            }
+            drop(hosted);
+            return Ok(receipt);
+        }
         let mode = hosted.lifecycle.observed_mode;
         let runtime = hosted
             .runtime
@@ -657,7 +1232,17 @@ impl AppState {
     }
 
     fn publish_update(&self, kind: ReplicationKind, event_sequence: u64) {
+        self.publish_player_update(kind, event_sequence);
+        self.publish_public_update(kind, event_sequence);
+    }
+
+    fn publish_player_update(&self, kind: ReplicationKind, event_sequence: u64) {
         self.updates
+            .send_if_modified(|feed| feed.publish(kind, event_sequence));
+    }
+
+    fn publish_public_update(&self, kind: ReplicationKind, event_sequence: u64) {
+        self.public_updates
             .send_if_modified(|feed| feed.publish(kind, event_sequence));
     }
 
@@ -761,13 +1346,47 @@ struct PendingInterestFrame {
     projection: InterestProjectionState,
     frontier: InterestFrontier,
     sent_at: tokio::time::Instant,
-    recovery: bool,
+    purpose: PendingFramePurpose,
+}
+
+#[derive(Debug, Clone)]
+enum PendingFramePurpose {
+    Ordinary,
+    Recovery,
+    InitialRoute(ResidentPlayerRoute),
+    DestinationHandoff {
+        transfer_id: String,
+        route: ResidentPlayerRoute,
+    },
+}
+
+impl PendingFramePurpose {
+    fn route(&self) -> Option<&ResidentPlayerRoute> {
+        match self {
+            Self::InitialRoute(route) | Self::DestinationHandoff { route, .. } => Some(route),
+            Self::Ordinary | Self::Recovery => None,
+        }
+    }
+
+    fn is_recovery(&self) -> bool {
+        matches!(self, Self::Recovery | Self::DestinationHandoff { .. })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InterestAckOutcome {
+    Accepted,
+    RouteInstalled,
+    Duplicate,
+    Rejected,
 }
 
 #[derive(Debug)]
 struct SessionTransport {
     acknowledged_projection: InterestProjectionState,
     acknowledged_frontier: Option<InterestFrontier>,
+    resident_route: Option<ResidentPlayerRoute>,
+    initial_route: Option<ResidentPlayerRoute>,
     pending: Option<PendingInterestFrame>,
     superseded_frontier: Option<InterestFrontier>,
     recovery_window_started_at: tokio::time::Instant,
@@ -775,7 +1394,12 @@ struct SessionTransport {
 }
 
 impl SessionTransport {
+    #[cfg(test)]
     fn new(binding: &SessionBinding) -> Self {
+        Self::new_at(binding, None)
+    }
+
+    fn new_at(binding: &SessionBinding, initial_route: Option<ResidentPlayerRoute>) -> Self {
         let session_epoch = uuid::Uuid::new_v4().to_string();
         let acknowledged_projection = match binding {
             SessionBinding::Spectator => {
@@ -788,6 +1412,8 @@ impl SessionTransport {
         Self {
             acknowledged_projection,
             acknowledged_frontier: None,
+            resident_route: None,
+            initial_route,
             pending: None,
             superseded_frontier: None,
             recovery_window_started_at: tokio::time::Instant::now(),
@@ -808,7 +1434,15 @@ impl SessionTransport {
     fn recovery_is_pending(&self) -> bool {
         self.pending
             .as_ref()
-            .is_some_and(|pending| pending.recovery)
+            .is_some_and(|pending| pending.purpose.is_recovery())
+    }
+
+    fn initial_route_is_acknowledged(&self) -> bool {
+        self.initial_route.is_none() || self.resident_route.is_some()
+    }
+
+    fn mutation_route(&self) -> Option<&ResidentPlayerRoute> {
+        self.resident_route.as_ref()
     }
 
     fn permit_recovery(&mut self) -> bool {
@@ -830,7 +1464,7 @@ impl SessionTransport {
         baseline_id: &str,
         delta_sequence: u64,
         view_hash: &str,
-    ) -> bool {
+    ) -> InterestAckOutcome {
         if let Some(pending) = self.pending.as_ref()
             && pending.frontier.matches_acknowledgement(
                 session_epoch,
@@ -844,9 +1478,18 @@ impl SessionTransport {
             self.acknowledged_projection = pending.projection;
             self.acknowledged_frontier = Some(pending.frontier);
             self.superseded_frontier = None;
-            return true;
+            return match pending.purpose {
+                PendingFramePurpose::InitialRoute(route)
+                | PendingFramePurpose::DestinationHandoff { route, .. } => {
+                    self.resident_route = Some(route);
+                    InterestAckOutcome::RouteInstalled
+                }
+                PendingFramePurpose::Ordinary | PendingFramePurpose::Recovery => {
+                    InterestAckOutcome::Accepted
+                }
+            };
         }
-        self.acknowledged_frontier.as_ref().is_some_and(|frontier| {
+        if self.acknowledged_frontier.as_ref().is_some_and(|frontier| {
             frontier.matches_acknowledgement(
                 session_epoch,
                 interest_epoch,
@@ -854,7 +1497,11 @@ impl SessionTransport {
                 delta_sequence,
                 view_hash,
             )
-        })
+        }) {
+            InterestAckOutcome::Duplicate
+        } else {
+            InterestAckOutcome::Rejected
+        }
     }
 
     fn matches_superseded_acknowledgement(
@@ -874,6 +1521,42 @@ impl SessionTransport {
                 view_hash,
             )
         })
+    }
+
+    fn stage_initial(
+        &mut self,
+        material: &InitialSessionProjection,
+    ) -> Result<ServerMessage, ProjectionError> {
+        if self.pending.is_some() || self.acknowledged_frontier.is_some() {
+            return Err(ProjectionError::InvalidSession(
+                "initial projection was requested after session state existed".into(),
+            ));
+        }
+        let mut candidate = self.acknowledged_projection.clone();
+        let source = material.revision.source()?;
+        let message = match source.project_interest_frame(&mut candidate, &material.removals)? {
+            ProjectedInterestFrame::Baseline(baseline) => ServerMessage::InterestBaseline {
+                baseline: Box::new(baseline),
+            },
+            ProjectedInterestFrame::Delta(_) => {
+                return Err(ProjectionError::InvalidSession(
+                    "initial projection did not produce a complete baseline".into(),
+                ));
+            }
+        };
+        let interest = replication_interest(&message)
+            .expect("an initial interest baseline contains a frontier");
+        let purpose = self.initial_route.clone().map_or(
+            PendingFramePurpose::Ordinary,
+            PendingFramePurpose::InitialRoute,
+        );
+        self.pending = Some(PendingInterestFrame {
+            projection: candidate,
+            frontier: InterestFrontier::from_interest(interest),
+            sent_at: tokio::time::Instant::now(),
+            purpose,
+        });
+        Ok(message)
     }
 
     fn stage(
@@ -898,7 +1581,13 @@ impl SessionTransport {
         if fresh_baseline {
             candidate.fresh_baseline()?;
         }
-        let message = match state.projected_interest_frame(&mut candidate)? {
+        let projection_route = self
+            .pending
+            .as_ref()
+            .and_then(|pending| pending.purpose.route())
+            .or(self.resident_route.as_ref())
+            .or(self.initial_route.as_ref());
+        let message = match state.projected_interest_frame_at(&mut candidate, projection_route)? {
             ProjectedInterestFrame::Baseline(baseline) => ServerMessage::InterestBaseline {
                 baseline: Box::new(baseline),
             },
@@ -908,11 +1597,95 @@ impl SessionTransport {
         };
         let interest = replication_interest(&message)
             .expect("an interest frame always contains an interest frontier");
+        let purpose = if self.acknowledged_frontier.is_none() && self.initial_route.is_some() {
+            PendingFramePurpose::InitialRoute(
+                self.initial_route
+                    .clone()
+                    .expect("the initial route was just checked"),
+            )
+        } else if fresh_baseline {
+            PendingFramePurpose::Recovery
+        } else {
+            PendingFramePurpose::Ordinary
+        };
         self.pending = Some(PendingInterestFrame {
             projection: candidate,
             frontier: InterestFrontier::from_interest(interest),
             sent_at: tokio::time::Instant::now(),
-            recovery: fresh_baseline,
+            purpose,
+        });
+        Ok(message)
+    }
+
+    fn stage_transfer(
+        &mut self,
+        state: &AppState,
+        handoff: &CompletedPlayerHandoff,
+    ) -> Result<ServerMessage, ProjectionError> {
+        if self.pending.as_ref().is_some_and(|pending| {
+            matches!(
+                &pending.purpose,
+                PendingFramePurpose::DestinationHandoff { transfer_id, .. }
+                    if transfer_id == &handoff.transfer_id
+            )
+        }) {
+            return Err(ProjectionError::InvalidSession(
+                "cell handoff baseline is already pending".into(),
+            ));
+        }
+        if !self.initial_route_is_acknowledged() || self.acknowledged_frontier.is_none() {
+            return Err(ProjectionError::InvalidSession(
+                "cell handoff requires an acknowledged source baseline".into(),
+            ));
+        }
+        let source_route = self.resident_route.as_ref().ok_or_else(|| {
+            ProjectionError::InvalidSession(
+                "cell handoff requires an acknowledged resident route".into(),
+            )
+        })?;
+        if source_route.cell_key != handoff.source_cell_key
+            || source_route.placement_generation.checked_add(1)
+                != Some(handoff.placement_generation)
+        {
+            return Err(ProjectionError::InvalidSession(
+                "cell handoff does not exactly continue the session route".into(),
+            ));
+        }
+        let destination_route = ResidentPlayerRoute {
+            cell_key: handoff.destination_cell_key.clone(),
+            placement_generation: handoff.placement_generation,
+        };
+        self.superseded_frontier = self
+            .pending
+            .as_ref()
+            .map(|pending| pending.frontier.clone());
+        let mut candidate = self.acknowledged_projection.clone();
+        candidate.fresh_transfer_baseline(
+            &handoff.transfer_id,
+            handoff.destination_cell_key.clone(),
+            handoff.placement_generation,
+        )?;
+        let message =
+            match state.projected_interest_frame_at(&mut candidate, Some(&destination_route))? {
+                ProjectedInterestFrame::Baseline(baseline) => ServerMessage::InterestBaseline {
+                    baseline: Box::new(baseline),
+                },
+                ProjectedInterestFrame::Delta(_) => {
+                    return Err(ProjectionError::InvalidSession(
+                        "cell handoff did not produce a complete destination baseline".into(),
+                    ));
+                }
+            };
+        let interest = replication_interest(&message)
+            .expect("a transfer baseline always contains an interest frontier");
+        self.pending = Some(PendingInterestFrame {
+            projection: candidate,
+            frontier: InterestFrontier::from_interest(interest),
+            sent_at: tokio::time::Instant::now(),
+            purpose: PendingFramePurpose::DestinationHandoff {
+                transfer_id: handoff.transfer_id.clone(),
+                route: destination_route,
+            },
         });
         Ok(message)
     }
@@ -952,6 +1725,7 @@ struct StatusDocument {
     content_manifest_version: String,
     universe_id: String,
     cell_id: String,
+    cell_key: CellKeyV1,
     event_sequence: u64,
     simulation_tick: u64,
     fencing_token: u64,
@@ -1111,20 +1885,48 @@ fn no_store(mut response: Response) -> Response {
 }
 
 async fn status(State(state): State<Arc<AppState>>) -> Response {
-    let snapshot = state.snapshot();
+    let Ok(public_revision) = state.projection_revision_for_at(None, None) else {
+        return internal_error("public status projection is unavailable").into_response();
+    };
+    let (
+        content_manifest_version,
+        universe_id,
+        cell_id,
+        cell_key,
+        event_sequence,
+        simulation_tick,
+        fencing_token,
+        world_hash,
+        conservation_valid,
+    ) = {
+        let world = &public_revision.world;
+        (
+            world.content_manifest_version.clone(),
+            world.universe_id.clone(),
+            world.cell_id.clone(),
+            verse_simulation::cell_key_from_address(&world.cell_address)
+                .expect("canonical worker world always has a valid cell key"),
+            world.event_sequence,
+            world.simulation_tick,
+            world.fencing_token,
+            world.state_hash(),
+            world.conservation().valid,
+        )
+    };
     let lifecycle = state.lifecycle_status();
     no_store(
         Json(StatusDocument {
             service: "verse-simulation-worker",
             protocol_version: PROTOCOL_VERSION,
-            content_manifest_version: snapshot.content_manifest_version,
-            universe_id: snapshot.universe_id,
-            cell_id: snapshot.cell_id,
-            event_sequence: snapshot.event_sequence,
-            simulation_tick: snapshot.simulation_tick,
-            fencing_token: snapshot.fencing_token,
-            world_hash: snapshot.world_hash,
-            conservation_valid: snapshot.conservation.valid,
+            content_manifest_version,
+            universe_id,
+            cell_id,
+            cell_key,
+            event_sequence,
+            simulation_tick,
+            fencing_token,
+            world_hash,
+            conservation_valid,
             authoritative_halted: state.is_halted(),
             lifecycle: PublicLifecycleStatus::from(&lifecycle),
         })
@@ -1218,9 +2020,24 @@ async fn websocket_session(socket: WebSocket, state: Arc<AppState>, _permit: Own
 
     // Subscribe before projecting so a mutation between projection and delivery
     // is retained as a canonical marker and cannot be missed by this session.
-    let mut updates = state.updates.subscribe();
-    let mut transport = SessionTransport::new(&binding);
-    let Ok(initial_message) = transport.stage(&state, false) else {
+    let mut updates = match binding {
+        SessionBinding::Spectator => state.public_updates.subscribe(),
+        SessionBinding::Player(_) => state.updates.subscribe(),
+    };
+    let mut handoffs = state.handoffs.subscribe();
+    let initial = match state.initial_session_projection(&binding) {
+        Ok(initial) => initial,
+        Err(source) => {
+            send_fatal_and_close(&mut sender, "player_route_unavailable", source.to_string()).await;
+            if let Some(player_id) = binding.player_id() {
+                state.release_player(player_id);
+            }
+            return;
+        }
+    };
+    let mut last_handoff_transfer_id = initial.completed_transfer_id.clone();
+    let mut transport = SessionTransport::new_at(&binding, initial.resident_route.clone());
+    let Ok(initial_message) = transport.stage_initial(&initial) else {
         send_projection_failure(&mut sender).await;
         if let Some(player_id) = binding.player_id() {
             state.release_player(player_id);
@@ -1283,6 +2100,77 @@ async fn websocket_session(socket: WebSocket, state: Arc<AppState>, _permit: Own
 
     loop {
         tokio::select! {
+            biased;
+            changed = handoffs.changed() => {
+                if changed.is_err() {
+                    send_fatal_and_close(
+                        &mut sender,
+                        "authority_fenced",
+                        "the universe handoff coordinator stopped",
+                    ).await;
+                    break;
+                }
+                let Some(player_id) = binding.player_id() else {
+                    handoffs.borrow_and_update();
+                    continue;
+                };
+                let handoff = handoffs
+                    .borrow_and_update()
+                    .get(player_id)
+                    .filter(|handoff| handoff.transfer_id != last_handoff_transfer_id)
+                    .cloned();
+                let Some(handoff) = handoff else {
+                    continue;
+                };
+                let Ok(message) = transport.stage_transfer(&state, &handoff) else {
+                    let (code, reason) = if state
+                        .validate_current_session_projection(&binding)
+                        .is_err()
+                    {
+                        (
+                            "authority_fenced",
+                            "the destination route authority failed",
+                        )
+                    } else {
+                        (
+                            "handoff_route_discontinuity",
+                            "the completed handoff does not continue this acknowledged session; reconnect",
+                        )
+                    };
+                    send_fatal_and_close(&mut sender, code, reason).await;
+                    break;
+                };
+                let mut phases_sent = true;
+                for phase in [
+                    HandoffPhase::Preparing,
+                    HandoffPhase::Importing,
+                    HandoffPhase::VerifyingDestination,
+                ] {
+                    let status = ServerMessage::Handoff {
+                        handoff: HandoffStatus {
+                            transfer_id: handoff.transfer_id.clone(),
+                            phase,
+                            destination_cell_key: handoff.destination_cell_key.clone(),
+                            placement_generation: handoff.placement_generation,
+                        },
+                    };
+                    if send_server_message(&mut sender, &status).await.is_err() {
+                        phases_sent = false;
+                        break;
+                    }
+                }
+                if !phases_sent {
+                    break;
+                }
+                let destination_sequence = replication_event_sequence(&message)
+                    .expect("a transfer baseline has an event sequence");
+                if send_server_message(&mut sender, &message).await.is_err() {
+                    break;
+                }
+                replication_cursor = ReplicationCursor::after_initial_snapshot(destination_sequence);
+                updates.borrow_and_update();
+                last_handoff_transfer_id = handoff.transfer_id;
+            }
             changed = authority.changed() => {
                 let reason = match changed {
                     Ok(()) => match &*authority.borrow_and_update() {
@@ -1344,8 +2232,24 @@ async fn websocket_session(socket: WebSocket, state: Arc<AppState>, _permit: Own
                         break;
                     }
                     let Ok(message) = transport.stage(&state, true) else {
-                        send_projection_failure(&mut sender).await;
-                        break;
+                        match state.resident_route_is_stale(
+                            binding.player_id(),
+                            transport.mutation_route(),
+                        ) {
+                            Ok(true) => continue,
+                            Err(_) => {
+                                send_fatal_and_close(
+                                    &mut sender,
+                                    "authority_fenced",
+                                    "the universe route authority failed",
+                                ).await;
+                                break;
+                            }
+                            Ok(false) => {
+                                send_projection_failure(&mut sender).await;
+                                break;
+                            }
+                        }
                     };
                     if send_server_message(&mut sender, &message).await.is_err() {
                         break;
@@ -1361,8 +2265,24 @@ async fn websocket_session(socket: WebSocket, state: Arc<AppState>, _permit: Own
                     continue;
                 };
                 let Ok(message) = transport.stage(&state, false) else {
-                    send_projection_failure(&mut sender).await;
-                    break;
+                    match state.resident_route_is_stale(
+                        binding.player_id(),
+                        transport.mutation_route(),
+                    ) {
+                        Ok(true) => continue,
+                        Err(_) => {
+                            send_fatal_and_close(
+                                &mut sender,
+                                "authority_fenced",
+                                "the universe route authority failed",
+                            ).await;
+                            break;
+                        }
+                        Ok(false) => {
+                            send_projection_failure(&mut sender).await;
+                            break;
+                        }
+                    }
                 };
                 if send_server_message(&mut sender, &message).await.is_err() {
                     break;
@@ -1458,19 +2378,26 @@ async fn complete_handshake(
                             SessionBinding::Spectator
                         }
                         ClientAuthentication::LocalDevelopment { player_id } => {
-                            if !state
-                                .snapshot()
-                                .players
-                                .iter()
-                                .any(|player| player.player_id == player_id)
-                            {
-                                send_fatal_and_close(
-                                    sender,
-                                    "actor_not_present",
-                                    "the requested local-development player is not present in this cell",
-                                )
-                                .await;
-                                return None;
+                            match state.player_is_present(&player_id) {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    send_fatal_and_close(
+                                        sender,
+                                        "actor_not_present",
+                                        "the requested local-development player is not present in this cell",
+                                    )
+                                    .await;
+                                    return None;
+                                }
+                                Err(_) => {
+                                    send_fatal_and_close(
+                                        sender,
+                                        "authority_fenced",
+                                        "the universe route authority failed",
+                                    )
+                                    .await;
+                                    return None;
+                                }
                             }
                             if !state.claim_player(&player_id) {
                                 send_fatal_and_close(
@@ -1597,6 +2524,19 @@ async fn handle_client_message(
             if transport.recovery_is_pending() {
                 return true;
             }
+            match state.resident_route_is_stale(binding.player_id(), transport.mutation_route()) {
+                Ok(true) => return true,
+                Err(_) => {
+                    send_fatal_and_close(
+                        sender,
+                        "authority_fenced",
+                        "the universe route authority failed",
+                    )
+                    .await;
+                    return false;
+                }
+                Ok(false) => {}
+            }
             if !transport.permit_recovery() {
                 send_fatal_and_close(
                     sender,
@@ -1607,8 +2547,23 @@ async fn handle_client_message(
                 return false;
             }
             let Ok(message) = transport.stage(state, true) else {
-                send_projection_failure(sender).await;
-                return false;
+                match state.resident_route_is_stale(binding.player_id(), transport.mutation_route())
+                {
+                    Ok(true) => return true,
+                    Err(_) => {
+                        send_fatal_and_close(
+                            sender,
+                            "authority_fenced",
+                            "the universe route authority failed",
+                        )
+                        .await;
+                        return false;
+                    }
+                    Ok(false) => {
+                        send_projection_failure(sender).await;
+                        return false;
+                    }
+                }
             };
             if send_server_message(sender, &message).await.is_ok() {
                 replication_cursor.record(&message);
@@ -1624,12 +2579,15 @@ async fn handle_client_message(
             delta_sequence,
             view_hash,
         } => {
-            if transport.acknowledge(
-                &session_epoch,
-                interest_epoch,
-                &baseline_id,
-                delta_sequence,
-                &view_hash,
+            if !matches!(
+                transport.acknowledge(
+                    &session_epoch,
+                    interest_epoch,
+                    &baseline_id,
+                    delta_sequence,
+                    &view_hash,
+                ),
+                InterestAckOutcome::Rejected
             ) {
                 return true;
             }
@@ -1654,8 +2612,23 @@ async fn handle_client_message(
                 return false;
             }
             let Ok(message) = transport.stage(state, true) else {
-                send_projection_failure(sender).await;
-                return false;
+                match state.resident_route_is_stale(binding.player_id(), transport.mutation_route())
+                {
+                    Ok(true) => return true,
+                    Err(_) => {
+                        send_fatal_and_close(
+                            sender,
+                            "authority_fenced",
+                            "the universe route authority failed",
+                        )
+                        .await;
+                        return false;
+                    }
+                    Ok(false) => {
+                        send_projection_failure(sender).await;
+                        return false;
+                    }
+                }
             };
             if send_server_message(sender, &message).await.is_ok() {
                 replication_cursor.record(&message);
@@ -1678,7 +2651,7 @@ async fn handle_client_message(
                 .await
                 .is_ok();
             };
-            let result = state.execute_as(actor_player_id, &intent);
+            let result = state.execute_as_at(actor_player_id, transport.mutation_route(), &intent);
             match result {
                 Ok(receipt) => {
                     if send_server_message(sender, &ServerMessage::IntentAccepted { receipt })
@@ -1742,6 +2715,15 @@ async fn handle_client_message(
                         sender,
                         "cell_not_active",
                         format!("the cell is currently {mode:?}; reconnect after activation"),
+                    )
+                    .await;
+                    false
+                }
+                Err(RuntimeError::DirectoryManagedCellRequiresCoordinator) => {
+                    send_fatal_and_close(
+                        sender,
+                        "directory_coordinator_required",
+                        "this cell requires reconciled universe-coordinator admission",
                     )
                     .await;
                     false
@@ -1856,8 +2838,22 @@ mod tests {
     use tokio_tungstenite::tungstenite::Message as ClientWebSocketMessage;
     use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
     use tower::ServiceExt;
-    use verse_protocol::{BlockKind, ProductionRecipeKind, ResourceKind, Vec3};
-    use verse_simulation::{PersistenceError, Store, TrustedClock};
+    use verse_protocol::{BlockKind, LocomotionKind, ProductionRecipeKind, ResourceKind, Vec3};
+    use verse_simulation::{
+        PersistenceError, Store, TrustedClock, address_from_origin_offset_um, cell_id,
+        local_position_from_address, proof_cell_keys,
+    };
+
+    #[test]
+    fn active_elapsed_uses_real_time_and_stays_within_runtime_bounds() {
+        assert_eq!(bounded_active_elapsed(Duration::ZERO), 1);
+        assert_eq!(bounded_active_elapsed(Duration::from_millis(16)), 16);
+        assert_eq!(bounded_active_elapsed(Duration::from_millis(27)), 27);
+        assert_eq!(
+            bounded_active_elapsed(Duration::from_secs(2)),
+            MAX_ACTIVE_ELAPSED_MILLIS
+        );
+    }
 
     use super::*;
 
@@ -1931,6 +2927,13 @@ mod tests {
 
     async fn connect_test_socket() -> (TestSocket, Arc<AppState>, tokio::task::JoinHandle<()>) {
         let state = test_state();
+        let (socket, server) = connect_state_socket(state.clone()).await;
+        (socket, state, server)
+    }
+
+    async fn connect_state_socket(
+        state: Arc<AppState>,
+    ) -> (TestSocket, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("test listener binds");
@@ -1944,7 +2947,7 @@ mod tests {
         let (socket, _) = connect_async(format!("ws://{address}/ws"))
             .await
             .expect("test websocket connects");
-        (socket, state, server)
+        (socket, server)
     }
 
     async fn receive_wire_json(socket: &mut TestSocket) -> serde_json::Value {
@@ -2301,6 +3304,42 @@ mod tests {
             ),
             "{operation_id} must fail closed with {expected_code}; received {response:?}"
         );
+    }
+
+    fn two_cell_boundary_state() -> Arc<AppState> {
+        let root = tempdir().expect("two-cell tempdir").keep();
+        let cells = proof_cell_keys().expect("proof cells derive");
+        let source_root = root
+            .join("cells")
+            .join(cell_id(&cells[0]).expect("source cell ID derives"));
+        {
+            let mut store = Store::open_for_cell(&source_root, 8_031, cells[0].clone())
+                .expect("source cell fixture opens before directory management");
+            let mut world = store.load_world().expect("source cell fixture loads");
+            world.fencing_token = store.fencing_token();
+            let boundary_address =
+                address_from_origin_offset_um(&world.cell_address, [10_000_000_000, 0, 0])
+                    .expect("east boundary address canonicalizes");
+            let boundary_position =
+                local_position_from_address(&world.cell_address, &boundary_address)
+                    .expect("boundary address hydrates into source-local physics");
+            let player = world
+                .player
+                .get_mut("player-local")
+                .expect("source player exists");
+            player.address = boundary_address;
+            player.position = boundary_position;
+            player.linear_velocity = Vec3::ZERO;
+            player.locomotion.kind = LocomotionKind::Eva;
+            player.locomotion.support = None;
+            player.locomotion.magnetic_boots_enabled = false;
+            store
+                .save_snapshot(&world)
+                .expect("boundary fixture persists");
+        }
+        let coordinator = LocalTwoCellRuntime::open(&root, 8_031, 20, "gateway-test")
+            .expect("two-cell coordinator opens");
+        AppState::new_two_cell(coordinator)
     }
 
     async fn receive_intent_accepted(
@@ -3077,7 +4116,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn protocol17_orders_full_compatibility_registry_then_interest_baseline() {
+    async fn protocol18_orders_full_compatibility_registry_then_interest_baseline() {
         let (mut socket, state, server) = connect_test_socket().await;
         send_client_message(
             &mut socket,
@@ -3726,6 +4765,473 @@ mod tests {
             Some(first_delta_hash.as_str())
         );
         socket.close(None).await.expect("test socket closes");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn one_socket_handoff_requires_destination_ack_before_controls_resume() {
+        let state = two_cell_boundary_state();
+        let (mut socket, server) = connect_state_socket(state.clone()).await;
+        send_client_message(
+            &mut socket,
+            &local_player_hello("two-cell-handoff-test-client"),
+        )
+        .await;
+        assert!(matches!(
+            receive_wire_message(&mut socket).await,
+            ServerMessage::Welcome { .. }
+        ));
+        assert!(matches!(
+            receive_wire_message(&mut socket).await,
+            ServerMessage::Registry { .. }
+        ));
+        let ServerMessage::InterestBaseline { baseline: source } =
+            receive_wire_message(&mut socket).await
+        else {
+            panic!("two-cell session begins with a source baseline");
+        };
+        assert!(source.interest.transfer_link.is_none());
+        let source_cell_id = source.cell_id.clone();
+        let source_session_epoch = source.interest.session_epoch.clone();
+        let source_interest_epoch = source.interest.interest_epoch;
+        acknowledge_interest(&mut socket, &source.interest).await;
+
+        let source_player = actor_player(&source);
+        send_client_message(
+            &mut socket,
+            &ClientMessage::SetSuitMode {
+                operation_sequence: 1,
+                operation_id: "source-ack-barrier".into(),
+                helmet_closed: !source_player.helmet_closed,
+                jetpack_enabled: source_player.jetpack_enabled,
+                magnetic_boots_enabled: source_player.locomotion.magnetic_boots_enabled,
+            },
+        )
+        .await;
+        let source_barrier = receive_wire_message(&mut socket).await;
+        assert!(
+            matches!(source_barrier, ServerMessage::IntentAccepted { .. }),
+            "source ACK barrier intent must succeed: {source_barrier:?}"
+        );
+        let ServerMessage::InterestDelta {
+            delta: source_delta,
+        } = receive_wire_message(&mut socket).await
+        else {
+            panic!("source mutation publishes a source-cell delta");
+        };
+        assert_eq!(source_delta.cell_id, source_cell_id);
+        acknowledge_interest(&mut socket, &source_delta.interest).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        assert!(state.advance(16).expect("boundary crossing advances"));
+        let mut transfer_id = None;
+        let mut destination_cell_key = None;
+        let mut placement_generation = None;
+        for expected in [
+            HandoffPhase::Preparing,
+            HandoffPhase::Importing,
+            HandoffPhase::VerifyingDestination,
+        ] {
+            let ServerMessage::Handoff { handoff } = receive_wire_message(&mut socket).await else {
+                panic!("handoff phases precede every destination frame");
+            };
+            assert_eq!(handoff.phase, expected);
+            if let Some(existing) = &transfer_id {
+                assert_eq!(existing, &handoff.transfer_id);
+            } else {
+                transfer_id = Some(handoff.transfer_id.clone());
+                destination_cell_key = Some(handoff.destination_cell_key.clone());
+                placement_generation = Some(handoff.placement_generation);
+            }
+        }
+        let ServerMessage::InterestBaseline {
+            baseline: destination,
+        } = receive_wire_message(&mut socket).await
+        else {
+            panic!("handoff phases are followed by one destination baseline");
+        };
+        assert_ne!(destination.cell_id, source_cell_id);
+        assert_eq!(destination.interest.session_epoch, source_session_epoch);
+        assert_eq!(
+            destination.interest.interest_epoch,
+            source_interest_epoch + 1
+        );
+        let link = destination
+            .interest
+            .transfer_link
+            .as_ref()
+            .expect("destination baseline is transfer-linked");
+        assert_eq!(Some(&link.transfer_id), transfer_id.as_ref());
+        assert_eq!(
+            Some(&link.destination_cell_key),
+            destination_cell_key.as_ref()
+        );
+        assert_eq!(Some(link.placement_generation), placement_generation);
+
+        let destination_player = actor_player(&destination);
+        let queued_control = ClientMessage::SetPlayerControl {
+            operation_sequence: 2,
+            operation_id: "destination-control-after-ack".into(),
+            movement_epoch: destination_player.movement_epoch,
+            input_sequence: destination_player.last_received_input_sequence + 1,
+            linear_input: Vec3::new(0.0, 0.0, -1.0),
+            angular_input: Vec3::ZERO,
+            boost: false,
+            jump: false,
+            dampeners: true,
+        };
+        send_client_message(&mut socket, &ClientMessage::RequestSnapshot).await;
+        acknowledge_interest(&mut socket, &source_delta.interest).await;
+        send_client_message(&mut socket, &queued_control).await;
+        assert!(matches!(
+            receive_wire_message(&mut socket).await,
+            ServerMessage::IntentRejected { ref code, .. } if code == "player_route_stale"
+        ));
+
+        acknowledge_interest(&mut socket, &destination.interest).await;
+        send_client_message(&mut socket, &queued_control).await;
+        let ServerMessage::IntentAccepted { receipt } = receive_wire_message(&mut socket).await
+        else {
+            panic!("the exact unconsumed control succeeds after destination ACK");
+        };
+        assert_eq!(receipt.operation_sequence, 2);
+        let ServerMessage::InterestDelta { delta } = receive_wire_message(&mut socket).await else {
+            panic!("destination control publishes a destination-cell delta");
+        };
+        assert_eq!(delta.cell_id, destination.cell_id);
+        assert_eq!(delta.interest.session_epoch, source_session_epoch);
+        assert_eq!(delta.interest.interest_epoch, source_interest_epoch + 1);
+        assert_eq!(delta.interest.delta_sequence, 1);
+        acknowledge_interest(&mut socket, &delta.interest).await;
+
+        socket.close(None).await.expect("test socket closes");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn handoff_before_initial_baseline_ack_fails_closed_without_phases() {
+        let state = two_cell_boundary_state();
+        let (mut socket, server) = connect_state_socket(state.clone()).await;
+        send_client_message(
+            &mut socket,
+            &local_player_hello("unacknowledged-source-handoff-test-client"),
+        )
+        .await;
+        assert!(matches!(
+            receive_wire_message(&mut socket).await,
+            ServerMessage::Welcome { .. }
+        ));
+        assert!(matches!(
+            receive_wire_message(&mut socket).await,
+            ServerMessage::Registry { .. }
+        ));
+        assert!(matches!(
+            receive_wire_message(&mut socket).await,
+            ServerMessage::InterestBaseline { .. }
+        ));
+
+        assert!(state.advance(16).expect("boundary crossing advances"));
+        let message = receive_wire_message(&mut socket).await;
+        assert!(
+            matches!(
+                message,
+                ServerMessage::Fatal { ref code, .. }
+                    if code == "handoff_route_discontinuity"
+            ),
+            "an unacknowledged source view must not receive handoff phases: {message:?}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reconnect_before_destination_ack_uses_only_directory_destination() {
+        let state = two_cell_boundary_state();
+        let (mut socket, server) = connect_state_socket(state.clone()).await;
+        let address = server_address(&socket);
+        let initial = complete_session(
+            &mut socket,
+            &local_player_hello("handoff-reconnect-source-client"),
+        )
+        .await;
+        let source_session_epoch = initial["snapshot"]["interest"]["session_epoch"]
+            .as_str()
+            .expect("source session epoch")
+            .to_owned();
+        let source_cell_id = initial["snapshot"]["cell_id"]
+            .as_str()
+            .expect("source cell ID")
+            .to_owned();
+        let player = &initial["snapshot"]["actor_private"]["player"];
+        send_client_message(
+            &mut socket,
+            &ClientMessage::SetSuitMode {
+                operation_sequence: 1,
+                operation_id: "reconnect-source-ack-barrier".into(),
+                helmet_closed: !player["helmet_closed"]
+                    .as_bool()
+                    .expect("helmet state is boolean"),
+                jetpack_enabled: player["jetpack_enabled"]
+                    .as_bool()
+                    .expect("jetpack state is boolean"),
+                magnetic_boots_enabled: player["locomotion"]["magnetic_boots_enabled"]
+                    .as_bool()
+                    .expect("magnetic boots state is boolean"),
+            },
+        )
+        .await;
+        receive_intent_accepted(&mut socket, 1, "reconnect-source-ack-barrier").await;
+        let ServerMessage::InterestDelta {
+            delta: source_delta,
+        } = receive_wire_message(&mut socket).await
+        else {
+            panic!("source barrier publishes a delta");
+        };
+        acknowledge_interest(&mut socket, &source_delta.interest).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        assert!(state.advance(16).expect("boundary crossing advances"));
+        for expected in [
+            HandoffPhase::Preparing,
+            HandoffPhase::Importing,
+            HandoffPhase::VerifyingDestination,
+        ] {
+            let ServerMessage::Handoff { handoff } = receive_wire_message(&mut socket).await else {
+                panic!("handoff phase arrives before destination baseline");
+            };
+            assert_eq!(handoff.phase, expected);
+        }
+        let ServerMessage::InterestBaseline {
+            baseline: linked_destination,
+        } = receive_wire_message(&mut socket).await
+        else {
+            panic!("linked destination baseline arrives");
+        };
+        assert_ne!(linked_destination.cell_id, source_cell_id);
+        assert!(linked_destination.interest.transfer_link.is_some());
+        socket.close(None).await.expect("source socket closes");
+        wait_for_player_release(&state, "player-local").await;
+
+        let (mut reconnected, _) = connect_async(format!("ws://{address}/ws"))
+            .await
+            .expect("destination reconnect succeeds");
+        send_client_message(
+            &mut reconnected,
+            &local_player_hello("handoff-reconnect-destination-client"),
+        )
+        .await;
+        assert!(matches!(
+            receive_wire_message(&mut reconnected).await,
+            ServerMessage::Welcome { .. }
+        ));
+        assert!(matches!(
+            receive_wire_message(&mut reconnected).await,
+            ServerMessage::Registry { .. }
+        ));
+        let ServerMessage::InterestBaseline {
+            baseline: reconnected_destination,
+        } = receive_wire_message(&mut reconnected).await
+        else {
+            panic!("reconnect receives a fresh directory-routed baseline");
+        };
+        assert_eq!(reconnected_destination.cell_id, linked_destination.cell_id);
+        assert_ne!(reconnected_destination.cell_id, source_cell_id);
+        assert!(reconnected_destination.interest.transfer_link.is_none());
+        assert_ne!(
+            reconnected_destination.interest.session_epoch,
+            source_session_epoch
+        );
+        acknowledge_interest(&mut reconnected, &reconnected_destination.interest).await;
+
+        let player = actor_player(&reconnected_destination);
+        send_client_message(
+            &mut reconnected,
+            &ClientMessage::SetPlayerControl {
+                operation_sequence: 2,
+                operation_id: "reconnected-destination-control".into(),
+                movement_epoch: player.movement_epoch,
+                input_sequence: player.last_received_input_sequence + 1,
+                linear_input: Vec3::new(0.0, 0.0, -1.0),
+                angular_input: Vec3::ZERO,
+                boost: false,
+                jump: false,
+                dampeners: true,
+            },
+        )
+        .await;
+        receive_intent_accepted(&mut reconnected, 2, "reconnected-destination-control").await;
+        reconnected
+            .close(None)
+            .await
+            .expect("reconnected socket closes");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn two_cell_public_world_remains_pinned_to_origin_after_player_handoff() {
+        let state = two_cell_boundary_state();
+        let origin_cell_id = {
+            let hosted = state.runtime.lock();
+            hosted
+                .coordinator
+                .as_ref()
+                .expect("two-cell coordinator exists")
+                .public_origin_runtime()
+                .state()
+                .cell_id
+                .clone()
+        };
+        assert!(state.advance(16).expect("boundary crossing advances"));
+        let destination_cell_id = {
+            let hosted = state.runtime.lock();
+            cell_id(
+                &hosted
+                    .coordinator
+                    .as_ref()
+                    .expect("two-cell coordinator exists")
+                    .resident_player_route("player-local")
+                    .expect("destination route resolves")
+                    .cell_key,
+            )
+            .expect("destination cell ID derives")
+        };
+        assert_ne!(destination_cell_id, origin_cell_id);
+        let public: serde_json::Value = serde_json::from_str(
+            &state
+                .bounded_public_world_json()
+                .expect("public origin projection serializes"),
+        )
+        .expect("public origin projection is JSON");
+        assert_eq!(public["cell_id"], origin_cell_id);
+        assert!(public.get("actor_private").is_none());
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/status")
+                    .body(Body::empty())
+                    .expect("status request builds"),
+            )
+            .await
+            .expect("status responds");
+        let status: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .expect("status body reads"),
+        )
+        .expect("status is JSON");
+        assert_eq!(status["cell_id"], origin_cell_id);
+    }
+
+    #[test]
+    fn two_cell_bootstrap_captures_route_world_and_retained_completion_as_one_cut() {
+        let state = two_cell_boundary_state();
+        assert!(state.advance(16).expect("boundary crossing advances"));
+        let binding = SessionBinding::Player("player-local".into());
+        let initial = state
+            .initial_session_projection(&binding)
+            .expect("destination bootstrap material resolves");
+        let route = initial
+            .resident_route
+            .as_ref()
+            .expect("player bootstrap has a route");
+        assert_eq!(route.placement_generation, 2);
+        assert_eq!(
+            initial.revision.world.cell_id,
+            cell_id(&route.cell_key).expect("route cell ID derives")
+        );
+        assert!(!initial.completed_transfer_id.is_empty());
+
+        let mut transport = SessionTransport::new_at(&binding, Some(route.clone()));
+        let ServerMessage::InterestBaseline { baseline } = transport
+            .stage_initial(&initial)
+            .expect("atomic bootstrap stages one destination baseline")
+        else {
+            panic!("fresh bootstrap must be a baseline");
+        };
+        assert_eq!(baseline.cell_id, initial.revision.world.cell_id);
+        assert!(baseline.interest.transfer_link.is_none());
+    }
+
+    #[test]
+    fn two_cell_presence_probe_distinguishes_absence_from_bound_route_failure() {
+        let absent = two_cell_boundary_state();
+        assert!(matches!(
+            absent.player_is_present("player-not-admitted"),
+            Ok(false)
+        ));
+        assert!(matches!(
+            &*absent.authority.borrow(),
+            WorkerAuthorityStatus::Active
+        ));
+
+        let invalid_bound_route = two_cell_boundary_state();
+        let binding = SessionBinding::Player("player-not-admitted".into());
+        assert!(
+            invalid_bound_route
+                .validate_current_session_projection(&binding)
+                .is_err()
+        );
+        assert!(matches!(
+            &*invalid_bound_route.authority.borrow(),
+            WorkerAuthorityStatus::Fenced(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn two_cell_live_spectator_stays_on_origin_feed_after_player_handoff() {
+        let state = two_cell_boundary_state();
+        let (mut spectator, server) = connect_state_socket(state.clone()).await;
+        send_client_message(
+            &mut spectator,
+            &ClientMessage::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                client_name: "two-cell-origin-spectator".into(),
+                authentication: ClientAuthentication::Spectator,
+            },
+        )
+        .await;
+        assert!(matches!(
+            receive_wire_message(&mut spectator).await,
+            ServerMessage::Welcome { .. }
+        ));
+        assert!(matches!(
+            receive_wire_message(&mut spectator).await,
+            ServerMessage::Registry { .. }
+        ));
+        let ServerMessage::InterestBaseline { baseline: origin } =
+            receive_wire_message(&mut spectator).await
+        else {
+            panic!("spectator begins on the public origin cell");
+        };
+        acknowledge_interest(&mut spectator, &origin.interest).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        assert!(state.advance(16).expect("boundary crossing advances"));
+        let ServerMessage::InterestDelta { delta } = receive_wire_message(&mut spectator).await
+        else {
+            panic!("origin handoff publishes a cell-scoped structural delta");
+        };
+        assert_eq!(delta.cell_id, origin.cell_id);
+        assert!(delta.actor_private.is_none());
+        assert!(delta.interest.transfer_link.is_none());
+        let encoded = serde_json::to_string(&delta).expect("spectator delta serializes");
+        assert!(!encoded.contains("inventory-player-local"));
+
+        let removal = state
+            .public_origin_projection
+            .lock()
+            .removals
+            .get(&InterestEntityIdentity {
+                entity_id: "player-local".into(),
+                kind: InterestEntityKind::Player,
+            })
+            .copied();
+        assert_eq!(removal, Some(InterestRemovalReason::Transferred));
+
+        spectator
+            .close(None)
+            .await
+            .expect("spectator socket closes");
         server.abort();
     }
 
@@ -4473,9 +5979,68 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
         assert_eq!(json["conservation_valid"], true);
         assert_eq!(json["protocol_version"], PROTOCOL_VERSION);
+        assert_eq!(json["cell_key"]["schema_version"], 1);
+        assert_eq!(json["cell_key"]["universe_id"], "the-verse-local");
+        assert_eq!(json["cell_key"]["cell"]["x"], 500);
         assert!(json["lifecycle"]["next_production_occurrence"].is_null());
         assert!(json["lifecycle"]["acknowledged_production_sequence"].is_null());
         assert!(json["lifecycle"]["expires_at_unix_ms"].is_null());
+    }
+
+    #[tokio::test]
+    async fn empty_frontier_worker_serves_status_and_public_vacuum_without_a_primary_player() {
+        let directory = tempdir().expect("tempdir");
+        let origin = verse_simulation::cell_origin_key();
+        let east = verse_simulation::neighbor_cell_key(&origin, [1, 0, 0])
+            .expect("adjacent proof cell derives");
+        let runtime = Runtime::open_for_cell(directory.path(), 100, east, 20)
+            .expect("empty frontier runtime opens");
+        let app = router(AppState::new(runtime));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/status")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("status JSON");
+        assert_eq!(json["cell_key"]["cell"]["x"], 501);
+        assert_eq!(json["conservation_valid"], true);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/world")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("world JSON");
+        assert_eq!(json["cell_address"]["cell"]["x"], 501);
+        assert_eq!(json["gravity_body_id"], "");
+        assert_eq!(json["voxel_body_id"], "");
+        assert_eq!(json["environment"]["gravity_m_s2"], 0.0);
+        assert_eq!(json["environment"]["breathable"], false);
+        assert_eq!(
+            json["interest"]["entered"]
+                .as_array()
+                .expect("entered entities")
+                .len(),
+            0
+        );
     }
 
     #[tokio::test]

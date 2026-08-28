@@ -34,6 +34,7 @@ Requirement IDs are stable references for issues, pull requests, tests, and rele
 - **WORLD-007 — Offline travel:** Autopilot travel shall continue while a user is offline and remain observable through browser interfaces.
 - **WORLD-008 — Partitioned execution:** One logical universe shall be simulated by many dynamically managed cells.
 - **WORLD-009 — Canonical celestial identity:** Every materialized celestial body shall have one immutable ID and normalized hierarchical universe address pinned by a versioned registry hash. Authorized voxel edits or later rule changes shall not silently move or re-identify an existing body.
+- **WORLD-010 — Stable cell routing:** Every simulation cell shall have one canonical normalized key and deterministic ID independent of worker, process, display name, or storage path. Assignment shall use a durable monotonically increasing generation, and stale or conflicting assignments shall fail before cell mutation or state publication.
 
 ## Voxels and grids
 
@@ -52,6 +53,9 @@ Requirement IDs are stable references for issues, pull requests, tests, and rele
 - **SIM-013 — Server-derived spatial interest:** A real-time connection shall receive a bounded spatial view selected from authoritative position and server policy. A client-supplied camera or subscription hint shall never grant gameplay authority, reveal actor-private state, or change canonical simulation.
 - **SIM-014 — Interest-view convergence:** Interest baselines and deltas shall use deterministic ordering, explicit enter/update/remove semantics, a connection-local epoch and sequence, bounded latest-state backpressure, and a resnapshot path that converges after loss, duplication, reordering, or reconnect without requiring a global world snapshot.
 - **SIM-015 — Durable cell lifecycle and background production:** A simulation cell shall transition through fenced, durable lifecycle states. Sleeping or background execution shall advance approved production work through the same canonical integer quantum used while active, with stable occurrence identity, at-least-once idempotency, bounded catch-up, strict lease fencing, and exact crash/replay recovery. Background production shall not imply background physics, life support, combat, or client authority.
+- **SIM-016 — Fenced aggregate placement:** Every mobile player or grid aggregate shall have exactly one canonical resident cell and one monotonically increasing placement generation. Mutation requires both the cell's current lease fence and the aggregate's current placement generation.
+- **SIM-017 — Conservative atomic handoff:** Cross-cell movement shall transfer one complete server-derived dependency closure through a content-addressed package and one durable directory compare-and-swap commit. Crash, retry, duplication, or message reordering shall converge to exactly one live placement while conserving inventory, production escrow, ownership, physics state, and lineage.
+- **SIM-018 — Handoff session convergence:** A successful cross-cell handoff shall preserve the authenticated actor session while pausing controls, invalidating source-cell movement and interest state, and requiring one transfer-linked independently verified destination baseline before gameplay resumes.
 
 ## Persistence, death, and cleanup
 

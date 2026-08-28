@@ -8,17 +8,22 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The only protocol version accepted by this build.
-pub const PROTOCOL_VERSION: u32 = 17;
+pub mod protocol_v19;
 
-/// The actor-aware, interest-managed projection contract carried by protocol 17.
-pub const PROJECTION_SCHEMA_VERSION: u32 = 3;
+/// The only protocol version accepted by this build.
+pub const PROTOCOL_VERSION: u32 = 18;
+
+/// The transfer-aware, actor-scoped projection contract carried by protocol 18.
+pub const PROJECTION_SCHEMA_VERSION: u32 = 4;
 pub const CELESTIAL_REGISTRY_SCHEMA_VERSION: u32 = 1;
-pub const UNIVERSE_MANIFEST_SCHEMA_VERSION: u32 = 3;
-pub const INTEREST_SCHEMA_VERSION: u32 = 1;
-pub const INTENT_FINGERPRINT_SCHEMA_VERSION: u32 = 1;
-pub const LIFECYCLE_CONTROL_SCHEMA_VERSION: u32 = 1;
+pub const UNIVERSE_MANIFEST_SCHEMA_VERSION: u32 = 4;
+pub const INTEREST_SCHEMA_VERSION: u32 = 2;
+pub const INTENT_FINGERPRINT_SCHEMA_VERSION: u32 = 2;
+pub const LIFECYCLE_CONTROL_SCHEMA_VERSION: u32 = 2;
 pub const PRODUCTION_SCHEDULE_OCCURRENCE_SCHEMA_VERSION: u32 = 1;
+pub const CELL_KEY_SCHEMA_VERSION: u32 = 1;
+pub const CELL_DIRECTORY_SCHEMA_VERSION: u32 = 2;
+pub const TRANSFER_PACKAGE_SCHEMA_VERSION: u32 = 1;
 
 /// An exact bounded local coordinate in integer micrometres.
 #[derive(
@@ -68,6 +73,18 @@ pub struct UniverseAddress {
     pub sector: SectorCoordinate,
     pub cell: CellCoordinate,
     pub local_um: I64Vec3,
+}
+
+/// Stable execution-cell identity without a cell-local position. Routing,
+/// assignment, and persistence use this canonical key rather than a worker
+/// name, display alias, or filesystem path.
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CellKeyV1 {
+    pub schema_version: u32,
+    pub universe_id: String,
+    pub sector: SectorCoordinate,
+    pub cell: CellCoordinate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -156,6 +173,12 @@ pub struct UniverseManifestSnapshot {
     pub content_hash: String,
     pub world_schema_version: u32,
     pub event_schema_version: u32,
+    pub projection_schema_version: u32,
+    pub interest_schema_version: u32,
+    pub operation_fingerprint_schema_version: u32,
+    pub cell_key_schema_version: u32,
+    pub cell_directory_schema_version: u32,
+    pub transfer_package_schema_version: u32,
     pub lifecycle_control_schema_version: u32,
     pub production_schedule_occurrence_schema_version: u32,
     pub lifecycle_policy_hash: String,
@@ -229,6 +252,16 @@ pub struct InterestRemoval {
     pub reason: InterestRemovalReason,
 }
 
+/// One-time private proof that a destination baseline is the continuation of
+/// a committed cross-cell placement rather than an unrelated cell snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InterestTransferLink {
+    pub transfer_id: String,
+    pub destination_cell_key: CellKeyV1,
+    pub placement_generation: u64,
+}
+
 /// Connection-local replication frontier. The global commitment is retained
 /// as a documented timing/hash side channel; `view_hash` is the convergence
 /// commitment for the audience-safe subset.
@@ -246,6 +279,8 @@ pub struct InterestSnapshot {
     pub local_origin_address: UniverseAddress,
     pub registry_hash: String,
     pub universe_manifest_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transfer_link: Option<InterestTransferLink>,
     pub canonical_event_sequence: u64,
     pub canonical_tick: u64,
     pub canonical_world_hash: String,
@@ -1051,6 +1086,24 @@ pub enum SessionRole {
     Player { player_id: String },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HandoffPhase {
+    Preparing,
+    Importing,
+    VerifyingDestination,
+}
+
+/// Private, bounded gateway presentation state for one immutable handoff.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HandoffStatus {
+    pub transfer_id: String,
+    pub phase: HandoffPhase,
+    pub destination_cell_key: CellKeyV1,
+    pub placement_generation: u64,
+}
+
 /// Commands sent by all P0 clients. Every mutating command carries a contiguous
 /// actor-local operation sequence for durable idempotency plus a diagnostic ID.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1309,7 +1362,10 @@ pub enum ServerMessage {
     InterestDelta {
         delta: Box<ProjectedInterestDelta>,
     },
-    /// Protocol-15 compatibility shape. Protocol-16 official clients must use
+    Handoff {
+        handoff: HandoffStatus,
+    },
+    /// Legacy compatibility shape. Protocol-18 official clients must use
     /// `interest_baseline` and `interest_delta` and workers must never mix the
     /// two state-stream families within one session.
     Snapshot {
@@ -1371,7 +1427,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v17_registry_manifest_and_interest_reject_unknown_fields() {
+    fn protocol_v18_registry_manifest_and_interest_reject_unknown_fields() {
         let body = CelestialBodySnapshot {
             body_id: "body-test".into(),
             display_name: "Body Test".into(),
@@ -1432,8 +1488,14 @@ mod tests {
             content_schema_version: 11,
             content_manifest_version: "p1.5.0".into(),
             content_hash: "content-hash".into(),
-            world_schema_version: 19,
-            event_schema_version: 15,
+            world_schema_version: 20,
+            event_schema_version: 16,
+            projection_schema_version: PROJECTION_SCHEMA_VERSION,
+            interest_schema_version: INTEREST_SCHEMA_VERSION,
+            operation_fingerprint_schema_version: INTENT_FINGERPRINT_SCHEMA_VERSION,
+            cell_key_schema_version: CELL_KEY_SCHEMA_VERSION,
+            cell_directory_schema_version: CELL_DIRECTORY_SCHEMA_VERSION,
+            transfer_package_schema_version: TRANSFER_PACKAGE_SCHEMA_VERSION,
             lifecycle_control_schema_version: LIFECYCLE_CONTROL_SCHEMA_VERSION,
             production_schedule_occurrence_schema_version:
                 PRODUCTION_SCHEDULE_OCCURRENCE_SCHEMA_VERSION,
@@ -1453,6 +1515,28 @@ mod tests {
             .expect("interest object")
             .insert("unexpected".into(), serde_json::json!(true));
         assert!(serde_json::from_value::<InterestSnapshot>(interest_value).is_err());
+
+        let handoff = ServerMessage::Handoff {
+            handoff: HandoffStatus {
+                transfer_id: "transfer-proof".into(),
+                phase: HandoffPhase::VerifyingDestination,
+                destination_cell_key: CellKeyV1 {
+                    schema_version: CELL_KEY_SCHEMA_VERSION,
+                    universe_id: "the-verse-local".into(),
+                    sector: test_address().sector,
+                    cell: test_address().cell,
+                },
+                placement_generation: 2,
+            },
+        };
+        let mut handoff_value = serde_json::to_value(handoff).expect("handoff serializes");
+        assert_eq!(handoff_value["type"], "handoff");
+        assert_eq!(handoff_value["handoff"]["phase"], "verifying_destination");
+        handoff_value["handoff"]
+            .as_object_mut()
+            .expect("handoff object")
+            .insert("unexpected".into(), serde_json::json!(true));
+        assert!(serde_json::from_value::<ServerMessage>(handoff_value).is_err());
     }
 
     fn test_environment(altitude_m: f64) -> EnvironmentSnapshot {
@@ -1488,6 +1572,7 @@ mod tests {
             local_origin_address: test_address(),
             registry_hash: "registry-hash".into(),
             universe_manifest_hash: "manifest-hash".into(),
+            transfer_link: None,
             canonical_event_sequence: 8,
             canonical_tick: 13,
             canonical_world_hash: "canonical-hash".into(),
@@ -1621,9 +1706,9 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v17_preserves_tagged_life_state_and_death_cause() {
-        assert_eq!(PROTOCOL_VERSION, 17);
-        assert_eq!(PROJECTION_SCHEMA_VERSION, 3);
+    fn protocol_v18_preserves_tagged_life_state_and_death_cause() {
+        assert_eq!(PROTOCOL_VERSION, 18);
+        assert_eq!(PROJECTION_SCHEMA_VERSION, 4);
         let life_state = PlayerLifeState::Incapacitated {
             death_id: "death-player-local-42".into(),
             cause: PlayerDeathCause::OxygenDepleted,

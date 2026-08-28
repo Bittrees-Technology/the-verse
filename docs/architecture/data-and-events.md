@@ -1,7 +1,7 @@
 # Data and event architecture
 
-**Status:** Proposed service baseline; P1.5 bindings published and P1.6
-lifecycle/event contract accepted
+**Status:** Proposed service baseline; P1.5 bindings published, P1.6 verified,
+and P1.7 directory/transfer contract accepted
 
 ## Canonical principles
 
@@ -59,6 +59,24 @@ and every queue-head outcome in grid-ID/block-ID order. Live preparation and
 replay independently recompute the complete vector before atomic mutation.
 Event identity and canonical occurrence time derive from the occurrence; the
 authority fence and hash chain bind the holder that durably committed it.
+
+Event schema `16` adds cell-key and aggregate-placement bindings plus canonical
+`TransferPrepared`, `TransferImported`, and `TransferFinalized` system events.
+A transfer event binds the immutable transfer ID, source and destination cell
+keys, relevant assignment and fencing generations, prior and resulting
+placement generation, package hash, universe/content/registry roots, and the
+cell event/hash frontier. The directory commit is a separate durable service
+record and the sole cross-cell authority-transfer decision; a cell event cannot
+manufacture or reverse it.
+
+The cell store additionally persists transfer-boundary records for prepare,
+quarantine, import, export/finalization, and both abort-cleanup roles. Each
+record binds the exact canonical event sequence/hash, live store fence, and
+resulting world hash; records form a hash chain whose head is anchored in the
+cell lifecycle document. Startup truncates only an incomplete final record,
+verifies the chain and event material, replays post-snapshot boundaries to
+verify their world roots, and may backfill only the exact lifecycle-pending
+event-to-boundary crash gap.
 
 ## Canonical spatial identity
 
@@ -144,6 +162,8 @@ Terminal states retain tombstone events and provenance.
 ### Canonical services
 
 - PostgreSQL transaction stores.
+- Durable cell assignment, aggregate placement, transfer phase, package hash,
+  and quarantine-receipt records with compare-and-swap generations.
 - Outbox pattern for publishing committed events.
 - Inbox/idempotency tables for consumers.
 - Double-entry ledgers for BIT-denominated obligations and custody.
@@ -176,6 +196,12 @@ Global total ordering is neither required nor scalable. Ordering guarantees are:
 - Explicit causal links across services.
 
 Conflicts are rejected using aggregate versions and fencing tokens.
+
+P1.7 transfer ordering is causal rather than globally total: source prepare
+precedes destination quarantine, directory commit linearizes placement, and
+destination import plus source finalization reconcile from that commit. Before
+commit an exact abort may restore source residency; after commit only
+destination roll-forward is valid.
 
 ## Snapshot and recovery
 
@@ -243,6 +269,23 @@ declare its trusted-time cut-off, introduce one unambiguous production-clock
 generation and frontier, prove replay equality, and atomically switch the
 manifest pointer. Rollback restores the exact P1.5 binary, roots and archived
 data; it never reinterprets a P1.6 record.
+
+## P1.7 compatibility and migration
+
+P1.7 admits protocol `18`, projection schema `4`, world schema `20`, event
+schema `16`, content schema `11`, content manifest `p1.5.0`, registry schema
+`1`, universe manifest schema `4`, interest schema `2`, operation fingerprint
+schema `2`, lifecycle-control schema `2`, production-occurrence schema `1`,
+cell-directory schema `2`, and transfer/package schema `1` as one coordinated
+set. Partial combinations fail before assignment, recovery, package admission,
+journal replay, session routing, or projection.
+
+The first proof archives and resets P1.6 data. A later offline migration must
+derive canonical cell keys, install one placement generation for every mobile
+aggregate, preserve retained operation-conflict semantics under fingerprint
+schema `2`, create universe-unique subject IDs, and prove replay and
+cross-cell conservation equality. Rollback restores the matching P1.6 binary,
+roots, directory absence, and archived data together.
 
 ## Settlement batches
 

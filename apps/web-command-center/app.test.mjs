@@ -50,7 +50,7 @@ function address(xUm = 0, cellX = 500, sectorX = "0") {
 }
 
 const manifest = {
-  schema_version: 3,
+  schema_version: 4,
   manifest_hash: "manifest-hash",
   universe_id: "the-verse-local",
   address_schema_version: 1,
@@ -62,11 +62,11 @@ const manifest = {
   content_schema_version: 11,
   content_manifest_version: "p1.5.0",
   content_hash: "content-hash",
-  world_schema_version: 19,
-  event_schema_version: 15,
-  lifecycle_control_schema_version: 1,
+  world_schema_version: 20,
+  event_schema_version: 16,
+  lifecycle_control_schema_version: 2,
   production_schedule_occurrence_schema_version: 1,
-  lifecycle_policy_hash: "5bc077cc8a2eb101fcaecdce5513c13aa243e1f68a5af839a602dd689859ff3a",
+  lifecycle_policy_hash: "8abc99b5e076bd89a8914c3727560baaa82433b1b1b4191b2379355ac7d81471",
 };
 
 const celestialRegistry = {
@@ -90,14 +90,14 @@ function entity(kind, id, value, revision = 1) {
     entity_id: id,
     kind,
     projected_revision: revision,
-    component_schema_version: 3,
+    component_schema_version: 4,
     payload: { entity_kind: kind, value },
   };
 }
 
 function interest(frameKind, sequence, viewHash, operations = {}) {
   return {
-    schema_version: 1,
+    schema_version: 2,
     frame_kind: frameKind,
     session_epoch: "session-a",
     interest_epoch: 1,
@@ -139,8 +139,8 @@ function baselineFixture() {
     ],
   });
   return {
-    projection_schema_version: 3,
-    schema_version: 19,
+    projection_schema_version: 4,
+    schema_version: 20,
     content_manifest_version: "p1.5.0",
     universe_id: "the-verse-local",
     cell_id: "cell-origin",
@@ -321,17 +321,17 @@ test("publicProjection strips any private overlay before browser state storage",
   assert.equal("actor_private" in projected, true, "the received object stays immutable");
 });
 
-test("protocol 17 tuple and registry binding fail closed on any incompatible field", () => {
+test("protocol 18 tuple and registry binding fail closed on any incompatible field", () => {
   const welcome = {
-    protocol_version: 17,
-    projection_schema_version: 3,
-    world_schema_version: 19,
-    event_schema_version: 15,
+    protocol_version: 18,
+    projection_schema_version: 4,
+    world_schema_version: 20,
+    event_schema_version: 16,
     content_schema_version: 11,
     content_manifest_version: "p1.5.0",
     celestial_registry_schema_version: 1,
-    universe_manifest_schema_version: 3,
-    interest_schema_version: 1,
+    universe_manifest_schema_version: 4,
+    interest_schema_version: 2,
   };
   assert.equal(api.protocolTupleMatches(welcome), true);
   assert.equal(api.protocolTupleMatches({ ...welcome, event_schema_version: 13 }), false);
@@ -422,8 +422,8 @@ test("contiguous interest deltas replace, enter, and remove atomically", () => {
     }],
   });
   const next = plain(api.applyInterestDelta(baseline, {
-    projection_schema_version: 3,
-    schema_version: 19,
+    projection_schema_version: 4,
+    schema_version: 20,
     content_manifest_version: "p1.5.0",
     universe_id: "the-verse-local",
     universe_manifest_hash: "manifest-hash",
@@ -486,7 +486,7 @@ test("raw spectator UI marks economics private and ships no inventory reader", (
   assert.match(indexSource, /id="craft" disabled/);
   assert.equal(source.includes(".inventories"), false);
   assert.equal(source.includes("inventory_id"), false);
-  assert.match(source, /const PROTOCOL_VERSION = 17/);
+  assert.match(source, /const PROTOCOL_VERSION = 18/);
   assert.match(source, /interest_baseline/);
   assert.match(source, /new Worker\("\/verifier-worker\.js", \{ type: "module" \}\)/);
   assert.match(source, /prepare_verified_frame/);
@@ -504,7 +504,7 @@ test("browser verifier is pinned to the proof universe commitments", () => {
   assert.match(source, /expected_universe_manifest_hash: EXPECTED_UNIVERSE_MANIFEST_HASH/);
   assert.match(source, /expected_content_hash: EXPECTED_CONTENT_HASH/);
   assert.match(source, /4c367bbfa04218ece14104f0a3a7ec2c7e9fefcc37d4cf78a265df2d711a59da/);
-  assert.match(source, /c9bfd3baa1e64ab7665e60c4f989491e745e9af0d2512989f41625b57b546ace/);
+  assert.match(source, /3e93c305169eeecee44f2630e57ad183b319375197547344c45e1509e8aaf76b/);
   assert.match(source, /fc61c05b335fb951868010ecf2942a92ec4f03d00d0a75d3acba8c6f5162b6bd/);
 });
 

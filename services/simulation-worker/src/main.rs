@@ -6,17 +6,24 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use tokio::net::TcpListener;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
-use verse_simulation::{LifecycleMode, Runtime};
+use verse_protocol::CellKeyV1;
+use verse_simulation::{LifecycleMode, LocalTwoCellRuntime, Runtime, cell_origin_key};
 use verse_simulation_worker::{AppState, router};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum GenesisProfile {
+    Orbital,
+    EarthStart,
+}
 
 #[derive(Debug, Parser)]
 #[command(
     name = "verse-simulation-worker",
-    about = "The Verse authoritative local P0 universe"
+    about = "The Verse authoritative simulation cell"
 )]
 struct Arguments {
     #[arg(long, env = "VERSE_BIND", default_value = "127.0.0.1:7777")]
@@ -25,8 +32,21 @@ struct Arguments {
     #[arg(long, env = "VERSE_DATA_DIR", default_value = "data/local-universe")]
     data_directory: PathBuf,
 
+    /// Canonical `CellKeyV1` JSON for this worker. Omission selects the origin cell.
+    #[arg(long, env = "VERSE_CELL_KEY_JSON")]
+    cell_key_json: Option<String>,
+
     #[arg(long, env = "VERSE_WORLD_SEED", default_value_t = 20260826)]
     world_seed: u64,
+
+    /// Development-only fixture selected before the first canonical event.
+    #[arg(
+        long,
+        env = "VERSE_GENESIS_PROFILE",
+        value_enum,
+        default_value = "orbital"
+    )]
+    genesis_profile: GenesisProfile,
 
     #[arg(long, env = "VERSE_SNAPSHOT_EVERY", default_value_t = 25)]
     snapshot_every: u64,
@@ -51,6 +71,11 @@ struct Arguments {
     /// Open the authoritative state for recovery inspection without advancing time.
     #[arg(long, env = "VERSE_PAUSE_SIMULATION", default_value_t = false)]
     pause_simulation: bool,
+
+    /// Run the bounded directory-managed adjacent-cell universe and route
+    /// sessions through its reconciled coordinator.
+    #[arg(long, env = "VERSE_TWO_CELL_UNIVERSE", default_value_t = false)]
+    two_cell_universe: bool,
 }
 
 #[tokio::main]
@@ -70,31 +95,92 @@ async fn main() -> Result<()> {
             "protocol 11 local-development player authentication is restricted to a loopback bind; use 127.0.0.1 or wait for the configured session authority"
         );
     }
-    let mut runtime = if arguments.pause_simulation {
-        Runtime::open(
+    let state = if arguments.two_cell_universe {
+        if arguments.pause_simulation
+            || arguments.cell_key_json.is_some()
+            || arguments.genesis_profile != GenesisProfile::Orbital
+        {
+            bail!(
+                "the two-cell universe owns both cell routes and does not accept pause, a standalone cell key, or a development genesis profile"
+            );
+        }
+        let coordinator = LocalTwoCellRuntime::open(
             &arguments.data_directory,
             arguments.world_seed,
             arguments.snapshot_every,
+            "simulation-gateway",
         )
+        .with_context(|| {
+            format!(
+                "failed to reconcile the two-cell universe at {}",
+                arguments.data_directory.display()
+            )
+        })?;
+        for player_id in &arguments.development_players {
+            if coordinator.runtime_for_player(player_id).is_err() {
+                info!(%player_id, "two-cell gateway ignores development actors without a resident placement");
+            }
+        }
+        AppState::new_two_cell(coordinator)
     } else {
-        Runtime::open_hosted(
-            &arguments.data_directory,
-            arguments.world_seed,
-            arguments.snapshot_every,
-        )
-    }
-    .with_context(|| {
-        format!(
-            "failed to open universe data at {}",
-            arguments.data_directory.display()
-        )
-    })?;
-    for player_id in &arguments.development_players {
-        runtime
-            .admit_development_player(player_id)
-            .with_context(|| format!("failed to pre-admit development player {player_id}"))?;
-    }
-    let state = AppState::new(runtime);
+        let cell_key = arguments.cell_key_json.as_deref().map_or_else(
+            || Ok(cell_origin_key()),
+            |json| {
+                serde_json::from_str::<CellKeyV1>(json).context("VERSE_CELL_KEY_JSON is invalid")
+            },
+        )?;
+        let is_origin_cell = cell_key == cell_origin_key();
+        let mut runtime = if arguments.pause_simulation {
+            Runtime::open_for_cell(
+                &arguments.data_directory,
+                arguments.world_seed,
+                cell_key,
+                arguments.snapshot_every,
+            )
+        } else {
+            Runtime::open_hosted_for_cell(
+                &arguments.data_directory,
+                arguments.world_seed,
+                cell_key,
+                arguments.snapshot_every,
+            )
+        }
+        .with_context(|| {
+            format!(
+                "failed to open universe data at {}",
+                arguments.data_directory.display()
+            )
+        })?;
+        if arguments.genesis_profile == GenesisProfile::EarthStart {
+            if !is_origin_cell {
+                bail!(
+                    "the Earthlike surface playtest profile is available only in the origin cell"
+                );
+            }
+            if runtime.state().event_sequence == 0 {
+                let configured = runtime
+                    .configure_earth_start_playtest()
+                    .context("failed to configure the fresh Earthlike surface playtest")?;
+                info!(configured, "Earthlike surface playtest profile is ready");
+            }
+        }
+        if runtime.state().player.by_id.is_empty() {
+            if !arguments.development_players.is_empty() {
+                info!(
+                    "empty frontier cells ignore development-player admission until a canonical transfer arrives"
+                );
+            }
+        } else {
+            for player_id in &arguments.development_players {
+                runtime
+                    .admit_development_player(player_id)
+                    .with_context(|| {
+                        format!("failed to pre-admit development player {player_id}")
+                    })?;
+            }
+        }
+        AppState::new(runtime)
+    };
     let lifecycle_task = if arguments.pause_simulation {
         let lease_state = Arc::clone(&state);
         Some(tokio::spawn(async move {
@@ -191,6 +277,18 @@ mod tests {
         assert_eq!(arguments.tick_millis, 16);
         assert_eq!(arguments.idle_drain_seconds, 30);
         assert_eq!(arguments.development_players, ["player-remote"]);
+        assert!(arguments.cell_key_json.is_none());
+        assert_eq!(arguments.genesis_profile, GenesisProfile::Orbital);
         assert!(f64::from(arguments.tick_millis) <= 1_000.0 / 60.0);
+    }
+
+    #[test]
+    fn earth_start_profile_is_explicitly_selectable() {
+        let arguments = Arguments::parse_from([
+            "verse-simulation-worker",
+            "--genesis-profile",
+            "earth-start",
+        ]);
+        assert_eq!(arguments.genesis_profile, GenesisProfile::EarthStart);
     }
 }

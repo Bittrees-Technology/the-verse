@@ -13,6 +13,7 @@ node --check tools/e2e/protocol-smoke.mjs
 node --check tools/e2e/browser-verifier-smoke.mjs
 node --check tools/e2e/browser-command-center-smoke.mjs
 node --check tools/e2e/two-player-control-smoke.mjs
+node --check tools/e2e/two-cell-handoff-smoke.mjs
 node --check tools/e2e/p15-scale-evidence.mjs
 npm ci --ignore-scripts --prefix tools/markdownlint
 npm exec --prefix tools/markdownlint --no -- markdownlint-cli2 '**/*.md'
@@ -36,6 +37,7 @@ else
   tools/e2e/verify-local.sh
 fi
 tools/e2e/verify-p15-scale-evidence.sh
+tools/e2e/verify-two-cell-handoff.sh
 
 git diff --check
 echo "VERSE_CHECKS_OK"

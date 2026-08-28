@@ -3,15 +3,15 @@
 import assert from "node:assert/strict";
 
 export const COMPATIBILITY = Object.freeze({
-  protocol_version: 17,
-  projection_schema_version: 3,
-  world_schema_version: 19,
-  event_schema_version: 15,
+  protocol_version: 18,
+  projection_schema_version: 4,
+  world_schema_version: 20,
+  event_schema_version: 16,
   content_schema_version: 11,
   content_manifest_version: "p1.5.0",
   celestial_registry_schema_version: 1,
-  universe_manifest_schema_version: 3,
-  interest_schema_version: 1,
+  universe_manifest_schema_version: 4,
+  interest_schema_version: 2,
 });
 
 const ENTITY_KIND_ORDER = new Map([
@@ -355,11 +355,11 @@ export class Protocol16InterestStream {
       manifest.event_schema_version,
       this.welcome.event_schema_version,
     );
-    assert.equal(manifest.lifecycle_control_schema_version, 1);
+    assert.equal(manifest.lifecycle_control_schema_version, 2);
     assert.equal(manifest.production_schedule_occurrence_schema_version, 1);
     assert.equal(
       manifest.lifecycle_policy_hash,
-      "5bc077cc8a2eb101fcaecdce5513c13aa243e1f68a5af839a602dd689859ff3a",
+      "8abc99b5e076bd89a8914c3727560baaa82433b1b1b4191b2379355ac7d81471",
     );
     assert.equal(
       manifest.celestial_registry_schema_version,

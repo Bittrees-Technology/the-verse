@@ -1,6 +1,7 @@
 # Clients and public APIs
 
-**Status:** Proposed product API baseline; P1.5 replication contract accepted
+**Status:** Proposed product API baseline; P1.5 replication and P1.7 handoff
+contracts accepted
 
 ## Native client
 
@@ -55,6 +56,32 @@ not establish that the canonical entity was destroyed, and a loaded entity
 does not establish that an intent against it is valid. The server always
 reconstructs range, visibility, collision, ownership, and permissions from
 canonical state.
+
+## P1.7 same-session cell handoff
+
+Protocol `18`, projection schema `4`, and interest schema `2` preserve one
+authenticated gateway session while a player or piloted grid transfers between
+the two proof cells. The client never chooses the destination, package,
+transfer closure, assignment generation, or placement generation.
+
+The gateway presents a bounded state sequence:
+
+```text
+LIVE -> HANDOFF_PREPARING -> HANDOFF_IMPORTING -> VERIFYING_DESTINATION -> LIVE
+```
+
+Controls are neutralized after the source prepare boundary. Directory commit
+and destination import increment movement and interest epochs, discard every
+source baseline, delta, acknowledgement, predicted input, verification stage,
+and private overlay, and install one complete destination baseline. That
+baseline binds the transfer ID, destination cell key, current placement
+generation, destination cell-scoped frontier, and all existing trust roots.
+The official verifier must commit it before the gateway releases new controls.
+
+A timeout or reconnect asks the directory for canonical placement; it never
+guesses a cell or restores a stale source route. A source removal marked
+`transferred` is valid only when linked to committed transfer evidence and
+reveals no private destination or package contents.
 
 ## Browser command center
 
@@ -142,8 +169,8 @@ No hidden “human-only” endpoint is required, but system NPCs must be identif
 - GraphQL for composed browser queries.
 - WebSocket or server-sent events for subscriptions.
 - Versioned real-time protocol for native simulation replication; P1.5 pins
-  baseline/delta semantics while the final production binary codec remains
-  later work.
+  baseline/delta semantics and P1.7 pins transfer-linked cell-scoped
+  convergence while the final production binary codec remains later work.
 - Webhooks for approved server-to-server notifications.
 
 ## Versioning
@@ -171,6 +198,35 @@ Handshake rejects any mismatch before state delivery. Protocol `15` may remain
 only on an explicitly local diagnostic endpoint and is never an automatic
 public downgrade. Reconnect creates a new session epoch and complete baseline;
 clients do not reuse old deltas or acknowledgements.
+
+The P1.7 compatibility tuple is also indivisible:
+
+| Boundary | Version |
+| --- | --- |
+| Gameplay protocol | `18` |
+| Projection schema | `4` |
+| World schema | `20` |
+| Event schema | `16` |
+| Content schema | `11` |
+| Content manifest | `p1.5.0` |
+| Celestial registry | `1` |
+| Universe manifest | `4` |
+| Interest schema | `2` |
+| Operation fingerprint | `2` |
+| Lifecycle control | `2` |
+| Production occurrence | `1` |
+| Cell directory | `2` |
+| Transfer/package | `1` |
+
+Upgrade and rollback drain incompatible sessions. Protocol `18` state is never
+reinterpreted as a P1.6 stream, and handoff begins only after both cell workers,
+the directory, gateway, verifier, and client agree on the complete tuple.
+
+Atomic ordinary-grid closure handoff introduces protocol `19`, projection `5`,
+world `21`, event `17`, universe manifest `5`, interest `3`, directory `3`, and
+transfer package `2`. The complete boundary is recorded in ADR-0024; v1
+transfer artifacts remain independent-EVA artifacts and fail closed under the
+grid runtime.
 
 ## Permission examples
 

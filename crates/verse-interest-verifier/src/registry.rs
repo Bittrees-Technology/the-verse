@@ -8,10 +8,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 use verse_protocol::{
-    CELESTIAL_REGISTRY_SCHEMA_VERSION, CelestialBodyKind, CelestialBodySnapshot,
-    CelestialRegistrySnapshot, CelestialScaleClass, EnvironmentSnapshot,
+    CELESTIAL_REGISTRY_SCHEMA_VERSION, CELL_DIRECTORY_SCHEMA_VERSION, CELL_KEY_SCHEMA_VERSION,
+    CelestialBodyKind, CelestialBodySnapshot, CelestialRegistrySnapshot, CelestialScaleClass,
+    EnvironmentSnapshot, INTENT_FINGERPRINT_SCHEMA_VERSION, INTEREST_SCHEMA_VERSION,
     LIFECYCLE_CONTROL_SCHEMA_VERSION, PRODUCTION_SCHEDULE_OCCURRENCE_SCHEMA_VERSION,
-    UNIVERSE_MANIFEST_SCHEMA_VERSION, UniverseAddress, UniverseManifestSnapshot,
+    PROJECTION_SCHEMA_VERSION, TRANSFER_PACKAGE_SCHEMA_VERSION, UNIVERSE_MANIFEST_SCHEMA_VERSION,
+    UniverseAddress, UniverseManifestSnapshot,
 };
 
 use crate::canonical;
@@ -19,7 +21,7 @@ use crate::error::{ErrorCode, Result, VerifyError};
 
 const ADDRESS_SCHEMA_VERSION: u32 = 1;
 const REGISTRY_DOMAIN: &[u8] = b"the-verse/celestial-registry/v1\0";
-const MANIFEST_DOMAIN: &[u8] = b"the-verse/universe-manifest/v3\0";
+const MANIFEST_DOMAIN: &[u8] = b"the-verse/universe-manifest/v4\0";
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct AddressDimensions {
@@ -154,6 +156,12 @@ pub(crate) fn validate_documents(
         && manifest.address_schema_version == ADDRESS_SCHEMA_VERSION
         && manifest.world_schema_version == expected_world_schema
         && manifest.event_schema_version == expected_event_schema
+        && manifest.projection_schema_version == PROJECTION_SCHEMA_VERSION
+        && manifest.interest_schema_version == INTEREST_SCHEMA_VERSION
+        && manifest.operation_fingerprint_schema_version == INTENT_FINGERPRINT_SCHEMA_VERSION
+        && manifest.cell_key_schema_version == CELL_KEY_SCHEMA_VERSION
+        && manifest.cell_directory_schema_version == CELL_DIRECTORY_SCHEMA_VERSION
+        && manifest.transfer_package_schema_version == TRANSFER_PACKAGE_SCHEMA_VERSION
         && manifest.lifecycle_control_schema_version == LIFECYCLE_CONTROL_SCHEMA_VERSION
         && manifest.production_schedule_occurrence_schema_version
             == PRODUCTION_SCHEDULE_OCCURRENCE_SCHEMA_VERSION
@@ -787,6 +795,12 @@ struct ManifestHashMaterial<'a> {
     content_hash: &'a str,
     world_schema_version: u32,
     event_schema_version: u32,
+    projection_schema_version: u32,
+    interest_schema_version: u32,
+    operation_fingerprint_schema_version: u32,
+    cell_key_schema_version: u32,
+    cell_directory_schema_version: u32,
+    transfer_package_schema_version: u32,
     lifecycle_control_schema_version: u32,
     production_schedule_occurrence_schema_version: u32,
     lifecycle_policy_hash: &'a str,
@@ -812,6 +826,12 @@ pub(crate) fn manifest_hash(manifest: &UniverseManifestSnapshot) -> Result<Strin
             content_hash: &manifest.content_hash,
             world_schema_version: manifest.world_schema_version,
             event_schema_version: manifest.event_schema_version,
+            projection_schema_version: manifest.projection_schema_version,
+            interest_schema_version: manifest.interest_schema_version,
+            operation_fingerprint_schema_version: manifest.operation_fingerprint_schema_version,
+            cell_key_schema_version: manifest.cell_key_schema_version,
+            cell_directory_schema_version: manifest.cell_directory_schema_version,
+            transfer_package_schema_version: manifest.transfer_package_schema_version,
             lifecycle_control_schema_version: manifest.lifecycle_control_schema_version,
             production_schedule_occurrence_schema_version: manifest
                 .production_schedule_occurrence_schema_version,
@@ -927,6 +947,12 @@ mod tests {
             content_hash: CONTENT_HASH.into(),
             world_schema_version: 11,
             event_schema_version: 12,
+            projection_schema_version: PROJECTION_SCHEMA_VERSION,
+            interest_schema_version: verse_protocol::INTEREST_SCHEMA_VERSION,
+            operation_fingerprint_schema_version: verse_protocol::INTENT_FINGERPRINT_SCHEMA_VERSION,
+            cell_key_schema_version: verse_protocol::CELL_KEY_SCHEMA_VERSION,
+            cell_directory_schema_version: verse_protocol::CELL_DIRECTORY_SCHEMA_VERSION,
+            transfer_package_schema_version: verse_protocol::TRANSFER_PACKAGE_SCHEMA_VERSION,
             lifecycle_control_schema_version: LIFECYCLE_CONTROL_SCHEMA_VERSION,
             production_schedule_occurrence_schema_version:
                 PRODUCTION_SCHEDULE_OCCURRENCE_SCHEMA_VERSION,
