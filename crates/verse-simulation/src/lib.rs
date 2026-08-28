@@ -12,6 +12,7 @@ mod model;
 mod persistence;
 mod projection;
 mod targeting;
+mod two_cell;
 
 pub use celestial::{
     CelestialError, cell_address_from_key, cell_id, cell_key_from_address, cell_origin_key,
@@ -49,3 +50,4 @@ pub use projection::{
     InterestEntityIdentity, InterestProjectionState, ProjectedInterestFrame, ProjectionError,
     ProjectionSource,
 };
+pub use two_cell::{CompletedPlayerHandoff, LocalTwoCellRuntime, TwoCellRuntimeError};
