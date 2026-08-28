@@ -70,6 +70,252 @@ pub struct AggregatePlacementRecord {
     pub active_transfer_id: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub struct BundledPlacementMember {
+    pub aggregate_id: String,
+    pub aggregate_kind: MobileAggregateKind,
+    pub prior_placement_generation: u64,
+    pub resulting_placement_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub struct BundledPlacementPlan {
+    pub root_aggregate_id: String,
+    pub source_cell_key: CellKeyV1,
+    pub source_cell_id: String,
+    pub destination_cell_key: CellKeyV1,
+    pub destination_cell_id: String,
+    pub members: Vec<BundledPlacementMember>,
+    pub member_root: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub enum BundledPlacementTransition {
+    Prepare,
+    Commit,
+    Import,
+    Abort,
+}
+
+#[derive(Serialize)]
+#[cfg_attr(not(test), allow(dead_code))]
+struct BundledPlacementRootMaterial<'a> {
+    root_aggregate_id: &'a str,
+    source_cell_key: &'a CellKeyV1,
+    source_cell_id: &'a str,
+    destination_cell_key: &'a CellKeyV1,
+    destination_cell_id: &'a str,
+    members: &'a [BundledPlacementMember],
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl BundledPlacementPlan {
+    pub fn new(
+        root_aggregate_id: impl Into<String>,
+        source_cell_key: CellKeyV1,
+        destination_cell_key: CellKeyV1,
+        members: Vec<BundledPlacementMember>,
+    ) -> Result<Self, CellDirectoryError> {
+        let root_aggregate_id = root_aggregate_id.into();
+        let source_cell_id = celestial::cell_id(&source_cell_key)
+            .map_err(|source| CellDirectoryError::InvalidDirectory(source.to_string()))?;
+        let destination_cell_id = celestial::cell_id(&destination_cell_key)
+            .map_err(|source| CellDirectoryError::InvalidDirectory(source.to_string()))?;
+        let mut plan = Self {
+            root_aggregate_id,
+            source_cell_key,
+            source_cell_id,
+            destination_cell_key,
+            destination_cell_id,
+            members,
+            member_root: String::new(),
+        };
+        plan.member_root = plan.calculate_member_root()?;
+        plan.validate()?;
+        Ok(plan)
+    }
+
+    pub fn calculate_member_root(&self) -> Result<String, CellDirectoryError> {
+        let material = BundledPlacementRootMaterial {
+            root_aggregate_id: &self.root_aggregate_id,
+            source_cell_key: &self.source_cell_key,
+            source_cell_id: &self.source_cell_id,
+            destination_cell_key: &self.destination_cell_key,
+            destination_cell_id: &self.destination_cell_id,
+            members: &self.members,
+        };
+        let bytes = serde_json::to_vec(&material).map_err(|source| {
+            CellDirectoryError::InvalidDirectory(format!(
+                "bundled placement root material cannot be encoded: {source}"
+            ))
+        })?;
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"the-verse/bundled-placement-members/v1\0");
+        hasher.update(&bytes);
+        Ok(hasher.finalize().to_hex().to_string())
+    }
+
+    pub fn validate(&self) -> Result<(), CellDirectoryError> {
+        validate_stable_id(&self.root_aggregate_id, "root aggregate")?;
+        celestial::validate_cell_key(&self.source_cell_key)
+            .map_err(|source| CellDirectoryError::InvalidDirectory(source.to_string()))?;
+        celestial::validate_cell_key(&self.destination_cell_key)
+            .map_err(|source| CellDirectoryError::InvalidDirectory(source.to_string()))?;
+        if self.source_cell_key == self.destination_cell_key
+            || self.source_cell_key.universe_id != self.destination_cell_key.universe_id
+            || celestial::cell_id(&self.source_cell_key)
+                .is_ok_and(|cell_id| cell_id != self.source_cell_id)
+            || celestial::cell_id(&self.destination_cell_key)
+                .is_ok_and(|cell_id| cell_id != self.destination_cell_id)
+            || self.members.is_empty()
+            || self.members.len() > 128
+            || self.member_root != self.calculate_member_root()?
+        {
+            return Err(CellDirectoryError::InvalidDirectory(
+                "bundled placement cells, members, or root are invalid".into(),
+            ));
+        }
+
+        let mut saw_root = false;
+        let mut prior_id: Option<&str> = None;
+        for member in &self.members {
+            validate_stable_id(&member.aggregate_id, "bundle member")?;
+            if prior_id.is_some_and(|prior| prior >= member.aggregate_id.as_str())
+                || member.prior_placement_generation == 0
+                || member.prior_placement_generation.checked_add(1)
+                    != Some(member.resulting_placement_generation)
+            {
+                return Err(CellDirectoryError::InvalidDirectory(
+                    "bundled placement members must be unique, ordered, and advance once".into(),
+                ));
+            }
+            if member.aggregate_id == self.root_aggregate_id {
+                if member.aggregate_kind != MobileAggregateKind::Grid || saw_root {
+                    return Err(CellDirectoryError::InvalidDirectory(
+                        "bundled placement root must identify exactly one grid".into(),
+                    ));
+                }
+                saw_root = true;
+            } else if member.aggregate_kind != MobileAggregateKind::Player {
+                return Err(CellDirectoryError::InvalidDirectory(
+                    "the bounded grid bundle permits only player rider members".into(),
+                ));
+            }
+            prior_id = Some(&member.aggregate_id);
+        }
+        if !saw_root {
+            return Err(CellDirectoryError::InvalidDirectory(
+                "bundled placement members omit the grid root".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Pure phase staging for directory-v3 integration. This is not a standalone
+/// authority API: callers must supply the member root from the durable transfer
+/// record and install the resulting member changes with that record in one
+/// current-document commit.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn stage_bundled_placement_transition(
+    placements: &BTreeMap<String, AggregatePlacementRecord>,
+    plan: &BundledPlacementPlan,
+    transfer_id: &str,
+    durable_member_root: &str,
+    transition: BundledPlacementTransition,
+) -> Result<BTreeMap<String, AggregatePlacementRecord>, CellDirectoryError> {
+    plan.validate()?;
+    validate_stable_id(transfer_id, "transfer")?;
+    validate_hash(durable_member_root, "bundled placement member root")?;
+    if durable_member_root != plan.member_root {
+        return Err(CellDirectoryError::TransferConflict {
+            transfer_id: transfer_id.to_owned(),
+            reason: "placement plan does not match the durable member root".into(),
+        });
+    }
+    if placements.iter().any(|(aggregate_id, placement)| {
+        placement.active_transfer_id.as_deref() == Some(transfer_id)
+            && !plan
+                .members
+                .iter()
+                .any(|member| member.aggregate_id == *aggregate_id)
+    }) {
+        return Err(CellDirectoryError::TransferConflict {
+            transfer_id: transfer_id.to_owned(),
+            reason: "transfer ID is active on a nonmember placement".into(),
+        });
+    }
+
+    for member in &plan.members {
+        let placement = placements
+            .get(&member.aggregate_id)
+            .ok_or_else(|| CellDirectoryError::UnknownAggregate(member.aggregate_id.clone()))?;
+        let common_valid = placement.aggregate_id == member.aggregate_id
+            && placement.aggregate_kind == member.aggregate_kind;
+        let phase_valid = match transition {
+            BundledPlacementTransition::Prepare => {
+                placement.cell_key == plan.source_cell_key
+                    && placement.cell_id == plan.source_cell_id
+                    && placement.placement_generation == member.prior_placement_generation
+                    && placement.state == AggregatePlacementState::Resident
+                    && placement.active_transfer_id.is_none()
+            }
+            BundledPlacementTransition::Commit | BundledPlacementTransition::Abort => {
+                placement.cell_key == plan.source_cell_key
+                    && placement.cell_id == plan.source_cell_id
+                    && placement.placement_generation == member.prior_placement_generation
+                    && placement.state == AggregatePlacementState::Preparing
+                    && placement.active_transfer_id.as_deref() == Some(transfer_id)
+            }
+            BundledPlacementTransition::Import => {
+                placement.cell_key == plan.destination_cell_key
+                    && placement.cell_id == plan.destination_cell_id
+                    && placement.placement_generation == member.resulting_placement_generation
+                    && placement.state == AggregatePlacementState::InTransit
+                    && placement.active_transfer_id.as_deref() == Some(transfer_id)
+            }
+        };
+        if !common_valid || !phase_valid {
+            return Err(CellDirectoryError::TransferConflict {
+                transfer_id: transfer_id.to_owned(),
+                reason: format!(
+                    "bundle member {} is stale or in the wrong placement phase",
+                    member.aggregate_id
+                ),
+            });
+        }
+    }
+
+    let mut staged = placements.clone();
+    for member in &plan.members {
+        let placement = staged
+            .get_mut(&member.aggregate_id)
+            .expect("validated bundle member exists in cloned placements");
+        match transition {
+            BundledPlacementTransition::Prepare => {
+                placement.state = AggregatePlacementState::Preparing;
+                placement.active_transfer_id = Some(transfer_id.to_owned());
+            }
+            BundledPlacementTransition::Commit => {
+                placement.cell_key.clone_from(&plan.destination_cell_key);
+                placement.cell_id.clone_from(&plan.destination_cell_id);
+                placement.placement_generation = member.resulting_placement_generation;
+                placement.state = AggregatePlacementState::InTransit;
+            }
+            BundledPlacementTransition::Import | BundledPlacementTransition::Abort => {
+                placement.state = AggregatePlacementState::Resident;
+                placement.active_transfer_id = None;
+            }
+        }
+    }
+    Ok(staged)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TransferPhase {
@@ -1707,6 +1953,402 @@ mod tests {
     fn manifest(seed: u64) -> UniverseManifestSnapshot {
         universe_manifest(seed, WORLD_SCHEMA_VERSION, EVENT_SCHEMA_VERSION)
             .expect("test manifest builds")
+    }
+
+    fn bundled_placement(
+        aggregate_id: &str,
+        aggregate_kind: MobileAggregateKind,
+        cell_key: &CellKeyV1,
+    ) -> AggregatePlacementRecord {
+        AggregatePlacementRecord {
+            aggregate_id: aggregate_id.into(),
+            aggregate_kind,
+            cell_key: cell_key.clone(),
+            cell_id: celestial::cell_id(cell_key).expect("test cell ID derives"),
+            placement_generation: 1,
+            state: AggregatePlacementState::Resident,
+            active_transfer_id: None,
+        }
+    }
+
+    fn bundled_plan() -> BundledPlacementPlan {
+        let [source, destination] = proof_cell_keys().expect("proof cells derive");
+        BundledPlacementPlan::new(
+            "grid-transfer-proof",
+            source,
+            destination,
+            vec![
+                BundledPlacementMember {
+                    aggregate_id: "grid-transfer-proof".into(),
+                    aggregate_kind: MobileAggregateKind::Grid,
+                    prior_placement_generation: 1,
+                    resulting_placement_generation: 2,
+                },
+                BundledPlacementMember {
+                    aggregate_id: "player-transfer-owner".into(),
+                    aggregate_kind: MobileAggregateKind::Player,
+                    prior_placement_generation: 1,
+                    resulting_placement_generation: 2,
+                },
+                BundledPlacementMember {
+                    aggregate_id: "player-transfer-rider".into(),
+                    aggregate_kind: MobileAggregateKind::Player,
+                    prior_placement_generation: 1,
+                    resulting_placement_generation: 2,
+                },
+            ],
+        )
+        .expect("bundled placement plan is canonical")
+    }
+
+    #[test]
+    fn bundled_placement_member_root_has_a_stable_golden_vector() {
+        assert_eq!(
+            bundled_plan().member_root,
+            "2f5eb27786bc9230e48f5b1b946f985270a14066132a7ebfda0f6a0aeb7f3eb9"
+        );
+    }
+
+    #[test]
+    fn bundled_grid_and_rider_placements_advance_atomically() {
+        let plan = bundled_plan();
+        let unrelated_id = "player-unrelated";
+        let mut placements = BTreeMap::from([
+            (
+                plan.root_aggregate_id.clone(),
+                bundled_placement(
+                    &plan.root_aggregate_id,
+                    MobileAggregateKind::Grid,
+                    &plan.source_cell_key,
+                ),
+            ),
+            (
+                plan.members[1].aggregate_id.clone(),
+                bundled_placement(
+                    &plan.members[1].aggregate_id,
+                    MobileAggregateKind::Player,
+                    &plan.source_cell_key,
+                ),
+            ),
+            (
+                plan.members[2].aggregate_id.clone(),
+                bundled_placement(
+                    &plan.members[2].aggregate_id,
+                    MobileAggregateKind::Player,
+                    &plan.source_cell_key,
+                ),
+            ),
+            (
+                unrelated_id.into(),
+                bundled_placement(
+                    unrelated_id,
+                    MobileAggregateKind::Player,
+                    &plan.source_cell_key,
+                ),
+            ),
+        ]);
+        let unrelated = placements[unrelated_id].clone();
+
+        for transition in [
+            BundledPlacementTransition::Prepare,
+            BundledPlacementTransition::Commit,
+            BundledPlacementTransition::Import,
+        ] {
+            let advanced = stage_bundled_placement_transition(
+                &placements,
+                &plan,
+                "grid-bundle-transfer-1",
+                &plan.member_root,
+                transition,
+            )
+            .expect("whole bundle advances");
+            placements = advanced;
+        }
+
+        for member in &plan.members {
+            let placement = &placements[&member.aggregate_id];
+            assert_eq!(placement.cell_key, plan.destination_cell_key);
+            assert_eq!(placement.cell_id, plan.destination_cell_id);
+            assert_eq!(
+                placement.placement_generation,
+                member.resulting_placement_generation
+            );
+            assert_eq!(placement.state, AggregatePlacementState::Resident);
+            assert_eq!(placement.active_transfer_id, None);
+        }
+        assert_eq!(placements[unrelated_id], unrelated);
+    }
+
+    #[test]
+    fn bundled_placement_conflict_changes_no_member() {
+        let plan = bundled_plan();
+        let mut placements = plan
+            .members
+            .iter()
+            .map(|member| {
+                (
+                    member.aggregate_id.clone(),
+                    bundled_placement(
+                        &member.aggregate_id,
+                        member.aggregate_kind,
+                        &plan.source_cell_key,
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        placements
+            .get_mut("player-transfer-rider")
+            .expect("rider placement exists")
+            .placement_generation = 2;
+        let prior = placements.clone();
+
+        assert!(matches!(
+            stage_bundled_placement_transition(
+                &placements,
+                &plan,
+                "grid-bundle-transfer-2",
+                &plan.member_root,
+                BundledPlacementTransition::Prepare,
+            ),
+            Err(CellDirectoryError::TransferConflict { .. })
+        ));
+        assert_eq!(placements, prior);
+    }
+
+    #[test]
+    fn bundled_placement_rejects_a_partially_advanced_member_set() {
+        let plan = bundled_plan();
+        let placements = plan
+            .members
+            .iter()
+            .map(|member| {
+                (
+                    member.aggregate_id.clone(),
+                    bundled_placement(
+                        &member.aggregate_id,
+                        member.aggregate_kind,
+                        &plan.source_cell_key,
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut partial = placements.clone();
+        let grid = partial
+            .get_mut(&plan.root_aggregate_id)
+            .expect("grid placement exists");
+        grid.state = AggregatePlacementState::Preparing;
+        grid.active_transfer_id = Some("grid-bundle-transfer-partial".into());
+
+        assert!(matches!(
+            stage_bundled_placement_transition(
+                &partial,
+                &plan,
+                "grid-bundle-transfer-partial",
+                &plan.member_root,
+                BundledPlacementTransition::Prepare,
+            ),
+            Err(CellDirectoryError::TransferConflict { .. })
+        ));
+        assert_eq!(
+            placements[&plan.root_aggregate_id].state,
+            AggregatePlacementState::Resident
+        );
+
+        let mut aliased = placements;
+        let mut unrelated = bundled_placement(
+            "player-unrelated",
+            MobileAggregateKind::Player,
+            &plan.source_cell_key,
+        );
+        unrelated.active_transfer_id = Some("grid-bundle-transfer-partial".into());
+        unrelated.state = AggregatePlacementState::Preparing;
+        aliased.insert(unrelated.aggregate_id.clone(), unrelated);
+        assert!(
+            stage_bundled_placement_transition(
+                &aliased,
+                &plan,
+                "grid-bundle-transfer-partial",
+                &plan.member_root,
+                BundledPlacementTransition::Prepare,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn bundled_placement_abort_restores_every_source_member() {
+        let plan = bundled_plan();
+        let placements = plan
+            .members
+            .iter()
+            .map(|member| {
+                (
+                    member.aggregate_id.clone(),
+                    bundled_placement(
+                        &member.aggregate_id,
+                        member.aggregate_kind,
+                        &plan.source_cell_key,
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let prepared = stage_bundled_placement_transition(
+            &placements,
+            &plan,
+            "grid-bundle-transfer-3",
+            &plan.member_root,
+            BundledPlacementTransition::Prepare,
+        )
+        .expect("bundle prepares");
+        let aborted = stage_bundled_placement_transition(
+            &prepared,
+            &plan,
+            "grid-bundle-transfer-3",
+            &plan.member_root,
+            BundledPlacementTransition::Abort,
+        )
+        .expect("bundle aborts");
+        assert_eq!(aborted, placements);
+    }
+
+    #[test]
+    fn bundled_placement_rejects_wrong_transfer_id_and_plan_substitution() {
+        let plan = bundled_plan();
+        let placements = plan
+            .members
+            .iter()
+            .map(|member| {
+                (
+                    member.aggregate_id.clone(),
+                    bundled_placement(
+                        &member.aggregate_id,
+                        member.aggregate_kind,
+                        &plan.source_cell_key,
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert!(
+            stage_bundled_placement_transition(
+                &placements,
+                &plan,
+                "grid-bundle-never-started",
+                &plan.member_root,
+                BundledPlacementTransition::Abort,
+            )
+            .is_err()
+        );
+
+        let prepared = stage_bundled_placement_transition(
+            &placements,
+            &plan,
+            "grid-bundle-transfer-bound",
+            &plan.member_root,
+            BundledPlacementTransition::Prepare,
+        )
+        .expect("bundle prepares");
+        assert!(
+            stage_bundled_placement_transition(
+                &prepared,
+                &plan,
+                "grid-bundle-wrong-id",
+                &plan.member_root,
+                BundledPlacementTransition::Commit,
+            )
+            .is_err()
+        );
+
+        let alternate_destination = celestial::neighbor_cell_key(&plan.source_cell_key, [-1, 0, 0])
+            .expect("alternate neighbor derives");
+        let substituted = BundledPlacementPlan::new(
+            plan.root_aggregate_id.clone(),
+            plan.source_cell_key.clone(),
+            alternate_destination,
+            plan.members.clone(),
+        )
+        .expect("alternate plan is syntactically canonical");
+        assert_ne!(substituted.member_root, plan.member_root);
+        assert!(
+            stage_bundled_placement_transition(
+                &prepared,
+                &substituted,
+                "grid-bundle-transfer-bound",
+                &plan.member_root,
+                BundledPlacementTransition::Commit,
+            )
+            .is_err()
+        );
+
+        let committed = stage_bundled_placement_transition(
+            &prepared,
+            &plan,
+            "grid-bundle-transfer-bound",
+            &plan.member_root,
+            BundledPlacementTransition::Commit,
+        )
+        .expect("bundle commits");
+        assert!(
+            stage_bundled_placement_transition(
+                &committed,
+                &plan,
+                "grid-bundle-wrong-id",
+                &plan.member_root,
+                BundledPlacementTransition::Import,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn bundled_placement_plan_rejects_missing_root_and_alias_order() {
+        let [source, destination] = proof_cell_keys().expect("proof cells derive");
+        let rider = BundledPlacementMember {
+            aggregate_id: "player-transfer-rider".into(),
+            aggregate_kind: MobileAggregateKind::Player,
+            prior_placement_generation: 1,
+            resulting_placement_generation: 2,
+        };
+        assert!(
+            BundledPlacementPlan::new(
+                "grid-transfer-proof",
+                source.clone(),
+                destination.clone(),
+                vec![rider.clone()],
+            )
+            .is_err()
+        );
+        let grid = BundledPlacementMember {
+            aggregate_id: "grid-transfer-proof".into(),
+            aggregate_kind: MobileAggregateKind::Grid,
+            prior_placement_generation: 1,
+            resulting_placement_generation: 2,
+        };
+        assert!(
+            BundledPlacementPlan::new(
+                "grid-transfer-proof",
+                source.clone(),
+                destination.clone(),
+                vec![rider, grid.clone()],
+            )
+            .is_err()
+        );
+
+        let mut other_universe = destination.clone();
+        other_universe.universe_id = "other-universe".into();
+        assert!(
+            BundledPlacementPlan::new(
+                "grid-transfer-proof",
+                source.clone(),
+                other_universe,
+                vec![grid.clone()],
+            )
+            .is_err()
+        );
+        let mut tampered =
+            BundledPlacementPlan::new("grid-transfer-proof", source, destination, vec![grid])
+                .expect("root-only grid plan is valid");
+        tampered.member_root = "0".repeat(64);
+        assert!(tampered.validate().is_err());
     }
 
     fn import_proof(transfer: &CellTransferRecord, receipt_hash: &str) -> CellTransferImportProof {
