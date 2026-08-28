@@ -12,9 +12,26 @@ These documents form the initial specification baseline.
 - [Feature catalog](product/feature-catalog.md)
 - [Visual direction](product/visual-direction.md)
 
+## Gameplay
+
+- [P0.2 Salvage Frontier](gameplay/salvage-frontier.md)
+- [P0.3 visual engineering checkpoint](gameplay/engineering-realism.md)
+- [P0.4 Engineering Hands](gameplay/engineering-hands.md)
+- [P0.5 Planetary Logistics](gameplay/planetary-logistics.md)
+- [P0.6 Orbital Operations](gameplay/orbital-operations.md)
+- [P0.7 Server-Authoritative Contact Physics](gameplay/contact-physics.md)
+- [P0.8 Survival Death Foundation](gameplay/survival-death.md)
+- [P0.9 Authoritative EVA Physics](gameplay/authoritative-character-motion.md)
+- [P0.10 Authoritative Grounded and Magnetic Locomotion](gameplay/authoritative-grounded-locomotion.md)
+
+## Research
+
+- [Space-engineering reference study](research/space-engineering-reference.md)
+
 ## Architecture
 
 - [System overview](architecture/system-overview.md)
+- [Current P0 implementation guide](architecture/p0-implementation.md)
 - [Universe simulation](architecture/universe-simulation.md)
 - [Data and events](architecture/data-and-events.md)
 - [Clients and public APIs](architecture/clients-and-apis.md)
@@ -39,6 +56,10 @@ These documents form the initial specification baseline.
 - [Roadmap](roadmap/roadmap.md)
 - [Core protocol invariants](specifications/core-invariants.md)
 - [P0 simulation proof](specifications/P0-simulation-proof.md)
+- [P0.1 Apple Silicon benchmark](benchmarks/P0.1-apple-silicon.md)
+- [P0.7 Apple Silicon contact-physics benchmark](benchmarks/P0.7-contact-physics-apple-silicon.md)
+- [P0.10 Apple Silicon grounded-locomotion benchmark](benchmarks/P0.10-grounded-locomotion-apple-silicon.md)
+- [P0.10 hosted Linux grounded-locomotion benchmark](benchmarks/P0.10-grounded-locomotion-linux.md)
 - [Architecture decision records](decisions/README.md)
 - [Open questions](open-questions.md)
 

@@ -2,7 +2,66 @@
 
 The Verse is an open-source persistent voxel space universe, work-and-economy simulator, and Web3 marketplace.
 
-The project is currently in its **specification-first phase**. The repository is defining its product requirements, architecture, economic invariants, governance boundaries, security model, and delivery sequence before gameplay implementation begins.
+The repository now contains the **cross-platform verified P0.10 simulation proof**, including authoritative grounded locomotion, EVA, orbital operations, contact physics, survival death, mining, production, construction, and exact recovery. It is still a single-player proof—not yet the public multiplayer universe or real-value economy—but the irreducible gameplay loop now shares one authoritative world on packaged macOS and Linux clients.
+
+## Play it on macOS
+
+Requirements: Apple Silicon or Intel macOS, Rust, Node.js, `curl`, and `jq`.
+
+```bash
+tools/dev/bootstrap-macos.sh
+tools/dev/run-local.sh
+```
+
+The bootstrap downloads the pinned Godot 4.7.2 editor from the official release and verifies its checksum. The launcher starts the authoritative server and native client. While the server is running, the browser command center is available at <http://127.0.0.1:7777>.
+
+To create the portable Apple Silicon development package used by release testing:
+
+```bash
+tools/release/install-godot-export-templates.sh
+tools/release/package-native.sh
+```
+
+The generated archive under `artifacts/release` contains the native app, authoritative server, one-click launcher, license notices, exact version record, and checksums. It is an unsigned development build; public signing, notarization, and an automatic updater remain later release work.
+
+You begin in the Khepri Prime orbital sector beside a powered 25-block salvage skiff and an independent mineable asteroid. The planet surface is more than three kilometers away; the starting field is vacuum with weak distant gravity, not a planetary outcrop. The authoritative server consumes sequenced movement controls and owns the character's pose, gravity, collision, and landing contact. The guided contract asks you to extract three voxels, refine ore, fabricate a component, extend the rig, and anchor it into the asteroid. Actions earn persistent career experience and clearance levels.
+
+Native controls are shown in the client:
+
+| Action | Control |
+| --- | --- |
+| Walk or EVA thrust | `WASD` |
+| Jump / EVA ascend / EVA descend | `Space` / `Space` / `C` |
+| EVA roll left / right | `Q` / `E` |
+| Sprint or boost / toggle dampeners | `Shift` / `Z` |
+| Toggle helmet work light | `L` |
+| Toggle jetpack / helmet seal | `J` / `H` |
+| Arm or release magnetic boots | `K` |
+| Open engineering inventory terminal | `I` |
+| Mine highlighted voxel | Hold left mouse |
+| Enter construction / choose block | `B` / `1`–`5` |
+| Rotate construction hologram | `[` / `]` |
+| Weld construction hologram | Hold left mouse |
+| Cut and salvage a block | Hold right mouse |
+| Refine / fabricate / transfer cargo | `R` / `T` / `V` (`Shift+V` reverses transfer) |
+| Anchor / move / stop targeted grid | `F` / `M` / `X` |
+| Request recovery when incapacitated | `Enter` |
+
+To run only the Linux-compatible headless server:
+
+```bash
+tools/dev/run-server.sh
+```
+
+The same packaging command runs on x86_64 Ubuntu and produces a portable Linux archive. Hosted automation builds and smoke-tests both development packages. Signed public downloads remain scheduled work.
+
+## Verify the build
+
+```bash
+tools/ci/check.sh
+```
+
+This runs the Rust tests and lints, browser syntax checks, Godot validation, native motion-impairment coverage, and an input-only end-to-end scenario that restarts the server and proves exact state recovery. See the [Grounded and magnetic locomotion checkpoint](docs/gameplay/authoritative-grounded-locomotion.md), [Authoritative EVA checkpoint](docs/gameplay/authoritative-character-motion.md), [Survival Death checkpoint](docs/gameplay/survival-death.md), [Contact Physics checkpoint](docs/gameplay/contact-physics.md), and [P0 implementation guide](docs/architecture/p0-implementation.md) for scope and limitations.
 
 ## Product pillars
 
@@ -29,7 +88,7 @@ Start with [the documentation map](docs/README.md), then read:
 
 ## Current status
 
-No gameplay implementation has been selected as production-ready. The first engineering milestone is a macOS client and Ubuntu server proof that validates voxel editing, movable grids, authoritative physics, persistence, and inventory conservation.
+P0.10 retains durable input-only controls and one atomic Jolt-backed character/grid physics step, while protocol 10 adds jump and magnetic preference without accepting a client transform. A 1.8 m dynamic capsule owns radial upright alignment, tangent walk/sprint, buffered jump, 50° slope entry with 2° exit hysteresis, bounded 45 cm steps, 18 cm ground snap, magnetic attachment to completed grid blocks, and moving-support velocity inheritance. The native client predicts these modes, presents `EVA`, `FREEFALL`, `GROUND`, and `MAG-LOCK`, and retains the oxygen, death-drop, and recovery loop. Local and hosted Rust, Godot, protocol, impairment, exact-recovery, package, container, and serialized performance gates are green in [run 33077252402](https://github.com/Bittrees-Technology/the-verse/actions/runs/33077252402). Multiplayer, drop recovery/expiry, global streaming, safe zones, accounts, AMMs, and blockchain settlement remain sequenced in the [delivery roadmap](docs/roadmap/roadmap.md).
 
 ## Licensing
 

@@ -1,0 +1,16 @@
+[package]
+name = "verse-protocol"
+description = "Versioned public wire types for The Verse P0 simulation"
+license = "Apache-2.0"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true
