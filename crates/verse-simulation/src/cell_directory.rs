@@ -15,7 +15,7 @@ use verse_protocol::{CellKeyV1, UniverseManifestSnapshot};
 
 use crate::celestial;
 
-pub const CELL_DIRECTORY_SCHEMA_VERSION: u32 = 1;
+pub const CELL_DIRECTORY_SCHEMA_VERSION: u32 = verse_protocol::CELL_DIRECTORY_SCHEMA_VERSION;
 
 const DIRECTORY_FILE: &str = "cell-directory.json";
 const DIRECTORY_LOCK_FILE: &str = "cell-directory.lock";

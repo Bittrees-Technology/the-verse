@@ -1005,7 +1005,7 @@ fn validate_entity_vector(
         if entity.component_schema_version != PROJECTION_SCHEMA_VERSION {
             return Err(VerifyError::new(
                 ErrorCode::InvalidEntity,
-                "entity component schema version is not 3",
+                "entity component schema version does not match the projection schema",
             ));
         }
         match (&entity.kind, &entity.payload) {
@@ -1984,6 +1984,12 @@ mod tests {
             content_hash: CONTENT_HASH.into(),
             world_schema_version: WORLD_SCHEMA,
             event_schema_version: EVENT_SCHEMA,
+            projection_schema_version: PROJECTION_SCHEMA_VERSION,
+            interest_schema_version: INTEREST_SCHEMA_VERSION,
+            operation_fingerprint_schema_version: verse_protocol::INTENT_FINGERPRINT_SCHEMA_VERSION,
+            cell_key_schema_version: verse_protocol::CELL_KEY_SCHEMA_VERSION,
+            cell_directory_schema_version: verse_protocol::CELL_DIRECTORY_SCHEMA_VERSION,
+            transfer_package_schema_version: verse_protocol::TRANSFER_PACKAGE_SCHEMA_VERSION,
             lifecycle_control_schema_version: verse_protocol::LIFECYCLE_CONTROL_SCHEMA_VERSION,
             production_schedule_occurrence_schema_version:
                 verse_protocol::PRODUCTION_SCHEDULE_OCCURRENCE_SCHEMA_VERSION,
@@ -2820,7 +2826,7 @@ mod tests {
             Some(concat!(
                 "{\"type\":\"acknowledge_interest\",\"session_epoch\":\"session-1\",",
                 "\"interest_epoch\":41,\"baseline_id\":\"baseline-1\",\"delta_sequence\":0,",
-                "\"view_hash\":\"8e576c2b228cffc05b97e8baeff3f30a577469cc5c3b3cc12210c5c078c163ec\"}"
+                "\"view_hash\":\"5e73febfbce403ff0da41746233e02d27aaf0bdb7b0b9a1a6196aedd6995204d\"}"
             ))
         );
 
@@ -3108,7 +3114,7 @@ mod tests {
     fn empty_spectator_view_hash_is_frozen() {
         assert_eq!(
             view_state(0).view_hash,
-            "8e576c2b228cffc05b97e8baeff3f30a577469cc5c3b3cc12210c5c078c163ec"
+            "5e73febfbce403ff0da41746233e02d27aaf0bdb7b0b9a1a6196aedd6995204d"
         );
     }
 }

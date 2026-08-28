@@ -1877,8 +1877,11 @@ mod tests {
         let expected = celestial::universe_manifest(13, WORLD_SCHEMA_VERSION, EVENT_SCHEMA_VERSION)
             .expect("runtime universe manifest is valid");
         assert_eq!(stored, expected);
-        assert_eq!(stored.schema_version, 3);
-        assert_eq!(stored.event_schema_version, 15);
+        assert_eq!(
+            stored.schema_version,
+            verse_protocol::UNIVERSE_MANIFEST_SCHEMA_VERSION
+        );
+        assert_eq!(stored.event_schema_version, EVENT_SCHEMA_VERSION);
     }
 
     #[test]
