@@ -188,6 +188,10 @@ cell-directory schema `2`, and transfer/package schema `1`. Directory schema
 both abort-cleanup event/world proofs mandatory before their placement phases
 can advance, and retains immutable assignment-generation-to-fence history.
 
+This tuple is the implemented independent-EVA checkpoint. ADR-0024 introduces
+the next fail-closed compatibility boundary for the promised ordinary-grid
+closure rather than changing player-only package-v1 artifacts in place.
+
 The first proof archives and resets P1.6 data. A later migration must derive
 cell keys, install aggregate placement generations, preserve retry conflict
 semantics, introduce universe-unique IDs, and prove cross-cell conservation and

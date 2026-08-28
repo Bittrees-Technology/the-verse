@@ -27,5 +27,6 @@ ADRs capture durable choices and their consequences.
 | [0021](ADR-0021-independent-interest-view-verification.md) | Independent interest-view verification before client apply | Accepted |
 | [0022](ADR-0022-durable-single-cell-lifecycle.md) | Fenced durable single-cell lifecycle and background production | Accepted |
 | [0023](ADR-0023-durable-two-cell-handoff.md) | Durable two-cell assignment and atomic mobile-aggregate handoff | Accepted |
+| [0024](ADR-0024-versioned-grid-closure-handoff.md) | Versioned atomic grid-closure handoff | Accepted |
 
 Status values: Proposed, Accepted, Superseded, Rejected.

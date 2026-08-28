@@ -65,6 +65,7 @@ This register reconciles the planning conversations into explicit project decisi
 | D-057 | P1.5 combines a fixed canonical celestial registry with deterministic single-cell spatial interest | Accepted as a bounded correctness slice; dynamic cells, handoff, frontier materialization, and production scale remain later | WORLD-009, SIM-013/014, F-014/059 |
 | D-058 | P1.6 proves a fenced durable lifecycle and production-only background execution for one fixed cell | Accepted as the next bounded dependency; it must reuse one atomic canonical production quantum and does not complete multi-cell scheduling or handoff | SIM-006/015, F-023/060, ADR-0022 |
 | D-059 | P1.7 proves durable assignment and atomic mobile-aggregate handoff between two adjacent cells | Accepted as a bounded correctness slice: one directory compare-and-swap is the authority-transfer point; cell fencing and aggregate placement generations are both required; general cross-cell physics and megastructure partitioning remain later | WORLD-010, SIM-016/017/018, F-061, ADR-0023 |
+| D-060 | Ordinary-grid closure handoff gets a new compatibility tuple instead of redefining player-only transfer artifacts | Accepted: protocol 19 binds one fully contained unanchored grid, supported riders, cargo, queues, escrow, bundled placements, and universe-unique subject IDs; protocol-18 package v1 remains EVA-only | F-061, ADR-0024 |
 
 ## Amendment rule
 

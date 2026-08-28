@@ -482,9 +482,9 @@ or edit package contents.
 
 ## Compatibility and migration
 
-The coordinated P1.7 boundary is:
+The implemented independent-EVA checkpoint uses this indivisible boundary:
 
-| Boundary | P1.7 value |
+| Boundary | EVA checkpoint value |
 | --- | ---: |
 | Gameplay protocol | `18` |
 | Projection schema | `4` |
@@ -505,6 +505,31 @@ Universe manifest `4` binds cell-key, directory, transfer, placement, operation
 fingerprint, projection, and interest policy commitments. Partial combinations
 fail before directory claim, cell recovery, package validation, journal replay,
 session admission, or state projection.
+
+The ordinary-grid closure completes under the new boundary recorded by
+[ADR-0024](../decisions/ADR-0024-versioned-grid-closure-handoff.md):
+
+| Boundary | Grid-closure value |
+| --- | ---: |
+| Gameplay protocol | `19` |
+| Projection schema | `5` |
+| World schema | `21` |
+| Event schema | `17` |
+| Content schema | `11` |
+| Content manifest | `p1.5.0` |
+| Celestial registry schema | `1` |
+| Universe manifest schema | `5` |
+| Interest schema | `3` |
+| Operation fingerprint schema | `2` |
+| Lifecycle-control schema | `2` |
+| Production-occurrence schema | `1` |
+| Cell-directory schema | `3` |
+| Transfer/package schema | `2` |
+
+Protocol-18 package-v1 artifacts are EVA-only and are never reinterpreted as
+grid closures. Upgrade refuses nonterminal transfers; incompatible roots stay
+archive/read-only unless an explicit offline migration proves the complete
+tuple transition.
 
 The first P1.7 proof archives and resets P1.6 data. A later offline migration
 must derive canonical cell keys, install one placement generation for every
