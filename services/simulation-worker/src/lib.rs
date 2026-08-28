@@ -36,7 +36,7 @@ use verse_protocol::{
     SessionRole, UNIVERSE_MANIFEST_SCHEMA_VERSION, UniverseManifestSnapshot, WorldSnapshot,
 };
 use verse_simulation::{
-    AdvanceImpact, EVENT_SCHEMA_VERSION, IntentError, InterestEntityIdentity,
+    AdvanceImpact, CellLifecycleStatus, EVENT_SCHEMA_VERSION, IntentError, InterestEntityIdentity,
     InterestProjectionState, ProjectedInterestFrame, ProjectionError, ProjectionSource, Runtime,
     RuntimeError, WORLD_SCHEMA_VERSION, WorldState, registry_snapshot, universe_manifest,
 };
@@ -80,6 +80,7 @@ struct ReplicationFeed {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum WorkerAuthorityStatus {
     Active,
+    Draining(Arc<str>),
     Fenced(Arc<str>),
 }
 
@@ -277,6 +278,10 @@ impl AppState {
         self.runtime.lock().motion_snapshot()
     }
 
+    pub fn lifecycle_status(&self) -> CellLifecycleStatus {
+        self.runtime.lock().lifecycle_status()
+    }
+
     fn projected_snapshot(
         &self,
         actor_player_id: Option<&str>,
@@ -350,6 +355,32 @@ impl AppState {
 
     pub fn is_halted(&self) -> bool {
         self.runtime.lock().is_halted()
+    }
+
+    pub fn drain_to_background_or_sleeping(
+        &self,
+    ) -> Result<verse_simulation::LifecycleMode, RuntimeError> {
+        self.authority
+            .send_replace(WorkerAuthorityStatus::Draining(Arc::from(
+                "the authoritative cell is draining",
+            )));
+        let result = self.runtime.lock().drain_to_background_or_sleeping();
+        if let Err(source) = &result {
+            self.publish_fenced(source.to_string());
+        }
+        result
+    }
+
+    pub fn activation_step(&self) -> Result<bool, RuntimeError> {
+        let result = self.runtime.lock().activation_step();
+        match &result {
+            Ok(true) => {
+                self.authority.send_replace(WorkerAuthorityStatus::Active);
+            }
+            Err(source) => self.publish_fenced(source.to_string()),
+            Ok(false) => {}
+        }
+        result
     }
 
     pub fn advance(&self, delta_millis: u16) -> Result<bool, RuntimeError> {
@@ -428,10 +459,11 @@ impl AppState {
             .send_replace(WorkerAuthorityStatus::Fenced(Arc::from(reason)));
     }
 
-    fn fenced_reason(&self) -> Option<Arc<str>> {
+    fn unavailable_reason(&self) -> Option<(&'static str, Arc<str>)> {
         match &*self.authority.borrow() {
             WorkerAuthorityStatus::Active => None,
-            WorkerAuthorityStatus::Fenced(reason) => Some(Arc::clone(reason)),
+            WorkerAuthorityStatus::Draining(reason) => Some(("cell_draining", Arc::clone(reason))),
+            WorkerAuthorityStatus::Fenced(reason) => Some(("authority_fenced", Arc::clone(reason))),
         }
     }
 
@@ -686,6 +718,7 @@ struct StatusDocument {
     world_hash: String,
     conservation_valid: bool,
     authoritative_halted: bool,
+    lifecycle: CellLifecycleStatus,
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -801,7 +834,7 @@ async fn generated_browser_asset(file_name: &str, content_type: &'static str) ->
 }
 
 async fn health(State(state): State<Arc<AppState>>) -> StatusCode {
-    if state.is_halted() {
+    if state.is_halted() || state.unavailable_reason().is_some() {
         StatusCode::SERVICE_UNAVAILABLE
     } else {
         StatusCode::NO_CONTENT
@@ -818,6 +851,7 @@ fn no_store(mut response: Response) -> Response {
 
 async fn status(State(state): State<Arc<AppState>>) -> Response {
     let snapshot = state.snapshot();
+    let lifecycle = state.lifecycle_status();
     no_store(
         Json(StatusDocument {
             service: "verse-simulation-worker",
@@ -831,6 +865,7 @@ async fn status(State(state): State<Arc<AppState>>) -> Response {
             world_hash: snapshot.world_hash,
             conservation_valid: snapshot.conservation.valid,
             authoritative_halted: state.is_halted(),
+            lifecycle,
         })
         .into_response(),
     )
@@ -872,7 +907,7 @@ async fn websocket_upgrade(
     upgrade: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
 ) -> Response {
-    if state.fenced_reason().is_some() {
+    if state.unavailable_reason().is_some() {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             "authoritative cell is fenced and cannot admit sessions",
@@ -894,8 +929,8 @@ async fn websocket_upgrade(
 async fn websocket_session(socket: WebSocket, state: Arc<AppState>, _permit: OwnedSemaphorePermit) {
     let (mut sender, mut receiver) = socket.split();
     let mut authority = state.authority.subscribe();
-    if let Some(reason) = state.fenced_reason() {
-        send_fatal_and_close(&mut sender, "authority_fenced", reason.as_ref()).await;
+    if let Some((code, reason)) = state.unavailable_reason() {
+        send_fatal_and_close(&mut sender, code, reason.as_ref()).await;
         return;
     }
     let Some((client_name, binding)) = complete_handshake(&mut receiver, &mut sender, &state).await
@@ -903,8 +938,8 @@ async fn websocket_session(socket: WebSocket, state: Arc<AppState>, _permit: Own
         return;
     };
     info!(%client_name, role = ?binding, "client completed protocol handshake");
-    if let Some(reason) = state.fenced_reason() {
-        send_fatal_and_close(&mut sender, "authority_fenced", reason.as_ref()).await;
+    if let Some((code, reason)) = state.unavailable_reason() {
+        send_fatal_and_close(&mut sender, code, reason.as_ref()).await;
         if let Some(player_id) = binding.player_id() {
             state.release_player(player_id);
         }
@@ -982,11 +1017,19 @@ async fn websocket_session(socket: WebSocket, state: Arc<AppState>, _permit: Own
                 let reason = match changed {
                     Ok(()) => match &*authority.borrow_and_update() {
                         WorkerAuthorityStatus::Active => continue,
-                        WorkerAuthorityStatus::Fenced(reason) => Arc::clone(reason),
+                        WorkerAuthorityStatus::Draining(reason) => {
+                            ("cell_draining", Arc::clone(reason))
+                        }
+                        WorkerAuthorityStatus::Fenced(reason) => {
+                            ("authority_fenced", Arc::clone(reason))
+                        }
                     },
-                    Err(_) => Arc::from("authoritative lifecycle supervisor stopped"),
+                    Err(_) => (
+                        "authority_fenced",
+                        Arc::from("authoritative lifecycle supervisor stopped"),
+                    ),
                 };
-                send_fatal_and_close(&mut sender, "authority_fenced", reason.as_ref()).await;
+                send_fatal_and_close(&mut sender, reason.0, reason.1.as_ref()).await;
                 break;
             }
             client_message = receiver.next() => {
@@ -1398,6 +1441,15 @@ async fn handle_client_message(
                     .await;
                     false
                 }
+                Err(RuntimeError::LifecycleUnavailable { mode }) => {
+                    send_fatal_and_close(
+                        sender,
+                        "cell_not_active",
+                        format!("the cell is currently {mode:?}; reconnect after activation"),
+                    )
+                    .await;
+                    false
+                }
             }
         }
     }
@@ -1497,6 +1549,7 @@ pub fn internal_error(source: impl std::fmt::Display) -> impl IntoResponse {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
     use axum::body::{Body, to_bytes};
@@ -1508,7 +1561,7 @@ mod tests {
     use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
     use tower::ServiceExt;
     use verse_protocol::{BlockKind, ProductionRecipeKind, ResourceKind, Vec3};
-    use verse_simulation::Store;
+    use verse_simulation::{PersistenceError, Store, TrustedClock};
 
     use super::*;
 
@@ -1525,10 +1578,31 @@ mod tests {
         AppState::new(runtime)
     }
 
-    fn production_test_state() -> Arc<AppState> {
+    #[derive(Debug)]
+    struct ManualTrustedClock(AtomicU64);
+
+    impl ManualTrustedClock {
+        const fn new(now_unix_ms: u64) -> Self {
+            Self(AtomicU64::new(now_unix_ms))
+        }
+
+        fn set(&self, now_unix_ms: u64) {
+            self.0.store(now_unix_ms, Ordering::SeqCst);
+        }
+    }
+
+    impl TrustedClock for ManualTrustedClock {
+        fn now_unix_ms(&self) -> Result<u64, PersistenceError> {
+            Ok(self.0.load(Ordering::SeqCst))
+        }
+    }
+
+    fn production_test_state() -> (Arc<AppState>, Arc<ManualTrustedClock>) {
         let directory = tempdir().expect("tempdir").keep();
+        let clock = Arc::new(ManualTrustedClock::new(1_000_000));
         {
-            let mut store = Store::open(&directory, 199).expect("fixture store opens");
+            let mut store = Store::open_with_clock(&directory, 199, clock.clone())
+                .expect("fixture store opens");
             let mut world = store.load_world().expect("fixture world loads");
             let position = Vec3::new(900.0, -990.0, -3_800.0);
             let address = world
@@ -1549,7 +1623,12 @@ mod tests {
                 .save_snapshot(&world)
                 .expect("production fixture persists");
         }
-        AppState::new(Runtime::open(directory, 199, 20).expect("runtime"))
+        (
+            AppState::new(
+                Runtime::open_with_clock(directory, 199, 20, clock.clone()).expect("runtime"),
+            ),
+            clock,
+        )
     }
 
     type TestSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
@@ -1775,10 +1854,11 @@ mod tests {
 
     async fn complete_session(socket: &mut TestSocket, hello: &ClientMessage) -> serde_json::Value {
         send_client_message(socket, hello).await;
-        assert!(matches!(
-            receive_wire_message(socket).await,
-            ServerMessage::Welcome { .. }
-        ));
+        let welcome = receive_wire_message(socket).await;
+        assert!(
+            matches!(welcome, ServerMessage::Welcome { .. }),
+            "expected welcome, received {welcome:?}"
+        );
         assert!(matches!(
             receive_wire_message(socket).await,
             ServerMessage::Registry { .. }
@@ -2209,7 +2289,7 @@ mod tests {
 
     #[test]
     fn production_progress_publishes_structural_without_life_support_change() {
-        let state = production_test_state();
+        let (state, clock) = production_test_state();
         let before = state
             .projected_snapshot(Some("player-local"))
             .expect("private projection succeeds");
@@ -2236,10 +2316,12 @@ mod tests {
             Some(queued.event_sequence)
         );
 
-        for _ in 0..3 {
+        for quarter in 1..=3 {
+            clock.set(1_000_000 + quarter * 250);
             assert!(!state.advance(250).expect("partial production tick"));
             assert!(!observer.has_changed().expect("the feed remains open"));
         }
+        clock.set(1_001_000);
         assert!(state.advance(250).expect("production second advances"));
         assert!(observer.has_changed().expect("the feed remains open"));
         let feed = observer.borrow_and_update().clone();
@@ -2557,7 +2639,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn protocol16_orders_full_compatibility_registry_then_interest_baseline() {
+    async fn draining_closes_sessions_rejects_admission_and_releases_an_idle_cell() {
+        let (mut socket, state, server) = connect_test_socket().await;
+        let address = server_address(&socket);
+        complete_session(&mut socket, &local_player_hello("draining-session")).await;
+
+        assert_eq!(
+            state
+                .drain_to_background_or_sleeping()
+                .expect("idle cell drains"),
+            verse_simulation::LifecycleMode::Sleeping
+        );
+        assert!(matches!(
+            receive_wire_message(&mut socket).await,
+            ServerMessage::Fatal { ref code, .. } if code == "cell_draining"
+        ));
+        tokio::time::timeout(SERVER_WRITE_TIMEOUT + Duration::from_secs(1), async {
+            while state.session_admission.available_permits() != MAX_CONCURRENT_CONNECTIONS {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("drained server session releases its admission permit");
+        assert_eq!(
+            state.lifecycle_status().observed_mode,
+            verse_simulation::LifecycleMode::Sleeping
+        );
+
+        let error = connect_async(format!("ws://{address}/ws"))
+            .await
+            .expect_err("draining authority rejects a new websocket");
+        assert!(matches!(
+            error,
+            tokio_tungstenite::tungstenite::Error::Http(response)
+                if response.status() == StatusCode::SERVICE_UNAVAILABLE
+        ));
+        let _ = socket.close(None).await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn protocol17_orders_full_compatibility_registry_then_interest_baseline() {
         let (mut socket, state, server) = connect_test_socket().await;
         send_client_message(
             &mut socket,
@@ -3824,6 +3946,8 @@ mod tests {
     #[tokio::test]
     async fn death_drop_and_cargo_remain_private_across_sessions_and_reconnect() {
         let (mut local, state, server) = connect_test_socket().await;
+        let address = server_address(&local);
+        local.close(None).await.expect("setup socket closes");
         state
             .execute_as(
                 "player-local",
@@ -3844,6 +3968,10 @@ mod tests {
         let drop_inventory_id = canonical.death_drops[0].inventory_id.clone();
         let drop_id = canonical.death_drops[0].drop_id.clone();
 
+        let (reopened_local, _) = connect_async(format!("ws://{address}/ws"))
+            .await
+            .expect("local test websocket reconnects");
+        local = reopened_local;
         let mut remote = connect_additional(&local).await;
         let mut spectator = connect_additional(&local).await;
         let local_initial = complete_session(&mut local, &local_player_hello("drop-local")).await;

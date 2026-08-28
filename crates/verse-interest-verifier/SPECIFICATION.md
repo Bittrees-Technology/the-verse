@@ -2,7 +2,7 @@
 
 # The Verse interest-view hash and verifier specification, version 1
 
-This document is the normative portable contract for gameplay protocol 16,
+This document is the normative portable contract for gameplay protocol 17,
 projection schema 3, interest schema 1, and the `interest-view/v1` domain. It
 describes values, not one implementation. An encoding change requires a new
 domain separator and coordinated schema negotiation.
@@ -21,7 +21,7 @@ string escaping do not affect the digest. Strings are not Unicode-normalized.
 
 ## Registry and universe-manifest commitments
 
-The verifier independently validates the protocol-16 registry message before
+The verifier independently validates the protocol-17 registry message before
 establishing its immutable connection binding. Registry schema 1 is lowercase
 hexadecimal BLAKE3 over:
 
@@ -37,10 +37,10 @@ UTF8("the-verse/celestial-registry/v1\0") || canonical_integer_json(material)
 the protocol serializer. Schema 1 requires the registry license identifier
 `CC-BY-SA-4.0` exactly.
 
-Universe-manifest schema 2 is lowercase hexadecimal BLAKE3 over:
+Universe-manifest schema 3 is lowercase hexadecimal BLAKE3 over:
 
 ```text
-UTF8("the-verse/universe-manifest/v2\0") || canonical_integer_json(material)
+UTF8("the-verse/universe-manifest/v3\0") || canonical_integer_json(material)
 ```
 
 `material` contains exactly `schema_version`, `universe_id`, `world_seed`,
@@ -49,7 +49,9 @@ UTF8("the-verse/universe-manifest/v2\0") || canonical_integer_json(material)
 `frontier_policy_version`, `celestial_registry_schema_version`,
 `celestial_registry_hash`, `content_schema_version`,
 `content_manifest_version`, `content_hash`, `world_schema_version`, and
-`event_schema_version`. It does not contain `manifest_hash`.
+`event_schema_version`, `lifecycle_control_schema_version`,
+`production_schedule_occurrence_schema_version`, and
+`lifecycle_policy_hash`. It does not contain `manifest_hash`.
 
 `canonical_integer_json` uses the same compact UTF-8 object-key and string
 rules as the interest-view encoding below. All values in these two materials
@@ -215,7 +217,7 @@ One verifier follows:
 await_welcome -> await_registry -> await_baseline -> current
 ```
 
-The welcome must negotiate protocol 16, projection 3, interest 1, and the
+The welcome must negotiate protocol 17, projection 3, interest 1, and the
 compatible world/event/content/registry/manifest tuple. Its role must equal the
 role configured by the client. The registry and universe manifest must bind the
 same universe, schema tuple, content manifest, registry hash, and universe

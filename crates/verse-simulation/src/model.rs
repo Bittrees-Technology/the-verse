@@ -15,7 +15,7 @@ use verse_protocol::{
 
 use crate::{celestial, content};
 
-pub const WORLD_SCHEMA_VERSION: u32 = 18;
+pub const WORLD_SCHEMA_VERSION: u32 = 19;
 pub const PROCESSED_OPERATION_RETENTION_LIMIT: usize = 128;
 pub const PROCESSED_OPERATION_RETAINED_BYTES_LIMIT: usize = 131_072;
 pub const PROCESSED_OPERATION_RECORD_BYTES_LIMIT: usize = 4_096;

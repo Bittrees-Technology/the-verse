@@ -11,7 +11,7 @@ use crate::celestial;
 use crate::model::{Block, ContactPairKey, DeathDrop, InventoryRecord, ProductionJob};
 
 pub const EVENT_SCHEMA_NAME: &str = "verse.world_event";
-pub const EVENT_SCHEMA_VERSION: u32 = 14;
+pub const EVENT_SCHEMA_VERSION: u32 = 15;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event_type", rename_all = "snake_case", deny_unknown_fields)]
@@ -128,7 +128,8 @@ pub enum EventPayload {
     },
 }
 
-pub const PRODUCTION_SCHEDULE_OCCURRENCE_SCHEMA_VERSION: u32 = 1;
+pub const PRODUCTION_SCHEDULE_OCCURRENCE_SCHEMA_VERSION: u32 =
+    verse_protocol::PRODUCTION_SCHEDULE_OCCURRENCE_SCHEMA_VERSION;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -567,6 +568,11 @@ impl CanonicalEvent {
 
     pub fn hash_is_valid(&self) -> bool {
         self.event_hash == self.calculate_hash()
+    }
+
+    pub(crate) fn retime_and_rehash(&mut self, occurred_at_unix_ms: u64) {
+        self.occurred_at_unix_ms = occurred_at_unix_ms;
+        self.event_hash = self.calculate_hash();
     }
 }
 

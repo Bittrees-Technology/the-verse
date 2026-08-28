@@ -11,18 +11,21 @@ const PLANET_SHADER: Shader = preload("res://shaders/planet_surface.gdshader")
 const ATMOSPHERE_SHADER: Shader = preload("res://shaders/planet_atmosphere.gdshader")
 const CLOUD_SHADER: Shader = preload("res://shaders/planet_clouds.gdshader")
 const BLOCK_DAMAGE_SHADER: Shader = preload("res://shaders/block_damage.gdshader")
-const PROTOCOL_VERSION := 16
+const PROTOCOL_VERSION := 17
 const PROJECTION_SCHEMA_VERSION := 3
-const WORLD_SCHEMA_VERSION := 18
-const EVENT_SCHEMA_VERSION := 14
+const WORLD_SCHEMA_VERSION := 19
+const EVENT_SCHEMA_VERSION := 15
 const CONTENT_SCHEMA_VERSION := 11
 const CONTENT_MANIFEST_VERSION := "p1.5.0"
 const CELESTIAL_REGISTRY_SCHEMA_VERSION := 1
-const UNIVERSE_MANIFEST_SCHEMA_VERSION := 2
+const UNIVERSE_MANIFEST_SCHEMA_VERSION := 3
+const LIFECYCLE_CONTROL_SCHEMA_VERSION := 1
+const PRODUCTION_SCHEDULE_OCCURRENCE_SCHEMA_VERSION := 1
+const LIFECYCLE_POLICY_HASH := "5bc077cc8a2eb101fcaecdce5513c13aa243e1f68a5af839a602dd689859ff3a"
 const INTEREST_SCHEMA_VERSION := 1
 const EXPECTED_UNIVERSE_ID := "the-verse-local"
 const EXPECTED_CELESTIAL_REGISTRY_HASH := "4c367bbfa04218ece14104f0a3a7ec2c7e9fefcc37d4cf78a265df2d711a59da"
-const EXPECTED_UNIVERSE_MANIFEST_HASH := "08f96738abee769d2f9998a9666970ef6cd8474f3270977aec1a50672aad814e"
+const EXPECTED_UNIVERSE_MANIFEST_HASH := "c9bfd3baa1e64ab7665e60c4f989491e745e9af0d2512989f41625b57b546ace"
 const EXPECTED_CONTENT_HASH := "fc61c05b335fb951868010ecf2942a92ec4f03d00d0a75d3acba8c6f5162b6bd"
 const DEFAULT_SERVER := "ws://127.0.0.1:7777/ws"
 const DEFAULT_PLAYER_ID := "player-local"
@@ -2269,6 +2272,11 @@ func _install_registry(message: Dictionary) -> bool:
 		or String(manifest.get("content_manifest_version", "")) != CONTENT_MANIFEST_VERSION
 		or int(manifest.get("world_schema_version", -1)) != WORLD_SCHEMA_VERSION
 		or int(manifest.get("event_schema_version", -1)) != EVENT_SCHEMA_VERSION
+		or int(manifest.get("lifecycle_control_schema_version", -1))
+		!= LIFECYCLE_CONTROL_SCHEMA_VERSION
+		or int(manifest.get("production_schedule_occurrence_schema_version", -1))
+		!= PRODUCTION_SCHEDULE_OCCURRENCE_SCHEMA_VERSION
+		or String(manifest.get("lifecycle_policy_hash", "")) != LIFECYCLE_POLICY_HASH
 		or String(manifest.get("generation_rule_version", ""))
 		!= String(registry.get("generation_rule_version", ""))
 		or int(manifest.get("address_schema_version", -1)) != 1
