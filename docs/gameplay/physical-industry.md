@@ -3,7 +3,7 @@
 **Feature ID:** F-023
 
 **Status:** Implemented and locally/hosted verified for one active simulation
-cell; background-cell equivalence pending
+cell; P1.6 background-cell contract accepted and implementation pending
 
 **Owner:** Core simulation, worker, protocol, and native-client maintainers
 
@@ -63,8 +63,9 @@ expression.
   priority.
 - Physical terminal proximity, cockpit possession, radio or antenna range,
   delegated operators, company permissions, and hostile capture.
-- Sleeping-cell and offline production execution. The event contract supports
-  it, but dynamic cell scheduling must implement it later.
+- Sleeping-cell and offline production execution. P1.6 replaces the current
+  per-machine commit boundary with one occurrence-bound whole-cell event before
+  enabling this path.
 - Browser production management, market custody, contracts, and blockchain
   settlement.
 
@@ -173,8 +174,9 @@ Event schema `13` introduces versioned payloads equivalent to:
 
 - `ProductionQueued`: queue identity, pinned recipe/manifest, cargo endpoints,
   reserved inputs, required ticks, and initial state;
-- `ProductionAdvanced`: integer elapsed ticks plus the canonical ordered machine
-  and job outcomes for one scheduler quantum;
+- `ProductionAdvanced`: integer elapsed ticks and the outcome of one machine
+  queue head. The P1.4 runtime emits these in grid-ID/block-ID order but they
+  are separate journal commits;
 - `ProductionOutputDelivered`: job, destination, exact output, and terminal job
   state; and
 - deterministic block-damage handling that moves a destroyed machine's queue
@@ -184,6 +186,13 @@ Event schema `13` introduces versioned payloads equivalent to:
 No event trusts client-supplied yields, duration, progress, loss, connectivity,
 power state, or inventory delta. Live preparation and replay derive and validate
 the same result from the authoritative prior state.
+
+P1.6 event schema `15` replaces new production advances with one
+`ProductionQuantumCommitted` event for a stable durable occurrence. It contains
+the complete ordered vector of queue-head outcomes selected at the start of the
+quantum and applies atomically. A crash or lease loss cannot expose progress for
+only the first machine. Active, Background, and replay use the same planner;
+the detailed contract is [F-060](durable-single-cell-lifecycle.md).
 
 ## Permissions and trust boundaries
 
@@ -245,10 +254,12 @@ Only each machine's FIFO head may advance. A job never receives more than its
 remaining required ticks. Completion, loss, output escrow, and delivery occur at
 the deterministic boundary inside that event.
 
-An active cell accumulates authoritative fixed steps and emits this event. A
-future background cell may use a durable schedule to emit the identical event,
-but it must supply the same elapsed tick count and validate the same prior state.
-This slice does not yet claim offline progress.
+The implemented active P1.4 cell accumulates authoritative fixed steps and
+emits one event per machine. P1.6 moves cadence to a durable trusted-time
+occurrence and commits one whole-cell event. Each occurrence still advances
+exactly `fixed_step_hz` integer job ticks and never implies a background physics
+tick. The new slice does not claim offline progress until its lifecycle,
+fencing, crash and package evidence all pass.
 
 ## Failure, retry, and recovery
 
@@ -411,8 +422,9 @@ telemetry.
     blocked, and completed transitions without client-authored inventory state.
 14. The cross-process loop mines ore, routes cargo, refines material, assembles
     a component, and builds a block without accepted direct refine/craft intents.
-15. Active and synthetic background advancement produce identical production
-    events for the same prior state and elapsed tick count.
+15. P1.6 Active and Background advancement produce the same occurrence,
+    ordered outcomes, conservation state, and resulting world hash for the same
+    prior state; the entire vector commits atomically.
 16. A machine leaving P1.5 interest disables its terminal controls with an
     out-of-view reason while its canonical queue and escrow remain unchanged;
     re-entry restores one exact private queue after the public machine baseline.
@@ -445,19 +457,19 @@ telemetry.
 6. Reset the local proof universe and run full cross-process recovery evidence.
 7. Publish tested machine, graph, and queue operating envelopes.
 
-Steps 1–6 are implemented and pass the repository's complete local verifier,
+P1.4 steps 1–6 are implemented and pass the repository's complete local verifier,
 including Rust unit/integration/replay coverage, two-player authority and
 privacy, browser and native smoke tests, and the cross-process
-mining-to-building path. Hosted CI and published operating envelopes remain the
-release evidence gate. Sleeping/background-cell equivalence remains attached
-to dynamic cell scheduling rather than being claimed by this active-cell slice.
+mining-to-building path. P1.5 hosted CI and package evidence preserve those
+gates. Sleeping/background equivalence is now frozen by P1.6 but remains
+unclaimed until its implementation and evidence are published.
 
 Rollback uses the last protocol-14 executable and an archived P1.3 world. P1.4
 events and saves are never interpreted by older code.
 
 ## Open questions
 
-No unresolved decision blocks this slice. Battery discharge and allocation,
+No unresolved decision blocks the P1.4 slice. P1.6 now defines the bounded
+offline-production dependency. Battery discharge and allocation,
 terminal/signal authority, generic conveyor-bound transfers, job cancellation,
-and offline scheduling are explicitly deferred features rather than implicit
-P1.4 behavior.
+and other background systems remain explicitly deferred features.

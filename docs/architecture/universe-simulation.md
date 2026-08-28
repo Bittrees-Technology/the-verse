@@ -1,6 +1,7 @@
 # Universe simulation
 
-**Status:** P1.5 address and fixed-registry contract accepted; multi-cell runtime proposed
+**Status:** P1.5 address/registry proof published; P1.6 one-cell lifecycle
+contract accepted; multi-cell runtime proposed
 
 ## Coordinate model
 
@@ -109,19 +110,44 @@ Resource availability expands through frontier discovery rather than regeneratin
 ## Cell lifecycle
 
 ```text
-Unmaterialized → Generated → Sleeping → Background → Active → Draining → Sleeping
+Sleeping ── due production ──> Background ── no work ──> Sleeping
+    │                              │
+    └── authenticated gameplay ────┴──> Activating ──> Active
+                                                        │
+                                                idle/operator
+                                                        │
+                                                        v
+                                                    Draining
+                                                   /        \
+                                  runnable work <─          ─> no work
+                                      │                         │
+                                      v                         v
+                                 Background                  Sleeping
 ```
 
-- **Sleeping:** no real-time process; state is a snapshot plus scheduled events.
-- **Background:** low-frequency power, travel, production, cleanup, and market-linked simulation.
-- **Active:** full physics and client replication.
-- **Draining:** no new entrants; transfer and snapshot complete before worker release.
+- **Sleeping:** no real-time process or busy poll; durable state is a verified
+  snapshot, journal, lifecycle record, and optional next occurrence.
+- **Activating:** a fenced holder recovers, reconciles and performs bounded
+  production catch-up through one wake cut-off before admitting gameplay.
+- **Background:** a short-lived fenced worker advances only due physical
+  production through the same atomic quantum used while Active.
+- **Active:** full physics, life support, damage, gameplay and client
+  replication.
+- **Draining:** no new entrants or intents; the selected atomic boundary,
+  session invalidation and snapshot finish before mode change or lease release.
 
-Attacks, arrivals, expiring timers, or observation may wake a cell.
+Lease loss or uncertainty immediately fences a worker; `Fenced` is a worker
+result, not a state that stale authority may persist. In P1.6, only
+authenticated gameplay ingress, an authorized operator request, or a durable
+production occurrence wakes the fixed proof cell. Public spectators do not
+wake it or keep it Active. Attacks, travel arrivals, other expiring timers,
+cleanup and market-linked work remain later lifecycle triggers.
 
-P1.5 implements only the active local cell and records the hierarchy needed by
-later schedulers. Sleeping/background execution, dynamic activation, and
-multi-process leasing remain requirements, not demonstrated capabilities.
+P1.5 implements only the active local cell. P1.6 is the bounded next slice
+defined in [the durable single-cell lifecycle contract](../gameplay/durable-single-cell-lifecycle.md):
+one fixed cell, one local coordinator, renewable single-host fencing, and
+production-only background execution. It does not complete dynamic assignment,
+multi-cell scheduling, handoff, distributed availability, or WORLD-008.
 
 ## Player and grid handoff
 
@@ -226,6 +252,14 @@ all bodies and subjects, record old and new hashes, and switch manifests only
 after replay equality. Rollback restores the previous binary, manifests, and
 read-only world together; it never opens world schema `18` under older rules.
 
+P1.6 is a second coordinated boundary: protocol `17`, projection schema `3`,
+world schema `19`, event schema `15`, content schema `11`, content manifest
+`p1.5.0`, registry schema `1`, universe manifest schema `3`, interest schema
+`1`, lifecycle-control schema `1`, and schedule-occurrence schema `1`.
+Universe manifest `3` binds the lifecycle/schedule policy. The first proof
+archives and resets P1.5 data; any later offline migration must introduce an
+unambiguous occurrence frontier and prove replay equality.
+
 ## Prototype gates
 
 The architecture is not accepted for production until benchmarks demonstrate:
@@ -242,3 +276,6 @@ The architecture is not accepted for production until benchmarks demonstrate:
 - Cross-platform registry and universe-manifest hash equality.
 - Fixed-body separation at the exact accepted and rejected boundaries.
 - Registry mismatch rejection before load, replay, or append.
+- Atomic whole-cell production equivalence between Active and Background.
+- Hard-crash occurrence reconciliation and stale-fence rejection.
+- Bounded catch-up and fresh activation baselines for one fixed cell.

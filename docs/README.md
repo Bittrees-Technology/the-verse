@@ -27,6 +27,8 @@ These documents form the initial specification baseline.
 - [P1.1 Actor-owned Industry and Engineering](gameplay/actor-owned-industry.md)
 - [P1.2 Private Player State Projection](gameplay/private-state-projection.md)
 - [P1.4 Physical Refining and Manufacturing](gameplay/physical-industry.md)
+- [P1.5 Celestial Registry and Interest-managed Visibility](gameplay/celestial-registry-and-interest-management.md)
+- [P1.6 Durable Single-cell Lifecycle](gameplay/durable-single-cell-lifecycle.md)
 - [Authoritative Hand-tool Targeting](gameplay/authoritative-hand-tool-targeting.md)
 
 ## Research

@@ -25,5 +25,6 @@ ADRs capture durable choices and their consequences.
 | [0019](ADR-0019-fixed-celestial-registry.md) | Fixed celestial registry and canonical universe addresses | Accepted |
 | [0020](ADR-0020-spatial-interest-replication.md) | Server-derived spatial interest replication | Accepted |
 | [0021](ADR-0021-independent-interest-view-verification.md) | Independent interest-view verification before client apply | Accepted |
+| [0022](ADR-0022-durable-single-cell-lifecycle.md) | Fenced durable single-cell lifecycle and background production | Accepted |
 
 Status values: Proposed, Accepted, Superseded, Rejected.

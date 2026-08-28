@@ -71,6 +71,7 @@ Priorities:
 | F-057 | Server-authoritative EVA, landing, and rotation | P0 | F-002, F-004, F-006 |
 | F-058 | Server-authoritative grounded and magnetic locomotion | P0 | F-057, F-006, SIM-010 |
 | F-059 | Deterministic single-cell spatial interest replication | P1 | F-012, SIM-013/014 |
+| F-060 | Fenced single-cell lifecycle and background production | P1 | F-011, F-023, SIM-006/015 |
 
 ## Current implementation readiness
 
@@ -99,6 +100,13 @@ simulate multi-day routes, stream planetary terrain, provide arbitrary remote
 spectator cameras, or establish a thousands-of-players capacity claim. Its
 encoding-independent correctness contract may continue over the inspectable
 transport while the production binary codec remains a later P1 exit item.
+
+F-060 is the bounded P1.6 lifecycle slice. It proves one fixed cell can drain,
+sleep, wake for a durable production occurrence, process a bounded backlog
+through the same whole-cell quantum used while active, and reject stale writers
+through a renewable fenced lease. It does not complete F-013 or WORLD-008:
+multi-cell assignment, handoff, distributed control-plane availability, and
+background physics remain separate milestones.
 
 ## Definition of specification-ready
 

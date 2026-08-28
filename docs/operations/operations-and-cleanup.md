@@ -112,6 +112,33 @@ Examples:
 
 The scheduler delivers events at least once; handlers must be idempotent.
 
+### P1.6 production-only proof
+
+The first durable scheduler handles one fixed cell and physical production
+only. Its lifecycle record stores the desired/observed mode, monotonic revision,
+holder, fencing token, lease times, verified world frontier, next production
+occurrence and acknowledged occurrence. One exclusive local file lock plus a
+renewed durable lease proves safe same-host replacement; it is not a
+distributed-availability claim.
+
+Each production delivery carries a stable occurrence key and trusted due time.
+The handler validates the exact next sequence, plans one atomic whole-cell
+quantum, appends and syncs it, and only then acknowledges it. Redelivery after a
+crash reconciles against the canonical frontier. A conflicting, skipped,
+future, wrong-root, wrong-cell or wrong-fence delivery fails closed.
+
+Catch-up processes at most 60 exact quanta, at most 256 queue-bearing machines,
+and at most 250 milliseconds of coordinator work per dispatch before yielding
+after the current atomic quantum. Backlog is visible and never silently skipped
+or combined. Paused and empty queues sleep until a relevant canonical mutation
+re-arms evaluation. Clock rollback outside tolerance, forward-time overflow,
+lease uncertainty or inability to finish inside the lease margin halts mutation
+with an actionable reason.
+
+P1.6 explicitly excludes background travel, power depletion, cleanup,
+insurance, market deadlines, physics, oxygen, combat, turrets and AI. Those
+examples remain future handlers with separate outage and conservation rules.
+
 ## Backups
 
 Required:
