@@ -650,13 +650,17 @@ pub(super) struct ValidatedDraftGridTransferCellStateV21<'state, 'manifest> {
     manifest: &'manifest crate::manifest_v5::ValidatedUniverseManifestV5,
 }
 
-impl ValidatedDraftGridTransferCellStateV21<'_, '_> {
-    pub(super) fn state(&self) -> &DraftGridTransferCellStateV2 {
+impl<'state, 'manifest> ValidatedDraftGridTransferCellStateV21<'state, 'manifest> {
+    pub(super) fn state(&self) -> &'state DraftGridTransferCellStateV2 {
         self.state
     }
 
     pub(super) fn manifest_hash(&self) -> &str {
         self.manifest.manifest_hash()
+    }
+
+    pub(super) fn manifest(&self) -> &'manifest crate::manifest_v5::ValidatedUniverseManifestV5 {
+        self.manifest
     }
 }
 
@@ -3721,6 +3725,17 @@ impl DraftGridTransferCellStateV2 {
     ) -> Result<(), DraftGridClosureError> {
         self.base.fencing_token = fencing_token;
         self.seal()
+    }
+
+    #[cfg(test)]
+    pub(super) fn rebind_test_manifest_v5(
+        &mut self,
+        manifest: &crate::manifest_v5::ValidatedUniverseManifestV5,
+    ) -> Result<(), DraftGridClosureError> {
+        self.base.universe_manifest_hash = manifest.manifest_hash().to_owned();
+        self.state_hash = self.calculate_hash()?;
+        self.validate_world_v21(manifest)?;
+        Ok(())
     }
 
     pub(super) fn rebind_validated_cell_authority(
