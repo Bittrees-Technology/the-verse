@@ -73,6 +73,13 @@ Priorities:
 | F-059 | Deterministic single-cell spatial interest replication | P1 | F-012, SIM-013/014 |
 | F-060 | Fenced single-cell lifecycle and background production | P1 | F-011, F-023, SIM-006/015 |
 | F-061 | Durable two-cell assignment and mobile-aggregate handoff | P1 | F-011–F-014, F-059/060, WORLD-010, SIM-016–018 |
+| F-062 | Guided first-session engineering worksite and conserved work loop | P1 | F-023, UX-002 |
+| F-063 | Movement, camera, interaction, correction, and performance quality gates | P1 | F-057–F-059, UX-001/003, PERF-001/002 |
+| F-064 | Programmable engineering and autonomous work automation | P2 | F-023, F-039, F-043/044, IND-008 |
+| F-065 | Regional demand, scarcity, and logistics signals | P2 | F-028, F-055, MKT-004/011 |
+| F-066 | Company roles, payroll, treasury, permissions, and work operations | P2 | F-024–F-026, IND-005/009 |
+| F-067 | Durable survey, discovery, route, and world-history records | P2 | F-014, F-036–F-038, WORLD-011 |
+| F-068 | Versioned blueprint, script, and automation-package sharing | P3 | F-043/044, F-046, MOD-005 |
 
 ## Current implementation readiness
 
@@ -124,6 +131,11 @@ remains an implementation gate under the versioned boundary in
 not complete arbitrary
 multi-cell placement, cross-cell physics, multi-host availability, static
 megastructure partitioning, or the public-scale concurrency envelope.
+
+F-062 and F-063 are cross-cutting release gates, not optional polish. A
+playable milestone may add depth behind them, but shall not claim broader
+construction or economy readiness while the first verified work loop or
+ordinary movement and interaction remain unreliable on supported hardware.
 
 ## Definition of specification-ready
 
