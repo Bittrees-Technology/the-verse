@@ -64,9 +64,9 @@ const manifest = {
   content_hash: "content-hash",
   world_schema_version: 20,
   event_schema_version: 16,
-  lifecycle_control_schema_version: 1,
+  lifecycle_control_schema_version: 2,
   production_schedule_occurrence_schema_version: 1,
-  lifecycle_policy_hash: "5bc077cc8a2eb101fcaecdce5513c13aa243e1f68a5af839a602dd689859ff3a",
+  lifecycle_policy_hash: "8abc99b5e076bd89a8914c3727560baaa82433b1b1b4191b2379355ac7d81471",
 };
 
 const celestialRegistry = {
@@ -504,7 +504,7 @@ test("browser verifier is pinned to the proof universe commitments", () => {
   assert.match(source, /expected_universe_manifest_hash: EXPECTED_UNIVERSE_MANIFEST_HASH/);
   assert.match(source, /expected_content_hash: EXPECTED_CONTENT_HASH/);
   assert.match(source, /4c367bbfa04218ece14104f0a3a7ec2c7e9fefcc37d4cf78a265df2d711a59da/);
-  assert.match(source, /ce89422bd5d0c4a2ddc50f22883439a7ee1ecd7dd14165a46bb500623fd0b7eb/);
+  assert.match(source, /3e93c305169eeecee44f2630e57ad183b319375197547344c45e1509e8aaf76b/);
   assert.match(source, /fc61c05b335fb951868010ecf2942a92ec4f03d00d0a75d3acba8c6f5162b6bd/);
 });
 

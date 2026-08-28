@@ -69,6 +69,15 @@ cell event/hash frontier. The directory commit is a separate durable service
 record and the sole cross-cell authority-transfer decision; a cell event cannot
 manufacture or reverse it.
 
+The cell store additionally persists transfer-boundary records for prepare,
+quarantine, import, export/finalization, and both abort-cleanup roles. Each
+record binds the exact canonical event sequence/hash, live store fence, and
+resulting world hash; records form a hash chain whose head is anchored in the
+cell lifecycle document. Startup truncates only an incomplete final record,
+verifies the chain and event material, replays post-snapshot boundaries to
+verify their world roots, and may backfill only the exact lifecycle-pending
+event-to-boundary crash gap.
+
 ## Canonical spatial identity
 
 Universe manifest schema `2` defines the universe, address dimensions,
@@ -266,8 +275,8 @@ data; it never reinterprets a P1.6 record.
 P1.7 admits protocol `18`, projection schema `4`, world schema `20`, event
 schema `16`, content schema `11`, content manifest `p1.5.0`, registry schema
 `1`, universe manifest schema `4`, interest schema `2`, operation fingerprint
-schema `2`, lifecycle-control schema `1`, production-occurrence schema `1`,
-cell-directory schema `1`, and transfer/package schema `1` as one coordinated
+schema `2`, lifecycle-control schema `2`, production-occurrence schema `1`,
+cell-directory schema `2`, and transfer/package schema `1` as one coordinated
 set. Partial combinations fail before assignment, recovery, package admission,
 journal replay, session routing, or projection.
 

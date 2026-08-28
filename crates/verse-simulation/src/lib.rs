@@ -20,8 +20,9 @@ pub use celestial::{
 };
 pub use cell_directory::{
     AggregatePlacementRecord, AggregatePlacementState, CELL_DIRECTORY_SCHEMA_VERSION,
-    CellAssignmentRecord, CellAssignmentState, CellDirectoryError, CellTransferRecord,
-    LocalCellDirectory, MobileAggregateKind, TransferPhase, proof_cell_keys,
+    CellAssignmentRecord, CellAssignmentState, CellDirectoryError, CellTransferFinalizationProof,
+    CellTransferImportProof, CellTransferPrepareProof, CellTransferQuarantineProof,
+    CellTransferRecord, LocalCellDirectory, MobileAggregateKind, TransferPhase, proof_cell_keys,
 };
 pub use content::ContentManifest;
 pub use engine::{

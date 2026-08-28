@@ -195,8 +195,8 @@ authority.
 The coordinated P1.7 boundary is protocol `18`, projection schema `4`, world
 schema `20`, event schema `16`, content schema `11`, content manifest
 `p1.5.0`, registry schema `1`, universe manifest schema `4`, interest schema
-`2`, operation fingerprint schema `2`, lifecycle-control schema `1`,
-production-occurrence schema `1`, cell-directory schema `1`, and transfer
+`2`, operation fingerprint schema `2`, lifecycle-control schema `2`,
+production-occurrence schema `1`, cell-directory schema `2`, and transfer
 schema `1`.
 
 ## Evidence gates

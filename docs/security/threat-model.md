@@ -181,12 +181,20 @@ secrecy, fog of war, or zero-knowledge state.
 
 - The P1.7 schema tuple is protocol `18`, projection `4`, world `20`, event
   `16`, content `11`, manifest `p1.5.0`, registry `1`, universe manifest `4`,
-  interest `2`, operation fingerprint `2`, lifecycle control `1`, production
-  occurrence `1`, cell directory `1`, and transfer/package `1`; partial
+  interest `2`, operation fingerprint `2`, lifecycle control `2`, production
+  occurrence `1`, cell directory `2`, and transfer/package `1`; partial
   deployment is not allowed.
 - Every cell mutation revalidates the current assignment and lease fence.
   Every mobile-aggregate mutation additionally revalidates its directory
   placement generation. A valid lease for the wrong cell is insufficient.
+- A successor acquires the cell store before its directory assignment advances.
+  Immutable assignment-generation-to-store-fence history and lifecycle-anchored
+  event/world proofs prevent successor relabeling, current-state proof forgery,
+  and acceptance of a tampered historic post-state root.
+- A standalone simulation worker fails closed when pointed at a
+  directory-managed cell root. Session admission for those cells must be
+  reached through the coordinator only after startup reconciliation; local
+  player presence by itself is not placement authority.
 - The source derives the dependency closure from canonical contacts, support,
   ownership, inventory, and system edges. Clients cannot nominate a hidden
   subject, destination, package, generation, receipt, or commit.
@@ -197,6 +205,10 @@ secrecy, fog of war, or zero-knowledge state.
 - Directory uncertainty after a commit attempt forbids source unlock. Operators
   may retry or quarantine a stuck transfer but cannot edit package contents,
   lower placement generation, or select a conflicting owner.
+- Pre-commit abort first enters a pinned `Aborting` state and becomes terminal
+  only after both cells durably record their cleanup result. This closes the
+  crash window in which source could be restored while a quarantined
+  destination copy remained unproved.
 - Handoff discards source route, controls, interest state, acknowledgements,
   verifier stages, and private overlays. The session returns to `LIVE` only
   after a transfer-linked destination baseline is independently verified.

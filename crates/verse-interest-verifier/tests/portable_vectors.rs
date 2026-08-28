@@ -6,10 +6,10 @@ use verse_protocol::SessionRole;
 
 const DOMAIN: &[u8] = b"the-verse/interest-view/v1\0";
 const REGISTRY_HASH: &str = "f00517b0fbef09d7924fde2cb11f2c74066627992ab900a6a9e0bd3ac3dc7311";
-const MANIFEST_HASH: &str = "a3d5eb718f859d6010854f231a0e2cb4518c9618580020762311b4c3e43e3e06";
+const MANIFEST_HASH: &str = "551b4f30761a3fe8eed2bc3a9525e46f81d16563f9118b305bf5f2a3b9e63346";
 const CONTENT_HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const BASELINE_HASH: &str = "05445f8eda0373f1f214b661584eceaa84f845deb02af757bfadb266b63ea2a2";
-const DELTA_HASH: &str = "4cb9ff8804f86af5387c21e9e81511445b3364069b8d1ac5a1c2dba11cbbb5e5";
+const BASELINE_HASH: &str = "ca8c95c5c3500737da44f85803f14847d56a92ccde59e0d9bb1a4db361d015d0";
+const DELTA_HASH: &str = "b28bacc07723afd4f02cf9ad93d4e2b5113bf2db63b76d374191b09b05a82532";
 
 fn payload(bytes: &'static [u8]) -> &'static [u8] {
     bytes

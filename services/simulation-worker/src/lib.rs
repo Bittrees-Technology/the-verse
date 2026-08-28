@@ -1777,6 +1777,15 @@ async fn handle_client_message(
                     .await;
                     false
                 }
+                Err(RuntimeError::DirectoryManagedCellRequiresCoordinator) => {
+                    send_fatal_and_close(
+                        sender,
+                        "directory_coordinator_required",
+                        "this cell requires reconciled universe-coordinator admission",
+                    )
+                    .await;
+                    false
+                }
             }
         }
     }

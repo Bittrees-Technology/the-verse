@@ -20,7 +20,7 @@ const COMPATIBILITY = Object.freeze({
   expected_celestial_registry_hash:
     "4c367bbfa04218ece14104f0a3a7ec2c7e9fefcc37d4cf78a265df2d711a59da",
   expected_universe_manifest_hash:
-    "ce89422bd5d0c4a2ddc50f22883439a7ee1ecd7dd14165a46bb500623fd0b7eb",
+    "3e93c305169eeecee44f2630e57ad183b319375197547344c45e1509e8aaf76b",
   expected_content_hash:
     "fc61c05b335fb951868010ecf2942a92ec4f03d00d0a75d3acba8c6f5162b6bd",
 });

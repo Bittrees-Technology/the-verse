@@ -355,11 +355,11 @@ export class Protocol16InterestStream {
       manifest.event_schema_version,
       this.welcome.event_schema_version,
     );
-    assert.equal(manifest.lifecycle_control_schema_version, 1);
+    assert.equal(manifest.lifecycle_control_schema_version, 2);
     assert.equal(manifest.production_schedule_occurrence_schema_version, 1);
     assert.equal(
       manifest.lifecycle_policy_hash,
-      "5bc077cc8a2eb101fcaecdce5513c13aa243e1f68a5af839a602dd689859ff3a",
+      "8abc99b5e076bd89a8914c3727560baaa82433b1b1b4191b2379355ac7d81471",
     );
     assert.equal(
       manifest.celestial_registry_schema_version,

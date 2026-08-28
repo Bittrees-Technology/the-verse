@@ -153,11 +153,19 @@ direction remain registry-derived.
 
 The directory owns:
 
-- canonical cell keys and cell assignment generations;
+- canonical cell keys, cell assignment generations, and the immutable mapping
+  from every assignment generation to the exact cell-store fencing token it
+  acquired;
 - desired worker placement and assignment state;
 - aggregate placement cell and placement generation;
 - transfer ID, phase, source, destination, package hash, and commit record;
-- destination quarantine receipt binding; and
+- source prepare and destination quarantine event/world proofs;
+- destination quarantine receipt binding;
+- a destination import proof binding the committed import event frontier,
+  live fence, placement generation, and resulting world hash;
+- a source finalization proof binding the committed export event frontier,
+  live fence, placement generation, and resulting world hash; and
+- an explicit `Aborting` phase plus source and destination cleanup proofs; and
 - the sole compare-and-swap authority-transfer decision.
 
 The directory cannot create gameplay contents or rewrite a package. Its records
@@ -212,7 +220,10 @@ Unassigned/Sleeping
 Assignment generation and the P1.6 cell fencing token are separate monotonic
 values. Assignment selects which worker may attempt the cell lease. The lease
 still protects every cell append, snapshot, production occurrence, and
-lifecycle transition. Losing either authority stops mutation and publication.
+lifecycle transition. A successor acquires the cell Store lease and its newer
+fence before the directory advances assignment generation; the directory then
+records that exact generation-to-fence pair permanently. Losing either
+authority stops mutation and publication.
 
 ### Aggregate placement and handoff
 
@@ -229,6 +240,18 @@ Before directory commit, recovery may abort and restore the exact source
 resident state. After commit, recovery is roll-forward only. The destination
 must finish import; the source can never regain gameplay authority even if its
 snapshot still physically contains locked package bytes.
+
+Pre-commit abort is itself a proved saga:
+
+```text
+Preparing|Prepared
+  -> Aborting (both cell assignments remain pinned)
+  -> source cleanup event + destination cleanup event
+  -> Aborted + Resident(source, generation N)
+```
+
+Both cleanup events are required even when one cell has no lock or reservation;
+the no-op event durably proves absence before the directory unpins either cell.
 
 ## Transfer trigger and closure
 
@@ -295,9 +318,11 @@ kind, and ordinal. Moving an entity never changes its ID.
 1. The source detects an authoritative boundary crossing and stops accepting a
    new mutation for the candidate closure.
 2. It finishes only an already selected physics/production atomic boundary.
-3. It recomputes the closure, validates isolation, removes live physics bodies,
-   records `locked_for_transfer`, appends `TransferPrepared`, and synchronizes
-   the immutable package.
+3. It recomputes the closure, validates isolation, performs an exact closure
+   compare-and-swap over the player, carried inventory, operation history, and
+   referenced production state, records `locked_for_transfer`, appends
+   `TransferPrepared`, and synchronizes the immutable package. Unrelated world
+   activity and a newer valid source fence do not invalidate the closure CAS.
 4. The directory requests destination activation. A sleeping destination
    performs P1.6 production catch-up through its captured cut-off before it can
    accept a quarantine.
@@ -310,14 +335,25 @@ kind, and ordinal. Moving an entity never changes its ID.
    linearization point.
 7. The destination imports through one canonical `TransferImported` event,
    reconstructs physics, re-arms eligible production from the trusted import
-   boundary, validates the world, and snapshots.
+   boundary, validates the world, and snapshots. The directory may mark the
+   placement imported only after recording the exact destination event/world
+   proof.
 8. The source appends `TransferFinalized`, retains an audit tombstone/package
-   witness, and removes the locked bytes when retention permits.
+   witness, and removes the locked bytes when retention permits. The directory
+   may finalize only after recording the exact source event/world proof.
 9. The gateway invalidates the source movement/interest route, increments the
    movement and interest epochs, and sends one transfer-linked destination
    baseline.
 10. The verifier commits that baseline. Only then may the gateway release
     queued destination controls and ordinary intents.
+
+Every transfer cell event also appends an event-time boundary containing its
+event frontier and replay-derived post-state root. Boundary records form a
+domain-separated hash chain whose head is committed in durable lifecycle
+control. Recovery truncates incomplete tails, backfills only the exact pending
+canonical event, and verifies stored directory proofs against the corresponding
+cell boundary before using a phase. Historic terminal verification does not
+require retaining the package artifact.
 
 No step relies on a distributed transaction across the directory and two cell
 journals. Durable reconciliation follows the pre-commit abort/post-commit
@@ -400,6 +436,9 @@ cell.
 - Crash before synchronized prepare: recover the original source resident.
 - Crash after prepare but before directory commit: reconcile destination
   quarantine; either retry commit or abort/unlock the exact source state.
+- Crash after a cell event but before its directory proof: recover the proof
+  from the cell's chained event boundary, preserving the historical assignment
+  generation and fence even after successor takeover.
 - Crash after directory commit: roll forward destination import. Source unlock
   is forbidden.
 - Crash after import but before source finalization: destination remains the
@@ -410,7 +449,8 @@ cell.
   projection, and import; placement generation blocks aggregate mutation even
   under a valid lease for the wrong cell.
 - Destination unavailable before commit: source remains locked for a bounded
-  interval, then aborts exactly. After commit, the directory must keep retrying
+  interval, then enters `Aborting`; both cell cleanup proofs finish before
+  either assignment is released. After commit, the directory must keep retrying
   destination recovery and report an actionable stuck-transfer incident.
 - Directory unavailable before commit: no authority transfer occurs. Directory
   uncertainty after a commit attempt forbids source unlock until the durable
@@ -456,9 +496,9 @@ The coordinated P1.7 boundary is:
 | Universe manifest schema | `4` |
 | Interest schema | `2` |
 | Operation fingerprint schema | `2` |
-| Lifecycle-control schema | `1` |
+| Lifecycle-control schema | `2` |
 | Production-occurrence schema | `1` |
-| Cell-directory schema | `1` |
+| Cell-directory schema | `2` |
 | Transfer/package schema | `1` |
 
 Universe manifest `4` binds cell-key, directory, transfer, placement, operation
@@ -540,6 +580,12 @@ not expose private package subjects, inventories, queues, routes, or actor IDs.
 20. Evidence explicitly states that P1.7 proves two-cell local correctness, not
     general multi-cell physics, multi-host availability, megastructure support,
     or production scale.
+
+Criterion 17 remains a release gate rather than a claim of this local proof:
+terminal directory records, assignment-fence history, transfer-boundary
+journals, and retained world witnesses are not yet compacted. A later
+hash-chained archive/compaction milestone must bound them without weakening
+historic proof verification.
 
 ## Test and evidence strategy
 

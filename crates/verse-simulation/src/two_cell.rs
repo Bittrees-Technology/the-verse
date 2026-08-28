@@ -83,18 +83,33 @@ impl LocalTwoCellRuntime {
         for key in proof_cells {
             let current = directory.assignment(&key)?.clone();
             let cell_holder = format!("{holder_id}:{}", &current.cell_id[..16]);
+            let cell_root = directory.cell_store_root(&key)?;
+            // Acquire the independently fenced cell writer before advancing the
+            // directory assignment. A failed Store acquisition therefore cannot
+            // strand a successor generation while the old writer remains live.
+            let runtime = Runtime::open_directory_managed_for_cell(
+                cell_root,
+                world_seed,
+                key.clone(),
+                snapshot_every,
+            )?;
+            let authority_fencing_token = runtime.state().fencing_token;
             let assignment = match current.state {
-                CellAssignmentState::Sleeping => {
-                    directory.claim(&key, current.assignment_generation, &cell_holder)?
-                }
-                CellAssignmentState::Assigned
-                    if current.holder_id.as_deref() == Some(cell_holder.as_str()) =>
-                {
-                    current
-                }
+                CellAssignmentState::Sleeping => directory.claim(
+                    &key,
+                    current.assignment_generation,
+                    &cell_holder,
+                    authority_fencing_token,
+                )?,
+                CellAssignmentState::Assigned => directory.recover_assignment(
+                    &key,
+                    current.assignment_generation,
+                    &cell_holder,
+                    authority_fencing_token,
+                )?,
                 _ => {
                     return Err(TwoCellRuntimeError::Invalid(format!(
-                        "proof cell {} is already assigned to another holder",
+                        "proof cell {} retained an incomplete assignment transition",
                         current.cell_id
                     )));
                 }
@@ -104,9 +119,6 @@ impl LocalTwoCellRuntime {
                     "claimed cell has no assignment generation".into(),
                 ));
             }
-            let cell_root = directory.cell_store_root(&key)?;
-            let runtime =
-                Runtime::open_for_cell(cell_root, world_seed, key.clone(), snapshot_every)?;
             cells.push(CellSlot { key, runtime });
         }
         let artifacts = LocalHandoffArtifactStore::open(root.join("handoff-artifacts"))?;
@@ -225,15 +237,39 @@ impl LocalTwoCellRuntime {
         })
     }
 
+    pub fn abort_transfer(
+        &mut self,
+        transfer_id: &str,
+    ) -> Result<crate::cell_directory::CellTransferRecord, TwoCellRuntimeError> {
+        self.directory.request_abort(transfer_id)?;
+        self.reconcile_transfer(transfer_id)
+    }
+
     fn reconcile_transfers(&mut self) -> Result<(), TwoCellRuntimeError> {
-        let transfer_ids = self
-            .directory
-            .transfer_records()
-            .into_iter()
-            .map(|transfer| transfer.transfer_id)
-            .collect::<Vec<_>>();
-        for transfer_id in transfer_ids {
-            self.reconcile_transfer(&transfer_id)?;
+        for transfer in self.directory.transfer_records() {
+            if matches!(
+                transfer.phase,
+                TransferPhase::Finalized | TransferPhase::Aborted
+            ) {
+                let source_index = self.cell_index(&transfer.source_cell_key).ok_or_else(|| {
+                    TwoCellRuntimeError::Invalid("terminal transfer source is not hosted".into())
+                })?;
+                let destination_index = self
+                    .cell_index(&transfer.destination_cell_key)
+                    .ok_or_else(|| {
+                        TwoCellRuntimeError::Invalid(
+                            "terminal transfer destination is not hosted".into(),
+                        )
+                    })?;
+                self.cells[source_index]
+                    .runtime
+                    .verify_transfer_record_proofs(&transfer)?;
+                self.cells[destination_index]
+                    .runtime
+                    .verify_transfer_record_proofs(&transfer)?;
+                continue;
+            }
+            self.reconcile_transfer(&transfer.transfer_id)?;
         }
         Ok(())
     }
@@ -258,27 +294,34 @@ impl LocalTwoCellRuntime {
             ));
         }
 
+        // Directory phase flags are never authority by themselves. Every
+        // persisted proof must resolve to the exact replay-derived cell event
+        // before reconciliation may use it to move or finish placement.
+        self.cells[source_index]
+            .runtime
+            .verify_transfer_record_proofs(&transfer)?;
+        self.cells[destination_index]
+            .runtime
+            .verify_transfer_record_proofs(&transfer)?;
+
         if transfer.phase == TransferPhase::Aborted {
-            if self.cells[source_index]
-                .runtime
-                .state()
-                .player_transfer_locks
-                .contains_key(&package.aggregate_id)
-            {
-                self.cells[source_index]
+            return Ok(transfer);
+        }
+
+        if transfer.phase == TransferPhase::Aborting {
+            if transfer.source_abort_proof.is_none() {
+                let proof = self.cells[source_index]
                     .runtime
                     .commit_player_transfer_aborted(&package, &transfer)?;
+                self.directory.record_abort_cleanup(transfer_id, &proof)?;
             }
-            if self.cells[destination_index]
-                .runtime
-                .state()
-                .player_transfer_reservations
-                .contains_key(transfer_id)
-            {
-                self.cells[destination_index]
+            if transfer.destination_abort_proof.is_none() {
+                let proof = self.cells[destination_index]
                     .runtime
                     .commit_player_transfer_aborted(&package, &transfer)?;
+                self.directory.record_abort_cleanup(transfer_id, &proof)?;
             }
+            transfer = self.directory.finalize_abort(transfer_id)?;
             return Ok(transfer);
         }
 
@@ -286,9 +329,12 @@ impl LocalTwoCellRuntime {
             transfer.phase,
             TransferPhase::Prepared | TransferPhase::Quarantined
         ) {
-            self.cells[source_index]
+            let prepare_proof = self.cells[source_index]
                 .runtime
                 .commit_player_transfer_prepared(&package, &transfer)?;
+            transfer = self
+                .directory
+                .record_source_prepared(transfer_id, &prepare_proof)?;
             let (_, receipt) = stage_eva_player_quarantine(
                 self.cells[destination_index].runtime.state(),
                 self.cells[destination_index].runtime.state().fencing_token,
@@ -303,7 +349,7 @@ impl LocalTwoCellRuntime {
                     "durable quarantine receipt disagrees with the destination reservation".into(),
                 ));
             }
-            self.cells[destination_index]
+            let quarantine_proof = self.cells[destination_index]
                 .runtime
                 .commit_player_transfer_quarantined(&package, &receipt)?;
             self.artifacts.persist_quarantine_receipt(&receipt)?;
@@ -311,6 +357,7 @@ impl LocalTwoCellRuntime {
                 transfer_id,
                 &package.package_hash,
                 &receipt.receipt_hash,
+                &quarantine_proof,
             )?;
         }
 
@@ -327,9 +374,14 @@ impl LocalTwoCellRuntime {
             ));
         }
 
-        if matches!(
+        if transfer.phase == TransferPhase::Committed {
+            let proof = self.cells[destination_index]
+                .runtime
+                .commit_player_transfer_imported(&package, &receipt, &transfer)?;
+            transfer = self.directory.record_imported(transfer_id, &proof)?;
+        } else if matches!(
             transfer.phase,
-            TransferPhase::Committed | TransferPhase::Imported | TransferPhase::Finalized
+            TransferPhase::Imported | TransferPhase::Finalized
         ) && !has_exact_transfer_witness(
             self.cells[destination_index].runtime.state(),
             &package,
@@ -339,23 +391,21 @@ impl LocalTwoCellRuntime {
                 .runtime
                 .commit_player_transfer_imported(&package, &receipt, &transfer)?;
         }
-        if transfer.phase == TransferPhase::Committed {
-            transfer = self.directory.record_imported(transfer_id)?;
-        }
-        if matches!(
-            transfer.phase,
-            TransferPhase::Imported | TransferPhase::Finalized
-        ) && !has_exact_transfer_witness(
-            self.cells[source_index].runtime.state(),
-            &package,
-            TransferWitnessDirection::Export,
-        )? {
+        if transfer.phase == TransferPhase::Imported {
+            let proof = self.cells[source_index]
+                .runtime
+                .commit_player_transfer_exported(&package, &transfer)?;
+            transfer = self.directory.finalize_transfer(transfer_id, &proof)?;
+        } else if transfer.phase == TransferPhase::Finalized
+            && !has_exact_transfer_witness(
+                self.cells[source_index].runtime.state(),
+                &package,
+                TransferWitnessDirection::Export,
+            )?
+        {
             self.cells[source_index]
                 .runtime
                 .commit_player_transfer_exported(&package, &transfer)?;
-        }
-        if transfer.phase == TransferPhase::Imported {
-            transfer = self.directory.finalize_transfer(transfer_id)?;
         }
         if transfer.phase != TransferPhase::Finalized {
             return Err(TwoCellRuntimeError::Invalid(
@@ -434,6 +484,8 @@ fn has_exact_transfer_witness(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::io::Write as _;
     use std::path::Path;
 
     use tempfile::tempdir;
@@ -482,6 +534,7 @@ mod tests {
 
     fn prepare_test_transfer(
         coordinator: &mut LocalTwoCellRuntime,
+        record_source_proof: bool,
     ) -> (String, usize, usize, PlayerTransferPackage) {
         let player_id = "player-local";
         let placement = coordinator
@@ -541,10 +594,16 @@ mod tests {
                 &package.package_hash,
             )
             .expect("directory prepares");
-        coordinator.cells[source_index]
+        let prepare_proof = coordinator.cells[source_index]
             .runtime
             .commit_player_transfer_prepared(&package, &prepared)
             .expect("source locks");
+        if record_source_proof {
+            coordinator
+                .directory
+                .record_source_prepared(&transfer_id, &prepare_proof)
+                .expect("directory binds source prepare proof");
+        }
         (transfer_id, source_index, destination_index, package)
     }
 
@@ -563,14 +622,15 @@ mod tests {
         assert_eq!(completed.destination_cell_key, cells[1]);
         assert_eq!(completed.placement_generation, 2);
         assert_eq!(completed.destination_movement_epoch, 2);
-        assert_eq!(
-            coordinator
-                .directory()
-                .transfer(&completed.transfer_id)
-                .expect("transfer remains auditable")
-                .phase,
-            TransferPhase::Finalized
-        );
+        let transfer = coordinator
+            .directory()
+            .transfer(&completed.transfer_id)
+            .expect("transfer remains auditable");
+        assert_eq!(transfer.phase, TransferPhase::Finalized);
+        assert!(transfer.source_prepare_proof.is_some());
+        assert!(transfer.destination_quarantine_proof.is_some());
+        assert!(transfer.import_proof.is_some());
+        assert!(transfer.finalization_proof.is_some());
         assert!(
             coordinator
                 .runtime_for_cell(&cells[0])
@@ -638,13 +698,155 @@ mod tests {
     }
 
     #[test]
+    fn standalone_runtime_cannot_bypass_directory_managed_admission() {
+        let root = tempdir().expect("universe root");
+        let seed = 8_040;
+        let cells = initialize_boundary_universe(root.path(), seed);
+        let source_root = root
+            .path()
+            .join("cells")
+            .join(celestial::cell_id(&cells[0]).expect("source cell ID"));
+
+        assert!(matches!(
+            Runtime::open_for_cell(&source_root, seed, cells[0].clone(), 20),
+            Err(RuntimeError::DirectoryManagedCellRequiresCoordinator)
+        ));
+
+        LocalTwoCellRuntime::open(root.path(), seed, 20, "coordinator-host")
+            .expect("directory coordinator retains the authority capability");
+    }
+
+    #[test]
+    fn historic_transfer_world_root_is_bound_by_the_lifecycle_hash_chain() {
+        let root = tempdir().expect("universe root");
+        let seed = 8_037;
+        let cells = initialize_boundary_universe(root.path(), seed);
+        let mut coordinator = LocalTwoCellRuntime::open(root.path(), seed, 1, "test-host")
+            .expect("coordinator opens");
+        coordinator
+            .handoff_player("player-local")
+            .expect("handoff completes and snapshots each event");
+        drop(coordinator);
+
+        let source_root = root
+            .path()
+            .join("cells")
+            .join(celestial::cell_id(&cells[0]).expect("source cell ID"));
+        let boundary_path = source_root.join("transfer-boundaries.ndjson");
+        let text = fs::read_to_string(&boundary_path).expect("boundary journal reads");
+        let mut lines = text.lines().map(str::to_owned).collect::<Vec<_>>();
+        let mut first: serde_json::Value =
+            serde_json::from_str(&lines[0]).expect("boundary parses");
+        first["resulting_world_hash"] = serde_json::Value::String("0".repeat(64));
+        lines[0] = serde_json::to_string(&first).expect("tampered boundary serializes");
+        fs::write(&boundary_path, format!("{}\n", lines.join("\n")))
+            .expect("tampered boundary writes");
+
+        assert!(matches!(
+            LocalTwoCellRuntime::open(root.path(), seed, 1, "replacement-host"),
+            Err(TwoCellRuntimeError::Runtime(RuntimeError::Persistence(
+                crate::PersistenceError::InvalidTransferBoundary(_)
+            )))
+        ));
+    }
+
+    #[test]
+    fn partial_transfer_boundary_tail_is_truncated_before_recovery() {
+        let root = tempdir().expect("universe root");
+        let seed = 8_038;
+        let cells = initialize_boundary_universe(root.path(), seed);
+        let mut coordinator = LocalTwoCellRuntime::open(root.path(), seed, 20, "test-host")
+            .expect("coordinator opens");
+        coordinator
+            .handoff_player("player-local")
+            .expect("handoff completes");
+        drop(coordinator);
+
+        let destination_root = root
+            .path()
+            .join("cells")
+            .join(celestial::cell_id(&cells[1]).expect("destination cell ID"));
+        let boundary_path = destination_root.join("transfer-boundaries.ndjson");
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&boundary_path)
+            .expect("boundary journal opens");
+        file.write_all(b"{\"partial\":true")
+            .and_then(|()| file.sync_data())
+            .expect("partial boundary tail writes");
+        drop(file);
+
+        LocalTwoCellRuntime::open(root.path(), seed, 20, "replacement-host")
+            .expect("partial boundary tail is discarded safely");
+        assert_eq!(
+            fs::read(&boundary_path)
+                .expect("boundary journal reads")
+                .last(),
+            Some(&b'\n')
+        );
+    }
+
+    #[test]
+    fn multiple_unanchored_transfer_boundaries_are_rejected() {
+        let root = tempdir().expect("universe root");
+        let seed = 8_039;
+        let cells = initialize_boundary_universe(root.path(), seed);
+        let mut coordinator = LocalTwoCellRuntime::open(root.path(), seed, 20, "test-host")
+            .expect("coordinator opens");
+        coordinator
+            .handoff_player("player-local")
+            .expect("handoff completes");
+        drop(coordinator);
+
+        let source_root = root
+            .path()
+            .join("cells")
+            .join(celestial::cell_id(&cells[0]).expect("source cell ID"));
+        let boundaries = fs::read_to_string(source_root.join("transfer-boundaries.ndjson"))
+            .expect("boundary journal reads")
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("boundary parses"))
+            .collect::<Vec<_>>();
+        assert_eq!(boundaries.len(), 2, "source proof has prepare and export");
+        let last = boundaries.last().expect("last boundary exists");
+
+        let lifecycle_path = source_root.join("cell-lifecycle.json");
+        let mut lifecycle: serde_json::Value =
+            serde_json::from_slice(&fs::read(&lifecycle_path).expect("lifecycle reads"))
+                .expect("lifecycle parses");
+        lifecycle["transfer_boundary_head_hash"] = serde_json::Value::String(String::new());
+        lifecycle["last_world_event_sequence"] = serde_json::json!(0);
+        lifecycle["last_world_event_hash"] = serde_json::Value::String(String::new());
+        lifecycle["last_world_state_hash"] = serde_json::Value::String(String::new());
+        lifecycle["pending_world_commit"] = serde_json::json!({
+            "event_sequence": last["event_sequence"],
+            "event_hash": last["event_hash"],
+            "occurred_at_unix_ms": 1,
+            "prior_next_occurrence": null,
+            "resulting_next_occurrence": null
+        });
+        fs::write(
+            &lifecycle_path,
+            serde_json::to_vec(&lifecycle).expect("lifecycle serializes"),
+        )
+        .expect("lifecycle writes");
+
+        assert!(matches!(
+            LocalTwoCellRuntime::open(root.path(), seed, 20, "replacement-host"),
+            Err(TwoCellRuntimeError::Runtime(RuntimeError::Persistence(
+                crate::PersistenceError::InvalidTransferBoundary(_)
+            )))
+        ));
+    }
+
+    #[test]
     fn reopen_rolls_a_prepared_transfer_forward_exactly_once() {
         let root = tempdir().expect("universe root");
         let seed = 8_032;
         let cells = initialize_boundary_universe(root.path(), seed);
         let mut coordinator = LocalTwoCellRuntime::open(root.path(), seed, 20, "test-host")
             .expect("coordinator opens");
-        let (transfer_id, _, _, _) = prepare_test_transfer(&mut coordinator);
+        let (transfer_id, _, _, _) = prepare_test_transfer(&mut coordinator, true);
         assert_eq!(
             coordinator
                 .directory
@@ -686,13 +888,128 @@ mod tests {
     }
 
     #[test]
+    fn terminal_transfer_reopens_after_ephemeral_artifacts_are_removed() {
+        let root = tempdir().expect("universe root");
+        let seed = 8_037;
+        initialize_boundary_universe(root.path(), seed);
+        let mut coordinator = LocalTwoCellRuntime::open(root.path(), seed, 20, "test-host")
+            .expect("coordinator opens");
+        let completed = coordinator
+            .handoff_player("player-local")
+            .expect("handoff completes");
+        drop(coordinator);
+
+        let artifact_root = root
+            .path()
+            .join("handoff-artifacts")
+            .join(&completed.transfer_id);
+        fs::remove_file(artifact_root.join("package.json")).expect("package artifact removes");
+        fs::remove_file(artifact_root.join("quarantine-receipt.json"))
+            .expect("receipt artifact removes");
+
+        let recovered = LocalTwoCellRuntime::open(root.path(), seed, 20, "successor-host")
+            .expect("terminal proof reopens without package artifacts");
+        assert_eq!(
+            recovered
+                .directory
+                .transfer(&completed.transfer_id)
+                .expect("terminal transfer remains auditable")
+                .phase,
+            TransferPhase::Finalized
+        );
+    }
+
+    #[test]
+    fn successor_recovers_prepare_event_before_directory_proof_cas() {
+        let root = tempdir().expect("universe root");
+        let seed = 8_036;
+        initialize_boundary_universe(root.path(), seed);
+        let mut coordinator = LocalTwoCellRuntime::open(root.path(), seed, 20, "first-host")
+            .expect("first coordinator opens");
+        let (transfer_id, _, _, _) = prepare_test_transfer(&mut coordinator, false);
+        let original_generation = coordinator
+            .directory
+            .transfer(&transfer_id)
+            .expect("prepared transfer exists")
+            .source_assignment_generation;
+        assert!(
+            coordinator
+                .directory
+                .transfer(&transfer_id)
+                .expect("prepared transfer exists")
+                .source_prepare_proof
+                .is_none()
+        );
+        drop(coordinator);
+
+        let recovered = LocalTwoCellRuntime::open(root.path(), seed, 20, "successor-host")
+            .expect("successor reconstructs the proof from the cell boundary");
+        let transfer = recovered
+            .directory
+            .transfer(&transfer_id)
+            .expect("transfer remains auditable");
+        assert_eq!(transfer.phase, TransferPhase::Finalized);
+        assert_eq!(
+            transfer
+                .source_prepare_proof
+                .as_ref()
+                .expect("source proof recovers")
+                .source_assignment_generation,
+            original_generation
+        );
+        assert!(
+            recovered
+                .directory
+                .assignment(&transfer.source_cell_key)
+                .expect("successor source assignment")
+                .assignment_generation
+                > original_generation
+        );
+    }
+
+    #[test]
+    fn successor_holder_recovers_pinned_assignments_and_rolls_forward() {
+        let root = tempdir().expect("universe root");
+        let seed = 8_035;
+        let cells = initialize_boundary_universe(root.path(), seed);
+        let mut coordinator = LocalTwoCellRuntime::open(root.path(), seed, 20, "first-host")
+            .expect("first coordinator opens");
+        let (transfer_id, _, _, _) = prepare_test_transfer(&mut coordinator, true);
+        let source_generation = coordinator
+            .directory
+            .assignment(&cells[0])
+            .expect("source assignment")
+            .assignment_generation;
+        drop(coordinator);
+
+        let recovered = LocalTwoCellRuntime::open(root.path(), seed, 20, "successor-host")
+            .expect("successor coordinator takes over and reconciles");
+        assert!(
+            recovered
+                .directory
+                .assignment(&cells[0])
+                .expect("recovered source assignment")
+                .assignment_generation
+                > source_generation
+        );
+        let transfer = recovered
+            .directory
+            .transfer(&transfer_id)
+            .expect("transfer remains auditable");
+        assert_eq!(transfer.phase, TransferPhase::Finalized);
+        assert!(transfer.import_proof.is_some());
+        assert!(transfer.finalization_proof.is_some());
+    }
+
+    #[test]
     fn reopen_completes_a_directory_committed_transfer() {
         let root = tempdir().expect("universe root");
         let seed = 8_033;
         initialize_boundary_universe(root.path(), seed);
         let mut coordinator = LocalTwoCellRuntime::open(root.path(), seed, 20, "test-host")
             .expect("coordinator opens");
-        let (transfer_id, _, destination_index, package) = prepare_test_transfer(&mut coordinator);
+        let (transfer_id, _, destination_index, package) =
+            prepare_test_transfer(&mut coordinator, true);
         let (_, receipt) = stage_eva_player_quarantine(
             coordinator.cells[destination_index].runtime.state(),
             coordinator.cells[destination_index]
@@ -702,7 +1019,7 @@ mod tests {
             &package,
         )
         .expect("receipt prepares");
-        coordinator.cells[destination_index]
+        let quarantine_proof = coordinator.cells[destination_index]
             .runtime
             .commit_player_transfer_quarantined(&package, &receipt)
             .expect("destination quarantines");
@@ -712,7 +1029,12 @@ mod tests {
             .expect("receipt persists");
         coordinator
             .directory
-            .record_quarantine(&transfer_id, &package.package_hash, &receipt.receipt_hash)
+            .record_quarantine(
+                &transfer_id,
+                &package.package_hash,
+                &receipt.receipt_hash,
+                &quarantine_proof,
+            )
             .expect("directory records quarantine");
         coordinator
             .directory
@@ -740,7 +1062,7 @@ mod tests {
         let mut coordinator = LocalTwoCellRuntime::open(root.path(), seed, 20, "test-host")
             .expect("coordinator opens");
         let (transfer_id, source_index, destination_index, package) =
-            prepare_test_transfer(&mut coordinator);
+            prepare_test_transfer(&mut coordinator, true);
         let (_, receipt) = stage_eva_player_quarantine(
             coordinator.cells[destination_index].runtime.state(),
             coordinator.cells[destination_index]
@@ -750,7 +1072,7 @@ mod tests {
             &package,
         )
         .expect("receipt prepares");
-        coordinator.cells[destination_index]
+        let quarantine_proof = coordinator.cells[destination_index]
             .runtime
             .commit_player_transfer_quarantined(&package, &receipt)
             .expect("destination quarantines");
@@ -760,12 +1082,17 @@ mod tests {
             .expect("receipt persists");
         coordinator
             .directory
-            .record_quarantine(&transfer_id, &package.package_hash, &receipt.receipt_hash)
+            .record_quarantine(
+                &transfer_id,
+                &package.package_hash,
+                &receipt.receipt_hash,
+                &quarantine_proof,
+            )
             .expect("directory records quarantine");
         let aborted = coordinator
             .directory
-            .abort_transfer(&transfer_id)
-            .expect("directory aborts");
+            .request_abort(&transfer_id)
+            .expect("directory begins abort");
         coordinator.cells[source_index]
             .runtime
             .commit_player_transfer_aborted(&package, &aborted)

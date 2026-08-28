@@ -2794,10 +2794,15 @@ mod tests {
         )
         .expect("cell directory opens");
         directory
-            .claim(&source_key, 0, "worker-source")
+            .claim(&source_key, 0, "worker-source", world.fencing_token)
             .expect("source cell claims");
         directory
-            .claim(&destination_key, 0, "worker-destination")
+            .claim(
+                &destination_key,
+                0,
+                "worker-destination",
+                destination.fencing_token,
+            )
             .expect("destination cell claims");
         directory
             .register_placement(
@@ -2820,11 +2825,42 @@ mod tests {
         let (reserved_destination, receipt) =
             crate::stage_eva_player_quarantine(&destination, destination.fencing_token, &package)
                 .expect("destination quarantine commits");
+        let prepare_proof = crate::CellTransferPrepareProof {
+            transfer_id: package.transfer_id.clone(),
+            package_hash: package.package_hash.clone(),
+            source_cell_id: package.source_cell_id.clone(),
+            source_assignment_generation: package.source_assignment_generation,
+            prior_placement_generation: package.prior_placement_generation,
+            source_fencing_token: locked_source.fencing_token,
+            source_event_sequence: locked_source.event_sequence.max(1),
+            source_event_hash: blake3::hash(b"projection-source-prepare")
+                .to_hex()
+                .to_string(),
+            source_world_hash: locked_source.state_hash(),
+        };
+        directory
+            .record_source_prepared(&package.transfer_id, &prepare_proof)
+            .expect("directory records source proof");
+        let quarantine_proof = crate::CellTransferQuarantineProof {
+            transfer_id: package.transfer_id.clone(),
+            package_hash: package.package_hash.clone(),
+            quarantine_receipt_hash: receipt.receipt_hash.clone(),
+            destination_cell_id: package.destination_cell_id.clone(),
+            destination_assignment_generation: package.destination_assignment_generation,
+            resulting_placement_generation: package.resulting_placement_generation,
+            destination_fencing_token: reserved_destination.fencing_token,
+            destination_event_sequence: reserved_destination.event_sequence.max(1),
+            destination_event_hash: blake3::hash(b"projection-destination-quarantine")
+                .to_hex()
+                .to_string(),
+            destination_world_hash: reserved_destination.state_hash(),
+        };
         directory
             .record_quarantine(
                 &package.transfer_id,
                 &package.package_hash,
                 &receipt.receipt_hash,
+                &quarantine_proof,
             )
             .expect("directory records quarantine");
         let committed = directory

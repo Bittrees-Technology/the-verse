@@ -393,7 +393,7 @@ mod tests {
     const CONTENT_HASH: &str = "fc61c05b335fb951868010ecf2942a92ec4f03d00d0a75d3acba8c6f5162b6bd";
     const UNIVERSE_ID: &str = "the-verse-local";
     const REGISTRY_HASH: &str = "4c367bbfa04218ece14104f0a3a7ec2c7e9fefcc37d4cf78a265df2d711a59da";
-    const MANIFEST_HASH: &str = "ce89422bd5d0c4a2ddc50f22883439a7ee1ecd7dd14165a46bb500623fd0b7eb";
+    const MANIFEST_HASH: &str = "3e93c305169eeecee44f2630e57ad183b319375197547344c45e1509e8aaf76b";
 
     fn session() -> AdapterSession {
         let mut session = AdapterSession::default();
@@ -433,7 +433,7 @@ mod tests {
                     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                     "universe-vector",
                     "f00517b0fbef09d7924fde2cb11f2c74066627992ab900a6a9e0bd3ac3dc7311",
-                    "a3d5eb718f859d6010854f231a0e2cb4518c9618580020762311b4c3e43e3e06",
+                    "551b4f30761a3fe8eed2bc3a9525e46f81d16563f9118b305bf5f2a3b9e63346",
                 ))
                 .expect("vector verifier config"),
             ),

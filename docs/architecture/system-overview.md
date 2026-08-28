@@ -182,6 +182,17 @@ durable directory. Each cell has an independent P1.6 lifecycle, store root,
 assignment generation, lease, and fencing token. A canonical `CellKeyV1`
 derives stable routing identity without depending on worker names or paths.
 
+The cell store is fenced before a directory assignment advances, and the
+directory retains the immutable assignment-generation-to-store-fence mapping.
+Every transfer phase is admitted from an exact canonical cell event proof in a
+lifecycle-anchored transfer-boundary hash chain, rather than from mutable
+current world state.
+
+Directory-managed cell roots reject the standalone runtime constructor. Only
+the universe coordinator holds the internal open capability, and it completes
+assignment binding, transfer reconciliation, and resident registration before
+a future multi-cell gateway may admit a gameplay session.
+
 An EVA actor or isolated ordinary unanchored grid crosses through one durable
 handoff saga. The source locks the complete dependency closure and publishes an
 immutable package, the destination validates it into non-live quarantine, and
@@ -190,11 +201,15 @@ that commit recovery may abort to the source; afterward only destination
 roll-forward is legal. Import, source finalization, operation retry history,
 and the transfer-linked destination view are all idempotent.
 
+Abort is a two-cell cleanup saga: the directory first enters `Aborting`, pins
+both assignments, collects canonical source and destination cleanup proofs,
+and only then restores source residency as terminal `Aborted`.
+
 The coordinated P1.7 boundary is protocol `18`, projection schema `4`, world
 schema `20`, event schema `16`, content schema `11`, content manifest
 `p1.5.0`, registry schema `1`, universe manifest schema `4`, interest schema
-`2`, operation fingerprint schema `2`, lifecycle-control schema `1`,
-production-occurrence schema `1`, cell-directory schema `1`, and transfer
+`2`, operation fingerprint schema `2`, lifecycle-control schema `2`,
+production-occurrence schema `1`, cell-directory schema `2`, and transfer
 schema `1`.
 
 This slice does not establish multi-host control-plane availability,
@@ -202,6 +217,11 @@ cross-cell physics or systems, arbitrary cell counts, static/oversized
 structure partitioning, frontier materialization, or a production-capacity
 claim. The complete contract is
 [F-061](../gameplay/durable-two-cell-handoff.md).
+
+This proof also does not yet implement bounded compaction of terminal transfer
+records, assignment-fence history, transfer-boundary journals, or world
+witnesses. Production-scale retention requires a future hash-chained archival
+and compaction design that preserves verification of retained roots.
 
 ## Initial implementation choice
 

@@ -1065,7 +1065,7 @@ mod tests {
         .expect("golden manifest builds");
         assert_eq!(
             manifest.lifecycle_policy_hash,
-            "5bc077cc8a2eb101fcaecdce5513c13aa243e1f68a5af839a602dd689859ff3a"
+            "8abc99b5e076bd89a8914c3727560baaa82433b1b1b4191b2379355ac7d81471"
         );
         assert_eq!(
             registry.registry_hash,
@@ -1073,7 +1073,7 @@ mod tests {
         );
         assert_eq!(
             manifest.manifest_hash,
-            "ce89422bd5d0c4a2ddc50f22883439a7ee1ecd7dd14165a46bb500623fd0b7eb"
+            "3e93c305169eeecee44f2630e57ad183b319375197547344c45e1509e8aaf76b"
         );
     }
 

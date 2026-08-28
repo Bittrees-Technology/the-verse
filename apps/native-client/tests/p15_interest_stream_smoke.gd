@@ -379,9 +379,9 @@ func _manifest() -> Dictionary:
 		"content_hash": HASH_C,
 		"world_schema_version": 20,
 		"event_schema_version": 16,
-		"lifecycle_control_schema_version": 1,
+		"lifecycle_control_schema_version": 2,
 		"production_schedule_occurrence_schema_version": 1,
-		"lifecycle_policy_hash": "5bc077cc8a2eb101fcaecdce5513c13aa243e1f68a5af839a602dd689859ff3a",
+		"lifecycle_policy_hash": "8abc99b5e076bd89a8914c3727560baaa82433b1b1b4191b2379355ac7d81471",
 	}
 
 

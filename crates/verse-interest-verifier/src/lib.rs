@@ -3099,7 +3099,7 @@ mod tests {
             Some(concat!(
                 "{\"type\":\"acknowledge_interest\",\"session_epoch\":\"session-1\",",
                 "\"interest_epoch\":41,\"baseline_id\":\"baseline-1\",\"delta_sequence\":0,",
-                "\"view_hash\":\"5e73febfbce403ff0da41746233e02d27aaf0bdb7b0b9a1a6196aedd6995204d\"}"
+                "\"view_hash\":\"b621be02b9ca425e349809a5c2b11cd6aa4beadbcf72ef28b17901f00de5c96d\"}"
             ))
         );
 
@@ -3387,7 +3387,7 @@ mod tests {
     fn empty_spectator_view_hash_is_frozen() {
         assert_eq!(
             view_state(0).view_hash,
-            "5e73febfbce403ff0da41746233e02d27aaf0bdb7b0b9a1a6196aedd6995204d"
+            "b621be02b9ca425e349809a5c2b11cd6aa4beadbcf72ef28b17901f00de5c96d"
         );
     }
 }

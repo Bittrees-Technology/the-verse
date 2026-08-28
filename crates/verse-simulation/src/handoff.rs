@@ -863,16 +863,15 @@ pub fn stage_prepared_eva_lock(
         validate_staged_world(source)?;
         return Ok(source.clone());
     }
-    if source.state_hash() != package.source_world_hash
-        || source.cell_id != package.source_cell_id
-        || source.fencing_token != package.source_fencing_token
+    if source.cell_id != package.source_cell_id
+        || source.fencing_token < package.source_fencing_token
         || source.player.get(&package.aggregate_id) != Some(&package.source_player)
         || source.inventories.get(&package.inventory.inventory_id) != Some(&package.inventory)
         || source.processed_operations.get(&package.aggregate_id)
             != package.operation_history.as_ref()
     {
         return Err(HandoffError::CommittedStateRejected(
-            "source world no longer matches the exact prepare boundary".into(),
+            "source transfer closure no longer matches the prepared package".into(),
         ));
     }
     if source.production_queues.values().flatten().any(|job| {
@@ -897,9 +896,9 @@ pub fn stage_aborted_eva_unlock(
     transfer: &CellTransferRecord,
 ) -> Result<WorldState, HandoffError> {
     package.validate()?;
-    if transfer.phase != TransferPhase::Aborted {
+    if transfer.phase != TransferPhase::Aborting {
         return Err(HandoffError::CommittedStateRejected(
-            "only a directory-aborted transfer may unlock its source player".into(),
+            "only a directory-aborting transfer may clean its cell state".into(),
         ));
     }
     validate_transfer_identity(package, transfer)?;
@@ -1191,8 +1190,9 @@ mod tests {
     use super::*;
     use crate::model::WORLD_SCHEMA_VERSION;
     use crate::{
-        EVENT_SCHEMA_VERSION, EventPayload, LocalCellDirectory, MobileAggregateKind, Store,
-        neighbor_cell_key, proof_cell_keys, universe_manifest,
+        CellTransferFinalizationProof, CellTransferImportProof, CellTransferPrepareProof,
+        CellTransferQuarantineProof, EVENT_SCHEMA_VERSION, EventPayload, LocalCellDirectory,
+        MobileAggregateKind, Store, neighbor_cell_key, proof_cell_keys, universe_manifest,
     };
     use tempfile::tempdir;
     use verse_protocol::ClientMessage;
@@ -1342,10 +1342,10 @@ mod tests {
         )
         .expect("directory opens");
         directory
-            .claim(&origin, 0, "worker-origin")
+            .claim(&origin, 0, "worker-origin", source.fencing_token)
             .expect("source assignment commits");
         directory
-            .claim(&east, 0, "worker-east")
+            .claim(&east, 0, "worker-east", destination.fencing_token)
             .expect("destination assignment commits");
         directory
             .register_placement("player-local", MobileAggregateKind::Player, &origin)
@@ -1398,11 +1398,40 @@ mod tests {
             )
             .is_err()
         );
+        let prepare_proof = CellTransferPrepareProof {
+            transfer_id: package.transfer_id.clone(),
+            package_hash: package.package_hash.clone(),
+            source_cell_id: package.source_cell_id.clone(),
+            source_assignment_generation: package.source_assignment_generation,
+            prior_placement_generation: package.prior_placement_generation,
+            source_fencing_token: locked_source.fencing_token,
+            source_event_sequence: locked_source.event_sequence.max(1),
+            source_event_hash: blake3::hash(b"source-prepare-event").to_hex().to_string(),
+            source_world_hash: locked_source.state_hash(),
+        };
+        directory
+            .record_source_prepared(&package.transfer_id, &prepare_proof)
+            .expect("source prepare proof commits");
+        let quarantine_proof = CellTransferQuarantineProof {
+            transfer_id: package.transfer_id.clone(),
+            package_hash: package.package_hash.clone(),
+            quarantine_receipt_hash: receipt.receipt_hash.clone(),
+            destination_cell_id: package.destination_cell_id.clone(),
+            destination_assignment_generation: package.destination_assignment_generation,
+            resulting_placement_generation: package.resulting_placement_generation,
+            destination_fencing_token: reserved_destination.fencing_token,
+            destination_event_sequence: reserved_destination.event_sequence.max(1),
+            destination_event_hash: blake3::hash(b"destination-quarantine-event")
+                .to_hex()
+                .to_string(),
+            destination_world_hash: reserved_destination.state_hash(),
+        };
         directory
             .record_quarantine(
                 &package.transfer_id,
                 &package.package_hash,
                 &receipt.receipt_hash,
+                &quarantine_proof,
             )
             .expect("quarantine receipt commits");
         let committed = directory
@@ -1415,6 +1444,22 @@ mod tests {
         let mut recovered_destination = reserved_destination;
         recovered_destination.simulation_tick += 1;
         recovered_destination.fencing_token += 1;
+        let source_recovery = directory
+            .recover_assignment(
+                &origin,
+                committed.source_assignment_generation,
+                "worker-origin",
+                recovered_source.fencing_token,
+            )
+            .expect("source assignment recovery binds its newer fence");
+        let destination_recovery = directory
+            .recover_assignment(
+                &east,
+                committed.destination_assignment_generation,
+                "worker-east",
+                recovered_destination.fencing_token,
+            )
+            .expect("destination assignment recovery binds its newer fence");
         let exported = stage_committed_eva_export(&recovered_source, &package, &committed)
             .expect("source export stages atomically");
         let imported =
@@ -1464,11 +1509,38 @@ mod tests {
             imported
         );
 
+        let import_proof = CellTransferImportProof {
+            transfer_id: package.transfer_id.clone(),
+            package_hash: package.package_hash.clone(),
+            quarantine_receipt_hash: receipt.receipt_hash.clone(),
+            destination_cell_id: imported.cell_id.clone(),
+            destination_assignment_generation: destination_recovery.assignment_generation,
+            resulting_placement_generation: committed.resulting_placement_generation,
+            destination_fencing_token: imported.fencing_token,
+            destination_event_sequence: imported.event_sequence.max(1),
+            destination_event_hash: blake3::hash(b"destination-import-event")
+                .to_hex()
+                .to_string(),
+            destination_world_hash: imported.state_hash(),
+        };
         let imported_record = directory
-            .record_imported(&package.transfer_id)
+            .record_imported(&package.transfer_id, &import_proof)
             .expect("directory records destination import");
+        let finalization_proof = CellTransferFinalizationProof {
+            transfer_id: package.transfer_id.clone(),
+            package_hash: package.package_hash.clone(),
+            source_cell_id: exported.cell_id.clone(),
+            source_assignment_generation: source_recovery.assignment_generation,
+            resulting_placement_generation: committed.resulting_placement_generation,
+            source_fencing_token: exported.fencing_token,
+            source_event_sequence: exported.event_sequence.max(1),
+            source_event_hash: blake3::hash(b"source-finalization-event")
+                .to_hex()
+                .to_string(),
+            source_world_hash: exported.state_hash(),
+        };
         let finalized = directory
-            .finalize_transfer(&package.transfer_id)
+            .finalize_transfer(&package.transfer_id, &finalization_proof)
             .expect("directory finalizes handoff");
         assert_eq!(imported_record.phase, TransferPhase::Imported);
         assert_eq!(finalized.phase, TransferPhase::Finalized);
@@ -1506,10 +1578,27 @@ mod tests {
             resulting_placement_generation: package.resulting_placement_generation,
             package_hash: package.package_hash.clone(),
             quarantine_receipt_hash: Some(receipt.receipt_hash.clone()),
+            source_prepare_proof: None,
+            destination_quarantine_proof: None,
+            import_proof: None,
+            finalization_proof: None,
+            source_abort_proof: None,
+            destination_abort_proof: None,
             phase: TransferPhase::Quarantined,
         };
-        let locked_source = stage_prepared_eva_lock(&source, &package, &transfer)
-            .expect("quarantined source lock reconciles");
+        let mut unrelated_source = source.clone();
+        unrelated_source.simulation_tick += 1;
+        unrelated_source.fencing_token += 1;
+        let locked_source = stage_prepared_eva_lock(&unrelated_source, &package, &transfer)
+            .expect("unrelated activity and a newer valid fence preserve the closure CAS");
+        let mut changed_closure = unrelated_source;
+        changed_closure
+            .inventories
+            .get_mut(&package.inventory.inventory_id)
+            .expect("carried inventory exists")
+            .contents
+            .ore += 1;
+        assert!(stage_prepared_eva_lock(&changed_closure, &package, &transfer).is_err());
         assert!(stage_committed_eva_export(&locked_source, &package, &transfer).is_err());
         assert!(
             stage_committed_eva_import(&reserved_destination, &package, &receipt, &transfer)
@@ -1517,7 +1606,7 @@ mod tests {
         );
 
         let mut aborted = transfer.clone();
-        aborted.phase = TransferPhase::Aborted;
+        aborted.phase = TransferPhase::Aborting;
         let unlocked = stage_aborted_eva_unlock(&locked_source, &package, &aborted)
             .expect("precommit abort unlocks exact source closure");
         assert!(!unlocked.player_transfer_locks.contains_key("player-local"));
@@ -1640,6 +1729,12 @@ mod tests {
             resulting_placement_generation: package.resulting_placement_generation,
             package_hash: package.package_hash.clone(),
             quarantine_receipt_hash: None,
+            source_prepare_proof: None,
+            destination_quarantine_proof: None,
+            import_proof: None,
+            finalization_proof: None,
+            source_abort_proof: None,
+            destination_abort_proof: None,
             phase: TransferPhase::Prepared,
         };
         let prepare_event = source.prepare_system_event(EventPayload::PlayerTransferPrepared {
@@ -1798,6 +1893,12 @@ mod tests {
             resulting_placement_generation: package.resulting_placement_generation,
             package_hash: package.package_hash.clone(),
             quarantine_receipt_hash: None,
+            source_prepare_proof: None,
+            destination_quarantine_proof: None,
+            import_proof: None,
+            finalization_proof: None,
+            source_abort_proof: None,
+            destination_abort_proof: None,
             phase: TransferPhase::Prepared,
         };
         let prepare_event = source.prepare_system_event(EventPayload::PlayerTransferPrepared {
