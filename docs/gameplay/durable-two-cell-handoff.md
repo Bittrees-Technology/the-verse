@@ -629,9 +629,17 @@ gameplay activation lock is still pending; later activation neither recreates
 nor delays it. Dormant directory v3 persists and reconstructs both typed
 destination import and
 activation proofs, and Imported/Finalized retries must match the local
-historical results exactly. Source finalization, the active event-17 runtime
-scheduler and durable wake-up path, and persistence failpoint crash/replay
-integration remain to be implemented before activation. All drafts are
+historical results exactly. A separate dormant source-finalization transaction
+now consumes that authenticated chain only after destination activation. It
+advances one source event, changes no gameplay or economy family, retains the
+export conservation witness, writes a compact active tombstone, and archives
+the full import/activation-linked finalization record outside the active-world
+projection. Restart validation reconstructs the exact predecessor at the
+finalization frontier. Cell-first and directory-first retries are exact, while
+a directory-finalized transfer with no local finalization event fails closed.
+The active event-17 runtime/store adapter, scheduler and durable wake-up path,
+and persistence failpoint crash/replay integration remain to be implemented
+before activation. All drafts are
 intentionally unreachable from the production directory-v2/package-v1 paths
 until every version in the table above moves in one coordinated activation.
 The dormant proof harness retains bounded predecessor projections for replay;

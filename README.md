@@ -217,10 +217,15 @@ another handoff while a cell-bound hold remains fail closed. Release may
 precede the independent gameplay activation because its boundary is derived
 from import time. Dormant directory v3 persists and reconstructs both typed
 import and activation proofs; late Imported/Finalized retries require exact
-equality with the local historical results. Source finalization,
-event-17/runtime scheduler and durable wake-up wiring, and the persistence
-failpoint crash matrix remain disabled until their atomic paths are
-implemented. The dormant proof harness also remains bounded and
+equality with the local historical results. The dormant source-finalization
+transaction now requires those exact directory-retained proofs, advances one
+source event without changing gameplay or economy state, and commits both a
+compact active tombstone and a full historical proof chain. It rejects
+pre-activation, backdated, substituted, missing-local-event, and stale-fence
+attempts; exact cell-first and directory-first retries survive restart. The
+event-17 runtime/store adapter, durable scheduler wake-up wiring, and the
+persistence failpoint crash matrix remain disabled until their atomic paths
+are implemented. The dormant proof harness also remains bounded and
 snapshot-heavy; activation must place occurrence durability in the canonical
 event journal and reserve evidence capacity before accepting an import.
 Production remains

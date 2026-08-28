@@ -18,7 +18,8 @@ use crate::cell_directory::{
 };
 use crate::grid_handoff_v2::state::{
     DraftGridAbortCleanupProofV2, DraftGridActivationProofV2, DraftGridExportProofV2,
-    DraftGridImportProofV2, DraftGridTransferAbortSideV2, DraftGridTransferLedgerVectorV2,
+    DraftGridFinalizationProofV2, DraftGridImportProofV2, DraftGridTransferAbortSideV2,
+    DraftGridTransferLedgerVectorV2,
 };
 use crate::{celestial, model::valid_blake3_hex};
 
@@ -74,6 +75,7 @@ pub(super) struct DirectoryPhaseProofV3 {
     export_proof_hash: Option<String>,
     import_proof_hash: Option<String>,
     activation_proof_hash: Option<String>,
+    finalization_proof_hash: Option<String>,
     destination_import_proof_hash: Option<String>,
     prior_event_sequence: Option<u64>,
     prior_event_hash: Option<String>,
@@ -81,6 +83,7 @@ pub(super) struct DirectoryPhaseProofV3 {
     prior_active_world_hash: Option<String>,
     quarantined_at_unix_ms: Option<u64>,
     imported_at_unix_ms: Option<u64>,
+    destination_activated_at_unix_ms: Option<u64>,
     source_export_proof_hash: Option<String>,
     source_exported_at_unix_ms: Option<u64>,
     destination_production_lifecycle_generation: Option<u64>,
@@ -190,6 +193,37 @@ impl DirectoryPhaseProofV3 {
             proof_hash: self.activation_proof_hash.clone()?,
         };
         activation.validate().is_ok().then_some(activation)
+    }
+
+    fn source_finalization_cell_proof(
+        &self,
+        root_aggregate_id: &str,
+    ) -> Option<DraftGridFinalizationProofV2> {
+        let finalization = DraftGridFinalizationProofV2 {
+            transfer_id: self.transfer_id.clone(),
+            root_aggregate_id: root_aggregate_id.to_owned(),
+            member_root: self.member_root.clone(),
+            package_hash: self.package_hash.clone(),
+            source_cell_id: self.cell_id.clone(),
+            assignment_generation: self.assignment_generation,
+            fencing_token: self.fencing_token,
+            prior_event_sequence: self.prior_event_sequence?,
+            prior_event_hash: self.prior_event_hash.clone()?,
+            event_sequence: self.event_sequence,
+            event_hash: self.event_hash.clone(),
+            prior_active_world_hash: self.prior_active_world_hash.clone()?,
+            resulting_active_world_hash: self.world_hash.clone(),
+            source_export_proof_hash: self.source_export_proof_hash.clone()?,
+            source_exported_at_unix_ms: self.source_exported_at_unix_ms?,
+            destination_import_proof_hash: self.destination_import_proof_hash.clone()?,
+            imported_at_unix_ms: self.imported_at_unix_ms?,
+            destination_activation_proof_hash: self.activation_proof_hash.clone()?,
+            activated_at_unix_ms: self.destination_activated_at_unix_ms?,
+            finalized_at_unix_ms: self.trusted_time_unix_ms?,
+            mutation_witness_hash: self.mutation_witness_hash.clone()?,
+            proof_hash: self.finalization_proof_hash.clone()?,
+        };
+        finalization.validate().is_ok().then_some(finalization)
     }
 }
 
@@ -394,6 +428,11 @@ impl ValidatedGridTransferAuthorityV3 {
 
     pub(super) fn source_finalization_proof(&self) -> Option<&DirectoryPhaseProofV3> {
         self.record.finalization_proof.as_ref()
+    }
+
+    pub(super) fn source_finalization_cell_proof(&self) -> Option<DraftGridFinalizationProofV2> {
+        let proof = self.record.finalization_proof.as_ref()?;
+        proof.source_finalization_cell_proof(&self.record.root_aggregate_id)
     }
 
     pub(super) fn source_abort_proven(&self) -> bool {
@@ -738,6 +777,9 @@ impl CellTransferRecordV3 {
         if let Some(hash) = &proof.activation_proof_hash {
             validate_hash(hash, "destination-activation proof")?;
         }
+        if let Some(hash) = &proof.finalization_proof_hash {
+            validate_hash(hash, "source-finalization proof")?;
+        }
         if let Some(hash) = &proof.destination_import_proof_hash {
             validate_hash(hash, "activation destination-import proof")?;
         }
@@ -870,6 +912,13 @@ impl CellTransferRecordV3 {
                             && proof.source_exported_at_unix_ms
                                 == source_export.trusted_time_unix_ms
                     })
+        } else if expected_kind == DirectoryPhaseProofKindV3::SourceFinalization {
+            proof.import_proof_hash.is_none()
+                && proof.prior_draft_world_hash.is_none()
+                && proof.quarantined_at_unix_ms.is_none()
+                && proof.source_export_proof_hash.is_some()
+                && proof.source_exported_at_unix_ms.is_some()
+                && proof.destination_production_lifecycle_generation.is_none()
         } else {
             proof.import_proof_hash.is_none()
                 && proof.prior_draft_world_hash.is_none()
@@ -946,16 +995,55 @@ impl CellTransferRecordV3 {
                                 && proof.prior_active_world_hash.as_deref()
                                     == Some(import.world_hash.as_str())))
                 })
+        } else if expected_kind == DirectoryPhaseProofKindV3::SourceFinalization {
+            proof.activation_proof_hash.is_some()
+                && proof.destination_import_proof_hash.is_some()
+                && proof.prior_active_world_hash.is_some()
+                && proof.imported_at_unix_ms.is_some()
         } else {
             proof.activation_proof_hash.is_none()
                 && proof.destination_import_proof_hash.is_none()
                 && proof.prior_active_world_hash.is_none()
                 && proof.imported_at_unix_ms.is_none()
         };
+        let finalization_binding_valid = if expected_kind
+            == DirectoryPhaseProofKindV3::SourceFinalization
+        {
+            proof
+                .source_finalization_cell_proof(&self.root_aggregate_id)
+                .is_some_and(|finalization| {
+                    finalization.validate().is_ok()
+                        && self.source_export_proof.as_ref().is_some_and(|export| {
+                            export.export_proof_hash.as_deref()
+                                == Some(finalization.source_export_proof_hash.as_str())
+                                && export.trusted_time_unix_ms
+                                    == Some(finalization.source_exported_at_unix_ms)
+                        })
+                        && self.import_proof.as_ref().is_some_and(|import| {
+                            import.import_proof_hash.as_deref()
+                                == Some(finalization.destination_import_proof_hash.as_str())
+                                && import.trusted_time_unix_ms
+                                    == Some(finalization.imported_at_unix_ms)
+                        })
+                        && self
+                            .destination_activation_proof
+                            .as_ref()
+                            .is_some_and(|activation| {
+                                activation.activation_proof_hash.as_deref()
+                                    == Some(finalization.destination_activation_proof_hash.as_str())
+                                    && activation.trusted_time_unix_ms
+                                        == Some(finalization.activated_at_unix_ms)
+                            })
+                })
+        } else {
+            proof.finalization_proof_hash.is_none()
+                && proof.destination_activated_at_unix_ms.is_none()
+        };
         let has_event_predecessor = matches!(
             expected_kind,
             DirectoryPhaseProofKindV3::DestinationImport
                 | DirectoryPhaseProofKindV3::DestinationActivation
+                | DirectoryPhaseProofKindV3::SourceFinalization
         );
         let event_predecessor_valid = has_event_predecessor
             == (proof.prior_event_sequence.is_some() && proof.prior_event_hash.is_some());
@@ -969,6 +1057,7 @@ impl CellTransferRecordV3 {
             DirectoryPhaseProofKindV3::SourceExport
                 | DirectoryPhaseProofKindV3::DestinationImport
                 | DirectoryPhaseProofKindV3::DestinationActivation
+                | DirectoryPhaseProofKindV3::SourceFinalization
         ) {
             proof.mutation_witness_hash.is_some() && proof.trusted_time_unix_ms.is_some()
         } else {
@@ -1031,6 +1120,7 @@ impl CellTransferRecordV3 {
             || !export_binding_valid
             || !import_binding_valid
             || !activation_binding_valid
+            || !finalization_binding_valid
             || !event_predecessor_valid
             || !production_root_valid
             || !shared_handoff_binding_valid
@@ -1651,6 +1741,7 @@ fn stage_v3_destination_imported(
         export_proof_hash: None,
         import_proof_hash: Some(import.proof_hash.clone()),
         activation_proof_hash: None,
+        finalization_proof_hash: None,
         destination_import_proof_hash: None,
         prior_event_sequence: Some(import.prior_event_sequence),
         prior_event_hash: Some(import.prior_event_hash.clone()),
@@ -1658,6 +1749,7 @@ fn stage_v3_destination_imported(
         prior_active_world_hash: None,
         quarantined_at_unix_ms: Some(import.quarantined_at_unix_ms),
         imported_at_unix_ms: None,
+        destination_activated_at_unix_ms: None,
         source_export_proof_hash: Some(import.source_export_proof_hash.clone()),
         source_exported_at_unix_ms: Some(import.source_exported_at_unix_ms),
         destination_production_lifecycle_generation: Some(
@@ -1751,6 +1843,7 @@ fn stage_v3_source_exported(
         export_proof_hash: Some(export.proof_hash.clone()),
         import_proof_hash: None,
         activation_proof_hash: None,
+        finalization_proof_hash: None,
         destination_import_proof_hash: None,
         prior_event_sequence: None,
         prior_event_hash: None,
@@ -1758,6 +1851,7 @@ fn stage_v3_source_exported(
         prior_active_world_hash: None,
         quarantined_at_unix_ms: None,
         imported_at_unix_ms: None,
+        destination_activated_at_unix_ms: None,
         source_export_proof_hash: None,
         source_exported_at_unix_ms: None,
         destination_production_lifecycle_generation: None,
@@ -1840,6 +1934,7 @@ fn stage_v3_destination_activated(
         export_proof_hash: None,
         import_proof_hash: None,
         activation_proof_hash: Some(activation.proof_hash.clone()),
+        finalization_proof_hash: None,
         destination_import_proof_hash: Some(activation.destination_import_proof_hash.clone()),
         prior_event_sequence: Some(activation.prior_event_sequence),
         prior_event_hash: Some(activation.prior_event_hash.clone()),
@@ -1847,6 +1942,7 @@ fn stage_v3_destination_activated(
         prior_active_world_hash: Some(activation.prior_active_world_hash.clone()),
         quarantined_at_unix_ms: None,
         imported_at_unix_ms: Some(activation.imported_at_unix_ms),
+        destination_activated_at_unix_ms: None,
         source_export_proof_hash: None,
         source_exported_at_unix_ms: None,
         destination_production_lifecycle_generation: None,
@@ -1896,7 +1992,63 @@ fn apply_v3_destination_activation_proof(
     finish_v3_transaction(document, next)
 }
 
-fn stage_v3_finalize(
+fn stage_v3_source_finalized(
+    document: &CellDirectoryDocumentV3,
+    transfer_id: &str,
+    finalization: &DraftGridFinalizationProofV2,
+) -> Result<CellDirectoryDocumentV3, CellDirectoryError> {
+    finalization.validate().map_err(|source| {
+        invalid(format!(
+            "grid source-finalization proof is invalid: {source}"
+        ))
+    })?;
+    document.validate()?;
+    let current = v3_transfer(document, transfer_id)?;
+    if finalization.root_aggregate_id != current.root_aggregate_id {
+        return Err(conflict(
+            transfer_id,
+            "v3 source-finalization proof changed its root aggregate",
+        ));
+    }
+    let proof = DirectoryPhaseProofV3 {
+        kind: DirectoryPhaseProofKindV3::SourceFinalization,
+        transfer_id: finalization.transfer_id.clone(),
+        member_root: finalization.member_root.clone(),
+        package_hash: finalization.package_hash.clone(),
+        cell_id: finalization.source_cell_id.clone(),
+        assignment_generation: finalization.assignment_generation,
+        fencing_token: finalization.fencing_token,
+        event_sequence: finalization.event_sequence,
+        event_hash: finalization.event_hash.clone(),
+        world_hash: finalization.resulting_active_world_hash.clone(),
+        quarantine_receipt_hash: None,
+        export_proof_hash: None,
+        import_proof_hash: None,
+        activation_proof_hash: Some(finalization.destination_activation_proof_hash.clone()),
+        finalization_proof_hash: Some(finalization.proof_hash.clone()),
+        destination_import_proof_hash: Some(finalization.destination_import_proof_hash.clone()),
+        prior_event_sequence: Some(finalization.prior_event_sequence),
+        prior_event_hash: Some(finalization.prior_event_hash.clone()),
+        prior_draft_world_hash: None,
+        prior_active_world_hash: Some(finalization.prior_active_world_hash.clone()),
+        quarantined_at_unix_ms: None,
+        imported_at_unix_ms: Some(finalization.imported_at_unix_ms),
+        destination_activated_at_unix_ms: Some(finalization.activated_at_unix_ms),
+        source_export_proof_hash: Some(finalization.source_export_proof_hash.clone()),
+        source_exported_at_unix_ms: Some(finalization.source_exported_at_unix_ms),
+        destination_production_lifecycle_generation: None,
+        production_eligibility_root: None,
+        mutation_witness_hash: Some(finalization.mutation_witness_hash.clone()),
+        ledger_vector: None,
+        trusted_time_unix_ms: Some(finalization.finalized_at_unix_ms),
+        abort_witness_hash: None,
+        resulting_draft_world_hash: None,
+        abort_removed_authority: None,
+    };
+    apply_v3_source_finalization_proof(document, transfer_id, &proof)
+}
+
+fn apply_v3_source_finalization_proof(
     document: &CellDirectoryDocumentV3,
     transfer_id: &str,
     proof: &DirectoryPhaseProofV3,
@@ -1988,6 +2140,7 @@ fn stage_v3_abort_cleanup(
         export_proof_hash: None,
         import_proof_hash: None,
         activation_proof_hash: None,
+        finalization_proof_hash: None,
         destination_import_proof_hash: None,
         prior_event_sequence: None,
         prior_event_hash: None,
@@ -1995,6 +2148,7 @@ fn stage_v3_abort_cleanup(
         prior_active_world_hash: None,
         quarantined_at_unix_ms: None,
         imported_at_unix_ms: None,
+        destination_activated_at_unix_ms: None,
         source_export_proof_hash: None,
         source_exported_at_unix_ms: None,
         destination_production_lifecycle_generation: None,
@@ -2484,6 +2638,7 @@ mod tests {
             export_proof_hash: None,
             import_proof_hash: None,
             activation_proof_hash: None,
+            finalization_proof_hash: None,
             destination_import_proof_hash: None,
             prior_event_sequence: None,
             prior_event_hash: None,
@@ -2491,6 +2646,7 @@ mod tests {
             prior_active_world_hash: None,
             quarantined_at_unix_ms: None,
             imported_at_unix_ms: None,
+            destination_activated_at_unix_ms: None,
             source_export_proof_hash: None,
             source_exported_at_unix_ms: None,
             destination_production_lifecycle_generation: None,
@@ -2688,6 +2844,93 @@ mod tests {
             proof.mutation_witness_hash = Some(activation.mutation_witness_hash);
             proof.trusted_time_unix_ms = Some(activation.activated_at_unix_ms);
         }
+        if kind == DirectoryPhaseProofKindV3::SourceFinalization {
+            let source_export = transfer.source_export_proof.as_ref();
+            let destination_import = transfer.import_proof.as_ref();
+            let destination_activation = transfer.destination_activation_proof.as_ref();
+            let source_export_proof_hash = source_export
+                .and_then(|export| export.export_proof_hash.clone())
+                .unwrap_or_else(|| blake3::hash(b"source export proof").to_hex().to_string());
+            let source_exported_at_unix_ms = source_export
+                .and_then(|export| export.trusted_time_unix_ms)
+                .unwrap_or(1_800_000_000_000);
+            let destination_import_proof_hash = destination_import
+                .and_then(|import| import.import_proof_hash.clone())
+                .unwrap_or_else(|| {
+                    blake3::hash(b"destination import proof")
+                        .to_hex()
+                        .to_string()
+                });
+            let imported_at_unix_ms = destination_import
+                .and_then(|import| import.trusted_time_unix_ms)
+                .unwrap_or(1_800_000_001_000);
+            let destination_activation_proof_hash = destination_activation
+                .and_then(|activation| activation.activation_proof_hash.clone())
+                .unwrap_or_else(|| {
+                    blake3::hash(b"destination activation proof")
+                        .to_hex()
+                        .to_string()
+                });
+            let activated_at_unix_ms = destination_activation
+                .and_then(|activation| activation.trusted_time_unix_ms)
+                .unwrap_or(imported_at_unix_ms + 1_000);
+            let mut finalization = DraftGridFinalizationProofV2 {
+                transfer_id: proof.transfer_id.clone(),
+                root_aggregate_id: transfer.root_aggregate_id.clone(),
+                member_root: proof.member_root.clone(),
+                package_hash: proof.package_hash.clone(),
+                source_cell_id: proof.cell_id.clone(),
+                assignment_generation: proof.assignment_generation,
+                fencing_token: proof.fencing_token,
+                prior_event_sequence: proof.event_sequence - 1,
+                prior_event_hash: source_export.map_or_else(
+                    || {
+                        blake3::hash(b"source finalization prior event")
+                            .to_hex()
+                            .to_string()
+                    },
+                    |export| export.event_hash.clone(),
+                ),
+                event_sequence: proof.event_sequence,
+                event_hash: String::new(),
+                prior_active_world_hash: source_export.map_or_else(
+                    || {
+                        blake3::hash(b"source finalization prior world")
+                            .to_hex()
+                            .to_string()
+                    },
+                    |export| export.world_hash.clone(),
+                ),
+                resulting_active_world_hash: proof.world_hash.clone(),
+                source_export_proof_hash,
+                source_exported_at_unix_ms,
+                destination_import_proof_hash,
+                imported_at_unix_ms,
+                destination_activation_proof_hash,
+                activated_at_unix_ms,
+                finalized_at_unix_ms: activated_at_unix_ms + 1_000,
+                mutation_witness_hash: blake3::hash(b"source finalization mutation")
+                    .to_hex()
+                    .to_string(),
+                proof_hash: String::new(),
+            };
+            finalization
+                .seal_hashes_for_test()
+                .expect("source finalization proof seals");
+            proof.event_hash = finalization.event_hash;
+            proof.activation_proof_hash = Some(finalization.destination_activation_proof_hash);
+            proof.finalization_proof_hash = Some(finalization.proof_hash);
+            proof.destination_import_proof_hash = Some(finalization.destination_import_proof_hash);
+            proof.prior_event_sequence = Some(finalization.prior_event_sequence);
+            proof.prior_event_hash = Some(finalization.prior_event_hash);
+            proof.prior_active_world_hash = Some(finalization.prior_active_world_hash);
+            proof.imported_at_unix_ms = Some(finalization.imported_at_unix_ms);
+            proof.destination_activated_at_unix_ms = Some(finalization.activated_at_unix_ms);
+            proof.source_export_proof_hash = Some(finalization.source_export_proof_hash);
+            proof.source_exported_at_unix_ms = Some(finalization.source_exported_at_unix_ms);
+            proof.mutation_witness_hash = Some(finalization.mutation_witness_hash);
+            proof.trusted_time_unix_ms = Some(finalization.finalized_at_unix_ms);
+        }
         if is_abort {
             let mut cleanup = DraftGridAbortCleanupProofV2 {
                 side: match kind {
@@ -2791,8 +3034,9 @@ mod tests {
             &activation_material,
             DirectoryPhaseProofKindV3::DestinationActivation,
         ));
+        let finalization_material = transfer.clone();
         transfer.finalization_proof = Some(phase_proof(
-            &proof_material,
+            &finalization_material,
             DirectoryPhaseProofKindV3::SourceFinalization,
         ));
         for member in &transfer.bundle.members {
@@ -3212,8 +3456,16 @@ mod tests {
             &imported.transfers["transfer-grid-v3-proof"],
             DirectoryPhaseProofKindV3::SourceFinalization,
         );
+        let premature_typed_finalization = finalization_proof
+            .source_finalization_cell_proof(&requested.root_aggregate_id)
+            .expect("premature typed finalization proof reconstructs");
         assert!(
-            stage_v3_finalize(&imported, "transfer-grid-v3-proof", &finalization_proof).is_err()
+            stage_v3_source_finalized(
+                &imported,
+                "transfer-grid-v3-proof",
+                &premature_typed_finalization,
+            )
+            .is_err()
         );
 
         let activation_proof = phase_proof(
@@ -3268,8 +3520,28 @@ mod tests {
             &activated.transfers["transfer-grid-v3-proof"],
             DirectoryPhaseProofKindV3::SourceFinalization,
         );
+        let typed_finalization = finalization_proof
+            .source_finalization_cell_proof(&requested.root_aggregate_id)
+            .expect("typed finalization proof reconstructs");
+        let mut substituted_activation = typed_finalization.clone();
+        substituted_activation.destination_activation_proof_hash =
+            blake3::hash(b"substituted destination activation proof")
+                .to_hex()
+                .to_string();
+        substituted_activation
+            .seal_hashes_for_test()
+            .expect("substituted finalization proof reseals");
+        assert!(
+            stage_v3_source_finalized(
+                &activated,
+                "transfer-grid-v3-proof",
+                &substituted_activation,
+            )
+            .is_err(),
+            "finalization cannot substitute a different destination activation"
+        );
         let finalized =
-            stage_v3_finalize(&activated, "transfer-grid-v3-proof", &finalization_proof)
+            stage_v3_source_finalized(&activated, "transfer-grid-v3-proof", &typed_finalization)
                 .expect("bundle finalizes");
         assert_eq!(finalized.directory_revision, initial.directory_revision + 8);
         assert_eq!(
@@ -3292,7 +3564,7 @@ mod tests {
             finalized
         );
         assert_eq!(
-            stage_v3_finalize(&finalized, "transfer-grid-v3-proof", &finalization_proof)
+            stage_v3_source_finalized(&finalized, "transfer-grid-v3-proof", &typed_finalization,)
                 .expect("finalization retry is exact"),
             finalized
         );
@@ -3644,9 +3916,19 @@ mod tests {
     #[test]
     fn dormant_v3_proofs_accept_a_historically_fenced_successor() {
         let mut document = finalized_document();
-        let source_cell_id = document.transfers["transfer-grid-v3-proof"]
-            .source_cell_id
-            .clone();
+        let transfer = &document.transfers["transfer-grid-v3-proof"];
+        let source_cell_id = transfer.source_cell_id.clone();
+        let root_aggregate_id = transfer.root_aggregate_id.clone();
+        let mut typed_finalization = transfer
+            .finalization_proof
+            .as_ref()
+            .and_then(|proof| proof.source_finalization_cell_proof(&root_aggregate_id))
+            .expect("typed finalization proof reconstructs");
+        typed_finalization.assignment_generation = 2;
+        typed_finalization.fencing_token = 11;
+        typed_finalization
+            .seal_hashes_for_test()
+            .expect("successor finalization proof reseals");
         let source = document
             .assignments
             .get_mut(&source_cell_id)
@@ -3663,6 +3945,8 @@ mod tests {
             .expect("finalization proof exists");
         proof.assignment_generation = 2;
         proof.fencing_token = 11;
+        proof.event_hash.clone_from(&typed_finalization.event_hash);
+        proof.finalization_proof_hash = Some(typed_finalization.proof_hash);
         document.document_hash = document.calculate_hash().unwrap();
         document
             .validate()

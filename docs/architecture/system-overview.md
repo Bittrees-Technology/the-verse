@@ -204,6 +204,14 @@ generation. Before that commit recovery may abort to the source; afterward
 only destination roll-forward is legal. Import, source finalization, operation
 retry history, and the transfer-linked destination view are all idempotent.
 
+The dormant protocol-19 grid path now models source finalization as a distinct
+post-activation cell event. It cannot be folded into export or inferred from a
+directory-only terminal phase: the source must retain its exact export proof,
+the directory must retain matching destination import and activation proofs,
+and the source writes an active audit tombstone plus restart-verifiable history.
+This model is not production-reachable until event schema 17, directory schema
+3, package schema 2, and the rest of the protocol-19 tuple activate together.
+
 Abort is a two-cell cleanup saga: the directory first enters `Aborting`, pins
 both assignments, collects canonical source and destination cleanup proofs,
 and only then restores source residency as terminal `Aborted`.
