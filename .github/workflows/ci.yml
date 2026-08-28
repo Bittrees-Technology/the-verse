@@ -107,6 +107,8 @@ jobs:
             -- --exact
           "${GODOT_BIN}" --headless --path apps/native-client \
             --script res://tests/p15_interest_stream_smoke.gd
+          "${GODOT_BIN}" --headless --path apps/native-client \
+            --script res://tests/planet_visual_smoke.gd
       - name: Measure inherited grounded-locomotion distribution
         if: runner.os == 'Linux'
         env:

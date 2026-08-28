@@ -8,6 +8,14 @@ facing the outpost, with the starter salvage skiff parked nearby. Khepri reads
 as an Earthlike ocean-and-continent world with clouds and a blue atmosphere,
 and its rendered surface agrees with the authoritative spherical collider.
 
+Khepri's presentation uses an original high-detail fictional satellite map as
+the source of truth for oceans, coastlines, mountain systems, climate bands,
+and polar ice. Ocean and land respond differently to light, two seamless
+spherical cloud layers move at independent rates, and the visual atmospheric
+shell is compressed around the proof-scale planet to preserve a believable
+orbital limb. The breathable height and every other gameplay quantity remain
+server-owned; these rendering choices do not change authority or collision.
+
 ## Authority and persistence
 
 1. `earth-start` is a server-selected development genesis profile. It may
@@ -48,5 +56,8 @@ packaging cadence without changing canonical simulation rules.
   60 Hz accumulator to catch up rather than slowing the universe.
 - The native camera interpolates fixed-step position, body orientation, and
   grounded view pitch between rendered frames.
+- The Earthlike albedo remains an exact 2:1 equirectangular map, the planet
+  shader exposes its albedo and outpost-biome inputs, and the two cloud layers
+  expose independent scale, coverage, opacity, and spherical-noise offsets.
 - The player can walk with `WASD`, sprint with `Shift`, jump with `Space`, and
   toggle EVA with `J`; the server remains the movement authority throughout.

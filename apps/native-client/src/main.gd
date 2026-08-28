@@ -5,7 +5,9 @@ const ARMOR_TEXTURE: Texture2D = preload("res://assets/materials/verse_armor_alb
 const ASTEROID_TEXTURE: Texture2D = preload(
 	"res://assets/materials/verse_asteroid_regolith_albedo.png"
 )
-const PLANET_TEXTURE: Texture2D = preload("res://assets/materials/khepri_prime_albedo.png")
+const PLANET_TEXTURE: Texture2D = preload(
+	"res://assets/materials/khepri_prime_earthlike_albedo_v2.png"
+)
 const ASTEROID_SHADER: Shader = preload("res://shaders/asteroid_surface.gdshader")
 const PLANET_SHADER: Shader = preload("res://shaders/planet_surface.gdshader")
 const ATMOSPHERE_SHADER: Shader = preload("res://shaders/planet_atmosphere.gdshader")
@@ -289,6 +291,7 @@ var mining_fragments: GPUParticles3D
 var suit_light: SpotLight3D
 var inventory_overlay: Control
 var planet_cloud_layer: MeshInstance3D
+var planet_high_cloud_layer: MeshInstance3D
 var celestial_visuals: Dictionary = {}
 var rendered_celestial_registry_hash := ""
 var rendered_celestial_origin: Dictionary = {}
@@ -328,7 +331,9 @@ func _process(delta: float) -> void:
 	elapsed_time += delta
 	_advance_auto_reconnect(delta)
 	if planet_cloud_layer != null:
-		planet_cloud_layer.rotation.y += delta * 0.0025
+		planet_cloud_layer.rotation.y += delta * 0.0018
+	if planet_high_cloud_layer != null:
+		planet_high_cloud_layer.rotation.y += delta * 0.0042
 	_poll_socket()
 	_advance_mutation_transport(delta)
 	_update_player_presentation(delta)
@@ -1005,6 +1010,7 @@ func _rebuild_registered_celestials() -> void:
 		child.queue_free()
 	celestial_visuals.clear()
 	planet_cloud_layer = null
+	planet_high_cloud_layer = null
 	if asteroid_root != null:
 		var voxel_body := _registered_body(String(snapshot.get("voxel_body_id", "")))
 		var voxel_center: Variant = _address_relative_m(voxel_body.get("center", {}), interest_local_origin)
@@ -1066,10 +1072,17 @@ func _rebuild_registered_celestials() -> void:
 		var atmosphere_height := float(body.get("atmosphere_height_um", 0)) / 1_000_000.0
 		if atmosphere_height <= 0.0:
 			continue
+		# Registry atmosphere height remains authoritative for survival and
+		# interest. Presentation compresses the shell to a believable limb so
+		# the proof-scale planet does not look like a blue bubble from orbit.
+		var visual_atmosphere_height := minf(
+			atmosphere_height,
+			maxf(18.0, radius * 0.035),
+		)
 		var atmosphere := MeshInstance3D.new()
 		atmosphere.name = "%s_Atmosphere" % visual.name
 		var atmosphere_mesh := SphereMesh.new()
-		atmosphere_mesh.radius = radius + atmosphere_height
+		atmosphere_mesh.radius = radius + visual_atmosphere_height
 		atmosphere_mesh.height = atmosphere_mesh.radius * 2.0
 		atmosphere_mesh.radial_segments = 128
 		atmosphere_mesh.rings = 64
@@ -1080,21 +1093,57 @@ func _rebuild_registered_celestials() -> void:
 		atmosphere.position = center
 		planet_root.add_child(atmosphere)
 		if descriptor == "khepri-prime-terrestrial-v1":
-			planet_cloud_layer = MeshInstance3D.new()
-			planet_cloud_layer.name = "%s_Clouds" % visual.name
-			var cloud_mesh := SphereMesh.new()
-			cloud_mesh.radius = radius + minf(12.0, atmosphere_height * 0.2)
-			cloud_mesh.height = cloud_mesh.radius * 2.0
-			cloud_mesh.radial_segments = 160
-			cloud_mesh.rings = 80
-			var cloud_material := ShaderMaterial.new()
-			cloud_material.shader = CLOUD_SHADER
-			cloud_mesh.material = cloud_material
-			planet_cloud_layer.mesh = cloud_mesh
-			planet_cloud_layer.position = center
+			planet_cloud_layer = _create_planet_cloud_layer(
+				"%s_Weather" % visual.name,
+				center,
+				radius + minf(10.0, atmosphere_height * 0.12),
+				2.35,
+				0.63,
+				0.50,
+				Vector3(5.4, 11.7, 2.9),
+			)
 			planet_root.add_child(planet_cloud_layer)
+			planet_high_cloud_layer = _create_planet_cloud_layer(
+				"%s_HighClouds" % visual.name,
+				center,
+				radius + minf(18.0, atmosphere_height * 0.22),
+				3.65,
+				0.70,
+				0.26,
+				Vector3(18.1, 3.2, 9.6),
+			)
+			planet_high_cloud_layer.rotation_degrees.y = 27.0
+			planet_root.add_child(planet_high_cloud_layer)
 	rendered_celestial_registry_hash = registry_hash
 	rendered_celestial_origin = interest_local_origin.duplicate(true)
+
+
+func _create_planet_cloud_layer(
+	layer_name: String,
+	center: Vector3,
+	radius: float,
+	cloud_scale: float,
+	coverage: float,
+	opacity: float,
+	noise_offset: Vector3,
+) -> MeshInstance3D:
+	var layer := MeshInstance3D.new()
+	layer.name = layer_name
+	var mesh := SphereMesh.new()
+	mesh.radius = radius
+	mesh.height = radius * 2.0
+	mesh.radial_segments = 192
+	mesh.rings = 96
+	var material := ShaderMaterial.new()
+	material.shader = CLOUD_SHADER
+	material.set_shader_parameter("cloud_scale", cloud_scale)
+	material.set_shader_parameter("coverage", coverage)
+	material.set_shader_parameter("opacity", opacity)
+	material.set_shader_parameter("noise_offset", noise_offset)
+	mesh.material = material
+	layer.mesh = mesh
+	layer.position = center
+	return layer
 
 
 func _build_orbital_dust() -> void:

@@ -43,39 +43,47 @@ void vertex() {
 
 void fragment() {
 	vec3 radial = normalize(planet_direction);
-	float continental = terrain_noise(radial * 3.4 + vec3(2.7, 8.1, 4.3));
-	float regional = terrain_noise(radial * 11.0 + vec3(9.0, 1.5, 6.0));
-	float detail = terrain_noise(radial * 46.0 + vec3(3.0, 7.0, 2.0));
 	vec3 mapped_surface = texture(planet_albedo, UV).rgb;
-	float texture_value = dot(mapped_surface, vec3(0.30, 0.55, 0.15));
-	float polar_land = smoothstep(0.70, 0.96, abs(radial.y)) * 0.10;
-	float outpost_patch = smoothstep(0.990, 0.9985, dot(radial, normalize(outpost_direction)));
-	float land_field = continental * 0.72 + regional * 0.20 + texture_value * 0.08 + polar_land + outpost_patch * 0.14;
-	float land = smoothstep(0.49, 0.535, land_field);
-	float coast = smoothstep(0.49, 0.57, land_field);
+	float mapped_luma = dot(mapped_surface, vec3(0.2126, 0.7152, 0.0722));
+	float ocean_blue = mapped_surface.b - max(mapped_surface.r, mapped_surface.g * 0.82);
+	float water = smoothstep(0.035, 0.13, ocean_blue);
+	water *= 1.0 - smoothstep(0.68, 0.86, mapped_luma);
 
-	vec3 deep_ocean = vec3(0.012, 0.085, 0.19);
-	vec3 shelf_ocean = vec3(0.025, 0.30, 0.43);
-	vec3 ocean = mix(deep_ocean, shelf_ocean, smoothstep(0.36, 0.52, land_field));
-	vec3 dry_land = vec3(0.43, 0.34, 0.16);
-	vec3 grassland = vec3(0.12, 0.34, 0.12);
-	vec3 forest = vec3(0.035, 0.19, 0.085);
-	vec3 vegetation = mix(grassland, forest, smoothstep(0.45, 0.78, regional));
-	vec3 ground = mix(dry_land, vegetation, smoothstep(0.34, 0.66, detail));
-	ground = mix(ground, vec3(0.08, 0.30, 0.10), outpost_patch * 0.82);
-	float mountain = smoothstep(0.61, 0.76, land_field + detail * 0.10);
-	mountain *= 1.0 - outpost_patch * 0.92;
-	ground = mix(ground, vec3(0.36, 0.38, 0.36), mountain);
-	float snow = smoothstep(0.76, 0.94, abs(radial.y) + mountain * 0.18);
-	snow *= 1.0 - outpost_patch;
-	ground = mix(ground, vec3(0.88, 0.93, 0.95), snow * mountain);
-	vec3 coast_color = vec3(0.63, 0.58, 0.34);
-	ground = mix(coast_color, ground, coast);
+	float macro_relief = terrain_noise(radial * 17.0 + vec3(9.0, 1.5, 6.0));
+	float surface_detail = terrain_noise(radial * 94.0 + vec3(3.0, 7.0, 2.0));
+	float outpost_alignment = dot(radial, normalize(outpost_direction));
+	float outpost_region = smoothstep(0.9915, 0.9988, outpost_alignment);
+	float outpost_clearing = smoothstep(0.9988, 0.99975, outpost_alignment);
 
-	vec3 finished_surface = mix(ocean, ground, land);
-	ALBEDO = finished_surface * mix(0.90, 1.10, detail);
-	EMISSION = finished_surface * 0.018;
-	ROUGHNESS = mix(0.24, 0.88, land);
+	// The development outpost starts on the authoritative spherical surface.
+	// Give that small area a temperate visual biome without inventing relief
+	// that would disagree with collision.
+	water *= 1.0 - outpost_region;
+	vec3 temperate_ground = mix(
+		vec3(0.085, 0.19, 0.065),
+		vec3(0.24, 0.31, 0.12),
+		surface_detail
+	);
+	mapped_surface = mix(mapped_surface, temperate_ground, outpost_region * 0.88);
+	mapped_surface = mix(mapped_surface, vec3(0.22, 0.24, 0.19), outpost_clearing * 0.32);
+
+	float land = 1.0 - water;
+	float polar_ice = smoothstep(0.76, 0.96, abs(radial.y));
+	float mountain_snow = smoothstep(0.64, 0.86, mapped_luma) * land;
+	float terrain_variation = mix(0.94, 1.065, surface_detail);
+	terrain_variation *= mix(0.97, 1.035, macro_relief);
+	vec3 deep_ocean = vec3(0.008, 0.045, 0.12);
+	vec3 physical_ocean = mix(deep_ocean, mapped_surface, 0.82);
+	vec3 finished_surface = mix(mapped_surface, physical_ocean, water);
+	finished_surface = mix(
+		finished_surface,
+		vec3(0.78, 0.84, 0.86),
+		polar_ice * mountain_snow * (1.0 - outpost_region)
+	);
+
+	ALBEDO = finished_surface * mix(1.0, terrain_variation, land);
+	ROUGHNESS = mix(0.10, mix(0.70, 0.94, surface_detail), land);
+	ROUGHNESS = mix(ROUGHNESS, 0.62, mountain_snow * land);
 	METALLIC = 0.0;
-	SPECULAR = mix(0.78, 0.30, land);
+	SPECULAR = mix(0.92, 0.28, land);
 }
