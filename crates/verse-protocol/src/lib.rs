@@ -8,6 +8,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod protocol_v19;
+
 /// The only protocol version accepted by this build.
 pub const PROTOCOL_VERSION: u32 = 18;
 
