@@ -1,8 +1,7 @@
 # P1 replication and backpressure
 
 **Status:** P1.5 transport and independent official-client view verification
-locally verified; production active-player load and current hosted evidence
-pending
+hosted verified; production active-player load remains pending
 
 ## Failure being prevented
 
@@ -185,11 +184,11 @@ include:
   `64` active players plus synthetic nearby entities. The current spectator
   harness does not satisfy this active-player gate.
 
-[Hosted CI run 33112815767](https://github.com/Bittrees-Technology/the-verse/actions/runs/33112815767)
-passes the complete Linux replay and packages Linux and Apple Silicon clients
-for implementation revision `bb4ab4e`; current verifier-revision hosted
-evidence is pending, and neither result widens the spectator harness into an
-active-player or production-capacity claim.
+[Hosted CI run 33128613104](https://github.com/Bittrees-Technology/the-verse/actions/runs/33128613104)
+passes the complete Linux replay, Linux container probe, independent browser
+and native verifier suites, and Linux and Apple Silicon client packages for
+implementation revision `71e955c`. This does not widen the spectator harness
+into an active-player or production-capacity claim.
 
 This is still a local-cell scale slice. A final binary codec, multi-process
 cell scheduler, cross-cell handoff, and thousand-participant production result

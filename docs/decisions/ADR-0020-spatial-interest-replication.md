@@ -1,7 +1,7 @@
 # ADR-0020: Server-derived spatial interest replication
 
-**Status:** Implemented and locally verified for P1.5; production scale and
-current hosted evidence required
+**Status:** Implemented and hosted verified for P1.5; production-scale
+active-player evidence required
 
 ## Context
 

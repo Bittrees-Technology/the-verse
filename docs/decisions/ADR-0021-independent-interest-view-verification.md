@@ -1,7 +1,6 @@
 # ADR-0021: Independent interest-view verification before client apply
 
-**Status:** Implemented, locally verified, and packaged for P1.5; current hosted
-evidence required
+**Status:** Implemented, packaged, and hosted verified for P1.5
 
 ## Context
 
@@ -181,8 +180,10 @@ hash in flight and observes zero applied tampered state and zero tampered
 acknowledgements. The complete mining, refining, manufacturing, transfer,
 construction, damage, death, oxygen, respawn, two-player, and restart scenario
 remains green. The Apple Silicon direct-download package runs the native
-verifier and live client from the assembled archive. A current hosted run must
-still be attached before this revision is called published.
+verifier and live client from the assembled archive. [Hosted CI run
+33128613104](https://github.com/Bittrees-Technology/the-verse/actions/runs/33128613104)
+passes those suites, the Linux container probe, and Linux/Apple Silicon
+packages for implementation revision `71e955c`.
 
 ## Deliberate exclusions
 
