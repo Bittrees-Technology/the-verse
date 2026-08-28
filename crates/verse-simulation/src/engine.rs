@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::Serialize;
 use thiserror::Error;
@@ -19,8 +20,10 @@ use verse_protocol::{
 
 use crate::content;
 use crate::event::{
-    CanonicalEvent, EVENT_SCHEMA_NAME, EVENT_SCHEMA_VERSION, EventPayload, PhysicsBodyOutcome,
-    PhysicsContactOutcome, PhysicsContactPhase, PlayerPhysicsOutcome,
+    CanonicalEvent, EVENT_SCHEMA_NAME, EVENT_SCHEMA_VERSION, EventPayload,
+    PRODUCTION_SCHEDULE_OCCURRENCE_SCHEMA_VERSION, PhysicsBodyOutcome, PhysicsContactOutcome,
+    PhysicsContactPhase, PlayerPhysicsOutcome, ProductionMachineOutcome,
+    ProductionMachineOutcomeKind, ProductionScheduleOccurrence,
 };
 #[cfg(test)]
 use crate::model::PLAYER_INVENTORY_ID;
@@ -30,10 +33,16 @@ use crate::model::{
     WorldState, inventory_can_add_contents, planet_center, planet_surface_radius_m,
     production_recipe_quantities, radial_up, valid_blake3_hex,
 };
-use crate::persistence::{PersistenceError, Store};
+use crate::persistence::{
+    CellLifecycleStatus, PersistenceError, Store, SystemTrustedClock, TrustedClock,
+};
 #[cfg(test)]
 use crate::targeting::{TOOL_SURFACE_RANGE_M, ToolHit};
 use crate::targeting::{ToolTarget, closest_tool_hit};
+
+pub const MAX_BACKGROUND_QUEUE_BEARING_MACHINES: usize = 256;
+pub const MAX_PRODUCTION_CATCH_UP_QUANTA: usize = 60;
+pub const MAX_PRODUCTION_CATCH_UP_MILLIS: u128 = 250;
 
 #[cfg(test)]
 const PLAYER_BODY_ID: &str = "player-body-player-local";
@@ -198,6 +207,10 @@ pub enum RuntimeError {
     Physics(#[from] PhysicsError),
     #[error("authoritative writes are halted after a persistence failure")]
     Halted,
+    #[error("cell lifecycle mode {mode:?} does not permit this operation")]
+    LifecycleUnavailable {
+        mode: crate::persistence::LifecycleMode,
+    },
     #[error("canonical world invariant failed: {0}")]
     CanonicalInvariant(String),
 }
@@ -231,6 +244,20 @@ pub struct AdvanceOutcome {
     pub impact: AdvanceImpact,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProductionDispatchOutcome {
+    pub committed_quanta: usize,
+    pub backlog_remaining: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeOpenConfig {
+    data_directory: PathBuf,
+    requested_seed: u64,
+    snapshot_every: u64,
+    clock: Arc<dyn TrustedClock>,
+}
+
 impl AdvanceOutcome {
     #[must_use]
     pub const fn changed(self) -> bool {
@@ -249,9 +276,8 @@ pub struct Runtime {
     snapshot_every: u64,
     events_since_snapshot: u64,
     life_support_elapsed_millis_by_player: BTreeMap<String, u32>,
-    production_elapsed_millis: u32,
     physics_step_phase: u64,
-    physics: Scene,
+    physics: Option<Scene>,
     halted: bool,
     #[cfg(test)]
     physics_full_rebuilds: u64,
@@ -265,12 +291,78 @@ impl Runtime {
         requested_seed: u64,
         snapshot_every: u64,
     ) -> Result<Self, RuntimeError> {
-        let mut store = Store::open(data_directory, requested_seed)?;
+        Self::open_with_clock(
+            data_directory,
+            requested_seed,
+            snapshot_every,
+            Arc::new(SystemTrustedClock),
+        )
+    }
+
+    pub fn open_hosted(
+        data_directory: impl AsRef<Path>,
+        requested_seed: u64,
+        snapshot_every: u64,
+    ) -> Result<Self, RuntimeError> {
+        Self::open_hosted_with_clock(
+            data_directory,
+            requested_seed,
+            snapshot_every,
+            Arc::new(SystemTrustedClock),
+        )
+    }
+
+    pub fn open_hosted_with_clock(
+        data_directory: impl AsRef<Path>,
+        requested_seed: u64,
+        snapshot_every: u64,
+        clock: Arc<dyn TrustedClock>,
+    ) -> Result<Self, RuntimeError> {
+        let mut runtime = Self::open_for_activation_with_clock(
+            data_directory,
+            requested_seed,
+            snapshot_every,
+            clock,
+        )?;
+        runtime.store.restore_recovered_host_mode(&runtime.state)?;
+        Ok(runtime)
+    }
+
+    pub fn open_with_clock(
+        data_directory: impl AsRef<Path>,
+        requested_seed: u64,
+        snapshot_every: u64,
+        clock: Arc<dyn TrustedClock>,
+    ) -> Result<Self, RuntimeError> {
+        let mut runtime = Self::open_for_activation_with_clock(
+            data_directory,
+            requested_seed,
+            snapshot_every,
+            clock,
+        )?;
+        while !runtime.activation_step()? {}
+        Ok(runtime)
+    }
+
+    pub fn open_for_activation(config: &RuntimeOpenConfig) -> Result<Self, RuntimeError> {
+        Self::open_for_activation_with_clock(
+            &config.data_directory,
+            config.requested_seed,
+            config.snapshot_every,
+            Arc::clone(&config.clock),
+        )
+    }
+
+    fn open_for_activation_with_clock(
+        data_directory: impl AsRef<Path>,
+        requested_seed: u64,
+        snapshot_every: u64,
+        clock: Arc<dyn TrustedClock>,
+    ) -> Result<Self, RuntimeError> {
+        let mut store = Store::open_with_clock(data_directory, requested_seed, clock)?;
         let mut state = store.load_world()?;
         state.fencing_token = store.fencing_token();
 
-        let mut physics = Scene::new(physics_scene_config())?;
-        physics.rebuild(&physics_body_specs(&state))?;
         let physics_step_phase = state.physics_step_phase;
         let life_support_elapsed_millis_by_player = state
             .player
@@ -284,9 +376,8 @@ impl Runtime {
             snapshot_every: snapshot_every.max(1),
             events_since_snapshot: 0,
             life_support_elapsed_millis_by_player,
-            production_elapsed_millis: 0,
             physics_step_phase,
-            physics,
+            physics: None,
             halted: false,
             #[cfg(test)]
             physics_full_rebuilds: 0,
@@ -299,8 +390,61 @@ impl Runtime {
         Ok(runtime)
     }
 
+    fn initialize_physics(&mut self) -> Result<(), RuntimeError> {
+        if self.physics.is_some() {
+            return Ok(());
+        }
+        let mut physics = Scene::new(physics_scene_config())?;
+        physics.rebuild(&physics_body_specs(&self.state))?;
+        self.physics = Some(physics);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn physics(&self) -> &Scene {
+        self.physics
+            .as_ref()
+            .expect("active test runtime has an initialized physics scene")
+    }
+
+    #[cfg(test)]
+    fn physics_mut(&mut self) -> &mut Scene {
+        self.physics
+            .as_mut()
+            .expect("active test runtime has an initialized physics scene")
+    }
+
+    #[cfg(test)]
+    fn rebuild_physics_for_test(&mut self) {
+        let body_specs = physics_body_specs(&self.state);
+        self.physics_mut()
+            .rebuild(&body_specs)
+            .expect("test fixture must produce a valid physics scene");
+    }
+
+    pub fn open_config(&self) -> RuntimeOpenConfig {
+        RuntimeOpenConfig {
+            data_directory: self.store.root_path().to_path_buf(),
+            requested_seed: self.state.world_seed,
+            snapshot_every: self.snapshot_every,
+            clock: self.store.clock(),
+        }
+    }
+
     pub const fn state(&self) -> &WorldState {
         &self.state
+    }
+
+    pub const fn physics_scene_is_initialized(&self) -> bool {
+        self.physics.is_some()
+    }
+
+    pub fn next_production_occurrence(&self) -> Option<&ProductionScheduleOccurrence> {
+        self.store.next_production_occurrence()
+    }
+
+    pub fn lifecycle_status(&self) -> CellLifecycleStatus {
+        self.store.lifecycle_status()
     }
 
     /// Adds a deterministic loopback-development actor before the first
@@ -399,8 +543,14 @@ impl Runtime {
             }
             .into());
         }
-        let mut next_physics = Scene::new(physics_scene_config())?;
-        next_physics.rebuild(&physics_body_specs(&next_state))?;
+        let next_physics =
+            if self.store.lifecycle_mode() == crate::persistence::LifecycleMode::Active {
+                let mut physics = Scene::new(physics_scene_config())?;
+                physics.rebuild(&physics_body_specs(&next_state))?;
+                Some(physics)
+            } else {
+                None
+            };
         self.store.save_snapshot(&next_state)?;
         self.state = next_state;
         self.physics = next_physics;
@@ -423,9 +573,7 @@ impl Runtime {
         self.state.player.linear_velocity = Vec3::ZERO;
         self.state.player.angular_velocity = Vec3::ZERO;
         self.state.player.surface_contact = false;
-        self.physics
-            .rebuild(&physics_body_specs(&self.state))
-            .expect("test relocation must produce a valid physics scene");
+        self.rebuild_physics_for_test();
     }
 
     #[cfg(test)]
@@ -466,9 +614,7 @@ impl Runtime {
         self.state.player.locomotion.kind = LocomotionKind::Airborne;
         self.state.player.locomotion.up = Vec3::new(0.0, 1.0, 0.0);
         self.state.player.locomotion.view_pitch_radians = 0.0;
-        self.physics
-            .rebuild(&physics_body_specs(&self.state))
-            .expect("test aim must produce a valid physics scene");
+        self.rebuild_physics_for_test();
     }
 
     pub const fn is_halted(&self) -> bool {
@@ -498,6 +644,11 @@ impl Runtime {
     ) -> Result<IntentReceipt, RuntimeError> {
         if self.halted {
             return Err(RuntimeError::Halted);
+        }
+        if self.store.lifecycle_mode() != crate::persistence::LifecycleMode::Active {
+            return Err(RuntimeError::LifecycleUnavailable {
+                mode: self.store.lifecycle_mode(),
+            });
         }
         if let Err(message) = self.state.validate_player_roster() {
             self.halted = true;
@@ -540,15 +691,36 @@ impl Runtime {
             return Ok(receipt);
         }
 
-        let event = self
+        let mut event = self
             .state
             .prepare_client_event_as(actor_player_id, message)?;
+        let occurred_at_unix_ms = match self.store.accepted_trusted_time() {
+            Ok(now) => now,
+            Err(source) => {
+                self.halted = true;
+                return Err(source.into());
+            }
+        };
+        event.retime_and_rehash(occurred_at_unix_ms);
+        let prior_production_runnable = self.state.background_production_is_runnable()?;
         let mut next_state = self.state.clone();
         next_state.apply_event(&event)?;
+        let resulting_next_occurrence = self.resulting_next_production_occurrence(
+            prior_production_runnable,
+            &next_state,
+            &event,
+        )?;
+        let lifecycle_mode = self.store.lifecycle_mode();
+        let physics = self
+            .physics
+            .as_mut()
+            .ok_or(RuntimeError::LifecycleUnavailable {
+                mode: lifecycle_mode,
+            })?;
         if let EventPayload::VoxelMined { coordinate, .. } = &event.payload {
             let chunk = voxel_collision_chunk_coordinate(*coordinate);
             let body_id = voxel_collision_chunk_body_id(chunk);
-            self.physics.replace_body(
+            physics.replace_body(
                 &body_id,
                 voxel_collision_chunk_body_spec(&next_state, chunk),
             )?;
@@ -557,13 +729,16 @@ impl Runtime {
                 self.physics_chunk_replacements += 1;
             }
         } else if event_changes_physics_scene(&event.payload) {
-            self.physics.rebuild(&physics_body_specs(&next_state))?;
+            physics.rebuild(&physics_body_specs(&next_state))?;
             #[cfg(test)]
             {
                 self.physics_full_rebuilds += 1;
             }
         }
-        if let Err(source) = self.store.append_event(&event) {
+        if let Err(source) =
+            self.store
+                .commit_world_event(&event, &next_state, resulting_next_occurrence)
+        {
             self.halted = true;
             return Err(source.into());
         }
@@ -634,6 +809,15 @@ impl Runtime {
         if self.halted {
             return Err(RuntimeError::Halted);
         }
+        if self.store.lifecycle_mode() != crate::persistence::LifecycleMode::Active {
+            return Err(RuntimeError::LifecycleUnavailable {
+                mode: self.store.lifecycle_mode(),
+            });
+        }
+        if let Err(source) = self.store.renew_lease() {
+            self.halted = true;
+            return Err(source.into());
+        }
         let moving_grid = self.state.grids.values().any(|grid| {
             !grid.anchored
                 && (grid.linear_velocity.magnitude() > f64::EPSILON
@@ -664,7 +848,14 @@ impl Runtime {
             let step_count = (self.physics_step_phase / 1_000_000_000).min(15);
             if step_count > 0 {
                 self.physics_step_phase -= step_count * 1_000_000_000;
-                let mut body_states = match self.physics.body_states() {
+                let lifecycle_mode = self.store.lifecycle_mode();
+                let physics = self
+                    .physics
+                    .as_mut()
+                    .ok_or(RuntimeError::LifecycleUnavailable {
+                        mode: lifecycle_mode,
+                    })?;
+                let mut body_states = match physics.body_states() {
                     Ok(bodies) => bodies,
                     Err(source) => {
                         self.halted = true;
@@ -686,14 +877,14 @@ impl Runtime {
                         );
                         adjust_grounded_capsule_for_substep(
                             &self.state,
-                            &mut self.physics,
+                            physics,
                             scheduled_player,
                             &mut body_states,
                             substep_simulation_tick,
                         )?;
                         let jump = classify_player_locomotion_for_substep(
                             &self.state,
-                            &self.physics,
+                            &*physics,
                             scheduled_player,
                             &body_states,
                             substep_simulation_tick,
@@ -713,7 +904,7 @@ impl Runtime {
                             index == 0,
                         ));
                     }
-                    let step = match self.physics.step(&controls) {
+                    let step = match physics.step(&controls) {
                         Ok(step) => step,
                         Err(source) => {
                             self.halted = true;
@@ -825,7 +1016,14 @@ impl Runtime {
                     self.halted = true;
                     return Err(source);
                 }
-                if let Err(source) = self.physics.rebuild(&physics_body_specs(&self.state)) {
+                let lifecycle_mode = self.store.lifecycle_mode();
+                let physics = self
+                    .physics
+                    .as_mut()
+                    .ok_or(RuntimeError::LifecycleUnavailable {
+                        mode: lifecycle_mode,
+                    })?;
+                if let Err(source) = physics.rebuild(&physics_body_specs(&self.state)) {
                     self.halted = true;
                     return Err(source.into());
                 }
@@ -897,50 +1095,136 @@ impl Runtime {
             }
         }
 
-        self.production_elapsed_millis = self
-            .production_elapsed_millis
-            .saturating_add(u32::from(delta_millis));
-        let production_seconds = self.production_elapsed_millis / 1_000;
-        self.production_elapsed_millis %= 1_000;
-        for _ in 0..production_seconds {
-            let machine_ids = self
-                .state
-                .production_queues
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>();
-            for machine_block_id in machine_ids {
-                let Some(payload) = self
-                    .state
-                    .production_payload_after_one_second(&machine_block_id)?
-                else {
-                    continue;
-                };
-                self.commit_system_event(payload)?;
-                outcome.record(AdvanceImpact::Structural);
-            }
+        if self.advance_due_production()?.committed_quanta > 0 {
+            outcome.record(AdvanceImpact::Structural);
         }
         Ok(outcome)
     }
 
     fn commit_system_event(&mut self, payload: EventPayload) -> Result<(), RuntimeError> {
-        let event = self.state.prepare_system_event(payload);
+        let mut event = self.state.prepare_system_event(payload);
+        let occurred_at_unix_ms = match self.store.accepted_trusted_time() {
+            Ok(now) => now,
+            Err(source) => {
+                self.halted = true;
+                return Err(source.into());
+            }
+        };
+        event.retime_and_rehash(occurred_at_unix_ms);
+        self.commit_prepared_system_event(&event)
+    }
+
+    fn commit_production_quantum(&mut self, payload: EventPayload) -> Result<(), RuntimeError> {
+        let event = self.state.prepare_production_quantum_event(payload)?;
+        self.commit_prepared_system_event(&event)
+    }
+
+    fn commit_prepared_system_event(&mut self, event: &CanonicalEvent) -> Result<(), RuntimeError> {
+        let prior_production_runnable = self.state.background_production_is_runnable()?;
         let mut next_state = self.state.clone();
-        next_state.apply_event(&event)?;
+        next_state.apply_event(event)?;
+        let resulting_next_occurrence = self.resulting_next_production_occurrence(
+            prior_production_runnable,
+            &next_state,
+            event,
+        )?;
         if event_changes_physics_scene(&event.payload) {
-            self.physics.rebuild(&physics_body_specs(&next_state))?;
+            let lifecycle_mode = self.store.lifecycle_mode();
+            self.physics
+                .as_mut()
+                .ok_or(RuntimeError::LifecycleUnavailable {
+                    mode: lifecycle_mode,
+                })?
+                .rebuild(&physics_body_specs(&next_state))?;
             #[cfg(test)]
             {
                 self.physics_full_rebuilds += 1;
             }
         }
-        if let Err(source) = self.store.append_event(&event) {
+        if let Err(source) =
+            self.store
+                .commit_world_event(event, &next_state, resulting_next_occurrence)
+        {
             self.halted = true;
             return Err(source.into());
         }
         self.state = next_state;
+        if matches!(
+            &event.payload,
+            EventPayload::ProductionQuantumCommitted { .. }
+        ) && let Err(source) = self.store.acknowledge_production_sequence(&self.state)
+        {
+            self.halted = true;
+            return Err(source.into());
+        }
         self.after_event()?;
         Ok(())
+    }
+
+    fn resulting_next_production_occurrence(
+        &self,
+        prior_runnable: bool,
+        resulting_state: &WorldState,
+        event: &CanonicalEvent,
+    ) -> Result<Option<ProductionScheduleOccurrence>, RuntimeError> {
+        let resulting_runnable = resulting_state.background_production_is_runnable()?;
+        if !resulting_runnable {
+            return Ok(None);
+        }
+        if let EventPayload::ProductionQuantumCommitted { occurrence, .. } = &event.payload {
+            let scheduled_for_unix_ms = occurrence
+                .scheduled_for_unix_ms
+                .checked_add(1_000)
+                .ok_or_else(|| {
+                    IntentError::rejected(
+                        "production_clock_exhausted",
+                        "production scheduled time is exhausted",
+                    )
+                })?;
+            return resulting_state
+                .next_production_occurrence_at(scheduled_for_unix_ms)
+                .map(Some)
+                .map_err(Into::into);
+        }
+        if prior_runnable {
+            return self
+                .store
+                .next_production_occurrence()
+                .cloned()
+                .map(Some)
+                .ok_or_else(|| {
+                    IntentError::rejected(
+                        "production_schedule_missing",
+                        "runnable production has no durable next occurrence",
+                    )
+                    .into()
+                });
+        }
+        let scheduled_from_trusted_boundary = event
+            .occurred_at_unix_ms
+            .checked_add(1_000)
+            .ok_or_else(|| {
+                IntentError::rejected(
+                    "production_clock_exhausted",
+                    "production scheduled time is exhausted",
+                )
+            })?;
+        let scheduled_after_committed_cursor = resulting_state
+            .production_clock
+            .last_scheduled_for_unix_ms
+            .checked_add(1_000)
+            .ok_or_else(|| {
+                IntentError::rejected(
+                    "production_clock_exhausted",
+                    "production scheduled time is exhausted",
+                )
+            })?;
+        let scheduled_for_unix_ms =
+            scheduled_from_trusted_boundary.max(scheduled_after_committed_cursor);
+        resulting_state
+            .next_production_occurrence_at(scheduled_for_unix_ms)
+            .map(Some)
+            .map_err(Into::into)
     }
 
     pub fn persist_snapshot(&mut self) -> Result<(), RuntimeError> {
@@ -955,6 +1239,194 @@ impl Runtime {
         Ok(())
     }
 
+    pub fn renew_lease(&mut self) -> Result<(), RuntimeError> {
+        if self.halted {
+            return Err(RuntimeError::Halted);
+        }
+        if let Err(source) = self.store.renew_lease() {
+            self.halted = true;
+            return Err(source.into());
+        }
+        Ok(())
+    }
+
+    /// Commits one scheduler-delivered production occurrence without stepping
+    /// physics, life support, controls, damage, or replication state. Exact
+    /// redelivery of the already committed frontier is an idempotent no-op.
+    pub fn advance_background_production_occurrence(
+        &mut self,
+        occurrence: ProductionScheduleOccurrence,
+    ) -> Result<bool, RuntimeError> {
+        if self.halted {
+            return Err(RuntimeError::Halted);
+        }
+        if !matches!(
+            self.store.lifecycle_mode(),
+            crate::persistence::LifecycleMode::Active
+                | crate::persistence::LifecycleMode::Background
+                | crate::persistence::LifecycleMode::Activating
+        ) {
+            return Err(RuntimeError::LifecycleUnavailable {
+                mode: self.store.lifecycle_mode(),
+            });
+        }
+        if self.state.production_occurrence_is_committed(&occurrence) {
+            if let Err(source) = self.store.acknowledge_production_sequence(&self.state) {
+                self.halted = true;
+                return Err(source.into());
+            }
+            return Ok(false);
+        }
+        if self.store.next_production_occurrence() != Some(&occurrence) {
+            return Err(IntentError::rejected(
+                "production_occurrence_delivery_conflict",
+                "scheduler delivery does not match the durable next production occurrence",
+            )
+            .into());
+        }
+        let payload = self.state.production_quantum_payload(occurrence)?;
+        self.commit_production_quantum(payload)?;
+        Ok(true)
+    }
+
+    pub fn advance_due_production(&mut self) -> Result<ProductionDispatchOutcome, RuntimeError> {
+        if self.halted {
+            return Err(RuntimeError::Halted);
+        }
+        let now_unix_ms = match self.store.accepted_trusted_time() {
+            Ok(now) => now,
+            Err(source) => {
+                self.halted = true;
+                return Err(source.into());
+            }
+        };
+        self.advance_due_production_through(now_unix_ms)
+    }
+
+    fn advance_due_production_through(
+        &mut self,
+        cutoff_unix_ms: u64,
+    ) -> Result<ProductionDispatchOutcome, RuntimeError> {
+        let started_at = std::time::Instant::now();
+        let mut committed_quanta = 0;
+        while committed_quanta < MAX_PRODUCTION_CATCH_UP_QUANTA {
+            let Some(occurrence) = self.store.next_production_occurrence().cloned() else {
+                break;
+            };
+            if occurrence.scheduled_for_unix_ms > cutoff_unix_ms {
+                break;
+            }
+            if self.advance_background_production_occurrence(occurrence)? {
+                committed_quanta += 1;
+            }
+            if started_at.elapsed().as_millis() >= MAX_PRODUCTION_CATCH_UP_MILLIS {
+                break;
+            }
+        }
+        let backlog_remaining = self
+            .store
+            .next_production_occurrence()
+            .is_some_and(|occurrence| occurrence.scheduled_for_unix_ms <= cutoff_unix_ms);
+        Ok(ProductionDispatchOutcome {
+            committed_quanta,
+            backlog_remaining,
+        })
+    }
+
+    pub fn production_wait_millis(&mut self) -> Result<Option<u64>, RuntimeError> {
+        if self.halted {
+            return Err(RuntimeError::Halted);
+        }
+        let now_unix_ms = self.store.accepted_trusted_time()?;
+        Ok(self
+            .store
+            .next_production_occurrence()
+            .map(|occurrence| occurrence.scheduled_for_unix_ms.saturating_sub(now_unix_ms)))
+    }
+
+    pub fn background_dispatch_step(
+        &mut self,
+    ) -> Result<crate::persistence::LifecycleMode, RuntimeError> {
+        if self.store.lifecycle_mode() != crate::persistence::LifecycleMode::Background {
+            return Err(RuntimeError::LifecycleUnavailable {
+                mode: self.store.lifecycle_mode(),
+            });
+        }
+        self.advance_due_production()?;
+        if self.store.next_production_occurrence().is_none() {
+            self.store.release_to_sleeping(&self.state)?;
+            return Ok(crate::persistence::LifecycleMode::Sleeping);
+        }
+        Ok(crate::persistence::LifecycleMode::Background)
+    }
+
+    pub fn drain_to_background_or_sleeping(
+        &mut self,
+    ) -> Result<crate::persistence::LifecycleMode, RuntimeError> {
+        if self.halted {
+            return Err(RuntimeError::Halted);
+        }
+        if self.store.lifecycle_mode() != crate::persistence::LifecycleMode::Active {
+            return Err(RuntimeError::LifecycleUnavailable {
+                mode: self.store.lifecycle_mode(),
+            });
+        }
+        let production_runnable = self.state.background_production_is_runnable()?;
+        let desired_mode = if production_runnable {
+            crate::persistence::LifecycleMode::Background
+        } else {
+            crate::persistence::LifecycleMode::Sleeping
+        };
+        self.store.transition_mode(
+            desired_mode,
+            crate::persistence::LifecycleMode::Draining,
+            &self.state,
+        )?;
+        self.persist_snapshot()?;
+        if production_runnable {
+            self.store.transition_mode(
+                crate::persistence::LifecycleMode::Background,
+                crate::persistence::LifecycleMode::Background,
+                &self.state,
+            )?;
+            self.physics = None;
+            Ok(crate::persistence::LifecycleMode::Background)
+        } else {
+            self.store.release_to_sleeping(&self.state)?;
+            self.physics = None;
+            Ok(crate::persistence::LifecycleMode::Sleeping)
+        }
+    }
+
+    pub fn activation_step(&mut self) -> Result<bool, RuntimeError> {
+        if self.halted {
+            return Err(RuntimeError::Halted);
+        }
+        match self.store.lifecycle_mode() {
+            crate::persistence::LifecycleMode::Active => return Ok(true),
+            crate::persistence::LifecycleMode::Background => self.store.transition_mode(
+                crate::persistence::LifecycleMode::Active,
+                crate::persistence::LifecycleMode::Activating,
+                &self.state,
+            )?,
+            crate::persistence::LifecycleMode::Activating => {}
+            mode => return Err(RuntimeError::LifecycleUnavailable { mode }),
+        }
+        let cutoff_unix_ms = self.store.activation_cutoff_unix_ms().ok_or_else(|| {
+            RuntimeError::Persistence(PersistenceError::InvalidLifecycleControl(
+                "activating lifecycle has no durable wake cut-off".into(),
+            ))
+        })?;
+        let dispatch = self.advance_due_production_through(cutoff_unix_ms)?;
+        if dispatch.backlog_remaining {
+            return Ok(false);
+        }
+        self.persist_snapshot()?;
+        self.initialize_physics()?;
+        self.store.publish_active(&self.state)?;
+        Ok(true)
+    }
+
     fn after_event(&mut self) -> Result<(), RuntimeError> {
         self.events_since_snapshot += 1;
         if self.events_since_snapshot >= self.snapshot_every {
@@ -965,16 +1437,208 @@ impl Runtime {
 }
 
 impl WorldState {
-    fn production_payload_after_one_second(
+    fn production_occurrence_is_committed(
+        &self,
+        occurrence: &ProductionScheduleOccurrence,
+    ) -> bool {
+        occurrence.schema_version == PRODUCTION_SCHEDULE_OCCURRENCE_SCHEMA_VERSION
+            && occurrence.universe_id == self.universe_id
+            && occurrence.cell_id == self.cell_id
+            && occurrence.lifecycle_generation == self.production_clock.lifecycle_generation
+            && occurrence.production_quantum_sequence
+                == self.production_clock.last_committed_quantum_sequence
+            && occurrence.scheduled_for_unix_ms == self.production_clock.last_scheduled_for_unix_ms
+            && occurrence.universe_manifest_hash == self.universe_manifest_hash
+            && occurrence.celestial_registry_hash == self.celestial_registry_hash
+    }
+
+    pub fn background_production_is_runnable(&self) -> Result<bool, IntentError> {
+        if self.production_queues.len() > MAX_BACKGROUND_QUEUE_BEARING_MACHINES {
+            return Err(IntentError::rejected(
+                "background_machine_budget_exceeded",
+                format!(
+                    "background production supports at most {MAX_BACKGROUND_QUEUE_BEARING_MACHINES} queue-bearing machines"
+                ),
+            ));
+        }
+        let mut scheduled = self
+            .production_queues
+            .keys()
+            .map(|machine_block_id| {
+                self.block_grid(machine_block_id)
+                    .map(|(grid, _)| (grid.grid_id.as_str(), machine_block_id.as_str()))
+                    .ok_or_else(|| {
+                        IntentError::rejected(
+                            "production_machine_missing",
+                            "a queued production machine is missing from canonical state",
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        scheduled.sort_unstable();
+        for (_, machine_block_id) in scheduled {
+            if self
+                .production_machine_outcome_after_one_second(machine_block_id)?
+                .changes_state()
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn next_active_production_occurrence(
+        &self,
+    ) -> Result<ProductionScheduleOccurrence, IntentError> {
+        let production_quantum_sequence = self
+            .production_clock
+            .last_committed_quantum_sequence
+            .checked_add(1)
+            .ok_or_else(|| {
+                IntentError::rejected(
+                    "production_occurrence_exhausted",
+                    "production occurrence sequence is exhausted",
+                )
+            })?;
+        let scheduled_for_unix_ms = if self.production_clock.last_scheduled_for_unix_ms == 0 {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|_| {
+                    IntentError::rejected(
+                        "production_clock_invalid",
+                        "system time is before the Unix epoch",
+                    )
+                })?
+                .as_millis()
+                .try_into()
+                .map_err(|_| {
+                    IntentError::rejected(
+                        "production_clock_invalid",
+                        "system time cannot be represented by the production clock",
+                    )
+                })?
+        } else {
+            self.production_clock
+                .last_scheduled_for_unix_ms
+                .checked_add(1_000)
+                .ok_or_else(|| {
+                    IntentError::rejected(
+                        "production_clock_exhausted",
+                        "production scheduled time is exhausted",
+                    )
+                })?
+        };
+        Ok(ProductionScheduleOccurrence {
+            schema_version: PRODUCTION_SCHEDULE_OCCURRENCE_SCHEMA_VERSION,
+            universe_id: self.universe_id.clone(),
+            cell_id: self.cell_id.clone(),
+            lifecycle_generation: self.production_clock.lifecycle_generation,
+            production_quantum_sequence,
+            scheduled_for_unix_ms,
+            universe_manifest_hash: self.universe_manifest_hash.clone(),
+            celestial_registry_hash: self.celestial_registry_hash.clone(),
+        })
+    }
+
+    pub(crate) fn next_production_occurrence_at(
+        &self,
+        scheduled_for_unix_ms: u64,
+    ) -> Result<ProductionScheduleOccurrence, IntentError> {
+        let mut occurrence = self.next_active_production_occurrence()?;
+        occurrence.scheduled_for_unix_ms = scheduled_for_unix_ms;
+        Ok(occurrence)
+    }
+
+    fn production_quantum_payload(
+        &self,
+        occurrence: ProductionScheduleOccurrence,
+    ) -> Result<EventPayload, IntentError> {
+        self.validate_next_production_occurrence(&occurrence)?;
+        let mut scheduled = self
+            .production_queues
+            .keys()
+            .map(|machine_block_id| {
+                self.block_grid(machine_block_id)
+                    .map(|(grid, _)| (grid.grid_id.clone(), machine_block_id.clone()))
+                    .ok_or_else(|| {
+                        IntentError::rejected(
+                            "production_machine_missing",
+                            "a queued production machine is missing from canonical state",
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        scheduled.sort();
+
+        let mut planning_state = self.clone();
+        let mut outcomes = Vec::with_capacity(scheduled.len());
+        for (_, machine_block_id) in scheduled {
+            let outcome =
+                planning_state.production_machine_outcome_after_one_second(&machine_block_id)?;
+            if outcome.changes_state() {
+                planning_state.apply_production_machine_outcome(&outcome)?;
+            }
+            outcomes.push(outcome);
+        }
+        Ok(EventPayload::ProductionQuantumCommitted {
+            occurrence,
+            elapsed_ticks: u64::from(content::manifest().physics.fixed_step_hz),
+            outcomes,
+        })
+    }
+
+    fn validate_next_production_occurrence(
+        &self,
+        occurrence: &ProductionScheduleOccurrence,
+    ) -> Result<(), IntentError> {
+        let expected_sequence = self
+            .production_clock
+            .last_committed_quantum_sequence
+            .checked_add(1)
+            .ok_or_else(|| {
+                IntentError::rejected(
+                    "production_occurrence_exhausted",
+                    "production occurrence sequence is exhausted",
+                )
+            })?;
+        let time_is_valid = if self.production_clock.last_committed_quantum_sequence == 0 {
+            occurrence.scheduled_for_unix_ms > 0
+        } else {
+            self.production_clock
+                .last_scheduled_for_unix_ms
+                .checked_add(1_000)
+                .is_some_and(|earliest| occurrence.scheduled_for_unix_ms >= earliest)
+        };
+        if occurrence.schema_version != PRODUCTION_SCHEDULE_OCCURRENCE_SCHEMA_VERSION
+            || occurrence.universe_id != self.universe_id
+            || occurrence.cell_id != self.cell_id
+            || occurrence.lifecycle_generation != self.production_clock.lifecycle_generation
+            || occurrence.production_quantum_sequence != expected_sequence
+            || occurrence.universe_manifest_hash != self.universe_manifest_hash
+            || occurrence.celestial_registry_hash != self.celestial_registry_hash
+            || !time_is_valid
+        {
+            return Err(IntentError::rejected(
+                "production_occurrence_invalid",
+                "production occurrence is not the exact next trusted cell quantum",
+            ));
+        }
+        Ok(())
+    }
+
+    fn production_machine_outcome_after_one_second(
         &self,
         machine_block_id: &str,
-    ) -> Result<Option<EventPayload>, IntentError> {
+    ) -> Result<ProductionMachineOutcome, IntentError> {
         let Some(job) = self
             .production_queues
             .get(machine_block_id)
             .and_then(|queue| queue.front())
         else {
-            return Ok(None);
+            return Err(IntentError::rejected(
+                "production_job_missing",
+                "a scheduled production machine has no queue head",
+            ));
         };
         let Some((grid, machine)) = self.block_grid(machine_block_id) else {
             return Err(IntentError::rejected(
@@ -982,26 +1646,54 @@ impl WorldState {
                 "a queued production machine is missing from canonical state",
             ));
         };
-        if !machine.is_complete()
-            || !content::machine_supports_recipe(machine.kind, job.recipe)
-            || !grid.power().online
-            || !self.production_route_exists(machine_block_id, &job.source_inventory_id)
+        let base = |kind, new_progress_ticks, outputs| ProductionMachineOutcome {
+            grid_id: grid.grid_id.clone(),
+            machine_block_id: machine_block_id.to_owned(),
+            job_id: job.job_id.clone(),
+            kind,
+            previous_progress_ticks: job.progress_ticks,
+            new_progress_ticks,
+            destination_inventory_id: job.destination_inventory_id.clone(),
+            outputs,
+        };
+        if !machine.is_complete() || !content::machine_supports_recipe(machine.kind, job.recipe) {
+            return Ok(base(
+                ProductionMachineOutcomeKind::PausedMachine,
+                job.progress_ticks,
+                InventoryContents::default(),
+            ));
+        }
+        if !grid.power().online {
+            return Ok(base(
+                ProductionMachineOutcomeKind::PausedPower,
+                job.progress_ticks,
+                InventoryContents::default(),
+            ));
+        }
+        if !self.production_route_exists(machine_block_id, &job.source_inventory_id)
             || !self.production_route_exists(machine_block_id, &job.destination_inventory_id)
         {
-            return Ok(None);
+            return Ok(base(
+                ProductionMachineOutcomeKind::PausedRoute,
+                job.progress_ticks,
+                InventoryContents::default(),
+            ));
         }
 
         if job.progress_ticks == job.duration_ticks {
             let destination = self.inventory(&job.destination_inventory_id)?;
             if !inventory_can_add_contents(destination, &job.pending_outputs) {
-                return Ok(None);
+                return Ok(base(
+                    ProductionMachineOutcomeKind::OutputBlocked,
+                    job.progress_ticks,
+                    job.pending_outputs.clone(),
+                ));
             }
-            return Ok(Some(EventPayload::ProductionOutputDelivered {
-                machine_block_id: machine_block_id.to_owned(),
-                job_id: job.job_id.clone(),
-                destination_inventory_id: job.destination_inventory_id.clone(),
-                outputs: job.pending_outputs.clone(),
-            }));
+            return Ok(base(
+                ProductionMachineOutcomeKind::OutputDelivered,
+                job.progress_ticks,
+                job.pending_outputs.clone(),
+            ));
         }
 
         let elapsed_ticks = u64::from(content::manifest().physics.fixed_step_hz);
@@ -1009,27 +1701,155 @@ impl WorldState {
             .progress_ticks
             .saturating_add(elapsed_ticks)
             .min(job.duration_ticks);
-        let completed = new_progress_ticks == job.duration_ticks;
-        let output_delivered = if completed {
-            let (_, outputs, _) = production_recipe_quantities(job.recipe, job.batches)
-                .ok_or_else(|| {
+        if new_progress_ticks != job.duration_ticks {
+            return Ok(base(
+                ProductionMachineOutcomeKind::Advanced,
+                new_progress_ticks,
+                InventoryContents::default(),
+            ));
+        }
+        let (_, outputs, _) =
+            production_recipe_quantities(job.recipe, job.batches).ok_or_else(|| {
+                IntentError::rejected(
+                    "production_job_invalid",
+                    "queued production quantities no longer match registered content",
+                )
+            })?;
+        let kind =
+            if inventory_can_add_contents(self.inventory(&job.destination_inventory_id)?, &outputs)
+            {
+                ProductionMachineOutcomeKind::CompletedAndDelivered
+            } else {
+                ProductionMachineOutcomeKind::Completed
+            };
+        Ok(base(kind, new_progress_ticks, outputs))
+    }
+
+    fn apply_production_machine_outcome(
+        &mut self,
+        outcome: &ProductionMachineOutcome,
+    ) -> Result<(), IntentError> {
+        match outcome.kind {
+            ProductionMachineOutcomeKind::PausedPower
+            | ProductionMachineOutcomeKind::PausedRoute
+            | ProductionMachineOutcomeKind::PausedMachine
+            | ProductionMachineOutcomeKind::OutputBlocked => Ok(()),
+            ProductionMachineOutcomeKind::Advanced => {
+                self.production_queues
+                    .get_mut(&outcome.machine_block_id)
+                    .and_then(|queue| queue.front_mut())
+                    .expect("validated production queue head exists")
+                    .progress_ticks = outcome.new_progress_ticks;
+                Ok(())
+            }
+            ProductionMachineOutcomeKind::Completed
+            | ProductionMachineOutcomeKind::CompletedAndDelivered => {
+                let job = self.production_queues[&outcome.machine_block_id]
+                    .front()
+                    .expect("validated production completion has a queue head")
+                    .clone();
+                match job.recipe {
+                    ProductionRecipeKind::Refining => {
+                        self.ledger.refine_batches = self
+                            .ledger
+                            .refine_batches
+                            .checked_add(job.batches)
+                            .ok_or_else(|| {
+                                IntentError::rejected(
+                                    "replay_production_ledger_invalid",
+                                    "refining completion overflows the canonical ledger",
+                                )
+                            })?;
+                    }
+                    ProductionRecipeKind::Component => {
+                        self.ledger.crafted_components = self
+                            .ledger
+                            .crafted_components
+                            .checked_add(job.batches)
+                            .ok_or_else(|| {
+                                IntentError::rejected(
+                                    "replay_production_ledger_invalid",
+                                    "component completion overflows the canonical ledger",
+                                )
+                            })?;
+                    }
+                }
+                let (experience_reward, refining_batches, components_crafted) = match job.recipe {
+                    ProductionRecipeKind::Refining => (
+                        job.batches
+                            .saturating_mul(content::manifest().experience_rewards.refining_batch),
+                        job.batches,
+                        0,
+                    ),
+                    ProductionRecipeKind::Component => (
+                        job.batches.saturating_mul(
+                            content::manifest().experience_rewards.crafted_component,
+                        ),
+                        0,
+                        job.batches,
+                    ),
+                };
+                let owner = self.player.get_mut(&job.owner_player_id).ok_or_else(|| {
                     IntentError::rejected(
-                        "production_job_invalid",
-                        "queued production quantities no longer match registered content",
+                        "replay_production_owner_missing",
+                        "production completion owner is not present in the canonical roster",
                     )
                 })?;
-            inventory_can_add_contents(self.inventory(&job.destination_inventory_id)?, &outputs)
-        } else {
-            false
-        };
-        Ok(Some(EventPayload::ProductionAdvanced {
-            machine_block_id: machine_block_id.to_owned(),
-            job_id: job.job_id.clone(),
-            previous_progress_ticks: job.progress_ticks,
-            new_progress_ticks,
-            completed,
-            output_delivered,
-        }))
+                owner.experience = owner.experience.saturating_add(experience_reward);
+                owner.career.refining_batches = owner
+                    .career
+                    .refining_batches
+                    .saturating_add(refining_batches);
+                owner.career.components_crafted = owner
+                    .career
+                    .components_crafted
+                    .saturating_add(components_crafted);
+
+                if matches!(
+                    outcome.kind,
+                    ProductionMachineOutcomeKind::CompletedAndDelivered
+                ) {
+                    add_contents(
+                        &mut self
+                            .inventory_mut(&outcome.destination_inventory_id)?
+                            .contents,
+                        &outcome.outputs,
+                    )?;
+                    self.pop_production_queue_head(&outcome.machine_block_id);
+                } else {
+                    let head = self
+                        .production_queues
+                        .get_mut(&outcome.machine_block_id)
+                        .and_then(|queue| queue.front_mut())
+                        .expect("validated production queue head exists");
+                    head.progress_ticks = outcome.new_progress_ticks;
+                    head.reserved_inputs = InventoryContents::default();
+                    head.pending_outputs.clone_from(&outcome.outputs);
+                }
+                Ok(())
+            }
+            ProductionMachineOutcomeKind::OutputDelivered => {
+                add_contents(
+                    &mut self
+                        .inventory_mut(&outcome.destination_inventory_id)?
+                        .contents,
+                    &outcome.outputs,
+                )?;
+                self.pop_production_queue_head(&outcome.machine_block_id);
+                Ok(())
+            }
+        }
+    }
+
+    fn pop_production_queue_head(&mut self, machine_block_id: &str) {
+        let queue = self
+            .production_queues
+            .get_mut(machine_block_id)
+            .expect("validated production queue exists");
+        queue.pop_front();
+        if queue.is_empty() {
+            self.production_queues.remove(machine_block_id);
+        }
     }
 
     fn next_suit_oxygen_after_one_second_for(&self, player_id: &str) -> Result<u16, IntentError> {
@@ -1486,8 +2306,7 @@ impl WorldState {
                     "physics payload cannot use a human client envelope",
                 ));
             }
-            EventPayload::ProductionAdvanced { .. }
-            | EventPayload::ProductionOutputDelivered { .. } => {
+            EventPayload::ProductionQuantumCommitted { .. } => {
                 return Err(IntentError::rejected(
                     "replay_production_envelope_invalid",
                     "automatic production payload cannot use a human client envelope",
@@ -2151,6 +2970,26 @@ impl WorldState {
         self.new_event(None, "system", None, payload)
     }
 
+    fn prepare_production_quantum_event(
+        &self,
+        payload: EventPayload,
+    ) -> Result<CanonicalEvent, IntentError> {
+        let EventPayload::ProductionQuantumCommitted { occurrence, .. } = &payload else {
+            return Err(IntentError::rejected(
+                "production_payload_invalid",
+                "production commit requires a whole-cell quantum payload",
+            ));
+        };
+        self.validate_next_production_occurrence(occurrence)?;
+        let event_id = production_occurrence_event_id(occurrence);
+        let occurred_at_unix_ms = occurrence.scheduled_for_unix_ms;
+        let mut event = self.new_event(None, "system", None, payload);
+        event.event_id = event_id;
+        event.occurred_at_unix_ms = occurred_at_unix_ms;
+        event.event_hash = event.calculate_hash();
+        Ok(event)
+    }
+
     fn new_event(
         &self,
         actor_player_id: Option<&str>,
@@ -2173,7 +3012,7 @@ impl WorldState {
             self.celestial_registry_hash.clone(),
             self.universe_id.clone(),
             self.cell_id.clone(),
-            self.fencing_token,
+            self.fencing_token.max(1),
             actor_player_id.map(str::to_owned),
             actor_type,
             operation_id,
@@ -2384,15 +3223,14 @@ impl WorldState {
                     "industry, construction, grid control, anchoring, and hand-tool damage require an authenticated player actor and operation ID",
                 ));
             }
-            EventPayload::ProductionAdvanced { .. }
-            | EventPayload::ProductionOutputDelivered { .. }
+            EventPayload::ProductionQuantumCommitted { .. }
                 if event.actor_player_id.is_some()
                     || event.actor_type != "system"
                     || event.operation_id.is_some() =>
             {
                 return Err(IntentError::rejected(
                     "replay_production_envelope_invalid",
-                    "production advancement and delivery require the system actor and no operation ID",
+                    "production quanta require the system actor and no operation ID",
                 ));
             }
             EventPayload::PhysicsStepCommitted { .. }
@@ -2452,6 +3290,13 @@ impl WorldState {
             return Err(IntentError::rejected(
                 "replay_player_incapacitated",
                 "incapacitated players cannot commit gameplay events before recovery",
+            ));
+        }
+        if event.authority_fencing_token == 0 || event.authority_fencing_token < self.fencing_token
+        {
+            return Err(IntentError::rejected(
+                "event_fencing_token_invalid",
+                "event fencing token must be positive and nondecreasing",
             ));
         }
 
@@ -2823,141 +3668,35 @@ impl WorldState {
                     .or_default()
                     .push_back(job.clone());
             }
-            EventPayload::ProductionAdvanced {
-                machine_block_id,
-                new_progress_ticks,
-                completed,
-                output_delivered,
-                ..
+            EventPayload::ProductionQuantumCommitted {
+                occurrence,
+                elapsed_ticks,
+                outcomes,
             } => {
-                let expected = self.production_payload_after_one_second(machine_block_id)?;
-                if expected.as_ref() != Some(&event.payload) {
+                if *elapsed_ticks != u64::from(content::manifest().physics.fixed_step_hz)
+                    || event.event_id != production_occurrence_event_id(occurrence)
+                    || event.occurred_at_unix_ms != occurrence.scheduled_for_unix_ms
+                {
                     return Err(IntentError::rejected(
-                        "replay_production_advance_invalid",
-                        "production advance does not match the exact authoritative one-second outcome",
+                        "replay_production_quantum_envelope_invalid",
+                        "production quantum identity, time, or elapsed ticks are invalid",
                     ));
                 }
-                let job = self.production_queues[machine_block_id]
-                    .front()
-                    .expect("validated production advance has a queue head")
-                    .clone();
-                if *completed {
-                    let (_, outputs, _) = production_recipe_quantities(job.recipe, job.batches)
-                        .expect("validated production job quantities remain registered");
-                    match job.recipe {
-                        ProductionRecipeKind::Refining => {
-                            self.ledger.refine_batches = self
-                                .ledger
-                                .refine_batches
-                                .checked_add(job.batches)
-                                .ok_or_else(|| {
-                                    IntentError::rejected(
-                                        "replay_production_ledger_invalid",
-                                        "refining completion overflows the canonical ledger",
-                                    )
-                                })?;
-                        }
-                        ProductionRecipeKind::Component => {
-                            self.ledger.crafted_components = self
-                                .ledger
-                                .crafted_components
-                                .checked_add(job.batches)
-                                .ok_or_else(|| {
-                                    IntentError::rejected(
-                                        "replay_production_ledger_invalid",
-                                        "component completion overflows the canonical ledger",
-                                    )
-                                })?;
-                        }
-                    }
-                    let (experience_reward, refining_batches, components_crafted) = match job.recipe
-                    {
-                        ProductionRecipeKind::Refining => (
-                            job.batches.saturating_mul(
-                                content::manifest().experience_rewards.refining_batch,
-                            ),
-                            job.batches,
-                            0,
-                        ),
-                        ProductionRecipeKind::Component => (
-                            job.batches.saturating_mul(
-                                content::manifest().experience_rewards.crafted_component,
-                            ),
-                            0,
-                            job.batches,
-                        ),
-                    };
-                    let owner = self.player.get_mut(&job.owner_player_id).ok_or_else(|| {
-                        IntentError::rejected(
-                            "replay_production_owner_missing",
-                            "production completion owner is not present in the canonical roster",
-                        )
-                    })?;
-                    owner.experience = owner.experience.saturating_add(experience_reward);
-                    owner.career.refining_batches = owner
-                        .career
-                        .refining_batches
-                        .saturating_add(refining_batches);
-                    owner.career.components_crafted = owner
-                        .career
-                        .components_crafted
-                        .saturating_add(components_crafted);
-                    if *output_delivered {
-                        add_contents(
-                            &mut self.inventory_mut(&job.destination_inventory_id)?.contents,
-                            &outputs,
-                        )?;
-                        let queue = self
-                            .production_queues
-                            .get_mut(machine_block_id)
-                            .expect("queue exists");
-                        queue.pop_front();
-                        if queue.is_empty() {
-                            self.production_queues.remove(machine_block_id);
-                        }
-                    } else {
-                        let head = self
-                            .production_queues
-                            .get_mut(machine_block_id)
-                            .and_then(|queue| queue.front_mut())
-                            .expect("validated production queue head exists");
-                        head.progress_ticks = *new_progress_ticks;
-                        head.reserved_inputs = InventoryContents::default();
-                        head.pending_outputs = outputs;
-                    }
-                } else {
-                    self.production_queues
-                        .get_mut(machine_block_id)
-                        .and_then(|queue| queue.front_mut())
-                        .expect("validated production queue head exists")
-                        .progress_ticks = *new_progress_ticks;
-                }
-            }
-            EventPayload::ProductionOutputDelivered {
-                machine_block_id,
-                destination_inventory_id,
-                outputs,
-                ..
-            } => {
-                let expected = self.production_payload_after_one_second(machine_block_id)?;
-                if expected.as_ref() != Some(&event.payload) {
+                let expected = self.production_quantum_payload(occurrence.clone())?;
+                if expected != event.payload {
                     return Err(IntentError::rejected(
-                        "replay_production_delivery_invalid",
-                        "production output delivery does not match authoritative route and capacity",
+                        "replay_production_quantum_invalid",
+                        "production quantum does not match the complete authoritative one-second outcome",
                     ));
                 }
-                add_contents(
-                    &mut self.inventory_mut(destination_inventory_id)?.contents,
-                    outputs,
-                )?;
-                let queue = self
-                    .production_queues
-                    .get_mut(machine_block_id)
-                    .expect("queue exists");
-                queue.pop_front();
-                if queue.is_empty() {
-                    self.production_queues.remove(machine_block_id);
+                for outcome in outcomes {
+                    if outcome.changes_state() {
+                        self.apply_production_machine_outcome(outcome)?;
+                    }
                 }
+                self.production_clock.last_committed_quantum_sequence =
+                    occurrence.production_quantum_sequence;
+                self.production_clock.last_scheduled_for_unix_ms = occurrence.scheduled_for_unix_ms;
             }
             EventPayload::OreRefined {
                 inventory_id,
@@ -3941,8 +4680,7 @@ impl WorldState {
             | EventPayload::PlayerIncapacitated { .. }
             | EventPayload::PlayerRespawned { .. }
             | EventPayload::ProductionQueued { .. }
-            | EventPayload::ProductionAdvanced { .. }
-            | EventPayload::ProductionOutputDelivered { .. }
+            | EventPayload::ProductionQuantumCommitted { .. }
             | EventPayload::InventoryTransferred { .. }
             | EventPayload::BlockBuilt { .. }
             | EventPayload::BlockWelded { .. }
@@ -3955,6 +4693,7 @@ impl WorldState {
         }
 
         self.event_sequence = event.event_sequence;
+        self.fencing_token = event.authority_fencing_token;
         self.last_event_hash.clone_from(&event.event_hash);
         if let (
             Some(actor_player_id),
@@ -4975,11 +5714,19 @@ fn event_changes_physics_scene(payload: &EventPayload) -> bool {
             | EventPayload::SuitModeChanged { .. }
             | EventPayload::SuitOxygenChanged { .. }
             | EventPayload::ProductionQueued { .. }
-            | EventPayload::ProductionAdvanced { .. }
-            | EventPayload::ProductionOutputDelivered { .. }
+            | EventPayload::ProductionQuantumCommitted { .. }
             | EventPayload::GridControlSet { .. }
             | EventPayload::PhysicsStepCommitted { .. }
     )
+}
+
+fn production_occurrence_event_id(occurrence: &ProductionScheduleOccurrence) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"the-verse/production-occurrence/v1\0");
+    hasher.update(
+        &serde_json::to_vec(occurrence).expect("production occurrence serialization cannot fail"),
+    );
+    hasher.finalize().to_hex().to_string()
 }
 
 fn voxel_collision_chunk_edge_cells() -> i32 {
@@ -6379,6 +7126,7 @@ fn add_contents(
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use proptest::prelude::*;
     use tempfile::tempdir;
@@ -6391,6 +7139,25 @@ mod tests {
         STARTER_INDUSTRY_CARGO_INVENTORY_ID, STARTER_INDUSTRY_GRID_ID, VoxelField,
     };
     use crate::persistence::AppendFailpoint;
+
+    #[derive(Debug)]
+    struct ManualTrustedClock(AtomicU64);
+
+    impl ManualTrustedClock {
+        const fn new(now_unix_ms: u64) -> Self {
+            Self(AtomicU64::new(now_unix_ms))
+        }
+
+        fn set(&self, now_unix_ms: u64) {
+            self.0.store(now_unix_ms, Ordering::SeqCst);
+        }
+    }
+
+    impl TrustedClock for ManualTrustedClock {
+        fn now_unix_ms(&self) -> Result<u64, PersistenceError> {
+            Ok(self.0.load(Ordering::SeqCst))
+        }
+    }
 
     fn runtime() -> Runtime {
         Runtime::open(tempdir().expect("tempdir").keep(), 42, 5).expect("runtime opens")
@@ -6464,9 +7231,859 @@ mod tests {
     }
 
     fn advance_whole_seconds(runtime: &mut Runtime, seconds: usize) {
-        for _ in 0..seconds * 4 {
-            runtime.advance(250).expect("authoritative second advances");
+        for _ in 0..seconds {
+            if runtime.next_production_occurrence().is_none() {
+                if !runtime
+                    .state()
+                    .background_production_is_runnable()
+                    .expect("fixture production state is valid")
+                {
+                    continue;
+                }
+                let scheduled_for_unix_ms = runtime
+                    .state()
+                    .production_clock
+                    .last_scheduled_for_unix_ms
+                    .checked_add(1_000)
+                    .expect("fixture production clock has capacity");
+                let occurrence = runtime
+                    .state()
+                    .next_production_occurrence_at(scheduled_for_unix_ms)
+                    .expect("fixture occurrence follows canonical production state");
+                runtime
+                    .store
+                    .install_next_production_occurrence_for_test(occurrence)
+                    .expect("fixture occurrence persists");
+            }
+            let occurrence = runtime
+                .next_production_occurrence()
+                .cloned()
+                .expect("fixture occurrence is durably scheduled");
+            if let Err(source) =
+                runtime.advance_background_production_occurrence(occurrence.clone())
+            {
+                panic!(
+                    "authoritative second advances: {source}; occurrence={occurrence:?}; clock={:?}",
+                    runtime.state().production_clock
+                );
+            }
         }
+    }
+
+    fn two_machine_production_runtime(directory: &Path) -> Runtime {
+        let mut runtime = Runtime::open(directory, 499, 100).expect("runtime opens");
+        seed_industry_cargo(
+            &mut runtime,
+            InventoryContents {
+                ore: 2,
+                refined_material: 1,
+                ..InventoryContents::default()
+            },
+        );
+        runtime
+            .execute_next_for_fixture(&production_intent(
+                "atomic-refine",
+                "block-refinery",
+                ProductionRecipeKind::Refining,
+                1,
+            ))
+            .expect("refinery queue accepts");
+        runtime
+            .execute_next_for_fixture(&production_intent(
+                "atomic-component",
+                "block-assembler",
+                ProductionRecipeKind::Component,
+                1,
+            ))
+            .expect("assembler queue accepts");
+        runtime
+    }
+
+    fn last_journal_event(directory: &Path) -> CanonicalEvent {
+        let journal =
+            fs::read_to_string(directory.join("events.ndjson")).expect("production journal reads");
+        serde_json::from_str(
+            journal
+                .lines()
+                .last()
+                .expect("production journal contains an event"),
+        )
+        .expect("production event parses")
+    }
+
+    #[test]
+    fn whole_cell_production_quantum_is_one_ordered_atomic_event() {
+        let directory = tempdir().expect("tempdir");
+        let mut runtime = two_machine_production_runtime(directory.path());
+        let before_sequence = runtime.state().event_sequence;
+        let occurrence = runtime
+            .next_production_occurrence()
+            .cloned()
+            .expect("next occurrence is durably scheduled");
+
+        assert!(
+            runtime
+                .advance_background_production_occurrence(occurrence)
+                .expect("whole-cell quantum commits")
+        );
+
+        assert_eq!(runtime.state().event_sequence, before_sequence + 1);
+        assert_eq!(
+            runtime
+                .state()
+                .production_queues
+                .values()
+                .map(|queue| queue.front().expect("queue head").progress_ticks)
+                .collect::<Vec<_>>(),
+            vec![60, 60]
+        );
+        assert_eq!(
+            runtime
+                .state()
+                .production_clock
+                .last_committed_quantum_sequence,
+            1
+        );
+        let event = last_journal_event(directory.path());
+        let EventPayload::ProductionQuantumCommitted {
+            occurrence,
+            elapsed_ticks,
+            outcomes,
+        } = event.payload
+        else {
+            panic!("last event must be the atomic production quantum");
+        };
+        assert_eq!(event.event_id, production_occurrence_event_id(&occurrence));
+        assert_eq!(event.occurred_at_unix_ms, occurrence.scheduled_for_unix_ms);
+        assert_eq!(occurrence.production_quantum_sequence, 1);
+        assert_eq!(elapsed_ticks, 60);
+        assert_eq!(outcomes.len(), 2);
+        assert_eq!(outcomes[0].grid_id, STARTER_INDUSTRY_GRID_ID);
+        assert_eq!(outcomes[0].machine_block_id, "block-assembler");
+        assert_eq!(outcomes[1].grid_id, STARTER_INDUSTRY_GRID_ID);
+        assert_eq!(outcomes[1].machine_block_id, "block-refinery");
+        assert!(
+            outcomes
+                .iter()
+                .all(|outcome| outcome.kind == ProductionMachineOutcomeKind::Advanced)
+        );
+        assert!(runtime.state().conservation().valid);
+    }
+
+    #[test]
+    fn production_quantum_replay_rejects_any_outcome_tamper_before_mutation() {
+        let directory = tempdir().expect("tempdir");
+        let mut runtime = two_machine_production_runtime(directory.path());
+        let prior = runtime.state().clone();
+        let occurrence = runtime
+            .next_production_occurrence()
+            .cloned()
+            .expect("next occurrence is durably scheduled");
+        runtime
+            .advance_background_production_occurrence(occurrence)
+            .expect("whole-cell quantum commits");
+        let mut event = last_journal_event(directory.path());
+        let EventPayload::ProductionQuantumCommitted { outcomes, .. } = &mut event.payload else {
+            panic!("last event must be a production quantum");
+        };
+        outcomes[0].new_progress_ticks += 1;
+        event.event_hash = event.calculate_hash();
+
+        let mut replay = prior.clone();
+        assert!(matches!(
+            replay.apply_event(&event),
+            Err(IntentError::Rejected { code, .. }) if code == "replay_production_quantum_invalid"
+        ));
+        assert_eq!(replay, prior);
+    }
+
+    #[test]
+    fn background_occurrence_is_idempotent_and_changes_no_physics_or_life_state() {
+        let directory = tempdir().expect("tempdir");
+        let mut runtime = two_machine_production_runtime(directory.path());
+        let occurrence = runtime
+            .next_production_occurrence()
+            .cloned()
+            .expect("next occurrence is durably scheduled");
+        let prior_sequence = runtime.state().event_sequence;
+        let prior_tick = runtime.state().simulation_tick;
+        let prior_phase = runtime.state().physics_step_phase;
+        let prior_players = runtime.state().player.clone();
+
+        assert!(
+            runtime
+                .advance_background_production_occurrence(occurrence.clone())
+                .expect("background occurrence commits")
+        );
+        assert_eq!(runtime.state().event_sequence, prior_sequence + 1);
+        assert_eq!(runtime.state().simulation_tick, prior_tick);
+        assert_eq!(runtime.state().physics_step_phase, prior_phase);
+        assert_eq!(runtime.state().player, prior_players);
+        let committed_hash = runtime.state().state_hash();
+
+        assert!(
+            !runtime
+                .advance_background_production_occurrence(occurrence)
+                .expect("duplicate occurrence reconciles")
+        );
+        assert_eq!(runtime.state().event_sequence, prior_sequence + 1);
+        assert_eq!(runtime.state().state_hash(), committed_hash);
+    }
+
+    #[test]
+    fn production_quantum_failpoints_recover_none_or_the_complete_vector() {
+        for (failpoint, durable) in [
+            (AppendFailpoint::BeforeWrite, false),
+            (AppendFailpoint::AfterSync, true),
+        ] {
+            let directory = tempdir().expect("tempdir");
+            let mut runtime = two_machine_production_runtime(directory.path());
+            let occurrence = runtime
+                .next_production_occurrence()
+                .cloned()
+                .expect("next occurrence is durably scheduled");
+            let prior_hash = runtime.state().state_hash();
+            let prior_sequence = runtime.state().event_sequence;
+            runtime.store.set_append_failpoint(failpoint);
+
+            assert!(matches!(
+                runtime.advance_background_production_occurrence(occurrence),
+                Err(RuntimeError::Persistence(
+                    PersistenceError::InjectedFailure(_)
+                ))
+            ));
+            assert!(runtime.is_halted());
+            assert_eq!(runtime.state().state_hash(), prior_hash);
+            assert_eq!(runtime.state().event_sequence, prior_sequence);
+            drop(runtime);
+
+            let recovered =
+                Runtime::open(directory.path(), 499, 100).expect("failed quantum recovers");
+            let progress = recovered
+                .state()
+                .production_queues
+                .values()
+                .map(|queue| queue.front().expect("queue head").progress_ticks)
+                .collect::<Vec<_>>();
+            if durable {
+                assert_eq!(recovered.state().event_sequence, prior_sequence + 1);
+                assert_eq!(progress, vec![60, 60]);
+                assert_eq!(
+                    recovered
+                        .state()
+                        .production_clock
+                        .last_committed_quantum_sequence,
+                    1
+                );
+            } else {
+                assert_eq!(recovered.state().event_sequence, prior_sequence);
+                assert_eq!(progress, vec![0, 0]);
+                assert_eq!(
+                    recovered
+                        .state()
+                        .production_clock
+                        .last_committed_quantum_sequence,
+                    0
+                );
+            }
+            assert!(recovered.state().conservation().valid);
+        }
+    }
+
+    #[test]
+    fn durable_schedule_preserves_the_remaining_subsecond_across_restart() {
+        let directory = tempdir().expect("tempdir");
+        let clock = Arc::new(ManualTrustedClock::new(1_000_000));
+        {
+            let mut runtime = Runtime::open_with_clock(directory.path(), 601, 100, clock.clone())
+                .expect("runtime opens");
+            seed_industry_cargo(
+                &mut runtime,
+                InventoryContents {
+                    ore: 2,
+                    ..InventoryContents::default()
+                },
+            );
+            runtime
+                .execute_next_for_fixture(&production_intent(
+                    "durable-partial-second",
+                    "block-refinery",
+                    ProductionRecipeKind::Refining,
+                    1,
+                ))
+                .expect("job queues");
+            assert_eq!(
+                runtime
+                    .next_production_occurrence()
+                    .expect("occurrence arms")
+                    .scheduled_for_unix_ms,
+                1_001_000
+            );
+        }
+
+        clock.set(1_000_750);
+        let mut recovered = Runtime::open_with_clock(directory.path(), 601, 100, clock.clone())
+            .expect("runtime recovers at 750 ms");
+        assert_eq!(
+            recovered
+                .advance_due_production()
+                .expect("early dispatch is inert")
+                .committed_quanta,
+            0
+        );
+        clock.set(1_000_999);
+        assert_eq!(
+            recovered
+                .advance_due_production()
+                .expect("999 ms dispatch is inert")
+                .committed_quanta,
+            0
+        );
+        clock.set(1_001_000);
+        assert_eq!(
+            recovered
+                .advance_due_production()
+                .expect("exact due dispatch commits")
+                .committed_quanta,
+            1
+        );
+        assert_eq!(
+            recovered.state().production_queues["block-refinery"][0].progress_ticks,
+            60
+        );
+    }
+
+    #[test]
+    fn forward_jump_respects_catch_up_budgets_and_retains_exact_continuation() {
+        let directory = tempdir().expect("tempdir");
+        let clock = Arc::new(ManualTrustedClock::new(2_000_000));
+        let open_config;
+        {
+            let mut runtime = Runtime::open_with_clock(directory.path(), 602, 100, clock.clone())
+                .expect("runtime opens");
+            seed_industry_cargo(
+                &mut runtime,
+                InventoryContents {
+                    ore: 200,
+                    ..InventoryContents::default()
+                },
+            );
+            runtime
+                .execute_next_for_fixture(&production_intent(
+                    "bounded-forward-jump",
+                    "block-refinery",
+                    ProductionRecipeKind::Refining,
+                    100,
+                ))
+                .expect("long job queues");
+            open_config = runtime.open_config();
+        }
+
+        clock.set(2_100_000);
+        let mut recovered = Runtime::open_for_activation(&open_config)
+            .expect("replacement runtime opens after forward jump");
+        let first = recovered
+            .advance_due_production()
+            .expect("first catch-up dispatch succeeds");
+        assert!((1..=MAX_PRODUCTION_CATCH_UP_QUANTA).contains(&first.committed_quanta));
+        assert!(first.backlog_remaining);
+        let mut committed = first.committed_quanta;
+        let mut backlog_remaining = first.backlog_remaining;
+        let mut dispatches = 1;
+        while backlog_remaining {
+            let continuation = recovered
+                .advance_due_production()
+                .expect("continuation dispatch succeeds");
+            assert!((1..=MAX_PRODUCTION_CATCH_UP_QUANTA).contains(&continuation.committed_quanta));
+            committed += continuation.committed_quanta;
+            backlog_remaining = continuation.backlog_remaining;
+            dispatches += 1;
+            assert!(dispatches <= 100, "bounded continuation must make progress");
+        }
+        assert_eq!(committed, 100);
+        assert_eq!(
+            recovered
+                .state()
+                .production_clock
+                .last_committed_quantum_sequence,
+            100
+        );
+        assert_eq!(
+            recovered.state().production_queues["block-refinery"][0].progress_ticks,
+            6_000
+        );
+    }
+
+    #[test]
+    fn drain_releases_an_idle_cell_and_a_successor_reactivates_with_a_new_fence() {
+        let directory = tempdir().expect("tempdir");
+        let first_fence;
+        {
+            let mut runtime = Runtime::open(directory.path(), 603, 100).expect("runtime opens");
+            first_fence = runtime.lifecycle_status().fencing_token;
+            assert_eq!(
+                runtime
+                    .drain_to_background_or_sleeping()
+                    .expect("idle drain succeeds"),
+                crate::persistence::LifecycleMode::Sleeping
+            );
+            let sleeping = runtime.lifecycle_status();
+            assert_eq!(
+                sleeping.observed_mode,
+                crate::persistence::LifecycleMode::Sleeping
+            );
+            assert!(sleeping.expires_at_unix_ms.is_none());
+            assert!(!runtime.physics_scene_is_initialized());
+            assert!(matches!(
+                runtime.advance(16),
+                Err(RuntimeError::LifecycleUnavailable {
+                    mode: crate::persistence::LifecycleMode::Sleeping
+                })
+            ));
+        }
+
+        let successor = Runtime::open(directory.path(), 603, 100).expect("successor activates");
+        assert_eq!(
+            successor.lifecycle_status().observed_mode,
+            crate::persistence::LifecycleMode::Active
+        );
+        assert!(successor.physics_scene_is_initialized());
+        assert!(successor.lifecycle_status().fencing_token > first_fence);
+    }
+
+    #[test]
+    fn background_mode_runs_only_due_production_then_reactivates() {
+        let directory = tempdir().expect("tempdir");
+        let clock = Arc::new(ManualTrustedClock::new(3_000_000));
+        let mut runtime = Runtime::open_with_clock(directory.path(), 604, 100, clock.clone())
+            .expect("runtime opens");
+        seed_industry_cargo(
+            &mut runtime,
+            InventoryContents {
+                ore: 2,
+                ..InventoryContents::default()
+            },
+        );
+        runtime
+            .execute_next_for_fixture(&production_intent(
+                "background-drain",
+                "block-refinery",
+                ProductionRecipeKind::Refining,
+                1,
+            ))
+            .expect("job queues");
+        let simulation_tick = runtime.state().simulation_tick;
+        let player_oxygen = runtime.state().player.suit_oxygen_milli;
+        assert_eq!(
+            runtime
+                .drain_to_background_or_sleeping()
+                .expect("runnable drain succeeds"),
+            crate::persistence::LifecycleMode::Background
+        );
+        assert!(!runtime.physics_scene_is_initialized());
+        assert!(matches!(
+            runtime.advance(250),
+            Err(RuntimeError::LifecycleUnavailable {
+                mode: crate::persistence::LifecycleMode::Background
+            })
+        ));
+
+        clock.set(3_001_000);
+        assert_eq!(
+            runtime
+                .advance_due_production()
+                .expect("background production advances")
+                .committed_quanta,
+            1
+        );
+        assert_eq!(runtime.state().simulation_tick, simulation_tick);
+        assert_eq!(runtime.state().player.suit_oxygen_milli, player_oxygen);
+        assert!(runtime.activation_step().expect("activation completes"));
+        assert_eq!(
+            runtime.lifecycle_status().observed_mode,
+            crate::persistence::LifecycleMode::Active
+        );
+        assert!(runtime.physics_scene_is_initialized());
+    }
+
+    #[test]
+    fn idle_production_rearms_from_the_new_trusted_boundary_without_cursor_conflict() {
+        let directory = tempdir().expect("tempdir");
+        let clock = Arc::new(ManualTrustedClock::new(3_500_000));
+        let mut runtime = Runtime::open_with_clock(directory.path(), 608, 100, clock.clone())
+            .expect("runtime opens");
+        seed_industry_cargo(
+            &mut runtime,
+            InventoryContents {
+                ore: 2,
+                ..InventoryContents::default()
+            },
+        );
+        runtime
+            .execute_next_for_fixture(&production_intent(
+                "idle-rearm-refining",
+                "block-refinery",
+                ProductionRecipeKind::Refining,
+                1,
+            ))
+            .expect("refining queues");
+        for due in [3_501_000, 3_502_000] {
+            clock.set(due);
+            assert_eq!(
+                runtime
+                    .advance_due_production()
+                    .expect("refining quantum commits")
+                    .committed_quanta,
+                1
+            );
+        }
+        assert!(runtime.next_production_occurrence().is_none());
+        assert_eq!(
+            runtime
+                .state()
+                .production_clock
+                .last_committed_quantum_sequence,
+            2
+        );
+
+        clock.set(3_502_125);
+        runtime
+            .execute_next_for_fixture(&production_intent(
+                "idle-rearm-assembly",
+                "block-assembler",
+                ProductionRecipeKind::Component,
+                1,
+            ))
+            .expect("assembly queues after the idle gap");
+        let rearmed = runtime
+            .next_production_occurrence()
+            .cloned()
+            .expect("new runnable boundary rearms production");
+        assert_eq!(rearmed.production_quantum_sequence, 3);
+        assert_eq!(rearmed.scheduled_for_unix_ms, 3_503_125);
+
+        let before_conflict = runtime.state().state_hash();
+        let mut conflicting = rearmed.clone();
+        conflicting.scheduled_for_unix_ms += 1;
+        assert!(matches!(
+            runtime.advance_background_production_occurrence(conflicting),
+            Err(RuntimeError::Intent(IntentError::Rejected { ref code, .. }))
+                if code == "production_occurrence_delivery_conflict"
+        ));
+        assert_eq!(runtime.state().state_hash(), before_conflict);
+
+        clock.set(rearmed.scheduled_for_unix_ms);
+        assert_eq!(
+            runtime
+                .advance_due_production()
+                .expect("rearmed occurrence commits")
+                .committed_quanta,
+            1
+        );
+        assert_eq!(
+            runtime
+                .state()
+                .production_clock
+                .last_committed_quantum_sequence,
+            3
+        );
+        assert!(runtime.state().conservation().valid);
+    }
+
+    #[test]
+    fn activation_catches_up_only_through_its_durable_wake_cutoff() {
+        let directory = tempdir().expect("tempdir");
+        let clock = Arc::new(ManualTrustedClock::new(4_000_000));
+        let mut runtime = Runtime::open_with_clock(directory.path(), 605, 100, clock.clone())
+            .expect("runtime opens");
+        seed_industry_cargo(
+            &mut runtime,
+            InventoryContents {
+                ore: 200,
+                ..InventoryContents::default()
+            },
+        );
+        runtime
+            .execute_next_for_fixture(&production_intent(
+                "activation-cutoff",
+                "block-refinery",
+                ProductionRecipeKind::Refining,
+                100,
+            ))
+            .expect("long job queues");
+        assert_eq!(
+            runtime
+                .drain_to_background_or_sleeping()
+                .expect("runnable cell drains"),
+            crate::persistence::LifecycleMode::Background
+        );
+        let open_config = runtime.open_config();
+        drop(runtime);
+
+        clock.set(4_070_000);
+        let mut runtime = Runtime::open_for_activation(&open_config)
+            .expect("replacement acquires the background cell for activation");
+        assert!(!runtime.activation_step().expect("bounded catch-up yields"));
+        assert_eq!(
+            runtime.lifecycle_status().observed_mode,
+            crate::persistence::LifecycleMode::Activating
+        );
+        assert!(!runtime.physics_scene_is_initialized());
+        assert!(
+            (1..=u64::try_from(MAX_PRODUCTION_CATCH_UP_QUANTA).expect("catch-up budget fits u64"))
+                .contains(
+                    &runtime
+                        .state()
+                        .production_clock
+                        .last_committed_quantum_sequence
+                )
+        );
+        let first_activation_frontier = runtime
+            .state()
+            .production_clock
+            .last_committed_quantum_sequence;
+        drop(runtime);
+
+        clock.set(4_075_000);
+        let mut runtime =
+            Runtime::open_hosted_with_clock(directory.path(), 605, 100, clock.clone())
+                .expect("activation crash recovery preserves the original cut-off");
+        assert_eq!(
+            runtime
+                .state()
+                .production_clock
+                .last_committed_quantum_sequence,
+            first_activation_frontier
+        );
+        let mut activated = false;
+        for _ in 0..100 {
+            activated = runtime
+                .activation_step()
+                .expect("cut-off catch-up continues");
+            if activated {
+                break;
+            }
+        }
+        assert!(
+            activated,
+            "bounded activation eventually reaches its cut-off"
+        );
+        assert_eq!(
+            runtime
+                .state()
+                .production_clock
+                .last_committed_quantum_sequence,
+            70
+        );
+        assert_eq!(
+            runtime
+                .next_production_occurrence()
+                .expect("post-cutoff work remains scheduled")
+                .scheduled_for_unix_ms,
+            4_071_000
+        );
+        assert!(runtime.physics_scene_is_initialized());
+    }
+
+    #[test]
+    fn hosted_restart_restores_sleeping_without_physics_or_writer_ownership() {
+        let directory = tempdir().expect("tempdir");
+        let clock = Arc::new(ManualTrustedClock::new(5_000_000));
+        let mut runtime = Runtime::open_with_clock(directory.path(), 606, 100, clock.clone())
+            .expect("runtime opens");
+        assert_eq!(
+            runtime
+                .drain_to_background_or_sleeping()
+                .expect("idle cell sleeps"),
+            crate::persistence::LifecycleMode::Sleeping
+        );
+        drop(runtime);
+
+        let sleeping_host =
+            Runtime::open_hosted_with_clock(directory.path(), 606, 100, clock.clone())
+                .expect("host recovers the durable sleeping mode");
+        assert_eq!(
+            sleeping_host.lifecycle_status().observed_mode,
+            crate::persistence::LifecycleMode::Sleeping
+        );
+        assert!(!sleeping_host.physics_scene_is_initialized());
+
+        let wake_config = sleeping_host.open_config();
+        let waking = Runtime::open_for_activation(&wake_config)
+            .expect("sleeping host retains no exclusive writer ownership");
+        assert_eq!(
+            waking.lifecycle_status().observed_mode,
+            crate::persistence::LifecycleMode::Activating
+        );
+        assert!(!waking.physics_scene_is_initialized());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cross_process_hard_kill_replays_exactly_one_background_output() {
+        const CHILD_FLAG: &str = "VERSE_P16_CROSS_PROCESS_CHILD";
+        const ROOT_ENV: &str = "VERSE_P16_CROSS_PROCESS_ROOT";
+        const READY_ENV: &str = "VERSE_P16_CROSS_PROCESS_READY";
+        const SEED: u64 = 607;
+        const START_UNIX_MS: u64 = 6_000_000;
+
+        if std::env::var_os(CHILD_FLAG).is_some() {
+            let root = std::path::PathBuf::from(
+                std::env::var_os(ROOT_ENV).expect("child receives the universe root"),
+            );
+            let ready = std::path::PathBuf::from(
+                std::env::var_os(READY_ENV).expect("child receives the readiness marker"),
+            );
+            let clock = Arc::new(ManualTrustedClock::new(START_UNIX_MS));
+            let mut runtime = Runtime::open_with_clock(&root, SEED, 100, clock.clone())
+                .expect("child runtime opens");
+            seed_industry_cargo(
+                &mut runtime,
+                InventoryContents {
+                    ore: 2,
+                    ..InventoryContents::default()
+                },
+            );
+            runtime
+                .execute_next_for_fixture(&production_intent(
+                    "cross-process-background",
+                    "block-refinery",
+                    ProductionRecipeKind::Refining,
+                    1,
+                ))
+                .expect("child queues refining");
+            let job = runtime
+                .state
+                .production_queues
+                .get_mut("block-refinery")
+                .and_then(|queue| queue.front_mut())
+                .expect("child refining job exists");
+            job.progress_ticks = job
+                .duration_ticks
+                .checked_sub(u64::from(content::manifest().physics.fixed_step_hz))
+                .expect("fixture duration exceeds one quantum");
+            runtime
+                .persist_snapshot()
+                .expect("near-complete child job persists");
+            assert_eq!(
+                runtime
+                    .drain_to_background_or_sleeping()
+                    .expect("child drains to background"),
+                crate::persistence::LifecycleMode::Background
+            );
+            clock.set(START_UNIX_MS + 1_000);
+            assert_eq!(
+                runtime
+                    .advance_due_production()
+                    .expect("child commits one due quantum")
+                    .committed_quanta,
+                1
+            );
+            assert_eq!(
+                runtime.state.inventories[STARTER_INDUSTRY_CARGO_INVENTORY_ID]
+                    .contents
+                    .refined_material,
+                1
+            );
+            fs::write(&ready, b"journal-synced").expect("child publishes readiness marker");
+            loop {
+                std::thread::park();
+            }
+        }
+
+        let directory = tempdir().expect("tempdir");
+        let ready = directory.path().join("background-event-synced");
+        let current_executable =
+            std::env::current_exe().expect("test executable path remains available");
+        let mut child = std::process::Command::new(current_executable)
+            .arg("--exact")
+            .arg("engine::tests::cross_process_hard_kill_replays_exactly_one_background_output")
+            .arg("--nocapture")
+            .env(CHILD_FLAG, "1")
+            .env(ROOT_ENV, directory.path())
+            .env(READY_ENV, &ready)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("cross-process fixture starts");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !ready.exists() {
+            if let Some(status) = child.try_wait().expect("child status remains readable") {
+                panic!("cross-process fixture exited before the hard-kill boundary: {status}");
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cross-process fixture did not reach the hard-kill boundary"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let stop_status = std::process::Command::new("kill")
+            .arg("-STOP")
+            .arg(child.id().to_string())
+            .status()
+            .expect("the local host provides POSIX process signalling");
+        assert!(stop_status.success());
+        let blocked_clock = Arc::new(ManualTrustedClock::new(START_UNIX_MS + 20_000));
+        assert!(matches!(
+            Runtime::open_hosted_with_clock(directory.path(), SEED, 100, blocked_clock,),
+            Err(RuntimeError::Persistence(
+                PersistenceError::WriterAlreadyActive(_)
+            ))
+        ));
+        child
+            .kill()
+            .expect("hard-kill terminates the writer process");
+        let status = child.wait().expect("hard-killed child is reaped");
+        assert!(!status.success());
+
+        let clock = Arc::new(ManualTrustedClock::new(START_UNIX_MS + 1_000));
+        let mut recovered =
+            Runtime::open_hosted_with_clock(directory.path(), SEED, 100, clock.clone())
+                .expect("successor replays the synced event without a graceful snapshot");
+        assert_eq!(
+            recovered.lifecycle_status().observed_mode,
+            crate::persistence::LifecycleMode::Background
+        );
+        assert!(!recovered.physics_scene_is_initialized());
+        assert_eq!(
+            recovered
+                .state()
+                .production_clock
+                .last_committed_quantum_sequence,
+            1
+        );
+        assert_eq!(
+            recovered.state().inventories[STARTER_INDUSTRY_CARGO_INVENTORY_ID]
+                .contents
+                .refined_material,
+            1
+        );
+        assert!(recovered.state().conservation().valid);
+        assert_eq!(
+            recovered
+                .background_dispatch_step()
+                .expect("reconciled background cell releases"),
+            crate::persistence::LifecycleMode::Sleeping
+        );
+
+        let wake_config = recovered.open_config();
+        drop(recovered);
+        let mut active = Runtime::open_for_activation(&wake_config)
+            .expect("successor reacquires the sleeping cell");
+        assert!(active.activation_step().expect("successor activates"));
+        assert_eq!(
+            active.state().inventories[STARTER_INDUSTRY_CARGO_INVENTORY_ID]
+                .contents
+                .refined_material,
+            1
+        );
+        assert_eq!(
+            active
+                .state()
+                .production_clock
+                .last_committed_quantum_sequence,
+            1
+        );
     }
 
     #[test]
@@ -7540,10 +9157,7 @@ mod tests {
         player.angular_velocity = primary.angular_velocity;
         player.surface_contact = primary.surface_contact;
         player.locomotion = primary.locomotion;
-        runtime
-            .physics
-            .rebuild(&physics_body_specs(&runtime.state))
-            .expect("actor-specific tool pose rebuilds the physics scene");
+        runtime.rebuild_physics_for_test();
     }
 
     fn normalized(value: Vec3) -> Vec3 {
@@ -7627,10 +9241,7 @@ mod tests {
         }
         *runtime.state.player.primary_mut() =
             aimed.expect("build fixture has one visible face-connected existing block");
-        runtime
-            .physics
-            .rebuild(&physics_body_specs(&runtime.state))
-            .expect("test setup rebuilds aimed player near the grid");
+        runtime.rebuild_physics_for_test();
     }
 
     fn exposed_voxel_face(voxels: &VoxelField, coordinate: IVec3) -> Option<IVec3> {
@@ -7694,10 +9305,7 @@ mod tests {
             .get_mut(player_id)
             .expect("aimed fixture actor exists") =
             aimed.expect("mining fixture voxel has a visible exposed face");
-        runtime
-            .physics
-            .rebuild(&physics_body_specs(&runtime.state))
-            .expect("test setup rebuilds aimed player near the voxel");
+        runtime.rebuild_physics_for_test();
     }
 
     fn aim_player_at_block(runtime: &mut Runtime, grid_id: &str, block_id: &str) {
@@ -7740,10 +9348,7 @@ mod tests {
         }
         *runtime.state.player.primary_mut() =
             aimed.expect("hand-tool fixture block has one visible exposed face");
-        runtime
-            .physics
-            .rebuild(&physics_body_specs(&runtime.state))
-            .expect("test setup rebuilds aimed player near the block");
+        runtime.rebuild_physics_for_test();
     }
 
     fn aim_player_at_block_preserving_locomotion(
@@ -7764,10 +9369,7 @@ mod tests {
         runtime.state.player.linear_velocity = prior.linear_velocity;
         runtime.state.player.angular_velocity = prior.angular_velocity;
         runtime.state.player.surface_contact = prior.surface_contact;
-        runtime
-            .physics
-            .rebuild(&physics_body_specs(&runtime.state))
-            .expect("tool fixture restores the physical player pose");
+        runtime.rebuild_physics_for_test();
     }
 
     fn add_remote_player(runtime: &mut Runtime) {
@@ -7780,10 +9382,7 @@ mod tests {
             .get_mut("player-remote")
             .expect("remote development player exists")
             .linear_velocity = Vec3::new(0.25, 0.0, 0.0);
-        runtime
-            .physics
-            .rebuild(&physics_body_specs(&runtime.state))
-            .expect("two-player physics scene builds");
+        runtime.rebuild_physics_for_test();
     }
 
     #[test]
@@ -8106,9 +9705,7 @@ mod tests {
                     },
                 )
                 .expect("secondary actor queues its connected refinery");
-            for _ in 0..8 {
-                runtime.advance(250).expect("refinery advances");
-            }
+            advance_whole_seconds(&mut runtime, 2);
             runtime
                 .execute_next_as_for_fixture(
                     "player-remote",
@@ -8123,9 +9720,7 @@ mod tests {
                     },
                 )
                 .expect("secondary actor queues its connected assembler");
-            for _ in 0..8 {
-                runtime.advance(250).expect("assembler advances");
-            }
+            advance_whole_seconds(&mut runtime, 2);
             runtime
                 .execute_next_as_for_fixture(
                     "player-remote",
@@ -8649,10 +10244,7 @@ mod tests {
             .sum();
         runtime.state.ledger.destroyed_components = 0;
         assert!(runtime.state.conservation().valid);
-        runtime
-            .physics
-            .rebuild(&physics_body_specs(&runtime.state))
-            .expect("fixture physics rebuilds");
+        runtime.rebuild_physics_for_test();
         runtime
             .persist_snapshot()
             .expect("fixture snapshot persists");
@@ -9441,7 +11033,7 @@ mod tests {
         let target = reachable_voxel(&mut runtime);
         let body_id = voxel_collision_chunk_body_id(voxel_collision_chunk_coordinate(target));
         let collider_id = voxel_collision_collider_id(target);
-        assert!(runtime.physics.contains_collider(&body_id, &collider_id));
+        assert!(runtime.physics().contains_collider(&body_id, &collider_id));
         let intent = ClientMessage::MineVoxel {
             operation_sequence: 0,
             operation_id: "mine-once".into(),
@@ -9452,7 +11044,7 @@ mod tests {
             .expect("first mine accepted");
         assert_eq!(runtime.physics_chunk_replacements, 1);
         assert_eq!(runtime.physics_full_rebuilds, 0);
-        assert!(!runtime.physics.contains_collider(&body_id, &collider_id));
+        assert!(!runtime.physics().contains_collider(&body_id, &collider_id));
         let hash_after_first = runtime.state().state_hash();
         let second = runtime
             .execute_next_for_fixture(&intent)
@@ -9655,7 +11247,7 @@ mod tests {
             |runtime: &mut Runtime, operation_id: &str, coordinate: IVec3, expected_code: &str| {
                 let before_hash = runtime.state().state_hash();
                 let before_sequence = runtime.state().event_sequence;
-                let before_fingerprint = runtime.physics.body_collider_fingerprint();
+                let before_fingerprint = runtime.physics().body_collider_fingerprint();
                 let before_journal = fs::read(directory.path().join("events.ndjson"))
                     .expect("journal reads before rejection");
                 let result = runtime.execute_next_as_for_fixture(
@@ -9674,7 +11266,7 @@ mod tests {
                 assert_eq!(runtime.state().state_hash(), before_hash);
                 assert_eq!(runtime.state().event_sequence, before_sequence);
                 assert_eq!(
-                    runtime.physics.body_collider_fingerprint(),
+                    runtime.physics().body_collider_fingerprint(),
                     before_fingerprint
                 );
                 assert_eq!(
@@ -9718,10 +11310,7 @@ mod tests {
             death_id: "remote-test-death".into(),
             cause: PlayerDeathCause::OxygenDepleted,
         };
-        runtime
-            .physics
-            .rebuild(&physics_body_specs(&runtime.state))
-            .expect("incapacitated fixture physics builds");
+        runtime.rebuild_physics_for_test();
         runtime
             .persist_snapshot()
             .expect("incapacitated mining baseline persists");
@@ -10085,7 +11674,7 @@ mod tests {
         runtime.persist_snapshot().expect("player pose persists");
         assert!(runtime.state().grids["anchored-grid"].anchor_touches(&runtime.state().voxels));
         let before_hash = runtime.state().state_hash();
-        let before_fingerprint = runtime.physics.body_collider_fingerprint();
+        let before_fingerprint = runtime.physics().body_collider_fingerprint();
         let before_journal =
             fs::read(directory.path().join("events.ndjson")).expect("journal reads");
 
@@ -10101,7 +11690,7 @@ mod tests {
         ));
         assert_eq!(runtime.state().state_hash(), before_hash);
         assert_eq!(
-            runtime.physics.body_collider_fingerprint(),
+            runtime.physics().body_collider_fingerprint(),
             before_fingerprint
         );
         assert_eq!(runtime.physics_chunk_replacements, 0);
@@ -10685,10 +12274,7 @@ mod tests {
         let mut runtime = runtime();
         runtime.state.player.linear_velocity = Vec3::new(20.0, 0.0, 0.0);
         runtime.state.player.angular_velocity = Vec3::new(0.0, 0.0, 3.0);
-        runtime
-            .physics
-            .rebuild(&physics_body_specs(&runtime.state))
-            .expect("high-inertia player fixture rebuilds");
+        runtime.rebuild_physics_for_test();
         runtime
             .execute_next_for_fixture(&ClientMessage::SetPlayerControl {
                 operation_sequence: 0,
@@ -10939,10 +12525,7 @@ mod tests {
             player.suit_oxygen_milli = 1_000;
             player.linear_velocity = Vec3::ZERO;
         }
-        runtime
-            .physics
-            .rebuild(&physics_body_specs(&runtime.state))
-            .expect("two-player vacuum fixture builds");
+        runtime.rebuild_physics_for_test();
         runtime.persist_snapshot().expect("fixture persists");
 
         for _ in 0..3 {
@@ -12780,7 +14363,7 @@ mod tests {
     fn lost_writer_authority_halts_without_mutating_world() {
         let directory = tempdir().expect("tempdir");
         let mut runtime = Runtime::open(directory.path(), 73, 100).expect("runtime opens");
-        let lock_path = directory.path().join("writer.lock");
+        let lock_path = directory.path().join("cell-lifecycle.json");
         let mut lease: serde_json::Value =
             serde_json::from_slice(&fs::read(&lock_path).expect("lease reads"))
                 .expect("lease parses");
@@ -12848,10 +14431,7 @@ mod tests {
         set_test_player_position(&mut runtime.state.player, start);
         runtime.state.player.linear_velocity = Vec3::new(0.0, -24.0, 0.0);
         runtime.state.player.jetpack_enabled = false;
-        runtime
-            .physics
-            .rebuild(&physics_body_specs(&runtime.state))
-            .expect("test setup rebuilds the rotated grid scene");
+        runtime.rebuild_physics_for_test();
 
         let mut contacted = false;
         for _ in 0..30 {
@@ -12886,10 +14466,7 @@ mod tests {
         set_test_player_position(&mut runtime.state.player, start);
         runtime.state.player.linear_velocity = Vec3::new(0.0, -24.0, 0.0);
         runtime.state.player.jetpack_enabled = false;
-        runtime
-            .physics
-            .rebuild(&physics_body_specs(&runtime.state))
-            .expect("planet landing fixture rebuilds");
+        runtime.rebuild_physics_for_test();
 
         let mut contacted = false;
         for _ in 0..60 {
@@ -13127,25 +14704,30 @@ mod tests {
             local_anchor: Vec3::new(0.0, planet_surface_radius_m(), 0.0),
             local_normal: Vec3::new(0.0, 1.0, 0.0),
         });
-        runtime
-            .physics
-            .rebuild(&physics_body_specs(&runtime.state))
-            .expect("snap fixture rebuilds");
-        let mut body_states = runtime.physics.body_states().expect("body states extract");
+        runtime.rebuild_physics_for_test();
+        let mut body_states = runtime
+            .physics_mut()
+            .body_states()
+            .expect("body states extract");
         let before = body_states
             .iter()
             .find(|body| body.body_id == PLAYER_BODY_ID)
             .expect("player body exists")
             .clone();
 
-        adjust_grounded_capsule_for_substep(
-            &runtime.state,
-            &mut runtime.physics,
-            &runtime.state.player,
-            &mut body_states,
-            runtime.state.simulation_tick,
-        )
-        .expect("ground snap applies");
+        {
+            let Runtime { state, physics, .. } = &mut runtime;
+            adjust_grounded_capsule_for_substep(
+                &*state,
+                physics
+                    .as_mut()
+                    .expect("active test runtime has an initialized physics scene"),
+                &state.player,
+                &mut body_states,
+                state.simulation_tick,
+            )
+            .expect("ground snap applies");
+        }
         let after = body_states
             .iter()
             .find(|body| body.body_id == PLAYER_BODY_ID)
@@ -13183,10 +14765,7 @@ mod tests {
             false,
             runtime.state.simulation_tick,
         );
-        runtime
-            .physics
-            .rebuild(&physics_body_specs(&runtime.state))
-            .expect("radial upright fixture rebuilds");
+        runtime.rebuild_physics_for_test();
 
         let desired_up = Vec3::new(1.0, 0.0, 0.0);
         let initial_up = runtime
@@ -13259,10 +14838,7 @@ mod tests {
                 false,
                 runtime.state.simulation_tick,
             );
-            runtime
-                .physics
-                .rebuild(&physics_body_specs(&runtime.state))
-                .expect("planet-axis fixture rebuilds");
+            runtime.rebuild_physics_for_test();
             runtime.advance(17).expect("planet-axis support classifies");
 
             assert_eq!(
@@ -13303,10 +14879,7 @@ mod tests {
             false,
             runtime.state.simulation_tick,
         );
-        runtime
-            .physics
-            .rebuild(&physics_body_specs(&runtime.state))
-            .expect("pole-neighborhood fixture rebuilds");
+        runtime.rebuild_physics_for_test();
         runtime.advance(17).expect("pole support classifies");
         let initial_position = runtime.state.player.position;
         let mut previous_orientation = runtime.state.player.orientation;
@@ -13371,10 +14944,7 @@ mod tests {
             false,
             runtime.state.simulation_tick,
         );
-        runtime
-            .physics
-            .rebuild(&physics_body_specs(&runtime.state))
-            .expect("grounded walking fixture rebuilds");
+        runtime.rebuild_physics_for_test();
         runtime.advance(17).expect("support is classified");
         assert_eq!(
             runtime.state().player.locomotion.kind,
@@ -13459,10 +15029,7 @@ mod tests {
             false,
             runtime.state.simulation_tick,
         );
-        runtime
-            .physics
-            .rebuild(&physics_body_specs(&runtime.state))
-            .expect("jump fixture rebuilds");
+        runtime.rebuild_physics_for_test();
         runtime.advance(17).expect("support is classified");
 
         runtime
@@ -13528,10 +15095,7 @@ mod tests {
             true,
             runtime.state.simulation_tick,
         );
-        runtime
-            .physics
-            .rebuild(&physics_body_specs(&runtime.state))
-            .expect("moving support fixture rebuilds");
+        runtime.rebuild_physics_for_test();
 
         runtime.advance(17).expect("magnetic support is classified");
         assert_eq!(
@@ -13586,10 +15150,7 @@ mod tests {
             true,
             runtime.state.simulation_tick,
         );
-        runtime
-            .physics
-            .rebuild(&physics_body_specs(&runtime.state))
-            .expect("rotating support fixture rebuilds");
+        runtime.rebuild_physics_for_test();
 
         runtime.advance(17).expect("rotating support classifies");
         assert_eq!(
@@ -13641,10 +15202,7 @@ mod tests {
             true,
             runtime.state.simulation_tick,
         );
-        runtime
-            .physics
-            .rebuild(&physics_body_specs(&runtime.state))
-            .expect("magnetic destruction fixture rebuilds");
+        runtime.rebuild_physics_for_test();
         runtime.advance(17).expect("magnetic support classifies");
         let support = runtime
             .state
@@ -13734,10 +15292,7 @@ mod tests {
             true,
             runtime.state.simulation_tick,
         );
-        runtime
-            .physics
-            .rebuild(&physics_body_specs(&runtime.state))
-            .expect("split-support fixture rebuilds");
+        runtime.rebuild_physics_for_test();
         runtime.advance(17).expect("split support classifies");
         let initial_support = runtime
             .state
@@ -13817,10 +15372,7 @@ mod tests {
         set_test_player_position(&mut runtime.state.player, start);
         runtime.state.player.linear_velocity = Vec3::new(0.0, -12.0, 0.0);
         runtime.state.player.jetpack_enabled = false;
-        runtime
-            .physics
-            .rebuild(&physics_body_specs(&runtime.state))
-            .expect("near-surface landing fixture rebuilds");
+        runtime.rebuild_physics_for_test();
 
         runtime
             .advance(17)
@@ -13852,10 +15404,7 @@ mod tests {
         set_test_player_position(&mut runtime.state.player, collision_start);
         runtime.state.player.linear_velocity = Vec3::new(0.0, -24.0, 0.0);
         runtime.state.player.jetpack_enabled = false;
-        runtime
-            .physics
-            .rebuild(&physics_body_specs(&runtime.state))
-            .expect("voxel collision fixture rebuilds");
+        runtime.rebuild_physics_for_test();
 
         let mut contacted = false;
         for _ in 0..30 {
@@ -13885,10 +15434,7 @@ mod tests {
         runtime.state.player.linear_velocity = Vec3::new(4.0, 0.0, 0.0);
         runtime.state.player.surface_contact = false;
         runtime.state.active_contact_pairs.clear();
-        runtime
-            .physics
-            .rebuild(&physics_body_specs(&runtime.state))
-            .expect("nearby clear voxel fixture rebuilds");
+        runtime.rebuild_physics_for_test();
         runtime.advance(100).expect("nearby clear motion commits");
         assert!(runtime.state().player.position.x > clear_start.x + 0.2);
     }
@@ -13909,10 +15455,7 @@ mod tests {
         );
         runtime.state.player.linear_velocity = Vec3::new(0.0, -24.0, 0.0);
         runtime.state.player.jetpack_enabled = false;
-        runtime
-            .physics
-            .rebuild(&physics_body_specs(&runtime.state))
-            .expect("axis-aligned grid fixture rebuilds");
+        runtime.rebuild_physics_for_test();
 
         let mut contacted = false;
         for _ in 0..30 {
@@ -13933,10 +15476,7 @@ mod tests {
         runtime.state.player.linear_velocity = Vec3::new(4.0, 0.0, 0.0);
         runtime.state.player.surface_contact = false;
         runtime.state.active_contact_pairs.clear();
-        runtime
-            .physics
-            .rebuild(&physics_body_specs(&runtime.state))
-            .expect("nearby clear grid fixture rebuilds");
+        runtime.rebuild_physics_for_test();
         runtime
             .advance(100)
             .expect("nearby clear grid motion commits");
@@ -14106,7 +15646,7 @@ mod tests {
                 voxel_collision_chunk_body_id(voxel_collision_chunk_coordinate(before_target));
             let collider_id = voxel_collision_collider_id(before_target);
             prior_hash = runtime.state().state_hash();
-            prior_fingerprint = runtime.physics.body_collider_fingerprint();
+            prior_fingerprint = runtime.physics().body_collider_fingerprint();
             assert_eq!(
                 prior_fingerprint,
                 expected_physics_fingerprint(runtime.state())
@@ -14127,14 +15667,14 @@ mod tests {
             assert!(runtime.is_halted());
             assert_eq!(runtime.state().state_hash(), prior_hash);
             assert!(runtime.state().voxels.occupied.contains(&before_target));
-            assert!(!runtime.physics.contains_collider(&body_id, &collider_id));
+            assert!(!runtime.physics().contains_collider(&body_id, &collider_id));
         }
         let recovered = Runtime::open(before_directory.path(), 109, 100)
             .expect("before-write mining failure recovers");
         assert_eq!(recovered.state().state_hash(), prior_hash);
         assert!(recovered.state().voxels.occupied.contains(&before_target));
         assert_eq!(
-            recovered.physics.body_collider_fingerprint(),
+            recovered.physics().body_collider_fingerprint(),
             prior_fingerprint
         );
 
@@ -14168,7 +15708,7 @@ mod tests {
             assert!(runtime.is_halted());
             assert_eq!(runtime.state().state_hash(), prior_state.state_hash());
             assert!(runtime.state().voxels.occupied.contains(&after_target));
-            assert!(!runtime.physics.contains_collider(&body_id, &collider_id));
+            assert!(!runtime.physics().contains_collider(&body_id, &collider_id));
 
             let journal = fs::read_to_string(after_directory.path().join("events.ndjson"))
                 .expect("synced mining journal reads");
@@ -14190,7 +15730,7 @@ mod tests {
         );
         assert!(!recovered.state().voxels.occupied.contains(&after_target));
         assert_eq!(
-            recovered.physics.body_collider_fingerprint(),
+            recovered.physics().body_collider_fingerprint(),
             expected_physics_fingerprint(&expected_durable_state)
         );
         assert!(recovered.state().conservation().valid);
@@ -14673,10 +16213,7 @@ mod tests {
                 },
             );
             assert!(runtime.state().conservation().valid);
-            runtime
-                .physics
-                .rebuild(&physics_body_specs(&runtime.state))
-                .expect("cargo-bearing anchor fixture physics rebuilds");
+            runtime.rebuild_physics_for_test();
             runtime
                 .persist_snapshot()
                 .expect("cargo-bearing anchor fixture snapshot persists");

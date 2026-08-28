@@ -56,6 +56,38 @@ arbitrary remote spectator cameras, or claim thousands-player capacity. Its
 correctness semantics are encoding-independent; the production binary codec,
 cross-cell execution, and public-scale soak evidence remain later P1 work.
 
+P1.5 is published and fully green at implementation revision `71e955c`; the
+documentation-only evidence update is `e4cb385`.
+
+[P1.6 durable single-cell lifecycle and background production](../gameplay/durable-single-cell-lifecycle.md)
+is implemented and fully green at implementation revision `0664130`.
+[CI run 33137371577](https://github.com/Bittrees-Technology/the-verse/actions/runs/33137371577)
+passes the hosted verifier, isolated Linux-container verification, and Linux
+and Apple Silicon native package jobs. It proves one fixed cell can drain,
+sleep, wake, reconcile and resume exact physical production under renewable
+single-host fencing. Active and Background share one atomic occurrence-bound
+whole-cell quantum, catch-up is finite, and activation creates a fresh verified
+baseline only after due work commits.
+
+P1.6 intentionally advances no background physics, oxygen, damage, combat,
+turrets, AI, travel, cleanup, or markets. It does not complete dynamic
+multi-cell assignment, cross-cell handoff, WORLD-008, F-013, or the
+thousand-participant production envelope.
+
+P1.6 acceptance evidence covers:
+
+- exact Active/Background production parity and one atomic multi-machine event;
+- stable at-least-once occurrence identity and crash reconciliation;
+- strict append/snapshot fencing across a two-process replacement race;
+- durable partial-second scheduling, bounded long-downtime catch-up, and
+  controlled-clock discontinuity tests;
+- recoverable Sleeping, Background, Activating, Active, and Draining
+  transitions with no writer overlap;
+- non-waking public spectator behavior and fresh verified activation baselines;
+  and
+- hosted Linux and Apple Silicon package evidence without a multi-host or
+  public-scale claim.
+
 P1.5 acceptance requires:
 
 - Deterministic registry identity, normalized addresses, minimum-separation

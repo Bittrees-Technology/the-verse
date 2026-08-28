@@ -9,8 +9,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use verse_protocol::{
     CELESTIAL_REGISTRY_SCHEMA_VERSION, CelestialBodyKind, CelestialBodySnapshot,
-    CelestialRegistrySnapshot, CelestialScaleClass, CellCoordinate, I64Vec3, SectorCoordinate,
-    UNIVERSE_MANIFEST_SCHEMA_VERSION, UniverseAddress, UniverseManifestSnapshot, Vec3,
+    CelestialRegistrySnapshot, CelestialScaleClass, CellCoordinate, I64Vec3,
+    LIFECYCLE_CONTROL_SCHEMA_VERSION, PRODUCTION_SCHEDULE_OCCURRENCE_SCHEMA_VERSION,
+    SectorCoordinate, UNIVERSE_MANIFEST_SCHEMA_VERSION, UniverseAddress, UniverseManifestSnapshot,
+    Vec3,
 };
 
 use crate::content;
@@ -114,6 +116,24 @@ struct UniverseManifestHashMaterial<'a> {
     content_hash: &'a str,
     world_schema_version: u32,
     event_schema_version: u32,
+    lifecycle_control_schema_version: u32,
+    production_schedule_occurrence_schema_version: u32,
+    lifecycle_policy_hash: &'a str,
+}
+
+#[derive(Serialize)]
+struct LifecyclePolicyHashMaterial {
+    lifecycle_control_schema_version: u32,
+    production_schedule_occurrence_schema_version: u32,
+    lease_duration_millis: u64,
+    lease_renewal_interval_millis: u64,
+    lease_write_safety_margin_millis: u64,
+    trusted_clock_rollback_tolerance_millis: u64,
+    production_occurrence_interval_millis: u64,
+    max_background_queue_bearing_machines: u32,
+    max_production_catch_up_quanta: u32,
+    max_production_catch_up_millis: u64,
+    max_claimed_unacknowledged_occurrences: u32,
 }
 
 fn canonical_json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, CelestialError> {
@@ -767,6 +787,7 @@ pub fn universe_manifest(
     let universe_id = registry.universe_id.clone();
     let generation_rule_version = registry.generation_rule_version.clone();
     let celestial_registry_hash = registry.registry_hash.clone();
+    let lifecycle_policy_hash = lifecycle_policy_hash()?;
     let material = UniverseManifestHashMaterial {
         schema_version: UNIVERSE_MANIFEST_SCHEMA_VERSION,
         universe_id: &universe_id,
@@ -784,10 +805,14 @@ pub fn universe_manifest(
         content_hash: content::manifest_hash(),
         world_schema_version,
         event_schema_version,
+        lifecycle_control_schema_version: LIFECYCLE_CONTROL_SCHEMA_VERSION,
+        production_schedule_occurrence_schema_version:
+            PRODUCTION_SCHEDULE_OCCURRENCE_SCHEMA_VERSION,
+        lifecycle_policy_hash: &lifecycle_policy_hash,
     };
     let bytes = canonical_json_bytes(&material)?;
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"the-verse/universe-manifest/v2\0");
+    hasher.update(b"the-verse/universe-manifest/v3\0");
     hasher.update(&bytes);
     let manifest_hash = hasher.finalize().to_hex().to_string();
     Ok(UniverseManifestSnapshot {
@@ -808,7 +833,33 @@ pub fn universe_manifest(
         content_hash: content::manifest_hash().into(),
         world_schema_version,
         event_schema_version,
+        lifecycle_control_schema_version: LIFECYCLE_CONTROL_SCHEMA_VERSION,
+        production_schedule_occurrence_schema_version:
+            PRODUCTION_SCHEDULE_OCCURRENCE_SCHEMA_VERSION,
+        lifecycle_policy_hash,
     })
+}
+
+fn lifecycle_policy_hash() -> Result<String, CelestialError> {
+    let material = LifecyclePolicyHashMaterial {
+        lifecycle_control_schema_version: LIFECYCLE_CONTROL_SCHEMA_VERSION,
+        production_schedule_occurrence_schema_version:
+            PRODUCTION_SCHEDULE_OCCURRENCE_SCHEMA_VERSION,
+        lease_duration_millis: 15_000,
+        lease_renewal_interval_millis: 5_000,
+        lease_write_safety_margin_millis: 5_000,
+        trusted_clock_rollback_tolerance_millis: 1_000,
+        production_occurrence_interval_millis: 1_000,
+        max_background_queue_bearing_machines: 256,
+        max_production_catch_up_quanta: 60,
+        max_production_catch_up_millis: 250,
+        max_claimed_unacknowledged_occurrences: 1,
+    };
+    let bytes = canonical_json_bytes(&material)?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"the-verse/lifecycle-policy/v1\0");
+    hasher.update(&bytes);
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 pub fn body_snapshot(world_seed: u64, body_id: &str) -> CelestialBodySnapshot {
@@ -918,7 +969,7 @@ mod tests {
                 "sable-moon"
             ]
         );
-        let manifest = universe_manifest(41, 18, 14).expect("manifest builds");
+        let manifest = universe_manifest(41, 19, 15).expect("manifest builds");
         assert_eq!(manifest.celestial_registry_hash, first.registry_hash);
         assert_eq!(manifest.content_hash, content::manifest_hash());
         assert_eq!(manifest.manifest_hash.len(), 64);
@@ -928,14 +979,18 @@ mod tests {
     fn registry_and_universe_manifest_match_cross_platform_golden_hashes() {
         let seed = 20_260_826;
         let registry = registry_snapshot(seed).expect("golden registry builds");
-        let manifest = universe_manifest(seed, 18, 14).expect("golden manifest builds");
+        let manifest = universe_manifest(seed, 19, 15).expect("golden manifest builds");
+        assert_eq!(
+            manifest.lifecycle_policy_hash,
+            "5bc077cc8a2eb101fcaecdce5513c13aa243e1f68a5af839a602dd689859ff3a"
+        );
         assert_eq!(
             registry.registry_hash,
             "4c367bbfa04218ece14104f0a3a7ec2c7e9fefcc37d4cf78a265df2d711a59da"
         );
         assert_eq!(
             manifest.manifest_hash,
-            "08f96738abee769d2f9998a9666970ef6cd8474f3270977aec1a50672aad814e"
+            "c9bfd3baa1e64ab7665e60c4f989491e745e9af0d2512989f41625b57b546ace"
         );
     }
 

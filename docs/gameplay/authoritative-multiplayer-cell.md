@@ -14,7 +14,10 @@ Protocol 12 completes the P1.1 trust-boundary increment: authentication precedes
 2. The local player and remote players occupy the same authoritative voxel and grid world. P1.4 broadcasts the complete proof cell; P1.5 delivers accepted work and destruction only through each authorized interest view.
 3. Walking, EVA, jumping, magnetic support, oxygen, death, inventory, and career state are independent per player.
 4. A player cannot move, change the suit mode of, respawn, spend from, or earn credit for another player.
-5. Disconnecting does not remove the character or inventory. Controls become neutral after the canonical lease, while gravity, support motion, oxygen, damage, and world time continue.
+5. Disconnecting does not remove the character or inventory. Controls become
+   neutral after the canonical input lease. Gravity, support motion, oxygen,
+   damage, and physics time continue only while the cell remains Active. P1.6
+   Sleeping and Background modes advance approved production only.
 6. Reconnecting resumes the server-owned movement epoch and received/processed input frontiers rather than resetting them.
 7. P1.0 remote characters use an original neutral engineering-suit presentation. Character-to-character collision is disabled until its gameplay and griefing rules are specified.
 8. In P1.5, entering replication range creates one stable remote identity, leaving range is distinct from destruction, and re-entry sends one fresh structural baseline without a duplicate actor.

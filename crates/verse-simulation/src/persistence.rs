@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -10,7 +11,9 @@ use thiserror::Error;
 use uuid::Uuid;
 use verse_protocol::UniverseManifestSnapshot;
 
-use crate::event::{CanonicalEvent, EVENT_SCHEMA_NAME, EVENT_SCHEMA_VERSION};
+use crate::event::{
+    CanonicalEvent, EVENT_SCHEMA_NAME, EVENT_SCHEMA_VERSION, ProductionScheduleOccurrence,
+};
 use crate::model::{WORLD_SCHEMA_VERSION, WorldState};
 use crate::{celestial, content};
 
@@ -18,6 +21,25 @@ const MANIFEST_FILE: &str = "universe-manifest.json";
 const SNAPSHOT_FILE: &str = "world-snapshot.json";
 const JOURNAL_FILE: &str = "events.ndjson";
 const LOCK_FILE: &str = "writer.lock";
+const LIFECYCLE_FILE: &str = "cell-lifecycle.json";
+pub const LIFECYCLE_CONTROL_SCHEMA_VERSION: u32 = verse_protocol::LIFECYCLE_CONTROL_SCHEMA_VERSION;
+pub const LEASE_DURATION_MILLIS: u64 = 15_000;
+pub const LEASE_RENEWAL_INTERVAL_MILLIS: u64 = 5_000;
+pub const LEASE_WRITE_SAFETY_MARGIN_MILLIS: u64 = 5_000;
+pub const TRUSTED_CLOCK_ROLLBACK_TOLERANCE_MILLIS: u64 = 1_000;
+
+pub trait TrustedClock: std::fmt::Debug + Send + Sync {
+    fn now_unix_ms(&self) -> Result<u64, PersistenceError>;
+}
+
+#[derive(Debug, Default)]
+pub struct SystemTrustedClock;
+
+impl TrustedClock for SystemTrustedClock {
+    fn now_unix_ms(&self) -> Result<u64, PersistenceError> {
+        unix_millis()
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum PersistenceError {
@@ -70,6 +92,53 @@ pub enum PersistenceError {
     },
     #[error("writer fencing token changed from {expected} to {found}")]
     FencingTokenChanged { expected: u64, found: u64 },
+    #[error("writer fencing token is exhausted")]
+    FencingTokenExhausted,
+    #[error("writer lease metadata no longer identifies the current holder")]
+    LeaseOwnershipChanged,
+    #[error("durable lifecycle control is missing for an existing world")]
+    MissingLifecycleControl,
+    #[error("durable lifecycle control is invalid: {0}")]
+    InvalidLifecycleControl(String),
+    #[error("cell store has released mutation authority")]
+    StoreReleased,
+    #[error("writer lease expired at {expires_at_unix_ms}; trusted time is {now_unix_ms}")]
+    LeaseExpired {
+        expires_at_unix_ms: u64,
+        now_unix_ms: u64,
+    },
+    #[error(
+        "writer lease has only {remaining_millis} ms remaining; at least {required_millis} ms is required"
+    )]
+    LeaseSafetyMarginInsufficient {
+        remaining_millis: u64,
+        required_millis: u64,
+    },
+    #[error("trusted time moved backward from {previous_unix_ms} to {now_unix_ms}")]
+    TrustedClockRollback {
+        previous_unix_ms: u64,
+        now_unix_ms: u64,
+    },
+    #[error("trusted time is unavailable or cannot be represented")]
+    TrustedClockUnavailable,
+    #[error("live fencing token {live} is not newer than recovered token {recovered}")]
+    LiveFenceNotNewer { live: u64, recovered: u64 },
+    #[error("durable lifecycle world frontier does not match recovered canonical state")]
+    LifecycleWorldFrontierMismatch,
+    #[error("journal fencing token is invalid at line {line}: previous {previous}, found {found}")]
+    InvalidHistoricalFence {
+        line: usize,
+        previous: u64,
+        found: u64,
+    },
+    #[error(
+        "journal fencing token {found} at line {line} is incompatible with snapshot fence {snapshot}"
+    )]
+    HistoricalFenceSnapshotMismatch {
+        line: usize,
+        snapshot: u64,
+        found: u64,
+    },
     #[error("journal replay rejected event {event_sequence}: {message}")]
     Replay {
         event_sequence: u64,
@@ -107,6 +176,7 @@ struct EventHeader {
     schema_name: String,
     schema_version: u32,
     event_sequence: u64,
+    authority_fencing_token: u64,
     #[serde(default)]
     content_manifest_version: Option<String>,
     #[serde(default)]
@@ -117,11 +187,63 @@ struct EventHeader {
     celestial_registry_hash: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct LeaseMetadata {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecycleMode {
+    Sleeping,
+    Activating,
+    Background,
+    Active,
+    Draining,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CellLifecycleStatus {
+    pub lifecycle_revision: u64,
+    pub desired_mode: LifecycleMode,
+    pub observed_mode: LifecycleMode,
+    pub fencing_token: u64,
+    pub expires_at_unix_ms: Option<u64>,
+    pub last_world_event_sequence: u64,
+    pub next_production_occurrence: Option<ProductionScheduleOccurrence>,
+    pub acknowledged_production_sequence: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PendingWorldCommit {
+    event_sequence: u64,
+    event_hash: String,
+    occurred_at_unix_ms: u64,
+    prior_next_occurrence: Option<ProductionScheduleOccurrence>,
+    resulting_next_occurrence: Option<ProductionScheduleOccurrence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CellLifecycleRecord {
+    schema_version: u32,
+    universe_id: String,
+    cell_id: String,
+    universe_manifest_hash: String,
+    celestial_registry_hash: String,
+    lifecycle_revision: u64,
+    desired_mode: LifecycleMode,
+    observed_mode: LifecycleMode,
     fencing_token: u64,
-    worker_id: String,
-    acquired_at_unix_ms: u64,
+    holder_id: Option<String>,
+    acquired_at_unix_ms: Option<u64>,
+    renewed_at_unix_ms: Option<u64>,
+    expires_at_unix_ms: Option<u64>,
+    activation_cutoff_unix_ms: Option<u64>,
+    last_trusted_unix_ms: u64,
+    last_world_event_sequence: u64,
+    last_world_event_hash: String,
+    last_world_state_hash: String,
+    next_production_occurrence: Option<ProductionScheduleOccurrence>,
+    acknowledged_production_sequence: u64,
+    pending_world_commit: Option<PendingWorldCommit>,
+    updated_at_unix_ms: u64,
 }
 
 #[derive(Debug)]
@@ -130,19 +252,32 @@ pub struct Store {
     lock_file: File,
     journal_file: File,
     fencing_token: u64,
+    lifecycle: CellLifecycleRecord,
+    last_trusted_unix_ms: u64,
     world_seed: u64,
     universe_manifest: UniverseManifestSnapshot,
+    clock: Arc<dyn TrustedClock>,
+    write_enabled: bool,
+    recovered_observed_mode: Option<LifecycleMode>,
     #[cfg(test)]
     append_failpoint: Option<AppendFailpoint>,
 }
 
 impl Store {
     pub fn open(root: impl AsRef<Path>, requested_seed: u64) -> Result<Self, PersistenceError> {
+        Self::open_with_clock(root, requested_seed, Arc::new(SystemTrustedClock))
+    }
+
+    pub fn open_with_clock(
+        root: impl AsRef<Path>,
+        requested_seed: u64,
+        clock: Arc<dyn TrustedClock>,
+    ) -> Result<Self, PersistenceError> {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root).map_err(|source| io_error(&root, source))?;
 
         let lock_path = root.join(LOCK_FILE);
-        let mut lock_file = OpenOptions::new()
+        let lock_file = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
@@ -156,18 +291,6 @@ impl Store {
                 io_error(&lock_path, source)
             }
         })?;
-
-        let previous_token =
-            read_lease(&mut lock_file, &lock_path)?.map_or(0, |lease| lease.fencing_token);
-        let fencing_token = previous_token
-            .checked_add(1)
-            .unwrap_or(previous_token.saturating_add(1));
-        let lease = LeaseMetadata {
-            fencing_token,
-            worker_id: Uuid::new_v4().to_string(),
-            acquired_at_unix_ms: unix_millis(),
-        };
-        write_json_to_file(&mut lock_file, &lock_path, &lease)?;
 
         let manifest_path = root.join(MANIFEST_FILE);
         let runtime_manifest = celestial::universe_manifest(
@@ -215,6 +338,91 @@ impl Store {
             write_json_atomic(&manifest_path, &runtime_manifest)?;
         }
 
+        let lifecycle_path = root.join(LIFECYCLE_FILE);
+        let previous_lifecycle = if lifecycle_path.exists() {
+            let lifecycle = read_json::<CellLifecycleRecord>(&lifecycle_path)?;
+            validate_prior_lifecycle(&lifecycle, &runtime_manifest)?;
+            Some(lifecycle)
+        } else {
+            let existing_snapshot = root.join(SNAPSHOT_FILE).exists();
+            let existing_journal = root
+                .join(JOURNAL_FILE)
+                .metadata()
+                .is_ok_and(|metadata| metadata.len() > 0);
+            if existing_snapshot || existing_journal {
+                return Err(PersistenceError::MissingLifecycleControl);
+            }
+            None
+        };
+        let recovered_observed_mode = previous_lifecycle
+            .as_ref()
+            .map(|record| record.observed_mode);
+        let recovered_fence = recover_persisted_fencing_frontier(&root)?;
+        let previous_token = previous_lifecycle
+            .as_ref()
+            .map_or(recovered_fence, |lifecycle| {
+                lifecycle.fencing_token.max(recovered_fence)
+            });
+        let lifecycle_revision = previous_lifecycle.as_ref().map_or(Ok(1), |lifecycle| {
+            lifecycle.lifecycle_revision.checked_add(1).ok_or(
+                PersistenceError::InvalidLifecycleControl("lifecycle revision is exhausted".into()),
+            )
+        })?;
+        let fencing_token = previous_token
+            .checked_add(1)
+            .ok_or(PersistenceError::FencingTokenExhausted)?;
+        let durable_last_trusted_unix_ms = previous_lifecycle
+            .as_ref()
+            .map_or(0, |lifecycle| lifecycle.last_trusted_unix_ms);
+        let acquired_at_unix_ms =
+            accept_trusted_time(clock.now_unix_ms()?, durable_last_trusted_unix_ms)?;
+        let expires_at_unix_ms = acquired_at_unix_ms
+            .checked_add(LEASE_DURATION_MILLIS)
+            .ok_or(PersistenceError::TrustedClockUnavailable)?;
+        let holder_id = Uuid::new_v4().to_string();
+        let activation_cutoff_unix_ms = previous_lifecycle
+            .as_ref()
+            .filter(|record| record.observed_mode == LifecycleMode::Activating)
+            .and_then(|record| record.activation_cutoff_unix_ms)
+            .or(Some(acquired_at_unix_ms));
+        let lifecycle = CellLifecycleRecord {
+            schema_version: LIFECYCLE_CONTROL_SCHEMA_VERSION,
+            universe_id: runtime_manifest.universe_id.clone(),
+            cell_id: celestial::ACTIVE_CELL_ID.into(),
+            universe_manifest_hash: runtime_manifest.manifest_hash.clone(),
+            celestial_registry_hash: runtime_manifest.celestial_registry_hash.clone(),
+            lifecycle_revision,
+            desired_mode: LifecycleMode::Active,
+            observed_mode: LifecycleMode::Activating,
+            fencing_token,
+            holder_id: Some(holder_id),
+            acquired_at_unix_ms: Some(acquired_at_unix_ms),
+            renewed_at_unix_ms: Some(acquired_at_unix_ms),
+            expires_at_unix_ms: Some(expires_at_unix_ms),
+            activation_cutoff_unix_ms,
+            last_trusted_unix_ms: acquired_at_unix_ms,
+            last_world_event_sequence: previous_lifecycle
+                .as_ref()
+                .map_or(0, |record| record.last_world_event_sequence),
+            last_world_event_hash: previous_lifecycle
+                .as_ref()
+                .map_or_else(String::new, |record| record.last_world_event_hash.clone()),
+            last_world_state_hash: previous_lifecycle
+                .as_ref()
+                .map_or_else(String::new, |record| record.last_world_state_hash.clone()),
+            next_production_occurrence: previous_lifecycle
+                .as_ref()
+                .and_then(|record| record.next_production_occurrence.clone()),
+            acknowledged_production_sequence: previous_lifecycle
+                .as_ref()
+                .map_or(0, |record| record.acknowledged_production_sequence),
+            pending_world_commit: previous_lifecycle
+                .as_ref()
+                .and_then(|record| record.pending_world_commit.clone()),
+            updated_at_unix_ms: acquired_at_unix_ms,
+        };
+        write_json_atomic(&lifecycle_path, &lifecycle)?;
+
         let journal_path = root.join(JOURNAL_FILE);
         let journal_file = OpenOptions::new()
             .create(true)
@@ -228,8 +436,13 @@ impl Store {
             lock_file,
             journal_file,
             fencing_token,
+            lifecycle,
+            last_trusted_unix_ms: acquired_at_unix_ms,
             world_seed: requested_seed,
             universe_manifest: runtime_manifest,
+            clock,
+            write_enabled: true,
+            recovered_observed_mode,
             #[cfg(test)]
             append_failpoint: None,
         })
@@ -237,6 +450,78 @@ impl Store {
 
     pub const fn fencing_token(&self) -> u64 {
         self.fencing_token
+    }
+
+    pub(crate) fn root_path(&self) -> &Path {
+        &self.root
+    }
+
+    pub(crate) fn clock(&self) -> Arc<dyn TrustedClock> {
+        Arc::clone(&self.clock)
+    }
+
+    pub const fn lifecycle_mode(&self) -> LifecycleMode {
+        self.lifecycle.observed_mode
+    }
+
+    pub fn next_production_occurrence(&self) -> Option<&ProductionScheduleOccurrence> {
+        self.lifecycle.next_production_occurrence.as_ref()
+    }
+
+    pub const fn activation_cutoff_unix_ms(&self) -> Option<u64> {
+        self.lifecycle.activation_cutoff_unix_ms
+    }
+
+    pub fn lifecycle_status(&self) -> CellLifecycleStatus {
+        CellLifecycleStatus {
+            lifecycle_revision: self.lifecycle.lifecycle_revision,
+            desired_mode: self.lifecycle.desired_mode,
+            observed_mode: self.lifecycle.observed_mode,
+            fencing_token: self.lifecycle.fencing_token,
+            expires_at_unix_ms: self.lifecycle.expires_at_unix_ms,
+            last_world_event_sequence: self.lifecycle.last_world_event_sequence,
+            next_production_occurrence: self.lifecycle.next_production_occurrence.clone(),
+            acknowledged_production_sequence: self.lifecycle.acknowledged_production_sequence,
+        }
+    }
+
+    pub fn accepted_trusted_time(&mut self) -> Result<u64, PersistenceError> {
+        self.trusted_unix_millis()
+    }
+
+    pub fn renew_lease(&mut self) -> Result<(), PersistenceError> {
+        let found = self.read_current_lease()?;
+        let now_unix_ms = self.trusted_unix_millis()?;
+        self.validate_live_lease(&found, now_unix_ms)?;
+        let renewed_at_unix_ms = self
+            .lifecycle
+            .renewed_at_unix_ms
+            .ok_or(PersistenceError::LeaseOwnershipChanged)?;
+        let expires_at_unix_ms = self
+            .lifecycle
+            .expires_at_unix_ms
+            .ok_or(PersistenceError::LeaseOwnershipChanged)?;
+        let renewal_due =
+            now_unix_ms.saturating_sub(renewed_at_unix_ms) >= LEASE_RENEWAL_INTERVAL_MILLIS;
+        let write_margin_low =
+            expires_at_unix_ms.saturating_sub(now_unix_ms) < LEASE_WRITE_SAFETY_MARGIN_MILLIS;
+        if !renewal_due && !write_margin_low {
+            return Ok(());
+        }
+        let expires_at_unix_ms = now_unix_ms
+            .checked_add(LEASE_DURATION_MILLIS)
+            .ok_or(PersistenceError::TrustedClockUnavailable)?;
+        let renewed = CellLifecycleRecord {
+            renewed_at_unix_ms: Some(now_unix_ms),
+            expires_at_unix_ms: Some(expires_at_unix_ms),
+            last_trusted_unix_ms: now_unix_ms,
+            updated_at_unix_ms: now_unix_ms,
+            ..found
+        };
+        write_json_atomic(&self.root.join(LIFECYCLE_FILE), &renewed)?;
+        self.lifecycle = renewed;
+        self.last_trusted_unix_ms = now_unix_ms;
+        Ok(())
     }
 
     pub fn load_world(&mut self) -> Result<WorldState, PersistenceError> {
@@ -275,6 +560,8 @@ impl Store {
             }
             state
         };
+        let snapshot_event_sequence = state.event_sequence;
+        let snapshot_fence = state.fencing_token;
 
         let journal_path = self.root.join(JOURNAL_FILE);
         let mut journal_bytes = Vec::new();
@@ -309,6 +596,7 @@ impl Store {
             }
         })?;
 
+        let mut previous_historical_fence = 0_u64;
         for (index, line) in journal.lines().enumerate() {
             if line.trim().is_empty() {
                 continue;
@@ -327,6 +615,27 @@ impl Store {
                     found_version: header.schema_version,
                     expected_name: EVENT_SCHEMA_NAME,
                     expected_version: EVENT_SCHEMA_VERSION,
+                });
+            }
+            if header.authority_fencing_token == 0
+                || header.authority_fencing_token < previous_historical_fence
+            {
+                return Err(PersistenceError::InvalidHistoricalFence {
+                    line: index + 1,
+                    previous: previous_historical_fence,
+                    found: header.authority_fencing_token,
+                });
+            }
+            previous_historical_fence = header.authority_fencing_token;
+            if (header.event_sequence <= snapshot_event_sequence
+                && header.authority_fencing_token > snapshot_fence)
+                || (header.event_sequence > snapshot_event_sequence
+                    && header.authority_fencing_token < snapshot_fence)
+            {
+                return Err(PersistenceError::HistoricalFenceSnapshotMismatch {
+                    line: index + 1,
+                    snapshot: snapshot_fence,
+                    found: header.authority_fencing_token,
                 });
             }
             if !self.event_header_binding_matches(&header) {
@@ -355,11 +664,288 @@ impl Store {
         if !self.world_binding_matches(&state) {
             return Err(PersistenceError::WorldUniverseBindingMismatch);
         }
+        let recovered_fence = state.fencing_token.max(previous_historical_fence);
+        if self.fencing_token <= recovered_fence {
+            return Err(PersistenceError::LiveFenceNotNewer {
+                live: self.fencing_token,
+                recovered: recovered_fence,
+            });
+        }
+        self.reconcile_lifecycle_with_world(&state)?;
         Ok(state)
     }
 
+    pub fn publish_active(&mut self, state: &WorldState) -> Result<(), PersistenceError> {
+        self.verify_live_lease_for_write()?;
+        if self.lifecycle.observed_mode == LifecycleMode::Active
+            && self.lifecycle.desired_mode == LifecycleMode::Active
+        {
+            return Ok(());
+        }
+        let now_unix_ms = self.trusted_unix_millis()?;
+        let mut active = self.lifecycle.clone();
+        active.lifecycle_revision = active.lifecycle_revision.checked_add(1).ok_or_else(|| {
+            PersistenceError::InvalidLifecycleControl("lifecycle revision is exhausted".into())
+        })?;
+        active.desired_mode = LifecycleMode::Active;
+        active.observed_mode = LifecycleMode::Active;
+        active.activation_cutoff_unix_ms = None;
+        active.last_world_event_sequence = state.event_sequence;
+        active
+            .last_world_event_hash
+            .clone_from(&state.last_event_hash);
+        active.last_world_state_hash = state.state_hash();
+        active.last_trusted_unix_ms = now_unix_ms;
+        active.updated_at_unix_ms = now_unix_ms;
+        self.persist_lifecycle(active)
+    }
+
+    pub fn transition_mode(
+        &mut self,
+        desired_mode: LifecycleMode,
+        observed_mode: LifecycleMode,
+        state: &WorldState,
+    ) -> Result<(), PersistenceError> {
+        self.verify_live_lease_for_write()?;
+        if self.lifecycle.desired_mode == desired_mode
+            && self.lifecycle.observed_mode == observed_mode
+        {
+            return Ok(());
+        }
+        if !valid_lifecycle_transition(self.lifecycle.observed_mode, observed_mode) {
+            return Err(PersistenceError::InvalidLifecycleControl(format!(
+                "invalid transition from {:?} to {:?}",
+                self.lifecycle.observed_mode, observed_mode
+            )));
+        }
+        let now_unix_ms = self.trusted_unix_millis()?;
+        let mut transitioned = self.lifecycle.clone();
+        transitioned.lifecycle_revision = transitioned
+            .lifecycle_revision
+            .checked_add(1)
+            .ok_or_else(|| {
+                PersistenceError::InvalidLifecycleControl("lifecycle revision is exhausted".into())
+            })?;
+        transitioned.desired_mode = desired_mode;
+        transitioned.observed_mode = observed_mode;
+        transitioned.activation_cutoff_unix_ms =
+            (observed_mode == LifecycleMode::Activating).then_some(now_unix_ms);
+        transitioned.last_world_event_sequence = state.event_sequence;
+        transitioned
+            .last_world_event_hash
+            .clone_from(&state.last_event_hash);
+        transitioned.last_world_state_hash = state.state_hash();
+        transitioned.last_trusted_unix_ms = now_unix_ms;
+        transitioned.updated_at_unix_ms = now_unix_ms;
+        self.persist_lifecycle(transitioned)
+    }
+
+    pub fn release_to_sleeping(&mut self, state: &WorldState) -> Result<(), PersistenceError> {
+        if !matches!(
+            self.lifecycle.observed_mode,
+            LifecycleMode::Draining | LifecycleMode::Background
+        ) {
+            return Err(PersistenceError::InvalidLifecycleControl(
+                "only a draining or background cell may release to sleeping".into(),
+            ));
+        }
+        self.save_snapshot(state)?;
+        let now_unix_ms = self.trusted_unix_millis()?;
+        let mut sleeping = self.lifecycle.clone();
+        sleeping.lifecycle_revision =
+            sleeping.lifecycle_revision.checked_add(1).ok_or_else(|| {
+                PersistenceError::InvalidLifecycleControl("lifecycle revision is exhausted".into())
+            })?;
+        sleeping.desired_mode = LifecycleMode::Sleeping;
+        sleeping.observed_mode = LifecycleMode::Sleeping;
+        sleeping.holder_id = None;
+        sleeping.acquired_at_unix_ms = None;
+        sleeping.renewed_at_unix_ms = None;
+        sleeping.expires_at_unix_ms = None;
+        sleeping.activation_cutoff_unix_ms = None;
+        sleeping.last_world_event_sequence = state.event_sequence;
+        sleeping
+            .last_world_event_hash
+            .clone_from(&state.last_event_hash);
+        sleeping.last_world_state_hash = state.state_hash();
+        sleeping.last_trusted_unix_ms = now_unix_ms;
+        sleeping.updated_at_unix_ms = now_unix_ms;
+        write_json_atomic(&self.root.join(LIFECYCLE_FILE), &sleeping)?;
+        self.lifecycle = sleeping;
+        FileExt::unlock(&self.lock_file)
+            .map_err(|source| io_error(self.root.join(LOCK_FILE), source))?;
+        self.write_enabled = false;
+        Ok(())
+    }
+
+    pub fn restore_recovered_host_mode(
+        &mut self,
+        state: &WorldState,
+    ) -> Result<LifecycleMode, PersistenceError> {
+        match self.recovered_observed_mode {
+            Some(LifecycleMode::Sleeping) => {
+                if self.lifecycle.observed_mode != LifecycleMode::Activating {
+                    return Err(PersistenceError::InvalidLifecycleControl(
+                        "sleeping recovery must hold activating authority".into(),
+                    ));
+                }
+                self.save_snapshot(state)?;
+                let now_unix_ms = self.trusted_unix_millis()?;
+                let mut sleeping = self.lifecycle.clone();
+                sleeping.lifecycle_revision =
+                    sleeping.lifecycle_revision.checked_add(1).ok_or_else(|| {
+                        PersistenceError::InvalidLifecycleControl(
+                            "lifecycle revision is exhausted".into(),
+                        )
+                    })?;
+                sleeping.desired_mode = LifecycleMode::Sleeping;
+                sleeping.observed_mode = LifecycleMode::Sleeping;
+                sleeping.holder_id = None;
+                sleeping.acquired_at_unix_ms = None;
+                sleeping.renewed_at_unix_ms = None;
+                sleeping.expires_at_unix_ms = None;
+                sleeping.activation_cutoff_unix_ms = None;
+                sleeping.last_world_event_sequence = state.event_sequence;
+                sleeping
+                    .last_world_event_hash
+                    .clone_from(&state.last_event_hash);
+                sleeping.last_world_state_hash = state.state_hash();
+                sleeping.last_trusted_unix_ms = now_unix_ms;
+                sleeping.updated_at_unix_ms = now_unix_ms;
+                write_json_atomic(&self.root.join(LIFECYCLE_FILE), &sleeping)?;
+                self.lifecycle = sleeping;
+                FileExt::unlock(&self.lock_file)
+                    .map_err(|source| io_error(self.root.join(LOCK_FILE), source))?;
+                self.write_enabled = false;
+                Ok(LifecycleMode::Sleeping)
+            }
+            Some(LifecycleMode::Background) => {
+                self.verify_live_lease_for_write()?;
+                let now_unix_ms = self.trusted_unix_millis()?;
+                let mut background = self.lifecycle.clone();
+                background.lifecycle_revision = background
+                    .lifecycle_revision
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        PersistenceError::InvalidLifecycleControl(
+                            "lifecycle revision is exhausted".into(),
+                        )
+                    })?;
+                background.desired_mode = LifecycleMode::Background;
+                background.observed_mode = LifecycleMode::Background;
+                background.activation_cutoff_unix_ms = None;
+                background.last_world_event_sequence = state.event_sequence;
+                background
+                    .last_world_event_hash
+                    .clone_from(&state.last_event_hash);
+                background.last_world_state_hash = state.state_hash();
+                background.last_trusted_unix_ms = now_unix_ms;
+                background.updated_at_unix_ms = now_unix_ms;
+                self.persist_lifecycle(background)?;
+                Ok(LifecycleMode::Background)
+            }
+            Some(LifecycleMode::Draining) => {
+                let runnable = state
+                    .background_production_is_runnable()
+                    .map_err(|source| {
+                        PersistenceError::InvalidLifecycleControl(source.to_string())
+                    })?;
+                self.recovered_observed_mode = Some(if runnable {
+                    LifecycleMode::Background
+                } else {
+                    LifecycleMode::Sleeping
+                });
+                self.restore_recovered_host_mode(state)
+            }
+            Some(LifecycleMode::Activating | LifecycleMode::Active) | None => {
+                Ok(LifecycleMode::Activating)
+            }
+        }
+    }
+
+    pub fn commit_world_event(
+        &mut self,
+        event: &CanonicalEvent,
+        resulting_state: &WorldState,
+        resulting_next_occurrence: Option<ProductionScheduleOccurrence>,
+    ) -> Result<(), PersistenceError> {
+        self.verify_live_lease_for_write()?;
+        if event.authority_fencing_token != self.fencing_token {
+            return Err(PersistenceError::FencingTokenChanged {
+                expected: self.fencing_token,
+                found: event.authority_fencing_token,
+            });
+        }
+        if resulting_state.event_sequence != event.event_sequence
+            || resulting_state.last_event_hash != event.event_hash
+            || resulting_state.fencing_token != self.fencing_token
+        {
+            return Err(PersistenceError::LifecycleWorldFrontierMismatch);
+        }
+        if let Some(occurrence) = &resulting_next_occurrence {
+            validate_occurrence_binding(occurrence, &self.lifecycle)?;
+        }
+        let now_unix_ms = self.trusted_unix_millis()?;
+        let pending = PendingWorldCommit {
+            event_sequence: event.event_sequence,
+            event_hash: event.event_hash.clone(),
+            occurred_at_unix_ms: event.occurred_at_unix_ms,
+            prior_next_occurrence: self.lifecycle.next_production_occurrence.clone(),
+            resulting_next_occurrence: resulting_next_occurrence.clone(),
+        };
+        let mut staged = self.lifecycle.clone();
+        staged.pending_world_commit = Some(pending);
+        staged.last_trusted_unix_ms = now_unix_ms;
+        staged.updated_at_unix_ms = now_unix_ms;
+        self.persist_lifecycle(staged)?;
+
+        self.append_event(event)?;
+
+        let now_unix_ms = self.trusted_unix_millis()?;
+        let mut committed = self.lifecycle.clone();
+        committed.last_world_event_sequence = event.event_sequence;
+        committed
+            .last_world_event_hash
+            .clone_from(&event.event_hash);
+        committed.last_world_state_hash = resulting_state.state_hash();
+        committed.next_production_occurrence = resulting_next_occurrence;
+        committed.pending_world_commit = None;
+        committed.last_trusted_unix_ms = now_unix_ms;
+        committed.updated_at_unix_ms = now_unix_ms;
+        self.persist_lifecycle(committed)
+    }
+
+    pub fn acknowledge_production_sequence(
+        &mut self,
+        state: &WorldState,
+    ) -> Result<(), PersistenceError> {
+        self.verify_live_lease_for_write()?;
+        let production_quantum_sequence = state.production_clock.last_committed_quantum_sequence;
+        if production_quantum_sequence <= self.lifecycle.acknowledged_production_sequence {
+            return Ok(());
+        }
+        if state.event_sequence != self.lifecycle.last_world_event_sequence
+            || state.last_event_hash != self.lifecycle.last_world_event_hash
+            || state.state_hash() != self.lifecycle.last_world_state_hash
+        {
+            return Err(PersistenceError::LifecycleWorldFrontierMismatch);
+        }
+        let now_unix_ms = self.trusted_unix_millis()?;
+        let mut acknowledged = self.lifecycle.clone();
+        acknowledged.acknowledged_production_sequence = production_quantum_sequence;
+        acknowledged.last_trusted_unix_ms = now_unix_ms;
+        acknowledged.updated_at_unix_ms = now_unix_ms;
+        self.persist_lifecycle(acknowledged)
+    }
+
     pub fn append_event(&mut self, event: &CanonicalEvent) -> Result<(), PersistenceError> {
-        self.verify_fencing_token()?;
+        self.verify_live_lease_for_write()?;
+        if event.authority_fencing_token != self.fencing_token {
+            return Err(PersistenceError::FencingTokenChanged {
+                expected: self.fencing_token,
+                found: event.authority_fencing_token,
+            });
+        }
         if !self.event_binding_matches(event) {
             return Err(PersistenceError::EventUniverseBindingMismatch {
                 context: "append".into(),
@@ -387,7 +973,13 @@ impl Store {
     }
 
     pub fn save_snapshot(&mut self, state: &WorldState) -> Result<(), PersistenceError> {
-        self.verify_fencing_token()?;
+        self.verify_live_lease_for_write()?;
+        if state.fencing_token != self.fencing_token {
+            return Err(PersistenceError::FencingTokenChanged {
+                expected: self.fencing_token,
+                found: state.fencing_token,
+            });
+        }
         if !self.world_binding_matches(state) {
             return Err(PersistenceError::WorldUniverseBindingMismatch);
         }
@@ -401,7 +993,17 @@ impl Store {
             last_event_hash: state.last_event_hash.clone(),
             state: state.clone(),
         };
-        write_json_atomic(&self.root.join(SNAPSHOT_FILE), &snapshot)
+        write_json_atomic(&self.root.join(SNAPSHOT_FILE), &snapshot)?;
+        let now_unix_ms = self.trusted_unix_millis()?;
+        let mut lifecycle = self.lifecycle.clone();
+        lifecycle.last_world_event_sequence = state.event_sequence;
+        lifecycle
+            .last_world_event_hash
+            .clone_from(&state.last_event_hash);
+        lifecycle.last_world_state_hash = state.state_hash();
+        lifecycle.last_trusted_unix_ms = now_unix_ms;
+        lifecycle.updated_at_unix_ms = now_unix_ms;
+        self.persist_lifecycle(lifecycle)
     }
 
     fn world_binding_matches(&self, state: &WorldState) -> bool {
@@ -429,23 +1031,207 @@ impl Store {
             && event.celestial_registry_hash == self.universe_manifest.celestial_registry_hash
     }
 
-    fn verify_fencing_token(&mut self) -> Result<(), PersistenceError> {
-        let lock_path = self.root.join(LOCK_FILE);
-        let found =
-            read_lease(&mut self.lock_file, &lock_path)?.map_or(0, |lease| lease.fencing_token);
-        if found == self.fencing_token {
-            Ok(())
-        } else {
-            Err(PersistenceError::FencingTokenChanged {
-                expected: self.fencing_token,
-                found,
-            })
+    fn verify_live_lease_for_write(&mut self) -> Result<(), PersistenceError> {
+        if !self.write_enabled {
+            return Err(PersistenceError::StoreReleased);
         }
+        let mut remaining_millis = 0;
+        for _ in 0..2 {
+            self.renew_lease()?;
+            let now_unix_ms = self.trusted_unix_millis()?;
+            let found = self.read_current_lease()?;
+            self.validate_live_lease(&found, now_unix_ms)?;
+            remaining_millis = found
+                .expires_at_unix_ms
+                .ok_or(PersistenceError::LeaseOwnershipChanged)?
+                .saturating_sub(now_unix_ms);
+            if remaining_millis >= LEASE_WRITE_SAFETY_MARGIN_MILLIS {
+                return Ok(());
+            }
+        }
+        Err(PersistenceError::LeaseSafetyMarginInsufficient {
+            remaining_millis,
+            required_millis: LEASE_WRITE_SAFETY_MARGIN_MILLIS,
+        })
+    }
+
+    fn read_current_lease(&self) -> Result<CellLifecycleRecord, PersistenceError> {
+        let lifecycle_path = self.root.join(LIFECYCLE_FILE);
+        if !lifecycle_path.exists() {
+            return Err(PersistenceError::LeaseOwnershipChanged);
+        }
+        read_json(&lifecycle_path)
+    }
+
+    fn validate_live_lease(
+        &self,
+        found: &CellLifecycleRecord,
+        now_unix_ms: u64,
+    ) -> Result<(), PersistenceError> {
+        if found.fencing_token != self.fencing_token {
+            return Err(PersistenceError::FencingTokenChanged {
+                expected: self.fencing_token,
+                found: found.fencing_token,
+            });
+        }
+        if found.schema_version != LIFECYCLE_CONTROL_SCHEMA_VERSION || found != &self.lifecycle {
+            return Err(PersistenceError::LeaseOwnershipChanged);
+        }
+        let expires_at_unix_ms = found
+            .expires_at_unix_ms
+            .ok_or(PersistenceError::LeaseOwnershipChanged)?;
+        if now_unix_ms >= expires_at_unix_ms {
+            return Err(PersistenceError::LeaseExpired {
+                expires_at_unix_ms,
+                now_unix_ms,
+            });
+        }
+        Ok(())
+    }
+
+    fn trusted_unix_millis(&mut self) -> Result<u64, PersistenceError> {
+        let accepted = accept_trusted_time(self.clock.now_unix_ms()?, self.last_trusted_unix_ms)?;
+        self.last_trusted_unix_ms = accepted;
+        Ok(accepted)
+    }
+
+    fn reconcile_lifecycle_with_world(
+        &mut self,
+        state: &WorldState,
+    ) -> Result<(), PersistenceError> {
+        let found = self.read_current_lease()?;
+        let now_unix_ms = self.trusted_unix_millis()?;
+        self.validate_live_lease(&found, now_unix_ms)?;
+        let mut reconciled = found;
+
+        if let Some(pending) = reconciled.pending_world_commit.take() {
+            if state.event_sequence < pending.event_sequence {
+                reconciled.next_production_occurrence = pending.prior_next_occurrence;
+            } else if state.event_sequence == pending.event_sequence
+                && state.last_event_hash == pending.event_hash
+            {
+                reconciled.next_production_occurrence = pending.resulting_next_occurrence;
+            } else {
+                return Err(PersistenceError::LifecycleWorldFrontierMismatch);
+            }
+        }
+        if reconciled.last_world_event_sequence > state.event_sequence {
+            return Err(PersistenceError::LifecycleWorldFrontierMismatch);
+        }
+        if reconciled.last_world_event_sequence == state.event_sequence
+            && ((!reconciled.last_world_event_hash.is_empty()
+                && reconciled.last_world_event_hash != state.last_event_hash)
+                || (!reconciled.last_world_state_hash.is_empty()
+                    && reconciled.last_world_state_hash != state.state_hash()))
+        {
+            return Err(PersistenceError::LifecycleWorldFrontierMismatch);
+        }
+
+        let committed_sequence = state.production_clock.last_committed_quantum_sequence;
+        if reconciled.acknowledged_production_sequence > committed_sequence {
+            return Err(PersistenceError::InvalidLifecycleControl(
+                "production acknowledgement is ahead of canonical world state".into(),
+            ));
+        }
+        let runnable = state
+            .background_production_is_runnable()
+            .map_err(|source| PersistenceError::InvalidLifecycleControl(source.to_string()))?;
+        match &reconciled.next_production_occurrence {
+            Some(occurrence) => {
+                let expected_sequence = committed_sequence.checked_add(1).ok_or_else(|| {
+                    PersistenceError::InvalidLifecycleControl(
+                        "production occurrence sequence is exhausted".into(),
+                    )
+                })?;
+                let expected_time = if committed_sequence == 0 {
+                    None
+                } else {
+                    Some(
+                        state
+                            .production_clock
+                            .last_scheduled_for_unix_ms
+                            .checked_add(1_000)
+                            .ok_or_else(|| {
+                                PersistenceError::InvalidLifecycleControl(
+                                    "production schedule time is exhausted".into(),
+                                )
+                            })?,
+                    )
+                };
+                if !runnable
+                    || occurrence.lifecycle_generation
+                        != state.production_clock.lifecycle_generation
+                    || occurrence.production_quantum_sequence != expected_sequence
+                    || expected_time
+                        .is_some_and(|scheduled| occurrence.scheduled_for_unix_ms != scheduled)
+                {
+                    return Err(PersistenceError::InvalidLifecycleControl(
+                        "next occurrence does not match canonical production state".into(),
+                    ));
+                }
+            }
+            None if runnable => {
+                let scheduled_for_unix_ms = now_unix_ms
+                    .checked_add(1_000)
+                    .ok_or(PersistenceError::TrustedClockUnavailable)?;
+                reconciled.next_production_occurrence = Some(
+                    state
+                        .next_production_occurrence_at(scheduled_for_unix_ms)
+                        .map_err(|source| {
+                            PersistenceError::InvalidLifecycleControl(source.to_string())
+                        })?,
+                );
+            }
+            None => {}
+        }
+        reconciled.acknowledged_production_sequence = committed_sequence;
+        reconciled.last_world_event_sequence = state.event_sequence;
+        reconciled
+            .last_world_event_hash
+            .clone_from(&state.last_event_hash);
+        reconciled.last_world_state_hash = state.state_hash();
+        reconciled.last_trusted_unix_ms = now_unix_ms;
+        reconciled.updated_at_unix_ms = now_unix_ms;
+        self.persist_lifecycle(reconciled)
+    }
+
+    fn persist_lifecycle(
+        &mut self,
+        lifecycle: CellLifecycleRecord,
+    ) -> Result<(), PersistenceError> {
+        write_json_atomic(&self.root.join(LIFECYCLE_FILE), &lifecycle)?;
+        self.lifecycle = lifecycle;
+        Ok(())
     }
 
     #[cfg(test)]
     pub(crate) fn set_append_failpoint(&mut self, failpoint: AppendFailpoint) {
         self.append_failpoint = Some(failpoint);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_next_production_occurrence_for_test(
+        &mut self,
+        occurrence: ProductionScheduleOccurrence,
+    ) -> Result<(), PersistenceError> {
+        validate_occurrence_binding(&occurrence, &self.lifecycle)?;
+        let expected_sequence = self
+            .lifecycle
+            .acknowledged_production_sequence
+            .checked_add(1)
+            .ok_or_else(|| {
+                PersistenceError::InvalidLifecycleControl(
+                    "acknowledged production sequence is exhausted".into(),
+                )
+            })?;
+        if occurrence.production_quantum_sequence != expected_sequence {
+            return Err(PersistenceError::InvalidLifecycleControl(
+                "test production occurrence does not follow the acknowledged frontier".into(),
+            ));
+        }
+        let mut lifecycle = self.lifecycle.clone();
+        lifecycle.next_production_occurrence = Some(occurrence);
+        self.persist_lifecycle(lifecycle)
     }
 
     #[cfg(test)]
@@ -461,42 +1247,254 @@ impl Store {
 
 impl Drop for Store {
     fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.lock_file);
+        if self.write_enabled {
+            let _ = FileExt::unlock(&self.lock_file);
+        }
     }
 }
 
-fn read_lease(file: &mut File, path: &Path) -> Result<Option<LeaseMetadata>, PersistenceError> {
-    file.seek(SeekFrom::Start(0))
-        .map_err(|source| io_error(path, source))?;
-    let mut text = String::new();
-    file.read_to_string(&mut text)
-        .map_err(|source| io_error(path, source))?;
-    if text.trim().is_empty() {
-        Ok(None)
-    } else {
-        serde_json::from_str(&text)
-            .map(Some)
-            .map_err(|source| PersistenceError::Json {
-                path: path.to_path_buf(),
-                source,
-            })
+fn valid_lifecycle_transition(from: LifecycleMode, to: LifecycleMode) -> bool {
+    match from {
+        LifecycleMode::Sleeping => {
+            matches!(to, LifecycleMode::Activating | LifecycleMode::Background)
+        }
+        LifecycleMode::Background => {
+            matches!(to, LifecycleMode::Activating | LifecycleMode::Sleeping)
+        }
+        LifecycleMode::Activating => to == LifecycleMode::Active,
+        LifecycleMode::Active => to == LifecycleMode::Draining,
+        LifecycleMode::Draining => {
+            matches!(to, LifecycleMode::Background | LifecycleMode::Sleeping)
+        }
     }
 }
 
-fn write_json_to_file<T: Serialize>(
-    file: &mut File,
-    path: &Path,
-    value: &T,
+fn validate_prior_lifecycle(
+    lifecycle: &CellLifecycleRecord,
+    manifest: &UniverseManifestSnapshot,
 ) -> Result<(), PersistenceError> {
-    let bytes = serde_json::to_vec_pretty(value).map_err(|source| PersistenceError::Json {
-        path: path.to_path_buf(),
-        source,
+    if lifecycle.schema_version != LIFECYCLE_CONTROL_SCHEMA_VERSION {
+        return Err(PersistenceError::InvalidLifecycleControl(format!(
+            "schema {} is unsupported; expected {}",
+            lifecycle.schema_version, LIFECYCLE_CONTROL_SCHEMA_VERSION
+        )));
+    }
+    if lifecycle.universe_id != manifest.universe_id
+        || lifecycle.cell_id != celestial::ACTIVE_CELL_ID
+        || lifecycle.universe_manifest_hash != manifest.manifest_hash
+        || lifecycle.celestial_registry_hash != manifest.celestial_registry_hash
+    {
+        return Err(PersistenceError::InvalidLifecycleControl(
+            "universe, cell, or manifest binding mismatch".into(),
+        ));
+    }
+    if lifecycle.lifecycle_revision == 0 {
+        return Err(PersistenceError::InvalidLifecycleControl(
+            "lifecycle revision must be positive".into(),
+        ));
+    }
+    match lifecycle.observed_mode {
+        LifecycleMode::Sleeping => {
+            if lifecycle.holder_id.is_some()
+                || lifecycle.acquired_at_unix_ms.is_some()
+                || lifecycle.renewed_at_unix_ms.is_some()
+                || lifecycle.expires_at_unix_ms.is_some()
+            {
+                return Err(PersistenceError::InvalidLifecycleControl(
+                    "sleeping lifecycle cannot retain a live holder or lease times".into(),
+                ));
+            }
+            if lifecycle.activation_cutoff_unix_ms.is_some() {
+                return Err(PersistenceError::InvalidLifecycleControl(
+                    "sleeping lifecycle cannot retain an activation cut-off".into(),
+                ));
+            }
+        }
+        LifecycleMode::Activating
+        | LifecycleMode::Background
+        | LifecycleMode::Active
+        | LifecycleMode::Draining => {
+            let holder_id = lifecycle.holder_id.as_deref().unwrap_or_default();
+            let (Some(acquired), Some(renewed), Some(expires)) = (
+                lifecycle.acquired_at_unix_ms,
+                lifecycle.renewed_at_unix_ms,
+                lifecycle.expires_at_unix_ms,
+            ) else {
+                return Err(PersistenceError::InvalidLifecycleControl(
+                    "live lifecycle requires complete lease times".into(),
+                ));
+            };
+            if lifecycle.fencing_token == 0
+                || holder_id.is_empty()
+                || acquired > renewed
+                || renewed > lifecycle.last_trusted_unix_ms
+                || lifecycle.last_trusted_unix_ms >= expires
+            {
+                return Err(PersistenceError::InvalidLifecycleControl(
+                    "live lifecycle holder, fence, or timestamps are not canonical".into(),
+                ));
+            }
+            match (lifecycle.observed_mode, lifecycle.activation_cutoff_unix_ms) {
+                (LifecycleMode::Activating, Some(cutoff))
+                    if cutoff <= lifecycle.last_trusted_unix_ms => {}
+                (LifecycleMode::Activating, _) => {
+                    return Err(PersistenceError::InvalidLifecycleControl(
+                        "activating lifecycle requires a trusted wake cut-off".into(),
+                    ));
+                }
+                (_, None) => {}
+                (_, Some(_)) => {
+                    return Err(PersistenceError::InvalidLifecycleControl(
+                        "only an activating lifecycle may retain a wake cut-off".into(),
+                    ));
+                }
+            }
+        }
+    }
+    if lifecycle.updated_at_unix_ms < lifecycle.last_trusted_unix_ms {
+        return Err(PersistenceError::InvalidLifecycleControl(
+            "lifecycle update time precedes trusted time".into(),
+        ));
+    }
+    if lifecycle.last_world_event_sequence > 0
+        && (lifecycle.last_world_event_hash.len() != 64
+            || lifecycle.last_world_state_hash.len() != 64)
+    {
+        return Err(PersistenceError::InvalidLifecycleControl(
+            "nonempty world frontier requires canonical hashes".into(),
+        ));
+    }
+    if let Some(occurrence) = &lifecycle.next_production_occurrence {
+        validate_occurrence_binding(occurrence, lifecycle)?;
+        if occurrence.production_quantum_sequence <= lifecycle.acknowledged_production_sequence {
+            return Err(PersistenceError::InvalidLifecycleControl(
+                "next production occurrence does not follow the acknowledged frontier".into(),
+            ));
+        }
+    }
+    if let Some(pending) = &lifecycle.pending_world_commit {
+        if pending.event_sequence <= lifecycle.last_world_event_sequence
+            || pending.event_hash.len() != 64
+            || pending.occurred_at_unix_ms == 0
+        {
+            return Err(PersistenceError::InvalidLifecycleControl(
+                "pending world commit does not follow the durable world frontier".into(),
+            ));
+        }
+        if let Some(occurrence) = &pending.prior_next_occurrence {
+            validate_occurrence_binding(occurrence, lifecycle)?;
+        }
+        if let Some(occurrence) = &pending.resulting_next_occurrence {
+            validate_occurrence_binding(occurrence, lifecycle)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_occurrence_binding(
+    occurrence: &ProductionScheduleOccurrence,
+    lifecycle: &CellLifecycleRecord,
+) -> Result<(), PersistenceError> {
+    if occurrence.schema_version != crate::event::PRODUCTION_SCHEDULE_OCCURRENCE_SCHEMA_VERSION
+        || occurrence.universe_id != lifecycle.universe_id
+        || occurrence.cell_id != lifecycle.cell_id
+        || occurrence.universe_manifest_hash != lifecycle.universe_manifest_hash
+        || occurrence.celestial_registry_hash != lifecycle.celestial_registry_hash
+        || occurrence.lifecycle_generation == 0
+        || occurrence.production_quantum_sequence == 0
+        || occurrence.scheduled_for_unix_ms == 0
+    {
+        return Err(PersistenceError::InvalidLifecycleControl(
+            "production occurrence binding is invalid".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn recover_persisted_fencing_frontier(root: &Path) -> Result<u64, PersistenceError> {
+    let snapshot_path = root.join(SNAPSHOT_FILE);
+    let (snapshot_event_sequence, snapshot_fence) = if snapshot_path.exists() {
+        let header: SnapshotHeader = read_json(&snapshot_path)?;
+        if header.schema_version != WORLD_SCHEMA_VERSION {
+            return Err(PersistenceError::SnapshotSchema {
+                found: header.schema_version,
+                expected: WORLD_SCHEMA_VERSION,
+            });
+        }
+        let snapshot: SnapshotDocument = read_json(&snapshot_path)?;
+        (snapshot.state.event_sequence, snapshot.state.fencing_token)
+    } else {
+        (0, 0)
+    };
+
+    let journal_path = root.join(JOURNAL_FILE);
+    let journal_bytes = match fs::read(&journal_path) {
+        Ok(bytes) => bytes,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(source) => return Err(io_error(&journal_path, source)),
+    };
+    let committed_length = if journal_bytes.last() == Some(&b'\n') {
+        journal_bytes.len()
+    } else {
+        journal_bytes
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |position| position + 1)
+    };
+    let journal = std::str::from_utf8(&journal_bytes[..committed_length]).map_err(|source| {
+        let line = std::str::from_utf8(&journal_bytes[..source.valid_up_to()])
+            .expect("UTF-8 error reports a valid prefix")
+            .matches('\n')
+            .count()
+            + 1;
+        PersistenceError::CorruptJournal {
+            line,
+            message: source.to_string(),
+        }
     })?;
-    file.seek(SeekFrom::Start(0))
-        .and_then(|_| file.set_len(0))
-        .and_then(|()| file.write_all(&bytes))
-        .and_then(|()| file.sync_data())
-        .map_err(|source| io_error(path, source))
+    let mut historical_fence = 0_u64;
+    for (index, line) in journal.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let header: EventHeader =
+            serde_json::from_str(line).map_err(|source| PersistenceError::CorruptJournal {
+                line: index + 1,
+                message: source.to_string(),
+            })?;
+        if header.authority_fencing_token == 0 || header.authority_fencing_token < historical_fence
+        {
+            return Err(PersistenceError::InvalidHistoricalFence {
+                line: index + 1,
+                previous: historical_fence,
+                found: header.authority_fencing_token,
+            });
+        }
+        if (header.event_sequence <= snapshot_event_sequence
+            && header.authority_fencing_token > snapshot_fence)
+            || (header.event_sequence > snapshot_event_sequence
+                && header.authority_fencing_token < snapshot_fence)
+        {
+            return Err(PersistenceError::HistoricalFenceSnapshotMismatch {
+                line: index + 1,
+                snapshot: snapshot_fence,
+                found: header.authority_fencing_token,
+            });
+        }
+        historical_fence = header.authority_fencing_token;
+    }
+    Ok(snapshot_fence.max(historical_fence))
+}
+
+fn accept_trusted_time(sample: u64, previous: u64) -> Result<u64, PersistenceError> {
+    let rollback_floor = previous.saturating_sub(TRUSTED_CLOCK_ROLLBACK_TOLERANCE_MILLIS);
+    if sample < rollback_floor {
+        return Err(PersistenceError::TrustedClockRollback {
+            previous_unix_ms: previous,
+            now_unix_ms: sample,
+        });
+    }
+    Ok(sample.max(previous))
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, PersistenceError> {
@@ -548,18 +1546,19 @@ fn io_error(path: impl AsRef<Path>, source: std::io::Error) -> PersistenceError 
     }
 }
 
-fn unix_millis() -> u64 {
+fn unix_millis() -> Result<u64, PersistenceError> {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
+        .map_err(|_| PersistenceError::TrustedClockUnavailable)?
         .as_millis()
         .try_into()
-        .unwrap_or(u64::MAX)
+        .map_err(|_| PersistenceError::TrustedClockUnavailable)
 }
 
 #[cfg(test)]
 mod tests {
     use std::io::Write as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use tempfile::tempdir;
     use verse_protocol::{BlockKind, ClientMessage, IVec3, Vec3};
@@ -568,6 +1567,29 @@ mod tests {
     use crate::Runtime;
     use crate::event::EventPayload;
     use crate::model::{STARTER_GRID_ID, WorldState};
+
+    #[derive(Debug)]
+    struct ManualTrustedClock {
+        now_unix_ms: AtomicU64,
+    }
+
+    impl ManualTrustedClock {
+        const fn new(now_unix_ms: u64) -> Self {
+            Self {
+                now_unix_ms: AtomicU64::new(now_unix_ms),
+            }
+        }
+
+        fn set(&self, now_unix_ms: u64) {
+            self.now_unix_ms.store(now_unix_ms, Ordering::SeqCst);
+        }
+    }
+
+    impl TrustedClock for ManualTrustedClock {
+        fn now_unix_ms(&self) -> Result<u64, PersistenceError> {
+            Ok(self.now_unix_ms.load(Ordering::SeqCst))
+        }
+    }
 
     #[test]
     fn second_writer_is_rejected_and_fencing_token_advances() {
@@ -584,6 +1606,220 @@ mod tests {
     }
 
     #[test]
+    fn append_and_snapshot_require_the_exact_live_fencing_token() {
+        let directory = tempdir().expect("tempdir");
+        let mut store = Store::open(directory.path(), 12).expect("store opens");
+        let mut world = WorldState::genesis(12);
+        world.fencing_token = store.fencing_token();
+        let mut event = world.prepare_system_event(EventPayload::SuitOxygenChanged {
+            player_id: "player-local".into(),
+            previous_oxygen_milli: 1_000,
+            new_oxygen_milli: 995,
+        });
+        event.authority_fencing_token += 1;
+        event.event_hash = event.calculate_hash();
+        assert!(matches!(
+            store.append_event(&event),
+            Err(PersistenceError::FencingTokenChanged { expected, found })
+                if expected == store.fencing_token() && found == event.authority_fencing_token
+        ));
+
+        world.fencing_token = 0;
+        assert!(matches!(
+            store.save_snapshot(&world),
+            Err(PersistenceError::FencingTokenChanged { expected, found: 0 })
+                if expected == store.fencing_token()
+        ));
+    }
+
+    #[test]
+    fn fencing_token_exhaustion_fails_closed() {
+        let directory = tempdir().expect("tempdir");
+        drop(Store::open(directory.path(), 14).expect("initial store opens"));
+        let lifecycle_path = directory.path().join(LIFECYCLE_FILE);
+        let mut lease: CellLifecycleRecord = read_json(&lifecycle_path).expect("lease reads");
+        lease.fencing_token = u64::MAX;
+        write_json_atomic(&lifecycle_path, &lease).expect("lease updates");
+
+        assert!(matches!(
+            Store::open(directory.path(), 14),
+            Err(PersistenceError::FencingTokenExhausted)
+        ));
+    }
+
+    #[test]
+    fn renewal_updates_the_durable_deadline_and_expiry_fences_writes() {
+        let directory = tempdir().expect("tempdir");
+        let clock = Arc::new(ManualTrustedClock::new(100_000));
+        let mut store =
+            Store::open_with_clock(directory.path(), 15, clock.clone()).expect("store opens");
+        clock.set(100_000 + LEASE_RENEWAL_INTERVAL_MILLIS);
+        store.renew_lease().expect("lease renews");
+        assert_eq!(store.lifecycle.renewed_at_unix_ms, Some(105_000));
+        assert_eq!(
+            store.lifecycle.expires_at_unix_ms,
+            Some(105_000 + LEASE_DURATION_MILLIS)
+        );
+        let lifecycle_path = directory.path().join(LIFECYCLE_FILE);
+        let persisted: CellLifecycleRecord =
+            read_json(&lifecycle_path).expect("renewed lease reads");
+        assert_eq!(
+            persisted.renewed_at_unix_ms,
+            store.lifecycle.renewed_at_unix_ms
+        );
+        assert_eq!(
+            persisted.expires_at_unix_ms,
+            store.lifecycle.expires_at_unix_ms
+        );
+        assert_eq!(persisted.last_trusted_unix_ms, 105_000);
+
+        clock.set(
+            store
+                .lifecycle
+                .expires_at_unix_ms
+                .expect("live lease has expiry"),
+        );
+        assert!(matches!(
+            store.renew_lease(),
+            Err(PersistenceError::LeaseExpired { .. })
+        ));
+    }
+
+    #[test]
+    fn trusted_clock_clamps_small_rollback_and_rejects_large_rollback() {
+        let directory = tempdir().expect("tempdir");
+        let clock = Arc::new(ManualTrustedClock::new(200_000));
+        let mut store =
+            Store::open_with_clock(directory.path(), 24, clock.clone()).expect("store opens");
+
+        clock.set(199_500);
+        store.renew_lease().expect("small rollback clamps");
+        assert_eq!(store.last_trusted_unix_ms, 200_000);
+
+        clock.set(198_999);
+        assert!(matches!(
+            store.renew_lease(),
+            Err(PersistenceError::TrustedClockRollback {
+                previous_unix_ms: 200_000,
+                now_unix_ms: 198_999
+            })
+        ));
+    }
+
+    #[test]
+    fn missing_lifecycle_control_for_existing_world_fails_closed() {
+        let directory = tempdir().expect("tempdir");
+        let mut runtime = Runtime::open(directory.path(), 25, 100).expect("runtime opens");
+        runtime.persist_snapshot().expect("snapshot persists");
+        drop(runtime);
+        fs::remove_file(directory.path().join(LIFECYCLE_FILE)).expect("lifecycle removed");
+
+        assert!(matches!(
+            Store::open(directory.path(), 25),
+            Err(PersistenceError::MissingLifecycleControl)
+        ));
+    }
+
+    #[test]
+    fn replacement_fence_exceeds_every_journal_header() {
+        let directory = tempdir().expect("tempdir");
+        {
+            let mut runtime = Runtime::open(directory.path(), 26, 100).expect("runtime opens");
+            runtime
+                .execute_next_for_fixture(&ClientMessage::SetSuitMode {
+                    operation_sequence: 0,
+                    operation_id: "historical-max".into(),
+                    helmet_closed: false,
+                    jetpack_enabled: false,
+                    magnetic_boots_enabled: false,
+                })
+                .expect("event commits");
+        }
+        let journal_path = directory.path().join(JOURNAL_FILE);
+        let journal = fs::read_to_string(&journal_path).expect("journal reads");
+        let mut event: CanonicalEvent = serde_json::from_str(journal.trim()).expect("event parses");
+        event.authority_fencing_token = 9;
+        event.event_hash = event.calculate_hash();
+        fs::write(
+            &journal_path,
+            format!(
+                "{}\n",
+                serde_json::to_string(&event).expect("event serializes")
+            ),
+        )
+        .expect("journal updates");
+        let lifecycle_path = directory.path().join(LIFECYCLE_FILE);
+        let mut lifecycle: CellLifecycleRecord =
+            read_json(&lifecycle_path).expect("lifecycle reads");
+        lifecycle.last_world_event_sequence = 0;
+        lifecycle.last_world_event_hash.clear();
+        lifecycle.last_world_state_hash.clear();
+        write_json_atomic(&lifecycle_path, &lifecycle).expect("lagging lifecycle persists");
+
+        let mut replacement = Store::open(directory.path(), 26).expect("replacement opens");
+        assert_eq!(replacement.fencing_token(), 10);
+        replacement.load_world().expect("journal replays");
+    }
+
+    #[test]
+    fn recovery_rejects_a_decreasing_historical_fence() {
+        let directory = tempdir().expect("tempdir");
+        drop(Runtime::open(directory.path(), 16, 100).expect("initial runtime opens"));
+        {
+            let mut runtime = Runtime::open(directory.path(), 16, 100).expect("second lease opens");
+            runtime
+                .execute_next_for_fixture(&ClientMessage::SetSuitMode {
+                    operation_sequence: 0,
+                    operation_id: "fence-two".into(),
+                    helmet_closed: false,
+                    jetpack_enabled: false,
+                    magnetic_boots_enabled: false,
+                })
+                .expect("first event commits");
+        }
+        {
+            let mut runtime = Runtime::open(directory.path(), 16, 100).expect("third lease opens");
+            runtime
+                .execute_next_for_fixture(&ClientMessage::SetSuitMode {
+                    operation_sequence: 0,
+                    operation_id: "fence-three".into(),
+                    helmet_closed: true,
+                    jetpack_enabled: false,
+                    magnetic_boots_enabled: false,
+                })
+                .expect("second event commits");
+        }
+        let journal_path = directory.path().join(JOURNAL_FILE);
+        let journal = fs::read_to_string(&journal_path).expect("journal reads");
+        let mut events = journal
+            .lines()
+            .map(|line| serde_json::from_str::<CanonicalEvent>(line).expect("event parses"))
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 2);
+        assert!(events[1].authority_fencing_token > events[0].authority_fencing_token);
+        events[1].authority_fencing_token = 1;
+        events[1].event_hash = events[1].calculate_hash();
+        fs::write(
+            &journal_path,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&events[0]).expect("first event serializes"),
+                serde_json::to_string(&events[1]).expect("second event serializes")
+            ),
+        )
+        .expect("tampered journal writes");
+
+        assert!(matches!(
+            Store::open(directory.path(), 16),
+            Err(PersistenceError::InvalidHistoricalFence {
+                line: 2,
+                previous: 2,
+                found: 1
+            })
+        ));
+    }
+
+    #[test]
     fn persisted_universe_manifest_matches_the_protocol_snapshot_exactly() {
         let directory = tempdir().expect("tempdir");
         drop(Store::open(directory.path(), 13).expect("store opens"));
@@ -592,8 +1828,8 @@ mod tests {
         let expected = celestial::universe_manifest(13, WORLD_SCHEMA_VERSION, EVENT_SCHEMA_VERSION)
             .expect("runtime universe manifest is valid");
         assert_eq!(stored, expected);
-        assert_eq!(stored.schema_version, 2);
-        assert_eq!(stored.event_schema_version, 14);
+        assert_eq!(stored.schema_version, 3);
+        assert_eq!(stored.event_schema_version, 15);
     }
 
     #[test]
@@ -712,7 +1948,8 @@ mod tests {
         let directory = tempdir().expect("tempdir");
         {
             let mut store = Store::open(directory.path(), 21).expect("store opens");
-            let world = WorldState::genesis(21);
+            let mut world = WorldState::genesis(21);
+            world.fencing_token = store.fencing_token();
             store.save_snapshot(&world).expect("snapshot persists");
         }
         let snapshot_path = directory.path().join(SNAPSHOT_FILE);

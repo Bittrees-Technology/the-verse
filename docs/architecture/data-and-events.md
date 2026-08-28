@@ -1,6 +1,7 @@
 # Data and event architecture
 
-**Status:** Proposed service baseline; P1.5 spatial and event bindings accepted
+**Status:** Proposed service baseline; P1.5 bindings published and P1.6
+lifecycle/event contract accepted
 
 ## Canonical principles
 
@@ -50,6 +51,14 @@ Event schema `14` requires the P1.5 universe and registry bindings. A mismatch
 fails before an event is prepared, appended, replayed, or projected. Registry
 and content definitions are addressed by immutable IDs and hashes rather than
 being copied as mutable floating-point constants into each event.
+
+Event schema `15` adds the P1.6 `ProductionQuantumCommitted` system event. Its
+stable occurrence key is `(universe_id, cell_id, lifecycle_generation,
+production_quantum_sequence)`. The event carries one exact one-second quantum
+and every queue-head outcome in grid-ID/block-ID order. Live preparation and
+replay independently recompute the complete vector before atomic mutation.
+Event identity and canonical occurrence time derive from the occurrence; the
+authority fence and hash chain bind the holder that durably committed it.
 
 ## Canonical spatial identity
 
@@ -172,17 +181,34 @@ Conflicts are rejected using aggregate versions and fencing tokens.
 
 A worker recovery process:
 
-1. Loads the latest verified snapshot.
-2. Validates its content hash and schema.
-3. Confirms world schema `18`, event schema `14`, content manifest `p1.5.0`,
-   universe manifest schema `2`, registry schema `1`, and exact hashes agree.
-4. Replays events after the snapshot, rejecting any per-event binding mismatch.
-5. Rebuilds derived physics structures from normalized cell-local addresses.
-6. Confirms aggregate hashes.
-7. Acquires a new fenced lease.
-8. Resumes writes.
+1. Performs an optional bounded read-only preflight without publishing health.
+2. Acquires exclusive mutation authority and a checked, strictly newer fencing
+   token for the exact universe and cell.
+3. Under that lease, loads and validates the latest snapshot, lifecycle record,
+   schemas, roots and hashes.
+4. Replays later events, requiring positive nondecreasing historical fences,
+   exact occurrence order and per-event binding equality.
+5. Proves the live token exceeds every recovered historical token and rebuilds
+   derived physics structures from normalized cell-local addresses.
+6. Reconciles at-least-once schedule acknowledgement against the canonical
+   committed-occurrence frontier.
+7. Confirms aggregate hashes, renews the lease and only then publishes Active
+   or Background health and resumes writes.
+
+Every append requires the event fence to equal the current live store fence;
+every snapshot requires the same equality. Holder, expiry, root, token or
+renewal uncertainty fails before mutation. A stale worker cannot append after a
+successor acquires a higher token. Token exhaustion is fatal rather than
+saturating or wrapping.
 
 Cleanup timers and long travel use durable scheduled events and never depend on one process's wall clock.
+
+P1.6 production uses an injected trusted clock, a durable next occurrence and
+a canonical committed frontier. Dispatch is at least once: append and sync
+precede acknowledgement, and redelivery of a committed key reconciles without
+another gameplay mutation. Forward clock jumps create exact sequential backlog
+processed under finite budgets; backward discontinuity cannot reverse or repeat
+the cursor. Paused or empty production does not schedule a one-second busy poll.
 
 Session reconnect never restores replication state from persistence. Protocol
 `16` creates new session and interest epochs and one fresh projection schema
@@ -203,6 +229,20 @@ every address, validates all parent and separation rules, produces a receipt
 with old/new hashes, proves replay equality, and atomically changes the active
 manifest pointer. Rollback restores matching prior binaries, manifests, and
 read-only data; an older executable never interprets a newer world or journal.
+
+## P1.6 compatibility and migration
+
+P1.6 admits protocol `17`, projection schema `3`, world schema `19`, event
+schema `15`, content schema `11`, content manifest `p1.5.0`, registry schema
+`1`, universe manifest schema `3`, interest schema `1`, operation fingerprint
+schema `1`, lifecycle-control schema `1`, and schedule-occurrence schema `1` as
+one coordinated set. Partial combinations fail closed.
+
+The first proof archives and resets P1.5 data. A future offline migration must
+declare its trusted-time cut-off, introduce one unambiguous production-clock
+generation and frontier, prove replay equality, and atomically switch the
+manifest pointer. Rollback restores the exact P1.5 binary, roots and archived
+data; it never reinterprets a P1.6 record.
 
 ## Settlement batches
 

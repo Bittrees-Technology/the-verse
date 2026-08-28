@@ -386,10 +386,10 @@ func _test_reconnect_policy_and_generation_reset() -> void:
 	client.set("interest_verifier", verifier)
 	_check(bool(client.call("_reset_interest_verifier")), "generation verifier initializes")
 	var welcome := {
-		"type": "welcome", "protocol_version": 16, "projection_schema_version": 3,
-		"world_schema_version": 18, "event_schema_version": 14,
+		"type": "welcome", "protocol_version": 17, "projection_schema_version": 3,
+		"world_schema_version": 19, "event_schema_version": 15,
 		"content_schema_version": 11, "content_manifest_version": "p1.5.0",
-		"celestial_registry_schema_version": 1, "universe_manifest_schema_version": 2,
+		"celestial_registry_schema_version": 1, "universe_manifest_schema_version": 3,
 		"interest_schema_version": 1, "server_name": "generation-test",
 		"session_role": {"kind": "player", "player_id": "impairment-player"},
 	}

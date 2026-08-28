@@ -167,7 +167,10 @@ async function expectRejectedIntent(type, payload, expectedCode) {
 
 async function waitForCanonicalIncapacitation(world) {
   const startingOxygen = world.player.suit_oxygen_milli;
-  const wallDeadline = Date.now() + 90_000;
+  // Debug physics deliberately favors exact replay over wall-clock throughput.
+  // Keep this end-stage survival proof independent of host performance while
+  // still requiring every observed oxygen transition to make exact progress.
+  const wallDeadline = Date.now() + 180_000;
   let observedOxygen = startingOxygen;
   let observedEventSequence = world.event_sequence;
   while (Date.now() < wallDeadline) {

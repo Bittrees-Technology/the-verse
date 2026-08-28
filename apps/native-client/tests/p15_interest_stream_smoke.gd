@@ -271,14 +271,14 @@ func _wire(value: Dictionary) -> Dictionary:
 func _welcome() -> Dictionary:
 	return {
 		"type": "welcome",
-		"protocol_version": 16,
+		"protocol_version": 17,
 		"projection_schema_version": 3,
-		"world_schema_version": 18,
-		"event_schema_version": 14,
+		"world_schema_version": 19,
+		"event_schema_version": 15,
 		"content_schema_version": 11,
 		"content_manifest_version": "p1.5.0",
 		"celestial_registry_schema_version": 1,
-		"universe_manifest_schema_version": 2,
+		"universe_manifest_schema_version": 3,
 		"interest_schema_version": 1,
 		"server_name": "test",
 		"session_role": {"kind": "player", "player_id": "player-local"},
@@ -287,7 +287,7 @@ func _welcome() -> Dictionary:
 
 func _manifest() -> Dictionary:
 	return {
-		"schema_version": 2,
+		"schema_version": 3,
 		"manifest_hash": HASH_A,
 		"universe_id": "the-verse-local",
 		"world_seed": "test",
@@ -302,8 +302,11 @@ func _manifest() -> Dictionary:
 		"content_schema_version": 11,
 		"content_manifest_version": "p1.5.0",
 		"content_hash": HASH_C,
-		"world_schema_version": 18,
-		"event_schema_version": 14,
+		"world_schema_version": 19,
+		"event_schema_version": 15,
+		"lifecycle_control_schema_version": 1,
+		"production_schedule_occurrence_schema_version": 1,
+		"lifecycle_policy_hash": "5bc077cc8a2eb101fcaecdce5513c13aa243e1f68a5af839a602dd689859ff3a",
 	}
 
 
@@ -348,7 +351,7 @@ func _baseline() -> Dictionary:
 	var chunk := _chunk(1, 0, "rock")
 	return {
 		"projection_schema_version": 3,
-		"schema_version": 18,
+		"schema_version": 19,
 		"content_manifest_version": "p1.5.0",
 		"universe_id": "the-verse-local",
 		"cell_id": "origin",
@@ -375,7 +378,7 @@ func _baseline() -> Dictionary:
 func _delta(sequence: int, previous_hash: String, view_hash: String) -> Dictionary:
 	return {
 		"projection_schema_version": 3,
-		"schema_version": 18,
+		"schema_version": 19,
 		"content_manifest_version": "p1.5.0",
 		"universe_id": "the-verse-local",
 		"cell_id": "origin",

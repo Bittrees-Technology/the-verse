@@ -9,14 +9,16 @@
 use serde::{Deserialize, Serialize};
 
 /// The only protocol version accepted by this build.
-pub const PROTOCOL_VERSION: u32 = 16;
+pub const PROTOCOL_VERSION: u32 = 17;
 
-/// The actor-aware, interest-managed projection contract carried by protocol 16.
+/// The actor-aware, interest-managed projection contract carried by protocol 17.
 pub const PROJECTION_SCHEMA_VERSION: u32 = 3;
 pub const CELESTIAL_REGISTRY_SCHEMA_VERSION: u32 = 1;
-pub const UNIVERSE_MANIFEST_SCHEMA_VERSION: u32 = 2;
+pub const UNIVERSE_MANIFEST_SCHEMA_VERSION: u32 = 3;
 pub const INTEREST_SCHEMA_VERSION: u32 = 1;
 pub const INTENT_FINGERPRINT_SCHEMA_VERSION: u32 = 1;
+pub const LIFECYCLE_CONTROL_SCHEMA_VERSION: u32 = 1;
+pub const PRODUCTION_SCHEDULE_OCCURRENCE_SCHEMA_VERSION: u32 = 1;
 
 /// An exact bounded local coordinate in integer micrometres.
 #[derive(
@@ -154,6 +156,9 @@ pub struct UniverseManifestSnapshot {
     pub content_hash: String,
     pub world_schema_version: u32,
     pub event_schema_version: u32,
+    pub lifecycle_control_schema_version: u32,
+    pub production_schedule_occurrence_schema_version: u32,
+    pub lifecycle_policy_hash: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1366,7 +1371,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v16_registry_manifest_and_interest_reject_unknown_fields() {
+    fn protocol_v17_registry_manifest_and_interest_reject_unknown_fields() {
         let body = CelestialBodySnapshot {
             body_id: "body-test".into(),
             display_name: "Body Test".into(),
@@ -1427,8 +1432,12 @@ mod tests {
             content_schema_version: 11,
             content_manifest_version: "p1.5.0".into(),
             content_hash: "content-hash".into(),
-            world_schema_version: 18,
-            event_schema_version: 14,
+            world_schema_version: 19,
+            event_schema_version: 15,
+            lifecycle_control_schema_version: LIFECYCLE_CONTROL_SCHEMA_VERSION,
+            production_schedule_occurrence_schema_version:
+                PRODUCTION_SCHEDULE_OCCURRENCE_SCHEMA_VERSION,
+            lifecycle_policy_hash: "lifecycle-policy-hash".into(),
         };
         let mut manifest_value = serde_json::to_value(manifest).expect("manifest serializes");
         manifest_value
@@ -1612,8 +1621,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v16_preserves_tagged_life_state_and_death_cause() {
-        assert_eq!(PROTOCOL_VERSION, 16);
+    fn protocol_v17_preserves_tagged_life_state_and_death_cause() {
+        assert_eq!(PROTOCOL_VERSION, 17);
         assert_eq!(PROJECTION_SCHEMA_VERSION, 3);
         let life_state = PlayerLifeState::Incapacitated {
             death_id: "death-player-local-42".into(),
