@@ -6,6 +6,8 @@ verse_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 verse_test_dir="$(mktemp -d "${TMPDIR:-/tmp}/the-verse-e2e.XXXXXX")"
 verse_server_pid=""
 verse_port="${VERSE_E2E_PORT:-17777}"
+verse_snapshot_every="${VERSE_E2E_SNAPSHOT_EVERY:-600}"
+verse_stress_snapshot_every="${VERSE_E2E_STRESS_SNAPSHOT_EVERY:-5}"
 
 cleanup() {
   if [[ -n "${verse_server_pid}" ]] && kill -0 "${verse_server_pid}" 2>/dev/null; then
@@ -17,16 +19,20 @@ cleanup() {
 trap cleanup EXIT
 
 cd "${verse_root}"
-cargo build --locked -p verse-simulation-worker
+# The active worker advances by real elapsed time. Exercise that production
+# behavior with optimized physics so debug-only throughput cannot manufacture
+# a catch-up spiral or life-support failure in the gameplay scenario.
+cargo build --locked --release -p verse-simulation-worker
 
 start_server() {
   local mode="${1:-live}"
   local data_directory="${2:-${verse_test_dir}}"
+  local snapshot_every="${3:-${verse_snapshot_every}}"
   local server_command=(
-    target/debug/verse-simulation-worker
+    target/release/verse-simulation-worker
     --data-directory "${data_directory}"
     --bind "127.0.0.1:${verse_port}"
-    --snapshot-every 5
+    --snapshot-every "${snapshot_every}"
   )
   if [[ "${mode}" == "paused" ]]; then
     server_command+=(--pause-simulation)
@@ -51,8 +57,14 @@ stop_server() {
 
 # Exercise concurrent actor binding, actor-owned mining, and actor-scoped
 # control against an isolated universe so its movement cannot perturb the
-# longer progression scenario.
-start_server live "${verse_test_dir}/two-player-control"
+# longer progression scenario. Keep this bounded fixture on the aggressive
+# five-event snapshot cadence so restart coverage still exercises dense
+# snapshot publication without making the full physics scenario fall behind
+# real time under an unoptimized build.
+start_server \
+  live \
+  "${verse_test_dir}/two-player-control" \
+  "${verse_stress_snapshot_every}"
 if ! node tools/e2e/two-player-control-smoke.mjs "ws://127.0.0.1:${verse_port}/ws"; then
   sed -n '1,240p' "${verse_test_dir}/server.log" >&2
   exit 1
@@ -61,7 +73,10 @@ stop_server
 
 # Reopen paused once to establish the exact durable state after the live
 # physics loop has stopped, then reopen it again to prove recovery.
-start_server paused "${verse_test_dir}/two-player-control"
+start_server \
+  paused \
+  "${verse_test_dir}/two-player-control" \
+  "${verse_stress_snapshot_every}"
 two_player_before="$(
   curl --fail --silent "http://127.0.0.1:${verse_port}/api/v1/status"
 )"
@@ -71,7 +86,10 @@ two_player_fence="$(jq -r '.fencing_token' <<<"${two_player_before}")"
 echo "VERSE_TWO_PLAYER_RECOVERY_BEFORE sequence=${two_player_sequence} fence=${two_player_fence} hash=${two_player_hash}"
 stop_server
 
-start_server paused "${verse_test_dir}/two-player-control"
+start_server \
+  paused \
+  "${verse_test_dir}/two-player-control" \
+  "${verse_stress_snapshot_every}"
 two_player_after="$(
   curl --fail --silent "http://127.0.0.1:${verse_port}/api/v1/status"
 )"
