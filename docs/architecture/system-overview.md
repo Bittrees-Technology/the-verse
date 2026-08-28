@@ -1,6 +1,6 @@
 # System architecture
 
-**Status:** Proposed production baseline with published P1.5 and accepted P1.6
+**Status:** Proposed production baseline with published P1.5 and verified P1.6
 single-cell contracts
 
 ## Architectural goals
@@ -155,7 +155,7 @@ on the partitioning in ADR-0002 plus published scheduler and handoff evidence.
 
 ## P1.6 durable one-cell lifecycle slice
 
-The accepted next slice hosts one already generated fixed cell through
+The implemented bounded slice hosts one already generated fixed cell through
 `Sleeping`, `Background`, `Activating`, `Active`, and `Draining`. A local
 coordinator owns desired mode, due-occurrence dispatch, lease renewal and
 acknowledgement; the simulation aggregate remains the only authority for

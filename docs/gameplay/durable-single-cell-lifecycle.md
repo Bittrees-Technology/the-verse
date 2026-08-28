@@ -1,15 +1,21 @@
 # P1.6 durable single-cell lifecycle and background production
 
-**Feature ID:** F-060 (proposed)
+**Feature ID:** F-060
 
-**Status:** Accepted implementation contract; implementation and release
-evidence pending
+**Status:** Implemented and verified locally, in the hosted Linux container,
+and in hosted Linux and Apple Silicon packages for the bounded P1.6 proof
 
 **Owner:** Universe-control, simulation-worker, persistence, protocol, and
 operations maintainers
 
 The durable architecture choices are recorded in
 [ADR-0022](../decisions/ADR-0022-durable-single-cell-lifecycle.md).
+
+Implementation revision `0664130` passed the complete local release gate and
+[hosted CI run 33137371577](https://github.com/Bittrees-Technology/the-verse/actions/runs/33137371577).
+The hosted run includes the isolated Linux-container verifier and both native
+package jobs. This is one-cell correctness and packaging evidence; it is not a
+multi-cell, multi-host, or public-scale claim.
 
 ## Linked requirements and features
 
