@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Dormant manifest-5 builder and opaque validation capability.
+//! Dormant manifest-5 builder and opaque simulation-wide validation capability.
 //!
 //! The active manifest generator remains schema 4. This module has no runtime
 //! caller and cannot activate protocol 19; it only establishes the exact
@@ -12,7 +12,6 @@ use verse_protocol::protocol_v19::{
     Protocol19CompatibilityTuple, UNIVERSE_MANIFEST_SCHEMA_VERSION, UniverseManifestSnapshotV5,
 };
 
-use crate::model::valid_blake3_hex;
 use crate::{celestial, content};
 
 const MANIFEST_HASH_DOMAIN_V5: &[u8] = b"the-verse/universe-manifest/v5\0";
@@ -32,24 +31,24 @@ pub(super) enum DraftManifestV5Error {
 /// Non-Serde capability proving the complete manifest-5 document was rebuilt
 /// and validated against this binary's immutable content and registry rules.
 #[derive(Debug)]
-pub(super) struct ValidatedUniverseManifestV5 {
+pub(crate) struct ValidatedUniverseManifestV5 {
     document: UniverseManifestSnapshotV5,
 }
 
 impl ValidatedUniverseManifestV5 {
-    pub(super) fn document(&self) -> &UniverseManifestSnapshotV5 {
+    pub(crate) fn document(&self) -> &UniverseManifestSnapshotV5 {
         &self.document
     }
 
-    pub(super) fn manifest_hash(&self) -> &str {
+    pub(crate) fn manifest_hash(&self) -> &str {
         &self.document.manifest_hash
     }
 
-    pub(super) fn universe_id(&self) -> &str {
+    pub(crate) fn universe_id(&self) -> &str {
         &self.document.universe_id
     }
 
-    pub(super) fn world_seed(&self) -> u64 {
+    pub(crate) fn world_seed(&self) -> u64 {
         self.document
             .world_seed
             .parse()
@@ -196,6 +195,13 @@ fn validate_manifest_v5(
     Ok(())
 }
 
+fn valid_blake3_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,6 +331,39 @@ mod tests {
         assert_eq!(hybrid.transfer_package_schema_version, 1);
         assert!(
             decode_manifest_v5(&serde_json::to_vec(&hybrid).expect("hybrid encodes"), 801).is_err()
+        );
+    }
+
+    #[test]
+    fn gameplay_body_identity_is_contextual_and_never_cross_validates() {
+        let manifest = build_validated_manifest_v5(801).expect("manifest builds");
+        let other_manifest = build_validated_manifest_v5(802).expect("other manifest builds");
+        let active = crate::model::WorldState::genesis(801);
+        assert!(active.validate_player_roster().is_ok());
+        assert!(
+            active
+                .validate_world_v21_gameplay_body_with_job_frontier(&manifest, |job| {
+                    job.queued_event_sequence <= active.event_sequence
+                })
+                .is_err(),
+            "manifest-4 authority cannot be treated as a world-21 gameplay body"
+        );
+
+        let mut body = active;
+        body.universe_manifest_hash = manifest.manifest_hash().to_owned();
+        assert!(body.validate_player_roster().is_err());
+        assert!(
+            body.validate_world_v21_gameplay_body_with_job_frontier(&manifest, |job| {
+                job.queued_event_sequence <= body.event_sequence
+            })
+            .is_ok()
+        );
+        assert!(
+            body.validate_world_v21_gameplay_body_with_job_frontier(&other_manifest, |job| {
+                job.queued_event_sequence <= body.event_sequence
+            })
+            .is_err(),
+            "a valid capability for another universe cannot authorize this body"
         );
     }
 }

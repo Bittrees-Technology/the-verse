@@ -13,6 +13,8 @@ mod event;
 mod grid_handoff_v2;
 mod handoff;
 mod identity;
+#[allow(dead_code)]
+mod manifest_v5;
 mod model;
 mod persistence;
 mod projection;
