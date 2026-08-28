@@ -1898,7 +1898,10 @@ fn validate_holder(holder_id: &str) -> Result<(), CellDirectoryError> {
     validate_stable_id(holder_id, "assignment holder")
 }
 
-fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), CellDirectoryError> {
+pub(crate) fn write_json_atomic<T: Serialize>(
+    path: &Path,
+    value: &T,
+) -> Result<(), CellDirectoryError> {
     let bytes = serde_json::to_vec_pretty(value).map_err(|source| CellDirectoryError::Json {
         path: path.to_path_buf(),
         source,

@@ -4,6 +4,8 @@
 
 mod celestial;
 mod cell_directory;
+#[allow(dead_code)]
+mod cell_directory_v3;
 mod content;
 mod engine;
 mod event;
