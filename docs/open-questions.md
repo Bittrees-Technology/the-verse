@@ -88,7 +88,23 @@ Determine whether cleanup-exemption contracts are priced by:
 
 ### OQ-009 — Dynamic megastructures
 
-Define when a free grid transitions from ordinary single-cell physics into a partitioned capital-ship model and which operations remain possible during transition.
+Define when a free grid transitions from ordinary single-cell physics into a
+partitioned capital-ship model and which operations remain possible during
+transition. The later design must resolve:
+
+- canonical ownership of static topology spanning cell boundaries;
+- external contacts, projectiles, docking, and mechanical constraints;
+- conveyor, power, atmosphere, damage, and control systems crossing cells;
+- interior-cell creation and occupants moving between exterior/interior space;
+- partitioned capital-ship motion, split, merge, anchoring, and recovery; and
+- finite work and transfer budgets without creating a permanent product size
+  cap.
+
+**Status:** Does not block the bounded P1.7 two-cell handoff. P1.7 transfers
+only an isolated EVA actor or ordinary unanchored grid whose complete closure
+fits one package; unsupported structures remain source-authoritative with an
+explicit `partition_required` result. OQ-009 must be resolved before F-050,
+F-051, arbitrary cross-cell grids, or production megastructure claims.
 
 ### OQ-010 — Planet separation and travel speed
 

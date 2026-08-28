@@ -17,6 +17,8 @@ These invariants are higher priority than convenience or performance.
 - Administrative actions identify their authority and reason.
 - Spatial interest and client-loaded state never grant intent, ownership,
   collision, targeting, or disclosure authority.
+- A mobile aggregate may mutate only under both the resident cell's current
+  fencing token and the aggregate's current directory placement generation.
 
 ## Universe identity and coordinates
 
@@ -31,6 +33,11 @@ These invariants are higher priority than convenience or performance.
   celestial-registry hashes used to interpret them.
 - A worker with the wrong manifest, registry, content, schema, or hash cannot
   load, replay, append, or project the world.
+- `CellKeyV1` is normalized and hashes to one deterministic cell ID. Worker
+  names, display aliases, storage paths, and noncanonical equivalent keys are
+  never routing or persistence authority.
+- Subject IDs are universe-unique and do not change when their resident cell
+  changes.
 
 ## Celestial registry
 
@@ -114,6 +121,40 @@ These invariants are higher priority than convenience or performance.
   wake cut-off, invariant validation, snapshot, and a fresh session/interest
   baseline. Public spectators cannot wake or retain a sleeping proof cell.
 
+## P1.7 placement, transfer, and compatibility
+
+- Every transferable mobile aggregate has exactly one resident cell and one
+  monotonically increasing placement generation.
+- Source prepare locks one complete server-derived dependency closure at an
+  atomic tick/production boundary. Destination quarantine is durable but has
+  no physics, production, projection, or mutation authority.
+- One directory compare-and-swap from source placement generation `N` to
+  destination generation `N+1` is the sole handoff linearization point.
+- Before directory commit, recovery may abort to the exact source state. After
+  commit, source unlock is forbidden and recovery only rolls forward through
+  idempotent destination import and source finalization.
+- One transfer ID identifies one immutable content-addressed package. The same
+  ID with changed bytes, roots, subjects, generations, or conservation vector
+  fails closed.
+- Cargo, installed components, production queues, reserved input, pending
+  output, ownership, rewards, physics state, actor history, and lineage are
+  conserved across source export, in-transit custody, and destination import.
+- Operation fingerprint schema `2` is cell-independent; retained receipts and
+  compaction commitments move with the actor so route changes cannot repeat an
+  accepted mutation.
+- A successful same-session handoff increments movement and interest epochs,
+  rejects every stale source control or frame, and resumes only after one
+  independently verified transfer-linked destination baseline.
+- P1.7 admits only protocol `18`, projection schema `4`, world schema `20`,
+  event schema `16`, content schema `11`, content manifest `p1.5.0`, registry
+  schema `1`, universe manifest schema `4`, interest schema `2`, operation
+  fingerprint schema `2`, lifecycle-control schema `1`, production-occurrence
+  schema `1`, cell-directory schema `1`, and transfer/package schema `1` as one
+  coordinated set.
+- An anchored, externally connected, boundary-spanning, or unsupported
+  aggregate remains source-authoritative and is never silently split, deleted,
+  capped, or assigned two writers.
+
 ## Assets
 
 - Every live canonical asset has exactly one owner and one location domain.
@@ -132,9 +173,11 @@ These invariants are higher priority than convenience or performance.
 
 ## Transfers
 
-- Cross-cell transfers never produce two active copies.
-- Retrying an operation returns the same result.
-- An incomplete transfer is recoverable to exactly one authoritative side.
+- Cross-cell transfers never produce two active copies or zero conserved
+  ownership domains.
+- Retrying an operation or transfer phase returns the same result.
+- An incomplete transfer is recoverable to exactly one authoritative side
+  according to the durable directory commit.
 - A market-deposited asset cannot be simultaneously installed, consumed, or transferred in-world.
 
 ## Markets

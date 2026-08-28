@@ -21,7 +21,7 @@ scheduling must reuse the same integer-tick production event before the project
 claims sleeping-cell, background, or offline production. This ordering improves
 the playable work loop without inventing a second production state machine.
 
-P1.5 is the active fixed-celestial and interest-management correctness slice. It pins
+P1.5 is the published fixed-celestial and interest-management correctness slice. It pins
 the current planet and asteroid to immutable hierarchical universe addresses,
 validates a versioned proof separation threshold, and replaces whole-cell
 fanout with deterministic server-derived interest baselines and deltas. Player
@@ -87,6 +87,27 @@ P1.6 acceptance evidence covers:
   and
 - hosted Linux and Apple Silicon package evidence without a multi-host or
   public-scale claim.
+
+[P1.7 durable two-cell assignment and mobile-aggregate handoff](../gameplay/durable-two-cell-handoff.md)
+is the accepted next correctness slice. It adds exactly one empty adjacent
+proof cell, canonical cell keys, durable directory assignment, per-cell P1.6
+lifecycle roots, a separate aggregate placement generation, and atomic handoff
+of an EVA actor or isolated ordinary unanchored grid. One directory
+compare-and-swap is the sole authority-transfer point; pre-commit failures may
+abort exactly, while post-commit failures only roll forward to destination
+import.
+
+P1.7 must preserve cargo, production queues and escrow, physics state,
+ownership, lineage, actor operation history, and movement/interest frontiers.
+The existing gateway session pauses controls and installs one transfer-linked,
+independently verified destination baseline before play resumes. Its crash
+matrix must prove exactly one mutable placement under stale workers, lost
+receipts, duplicate delivery, and restart.
+
+P1.7 remains a two-cell local correctness proof. It does not claim multi-host
+availability, cross-cell collision/combat, static or oversized structure
+partitioning, planet streaming, frontier expansion, routes, or thousands-player
+capacity.
 
 P1.5 acceptance requires:
 

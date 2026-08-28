@@ -1,7 +1,7 @@
 # System architecture
 
-**Status:** Proposed production baseline with published P1.5 and verified P1.6
-single-cell contracts
+**Status:** Proposed production baseline with published P1.5, verified P1.6,
+and accepted P1.7 two-cell contract
 
 ## Architectural goals
 
@@ -68,9 +68,9 @@ entity never grants authority and never changes simulation ownership.
 
 - Celestial and sector registry.
 - Content-addressed universe manifest and canonical address normalization.
-- Dynamic cell scheduler.
+- Durable cell directory and assignment scheduler.
 - Cell lease and fencing service.
-- Player/grid transfer coordinator.
+- Player/grid placement and transfer coordinator.
 - Route and autopilot service.
 - Content-manifest registry.
 - Configuration and feature-policy service.
@@ -124,7 +124,10 @@ entity never grants authority and never changes simulation ownership.
 - A P1.6 worker must verify universe manifest schema `3`, celestial registry
   schema `1`, lifecycle-control schema `1`, schedule-occurrence schema `1`, and
   their hashes before opening world schema `19` or event schema `15`.
-- Cross-cell transfers use an idempotent prepare/commit protocol.
+- Cross-cell transfer uses a content-addressed prepare/quarantine saga. A
+  directory compare-and-swap over the prior placement generation is the sole
+  authority-transfer point; cell fencing and aggregate placement fencing are
+  both required.
 - Economic writes use stable operation IDs and double-entry accounting.
 - Blockchain consumers wait for chain-specific confirmation policy and tolerate reorganization.
 - Mainnet is never a dependency for player movement, mining, combat, or machine ticks.
@@ -171,6 +174,34 @@ verified baseline only after activation catch-up and snapshot complete.
 This local proof does not implement a universe directory, multiple-cell
 placement, handoff, multi-host lease availability, frontier expansion, or a
 thousand-player capacity envelope.
+
+## P1.7 durable two-cell handoff slice
+
+The accepted bounded slice creates two adjacent proof cells under one local
+durable directory. Each cell has an independent P1.6 lifecycle, store root,
+assignment generation, lease, and fencing token. A canonical `CellKeyV1`
+derives stable routing identity without depending on worker names or paths.
+
+An EVA actor or isolated ordinary unanchored grid crosses through one durable
+handoff saga. The source locks the complete dependency closure and publishes an
+immutable package, the destination validates it into non-live quarantine, and
+the directory atomically advances the aggregate placement generation. Before
+that commit recovery may abort to the source; afterward only destination
+roll-forward is legal. Import, source finalization, operation retry history,
+and the transfer-linked destination view are all idempotent.
+
+The coordinated P1.7 boundary is protocol `18`, projection schema `4`, world
+schema `20`, event schema `16`, content schema `11`, content manifest
+`p1.5.0`, registry schema `1`, universe manifest schema `4`, interest schema
+`2`, operation fingerprint schema `2`, lifecycle-control schema `1`,
+production-occurrence schema `1`, cell-directory schema `1`, and transfer
+schema `1`.
+
+This slice does not establish multi-host control-plane availability,
+cross-cell physics or systems, arbitrary cell counts, static/oversized
+structure partitioning, frontier materialization, or a production-capacity
+claim. The complete contract is
+[F-061](../gameplay/durable-two-cell-handoff.md).
 
 ## Initial implementation choice
 

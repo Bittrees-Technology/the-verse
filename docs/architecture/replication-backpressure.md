@@ -1,7 +1,8 @@
 # P1 replication and backpressure
 
 **Status:** P1.5 transport and independent official-client view verification
-hosted verified; production active-player load remains pending
+hosted verified; P1.7 cross-cell convergence contract accepted; production
+active-player load remains pending
 
 ## Failure being prevented
 
@@ -175,6 +176,29 @@ schema `19`, event schema `15`, content schema `11`, content manifest
 `p1.5.0`, registry schema `1`, universe manifest schema `3`, interest schema
 `1`, lifecycle-control schema `1`, and schedule-occurrence schema `1`.
 
+P1.7 makes replication frontiers explicitly cell-scoped. During handoff the
+gateway pauses control delivery, preserves the authenticated session epoch,
+and discards every source-cell pending target, delta, acknowledgement, verifier
+stage, private overlay, and prediction queue. Directory commit plus successful
+destination import increments the movement and interest epochs and permits one
+new destination baseline. It binds the committed transfer ID, placement
+generation, destination cell key, destination event/tick frontier, and trust
+roots. The official verifier must commit it before controls resume.
+
+Source `transferred` removal derives only from a committed transfer tombstone;
+ordinary observers receive no destination or package metadata. Source and
+destination event sequence values are never compared as one global journal.
+Packet loss, backpressure, disconnect, or delayed source state can request a
+new destination baseline but cannot reverse placement or restore source
+authority.
+
+The coordinated P1.7 boundary is protocol `18`, projection schema `4`, world
+schema `20`, event schema `16`, content schema `11`, content manifest
+`p1.5.0`, registry schema `1`, universe manifest schema `4`, interest schema
+`2`, operation fingerprint schema `2`, lifecycle-control schema `1`,
+production-occurrence schema `1`, cell-directory schema `1`, and transfer
+schema `1`.
+
 ## Evidence gates
 
 Existing tests cover 4,096-motion coalescing, structural ordering,
@@ -203,6 +227,7 @@ and native verifier suites, and Linux and Apple Silicon client packages for
 implementation revision `71e955c`. This does not widen the spectator harness
 into an active-player or production-capacity claim.
 
-This is still a local-cell scale slice. A final binary codec, multi-process
-cell scheduler, cross-cell handoff, and thousand-participant production result
-remain separate evidence gates.
+The verified P1.5 result is still a local-cell scale slice. A final binary
+codec and thousand-participant production result remain separate evidence
+gates; P1.7 must separately publish its two-cell handoff and crash evidence
+before that behavior is considered implemented.
