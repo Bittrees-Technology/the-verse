@@ -589,14 +589,24 @@ evidence, and binds destination fence, event, lifecycle, conservation,
 eligibility root, and mutation witness. The typed import proof then adds the
 resulting world and a separate final proof hash. Canonical decode rejects
 unknown fields, substituted source evidence, non-monotonic import time, changed
-event material, and tampered historical records. This is persistence authority,
-not a materialization claim. Until distinct authenticated activation and
+event material, and tampered historical records. The pure materialization
+transaction consumes the exact reservation only after validating the live
+successor fence, full package-derived ledger vector, authenticated source proof,
+world and draft identity conflicts, and monotonic trusted time. It inserts the
+complete grid, rider, inventory, operation-history, contact, production FIFO,
+and job-origin closure; rebases only derived destination poses; records the
+checked import witness; advances one event; and derives the exact machine holds
+without advancing the production clock or any job. It then seals the pending
+lock, active-world result, typed proof, and historical record atomically, with
+an exact no-op retry. Until distinct authenticated activation and
 eligibility-release witnesses exist, restart validation requires every
 committed import to retain its exact pending lock and complete machine-hold
-set; advancing an unrelated event cannot erase either authority. Destination
-materialization/import, destination activation, source finalization, the
-explicit transfer-paused production outcome, and crash/replay integration
-remain to be implemented before activation. All drafts are
+set; advancing an unrelated event cannot erase either authority. Dormant
+directory v3 persists and revalidates the complete typed destination-import
+proof and requires imported/finalized retries to match the local historical
+proof exactly. Destination activation, source finalization, the explicit
+transfer-paused production outcome, and crash/replay integration remain to be
+implemented before activation. All drafts are
 intentionally unreachable from the production directory-v2/package-v1 paths
 until every version in the table above moves in one coordinated activation.
 

@@ -185,13 +185,22 @@ from the active-world hash. The typed import proof binds the nested validated
 source-export proof, original quarantine evidence, monotonic trusted times,
 destination event and fence, exact ledger vector, production lifecycle/root,
 resulting active world, and separate acyclic mutation and final proof hashes.
-These records and their strict codec validation are dormant models only.
-restart validation retains the complete pending lock and machine-hold set until
-future authenticated activation and eligibility-release witnesses replace
-them. An unrelated later cell event cannot silently discard either authority.
-Destination materialization, activation, source finalization, scheduler wiring,
-and the crash matrix remain disabled until their atomic transactions are
-implemented. Production remains
+The pure destination-import transaction now validates the live successor fence
+and every world/draft identity, consumes the exact reservation, rebases only
+derived local poses, inserts the complete grid/rider/inventory/contact/queue
+closure and production provenance, records one checked import witness, and
+derives the machine holds from its committed event without ticking production.
+It then seals the pending-activation lock, resulting active world, typed proof,
+and historical record in one cloned-state mutation. Exact retry returns that
+durable result. Restart validation retains the complete pending lock and
+machine-hold set until future authenticated activation and eligibility-release
+witnesses replace them; an unrelated later cell event cannot silently discard
+either authority. Dormant directory v3 persists every typed import-proof field,
+reconstructs and revalidates the exact cell proof after restart, and accepts a
+late imported/finalized retry only when that directory proof equals the local
+historical result. Destination activation, source finalization, scheduler
+wiring, and the crash matrix remain disabled until their atomic transactions
+are implemented. Production remains
 pinned to protocol 18/directory 2/package 1 until the complete protocol-19
 tuple activates together. Production active-player load, the
 production binary codec, general multi-cell execution, safe zones, accounts,
