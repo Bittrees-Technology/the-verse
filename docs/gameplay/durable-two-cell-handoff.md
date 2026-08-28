@@ -654,11 +654,22 @@ to use an authority pair the directory actually issued, and rejects a resealed
 cross-pair even when its individual numbers are in range. Successor workers use
 separate event-free reconciliation transactions, so an already committed event
 is never invented again during recovery. A proof-only replay dispatcher must
-resolve the exact historical directory revision externally and compare it with
-the event payload; serialized authority is not itself a trust root.
+resolve the exact historical directory revision and compare it with the event
+payload; serialized authority is not itself a trust root. The dormant
+directory-v3 path now retains every full sealed revision in a canonical NDJSON
+hash chain under an isolated protocol-19 namespace. An atomically replaced head
+pins its exact entry count, record boundary, revision, document hash, and chain
+hash, so deleting a durable suffix fails closed while a valid journal record
+that reached disk before its head is safely adopted on restart. Recovery
+truncates only an unterminated final record outside the pinned prefix. Exact
+historical transfer and assigned-cell capabilities resolve only by revision plus
+document hash; stale CAS attempts, revision forks, rewritten predecessors,
+complete garbage suffixes, and live directory-v2 filename collisions reject.
+The history remains dormant because its head advertises the indivisible
+protocol-19 tuple and no active runtime calls it.
 The active event-17 runtime/store adapter, scheduler and durable wake-up path,
-and persistence failpoint crash/replay integration remain to be implemented
-before activation. All drafts are
+the trusted proof-only dispatcher, and whole-world persistence failpoint
+crash/replay integration remain to be implemented before activation. All drafts are
 intentionally unreachable from the production directory-v2/package-v1 paths
 until every version in the table above moves in one coordinated activation.
 The dormant proof harness retains bounded predecessor projections for replay;

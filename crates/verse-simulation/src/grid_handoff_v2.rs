@@ -48,6 +48,51 @@ const CLOSURE_HASH_DOMAIN: &[u8] = b"the-verse/grid-transfer-closure/v2\0";
 const CONSERVATION_HASH_DOMAIN: &[u8] = b"the-verse/grid-transfer-conservation/v2\0";
 const PACKAGE_HASH_DOMAIN: &[u8] = b"the-verse/grid-transfer-package/v2\0";
 
+/// The compatibility tuple that must activate atomically before any dormant
+/// grid-handoff-v2 persistence or runtime entry point becomes reachable.
+///
+/// Keeping one shared type prevents the event and directory history codecs
+/// from drifting while both remain isolated from the protocol-18 runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct DraftGridCompatibilityTupleV19 {
+    protocol_version: u32,
+    projection_schema_version: u32,
+    world_schema_version: u32,
+    event_schema_version: u32,
+    content_schema_version: u32,
+    celestial_registry_schema_version: u32,
+    universe_manifest_schema_version: u32,
+    interest_schema_version: u32,
+    operation_fingerprint_schema_version: u32,
+    lifecycle_control_schema_version: u32,
+    production_occurrence_schema_version: u32,
+    cell_key_schema_version: u32,
+    directory_schema_version: u32,
+    transfer_package_schema_version: u32,
+}
+
+impl DraftGridCompatibilityTupleV19 {
+    pub(super) const fn canonical() -> Self {
+        Self {
+            protocol_version: 19,
+            projection_schema_version: 5,
+            world_schema_version: 21,
+            event_schema_version: 17,
+            content_schema_version: 11,
+            celestial_registry_schema_version: 1,
+            universe_manifest_schema_version: 5,
+            interest_schema_version: 3,
+            operation_fingerprint_schema_version: 2,
+            lifecycle_control_schema_version: 2,
+            production_occurrence_schema_version: 1,
+            cell_key_schema_version: 1,
+            directory_schema_version: 3,
+            transfer_package_schema_version: DRAFT_GRID_TRANSFER_PACKAGE_SCHEMA_VERSION,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 enum DraftGridClosureError {
     #[error("grid closure package is invalid: {0}")]
