@@ -45,6 +45,7 @@ func _initialize() -> void:
 func _run() -> void:
 	_test_received_vs_processed_reconciliation()
 	_test_ordering_corrections_and_motion_only_updates()
+	_test_render_interpolation_and_grounded_pitch_prediction()
 	_test_menu_dead_disconnect_and_bounds()
 	_test_life_state_reset()
 	_test_bound_player_roster_selection()
@@ -64,7 +65,7 @@ func _run() -> void:
 		quit(1)
 		return
 	print(
-		"VERSE_NATIVE_IMPAIRMENT_OK queued_ack=ordered motion=monotonic corrections=bounded menu=neutral_prediction lifecycle=reset buffers=bounded roll_tap=durable idle=silent rebuild=none targeting=closest_hit ownership=filtered privacy=projected operations=serialized production=physical"
+		"VERSE_NATIVE_IMPAIRMENT_OK queued_ack=ordered motion=monotonic corrections=bounded presentation=interpolated pitch=predicted menu=neutral_prediction lifecycle=reset buffers=bounded roll_tap=durable idle=silent rebuild=none targeting=closest_hit ownership=filtered privacy=projected operations=serialized production=physical"
 	)
 	quit(0)
 
@@ -1661,6 +1662,59 @@ func _test_ordering_corrections_and_motion_only_updates() -> void:
 	_check((correction_client.get("prediction_history") as Array).is_empty(), "reconnect cleared history")
 	_check((correction_client.get("pending_controls") as Array).is_empty(), "reconnect cleared controls")
 	correction_client.free()
+
+
+func _test_render_interpolation_and_grounded_pitch_prediction() -> void:
+	var client := _new_client()
+	client.set("previous_predicted_position", Vector3.ZERO)
+	client.set("predicted_position", Vector3(2.0, 0.0, 0.0))
+	client.set("previous_predicted_orientation", Quaternion.IDENTITY)
+	client.set("predicted_orientation", Quaternion(Vector3.UP, PI * 0.5))
+	client.set("previous_predicted_view_pitch_radians", 0.0)
+	client.set("predicted_view_pitch_radians", 0.4)
+	client.set("prediction_presentation_ready", true)
+	_check(
+		(client.call("_interpolated_prediction_position", 0.5) as Vector3).is_equal_approx(
+			Vector3(1.0, 0.0, 0.0)
+		),
+		"render position interpolates fixed steps"
+	)
+	var halfway_orientation: Quaternion = client.call(
+		"_interpolated_prediction_orientation", 0.5
+	)
+	_check(
+		absf(halfway_orientation.get_angle() - PI * 0.25) < 0.0001,
+		"render orientation interpolates fixed steps"
+	)
+	_check(
+		is_equal_approx(float(client.call("_interpolated_prediction_view_pitch", 0.5)), 0.2),
+		"grounded view pitch interpolates fixed steps"
+	)
+
+	var grounded := _base_player()
+	grounded["jetpack_enabled"] = false
+	grounded["locomotion"] = {
+		"kind": "grounded",
+		"up": _protocol_vec3(Vector3.UP),
+		"view_pitch_radians": 0.0,
+		"jump_held": false,
+	}
+	client.set("actor_private_snapshot", _private_snapshot(grounded))
+	client.set("predicted_view_pitch_radians", 0.0)
+	client.call("_predict_player_step", {
+		"linear_input": Vector3.ZERO,
+		"angular_input": Vector3(1.0, 0.0, 0.0),
+		"boost": false,
+		"jump": false,
+		"dampeners": true,
+	}, FIXED_DELTA, false)
+	_check(
+		is_equal_approx(
+			float(client.get("predicted_view_pitch_radians")), 2.5 * FIXED_DELTA
+		),
+		"grounded pitch predicts before authoritative motion arrives"
+	)
+	client.free()
 
 
 func _test_menu_dead_disconnect_and_bounds() -> void:

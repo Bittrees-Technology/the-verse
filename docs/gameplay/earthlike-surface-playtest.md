@@ -32,6 +32,10 @@ interest verifier is arm64. Packaging fails if the client architecture can
 select a slice for which no verifier library is shipped. The launcher also
 passes `--genesis-profile earth-start` and stores this playtest in a distinct
 application-support directory so prior orbital saves remain untouched.
+The local launcher snapshots every 600 events by default while retaining every
+canonical event durably. This avoids a large synchronous snapshot every fraction
+of a second during active walking; `VERSE_SNAPSHOT_EVERY` can override the local
+packaging cadence without changing canonical simulation rules.
 
 ## Acceptance
 
@@ -40,5 +44,9 @@ application-support directory so prior orbital saves remain untouched.
 - Applying the profile after canonical history begins is rejected.
 - The packaged native smoke test loads the verifier without a missing-library
   error.
+- A delayed worker poll advances by measured elapsed time, allowing the fixed
+  60 Hz accumulator to catch up rather than slowing the universe.
+- The native camera interpolates fixed-step position, body orientation, and
+  grounded view pitch between rendered frames.
 - The player can walk with `WASD`, sprint with `Shift`, jump with `Space`, and
   toggle EVA with `J`; the server remains the movement authority throughout.
