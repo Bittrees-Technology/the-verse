@@ -1,0 +1,113 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+name: Continuous integration
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.96.0 --profile minimal --component clippy,rustfmt
+      - name: Install Godot 4.7.2
+        run: |
+          curl -L --fail --show-error -o /tmp/godot.zip \
+            https://github.com/godotengine/godot-builds/releases/download/4.7.2-stable/Godot_v4.7.2-stable_linux.x86_64.zip
+          echo "cadd3204e728a35d3f13adb7fd0d7902636b79f6b95c40c265eb73b6c35329e4  /tmp/godot.zip" | sha256sum -c -
+          unzip -q /tmp/godot.zip -d /tmp/godot
+      - name: Verify
+        env:
+          GODOT_BIN: /tmp/godot/Godot_v4.7.2-stable_linux.x86_64
+        run: tools/ci/check.sh
+      - name: Verify Linux container
+        run: tools/ci/check-container.sh
+
+  package-native:
+    name: Package native (${{ matrix.package }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: linux-x86_64
+            runner: ubuntu-24.04
+            godot_archive: Godot_v4.7.2-stable_linux.x86_64.zip
+            godot_checksum: cadd3204e728a35d3f13adb7fd0d7902636b79f6b95c40c265eb73b6c35329e4
+            godot_binary: /tmp/godot/Godot_v4.7.2-stable_linux.x86_64
+          - package: macos-arm64
+            runner: macos-15
+            godot_archive: Godot_v4.7.2-stable_macos.universal.zip
+            godot_checksum: c58a24e31d720be9d62f60cb5627c4e695fb72f21b0cfe1bc9ccaa9a3b3ba63e
+            godot_binary: /tmp/godot/Godot.app/Contents/MacOS/Godot
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.96.0 --profile minimal
+      - name: Restore Godot export templates
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.local/share/godot/export_templates/4.7.2.stable
+            ~/Library/Application Support/Godot/export_templates/4.7.2.stable
+          key: godot-export-templates-${{ matrix.package }}-4.7.2-f298490b
+      - name: Install Godot 4.7.2
+        env:
+          GODOT_ARCHIVE: ${{ matrix.godot_archive }}
+          GODOT_CHECKSUM: ${{ matrix.godot_checksum }}
+        run: |
+          curl -L --fail --show-error -o /tmp/godot.zip \
+            "https://github.com/godotengine/godot-builds/releases/download/4.7.2-stable/${GODOT_ARCHIVE}"
+          if command -v sha256sum >/dev/null 2>&1; then
+            echo "${GODOT_CHECKSUM}  /tmp/godot.zip" | sha256sum -c -
+          else
+            echo "${GODOT_CHECKSUM}  /tmp/godot.zip" | shasum -a 256 -c -
+          fi
+          unzip -q /tmp/godot.zip -d /tmp/godot
+      - name: Install pinned export templates
+        run: tools/release/install-godot-export-templates.sh
+      - name: Build and smoke-test native package
+        env:
+          GODOT_BIN: ${{ matrix.godot_binary }}
+          VERSE_RELEASE_VERSION: p0.10.0-ci-${{ github.sha }}
+        run: tools/release/package-native.sh
+      - name: Measure Linux P0.10 physics distribution
+        if: runner.os == 'Linux'
+        env:
+          GODOT_BIN: ${{ matrix.godot_binary }}
+        run: |
+          benchmark_file="artifacts/release/P0.10-grounded-locomotion-linux.txt"
+          {
+            echo "The Verse P0.10 hosted Linux release distribution"
+            uname -a
+            lscpu
+            rustc --version
+            cmake --version
+            "${GODOT_BIN}" --headless --version
+          } > "${benchmark_file}"
+          for sample in 1 2 3 4 5; do
+            echo "sample=${sample}" | tee -a "${benchmark_file}"
+            cargo test -p verse-physics --release --locked \
+              --test compound_grid_benchmark -- \
+              --ignored --nocapture --test-threads=1 \
+              2>&1 | tee -a "${benchmark_file}"
+          done
+      - name: Upload native development package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: the-verse-p0.10.0-${{ matrix.package }}
+          path: |
+            artifacts/release/*.zip
+            artifacts/release/*.tar.gz
+            artifacts/release/*.sha256
+            artifacts/release/*.txt
+          if-no-files-found: error
+          retention-days: 7

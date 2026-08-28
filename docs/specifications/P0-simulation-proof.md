@@ -1,6 +1,6 @@
 # P0 specification: simulation proof
 
-**Status:** Draft ready for engineering design
+**Status:** P0 exit evidence complete; Godot/Rust/Jolt acceptance proposed
 
 ## Purpose
 
@@ -19,6 +19,8 @@ Prove that the proposed open-source stack can support the irreducible technical 
 - F-009 inventory conservation ledger.
 - F-010 damage and grid split.
 - F-011 snapshot and recovery.
+- F-057 server-authoritative EVA, landing, and rotation.
+- F-058 server-authoritative grounded and magnetic locomotion.
 
 ## Demonstration scenario
 
@@ -127,13 +129,183 @@ The proof must publish results for:
 
 Targets are set only after the first reproducible baseline to avoid inventing unsupported performance promises.
 
+The first Apple Silicon kernel baseline is published in [P0.1 benchmark results](../benchmarks/P0.1-apple-silicon.md). Ubuntu, rendering/remesh, multi-body physics, network-bandwidth, and large-grid baselines remain required before the P0 exit decision.
+
+## P0.1 implementation checkpoint
+
+Implemented and continuously verified:
+
+- Deterministic procedural asteroid and authoritative voxel removal.
+- Versioned content definitions for yields, recipes, block health, and power.
+- Inventory-domain transfers and conservation checks after every event.
+- Powered movable grids, voxel-contact anchors, block damage, and deterministic splits.
+- Operation idempotency, hash-chained journals, snapshots, recovery, and writer fencing.
+- Godot macOS client, browser command center, JSON WebSocket protocol, and public read endpoints.
+- End-to-end mining-to-construction scenario with server restart and native-client reconnect.
+
+Still required for the P0 exit gate:
+
+- Collision/contact physics and production-scale Jolt integration.
+- Sparse chunk meshing and edit/remesh latency measurements.
+- Ubuntu server benchmark and native Linux client package.
+- Network bandwidth measurements and larger body/block-count scaling.
+- Crash injection at each persistence boundary, beyond the current corruption and restart suite.
+
+The native Linux requirement means a reproducible direct-download client artifact and an Ubuntu-compatible headless server at the P0 gate. Signing, differential updates, and the automatic updater remain P1 work.
+
+## P0.2 gameplay checkpoint
+
+Implemented and continuously verified:
+
+- First-person six-axis EVA movement with boost and toggleable inertial dampeners.
+- A physical industrial multi-tool with hold-to-mine, weld, and cut interactions.
+- Surface-only irregular asteroid rendering while integer voxels remain canonical.
+- A differentiated 25-block starter skiff with control, power, battery, cargo, drill, and work-light silhouettes.
+- A five-stage salvage contract spanning extraction, refining, fabrication, construction, and anchoring.
+- Event-derived career counters, experience rewards, and clearance levels in the authoritative snapshot.
+- Protocol and save-schema rejection for incompatible pre-career clients and worlds.
+
+## P0.3 visual engineering checkpoint
+
+Implemented and continuously verified:
+
+- A continuous marching-tetrahedra asteroid surface derived from authoritative integer occupancy.
+- Deterministic fixed-point asteroid silhouette variation and clustered ferrite deposits.
+- An original procedural rock shader and CC BY-SA modular spacecraft armor material.
+- Helmet work lighting, glass and emissive details, framed machinery, and impact sparks.
+- Explicit schema rejection for worlds produced by the previous deterministic generator.
+- Clean-room reference boundaries and an independently specified engineering-parity sequence.
+
+## P0.4 engineering hands checkpoint
+
+Implemented and continuously verified:
+
+- Server-range-checked construction placement and welding.
+- Persistent 90-degree block orientations transmitted in protocol snapshots.
+- Frames that consume components once, begin at 25 percent integrity, and require three accepted weld stages.
+- Power and anchor rules that ignore unfinished construction.
+- Sealed cargo inventories until construction completes.
+- Durable completion state that keeps damaged armor visually distinct from frames and prevents repair from re-awarding build credit.
+- Completion-derived career progress, exact recovery, and idempotent final-weld receipts.
+- Exact mined-coordinate removal assertions in the cross-process scenario.
+- Client-side frame skeletons, rotating directional holograms, integrity telemetry, and confirmed-edit rock fragments.
+
+## P0.5 planetary logistics checkpoint
+
+Implemented and continuously verified:
+
+- A two-sided native inventory terminal with exact and complete-stack transfers.
+- Server-owned inventory volume, mass, capacities, and overfill rejection.
+- Flush completed block envelopes and differentiated machinery faces.
+- A procedural Khepri Prime surface, atmosphere shell, terrain ridges, and boulder field.
+- Authoritative altitude, local gravity, atmosphere density, oxygen fraction, and breathability snapshots.
+- Persistent helmet seal, jetpack mode, suit oxygen, planetary-surface validation, and gravity-aware client prediction.
+- Protocol, persistence, live-interface, restart, and recovery checks for the new environment and logistics state.
+
+## P0.6 orbital operations checkpoint
+
+Implemented and continuously verified:
+
+- An orbital asteroid origin separated by more than three kilometers from the modeled Khepri surface.
+- Vacuum, weak orbital gravity, and near-surface atmosphere assertions from the same authoritative environment model.
+- Local-axis mouse orientation plus continuous and tapped `Q`/`E` character roll.
+- `[`/`]` construction yaw so flight orientation remains available during build mode and on compact keyboards.
+- A compact connected-inventory interface with container selection, search, category filters, tabular item metrics, selection, and central transfers.
+- Original CC BY-SA geological maps, triplanar asteroid mapping, displaced planet terrain, moving clouds, and atmospheric limb rendering.
+
+## P0.7 server-authoritative contact-physics checkpoint
+
+Implemented foundation:
+
+- An isolated, license-recorded Jolt adapter for dynamic and static compound bodies.
+- Server-owned grid forces, poses, velocities, contacts, and anchoring body transitions.
+- Canonical quantized body/contact `PhysicsStepCommitted` outcomes so replay never depends on repeating floating-point collision solving.
+- Native Jolt manifolds, explicit pairwise-estimate semantics, and canonical contact onset/persistence that survives derived-scene rebuild and restart.
+- Authoritative runtime grid–grid momentum exchange and restart within a published `1 kg m/s` P0 tolerance, cargo-mass acceleration response, two-second settle plus two-second bounded resting-contact observation, and immovable static-anchor behavior under impact followed by conservative release and restart. Adapter coverage separately proves unequal-density collision response.
+- Authoritative swept player collision against voxels and axis-aligned or rotated grids, including a nearby clear-motion control case.
+- In-process before-write and after-sync physics-commit failures proving recovery of exactly the complete prior or durable tick, torn-tail truncation, and parent-directory synchronization after atomic snapshot rename.
+- Atomic 8×8×8 voxel collision chunks with stable signed-coordinate identities, Euclidean negative-coordinate ownership, one-body mining replacement, surviving contact lifecycle, anchored-support rejection, failure rollback, exact collider-fingerprint recovery, and old-content rejection.
+- Sparse dirty-chunk rendering after accepted voxel edits.
+- Initial contact, conservation, recovery, body-count, native-client, and macOS evidence.
+
+Still required for checkpoint acceptance:
+
+- A project-owned post-solve applied-impulse binding, collision damage, and atomic damage/split outcomes.
+- Subprocess crash-boundary, edit-remesh, Ubuntu, Linux-artifact, network, and scaling evidence.
+
+The complete contract is [P0.7 server-authoritative contact physics](../gameplay/contact-physics.md), with recovery rationale in [ADR-0010](../decisions/ADR-0010-committed-physics-outcomes.md) and dirty-collision rules in [ADR-0011](../decisions/ADR-0011-dirty-voxel-collision-chunks.md).
+
+## P0.8 survival-death foundation
+
+Implemented foundation:
+
+- Server-owned, content-versioned oxygen capacity, critical threshold, atmosphere/helmet rates, and proof recovery defaults.
+- One canonical oxygen-depletion transition with no playable `alive + zero oxygen` intermediate state.
+- Atomic carried-inventory movement into a stable death drop, an empty retained suit inventory, unchanged career/ledger values, and conservation after death.
+- Canonical incapacitation that disables the jetpack, clears latched grid controls, rejects every player mutation except respawn, and survives restart.
+- Location-free, server-selected, free, idempotent proof respawn with unchanged drop and progression state.
+- Generic crafting, refining, and transfer rejection for dropped inventories until explicit recovery and salvage authority exists.
+- Before-write and after-sync death/respawn failpoints proving exact complete-state recovery, plus replay tamper rejection and protocol/content/schema version fencing.
+- Native critical oxygen feedback, canonical incapacitation overlay, local control gating, death-drop confirmation, and a recovery action that submits no position.
+
+Still required for complete death-drop lifecycle:
+
+- Powered personal, company, or allied spawn selection and a real capital fallback.
+- Owner/team recovery permissions, 15-minute grace, public salvage, six-hour expiry, outage pausing, cleanup tombstones, and settlement evidence.
+- Combat/impact health, physical loot containers, corpse presentation, multiplayer ownership, and team state.
+
+The survival-death boundary is [P0.8 survival death foundation](../gameplay/survival-death.md), with transaction and deferral rationale in [ADR-0012](../decisions/ADR-0012-oxygen-incapacitation-and-proof-respawn.md).
+
+## P0.9 authoritative EVA-physics checkpoint
+
+Implemented local boundary:
+
+- Protocol 9 removes client-submitted character positions. `SetPlayerControl` contains only the server-owned `movement_epoch`, monotonic `input_sequence`, bounded local translation/angular input, boost, and dampeners. It has no jump or client transform fields. Full and lightweight player snapshots distinguish durable `last_received_input_sequence` from fixed-step `last_processed_input_sequence`.
+- Content `p0.9.0` owns character mass and collision radius, EVA speed and acceleration, boost, linear/angular damping and limits, and an 18-tick control lease at 60 Hz.
+- World schema 12 stores canonical player orientation, linear/angular velocity, movement epoch, received and processed sequence frontiers, a bounded pending-control FIFO, current controls, the absolute control-expiry tick, and the current `surface_contact` boolean. It adds no grounded state or jump latch.
+- Event schema 7 persists idempotent `PlayerControlSet` inputs under queued-consumption semantics. Durable acceptance advances the received frontier and appends to the FIFO. Each fixed 60 Hz substep retires expired entries, consumes at most one surviving transition, and advances the processed frontier. The existing atomic `PhysicsStepCommitted` outcome carries one optional `PlayerPhysicsOutcome` for the living player; there is no separately committed character time domain.
+- A content-sized dynamic Jolt sphere with `LinearCast` motion quality owns radial gravity, jetpack acceleration, boost, dampening, local-frame torque and rotation, continuous collision detection, contact response, and ballistic landing against the static planet, voxels, and grids.
+- `surface_contact` is true when the final substep's active-contact set contains the player body and false otherwise. Stable contact identity and normals remain in the ordinary physics-contact records. The boolean is collision evidence, not grounded-locomotion authority.
+- Queued press/release transitions survive worker scheduling phase. Entries whose receipt-time lease expires before consumption retire without motion; stale active controls expire into neutral dampened state. Incapacitation clears active and queued motion, and respawn advances the movement epoch, resets both sequence frontiers and the FIFO, and starts stationary.
+- The native client predicts from the same content values, allocates after the received frontier, and reconciles every newer canonical player state by discarding through the processed frontier and replaying the remainder. Lifecycle, reconnect, history-gap, large-error, and epoch changes hard-snap.
+- Lightweight player-state replication does not rebuild the complete voxel/grid presentation every motion tick. The browser may display this canonical state without a transform-submission path.
+
+Implemented and locally verified evidence:
+
+- Serialization and adversarial tests prove that clients cannot send pose, velocity, collision results, or elapsed time and cannot use stale, duplicate, non-finite, or excessive controls to mutate or accelerate the player.
+- Fixed-step fixtures prove bounded EVA, boost, drift, dampening, gravity, local pitch/yaw and `Q`/`E` roll, ballistic landing, Jolt `LinearCast` collision response without tunneling, queued press/release delivery, input-lease expiry, and quantized macOS outcomes. Live and replay validation enforce finite/global velocity limits, conservative fixed-step translation and rotation envelopes, bounded penetration, and stable contact identity; replay does not rerun Jolt or claim exact reconstruction of the forces behind an otherwise valid committed velocity.
+- Replay tamper, idempotency, queue-overflow no-mutation, before-write/after-sync control and physics failpoints, snapshot/journal recovery, death-mid-motion, respawn, disconnect, and reconnect tests preserve exact motion and queue state.
+- The live protocol scenario reaches a voxel by input, completes a range-gated action, survives lifecycle recovery and restart, and retains the exact canonical pose, velocity, controls, and world hash.
+- The gated native impairment harness covers received-versus-processed acknowledgement replay, skipped and stale motion messages, small correction smoothing, angular and lifecycle hard snaps, menu-open gravity continuity, bounded production prediction buffers, dead/disconnected gating, and motion-only updates without per-tick world rebuilds.
+
+The quantized fixed-step, headless Godot, live-client, release-container, native Linux package, native Apple Silicon package, and serialized cross-platform performance evidence pass in [hosted P0.10 run 33077252402](https://github.com/Bittrees-Technology/the-verse/actions/runs/33077252402). The raw Linux distribution is attached to its package artifact and summarized in the [hosted Linux baseline](../benchmarks/P0.10-grounded-locomotion-linux.md).
+
+Player-to-player collision, ragdolls, impact damage, suit fuel/power, cockpit possession, lag compensation, rollback, authenticated control ownership, production browser spectating, and multiplayer replication remain later work.
+
+The implemented contract is [P0.9 authoritative EVA physics](../gameplay/authoritative-character-motion.md), with authority and recovery rationale in [ADR-0013](../decisions/ADR-0013-input-only-authoritative-character-motion.md).
+
+## P0.10 authoritative grounded-locomotion checkpoint
+
+Implemented boundary:
+
+- Extend the P0.9 input FIFO rather than adding a client transform or a second character clock.
+- Use protocol 10, world schema 13, event schema 8, content schema 8, and manifest `p0.10.0` for the incompatible locomotion state.
+- Replace the spherical character collider with a content-sized capsule and add bounded, stable-identity capsule support and clearance queries to the safe physics adapter.
+- Derive `eva`, `airborne`, `grounded`, and `magnetic` exclusively from canonical suit mode, gravity, probes, contact, and support identity.
+- Add false-to-true jump buffering, radial upright orientation, walk/sprint motors, slope hysteresis, bounded step and ground-snap queries, grid-relative support anchors, exact support-point velocity inheritance, and magnetic attachment to completed grid colliders.
+- Keep grids and the player in one atomic `PhysicsStepCommitted` time domain; replay validates committed support-aware envelopes without rerunning Jolt.
+- Reconcile native prediction relative to a stable support and expose original `EVA`, `FREEFALL`, `GROUND`, `MAG-LOCK`, and `BOOTS ARMED` feedback.
+
+Verified evidence covers the true capsule collider and stable casts; walk/sprint/brake; buffered edge-triggered jump; 50° entry and 52° exit slope thresholds; bounded clear-step acceptance and over-height rejection; ground snap; radial upright alignment on all six planet axes and continuous pole-neighborhood traversal without quaternion flips; completed-block-only magnetic eligibility; translating-grid support velocity; rotating-grid local-anchor retention; destruction-driven detach without teleportation; collider-identity rebind after a grid split; full-capsule respawn and construction exclusion; client-side radial-upright prediction; persistence replay; real client/server restart recovery; and portable Linux and Apple Silicon packages whose bundled servers and exported clients pass the native smoke scenario.
+
+The complete contract and acceptance matrix are [P0.10 authoritative grounded and magnetic locomotion](../gameplay/authoritative-grounded-locomotion.md), with the authority decision in [ADR-0014](../decisions/ADR-0014-authoritative-grounded-and-magnetic-locomotion.md). Ladders, crouching, ragdolls, character-to-character collision, impact damage, suit power, artificial gravity, cockpit possession, and production multiplayer remain later checkpoints.
+
 ## Exit decision
 
-P0 ends with one of:
+The P0 evidence supports accepting the Godot client plus Rust/Jolt authoritative architecture for P1. This draft branch proposes that choice; repository merge and governance review remain human-controlled. The alternatives not selected by the proposal are:
 
-- Accept Godot/Jolt plus Rust architecture.
 - Retain Godot client but replace the server physics/grid kernel.
 - Replace the client engine.
 - Reduce or redesign an unsupported requirement through a new product decision.
 
-No production content work begins before this gate.
+Approval of this proposal closes the simulation-proof gate; it is not a production-capacity or public-universe claim.
