@@ -18,7 +18,6 @@ use verse_protocol::{
     ProductionRecipeKind, Quat, ResourceKind, Vec3, WorldSnapshot,
 };
 
-use crate::content;
 use crate::event::{
     CanonicalEvent, EVENT_SCHEMA_NAME, EVENT_SCHEMA_VERSION, EventPayload,
     PRODUCTION_SCHEDULE_OCCURRENCE_SCHEMA_VERSION, PhysicsBodyOutcome, PhysicsContactOutcome,
@@ -43,6 +42,7 @@ use crate::persistence::{
 #[cfg(test)]
 use crate::targeting::{TOOL_SURFACE_RANGE_M, ToolHit};
 use crate::targeting::{ToolTarget, closest_tool_hit};
+use crate::{celestial, content};
 
 pub const MAX_BACKGROUND_QUEUE_BEARING_MACHINES: usize = 256;
 pub const MAX_PRODUCTION_CATCH_UP_QUANTA: usize = 60;
@@ -257,6 +257,7 @@ pub struct ProductionDispatchOutcome {
 pub struct RuntimeOpenConfig {
     data_directory: PathBuf,
     requested_seed: u64,
+    cell_key: verse_protocol::CellKeyV1,
     snapshot_every: u64,
     clock: Arc<dyn TrustedClock>,
 }
@@ -294,9 +295,25 @@ impl Runtime {
         requested_seed: u64,
         snapshot_every: u64,
     ) -> Result<Self, RuntimeError> {
-        Self::open_with_clock(
+        Self::open_for_cell_with_clock(
             data_directory,
             requested_seed,
+            celestial::cell_origin_key(),
+            snapshot_every,
+            Arc::new(SystemTrustedClock),
+        )
+    }
+
+    pub fn open_for_cell(
+        data_directory: impl AsRef<Path>,
+        requested_seed: u64,
+        cell_key: verse_protocol::CellKeyV1,
+        snapshot_every: u64,
+    ) -> Result<Self, RuntimeError> {
+        Self::open_for_cell_with_clock(
+            data_directory,
+            requested_seed,
+            cell_key,
             snapshot_every,
             Arc::new(SystemTrustedClock),
         )
@@ -307,9 +324,25 @@ impl Runtime {
         requested_seed: u64,
         snapshot_every: u64,
     ) -> Result<Self, RuntimeError> {
-        Self::open_hosted_with_clock(
+        Self::open_hosted_for_cell_with_clock(
             data_directory,
             requested_seed,
+            celestial::cell_origin_key(),
+            snapshot_every,
+            Arc::new(SystemTrustedClock),
+        )
+    }
+
+    pub fn open_hosted_for_cell(
+        data_directory: impl AsRef<Path>,
+        requested_seed: u64,
+        cell_key: verse_protocol::CellKeyV1,
+        snapshot_every: u64,
+    ) -> Result<Self, RuntimeError> {
+        Self::open_hosted_for_cell_with_clock(
+            data_directory,
+            requested_seed,
+            cell_key,
             snapshot_every,
             Arc::new(SystemTrustedClock),
         )
@@ -321,9 +354,26 @@ impl Runtime {
         snapshot_every: u64,
         clock: Arc<dyn TrustedClock>,
     ) -> Result<Self, RuntimeError> {
-        let mut runtime = Self::open_for_activation_with_clock(
+        Self::open_hosted_for_cell_with_clock(
             data_directory,
             requested_seed,
+            celestial::cell_origin_key(),
+            snapshot_every,
+            clock,
+        )
+    }
+
+    fn open_hosted_for_cell_with_clock(
+        data_directory: impl AsRef<Path>,
+        requested_seed: u64,
+        cell_key: verse_protocol::CellKeyV1,
+        snapshot_every: u64,
+        clock: Arc<dyn TrustedClock>,
+    ) -> Result<Self, RuntimeError> {
+        let mut runtime = Self::open_for_activation_for_cell_with_clock(
+            data_directory,
+            requested_seed,
+            cell_key,
             snapshot_every,
             clock,
         )?;
@@ -337,9 +387,26 @@ impl Runtime {
         snapshot_every: u64,
         clock: Arc<dyn TrustedClock>,
     ) -> Result<Self, RuntimeError> {
-        let mut runtime = Self::open_for_activation_with_clock(
+        Self::open_for_cell_with_clock(
             data_directory,
             requested_seed,
+            celestial::cell_origin_key(),
+            snapshot_every,
+            clock,
+        )
+    }
+
+    fn open_for_cell_with_clock(
+        data_directory: impl AsRef<Path>,
+        requested_seed: u64,
+        cell_key: verse_protocol::CellKeyV1,
+        snapshot_every: u64,
+        clock: Arc<dyn TrustedClock>,
+    ) -> Result<Self, RuntimeError> {
+        let mut runtime = Self::open_for_activation_for_cell_with_clock(
+            data_directory,
+            requested_seed,
+            cell_key,
             snapshot_every,
             clock,
         )?;
@@ -348,21 +415,24 @@ impl Runtime {
     }
 
     pub fn open_for_activation(config: &RuntimeOpenConfig) -> Result<Self, RuntimeError> {
-        Self::open_for_activation_with_clock(
+        Self::open_for_activation_for_cell_with_clock(
             &config.data_directory,
             config.requested_seed,
+            config.cell_key.clone(),
             config.snapshot_every,
             Arc::clone(&config.clock),
         )
     }
 
-    fn open_for_activation_with_clock(
+    fn open_for_activation_for_cell_with_clock(
         data_directory: impl AsRef<Path>,
         requested_seed: u64,
+        cell_key: verse_protocol::CellKeyV1,
         snapshot_every: u64,
         clock: Arc<dyn TrustedClock>,
     ) -> Result<Self, RuntimeError> {
-        let mut store = Store::open_with_clock(data_directory, requested_seed, clock)?;
+        let mut store =
+            Store::open_for_cell_with_clock(data_directory, requested_seed, cell_key, clock)?;
         let mut state = store.load_world()?;
         state.fencing_token = store.fencing_token();
 
@@ -429,6 +499,7 @@ impl Runtime {
         RuntimeOpenConfig {
             data_directory: self.store.root_path().to_path_buf(),
             requested_seed: self.state.world_seed,
+            cell_key: self.store.cell_key().clone(),
             snapshot_every: self.snapshot_every,
             clock: self.store.clock(),
         }
@@ -7570,6 +7641,48 @@ mod tests {
         );
         assert_eq!(runtime.state().event_sequence, prior_sequence + 1);
         assert_eq!(runtime.state().state_hash(), committed_hash);
+    }
+
+    #[test]
+    fn runtime_startup_and_recovery_preserve_the_requested_frontier_cell() {
+        let directory = tempdir().expect("tempdir");
+        let origin = celestial::cell_origin_key();
+        let east =
+            celestial::neighbor_cell_key(&origin, [1, 0, 0]).expect("adjacent proof cell derives");
+        let expected_id = celestial::cell_id(&east).expect("cell ID derives");
+        let first_fence;
+        let open_config;
+        {
+            let runtime = Runtime::open_for_cell(directory.path(), 700, east.clone(), 100)
+                .expect("adjacent runtime opens");
+            assert_eq!(runtime.state().cell_id, expected_id);
+            assert_eq!(
+                celestial::cell_key_from_address(&runtime.state().cell_address)
+                    .expect("runtime key derives"),
+                east
+            );
+            assert!(runtime.state().player.by_id.is_empty());
+            assert!(runtime.physics_scene_is_initialized());
+            first_fence = runtime.state().fencing_token;
+            open_config = runtime.open_config();
+        }
+
+        let mut recovered = Runtime::open_for_activation(&open_config)
+            .expect("adjacent runtime recovers for activation");
+        while !recovered
+            .activation_step()
+            .expect("adjacent activation advances")
+        {}
+        assert_eq!(recovered.state().cell_id, expected_id);
+        assert!(recovered.state().fencing_token > first_fence);
+        drop(recovered);
+
+        assert!(matches!(
+            Runtime::open_for_cell(directory.path(), 700, origin, 100),
+            Err(RuntimeError::Persistence(
+                PersistenceError::InvalidLifecycleControl(_)
+            ))
+        ));
     }
 
     #[test]
