@@ -106,8 +106,8 @@ function connect() {
     elements.connection.className = "connection online";
     socket.send(JSON.stringify({
       type: "hello",
-      protocol_version: 14,
-      client_name: "browser-command-center-p1.3",
+      protocol_version: 15,
+      client_name: "browser-command-center-p1.4",
       authentication: { kind: "spectator" },
     }));
   });

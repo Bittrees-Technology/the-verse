@@ -9,10 +9,10 @@
 use serde::{Deserialize, Serialize};
 
 /// The only protocol version accepted by this build.
-pub const PROTOCOL_VERSION: u32 = 14;
+pub const PROTOCOL_VERSION: u32 = 15;
 
-/// The actor-aware public/private projection contract carried by protocol 13.
-pub const PROJECTION_SCHEMA_VERSION: u32 = 1;
+/// The actor-aware public/private projection contract carried by protocol 15.
+pub const PROJECTION_SCHEMA_VERSION: u32 = 2;
 pub const INTENT_FINGERPRINT_SCHEMA_VERSION: u32 = 1;
 
 /// A stable integer voxel or block coordinate.
@@ -200,6 +200,53 @@ pub enum BlockKind {
     Drill,
     Anchor,
     DamageTest,
+    Conveyor,
+    Refinery,
+    Assembler,
+}
+
+/// A manifest-registered physical production transformation. Clients select a
+/// recipe kind; the authoritative server resolves all quantities, loss, power,
+/// and duration from the active content manifest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProductionRecipeKind {
+    Refining,
+    Component,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProductionJobStatus {
+    Queued,
+    Running,
+    PausedPower,
+    PausedRoute,
+    OutputBlocked,
+}
+
+/// Actor-private view of one canonical physical-production job.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProductionJobSnapshot {
+    pub job_id: String,
+    pub owner_player_id: String,
+    pub machine_block_id: String,
+    pub recipe: ProductionRecipeKind,
+    pub batches: u64,
+    pub source_inventory_id: String,
+    pub destination_inventory_id: String,
+    pub progress_ticks: u64,
+    pub duration_ticks: u64,
+    pub status: ProductionJobStatus,
+    pub reserved_inputs: InventoryContents,
+    pub pending_outputs: InventoryContents,
+}
+
+/// Actor-private FIFO for one production machine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProductionQueueSnapshot {
+    pub machine_block_id: String,
+    pub jobs: Vec<ProductionJobSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -551,6 +598,7 @@ pub struct ActorPrivateSnapshot {
     pub inventories: Vec<InventorySnapshot>,
     pub death_drops: Vec<DeathDropSnapshot>,
     pub owned_grid_masses: Vec<OwnedGridMassSnapshot>,
+    pub production_queues: Vec<ProductionQueueSnapshot>,
 }
 
 /// Actor-aware wire projection of a canonical [`WorldSnapshot`].
@@ -686,6 +734,15 @@ pub enum ClientMessage {
         inventory_id: String,
         quantity: u64,
     },
+    QueueProduction {
+        operation_sequence: u64,
+        operation_id: String,
+        machine_block_id: String,
+        recipe: ProductionRecipeKind,
+        batches: u64,
+        source_inventory_id: String,
+        destination_inventory_id: String,
+    },
     TransferInventory {
         operation_sequence: u64,
         operation_id: String,
@@ -751,6 +808,9 @@ impl ClientMessage {
             | Self::CraftComponent {
                 operation_sequence, ..
             }
+            | Self::QueueProduction {
+                operation_sequence, ..
+            }
             | Self::TransferInventory {
                 operation_sequence, ..
             }
@@ -796,6 +856,9 @@ impl ClientMessage {
             | Self::CraftComponent {
                 operation_sequence, ..
             }
+            | Self::QueueProduction {
+                operation_sequence, ..
+            }
             | Self::TransferInventory {
                 operation_sequence, ..
             }
@@ -826,6 +889,7 @@ impl ClientMessage {
             | Self::MineVoxel { operation_id, .. }
             | Self::RefineOre { operation_id, .. }
             | Self::CraftComponent { operation_id, .. }
+            | Self::QueueProduction { operation_id, .. }
             | Self::TransferInventory { operation_id, .. }
             | Self::BuildBlock { operation_id, .. }
             | Self::WeldBlock { operation_id, .. }
@@ -1000,9 +1064,9 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v14_preserves_tagged_life_state_and_death_cause() {
-        assert_eq!(PROTOCOL_VERSION, 14);
-        assert_eq!(PROJECTION_SCHEMA_VERSION, 1);
+    fn protocol_v15_preserves_tagged_life_state_and_death_cause() {
+        assert_eq!(PROTOCOL_VERSION, 15);
+        assert_eq!(PROJECTION_SCHEMA_VERSION, 2);
         let life_state = PlayerLifeState::Incapacitated {
             death_id: "death-player-local-42".into(),
             cause: PlayerDeathCause::OxygenDepleted,
@@ -1298,7 +1362,63 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v14_sequences_every_mutating_variant_and_echoes_results() {
+    fn protocol_v15_exposes_actor_private_production_and_queue_intent() {
+        let job = ProductionJobSnapshot {
+            job_id: "job-player-local-7".into(),
+            owner_player_id: "player-local".into(),
+            machine_block_id: "block-refinery".into(),
+            recipe: ProductionRecipeKind::Refining,
+            batches: 2,
+            source_inventory_id: "inventory-cargo-input".into(),
+            destination_inventory_id: "inventory-cargo-output".into(),
+            progress_ticks: 60,
+            duration_ticks: 240,
+            status: ProductionJobStatus::Running,
+            reserved_inputs: InventoryContents {
+                ore: 4,
+                refined_material: 0,
+                components: 0,
+            },
+            pending_outputs: InventoryContents::default(),
+        };
+        let queue = ProductionQueueSnapshot {
+            machine_block_id: job.machine_block_id.clone(),
+            jobs: vec![job.clone()],
+        };
+        let value = serde_json::to_value(&queue).expect("production queue serializes");
+        assert_eq!(value["machine_block_id"], "block-refinery");
+        assert_eq!(value["jobs"][0]["recipe"], "refining");
+        assert_eq!(value["jobs"][0]["status"], "running");
+        assert_eq!(value["jobs"][0]["reserved_inputs"]["ore"], 4);
+        assert_eq!(
+            serde_json::from_value::<ProductionQueueSnapshot>(value)
+                .expect("production queue deserializes"),
+            queue
+        );
+
+        let intent = ClientMessage::QueueProduction {
+            operation_sequence: 7,
+            operation_id: "queue-production-7".into(),
+            machine_block_id: "block-refinery".into(),
+            recipe: ProductionRecipeKind::Refining,
+            batches: 2,
+            source_inventory_id: "inventory-cargo-input".into(),
+            destination_inventory_id: "inventory-cargo-output".into(),
+        };
+        let value = serde_json::to_value(&intent).expect("queue intent serializes");
+        assert_eq!(value["type"], "queue_production");
+        assert_eq!(value["recipe"], "refining");
+        assert_eq!(value["batches"], 2);
+        assert_eq!(intent.operation_sequence(), Some(7));
+        assert_eq!(intent.operation_id(), Some("queue-production-7"));
+        assert_eq!(
+            serde_json::from_value::<ClientMessage>(value).expect("queue intent deserializes"),
+            intent
+        );
+    }
+
+    #[test]
+    fn protocol_v15_sequences_every_mutating_variant_and_echoes_results() {
         let messages = vec![
             ClientMessage::SetPlayerControl {
                 operation_sequence: 1,
@@ -1339,8 +1459,17 @@ mod tests {
                 inventory_id: "inventory".into(),
                 quantity: 1,
             },
-            ClientMessage::TransferInventory {
+            ClientMessage::QueueProduction {
                 operation_sequence: 7,
+                operation_id: "production".into(),
+                machine_block_id: "machine".into(),
+                recipe: ProductionRecipeKind::Component,
+                batches: 1,
+                source_inventory_id: "source".into(),
+                destination_inventory_id: "destination".into(),
+            },
+            ClientMessage::TransferInventory {
+                operation_sequence: 8,
                 operation_id: "transfer".into(),
                 source_inventory_id: "source".into(),
                 destination_inventory_id: "destination".into(),
@@ -1348,7 +1477,7 @@ mod tests {
                 quantity: 1,
             },
             ClientMessage::BuildBlock {
-                operation_sequence: 8,
+                operation_sequence: 9,
                 operation_id: "build".into(),
                 grid_id: "grid".into(),
                 coordinate: IVec3::ZERO,
@@ -1356,13 +1485,13 @@ mod tests {
                 orientation: 0,
             },
             ClientMessage::WeldBlock {
-                operation_sequence: 9,
+                operation_sequence: 10,
                 operation_id: "weld".into(),
                 grid_id: "grid".into(),
                 block_id: "block".into(),
             },
             ClientMessage::SetGridControl {
-                operation_sequence: 10,
+                operation_sequence: 11,
                 operation_id: "grid-control".into(),
                 grid_id: "grid".into(),
                 linear_input: Vec3::ZERO,
@@ -1370,12 +1499,12 @@ mod tests {
                 dampeners: true,
             },
             ClientMessage::ToggleGridAnchor {
-                operation_sequence: 11,
+                operation_sequence: 12,
                 operation_id: "anchor".into(),
                 grid_id: "grid".into(),
             },
             ClientMessage::DamageBlock {
-                operation_sequence: 12,
+                operation_sequence: 13,
                 operation_id: "damage".into(),
                 grid_id: "grid".into(),
                 block_id: "block".into(),
@@ -1394,7 +1523,7 @@ mod tests {
         }
 
         let receipt = IntentReceipt {
-            operation_sequence: 12,
+            operation_sequence: 13,
             operation_id: "damage".into(),
             event_sequence: 44,
             code: "block_damaged".into(),
@@ -1402,7 +1531,7 @@ mod tests {
         };
         let value = serde_json::to_value(ServerMessage::IntentAccepted { receipt })
             .expect("accepted result serializes");
-        assert_eq!(value["receipt"]["operation_sequence"], 12);
+        assert_eq!(value["receipt"]["operation_sequence"], 13);
         let value = serde_json::to_value(ServerMessage::IntentRejected {
             operation_sequence: Some(13),
             operation_id: Some("rejected".into()),

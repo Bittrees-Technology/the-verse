@@ -11,7 +11,7 @@ mod projection;
 mod targeting;
 
 pub use content::ContentManifest;
-pub use engine::{IntentError, Runtime, RuntimeError};
+pub use engine::{AdvanceImpact, AdvanceOutcome, IntentError, Runtime, RuntimeError};
 pub use event::{CanonicalEvent, EventPayload};
 pub use model::{Block, Grid, InventoryRecord, Ledger, Player, VoxelField, WorldState};
 pub use persistence::{PersistenceError, Store};

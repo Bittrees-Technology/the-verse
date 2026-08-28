@@ -11,8 +11,8 @@ const PLANET_SHADER: Shader = preload("res://shaders/planet_surface.gdshader")
 const ATMOSPHERE_SHADER: Shader = preload("res://shaders/planet_atmosphere.gdshader")
 const CLOUD_SHADER: Shader = preload("res://shaders/planet_clouds.gdshader")
 const BLOCK_DAMAGE_SHADER: Shader = preload("res://shaders/block_damage.gdshader")
-const PROTOCOL_VERSION := 14
-const PROJECTION_SCHEMA_VERSION := 1
+const PROTOCOL_VERSION := 15
+const PROJECTION_SCHEMA_VERSION := 2
 const DEFAULT_SERVER := "ws://127.0.0.1:7777/ws"
 const DEFAULT_PLAYER_ID := "player-local"
 const STARTER_GRID := "grid-starter"
@@ -184,6 +184,14 @@ var inventory_title_labels: Dictionary = {}
 var inventory_subtitle_labels: Dictionary = {}
 var inventory_selectors: Dictionary = {}
 var inventory_transfer_buttons: Array[Button] = []
+var inventory_tab_buttons: Dictionary = {}
+var inventory_content_root: Control
+var production_content_root: Control
+var production_machine_label: Label
+var production_queue_label: Label
+var production_route_label: Label
+var production_buttons: Dictionary = {}
+var active_inventory_tab := "inventory"
 var inventory_selected_resource := "component"
 var inventory_selected_side := "suit"
 var inventory_filters := {"suit": "all", "cargo": "all"}
@@ -361,6 +369,15 @@ func _input(event: InputEvent) -> void:
 			KEY_5:
 				selected_block_kind = "damage_test"
 				build_mode = true
+			KEY_6:
+				selected_block_kind = "conveyor"
+				build_mode = true
+			KEY_7:
+				selected_block_kind = "refinery"
+				build_mode = true
+			KEY_8:
+				selected_block_kind = "assembler"
+				build_mode = true
 			KEY_B:
 				build_mode = not build_mode
 				action_charge = 0.0
@@ -528,7 +545,7 @@ func _actor_private_matches(candidate: Variant, event_sequence: int) -> bool:
 		) < 0
 	):
 		return false
-	# Protocol 14 nests the overlay in the outer projected snapshot, making the
+	# Protocol 15 nests the overlay in the outer projected snapshot, making the
 	# outer sequence authoritative. Honor a future explicit sequence only when
 	# it agrees, so malformed extensions still fail closed.
 	return (
@@ -543,11 +560,18 @@ func _install_actor_private(candidate: Variant, event_sequence: int) -> bool:
 	if not _actor_private_matches(candidate, event_sequence):
 		return false
 	actor_private_snapshot = (candidate as Dictionary).duplicate(true)
+	if not actor_private_snapshot.get("production_queues", []) is Array:
+		actor_private_snapshot["production_queues"] = []
 	return _reconcile_operation_frontier(
 		_protocol_nonnegative_integer(
 			actor_private_snapshot.get("committed_operation_sequence", null)
 		)
 	)
+
+
+func _production_queues() -> Array:
+	var queues: Variant = actor_private_snapshot.get("production_queues", [])
+	return queues if queues is Array else []
 
 
 func _life_support_display_state(player: Dictionary) -> String:
@@ -671,6 +695,9 @@ func _build_environment() -> void:
 		"drill": _armored_material(Color(0.82, 0.38, 0.23), 0.50, 0.60),
 		"anchor": _armored_material(Color(0.65, 0.37, 0.77), 0.54, 0.48),
 		"damage_test": _armored_material(Color(0.92, 0.22, 0.16), 0.64, 0.32),
+		"conveyor": _armored_material(Color(0.24, 0.63, 0.72), 0.62, 0.56),
+		"refinery": _armored_material(Color(0.56, 0.31, 0.18), 0.71, 0.66),
+		"assembler": _armored_material(Color(0.28, 0.58, 0.48), 0.58, 0.52),
 	}
 	detail_materials = {
 		"steel": _material(Color(0.50, 0.58, 0.61), 0.38, 0.82),
@@ -1291,7 +1318,13 @@ func _build_inventory_terminal(canvas: CanvasLayer) -> void:
 		tab.text = tabs[tab_index]
 		tab.position = Vector2(20.0 + float(tab_index) * 142.0, 12.0)
 		tab.size = Vector2(136.0, 34.0)
-		tab.disabled = tab_index != 0
+		tab.disabled = not tab_index in [0, 2]
+		if tab_index == 0:
+			tab.pressed.connect(_set_inventory_tab.bind("inventory"))
+			inventory_tab_buttons["inventory"] = tab
+		elif tab_index == 2:
+			tab.pressed.connect(_set_inventory_tab.bind("production"))
+			inventory_tab_buttons["production"] = tab
 		if tab_index == 0:
 			tab.add_theme_color_override("font_color", Color(0.87, 0.96, 1.0))
 			tab.add_theme_stylebox_override(
@@ -1318,11 +1351,16 @@ func _build_inventory_terminal(canvas: CanvasLayer) -> void:
 	close_button.pressed.connect(_set_inventory_open.bind(false))
 	terminal.add_child(close_button)
 
+	inventory_content_root = Control.new()
+	inventory_content_root.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	inventory_content_root.mouse_filter = Control.MOUSE_FILTER_PASS
+	terminal.add_child(inventory_content_root)
+
 	var suit_panel := _inventory_column(
-		terminal, 0.018, 0.462, "ORPHEUS-7", "SUIT INVENTORY", "suit"
+		inventory_content_root, 0.018, 0.462, "ORPHEUS-7", "SUIT INVENTORY", "suit"
 	)
 	var cargo_panel := _inventory_column(
-		terminal, 0.538, 0.982, "KHEPRI RELAY", "LARGE CARGO CONTAINER", "cargo"
+		inventory_content_root, 0.538, 0.982, "KHEPRI RELAY", "LARGE CARGO CONTAINER", "cargo"
 	)
 	for resource_data in [
 		["ore", "Ferrite Ore", "Ore", Color(0.62, 0.34, 0.18), 37, 3.5],
@@ -1339,7 +1377,7 @@ func _build_inventory_terminal(canvas: CanvasLayer) -> void:
 			cargo_panel, "cargo", resource, String(resource_data[1]), String(resource_data[2]),
 			resource_data[3], int(resource_data[4]), float(resource_data[5]), 190.0 + float(index) * 58.0
 		)
-	_add_transfer_controls(terminal)
+	_add_transfer_controls(inventory_content_root)
 	_update_inventory_row_styles()
 
 	var hint := _hud_label(
@@ -1349,7 +1387,76 @@ func _build_inventory_terminal(canvas: CanvasLayer) -> void:
 	)
 	hint.set_anchors_preset(Control.PRESET_BOTTOM_LEFT)
 	hint.add_theme_color_override("font_color", Color(0.45, 0.66, 0.73))
-	terminal.add_child(hint)
+	inventory_content_root.add_child(hint)
+
+	_build_production_terminal(terminal)
+	_set_inventory_tab("inventory")
+
+
+func _build_production_terminal(terminal: Control) -> void:
+	production_content_root = Control.new()
+	production_content_root.name = "ProductionTerminal"
+	production_content_root.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	production_content_root.mouse_filter = Control.MOUSE_FILTER_PASS
+	terminal.add_child(production_content_root)
+
+	var panel := ColorRect.new()
+	panel.color = Color(0.052, 0.063, 0.069, 0.98)
+	panel.anchor_left = 0.018
+	panel.anchor_top = 0.12
+	panel.anchor_right = 0.982
+	panel.anchor_bottom = 0.92
+	production_content_root.add_child(panel)
+	var title := _hud_label("PHYSICAL PRODUCTION NETWORK", Vector2(22.0, 18.0), 19)
+	title.add_theme_color_override("font_color", Color(0.80, 0.91, 0.94))
+	panel.add_child(title)
+	var subtitle := _hud_label(
+		"OWNED MACHINES  //  CARGO-TO-CARGO ROUTING  //  AUTHORITATIVE QUEUES",
+		Vector2(22.0, 48.0), 11
+	)
+	subtitle.add_theme_color_override("font_color", Color(0.38, 0.67, 0.74))
+	panel.add_child(subtitle)
+
+	production_machine_label = _hud_label("NO AUTHORIZED MACHINES", Vector2(24.0, 92.0), 13)
+	production_machine_label.size = Vector2(420.0, 330.0)
+	production_machine_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	panel.add_child(production_machine_label)
+	production_queue_label = _hud_label("NO CANONICAL JOBS", Vector2(468.0, 92.0), 13)
+	production_queue_label.size = Vector2(470.0, 330.0)
+	production_queue_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	panel.add_child(production_queue_label)
+	production_route_label = _hud_label("SELECT AN OWNED MACHINE ROUTE", Vector2(24.0, -88.0), 12)
+	production_route_label.set_anchors_preset(Control.PRESET_BOTTOM_LEFT)
+	production_route_label.size = Vector2(900.0, 28.0)
+	production_route_label.add_theme_color_override("font_color", Color(0.53, 0.76, 0.80))
+	panel.add_child(production_route_label)
+	for data in [
+		["refining", "QUEUE 1 REFINING BATCH", Vector2(24.0, -52.0)],
+		["component", "QUEUE 1 COMPONENT BATCH", Vector2(292.0, -52.0)],
+	]:
+		var button := Button.new()
+		button.text = String(data[1])
+		button.set_anchors_preset(Control.PRESET_BOTTOM_LEFT)
+		button.position = data[2]
+		button.size = Vector2(252.0, 34.0)
+		button.pressed.connect(_queue_physical_production.bind(String(data[0])))
+		panel.add_child(button)
+		production_buttons[String(data[0])] = button
+
+
+func _set_inventory_tab(tab_name: String) -> void:
+	if not tab_name in ["inventory", "production"]:
+		return
+	active_inventory_tab = tab_name
+	if is_instance_valid(inventory_content_root):
+		inventory_content_root.visible = tab_name == "inventory"
+	if is_instance_valid(production_content_root):
+		production_content_root.visible = tab_name == "production"
+	for name in inventory_tab_buttons:
+		var button: Button = inventory_tab_buttons[name]
+		button.button_pressed = String(name) == tab_name
+	if tab_name == "production":
+		_update_production_terminal()
 
 
 func _inventory_column(
@@ -1644,7 +1751,7 @@ func _poll_socket() -> void:
 			_send_transport({
 				"type": "hello",
 				"protocol_version": PROTOCOL_VERSION,
-				"client_name": "godot-native-p1.3",
+				"client_name": "godot-native-p1.4",
 				"authentication": {
 					"kind": "local_development",
 					"player_id": requested_player_id,
@@ -2699,6 +2806,43 @@ func _build_block_visual(block: Dictionary) -> Node3D:
 			var anchor_light := _box_visual(Vector3(0.36, 0.07, 0.05), detail_materials["cyan"])
 			anchor_light.position = Vector3(0.0, 0.30, -0.51)
 			root.add_child(anchor_light)
+		"conveyor":
+			for axis in [-0.30, 0.0, 0.30]:
+				var roller := _cylinder_visual(0.075, 0.72, detail_materials["steel"])
+				roller.rotation_degrees.z = 90.0
+				roller.position = Vector3(0.0, axis, -0.56)
+				root.add_child(roller)
+			for x in [-0.42, 0.42]:
+				var belt_rail := _box_visual(Vector3(0.06, 0.78, 0.08), detail_materials["cyan"])
+				belt_rail.position = Vector3(x, 0.0, -0.54)
+				root.add_child(belt_rail)
+			root.add_child(_block_face_label("CONVEYOR", Color(0.30, 0.88, 1.0)))
+		"refinery":
+			var furnace := _cylinder_visual(0.27, 0.56, detail_materials["amber"])
+			furnace.rotation_degrees.x = 90.0
+			furnace.position = Vector3(0.0, 0.03, -0.62)
+			root.add_child(furnace)
+			for x in [-0.34, 0.34]:
+				var exhaust := _cylinder_visual(0.075, 0.58, detail_materials["dark"])
+				exhaust.position = Vector3(x, 0.31, -0.34)
+				root.add_child(exhaust)
+			var refinery_glow := _box_visual(Vector3(0.48, 0.09, 0.055), detail_materials["amber"])
+			refinery_glow.position = Vector3(0.0, -0.31, -0.58)
+			root.add_child(refinery_glow)
+			root.add_child(_block_face_label("REFINERY", Color(1.0, 0.52, 0.12)))
+		"assembler":
+			for x in [-0.25, 0.25]:
+				var actuator := _cylinder_visual(0.09, 0.58, detail_materials["steel"])
+				actuator.rotation_degrees.x = 90.0
+				actuator.position = Vector3(x, 0.18, -0.60)
+				root.add_child(actuator)
+			var fabrication_bed := _box_visual(Vector3(0.66, 0.18, 0.10), detail_materials["dark"])
+			fabrication_bed.position = Vector3(0.0, -0.24, -0.57)
+			root.add_child(fabrication_bed)
+			var assembler_screen := _box_visual(Vector3(0.42, 0.18, 0.045), detail_materials["green"])
+			assembler_screen.position = Vector3(0.0, 0.34, -0.57)
+			root.add_child(assembler_screen)
+			root.add_child(_block_face_label("ASSEMBLER", Color(0.26, 1.0, 0.61)))
 		"damage_test":
 			for offset in [-0.22, 0.22]:
 				var warning := _box_visual(Vector3(0.11, 0.62, 0.055), detail_materials["red"])
@@ -4421,29 +4565,90 @@ func _take_active_grid_control_id() -> String:
 
 
 func _refine_ore() -> void:
-	var inventory_id := _local_inventory_id()
-	if inventory_id.is_empty():
-		_set_message("No authoritative suit inventory is available", true)
-		return
-	_queue_mutation({
-		"type": "refine_ore",
-		"operation_id": _operation_id("refine"),
-		"inventory_id": inventory_id,
-		"batches": 1,
-	})
+	_queue_physical_production("refining")
 
 
 func _craft_component() -> void:
-	var inventory_id := _local_inventory_id()
-	if inventory_id.is_empty():
-		_set_message("No authoritative suit inventory is available", true)
+	_queue_physical_production("component")
+
+
+func _queue_physical_production(recipe: String) -> void:
+	var route := _production_route(recipe)
+	if route.is_empty():
+		var machine_name := "REFINERY" if recipe == "refining" else "ASSEMBLER"
+		_set_message(
+			"NO AUTHORIZED %s ROUTE // OWNED COMPLETE MACHINE AND SAME-GRID CARGO REQUIRED"
+			% machine_name,
+			true
+		)
 		return
 	_queue_mutation({
-		"type": "craft_component",
-		"operation_id": _operation_id("craft"),
-		"inventory_id": inventory_id,
-		"quantity": 1,
+		"type": "queue_production",
+		"operation_id": _operation_id("production-%s" % recipe),
+		"machine_block_id": route.get("machine_block_id", ""),
+		"recipe": recipe,
+		"batches": 1,
+		"source_inventory_id": route.get("inventory_id", ""),
+		"destination_inventory_id": route.get("inventory_id", ""),
 	})
+	_set_message(
+		"%s BATCH QUEUED // %s" % [recipe.to_upper(), route.get("machine_block_id", "")]
+	)
+
+
+func _production_route(recipe: String) -> Dictionary:
+	var machine_kind := "refinery" if recipe == "refining" else "assembler" if recipe == "component" else ""
+	if machine_kind.is_empty():
+		return {}
+	var machines := _owned_machine_candidates(machine_kind)
+	var cargo := _owned_cargo_candidates()
+	for machine in machines:
+		for candidate in cargo:
+			if String(candidate.get("grid_id", "")) == String(machine.get("grid_id", "")):
+				return {
+					"grid_id": machine.get("grid_id", ""),
+					"machine_block_id": machine.get("block_id", ""),
+					"inventory_id": candidate.get("inventory_id", ""),
+				}
+	return {}
+
+
+func _owned_machine_candidates(kind: String) -> Array[Dictionary]:
+	var candidates: Array[Dictionary] = []
+	var targeted_grid_id := _targeted_owned_grid_id()
+	for grid_value in snapshot.get("grids", []):
+		if not grid_value is Dictionary:
+			continue
+		var grid: Dictionary = grid_value
+		if not _grid_owned_by_local(grid):
+			continue
+		var grid_id := String(grid.get("grid_id", ""))
+		for block_value in grid.get("blocks", []):
+			if not block_value is Dictionary:
+				continue
+			var block: Dictionary = block_value
+			if (
+				String(block.get("kind", "")) != kind
+				or not bool(block.get("construction_complete", false))
+				or int(block.get("health", 0)) <= 0
+			):
+				continue
+			candidates.append({
+				"grid_id": grid_id,
+				"block_id": String(block.get("block_id", "")),
+				"powered": bool(grid.get("power", {}).get("online", false)),
+				"targeted": grid_id == targeted_grid_id,
+			})
+	candidates.sort_custom(func(first: Dictionary, second: Dictionary) -> bool:
+		if bool(first.get("targeted", false)) != bool(second.get("targeted", false)):
+			return bool(first.get("targeted", false))
+		var first_grid := String(first.get("grid_id", ""))
+		var second_grid := String(second.get("grid_id", ""))
+		if first_grid != second_grid:
+			return first_grid < second_grid
+		return String(first.get("block_id", "")) < String(second.get("block_id", ""))
+	)
+	return candidates
 
 
 func _transfer_to_or_from_cargo(reverse: bool) -> void:
@@ -5213,6 +5418,9 @@ func _update_interface() -> void:
 			["3", "CARGO", "cargo"],
 			["4", "POWER", "power_source"],
 			["5", "BREACH", "damage_test"],
+			["6", "CONVEYOR", "conveyor"],
+			["7", "REFINERY", "refinery"],
+			["8", "ASSEMBLER", "assembler"],
 		]
 		var hotbar_parts: Array[String] = []
 		for choice in choices:
@@ -5299,6 +5507,7 @@ func _update_interface() -> void:
 func _update_inventory_terminal() -> void:
 	var cargo_candidates := _refresh_owned_cargo_selection()
 	_update_cargo_inventory_selector(cargo_candidates)
+	_update_production_terminal()
 	var suit_inventory := _inventory(_local_inventory_id())
 	var cargo_inventory := _inventory(selected_cargo_inventory_id)
 	for side_data in [["suit", suit_inventory], ["cargo", cargo_inventory]]:
@@ -5336,6 +5545,93 @@ func _update_inventory_terminal() -> void:
 		var capacity_bar: ProgressBar = inventory_capacity_bars.get(side, null)
 		if capacity_bar != null:
 			capacity_bar.value = clampf(float(used) / float(capacity), 0.0, 1.0)
+
+
+func _update_production_terminal() -> void:
+	var machine_lines: Array[String] = ["AUTHORIZED MACHINES"]
+	for kind in ["refinery", "assembler"]:
+		var machines := _owned_machine_candidates(kind)
+		if machines.is_empty():
+			machine_lines.append("%s  //  UNAVAILABLE" % kind.to_upper())
+		for machine in machines:
+			machine_lines.append(
+				"%s  //  %s  //  GRID %s  //  POWER %s" % [
+					kind.to_upper(),
+					machine.get("block_id", ""),
+					machine.get("grid_id", ""),
+					"ONLINE" if machine.get("powered", false) else "OFFLINE",
+				]
+			)
+	if is_instance_valid(production_machine_label):
+		production_machine_label.text = "\n".join(machine_lines)
+
+	var queue_lines: Array[String] = ["CANONICAL PRODUCTION QUEUES"]
+	var valid_jobs := 0
+	for queue_value in _production_queues():
+		if not queue_value is Dictionary:
+			continue
+		var machine_id := String(queue_value.get("machine_block_id", ""))
+		var jobs: Variant = queue_value.get("jobs", [])
+		if machine_id.is_empty() or not jobs is Array:
+			continue
+		for job_value in jobs:
+			if not job_value is Dictionary:
+				continue
+			var job: Dictionary = job_value
+			if (
+				String(job.get("owner_player_id", "")) != bound_player_id
+				or String(job.get("machine_block_id", "")) != machine_id
+			):
+				continue
+			var duration := maxi(int(job.get("duration_ticks", 0)), 0)
+			var progress := clampi(int(job.get("progress_ticks", 0)), 0, duration)
+			var percent := 0 if duration <= 0 else int(round(100.0 * float(progress) / float(duration)))
+			var status := String(job.get("status", "queued")).to_upper().replace("_", " ")
+			queue_lines.append(
+				"%s  //  %s ×%d  //  %d%%  //  %s\nROUTE %s → %s  //  RESERVED %s  //  PENDING %s" % [
+					machine_id,
+					String(job.get("recipe", "unknown")).to_upper(),
+					maxi(int(job.get("batches", 0)), 0),
+					percent,
+					status,
+					String(job.get("source_inventory_id", "")),
+					String(job.get("destination_inventory_id", "")),
+					_production_contents_text(job.get("reserved_inputs", {})),
+					_production_contents_text(job.get("pending_outputs", {})),
+				]
+			)
+			valid_jobs += 1
+	if valid_jobs == 0:
+		queue_lines.append("NO CANONICAL JOBS")
+	if is_instance_valid(production_queue_label):
+		production_queue_label.text = "\n\n".join(queue_lines)
+
+	var refining_route := _production_route("refining")
+	var component_route := _production_route("component")
+	if is_instance_valid(production_route_label):
+		production_route_label.text = "REFINERY %s  //  ASSEMBLER %s" % [
+			_production_route_text(refining_route), _production_route_text(component_route)
+		]
+	for recipe in production_buttons:
+		var route := refining_route if recipe == "refining" else component_route
+		var button: Button = production_buttons[recipe]
+		button.disabled = route.is_empty() or not _private_inventory_ready()
+
+
+func _production_contents_text(value: Variant) -> String:
+	if not value is Dictionary:
+		return "—"
+	return "O%d A%d C%d" % [
+		maxi(int(value.get("ore", 0)), 0),
+		maxi(int(value.get("refined_material", 0)), 0),
+		maxi(int(value.get("components", 0)), 0),
+	]
+
+
+func _production_route_text(route: Dictionary) -> String:
+	if route.is_empty():
+		return "NO AUTHORIZED ROUTE"
+	return "%s ↔ %s" % [route.get("machine_block_id", ""), route.get("inventory_id", "")]
 
 
 func _update_cargo_inventory_selector(candidates: Array[Dictionary]) -> void:

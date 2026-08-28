@@ -3,13 +3,14 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use verse_protocol::{
-    IVec3, PlayerDeathCause, PlayerLocomotionSnapshot, Quat, ResourceKind, Vec3, VoxelMaterial,
+    IVec3, InventoryContents, PlayerDeathCause, PlayerLocomotionSnapshot, Quat, ResourceKind, Vec3,
+    VoxelMaterial,
 };
 
-use crate::model::{Block, ContactPairKey, DeathDrop, InventoryRecord};
+use crate::model::{Block, ContactPairKey, DeathDrop, InventoryRecord, ProductionJob};
 
 pub const EVENT_SCHEMA_NAME: &str = "verse.world_event";
-pub const EVENT_SCHEMA_VERSION: u32 = 12;
+pub const EVENT_SCHEMA_VERSION: u32 = 13;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event_type", rename_all = "snake_case")]
@@ -64,6 +65,23 @@ pub enum EventPayload {
     ComponentCrafted {
         inventory_id: String,
         quantity: u64,
+    },
+    ProductionQueued {
+        job: ProductionJob,
+    },
+    ProductionAdvanced {
+        machine_block_id: String,
+        job_id: String,
+        previous_progress_ticks: u64,
+        new_progress_ticks: u64,
+        completed: bool,
+        output_delivered: bool,
+    },
+    ProductionOutputDelivered {
+        machine_block_id: String,
+        job_id: String,
+        destination_inventory_id: String,
+        outputs: InventoryContents,
     },
     InventoryTransferred {
         source_inventory_id: String,
@@ -194,6 +212,9 @@ impl EventPayload {
             | Self::SuitOxygenChanged { .. }
             | Self::PlayerIncapacitated { .. }
             | Self::PlayerRespawned { .. }
+            | Self::ProductionQueued { .. }
+            | Self::ProductionAdvanced { .. }
+            | Self::ProductionOutputDelivered { .. }
             | Self::GridControlSet { .. }
             | Self::GridAnchorSet { .. }
             | Self::PhysicsStepCommitted { .. } => 0,
@@ -249,6 +270,20 @@ impl EventPayload {
             Self::ComponentCrafted { quantity, .. } => (
                 "component_crafted",
                 format!("Crafted {quantity} component(s)"),
+            ),
+            Self::ProductionQueued { job } => (
+                "production_queued",
+                format!("Queued {:?} batch(es): {}", job.recipe, job.batches),
+            ),
+            Self::ProductionAdvanced {
+                completed: true, ..
+            } => ("production_completed", "Machine work completed".into()),
+            Self::ProductionAdvanced { .. } => {
+                ("production_advanced", "Machine work advanced".into())
+            }
+            Self::ProductionOutputDelivered { .. } => (
+                "production_output_delivered",
+                "Machine output delivered to cargo".into(),
             ),
             Self::InventoryTransferred {
                 resource, quantity, ..

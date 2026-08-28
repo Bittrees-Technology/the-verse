@@ -931,7 +931,7 @@ mod tests {
             assert!(matches!(
                 Store::open(directory.path(), 41),
                 Err(PersistenceError::ContentManifestMismatch { stored, runtime })
-                    if stored == stored_version && runtime == "p1.1.0"
+                    if stored == stored_version && runtime == "p1.4.0"
             ));
         }
     }

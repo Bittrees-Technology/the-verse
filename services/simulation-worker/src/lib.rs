@@ -30,7 +30,7 @@ use verse_protocol::{
     ClientAuthentication, ClientMessage, IntentReceipt, MotionSnapshot, PROTOCOL_VERSION,
     ProjectedMotionSnapshot, ProjectedWorldSnapshot, ServerMessage, SessionRole, WorldSnapshot,
 };
-use verse_simulation::{IntentError, ProjectionError, Runtime, RuntimeError};
+use verse_simulation::{AdvanceImpact, IntentError, ProjectionError, Runtime, RuntimeError};
 
 const COMMAND_CENTER_HTML: &str = include_str!("../../../apps/web-command-center/index.html");
 const COMMAND_CENTER_JS: &str = include_str!("../../../apps/web-command-center/app.js");
@@ -201,40 +201,16 @@ impl AppState {
 
     pub fn advance(&self, delta_millis: u16) -> Result<bool, RuntimeError> {
         let mut runtime = self.runtime.lock();
-        let before_lifecycle = runtime
-            .state()
-            .player
-            .iter()
-            .map(|(player_id, player)| {
-                (
-                    player_id.clone(),
-                    player.life_state.clone(),
-                    player.suit_oxygen_milli,
-                )
-            })
-            .collect::<Vec<_>>();
-        let changed = runtime.advance(delta_millis)?;
-        if changed {
-            let lifecycle_changed = runtime
-                .state()
-                .player
-                .iter()
-                .map(|(player_id, player)| {
-                    (
-                        player_id.clone(),
-                        player.life_state.clone(),
-                        player.suit_oxygen_milli,
-                    )
-                })
-                .ne(before_lifecycle);
-            let update_kind = if lifecycle_changed {
-                ReplicationKind::Structural
-            } else {
-                ReplicationKind::Motion
-            };
+        let outcome = runtime.advance_with_outcome(delta_millis)?;
+        let update_kind = match outcome.impact {
+            AdvanceImpact::None => None,
+            AdvanceImpact::Motion => Some(ReplicationKind::Motion),
+            AdvanceImpact::Structural => Some(ReplicationKind::Structural),
+        };
+        if let Some(update_kind) = update_kind {
             self.publish_update(update_kind, runtime.state().event_sequence);
         }
-        Ok(changed)
+        Ok(outcome.changed())
     }
 
     fn execute_as(
@@ -850,7 +826,8 @@ mod tests {
     use tokio_tungstenite::tungstenite::Message as ClientWebSocketMessage;
     use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
     use tower::ServiceExt;
-    use verse_protocol::{BlockKind, ResourceKind, Vec3};
+    use verse_protocol::{BlockKind, ProductionRecipeKind, ResourceKind, Vec3};
+    use verse_simulation::Store;
 
     use super::*;
 
@@ -865,6 +842,27 @@ mod tests {
             .admit_development_player("player-remote")
             .expect("remote development player admits");
         AppState::new(runtime)
+    }
+
+    fn production_test_state() -> Arc<AppState> {
+        let directory = tempdir().expect("tempdir").keep();
+        {
+            let mut store = Store::open(&directory, 199).expect("fixture store opens");
+            let mut world = store.load_world().expect("fixture world loads");
+            world.player.position = Vec3::new(900.0, -990.0, -3_800.0);
+            world
+                .inventories
+                .get_mut("inventory-cargo-industry-starter")
+                .expect("starter industry cargo exists")
+                .contents
+                .ore = 2;
+            world.ledger.genesis_ore += 2;
+            assert!(world.conservation().valid);
+            store
+                .save_snapshot(&world)
+                .expect("production fixture persists");
+        }
+        AppState::new(Runtime::open(directory, 199, 20).expect("runtime"))
     }
 
     type TestSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
@@ -1025,6 +1023,7 @@ mod tests {
                 for secret in [
                     "inventory-player-local",
                     "inventory-player-remote",
+                    "inventory-cargo-industry-starter",
                     "inventory-cargo-starter",
                     "inventory-drop-player-local",
                     "death-player-local",
@@ -1047,6 +1046,7 @@ mod tests {
                 } else {
                     for secret in [
                         "inventory-player-local",
+                        "inventory-cargo-industry-starter",
                         "inventory-cargo-starter",
                         "inventory-drop-player-local",
                         "death-player-local",
@@ -1236,6 +1236,57 @@ mod tests {
             .expect("the idempotent retry returns its receipt");
         assert_eq!(retry, first);
         assert!(!observer.has_changed().expect("the feed remains open"));
+    }
+
+    #[test]
+    fn production_progress_publishes_structural_without_life_support_change() {
+        let state = production_test_state();
+        let before = state
+            .projected_snapshot(Some("player-local"))
+            .expect("private projection succeeds");
+        let before_oxygen = actor_player(&before).suit_oxygen_milli;
+        assert!(before.environment.breathable);
+
+        let mut observer = state.updates.subscribe();
+        let queued = state
+            .execute_as(
+                "player-local",
+                &ClientMessage::QueueProduction {
+                    operation_sequence: 1,
+                    operation_id: "replicate-production-progress".into(),
+                    machine_block_id: "block-refinery".into(),
+                    recipe: ProductionRecipeKind::Refining,
+                    batches: 1,
+                    source_inventory_id: "inventory-cargo-industry-starter".into(),
+                    destination_inventory_id: "inventory-cargo-industry-starter".into(),
+                },
+            )
+            .expect("production job queues");
+        assert_eq!(
+            observer.borrow_and_update().latest_structural_sequence,
+            Some(queued.event_sequence)
+        );
+
+        for _ in 0..3 {
+            assert!(!state.advance(250).expect("partial production tick"));
+            assert!(!observer.has_changed().expect("the feed remains open"));
+        }
+        assert!(state.advance(250).expect("production second advances"));
+        assert!(observer.has_changed().expect("the feed remains open"));
+        let feed = observer.borrow_and_update().clone();
+        let after = state
+            .projected_snapshot(Some("player-local"))
+            .expect("private projection succeeds");
+        let private = after
+            .actor_private
+            .as_ref()
+            .expect("player receives actor-private state");
+
+        assert_eq!(actor_player(&after).suit_oxygen_milli, before_oxygen);
+        assert_eq!(private.production_queues[0].jobs[0].progress_ticks, 60);
+        assert_eq!(feed.latest_structural_sequence, Some(after.event_sequence));
+        assert_eq!(feed.latest_motion_sequence, None);
+        assert!(after.event_sequence > queued.event_sequence);
     }
 
     #[test]
@@ -1753,53 +1804,83 @@ mod tests {
             .expect("starter grid has canonical cargo");
 
         let denied_inventory_intents = [
-            ClientMessage::RefineOre {
-                operation_sequence: 1,
-                operation_id: "deny-remote-refine-primary".into(),
-                inventory_id: primary.inventory_id.clone(),
-                batches: 1,
-            },
-            ClientMessage::CraftComponent {
-                operation_sequence: 1,
-                operation_id: "deny-remote-craft-primary".into(),
-                inventory_id: primary.inventory_id.clone(),
-                quantity: 1,
-            },
-            ClientMessage::TransferInventory {
-                operation_sequence: 1,
-                operation_id: "deny-remote-withdraw-primary".into(),
-                source_inventory_id: primary.inventory_id.clone(),
-                destination_inventory_id: remote_player.inventory_id.clone(),
-                resource: ResourceKind::Component,
-                quantity: 1,
-            },
-            ClientMessage::TransferInventory {
-                operation_sequence: 1,
-                operation_id: "deny-remote-deposit-primary".into(),
-                source_inventory_id: remote_player.inventory_id.clone(),
-                destination_inventory_id: primary.inventory_id.clone(),
-                resource: ResourceKind::Ore,
-                quantity: 1,
-            },
-            ClientMessage::TransferInventory {
-                operation_sequence: 1,
-                operation_id: "deny-remote-withdraw-cargo".into(),
-                source_inventory_id: cargo_inventory_id.into(),
-                destination_inventory_id: remote_player.inventory_id.clone(),
-                resource: ResourceKind::Component,
-                quantity: 1,
-            },
-            ClientMessage::TransferInventory {
-                operation_sequence: 1,
-                operation_id: "deny-remote-deposit-cargo".into(),
-                source_inventory_id: remote_player.inventory_id.clone(),
-                destination_inventory_id: cargo_inventory_id.into(),
-                resource: ResourceKind::Ore,
-                quantity: 1,
-            },
+            (
+                ClientMessage::RefineOre {
+                    operation_sequence: 1,
+                    operation_id: "deny-remote-refine-primary".into(),
+                    inventory_id: primary.inventory_id.clone(),
+                    batches: 1,
+                },
+                "physical_machine_required",
+            ),
+            (
+                ClientMessage::CraftComponent {
+                    operation_sequence: 1,
+                    operation_id: "deny-remote-craft-primary".into(),
+                    inventory_id: primary.inventory_id.clone(),
+                    quantity: 1,
+                },
+                "physical_machine_required",
+            ),
+            (
+                ClientMessage::QueueProduction {
+                    operation_sequence: 1,
+                    operation_id: "deny-remote-queue-primary".into(),
+                    machine_block_id: "block-refinery".into(),
+                    recipe: ProductionRecipeKind::Refining,
+                    batches: 1,
+                    source_inventory_id: cargo_inventory_id.into(),
+                    destination_inventory_id: cargo_inventory_id.into(),
+                },
+                "grid_access_denied",
+            ),
+            (
+                ClientMessage::TransferInventory {
+                    operation_sequence: 1,
+                    operation_id: "deny-remote-withdraw-primary".into(),
+                    source_inventory_id: primary.inventory_id.clone(),
+                    destination_inventory_id: remote_player.inventory_id.clone(),
+                    resource: ResourceKind::Component,
+                    quantity: 1,
+                },
+                "inventory_access_denied",
+            ),
+            (
+                ClientMessage::TransferInventory {
+                    operation_sequence: 1,
+                    operation_id: "deny-remote-deposit-primary".into(),
+                    source_inventory_id: remote_player.inventory_id.clone(),
+                    destination_inventory_id: primary.inventory_id.clone(),
+                    resource: ResourceKind::Ore,
+                    quantity: 1,
+                },
+                "inventory_access_denied",
+            ),
+            (
+                ClientMessage::TransferInventory {
+                    operation_sequence: 1,
+                    operation_id: "deny-remote-withdraw-cargo".into(),
+                    source_inventory_id: cargo_inventory_id.into(),
+                    destination_inventory_id: remote_player.inventory_id.clone(),
+                    resource: ResourceKind::Component,
+                    quantity: 1,
+                },
+                "inventory_access_denied",
+            ),
+            (
+                ClientMessage::TransferInventory {
+                    operation_sequence: 1,
+                    operation_id: "deny-remote-deposit-cargo".into(),
+                    source_inventory_id: remote_player.inventory_id.clone(),
+                    destination_inventory_id: cargo_inventory_id.into(),
+                    resource: ResourceKind::Ore,
+                    quantity: 1,
+                },
+                "inventory_access_denied",
+            ),
         ];
-        for intent in denied_inventory_intents {
-            assert_intent_rejected(&mut remote, intent, "inventory_access_denied").await;
+        for (intent, expected_code) in denied_inventory_intents {
+            assert_intent_rejected(&mut remote, intent, expected_code).await;
         }
 
         let denied_grid_intents = [
