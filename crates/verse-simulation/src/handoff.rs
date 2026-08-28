@@ -892,7 +892,7 @@ pub fn stage_prepared_eva_lock(
 }
 
 pub fn stage_aborted_eva_unlock(
-    source: &WorldState,
+    cell: &WorldState,
     package: &PlayerTransferPackage,
     transfer: &CellTransferRecord,
 ) -> Result<WorldState, HandoffError> {
@@ -903,22 +903,77 @@ pub fn stage_aborted_eva_unlock(
         ));
     }
     validate_transfer_identity(package, transfer)?;
+
+    if cell.cell_id == package.destination_cell_id {
+        if cell.player.get(&package.aggregate_id).is_some()
+            || cell
+                .inventories
+                .contains_key(&package.inventory.inventory_id)
+            || cell.transfer_witnesses.contains_key(&package.transfer_id)
+        {
+            return Err(HandoffError::CommittedStateRejected(
+                "an aborted transfer cannot remove an imported destination subject".into(),
+            ));
+        }
+        let Some(existing) = cell.player_transfer_reservations.get(&package.transfer_id) else {
+            validate_staged_world(cell)?;
+            return Ok(cell.clone());
+        };
+        if existing.transfer_id != package.transfer_id
+            || existing.package_hash != package.package_hash
+            || transfer.quarantine_receipt_hash.as_deref() != Some(&existing.receipt_hash)
+            || existing.source_cell_id != package.source_cell_id
+            || existing.destination_cell_id != package.destination_cell_id
+            || existing.player_id != package.aggregate_id
+            || existing.inventory_id != package.inventory.inventory_id
+            || existing.destination_assignment_generation
+                != package.destination_assignment_generation
+            || existing.prior_placement_generation != package.prior_placement_generation
+            || existing.resulting_placement_generation != package.resulting_placement_generation
+        {
+            return Err(HandoffError::CommittedStateRejected(
+                "aborted transfer does not match the destination quarantine reservation".into(),
+            ));
+        }
+        let mut staged = cell.clone();
+        staged
+            .player_transfer_reservations
+            .remove(&package.transfer_id);
+        validate_staged_world(&staged)?;
+        return Ok(staged);
+    }
+
+    if cell.cell_id != package.source_cell_id {
+        return Err(HandoffError::CommittedStateRejected(
+            "aborted transfer cleanup was presented to an unrelated cell".into(),
+        ));
+    }
     let expected_lock = player_transfer_lock(package);
-    let Some(existing) = source.player_transfer_locks.get(&package.aggregate_id) else {
-        validate_staged_world(source)?;
-        return Ok(source.clone());
+    let Some(existing) = cell.player_transfer_locks.get(&package.aggregate_id) else {
+        if cell.player.get(&package.aggregate_id).is_none()
+            || !cell
+                .inventories
+                .contains_key(&package.inventory.inventory_id)
+            || cell.transfer_witnesses.contains_key(&package.transfer_id)
+        {
+            return Err(HandoffError::CommittedStateRejected(
+                "aborted source cleanup no longer has one live subject closure".into(),
+            ));
+        }
+        validate_staged_world(cell)?;
+        return Ok(cell.clone());
     };
     if existing != &expected_lock
-        || source.player.get(&package.aggregate_id) != Some(&package.source_player)
-        || source.inventories.get(&package.inventory.inventory_id) != Some(&package.inventory)
-        || source.processed_operations.get(&package.aggregate_id)
+        || cell.player.get(&package.aggregate_id) != Some(&package.source_player)
+        || cell.inventories.get(&package.inventory.inventory_id) != Some(&package.inventory)
+        || cell.processed_operations.get(&package.aggregate_id)
             != package.operation_history.as_ref()
     {
         return Err(HandoffError::CommittedStateRejected(
             "aborted transfer does not match the locked source closure".into(),
         ));
     }
-    let mut staged = source.clone();
+    let mut staged = cell.clone();
     staged.player_transfer_locks.remove(&package.aggregate_id);
     validate_staged_world(&staged)?;
     Ok(staged)

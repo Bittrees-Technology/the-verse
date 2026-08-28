@@ -318,6 +318,10 @@ impl LocalCellDirectory {
             .ok_or_else(|| CellDirectoryError::UnknownTransfer(transfer_id.to_owned()))
     }
 
+    pub fn transfer_records(&self) -> Vec<CellTransferRecord> {
+        self.document.transfers.values().cloned().collect()
+    }
+
     pub fn register_placement(
         &mut self,
         aggregate_id: &str,

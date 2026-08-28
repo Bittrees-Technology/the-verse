@@ -18,6 +18,7 @@ use verse_protocol::{
     ProductionRecipeKind, Quat, ResourceKind, Vec3, WorldSnapshot,
 };
 
+use crate::cell_directory::CellTransferRecord;
 use crate::event::{
     CanonicalEvent, EVENT_SCHEMA_NAME, EVENT_SCHEMA_VERSION, EventPayload,
     PRODUCTION_SCHEDULE_OCCURRENCE_SCHEMA_VERSION, PhysicsBodyOutcome, PhysicsContactOutcome,
@@ -25,8 +26,9 @@ use crate::event::{
     ProductionMachineOutcomeKind, ProductionScheduleOccurrence,
 };
 use crate::handoff::{
-    stage_aborted_eva_unlock, stage_committed_eva_export, stage_committed_eva_import,
-    stage_eva_player_quarantine, stage_prepared_eva_lock,
+    HandoffError, PlayerTransferPackage, PlayerTransferQuarantineReceipt, stage_aborted_eva_unlock,
+    stage_committed_eva_export, stage_committed_eva_import, stage_eva_player_quarantine,
+    stage_prepared_eva_lock,
 };
 #[cfg(test)]
 use crate::model::PLAYER_INVENTORY_ID;
@@ -198,6 +200,10 @@ impl IntentError {
             _ => self.to_string(),
         }
     }
+}
+
+fn transfer_runtime_error(source: &HandoffError) -> RuntimeError {
+    IntentError::rejected("player_transfer_rejected", source.to_string()).into()
 }
 
 #[derive(Debug, Error)]
@@ -507,6 +513,94 @@ impl Runtime {
 
     pub const fn state(&self) -> &WorldState {
         &self.state
+    }
+
+    pub fn commit_player_transfer_prepared(
+        &mut self,
+        package: &PlayerTransferPackage,
+        directory_transfer: &CellTransferRecord,
+    ) -> Result<(), RuntimeError> {
+        if stage_prepared_eva_lock(&self.state, package, directory_transfer)
+            .map_err(|source| transfer_runtime_error(&source))?
+            == self.state
+        {
+            return Ok(());
+        }
+        self.commit_system_event(EventPayload::PlayerTransferPrepared {
+            package: package.clone(),
+            directory_transfer: directory_transfer.clone(),
+        })
+    }
+
+    pub fn commit_player_transfer_quarantined(
+        &mut self,
+        package: &PlayerTransferPackage,
+        receipt: &PlayerTransferQuarantineReceipt,
+    ) -> Result<(), RuntimeError> {
+        if stage_eva_player_quarantine(&self.state, self.state.fencing_token, package)
+            .map_err(|source| transfer_runtime_error(&source))?
+            .0
+            == self.state
+        {
+            return Ok(());
+        }
+        self.commit_system_event(EventPayload::PlayerTransferQuarantined {
+            package: package.clone(),
+            receipt: receipt.clone(),
+        })
+    }
+
+    pub fn commit_player_transfer_aborted(
+        &mut self,
+        package: &PlayerTransferPackage,
+        directory_transfer: &CellTransferRecord,
+    ) -> Result<(), RuntimeError> {
+        if stage_aborted_eva_unlock(&self.state, package, directory_transfer)
+            .map_err(|source| transfer_runtime_error(&source))?
+            == self.state
+        {
+            return Ok(());
+        }
+        self.commit_system_event(EventPayload::PlayerTransferAborted {
+            package: package.clone(),
+            directory_transfer: directory_transfer.clone(),
+        })
+    }
+
+    pub fn commit_player_transfer_exported(
+        &mut self,
+        package: &PlayerTransferPackage,
+        directory_transfer: &CellTransferRecord,
+    ) -> Result<(), RuntimeError> {
+        if stage_committed_eva_export(&self.state, package, directory_transfer)
+            .map_err(|source| transfer_runtime_error(&source))?
+            == self.state
+        {
+            return Ok(());
+        }
+        self.commit_system_event(EventPayload::PlayerTransferExported {
+            package: package.clone(),
+            directory_transfer: directory_transfer.clone(),
+        })
+    }
+
+    pub fn commit_player_transfer_imported(
+        &mut self,
+        package: &PlayerTransferPackage,
+        receipt: &PlayerTransferQuarantineReceipt,
+        directory_transfer: &CellTransferRecord,
+    ) -> Result<(), RuntimeError> {
+        if stage_committed_eva_import(&self.state, package, receipt, directory_transfer)
+            .map_err(|source| transfer_runtime_error(&source))?
+            == self.state
+        {
+            return Ok(());
+        }
+        self.commit_system_event(EventPayload::PlayerTransferImported {
+            package: package.clone(),
+            receipt: receipt.clone(),
+            directory_transfer: directory_transfer.clone(),
+        })
     }
 
     pub const fn physics_scene_is_initialized(&self) -> bool {
