@@ -121,7 +121,7 @@ printf '%s\n' \
   "Universe manifest schema: 4" \
   "Interest schema: 2" \
   "Operation fingerprint schema: 2" \
-  "Cell directory schema: 1" \
+  "Cell directory schema: 2" \
   "Transfer package schema: 1" \
   "Interest verifier encoding: 1" \
   "Browser verifier generator: wasm-bindgen 0.2.127" \

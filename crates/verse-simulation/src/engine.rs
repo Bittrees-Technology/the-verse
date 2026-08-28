@@ -18,7 +18,10 @@ use verse_protocol::{
     ProductionRecipeKind, Quat, ResourceKind, Vec3, WorldSnapshot,
 };
 
-use crate::cell_directory::CellTransferRecord;
+use crate::cell_directory::{
+    CellTransferAbortProof, CellTransferFinalizationProof, CellTransferImportProof,
+    CellTransferPrepareProof, CellTransferQuarantineProof, CellTransferRecord, TransferAbortRole,
+};
 use crate::event::{
     CanonicalEvent, EVENT_SCHEMA_NAME, EVENT_SCHEMA_VERSION, EventPayload,
     PRODUCTION_SCHEDULE_OCCURRENCE_SCHEMA_VERSION, PhysicsBodyOutcome, PhysicsContactOutcome,
@@ -39,7 +42,8 @@ use crate::model::{
     production_recipe_quantities, radial_up, valid_blake3_hex,
 };
 use crate::persistence::{
-    CellLifecycleStatus, PersistenceError, Store, SystemTrustedClock, TrustedClock,
+    CellLifecycleStatus, DurableTransferBoundary, PersistenceError, Store, SystemTrustedClock,
+    TransferBoundaryKind, TrustedClock,
 };
 #[cfg(test)]
 use crate::targeting::{TOOL_SURFACE_RANGE_M, ToolHit};
@@ -220,6 +224,8 @@ pub enum RuntimeError {
     LifecycleUnavailable {
         mode: crate::persistence::LifecycleMode,
     },
+    #[error("directory-managed cell storage must be opened through the universe coordinator")]
+    DirectoryManagedCellRequiresCoordinator,
     #[error("canonical world invariant failed: {0}")]
     CanonicalInvariant(String),
 }
@@ -295,12 +301,26 @@ pub struct Runtime {
     physics_chunk_replacements: u64,
 }
 
+fn reject_standalone_directory_managed_open(path: &Path) -> Result<(), RuntimeError> {
+    let is_directory_root = path.join("cell-directory.json").is_file();
+    let is_managed_cell_root = path
+        .parent()
+        .filter(|parent| parent.file_name().is_some_and(|name| name == "cells"))
+        .and_then(Path::parent)
+        .is_some_and(|universe_root| universe_root.join("cell-directory.json").is_file());
+    if is_directory_root || is_managed_cell_root {
+        return Err(RuntimeError::DirectoryManagedCellRequiresCoordinator);
+    }
+    Ok(())
+}
+
 impl Runtime {
     pub fn open(
         data_directory: impl AsRef<Path>,
         requested_seed: u64,
         snapshot_every: u64,
     ) -> Result<Self, RuntimeError> {
+        reject_standalone_directory_managed_open(data_directory.as_ref())?;
         Self::open_for_cell_with_clock(
             data_directory,
             requested_seed,
@@ -316,6 +336,7 @@ impl Runtime {
         cell_key: verse_protocol::CellKeyV1,
         snapshot_every: u64,
     ) -> Result<Self, RuntimeError> {
+        reject_standalone_directory_managed_open(data_directory.as_ref())?;
         Self::open_for_cell_with_clock(
             data_directory,
             requested_seed,
@@ -330,6 +351,7 @@ impl Runtime {
         requested_seed: u64,
         snapshot_every: u64,
     ) -> Result<Self, RuntimeError> {
+        reject_standalone_directory_managed_open(data_directory.as_ref())?;
         Self::open_hosted_for_cell_with_clock(
             data_directory,
             requested_seed,
@@ -345,6 +367,7 @@ impl Runtime {
         cell_key: verse_protocol::CellKeyV1,
         snapshot_every: u64,
     ) -> Result<Self, RuntimeError> {
+        reject_standalone_directory_managed_open(data_directory.as_ref())?;
         Self::open_hosted_for_cell_with_clock(
             data_directory,
             requested_seed,
@@ -360,6 +383,7 @@ impl Runtime {
         snapshot_every: u64,
         clock: Arc<dyn TrustedClock>,
     ) -> Result<Self, RuntimeError> {
+        reject_standalone_directory_managed_open(data_directory.as_ref())?;
         Self::open_hosted_for_cell_with_clock(
             data_directory,
             requested_seed,
@@ -393,6 +417,7 @@ impl Runtime {
         snapshot_every: u64,
         clock: Arc<dyn TrustedClock>,
     ) -> Result<Self, RuntimeError> {
+        reject_standalone_directory_managed_open(data_directory.as_ref())?;
         Self::open_for_cell_with_clock(
             data_directory,
             requested_seed,
@@ -418,6 +443,21 @@ impl Runtime {
         )?;
         while !runtime.activation_step()? {}
         Ok(runtime)
+    }
+
+    pub(crate) fn open_directory_managed_for_cell(
+        data_directory: impl AsRef<Path>,
+        requested_seed: u64,
+        cell_key: verse_protocol::CellKeyV1,
+        snapshot_every: u64,
+    ) -> Result<Self, RuntimeError> {
+        Self::open_for_cell_with_clock(
+            data_directory,
+            requested_seed,
+            cell_key,
+            snapshot_every,
+            Arc::new(SystemTrustedClock),
+        )
     }
 
     pub fn open_for_activation(config: &RuntimeOpenConfig) -> Result<Self, RuntimeError> {
@@ -515,92 +555,360 @@ impl Runtime {
         &self.state
     }
 
-    pub fn commit_player_transfer_prepared(
+    pub(crate) fn commit_player_transfer_prepared(
         &mut self,
         package: &PlayerTransferPackage,
         directory_transfer: &CellTransferRecord,
-    ) -> Result<(), RuntimeError> {
-        if stage_prepared_eva_lock(&self.state, package, directory_transfer)
-            .map_err(|source| transfer_runtime_error(&source))?
-            == self.state
-        {
-            return Ok(());
+    ) -> Result<CellTransferPrepareProof, RuntimeError> {
+        let already_committed = self
+            .store
+            .transfer_boundary(&package.transfer_id, TransferBoundaryKind::Prepare)
+            .is_some();
+        if !already_committed {
+            stage_prepared_eva_lock(&self.state, package, directory_transfer)
+                .map_err(|source| transfer_runtime_error(&source))?;
+            self.ensure_transfer_mutation_enabled()?;
+            self.commit_system_event_recorded(EventPayload::PlayerTransferPrepared {
+                package: package.clone(),
+                directory_transfer: directory_transfer.clone(),
+            })?;
         }
-        self.commit_system_event(EventPayload::PlayerTransferPrepared {
-            package: package.clone(),
-            directory_transfer: directory_transfer.clone(),
+        let boundary = self.transfer_boundary(package, None, TransferBoundaryKind::Prepare)?;
+        Ok(CellTransferPrepareProof {
+            transfer_id: package.transfer_id.clone(),
+            package_hash: package.package_hash.clone(),
+            source_cell_id: package.source_cell_id.clone(),
+            source_assignment_generation: 0,
+            prior_placement_generation: package.prior_placement_generation,
+            source_fencing_token: boundary.authority_fencing_token,
+            source_event_sequence: boundary.event_sequence,
+            source_event_hash: boundary.event_hash,
+            source_world_hash: boundary.resulting_world_hash,
         })
     }
 
-    pub fn commit_player_transfer_quarantined(
+    pub(crate) fn commit_player_transfer_quarantined(
         &mut self,
         package: &PlayerTransferPackage,
         receipt: &PlayerTransferQuarantineReceipt,
-    ) -> Result<(), RuntimeError> {
-        if stage_eva_player_quarantine(&self.state, self.state.fencing_token, package)
-            .map_err(|source| transfer_runtime_error(&source))?
-            .0
-            == self.state
-        {
-            return Ok(());
+    ) -> Result<CellTransferQuarantineProof, RuntimeError> {
+        let already_committed = self
+            .store
+            .transfer_boundary(&package.transfer_id, TransferBoundaryKind::Quarantine)
+            .is_some();
+        if !already_committed {
+            stage_eva_player_quarantine(&self.state, self.state.fencing_token, package)
+                .map_err(|source| transfer_runtime_error(&source))?;
+            self.ensure_transfer_mutation_enabled()?;
+            self.commit_system_event_recorded(EventPayload::PlayerTransferQuarantined {
+                package: package.clone(),
+                receipt: receipt.clone(),
+            })?;
         }
-        self.commit_system_event(EventPayload::PlayerTransferQuarantined {
-            package: package.clone(),
-            receipt: receipt.clone(),
+        let boundary = self.transfer_boundary(
+            package,
+            Some(&receipt.receipt_hash),
+            TransferBoundaryKind::Quarantine,
+        )?;
+        Ok(CellTransferQuarantineProof {
+            transfer_id: package.transfer_id.clone(),
+            package_hash: package.package_hash.clone(),
+            quarantine_receipt_hash: receipt.receipt_hash.clone(),
+            destination_cell_id: package.destination_cell_id.clone(),
+            destination_assignment_generation: 0,
+            resulting_placement_generation: package.resulting_placement_generation,
+            destination_fencing_token: boundary.authority_fencing_token,
+            destination_event_sequence: boundary.event_sequence,
+            destination_event_hash: boundary.event_hash,
+            destination_world_hash: boundary.resulting_world_hash,
         })
     }
 
-    pub fn commit_player_transfer_aborted(
+    pub(crate) fn commit_player_transfer_aborted(
         &mut self,
         package: &PlayerTransferPackage,
         directory_transfer: &CellTransferRecord,
-    ) -> Result<(), RuntimeError> {
-        if stage_aborted_eva_unlock(&self.state, package, directory_transfer)
-            .map_err(|source| transfer_runtime_error(&source))?
-            == self.state
+    ) -> Result<CellTransferAbortProof, RuntimeError> {
+        let (_, kind) = if self.state.cell_id == package.source_cell_id {
+            (TransferAbortRole::Source, TransferBoundaryKind::AbortSource)
+        } else if self.state.cell_id == package.destination_cell_id {
+            (
+                TransferAbortRole::Destination,
+                TransferBoundaryKind::AbortDestination,
+            )
+        } else {
+            return Err(transfer_runtime_error(
+                &HandoffError::CommittedStateRejected(
+                    "abort proof requested from an unrelated cell".into(),
+                ),
+            ));
+        };
+        if self
+            .store
+            .transfer_boundary(&package.transfer_id, kind)
+            .is_none()
         {
-            return Ok(());
+            stage_aborted_eva_unlock(&self.state, package, directory_transfer)
+                .map_err(|source| transfer_runtime_error(&source))?;
+            self.ensure_transfer_mutation_enabled()?;
+            self.commit_system_event_recorded(EventPayload::PlayerTransferAborted {
+                package: package.clone(),
+                directory_transfer: directory_transfer.clone(),
+            })?;
         }
-        self.commit_system_event(EventPayload::PlayerTransferAborted {
-            package: package.clone(),
-            directory_transfer: directory_transfer.clone(),
+        let (role, kind) = if self.state.cell_id == package.source_cell_id {
+            (TransferAbortRole::Source, TransferBoundaryKind::AbortSource)
+        } else if self.state.cell_id == package.destination_cell_id {
+            (
+                TransferAbortRole::Destination,
+                TransferBoundaryKind::AbortDestination,
+            )
+        } else {
+            return Err(transfer_runtime_error(
+                &HandoffError::CommittedStateRejected(
+                    "abort proof requested from an unrelated cell".into(),
+                ),
+            ));
+        };
+        let boundary = self.transfer_boundary(package, None, kind)?;
+        Ok(CellTransferAbortProof {
+            transfer_id: package.transfer_id.clone(),
+            package_hash: package.package_hash.clone(),
+            cell_id: boundary.cell_id,
+            assignment_generation: 0,
+            role,
+            fencing_token: boundary.authority_fencing_token,
+            event_sequence: boundary.event_sequence,
+            event_hash: boundary.event_hash,
+            world_hash: boundary.resulting_world_hash,
         })
     }
 
-    pub fn commit_player_transfer_exported(
+    pub(crate) fn commit_player_transfer_exported(
         &mut self,
         package: &PlayerTransferPackage,
         directory_transfer: &CellTransferRecord,
-    ) -> Result<(), RuntimeError> {
-        if stage_committed_eva_export(&self.state, package, directory_transfer)
-            .map_err(|source| transfer_runtime_error(&source))?
-            == self.state
-        {
-            return Ok(());
+    ) -> Result<CellTransferFinalizationProof, RuntimeError> {
+        let already_committed = self
+            .store
+            .transfer_boundary(&package.transfer_id, TransferBoundaryKind::Export)
+            .is_some();
+        if !already_committed {
+            stage_committed_eva_export(&self.state, package, directory_transfer)
+                .map_err(|source| transfer_runtime_error(&source))?;
+            self.ensure_transfer_mutation_enabled()?;
+            self.commit_system_event_recorded(EventPayload::PlayerTransferExported {
+                package: package.clone(),
+                directory_transfer: directory_transfer.clone(),
+            })?;
         }
-        self.commit_system_event(EventPayload::PlayerTransferExported {
-            package: package.clone(),
-            directory_transfer: directory_transfer.clone(),
+        let boundary = self.transfer_boundary(package, None, TransferBoundaryKind::Export)?;
+        Ok(CellTransferFinalizationProof {
+            transfer_id: package.transfer_id.clone(),
+            package_hash: package.package_hash.clone(),
+            source_cell_id: package.source_cell_id.clone(),
+            source_assignment_generation: 0,
+            resulting_placement_generation: package.resulting_placement_generation,
+            source_fencing_token: boundary.authority_fencing_token,
+            source_event_sequence: boundary.event_sequence,
+            source_event_hash: boundary.event_hash,
+            source_world_hash: boundary.resulting_world_hash,
         })
     }
 
-    pub fn commit_player_transfer_imported(
+    pub(crate) fn commit_player_transfer_imported(
         &mut self,
         package: &PlayerTransferPackage,
         receipt: &PlayerTransferQuarantineReceipt,
         directory_transfer: &CellTransferRecord,
-    ) -> Result<(), RuntimeError> {
-        if stage_committed_eva_import(&self.state, package, receipt, directory_transfer)
-            .map_err(|source| transfer_runtime_error(&source))?
-            == self.state
-        {
-            return Ok(());
+    ) -> Result<CellTransferImportProof, RuntimeError> {
+        let already_committed = self
+            .store
+            .transfer_boundary(&package.transfer_id, TransferBoundaryKind::Import)
+            .is_some();
+        if !already_committed {
+            stage_committed_eva_import(&self.state, package, receipt, directory_transfer)
+                .map_err(|source| transfer_runtime_error(&source))?;
+            self.ensure_transfer_mutation_enabled()?;
+            self.commit_system_event_recorded(EventPayload::PlayerTransferImported {
+                package: package.clone(),
+                receipt: receipt.clone(),
+                directory_transfer: directory_transfer.clone(),
+            })?;
         }
-        self.commit_system_event(EventPayload::PlayerTransferImported {
-            package: package.clone(),
-            receipt: receipt.clone(),
-            directory_transfer: directory_transfer.clone(),
+        let boundary = self.transfer_boundary(
+            package,
+            Some(&receipt.receipt_hash),
+            TransferBoundaryKind::Import,
+        )?;
+        Ok(CellTransferImportProof {
+            transfer_id: package.transfer_id.clone(),
+            package_hash: package.package_hash.clone(),
+            quarantine_receipt_hash: receipt.receipt_hash.clone(),
+            destination_cell_id: package.destination_cell_id.clone(),
+            destination_assignment_generation: 0,
+            resulting_placement_generation: package.resulting_placement_generation,
+            destination_fencing_token: boundary.authority_fencing_token,
+            destination_event_sequence: boundary.event_sequence,
+            destination_event_hash: boundary.event_hash,
+            destination_world_hash: boundary.resulting_world_hash,
         })
+    }
+
+    fn ensure_transfer_mutation_enabled(&self) -> Result<(), RuntimeError> {
+        if self.halted {
+            Err(RuntimeError::Halted)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn transfer_boundary(
+        &self,
+        package: &PlayerTransferPackage,
+        receipt_hash: Option<&str>,
+        kind: TransferBoundaryKind,
+    ) -> Result<DurableTransferBoundary, RuntimeError> {
+        let boundary = self
+            .store
+            .transfer_boundary(&package.transfer_id, kind)
+            .cloned()
+            .ok_or_else(|| {
+                transfer_runtime_error(&HandoffError::CommittedStateRejected(format!(
+                    "transfer {} has no durable {:?} boundary",
+                    package.transfer_id, kind
+                )))
+            })?;
+        if boundary.package_hash != package.package_hash
+            || boundary.cell_id != self.state.cell_id
+            || boundary.receipt_hash.as_deref() != receipt_hash
+            || boundary.authority_fencing_token == 0
+            || boundary.event_sequence == 0
+            || !valid_blake3_hex(&boundary.event_hash)
+            || !valid_blake3_hex(&boundary.resulting_world_hash)
+        {
+            return Err(transfer_runtime_error(
+                &HandoffError::CommittedStateRejected(format!(
+                    "transfer {} durable {:?} boundary is invalid",
+                    package.transfer_id, kind
+                )),
+            ));
+        }
+        Ok(boundary)
+    }
+
+    pub(crate) fn verify_transfer_record_proofs(
+        &self,
+        transfer: &CellTransferRecord,
+    ) -> Result<(), RuntimeError> {
+        let verify = |kind: TransferBoundaryKind,
+                      event_sequence: u64,
+                      event_hash: &str,
+                      fencing_token: u64,
+                      world_hash: &str,
+                      cell_id: &str,
+                      receipt_hash: Option<&str>|
+         -> Result<(), RuntimeError> {
+            let boundary = self
+                .store
+                .transfer_boundary(&transfer.transfer_id, kind)
+                .ok_or_else(|| {
+                    transfer_runtime_error(&HandoffError::CommittedStateRejected(format!(
+                        "transfer {} directory proof has no durable {:?} cell event",
+                        transfer.transfer_id, kind
+                    )))
+                })?;
+            if boundary.package_hash != transfer.package_hash
+                || boundary.receipt_hash.as_deref() != receipt_hash
+                || boundary.cell_id != cell_id
+                || boundary.event_sequence != event_sequence
+                || boundary.event_hash != event_hash
+                || boundary.authority_fencing_token != fencing_token
+                || boundary.resulting_world_hash != world_hash
+            {
+                return Err(transfer_runtime_error(
+                    &HandoffError::CommittedStateRejected(format!(
+                        "transfer {} directory {:?} proof disagrees with its durable cell event",
+                        transfer.transfer_id, kind
+                    )),
+                ));
+            }
+            Ok(())
+        };
+        if self.state.cell_id == transfer.source_cell_id
+            && let Some(proof) = &transfer.source_prepare_proof
+        {
+            verify(
+                TransferBoundaryKind::Prepare,
+                proof.source_event_sequence,
+                &proof.source_event_hash,
+                proof.source_fencing_token,
+                &proof.source_world_hash,
+                &transfer.source_cell_id,
+                None,
+            )?;
+        }
+        if self.state.cell_id == transfer.destination_cell_id
+            && let Some(proof) = &transfer.destination_quarantine_proof
+        {
+            verify(
+                TransferBoundaryKind::Quarantine,
+                proof.destination_event_sequence,
+                &proof.destination_event_hash,
+                proof.destination_fencing_token,
+                &proof.destination_world_hash,
+                &transfer.destination_cell_id,
+                Some(&proof.quarantine_receipt_hash),
+            )?;
+        }
+        if self.state.cell_id == transfer.destination_cell_id
+            && let Some(proof) = &transfer.import_proof
+        {
+            verify(
+                TransferBoundaryKind::Import,
+                proof.destination_event_sequence,
+                &proof.destination_event_hash,
+                proof.destination_fencing_token,
+                &proof.destination_world_hash,
+                &transfer.destination_cell_id,
+                Some(&proof.quarantine_receipt_hash),
+            )?;
+        }
+        if self.state.cell_id == transfer.source_cell_id
+            && let Some(proof) = &transfer.finalization_proof
+        {
+            verify(
+                TransferBoundaryKind::Export,
+                proof.source_event_sequence,
+                &proof.source_event_hash,
+                proof.source_fencing_token,
+                &proof.source_world_hash,
+                &transfer.source_cell_id,
+                None,
+            )?;
+        }
+        for proof in [
+            transfer.source_abort_proof.as_ref(),
+            transfer.destination_abort_proof.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|proof| proof.cell_id == self.state.cell_id)
+        {
+            verify(
+                match proof.role {
+                    TransferAbortRole::Source => TransferBoundaryKind::AbortSource,
+                    TransferAbortRole::Destination => TransferBoundaryKind::AbortDestination,
+                },
+                proof.event_sequence,
+                &proof.event_hash,
+                proof.fencing_token,
+                &proof.world_hash,
+                &proof.cell_id,
+                None,
+            )?;
+        }
+        Ok(())
     }
 
     pub const fn physics_scene_is_initialized(&self) -> bool {
@@ -1295,6 +1603,13 @@ impl Runtime {
     }
 
     fn commit_system_event(&mut self, payload: EventPayload) -> Result<(), RuntimeError> {
+        self.commit_system_event_recorded(payload).map(drop)
+    }
+
+    fn commit_system_event_recorded(
+        &mut self,
+        payload: EventPayload,
+    ) -> Result<CanonicalEvent, RuntimeError> {
         let mut event = self.state.prepare_system_event(payload);
         let occurred_at_unix_ms = match self.store.accepted_trusted_time() {
             Ok(now) => now,
@@ -1304,7 +1619,8 @@ impl Runtime {
             }
         };
         event.retime_and_rehash(occurred_at_unix_ms);
-        self.commit_prepared_system_event(&event)
+        self.commit_prepared_system_event(&event)?;
+        Ok(event)
     }
 
     fn commit_production_quantum(&mut self, payload: EventPayload) -> Result<(), RuntimeError> {
@@ -9438,6 +9754,12 @@ mod tests {
             resulting_placement_generation: package.resulting_placement_generation,
             package_hash: package.package_hash.clone(),
             quarantine_receipt_hash: Some(receipt.receipt_hash.clone()),
+            source_prepare_proof: None,
+            destination_quarantine_proof: None,
+            import_proof: None,
+            finalization_proof: None,
+            source_abort_proof: None,
+            destination_abort_proof: None,
             phase: TransferPhase::Committed,
         };
         let mut imported =
@@ -14265,7 +14587,7 @@ mod tests {
     #[test]
     fn industry_and_grid_replay_require_authenticated_human_envelopes() {
         let state = WorldState::genesis(171);
-        let payloads = [
+        let payloads = vec![
             EventPayload::OreRefined {
                 inventory_id: PLAYER_INVENTORY_ID.into(),
                 batches: 1,

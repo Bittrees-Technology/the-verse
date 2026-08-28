@@ -59,6 +59,12 @@ Two fences are required:
 A worker must hold both applicable authorities. Cell fencing alone cannot stop
 two valid cells from each believing they own the same transferred grid.
 
+On assignment or recovery, the successor opens and exclusively fences the cell
+store before the directory advances. The directory permanently records the
+mapping from assignment generation to that exact store fence. Transfer proofs
+therefore retain the authority generation that actually wrote each cell event,
+even after a later holder takes over the cell.
+
 ### Durable saga and linearization point
 
 Handoff is a durable saga, not a distributed transaction across the directory
@@ -71,6 +77,14 @@ Resident(source, N)
   -> InTransit(destination, N+1)  [directory CAS commit]
   -> Imported(destination)
   -> Resident(destination, N+1)
+```
+
+A pre-commit abort uses a separate proved branch:
+
+```text
+Preparing|Prepared
+  -> Aborting(source and destination assignments pinned)
+  -> Aborted(source restored after both cell cleanup proofs)
 ```
 
 The directory compare-and-swap commit is the only linearization point. Before
@@ -105,6 +119,14 @@ hash.
 Destination quarantine is durable but not live. The same transfer ID with
 different material is fatal. Duplicate identical prepare, quarantine, commit,
 import, and finalize operations reconcile idempotently.
+
+Each prepare, quarantine, import, finalization, and abort-cleanup mutation is
+also represented by an event-time transfer boundary. Boundaries form a hash
+chain anchored by the cell lifecycle record and bind the canonical event
+sequence/hash, live store fence, and resulting world hash. The directory may
+advance a phase only after validating the matching proof from the cell that
+performed it. Recovery may complete the one exact event-to-directory gap; it
+cannot invent a proof from the cell's current state.
 
 Prepared export, directory in-transit custody, and committed import are
 explicit conservation domains. Transfer cannot create output, loss, reward, or
@@ -145,6 +167,8 @@ commit the destination baseline before controls resume. Source
 ### Failure direction
 
 - Before directory commit: source recovery or exact abort is legal.
+- Abort remains nonterminal until both source and destination cleanup events
+  are durable and proved; both assignments stay pinned during that interval.
 - After directory commit: only destination roll-forward is legal.
 - Uncertain commit result: source unlock is forbidden until the directory is
   read.
@@ -158,8 +182,11 @@ commit the destination baseline before controls resume. Source
 P1.7 uses protocol `18`, projection schema `4`, world schema `20`, event schema
 `16`, content schema `11`, content manifest `p1.5.0`, celestial registry schema
 `1`, universe manifest schema `4`, interest schema `2`, operation fingerprint
-schema `2`, lifecycle-control schema `1`, production-occurrence schema `1`,
-cell-directory schema `1`, and transfer/package schema `1`.
+schema `2`, lifecycle-control schema `2`, production-occurrence schema `1`,
+cell-directory schema `2`, and transfer/package schema `1`. Directory schema
+`2` makes prepare, quarantine, destination import, source finalization, and
+both abort-cleanup event/world proofs mandatory before their placement phases
+can advance, and retains immutable assignment-generation-to-fence history.
 
 The first proof archives and resets P1.6 data. A later migration must derive
 cell keys, install aggregate placement generations, preserve retry conflict

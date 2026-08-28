@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -12,7 +13,8 @@ use uuid::Uuid;
 use verse_protocol::{CellKeyV1, UniverseManifestSnapshot};
 
 use crate::event::{
-    CanonicalEvent, EVENT_SCHEMA_NAME, EVENT_SCHEMA_VERSION, ProductionScheduleOccurrence,
+    CanonicalEvent, EVENT_SCHEMA_NAME, EVENT_SCHEMA_VERSION, EventPayload,
+    ProductionScheduleOccurrence,
 };
 use crate::model::{WORLD_SCHEMA_VERSION, WorldState};
 use crate::{celestial, content};
@@ -22,6 +24,7 @@ const SNAPSHOT_FILE: &str = "world-snapshot.json";
 const JOURNAL_FILE: &str = "events.ndjson";
 const LOCK_FILE: &str = "writer.lock";
 const LIFECYCLE_FILE: &str = "cell-lifecycle.json";
+const TRANSFER_BOUNDARY_FILE: &str = "transfer-boundaries.ndjson";
 pub const LIFECYCLE_CONTROL_SCHEMA_VERSION: u32 = verse_protocol::LIFECYCLE_CONTROL_SCHEMA_VERSION;
 pub const LEASE_DURATION_MILLIS: u64 = 15_000;
 pub const LEASE_RENEWAL_INTERVAL_MILLIS: u64 = 5_000;
@@ -146,6 +149,8 @@ pub enum PersistenceError {
         event_sequence: u64,
         message: String,
     },
+    #[error("durable transfer boundary is invalid: {0}")]
+    InvalidTransferBoundary(String),
     #[cfg(test)]
     #[error("injected persistence failure at {0}")]
     InjectedFailure(&'static str),
@@ -189,6 +194,70 @@ struct EventHeader {
     universe_manifest_hash: Option<String>,
     #[serde(default)]
     celestial_registry_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TransferBoundaryKind {
+    Prepare,
+    Quarantine,
+    Import,
+    Export,
+    AbortSource,
+    AbortDestination,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DurableTransferBoundary {
+    pub transfer_id: String,
+    pub package_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt_hash: Option<String>,
+    pub cell_id: String,
+    pub kind: TransferBoundaryKind,
+    pub authority_fencing_token: u64,
+    pub event_sequence: u64,
+    pub event_hash: String,
+    pub resulting_world_hash: String,
+    pub previous_boundary_hash: String,
+    pub boundary_hash: String,
+}
+
+type TransferBoundaryIndex = BTreeMap<(String, TransferBoundaryKind), DurableTransferBoundary>;
+type LoadedTransferBoundaries = (TransferBoundaryIndex, String);
+
+impl DurableTransferBoundary {
+    fn calculate_hash(&self) -> String {
+        let mut material = self.clone();
+        material.boundary_hash.clear();
+        let bytes = serde_json::to_vec(&material)
+            .expect("durable transfer boundary hash material serializes");
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"the-verse/durable-transfer-boundary/v1\0");
+        hasher.update(&bytes);
+        hasher.finalize().to_hex().to_string()
+    }
+
+    fn hash_is_valid(&self) -> bool {
+        crate::model::valid_blake3_hex(&self.boundary_hash)
+            && self.boundary_hash == self.calculate_hash()
+    }
+}
+
+fn same_transfer_boundary_material(
+    left: &DurableTransferBoundary,
+    right: &DurableTransferBoundary,
+) -> bool {
+    left.transfer_id == right.transfer_id
+        && left.package_hash == right.package_hash
+        && left.receipt_hash == right.receipt_hash
+        && left.cell_id == right.cell_id
+        && left.kind == right.kind
+        && left.authority_fencing_token == right.authority_fencing_token
+        && left.event_sequence == right.event_sequence
+        && left.event_hash == right.event_hash
+        && left.resulting_world_hash == right.resulting_world_hash
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -244,6 +313,7 @@ struct CellLifecycleRecord {
     last_world_event_sequence: u64,
     last_world_event_hash: String,
     last_world_state_hash: String,
+    transfer_boundary_head_hash: String,
     next_production_occurrence: Option<ProductionScheduleOccurrence>,
     acknowledged_production_sequence: u64,
     pending_world_commit: Option<PendingWorldCommit>,
@@ -255,6 +325,8 @@ pub struct Store {
     root: PathBuf,
     lock_file: File,
     journal_file: File,
+    transfer_boundary_file: File,
+    transfer_boundaries: TransferBoundaryIndex,
     fencing_token: u64,
     lifecycle: CellLifecycleRecord,
     last_trusted_unix_ms: u64,
@@ -417,7 +489,7 @@ impl Store {
             .filter(|record| record.observed_mode == LifecycleMode::Activating)
             .and_then(|record| record.activation_cutoff_unix_ms)
             .or(Some(acquired_at_unix_ms));
-        let lifecycle = CellLifecycleRecord {
+        let mut lifecycle = CellLifecycleRecord {
             schema_version: LIFECYCLE_CONTROL_SCHEMA_VERSION,
             universe_id: runtime_manifest.universe_id.clone(),
             cell_id: cell_id.clone(),
@@ -442,6 +514,11 @@ impl Store {
             last_world_state_hash: previous_lifecycle
                 .as_ref()
                 .map_or_else(String::new, |record| record.last_world_state_hash.clone()),
+            transfer_boundary_head_hash: previous_lifecycle
+                .as_ref()
+                .map_or_else(String::new, |record| {
+                    record.transfer_boundary_head_hash.clone()
+                }),
             next_production_occurrence: previous_lifecycle
                 .as_ref()
                 .and_then(|record| record.next_production_occurrence.clone()),
@@ -462,11 +539,27 @@ impl Store {
             .read(true)
             .open(&journal_path)
             .map_err(|source| io_error(&journal_path, source))?;
+        let transfer_boundary_path = root.join(TRANSFER_BOUNDARY_FILE);
+        truncate_unterminated_tail(&transfer_boundary_path)?;
+        let (transfer_boundaries, recovered_boundary_head) =
+            load_transfer_boundaries(&root, requested_seed, &cell_key, &lifecycle)?;
+        if recovered_boundary_head != lifecycle.transfer_boundary_head_hash {
+            lifecycle.transfer_boundary_head_hash = recovered_boundary_head;
+            write_json_atomic(&lifecycle_path, &lifecycle)?;
+        }
+        let transfer_boundary_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .read(true)
+            .open(&transfer_boundary_path)
+            .map_err(|source| io_error(&transfer_boundary_path, source))?;
 
         Ok(Self {
             root,
             lock_file,
             journal_file,
+            transfer_boundary_file,
+            transfer_boundaries,
             fencing_token,
             lifecycle,
             last_trusted_unix_ms: acquired_at_unix_ms,
@@ -496,6 +589,15 @@ impl Store {
 
     pub(crate) fn root_path(&self) -> &Path {
         &self.root
+    }
+
+    pub(crate) fn transfer_boundary(
+        &self,
+        transfer_id: &str,
+        kind: TransferBoundaryKind,
+    ) -> Option<&DurableTransferBoundary> {
+        self.transfer_boundaries
+            .get(&(transfer_id.to_owned(), kind))
     }
 
     pub(crate) fn clock(&self) -> Arc<dyn TrustedClock> {
@@ -942,7 +1044,43 @@ impl Store {
         staged.updated_at_unix_ms = now_unix_ms;
         self.persist_lifecycle(staged)?;
 
+        let mut transfer_boundary =
+            transfer_boundary_from_event(event, &resulting_state.state_hash())?;
+        if let Some(boundary) = &mut transfer_boundary {
+            boundary
+                .previous_boundary_hash
+                .clone_from(&self.lifecycle.transfer_boundary_head_hash);
+            boundary.boundary_hash = boundary.calculate_hash();
+        }
+        if let Some(boundary) = &transfer_boundary {
+            let key = (boundary.transfer_id.clone(), boundary.kind);
+            if self.transfer_boundaries.contains_key(&key) {
+                return Err(PersistenceError::InvalidTransferBoundary(format!(
+                    "transfer {} already has a committed {:?} boundary",
+                    boundary.transfer_id, boundary.kind
+                )));
+            }
+        }
         self.append_event(event)?;
+        if let Some(boundary) = transfer_boundary {
+            let transfer_boundary_path = self.root.join(TRANSFER_BOUNDARY_FILE);
+            let bytes = serde_json::to_vec(&boundary).map_err(|source| PersistenceError::Json {
+                path: transfer_boundary_path.clone(),
+                source,
+            })?;
+            self.transfer_boundary_file
+                .write_all(&bytes)
+                .and_then(|()| self.transfer_boundary_file.write_all(b"\n"))
+                .and_then(|()| self.transfer_boundary_file.sync_data())
+                .map_err(|source| io_error(&transfer_boundary_path, source))?;
+            self.transfer_boundaries.insert(
+                (boundary.transfer_id.clone(), boundary.kind),
+                boundary.clone(),
+            );
+            self.lifecycle
+                .transfer_boundary_head_hash
+                .clone_from(&boundary.boundary_hash);
+        }
 
         let now_unix_ms = self.trusted_unix_millis()?;
         let mut committed = self.lifecycle.clone();
@@ -951,6 +1089,9 @@ impl Store {
             .last_world_event_hash
             .clone_from(&event.event_hash);
         committed.last_world_state_hash = resulting_state.state_hash();
+        committed
+            .transfer_boundary_head_hash
+            .clone_from(&self.lifecycle.transfer_boundary_head_hash);
         committed.next_production_occurrence = resulting_next_occurrence;
         committed.pending_world_commit = None;
         committed.last_trusted_unix_ms = now_unix_ms;
@@ -1342,6 +1483,13 @@ fn validate_prior_lifecycle(
             "lifecycle revision must be positive".into(),
         ));
     }
+    if !lifecycle.transfer_boundary_head_hash.is_empty()
+        && !crate::model::valid_blake3_hex(&lifecycle.transfer_boundary_head_hash)
+    {
+        return Err(PersistenceError::InvalidLifecycleControl(
+            "transfer boundary head is not a canonical hash".into(),
+        ));
+    }
     match lifecycle.observed_mode {
         LifecycleMode::Sleeping => {
             if lifecycle.holder_id.is_some()
@@ -1458,6 +1606,385 @@ fn validate_occurrence_binding(
         ));
     }
     Ok(())
+}
+
+fn transfer_boundary_from_event(
+    event: &CanonicalEvent,
+    resulting_world_hash: &str,
+) -> Result<Option<DurableTransferBoundary>, PersistenceError> {
+    let (package, receipt_hash, kind) = match &event.payload {
+        EventPayload::PlayerTransferPrepared { package, .. } => {
+            (package, None, TransferBoundaryKind::Prepare)
+        }
+        EventPayload::PlayerTransferQuarantined {
+            package, receipt, ..
+        } => (
+            package,
+            Some(receipt.receipt_hash.clone()),
+            TransferBoundaryKind::Quarantine,
+        ),
+        EventPayload::PlayerTransferImported {
+            package, receipt, ..
+        } => (
+            package,
+            Some(receipt.receipt_hash.clone()),
+            TransferBoundaryKind::Import,
+        ),
+        EventPayload::PlayerTransferExported { package, .. } => {
+            (package, None, TransferBoundaryKind::Export)
+        }
+        EventPayload::PlayerTransferAborted { package, .. } => {
+            let kind = if event.cell_id == package.source_cell_id {
+                TransferBoundaryKind::AbortSource
+            } else if event.cell_id == package.destination_cell_id {
+                TransferBoundaryKind::AbortDestination
+            } else {
+                return Err(PersistenceError::InvalidTransferBoundary(
+                    "abort event belongs to neither transfer cell".into(),
+                ));
+            };
+            (package, None, kind)
+        }
+        _ => return Ok(None),
+    };
+    if !event.hash_is_valid()
+        || event.authority_fencing_token == 0
+        || event.event_sequence == 0
+        || !crate::model::valid_blake3_hex(resulting_world_hash)
+    {
+        return Err(PersistenceError::InvalidTransferBoundary(
+            "event, fence, sequence, or resulting world hash is invalid".into(),
+        ));
+    }
+    if !package.hash_is_valid()
+        || package.transfer_id.is_empty()
+        || event.cell_id.as_str()
+            != match kind {
+                TransferBoundaryKind::Prepare
+                | TransferBoundaryKind::Export
+                | TransferBoundaryKind::AbortSource => package.source_cell_id.as_str(),
+                TransferBoundaryKind::Quarantine
+                | TransferBoundaryKind::Import
+                | TransferBoundaryKind::AbortDestination => package.destination_cell_id.as_str(),
+            }
+    {
+        return Err(PersistenceError::InvalidTransferBoundary(
+            "transfer event is not bound to its package and cell".into(),
+        ));
+    }
+    Ok(Some(DurableTransferBoundary {
+        transfer_id: package.transfer_id.clone(),
+        package_hash: package.package_hash.clone(),
+        receipt_hash,
+        cell_id: event.cell_id.clone(),
+        kind,
+        authority_fencing_token: event.authority_fencing_token,
+        event_sequence: event.event_sequence,
+        event_hash: event.event_hash.clone(),
+        resulting_world_hash: resulting_world_hash.to_owned(),
+        previous_boundary_hash: String::new(),
+        boundary_hash: String::new(),
+    }))
+}
+
+fn load_transfer_boundaries(
+    root: &Path,
+    world_seed: u64,
+    cell_key: &CellKeyV1,
+    lifecycle: &CellLifecycleRecord,
+) -> Result<LoadedTransferBoundaries, PersistenceError> {
+    let boundary_path = root.join(TRANSFER_BOUNDARY_FILE);
+    let boundary_is_empty = boundary_path
+        .metadata()
+        .map_or(true, |metadata| metadata.len() == 0);
+    if lifecycle.transfer_boundary_head_hash.is_empty() && boundary_is_empty {
+        let Some(pending) = &lifecycle.pending_world_commit else {
+            return Ok((BTreeMap::new(), String::new()));
+        };
+        let journal_path = root.join(JOURNAL_FILE);
+        let Ok(journal) = fs::read_to_string(&journal_path) else {
+            return Ok((BTreeMap::new(), String::new()));
+        };
+        let pending_is_transfer = journal.lines().any(|line| {
+            serde_json::from_str::<CanonicalEvent>(line).is_ok_and(|event| {
+                event.event_hash == pending.event_hash
+                    && matches!(
+                        event.payload,
+                        EventPayload::PlayerTransferPrepared { .. }
+                            | EventPayload::PlayerTransferQuarantined { .. }
+                            | EventPayload::PlayerTransferImported { .. }
+                            | EventPayload::PlayerTransferExported { .. }
+                            | EventPayload::PlayerTransferAborted { .. }
+                    )
+            })
+        });
+        if !pending_is_transfer {
+            return Ok((BTreeMap::new(), String::new()));
+        }
+    }
+    let journal_path = root.join(JOURNAL_FILE);
+    let journal_bytes = match fs::read(&journal_path) {
+        Ok(bytes) => bytes,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(source) => return Err(io_error(&journal_path, source)),
+    };
+    let journal_length = journal_bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |position| position + 1);
+    let journal = std::str::from_utf8(&journal_bytes[..journal_length]).map_err(|source| {
+        PersistenceError::InvalidTransferBoundary(format!(
+            "event journal is not UTF-8 while indexing transfer proofs: {source}"
+        ))
+    })?;
+    let snapshot_path = root.join(SNAPSHOT_FILE);
+    let snapshot = if snapshot_path.exists() {
+        let mut snapshot: SnapshotDocument = read_json(&snapshot_path)?;
+        if snapshot.schema_version != WORLD_SCHEMA_VERSION {
+            return Err(PersistenceError::SnapshotSchema {
+                found: snapshot.schema_version,
+                expected: WORLD_SCHEMA_VERSION,
+            });
+        }
+        snapshot
+            .state
+            .hydrate_spatial_poses()
+            .map_err(PersistenceError::InvalidPlayerRoster)?;
+        if snapshot.state_hash != snapshot.state.state_hash()
+            || snapshot.event_sequence != snapshot.state.event_sequence
+            || snapshot.last_event_hash != snapshot.state.last_event_hash
+        {
+            return Err(PersistenceError::SnapshotHashMismatch);
+        }
+        Some(snapshot)
+    } else {
+        None
+    };
+    let snapshot_event_sequence = snapshot
+        .as_ref()
+        .map_or(0, |snapshot| snapshot.event_sequence);
+    let mut replay = match &snapshot {
+        Some(snapshot) => snapshot.state.clone(),
+        None => WorldState::genesis_for_cell(world_seed, cell_key)
+            .map_err(PersistenceError::InvalidCellIdentity)?,
+    };
+    let mut canonical_events = BTreeMap::<(String, TransferBoundaryKind), CanonicalEvent>::new();
+    let mut expected = BTreeMap::<(String, TransferBoundaryKind), DurableTransferBoundary>::new();
+    for line in journal.lines().filter(|line| !line.trim().is_empty()) {
+        let event: CanonicalEvent = serde_json::from_str(line).map_err(|source| {
+            PersistenceError::InvalidTransferBoundary(format!(
+                "event journal cannot be indexed for transfer proofs: {source}"
+            ))
+        })?;
+        if !event.hash_is_valid() {
+            return Err(PersistenceError::InvalidTransferBoundary(format!(
+                "event {} has an invalid hash while indexing transfer proofs",
+                event.event_sequence
+            )));
+        }
+        let transfer_identity = transfer_boundary_from_event(&event, &"0".repeat(64))?;
+        if let Some(identity) = &transfer_identity {
+            canonical_events.insert((identity.transfer_id.clone(), identity.kind), event.clone());
+        }
+        if event.event_sequence <= snapshot_event_sequence {
+            continue;
+        }
+        replay
+            .apply_event(&event)
+            .map_err(|source| PersistenceError::Replay {
+                event_sequence: event.event_sequence,
+                message: source.to_string(),
+            })?;
+        if let Some(boundary) = transfer_identity
+            .map(|_| transfer_boundary_from_event(&event, &replay.state_hash()))
+            .transpose()?
+            .flatten()
+        {
+            let key = (boundary.transfer_id.clone(), boundary.kind);
+            if let Some(existing) = expected.insert(key, boundary.clone())
+                && existing != boundary
+            {
+                return Err(PersistenceError::InvalidTransferBoundary(format!(
+                    "transfer {} has multiple canonical {:?} events",
+                    boundary.transfer_id, boundary.kind
+                )));
+            }
+        }
+    }
+
+    let boundary_bytes = match fs::read(&boundary_path) {
+        Ok(bytes) => bytes,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(source) => return Err(io_error(&boundary_path, source)),
+    };
+    let boundary_length = boundary_bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |position| position + 1);
+    let boundary_text =
+        std::str::from_utf8(&boundary_bytes[..boundary_length]).map_err(|source| {
+            PersistenceError::InvalidTransferBoundary(format!(
+                "transfer boundary journal is not UTF-8: {source}"
+            ))
+        })?;
+    let mut committed = BTreeMap::new();
+    let mut observed_head = String::new();
+    let mut lifecycle_head_on_chain = lifecycle.transfer_boundary_head_hash.is_empty();
+    let mut records_after_lifecycle_head = 0_usize;
+    let mut last_committed_event_sequence = 0_u64;
+    let mut last_committed_event_hash = String::new();
+    for line in boundary_text.lines().filter(|line| !line.trim().is_empty()) {
+        let boundary: DurableTransferBoundary = serde_json::from_str(line).map_err(|source| {
+            PersistenceError::InvalidTransferBoundary(format!(
+                "transfer boundary journal is corrupt: {source}"
+            ))
+        })?;
+        let key = (boundary.transfer_id.clone(), boundary.kind);
+        let Some(event) = canonical_events.get(&key) else {
+            return Err(PersistenceError::InvalidTransferBoundary(format!(
+                "transfer {} {:?} boundary has no canonical cell event",
+                boundary.transfer_id, boundary.kind
+            )));
+        };
+        if boundary.previous_boundary_hash != observed_head || !boundary.hash_is_valid() {
+            return Err(PersistenceError::InvalidTransferBoundary(format!(
+                "transfer {} {:?} breaks the durable boundary hash chain",
+                boundary.transfer_id, boundary.kind
+            )));
+        }
+        if boundary.event_sequence <= last_committed_event_sequence {
+            return Err(PersistenceError::InvalidTransferBoundary(format!(
+                "transfer {} {:?} does not advance the boundary event frontier",
+                boundary.transfer_id, boundary.kind
+            )));
+        }
+        let event_bound = transfer_boundary_from_event(event, &boundary.resulting_world_hash)?;
+        if event_bound
+            .as_ref()
+            .is_none_or(|event_bound| !same_transfer_boundary_material(event_bound, &boundary))
+        {
+            return Err(PersistenceError::InvalidTransferBoundary(format!(
+                "transfer {} {:?} boundary does not match its canonical event",
+                boundary.transfer_id, boundary.kind
+            )));
+        }
+        if let Some(canonical) = expected.get(&key)
+            && !same_transfer_boundary_material(canonical, &boundary)
+        {
+            return Err(PersistenceError::InvalidTransferBoundary(format!(
+                "transfer {} {:?} corrupts its replay-derived post-state root",
+                boundary.transfer_id, boundary.kind
+            )));
+        }
+        if let Some(existing) = committed.insert(key, boundary.clone())
+            && existing != boundary
+        {
+            return Err(PersistenceError::InvalidTransferBoundary(format!(
+                "transfer {} has conflicting {:?} boundaries",
+                boundary.transfer_id, boundary.kind
+            )));
+        }
+        observed_head.clone_from(&boundary.boundary_hash);
+        last_committed_event_sequence = boundary.event_sequence;
+        last_committed_event_hash.clone_from(&boundary.event_hash);
+        if observed_head == lifecycle.transfer_boundary_head_hash {
+            lifecycle_head_on_chain = true;
+            records_after_lifecycle_head = 0;
+        } else if lifecycle_head_on_chain {
+            records_after_lifecycle_head = records_after_lifecycle_head.saturating_add(1);
+        }
+    }
+    if observed_head != lifecycle.transfer_boundary_head_hash {
+        let pending_matches_suffix =
+            lifecycle
+                .pending_world_commit
+                .as_ref()
+                .is_some_and(|pending| {
+                    pending.event_sequence == last_committed_event_sequence
+                        && pending.event_hash == last_committed_event_hash
+                });
+        if !lifecycle_head_on_chain || records_after_lifecycle_head != 1 || !pending_matches_suffix
+        {
+            return Err(PersistenceError::InvalidTransferBoundary(
+                "boundary hash-chain suffix is not the one exact pending lifecycle commit".into(),
+            ));
+        }
+    }
+    for (key, event) in &canonical_events {
+        if event.event_sequence <= snapshot_event_sequence && !committed.contains_key(key) {
+            return Err(PersistenceError::InvalidTransferBoundary(format!(
+                "historic transfer {} {:?} is missing its event-time boundary",
+                key.0, key.1
+            )));
+        }
+    }
+    let mut missing = expected
+        .iter()
+        .filter(|(key, _)| !committed.contains_key(*key))
+        .map(|(_, boundary)| boundary.clone())
+        .collect::<Vec<_>>();
+    missing.sort_by_key(|boundary| boundary.event_sequence);
+    if !missing.is_empty() {
+        if missing.len() != 1
+            || lifecycle
+                .pending_world_commit
+                .as_ref()
+                .is_none_or(|pending| pending.event_hash != missing[0].event_hash)
+        {
+            return Err(PersistenceError::InvalidTransferBoundary(
+                "only the exact pending world event may backfill a missing boundary".into(),
+            ));
+        }
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&boundary_path)
+            .map_err(|source| io_error(&boundary_path, source))?;
+        for mut boundary in missing {
+            boundary.previous_boundary_hash.clone_from(&observed_head);
+            boundary.boundary_hash = boundary.calculate_hash();
+            let bytes = serde_json::to_vec(&boundary).map_err(|source| PersistenceError::Json {
+                path: boundary_path.clone(),
+                source,
+            })?;
+            file.write_all(&bytes)
+                .and_then(|()| file.write_all(b"\n"))
+                .map_err(|source| io_error(&boundary_path, source))?;
+            committed.insert((boundary.transfer_id.clone(), boundary.kind), boundary);
+            observed_head.clone_from(
+                &committed
+                    .values()
+                    .max_by_key(|candidate| candidate.event_sequence)
+                    .expect("backfilled boundary was inserted")
+                    .boundary_hash,
+            );
+        }
+        file.sync_data()
+            .map_err(|source| io_error(&boundary_path, source))?;
+    }
+    Ok((committed, observed_head))
+}
+
+fn truncate_unterminated_tail(path: &Path) -> Result<(), PersistenceError> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => return Err(io_error(path, source)),
+    };
+    if bytes.is_empty() || bytes.last() == Some(&b'\n') {
+        return Ok(());
+    }
+    let committed_length = bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |position| position + 1);
+    let file = OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(|source| io_error(path, source))?;
+    file.set_len(u64::try_from(committed_length).expect("boundary journal length fits u64"))
+        .and_then(|()| file.sync_data())
+        .map_err(|source| io_error(path, source))
 }
 
 fn recover_persisted_fencing_frontier(root: &Path) -> Result<u64, PersistenceError> {
@@ -1766,6 +2293,31 @@ mod tests {
         assert!(matches!(
             Store::open(directory.path(), 25),
             Err(PersistenceError::MissingLifecycleControl)
+        ));
+    }
+
+    #[test]
+    fn lifecycle_schema_one_without_a_transfer_boundary_anchor_fails_closed() {
+        let directory = tempdir().expect("tempdir");
+        drop(Store::open(directory.path(), 2_501).expect("store opens"));
+        let lifecycle_path = directory.path().join(LIFECYCLE_FILE);
+        let mut lifecycle: serde_json::Value =
+            serde_json::from_slice(&fs::read(&lifecycle_path).expect("lifecycle reads"))
+                .expect("lifecycle parses");
+        lifecycle["schema_version"] = serde_json::json!(1);
+        lifecycle
+            .as_object_mut()
+            .expect("lifecycle is an object")
+            .remove("transfer_boundary_head_hash");
+        fs::write(
+            &lifecycle_path,
+            serde_json::to_vec(&lifecycle).expect("legacy lifecycle serializes"),
+        )
+        .expect("legacy lifecycle writes");
+
+        assert!(matches!(
+            Store::open(directory.path(), 2_501),
+            Err(PersistenceError::Json { .. })
         ));
     }
 

@@ -291,8 +291,8 @@ unambiguous occurrence frontier and prove replay equality.
 P1.7 is a third coordinated boundary: protocol `18`, projection schema `4`,
 world schema `20`, event schema `16`, content schema `11`, content manifest
 `p1.5.0`, registry schema `1`, universe manifest schema `4`, interest schema
-`2`, operation fingerprint schema `2`, lifecycle-control schema `1`,
-production-occurrence schema `1`, cell-directory schema `1`, and transfer
+`2`, operation fingerprint schema `2`, lifecycle-control schema `2`,
+production-occurrence schema `1`, cell-directory schema `2`, and transfer
 schema `1`. Manifest `4` binds the cell-key, directory, placement, package,
 projection, interest, and retry policies. The first proof archives and resets
 P1.6 data; a later migration must create stable cell keys and placements,

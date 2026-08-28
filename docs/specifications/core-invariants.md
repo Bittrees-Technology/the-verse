@@ -128,11 +128,18 @@ These invariants are higher priority than convenience or performance.
 - Source prepare locks one complete server-derived dependency closure at an
   atomic tick/production boundary. Destination quarantine is durable but has
   no physics, production, projection, or mutation authority.
+- A cell assignment generation permanently maps to the exact nonzero store
+  fence held when it was issued. A successor must acquire the store before the
+  directory advances, and cannot relabel an older cell event as its own proof.
 - One directory compare-and-swap from source placement generation `N` to
   destination generation `N+1` is the sole handoff linearization point.
 - Before directory commit, recovery may abort to the exact source state. After
   commit, source unlock is forbidden and recovery only rolls forward through
   idempotent destination import and source finalization.
+- Every transfer phase transition is backed by the exact canonical cell event,
+  store fence, and resulting world hash in a lifecycle-anchored boundary chain.
+  Pre-commit abort pins both cells until source and destination cleanup proofs
+  exist; a no-op cleanup is still a canonical proof-of-absence event.
 - One transfer ID identifies one immutable content-addressed package. The same
   ID with changed bytes, roots, subjects, generations, or conservation vector
   fails closed.
@@ -148,8 +155,8 @@ These invariants are higher priority than convenience or performance.
 - P1.7 admits only protocol `18`, projection schema `4`, world schema `20`,
   event schema `16`, content schema `11`, content manifest `p1.5.0`, registry
   schema `1`, universe manifest schema `4`, interest schema `2`, operation
-  fingerprint schema `2`, lifecycle-control schema `1`, production-occurrence
-  schema `1`, cell-directory schema `1`, and transfer/package schema `1` as one
+  fingerprint schema `2`, lifecycle-control schema `2`, production-occurrence
+  schema `1`, cell-directory schema `2`, and transfer/package schema `1` as one
   coordinated set.
 - An anchored, externally connected, boundary-spanning, or unsupported
   aggregate remains source-authoritative and is never silently split, deleted,

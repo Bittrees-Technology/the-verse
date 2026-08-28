@@ -35,6 +35,8 @@ pub struct CellAssignmentRecord {
     pub cell_key: CellKeyV1,
     pub cell_id: String,
     pub assignment_generation: u64,
+    pub authority_fencing_token: u64,
+    pub fencing_history: BTreeMap<u64, u64>,
     pub state: CellAssignmentState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub holder_id: Option<String>,
@@ -76,7 +78,15 @@ pub enum TransferPhase {
     Committed,
     Imported,
     Finalized,
+    Aborting,
     Aborted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferAbortRole {
+    Source,
+    Destination,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,7 +106,91 @@ pub struct CellTransferRecord {
     pub package_hash: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quarantine_receipt_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_prepare_proof: Option<CellTransferPrepareProof>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination_quarantine_proof: Option<CellTransferQuarantineProof>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub import_proof: Option<CellTransferImportProof>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finalization_proof: Option<CellTransferFinalizationProof>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_abort_proof: Option<CellTransferAbortProof>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination_abort_proof: Option<CellTransferAbortProof>,
     pub phase: TransferPhase,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CellTransferAbortProof {
+    pub(crate) transfer_id: String,
+    pub(crate) package_hash: String,
+    pub(crate) cell_id: String,
+    pub(crate) assignment_generation: u64,
+    pub(crate) role: TransferAbortRole,
+    pub(crate) fencing_token: u64,
+    pub(crate) event_sequence: u64,
+    pub(crate) event_hash: String,
+    pub(crate) world_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CellTransferImportProof {
+    pub(crate) transfer_id: String,
+    pub(crate) package_hash: String,
+    pub(crate) quarantine_receipt_hash: String,
+    pub(crate) destination_cell_id: String,
+    pub(crate) destination_assignment_generation: u64,
+    pub(crate) resulting_placement_generation: u64,
+    pub(crate) destination_fencing_token: u64,
+    pub(crate) destination_event_sequence: u64,
+    pub(crate) destination_event_hash: String,
+    pub(crate) destination_world_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CellTransferFinalizationProof {
+    pub(crate) transfer_id: String,
+    pub(crate) package_hash: String,
+    pub(crate) source_cell_id: String,
+    pub(crate) source_assignment_generation: u64,
+    pub(crate) resulting_placement_generation: u64,
+    pub(crate) source_fencing_token: u64,
+    pub(crate) source_event_sequence: u64,
+    pub(crate) source_event_hash: String,
+    pub(crate) source_world_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CellTransferPrepareProof {
+    pub(crate) transfer_id: String,
+    pub(crate) package_hash: String,
+    pub(crate) source_cell_id: String,
+    pub(crate) source_assignment_generation: u64,
+    pub(crate) prior_placement_generation: u64,
+    pub(crate) source_fencing_token: u64,
+    pub(crate) source_event_sequence: u64,
+    pub(crate) source_event_hash: String,
+    pub(crate) source_world_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CellTransferQuarantineProof {
+    pub(crate) transfer_id: String,
+    pub(crate) package_hash: String,
+    pub(crate) quarantine_receipt_hash: String,
+    pub(crate) destination_cell_id: String,
+    pub(crate) destination_assignment_generation: u64,
+    pub(crate) resulting_placement_generation: u64,
+    pub(crate) destination_fencing_token: u64,
+    pub(crate) destination_event_sequence: u64,
+    pub(crate) destination_event_hash: String,
+    pub(crate) destination_world_hash: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -155,7 +249,7 @@ pub struct LocalCellDirectory {
 }
 
 impl LocalCellDirectory {
-    pub fn open(
+    pub(crate) fn open(
         root: impl AsRef<Path>,
         universe_manifest: &UniverseManifestSnapshot,
         proof_cells: impl IntoIterator<Item = CellKeyV1>,
@@ -229,13 +323,19 @@ impl LocalCellDirectory {
             .ok_or(CellDirectoryError::UnknownCell(cell_id))
     }
 
-    pub fn claim(
+    pub(crate) fn claim(
         &mut self,
         cell_key: &CellKeyV1,
         expected_generation: u64,
         holder_id: &str,
+        authority_fencing_token: u64,
     ) -> Result<CellAssignmentRecord, CellDirectoryError> {
         validate_holder(holder_id)?;
+        if authority_fencing_token == 0 {
+            return Err(CellDirectoryError::InvalidDirectory(
+                "assigned cell authority fence must be positive".into(),
+            ));
+        }
         let cell_id = celestial::cell_id(cell_key)
             .map_err(|source| CellDirectoryError::InvalidDirectory(source.to_string()))?;
         let mut next_document = self.document.clone();
@@ -260,12 +360,23 @@ impl LocalCellDirectory {
             })?;
         assignment.state = CellAssignmentState::Assigned;
         assignment.holder_id = Some(holder_id.to_owned());
+        if authority_fencing_token <= assignment.authority_fencing_token {
+            return Err(CellDirectoryError::AssignmentConflict {
+                cell_id,
+                reason: "new cell authority fence must exceed its durable predecessor".into(),
+            });
+        }
+        assignment.authority_fencing_token = authority_fencing_token;
+        assignment
+            .fencing_history
+            .insert(assignment.assignment_generation, authority_fencing_token);
         let result = assignment.clone();
         self.commit_document(next_document)?;
         Ok(result)
     }
 
-    pub fn release(
+    #[allow(dead_code)]
+    pub(crate) fn release(
         &mut self,
         cell_key: &CellKeyV1,
         expected_generation: u64,
@@ -294,8 +405,64 @@ impl LocalCellDirectory {
                 reason: "generation, state, or holder no longer matches".into(),
             });
         }
+        if self.document.transfers.values().any(|transfer| {
+            !matches!(
+                transfer.phase,
+                TransferPhase::Finalized | TransferPhase::Aborted
+            ) && (transfer.source_cell_id == cell_id || transfer.destination_cell_id == cell_id)
+        }) {
+            return Err(CellDirectoryError::AssignmentConflict {
+                cell_id,
+                reason: "cell assignment is pinned by a nonterminal transfer".into(),
+            });
+        }
         assignment.state = CellAssignmentState::Sleeping;
         assignment.holder_id = None;
+        let result = assignment.clone();
+        self.commit_document(next_document)?;
+        Ok(result)
+    }
+
+    pub(crate) fn recover_assignment(
+        &mut self,
+        cell_key: &CellKeyV1,
+        expected_generation: u64,
+        holder_id: &str,
+        authority_fencing_token: u64,
+    ) -> Result<CellAssignmentRecord, CellDirectoryError> {
+        validate_holder(holder_id)?;
+        let cell_id = celestial::cell_id(cell_key)
+            .map_err(|source| CellDirectoryError::InvalidDirectory(source.to_string()))?;
+        let mut next_document = self.document.clone();
+        let assignment = next_document
+            .assignments
+            .get_mut(&cell_id)
+            .ok_or_else(|| CellDirectoryError::UnknownCell(cell_id.clone()))?;
+        if assignment.assignment_generation != expected_generation
+            || assignment.state != CellAssignmentState::Assigned
+        {
+            return Err(CellDirectoryError::AssignmentConflict {
+                cell_id,
+                reason: "only the current assigned generation may be recovered".into(),
+            });
+        }
+        assignment.assignment_generation = assignment
+            .assignment_generation
+            .checked_add(1)
+            .ok_or_else(|| {
+                CellDirectoryError::AssignmentGenerationExhausted(assignment.cell_id.clone())
+            })?;
+        if authority_fencing_token <= assignment.authority_fencing_token {
+            return Err(CellDirectoryError::AssignmentConflict {
+                cell_id,
+                reason: "replacement cell authority fence must strictly advance".into(),
+            });
+        }
+        assignment.authority_fencing_token = authority_fencing_token;
+        assignment
+            .fencing_history
+            .insert(assignment.assignment_generation, authority_fencing_token);
+        assignment.holder_id = Some(holder_id.to_owned());
         let result = assignment.clone();
         self.commit_document(next_document)?;
         Ok(result)
@@ -322,7 +489,7 @@ impl LocalCellDirectory {
         self.document.transfers.values().cloned().collect()
     }
 
-    pub fn register_placement(
+    pub(crate) fn register_placement(
         &mut self,
         aggregate_id: &str,
         aggregate_kind: MobileAggregateKind,
@@ -356,7 +523,7 @@ impl LocalCellDirectory {
         Ok(requested)
     }
 
-    pub fn prepare_transfer(
+    pub(crate) fn prepare_transfer(
         &mut self,
         aggregate_id: &str,
         expected_placement_generation: u64,
@@ -421,6 +588,12 @@ impl LocalCellDirectory {
             resulting_placement_generation,
             package_hash: package_hash.to_owned(),
             quarantine_receipt_hash: None,
+            source_prepare_proof: None,
+            destination_quarantine_proof: None,
+            import_proof: None,
+            finalization_proof: None,
+            source_abort_proof: None,
+            destination_abort_proof: None,
             phase: TransferPhase::Prepared,
         };
         let mut next_document = self.document.clone();
@@ -437,12 +610,60 @@ impl LocalCellDirectory {
         Ok(requested)
     }
 
-    pub fn record_quarantine(
+    pub(crate) fn record_source_prepared(
+        &mut self,
+        transfer_id: &str,
+        proof: &CellTransferPrepareProof,
+    ) -> Result<CellTransferRecord, CellDirectoryError> {
+        let mut proof = proof.clone();
+        let current = self.transfer(transfer_id)?.clone();
+        proof.source_assignment_generation = resolve_proof_generation(
+            &current,
+            proof.source_assignment_generation,
+            proof.source_fencing_token,
+            self.assignment(&current.source_cell_key)?,
+        )?;
+        validate_prepare_proof(&current, &proof)?;
+        if let Some(existing) = &current.source_prepare_proof {
+            if existing == &proof {
+                return Ok(current);
+            }
+            return Err(CellDirectoryError::TransferConflict {
+                transfer_id: transfer_id.to_owned(),
+                reason: "source prepare retry does not match the durable event proof".into(),
+            });
+        }
+        if current.phase != TransferPhase::Prepared {
+            return Err(CellDirectoryError::TransferConflict {
+                transfer_id: transfer_id.to_owned(),
+                reason: "source prepare proof arrived after the quarantine transition".into(),
+            });
+        }
+        validate_historical_proof_authority(
+            &current,
+            proof.source_assignment_generation,
+            proof.source_fencing_token,
+            self.assignment(&current.source_cell_key)?,
+        )?;
+        let mut next_document = self.document.clone();
+        let transfer = next_document
+            .transfers
+            .get_mut(transfer_id)
+            .expect("validated transfer exists in cloned document");
+        transfer.source_prepare_proof = Some(proof);
+        let result = transfer.clone();
+        self.commit_document(next_document)?;
+        Ok(result)
+    }
+
+    pub(crate) fn record_quarantine(
         &mut self,
         transfer_id: &str,
         package_hash: &str,
         receipt_hash: &str,
+        proof: &CellTransferQuarantineProof,
     ) -> Result<CellTransferRecord, CellDirectoryError> {
+        let mut proof = proof.clone();
         validate_hash(package_hash, "transfer package")?;
         validate_hash(receipt_hash, "quarantine receipt")?;
         let current = self.transfer(transfer_id)?.clone();
@@ -452,17 +673,45 @@ impl LocalCellDirectory {
                 reason: "quarantine package hash does not match prepare".into(),
             });
         }
+        proof.destination_assignment_generation = resolve_proof_generation(
+            &current,
+            proof.destination_assignment_generation,
+            proof.destination_fencing_token,
+            self.assignment(&current.destination_cell_key)?,
+        )?;
+        if proof.quarantine_receipt_hash != receipt_hash {
+            return Err(CellDirectoryError::TransferConflict {
+                transfer_id: transfer_id.to_owned(),
+                reason: "quarantine proof does not bind the submitted receipt hash".into(),
+            });
+        }
         if current.phase == TransferPhase::Quarantined
             && current.quarantine_receipt_hash.as_deref() == Some(receipt_hash)
         {
-            return Ok(current);
+            if current.destination_quarantine_proof.as_ref() == Some(&proof) {
+                return Ok(current);
+            }
+            return Err(CellDirectoryError::TransferConflict {
+                transfer_id: transfer_id.to_owned(),
+                reason: "quarantine retry does not match the durable event proof".into(),
+            });
         }
-        if current.phase != TransferPhase::Prepared || current.quarantine_receipt_hash.is_some() {
+        if current.phase != TransferPhase::Prepared
+            || current.quarantine_receipt_hash.is_some()
+            || current.source_prepare_proof.is_none()
+        {
             return Err(CellDirectoryError::TransferConflict {
                 transfer_id: transfer_id.to_owned(),
                 reason: "transfer is not awaiting its first quarantine receipt".into(),
             });
         }
+        validate_quarantine_proof(&current, &proof)?;
+        validate_historical_proof_authority(
+            &current,
+            proof.destination_assignment_generation,
+            proof.destination_fencing_token,
+            self.assignment(&current.destination_cell_key)?,
+        )?;
         let mut next_document = self.document.clone();
         let transfer = next_document
             .transfers
@@ -470,12 +719,13 @@ impl LocalCellDirectory {
             .expect("validated transfer exists in cloned document");
         transfer.phase = TransferPhase::Quarantined;
         transfer.quarantine_receipt_hash = Some(receipt_hash.to_owned());
+        transfer.destination_quarantine_proof = Some(proof);
         let result = transfer.clone();
         self.commit_document(next_document)?;
         Ok(result)
     }
 
-    pub fn commit_transfer(
+    pub(crate) fn commit_transfer(
         &mut self,
         transfer_id: &str,
         expected_prior_placement_generation: u64,
@@ -491,6 +741,8 @@ impl LocalCellDirectory {
         if current.phase != TransferPhase::Quarantined
             || current.prior_placement_generation != expected_prior_placement_generation
             || current.quarantine_receipt_hash.is_none()
+            || current.source_prepare_proof.is_none()
+            || current.destination_quarantine_proof.is_none()
         {
             return Err(CellDirectoryError::TransferConflict {
                 transfer_id: transfer_id.to_owned(),
@@ -501,9 +753,9 @@ impl LocalCellDirectory {
         let destination_assignment = self.assignment(&current.destination_cell_key)?;
         if source_assignment.state != CellAssignmentState::Assigned
             || destination_assignment.state != CellAssignmentState::Assigned
-            || source_assignment.assignment_generation != current.source_assignment_generation
+            || source_assignment.assignment_generation < current.source_assignment_generation
             || destination_assignment.assignment_generation
-                != current.destination_assignment_generation
+                < current.destination_assignment_generation
         {
             return Err(CellDirectoryError::TransferConflict {
                 transfer_id: transfer_id.to_owned(),
@@ -543,16 +795,30 @@ impl LocalCellDirectory {
         Ok(result)
     }
 
-    pub fn record_imported(
+    pub(crate) fn record_imported(
         &mut self,
         transfer_id: &str,
+        proof: &CellTransferImportProof,
     ) -> Result<CellTransferRecord, CellDirectoryError> {
+        let mut proof = proof.clone();
         let current = self.transfer(transfer_id)?.clone();
+        proof.destination_assignment_generation = resolve_proof_generation(
+            &current,
+            proof.destination_assignment_generation,
+            proof.destination_fencing_token,
+            self.assignment(&current.destination_cell_key)?,
+        )?;
         if matches!(
             current.phase,
             TransferPhase::Imported | TransferPhase::Finalized
         ) {
-            return Ok(current);
+            if current.import_proof.as_ref() == Some(&proof) {
+                return Ok(current);
+            }
+            return Err(CellDirectoryError::TransferConflict {
+                transfer_id: transfer_id.to_owned(),
+                reason: "import retry does not match the durable destination proof".into(),
+            });
         }
         let placement = self.placement(&current.aggregate_id)?;
         if current.phase != TransferPhase::Committed
@@ -566,6 +832,13 @@ impl LocalCellDirectory {
                 reason: "committed destination placement is not ready for import".into(),
             });
         }
+        validate_import_proof(&current, &proof)?;
+        validate_historical_proof_authority(
+            &current,
+            proof.destination_assignment_generation,
+            proof.destination_fencing_token,
+            self.assignment(&current.destination_cell_key)?,
+        )?;
         let mut next_document = self.document.clone();
         let next_placement = next_document
             .placements
@@ -578,18 +851,33 @@ impl LocalCellDirectory {
             .get_mut(transfer_id)
             .expect("validated transfer exists in cloned document");
         transfer.phase = TransferPhase::Imported;
+        transfer.import_proof = Some(proof);
         let result = transfer.clone();
         self.commit_document(next_document)?;
         Ok(result)
     }
 
-    pub fn finalize_transfer(
+    pub(crate) fn finalize_transfer(
         &mut self,
         transfer_id: &str,
+        proof: &CellTransferFinalizationProof,
     ) -> Result<CellTransferRecord, CellDirectoryError> {
+        let mut proof = proof.clone();
         let current = self.transfer(transfer_id)?.clone();
+        proof.source_assignment_generation = resolve_proof_generation(
+            &current,
+            proof.source_assignment_generation,
+            proof.source_fencing_token,
+            self.assignment(&current.source_cell_key)?,
+        )?;
         if current.phase == TransferPhase::Finalized {
-            return Ok(current);
+            if current.finalization_proof.as_ref() == Some(&proof) {
+                return Ok(current);
+            }
+            return Err(CellDirectoryError::TransferConflict {
+                transfer_id: transfer_id.to_owned(),
+                reason: "finalization retry does not match the durable source proof".into(),
+            });
         }
         if current.phase != TransferPhase::Imported {
             return Err(CellDirectoryError::TransferConflict {
@@ -607,23 +895,34 @@ impl LocalCellDirectory {
                 reason: "destination residency does not match imported transfer".into(),
             });
         }
+        validate_finalization_proof(&current, &proof)?;
+        validate_historical_proof_authority(
+            &current,
+            proof.source_assignment_generation,
+            proof.source_fencing_token,
+            self.assignment(&current.source_cell_key)?,
+        )?;
         let mut next_document = self.document.clone();
         let transfer = next_document
             .transfers
             .get_mut(transfer_id)
             .expect("validated transfer exists in cloned document");
         transfer.phase = TransferPhase::Finalized;
+        transfer.finalization_proof = Some(proof);
         let result = transfer.clone();
         self.commit_document(next_document)?;
         Ok(result)
     }
 
-    pub fn abort_transfer(
+    pub(crate) fn request_abort(
         &mut self,
         transfer_id: &str,
     ) -> Result<CellTransferRecord, CellDirectoryError> {
         let current = self.transfer(transfer_id)?.clone();
-        if current.phase == TransferPhase::Aborted {
+        if matches!(
+            current.phase,
+            TransferPhase::Aborting | TransferPhase::Aborted
+        ) {
             return Ok(current);
         }
         if !matches!(
@@ -647,6 +946,110 @@ impl LocalCellDirectory {
             });
         }
         let mut next_document = self.document.clone();
+        let transfer = next_document
+            .transfers
+            .get_mut(transfer_id)
+            .expect("validated transfer exists in cloned document");
+        transfer.phase = TransferPhase::Aborting;
+        let result = transfer.clone();
+        self.commit_document(next_document)?;
+        Ok(result)
+    }
+
+    pub(crate) fn record_abort_cleanup(
+        &mut self,
+        transfer_id: &str,
+        proof: &CellTransferAbortProof,
+    ) -> Result<CellTransferRecord, CellDirectoryError> {
+        let mut proof = proof.clone();
+        let current = self.transfer(transfer_id)?.clone();
+        if current.phase != TransferPhase::Aborting {
+            return Err(CellDirectoryError::TransferConflict {
+                transfer_id: transfer_id.to_owned(),
+                reason: "abort cleanup proof requires an aborting transfer".into(),
+            });
+        }
+        let cell_key = match proof.role {
+            TransferAbortRole::Source => &current.source_cell_key,
+            TransferAbortRole::Destination => &current.destination_cell_key,
+        };
+        proof.assignment_generation = resolve_proof_generation(
+            &current,
+            proof.assignment_generation,
+            proof.fencing_token,
+            self.assignment(cell_key)?,
+        )?;
+        validate_abort_proof(&current, &proof)?;
+        let (existing, cell_key) = match proof.role {
+            TransferAbortRole::Source => (
+                current.source_abort_proof.as_ref(),
+                &current.source_cell_key,
+            ),
+            TransferAbortRole::Destination => (
+                current.destination_abort_proof.as_ref(),
+                &current.destination_cell_key,
+            ),
+        };
+        if let Some(existing) = existing {
+            if existing == &proof {
+                return Ok(current);
+            }
+            return Err(CellDirectoryError::TransferConflict {
+                transfer_id: transfer_id.to_owned(),
+                reason: "abort cleanup retry does not match its durable cell proof".into(),
+            });
+        }
+        validate_historical_proof_authority(
+            &current,
+            proof.assignment_generation,
+            proof.fencing_token,
+            self.assignment(cell_key)?,
+        )?;
+        let mut next_document = self.document.clone();
+        let transfer = next_document
+            .transfers
+            .get_mut(transfer_id)
+            .expect("validated transfer exists in cloned document");
+        match proof.role {
+            TransferAbortRole::Source => transfer.source_abort_proof = Some(proof),
+            TransferAbortRole::Destination => {
+                transfer.destination_abort_proof = Some(proof);
+            }
+        }
+        let result = transfer.clone();
+        self.commit_document(next_document)?;
+        Ok(result)
+    }
+
+    pub(crate) fn finalize_abort(
+        &mut self,
+        transfer_id: &str,
+    ) -> Result<CellTransferRecord, CellDirectoryError> {
+        let current = self.transfer(transfer_id)?.clone();
+        if current.phase == TransferPhase::Aborted {
+            return Ok(current);
+        }
+        if current.phase != TransferPhase::Aborting
+            || current.source_abort_proof.is_none()
+            || current.destination_abort_proof.is_none()
+        {
+            return Err(CellDirectoryError::TransferConflict {
+                transfer_id: transfer_id.to_owned(),
+                reason: "abort cannot finish before every durable cell cleanup".into(),
+            });
+        }
+        let placement = self.placement(&current.aggregate_id)?;
+        if placement.state != AggregatePlacementState::Preparing
+            || placement.cell_id != current.source_cell_id
+            || placement.placement_generation != current.prior_placement_generation
+            || placement.active_transfer_id.as_deref() != Some(transfer_id)
+        {
+            return Err(CellDirectoryError::TransferConflict {
+                transfer_id: transfer_id.to_owned(),
+                reason: "source placement no longer matches the aborting transfer".into(),
+            });
+        }
+        let mut next_document = self.document.clone();
         let next_placement = next_document
             .placements
             .get_mut(&current.aggregate_id)
@@ -663,7 +1066,10 @@ impl LocalCellDirectory {
         Ok(result)
     }
 
-    pub fn cell_store_root(&self, cell_key: &CellKeyV1) -> Result<PathBuf, CellDirectoryError> {
+    pub(crate) fn cell_store_root(
+        &self,
+        cell_key: &CellKeyV1,
+    ) -> Result<PathBuf, CellDirectoryError> {
         let assignment = self.assignment(cell_key)?;
         Ok(self.root.join("cells").join(&assignment.cell_id))
     }
@@ -715,6 +1121,8 @@ fn canonical_assignments(
             cell_key,
             cell_id: cell_id.clone(),
             assignment_generation: 0,
+            authority_fencing_token: 0,
+            fencing_history: BTreeMap::new(),
             state: CellAssignmentState::Sleeping,
             holder_id: None,
         };
@@ -768,6 +1176,7 @@ fn validate_document(
             }
             CellAssignmentState::Assigned => {
                 if stored.assignment_generation == 0
+                    || stored.authority_fencing_token == 0
                     || stored.holder_id.as_deref().is_none_or(str::is_empty)
                 {
                     return Err(CellDirectoryError::InvalidDirectory(format!(
@@ -780,6 +1189,32 @@ fn validate_document(
                     "cell {cell_id} retained an incomplete assignment transition"
                 )));
             }
+        }
+        if stored.fencing_history.len()
+            != usize::try_from(stored.assignment_generation).unwrap_or(usize::MAX)
+            || stored
+                .fencing_history
+                .iter()
+                .enumerate()
+                .any(|(index, (generation, fence))| {
+                    *generation != u64::try_from(index + 1).unwrap_or(u64::MAX)
+                        || *fence == 0
+                        || (index > 0
+                            && stored
+                                .fencing_history
+                                .get(&(generation - 1))
+                                .is_some_and(|previous| previous >= fence))
+                })
+            || stored
+                .fencing_history
+                .get(&stored.assignment_generation)
+                .copied()
+                .unwrap_or(0)
+                != stored.authority_fencing_token
+        {
+            return Err(CellDirectoryError::InvalidDirectory(format!(
+                "cell {cell_id} assignment-to-fence history is invalid"
+            )));
         }
     }
     for (aggregate_id, placement) in &document.placements {
@@ -864,8 +1299,79 @@ fn validate_document(
         if let Some(receipt_hash) = &transfer.quarantine_receipt_hash {
             validate_hash(receipt_hash, "quarantine receipt")?;
         }
+        if let Some(proof) = &transfer.source_prepare_proof {
+            validate_prepare_proof(transfer, proof)?;
+            validate_historical_proof_authority(
+                transfer,
+                proof.source_assignment_generation,
+                proof.source_fencing_token,
+                source,
+            )?;
+        }
+        if let Some(proof) = &transfer.destination_quarantine_proof {
+            validate_quarantine_proof(transfer, proof)?;
+            validate_historical_proof_authority(
+                transfer,
+                proof.destination_assignment_generation,
+                proof.destination_fencing_token,
+                destination,
+            )?;
+            if transfer.quarantine_receipt_hash.as_deref()
+                != Some(proof.quarantine_receipt_hash.as_str())
+            {
+                return Err(CellDirectoryError::InvalidDirectory(format!(
+                    "transfer {transfer_id} quarantine proof and receipt disagree"
+                )));
+            }
+        }
+        if let Some(proof) = &transfer.import_proof {
+            validate_import_proof(transfer, proof)?;
+            validate_historical_proof_authority(
+                transfer,
+                proof.destination_assignment_generation,
+                proof.destination_fencing_token,
+                destination,
+            )?;
+        }
+        if let Some(proof) = &transfer.finalization_proof {
+            validate_finalization_proof(transfer, proof)?;
+            validate_historical_proof_authority(
+                transfer,
+                proof.source_assignment_generation,
+                proof.source_fencing_token,
+                source,
+            )?;
+        }
+        if let Some(proof) = &transfer.source_abort_proof {
+            validate_abort_proof(transfer, proof)?;
+            validate_historical_proof_authority(
+                transfer,
+                proof.assignment_generation,
+                proof.fencing_token,
+                source,
+            )?;
+            if proof.role != TransferAbortRole::Source {
+                return Err(CellDirectoryError::InvalidDirectory(format!(
+                    "transfer {transfer_id} source abort proof has the wrong role"
+                )));
+            }
+        }
+        if let Some(proof) = &transfer.destination_abort_proof {
+            validate_abort_proof(transfer, proof)?;
+            validate_historical_proof_authority(
+                transfer,
+                proof.assignment_generation,
+                proof.fencing_token,
+                destination,
+            )?;
+            if proof.role != TransferAbortRole::Destination {
+                return Err(CellDirectoryError::InvalidDirectory(format!(
+                    "transfer {transfer_id} destination abort proof has the wrong role"
+                )));
+            }
+        }
         let placement_matches = match transfer.phase {
-            TransferPhase::Prepared | TransferPhase::Quarantined => {
+            TransferPhase::Prepared | TransferPhase::Quarantined | TransferPhase::Aborting => {
                 placement.state == AggregatePlacementState::Preparing
                     && placement.cell_id == transfer.source_cell_id
                     && placement.placement_generation == transfer.prior_placement_generation
@@ -898,6 +1404,40 @@ fn validate_document(
                     | TransferPhase::Imported
                     | TransferPhase::Finalized
             ) && transfer.quarantine_receipt_hash.is_none())
+            || (transfer.source_prepare_proof.is_none()
+                && !matches!(
+                    transfer.phase,
+                    TransferPhase::Prepared | TransferPhase::Aborted
+                ))
+            || (transfer.destination_quarantine_proof.is_some()
+                != transfer.quarantine_receipt_hash.is_some())
+            || (matches!(
+                transfer.phase,
+                TransferPhase::Quarantined
+                    | TransferPhase::Committed
+                    | TransferPhase::Imported
+                    | TransferPhase::Finalized
+            ) && transfer.destination_quarantine_proof.is_none())
+            || (matches!(
+                transfer.phase,
+                TransferPhase::Prepared
+                    | TransferPhase::Quarantined
+                    | TransferPhase::Committed
+                    | TransferPhase::Aborting
+                    | TransferPhase::Aborted
+            ) && (transfer.import_proof.is_some() || transfer.finalization_proof.is_some()))
+            || (transfer.phase == TransferPhase::Imported
+                && (transfer.import_proof.is_none() || transfer.finalization_proof.is_some()))
+            || (transfer.phase == TransferPhase::Finalized
+                && (transfer.import_proof.is_none() || transfer.finalization_proof.is_none()))
+            || (!matches!(
+                transfer.phase,
+                TransferPhase::Aborting | TransferPhase::Aborted
+            ) && (transfer.source_abort_proof.is_some()
+                || transfer.destination_abort_proof.is_some()))
+            || (transfer.phase == TransferPhase::Aborted
+                && (transfer.source_abort_proof.is_none()
+                    || transfer.destination_abort_proof.is_none()))
         {
             return Err(CellDirectoryError::InvalidDirectory(format!(
                 "transfer {transfer_id} phase and placement state disagree"
@@ -926,6 +1466,184 @@ fn validate_hash(value: &str, kind: &str) -> Result<(), CellDirectoryError> {
         return Err(CellDirectoryError::InvalidDirectory(format!(
             "{kind} hash is not canonical BLAKE3 text"
         )));
+    }
+    Ok(())
+}
+
+fn validate_import_proof(
+    transfer: &CellTransferRecord,
+    proof: &CellTransferImportProof,
+) -> Result<(), CellDirectoryError> {
+    validate_hash(&proof.destination_event_hash, "destination import event")?;
+    validate_hash(&proof.destination_world_hash, "destination import world")?;
+    if proof.transfer_id != transfer.transfer_id
+        || proof.package_hash != transfer.package_hash
+        || transfer.quarantine_receipt_hash.as_deref()
+            != Some(proof.quarantine_receipt_hash.as_str())
+        || proof.destination_cell_id != transfer.destination_cell_id
+        || proof.destination_assignment_generation < transfer.destination_assignment_generation
+        || proof.resulting_placement_generation != transfer.resulting_placement_generation
+        || proof.destination_fencing_token == 0
+        || proof.destination_event_sequence == 0
+    {
+        return Err(CellDirectoryError::TransferConflict {
+            transfer_id: transfer.transfer_id.clone(),
+            reason: "destination import proof does not bind the committed transfer".into(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_finalization_proof(
+    transfer: &CellTransferRecord,
+    proof: &CellTransferFinalizationProof,
+) -> Result<(), CellDirectoryError> {
+    validate_hash(&proof.source_event_hash, "source finalization event")?;
+    validate_hash(&proof.source_world_hash, "source finalization world")?;
+    if proof.transfer_id != transfer.transfer_id
+        || proof.package_hash != transfer.package_hash
+        || proof.source_cell_id != transfer.source_cell_id
+        || proof.source_assignment_generation < transfer.source_assignment_generation
+        || proof.resulting_placement_generation != transfer.resulting_placement_generation
+        || proof.source_fencing_token == 0
+        || proof.source_event_sequence == 0
+    {
+        return Err(CellDirectoryError::TransferConflict {
+            transfer_id: transfer.transfer_id.clone(),
+            reason: "source finalization proof does not bind the committed transfer".into(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_prepare_proof(
+    transfer: &CellTransferRecord,
+    proof: &CellTransferPrepareProof,
+) -> Result<(), CellDirectoryError> {
+    validate_hash(&proof.source_event_hash, "source prepare event")?;
+    validate_hash(&proof.source_world_hash, "source prepare world")?;
+    if proof.transfer_id != transfer.transfer_id
+        || proof.package_hash != transfer.package_hash
+        || proof.source_cell_id != transfer.source_cell_id
+        || proof.source_assignment_generation < transfer.source_assignment_generation
+        || proof.prior_placement_generation != transfer.prior_placement_generation
+        || proof.source_fencing_token == 0
+        || proof.source_event_sequence == 0
+    {
+        return Err(CellDirectoryError::TransferConflict {
+            transfer_id: transfer.transfer_id.clone(),
+            reason: "source prepare proof does not bind the prepared transfer".into(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_quarantine_proof(
+    transfer: &CellTransferRecord,
+    proof: &CellTransferQuarantineProof,
+) -> Result<(), CellDirectoryError> {
+    validate_hash(
+        &proof.destination_event_hash,
+        "destination quarantine event",
+    )?;
+    validate_hash(
+        &proof.destination_world_hash,
+        "destination quarantine world",
+    )?;
+    if proof.transfer_id != transfer.transfer_id
+        || proof.package_hash != transfer.package_hash
+        || transfer
+            .quarantine_receipt_hash
+            .as_deref()
+            .is_some_and(|receipt| receipt != proof.quarantine_receipt_hash)
+        || proof.destination_cell_id != transfer.destination_cell_id
+        || proof.destination_assignment_generation < transfer.destination_assignment_generation
+        || proof.resulting_placement_generation != transfer.resulting_placement_generation
+        || proof.destination_fencing_token == 0
+        || proof.destination_event_sequence == 0
+    {
+        return Err(CellDirectoryError::TransferConflict {
+            transfer_id: transfer.transfer_id.clone(),
+            reason: "destination quarantine proof does not bind the prepared transfer".into(),
+        });
+    }
+    Ok(())
+}
+
+fn resolve_proof_generation(
+    transfer: &CellTransferRecord,
+    claimed_generation: u64,
+    fencing_token: u64,
+    assignment: &CellAssignmentRecord,
+) -> Result<u64, CellDirectoryError> {
+    let generations = assignment
+        .fencing_history
+        .iter()
+        .filter_map(|(generation, fence)| (*fence == fencing_token).then_some(*generation))
+        .collect::<Vec<_>>();
+    if assignment.state != CellAssignmentState::Assigned || generations.len() != 1 {
+        return Err(CellDirectoryError::TransferConflict {
+            transfer_id: transfer.transfer_id.clone(),
+            reason: "cell event fence does not resolve to one durable assignment generation".into(),
+        });
+    }
+    let generation = generations[0];
+    if claimed_generation != 0 && claimed_generation != generation {
+        return Err(CellDirectoryError::TransferConflict {
+            transfer_id: transfer.transfer_id.clone(),
+            reason: "cell event proof claims the wrong historical assignment generation".into(),
+        });
+    }
+    Ok(generation)
+}
+
+fn validate_historical_proof_authority(
+    transfer: &CellTransferRecord,
+    assignment_generation: u64,
+    fencing_token: u64,
+    assignment: &CellAssignmentRecord,
+) -> Result<(), CellDirectoryError> {
+    if assignment
+        .fencing_history
+        .get(&assignment_generation)
+        .copied()
+        != Some(fencing_token)
+    {
+        return Err(CellDirectoryError::InvalidDirectory(format!(
+            "transfer {} proof generation is not bound to its historical cell fence",
+            transfer.transfer_id
+        )));
+    }
+    Ok(())
+}
+
+fn validate_abort_proof(
+    transfer: &CellTransferRecord,
+    proof: &CellTransferAbortProof,
+) -> Result<(), CellDirectoryError> {
+    validate_hash(&proof.event_hash, "abort cleanup event")?;
+    validate_hash(&proof.world_hash, "abort cleanup world")?;
+    let (expected_cell_id, minimum_generation) = match proof.role {
+        TransferAbortRole::Source => (
+            transfer.source_cell_id.as_str(),
+            transfer.source_assignment_generation,
+        ),
+        TransferAbortRole::Destination => (
+            transfer.destination_cell_id.as_str(),
+            transfer.destination_assignment_generation,
+        ),
+    };
+    if proof.transfer_id != transfer.transfer_id
+        || proof.package_hash != transfer.package_hash
+        || proof.cell_id != expected_cell_id
+        || proof.assignment_generation < minimum_generation
+        || proof.fencing_token == 0
+        || proof.event_sequence == 0
+    {
+        return Err(CellDirectoryError::TransferConflict {
+            transfer_id: transfer.transfer_id.clone(),
+            reason: "abort cleanup proof does not bind the transfer and cell role".into(),
+        });
     }
     Ok(())
 }
@@ -991,6 +1709,79 @@ mod tests {
             .expect("test manifest builds")
     }
 
+    fn import_proof(transfer: &CellTransferRecord, receipt_hash: &str) -> CellTransferImportProof {
+        CellTransferImportProof {
+            transfer_id: transfer.transfer_id.clone(),
+            package_hash: transfer.package_hash.clone(),
+            quarantine_receipt_hash: receipt_hash.to_owned(),
+            destination_cell_id: transfer.destination_cell_id.clone(),
+            destination_assignment_generation: transfer.destination_assignment_generation,
+            resulting_placement_generation: transfer.resulting_placement_generation,
+            destination_fencing_token: 9,
+            destination_event_sequence: 41,
+            destination_event_hash: blake3::hash(b"destination-import-event")
+                .to_hex()
+                .to_string(),
+            destination_world_hash: blake3::hash(b"destination-import-world")
+                .to_hex()
+                .to_string(),
+        }
+    }
+
+    fn finalization_proof(transfer: &CellTransferRecord) -> CellTransferFinalizationProof {
+        CellTransferFinalizationProof {
+            transfer_id: transfer.transfer_id.clone(),
+            package_hash: transfer.package_hash.clone(),
+            source_cell_id: transfer.source_cell_id.clone(),
+            source_assignment_generation: transfer.source_assignment_generation,
+            resulting_placement_generation: transfer.resulting_placement_generation,
+            source_fencing_token: 5,
+            source_event_sequence: 43,
+            source_event_hash: blake3::hash(b"source-finalization-event")
+                .to_hex()
+                .to_string(),
+            source_world_hash: blake3::hash(b"source-finalization-world")
+                .to_hex()
+                .to_string(),
+        }
+    }
+
+    fn prepare_proof(transfer: &CellTransferRecord) -> CellTransferPrepareProof {
+        CellTransferPrepareProof {
+            transfer_id: transfer.transfer_id.clone(),
+            package_hash: transfer.package_hash.clone(),
+            source_cell_id: transfer.source_cell_id.clone(),
+            source_assignment_generation: transfer.source_assignment_generation,
+            prior_placement_generation: transfer.prior_placement_generation,
+            source_fencing_token: 5,
+            source_event_sequence: 37,
+            source_event_hash: blake3::hash(b"source-prepare-event").to_hex().to_string(),
+            source_world_hash: blake3::hash(b"source-prepare-world").to_hex().to_string(),
+        }
+    }
+
+    fn quarantine_proof(
+        transfer: &CellTransferRecord,
+        receipt_hash: &str,
+    ) -> CellTransferQuarantineProof {
+        CellTransferQuarantineProof {
+            transfer_id: transfer.transfer_id.clone(),
+            package_hash: transfer.package_hash.clone(),
+            quarantine_receipt_hash: receipt_hash.to_owned(),
+            destination_cell_id: transfer.destination_cell_id.clone(),
+            destination_assignment_generation: transfer.destination_assignment_generation,
+            resulting_placement_generation: transfer.resulting_placement_generation,
+            destination_fencing_token: 9,
+            destination_event_sequence: 39,
+            destination_event_hash: blake3::hash(b"destination-quarantine-event")
+                .to_hex()
+                .to_string(),
+            destination_world_hash: blake3::hash(b"destination-quarantine-world")
+                .to_hex()
+                .to_string(),
+        }
+    }
+
     #[test]
     fn two_cell_assignments_persist_distinct_roots_and_generations() {
         let directory_root = tempdir().expect("temporary directory");
@@ -1009,12 +1800,12 @@ mod tests {
         );
 
         let claimed = directory
-            .claim(&origin, 0, "worker-origin-a")
+            .claim(&origin, 0, "worker-origin-a", 1)
             .expect("origin claim commits");
         assert_eq!(claimed.assignment_generation, 1);
         assert_eq!(claimed.state, CellAssignmentState::Assigned);
         assert_eq!(claimed.holder_id.as_deref(), Some("worker-origin-a"));
-        assert!(directory.claim(&origin, 0, "worker-origin-b").is_err());
+        assert!(directory.claim(&origin, 0, "worker-origin-b", 2).is_err());
 
         let released = directory
             .release(&origin, 1, "worker-origin-a")
@@ -1036,7 +1827,7 @@ mod tests {
             &released
         );
         let replacement = reopened
-            .claim(&origin, 1, "worker-origin-b")
+            .claim(&origin, 1, "worker-origin-b", 2)
             .expect("replacement claim advances generation");
         assert_eq!(replacement.assignment_generation, 2);
     }
@@ -1111,10 +1902,10 @@ mod tests {
         )
         .expect("directory opens");
         directory
-            .claim(&origin, 0, "worker-origin")
+            .claim(&origin, 0, "worker-origin", 5)
             .expect("source assignment commits");
         directory
-            .claim(&east, 0, "worker-east")
+            .claim(&east, 0, "worker-east", 9)
             .expect("destination assignment commits");
         directory
             .register_placement("player-local", MobileAggregateKind::Player, &origin)
@@ -1125,6 +1916,8 @@ mod tests {
         assert_eq!(prepared.phase, TransferPhase::Prepared);
         assert_eq!(prepared.prior_placement_generation, 1);
         assert_eq!(prepared.resulting_placement_generation, 2);
+        assert!(directory.commit_transfer("transfer-player-1", 1).is_err());
+        assert!(directory.release(&origin, 1, "worker-origin").is_err());
         assert_eq!(
             directory
                 .prepare_transfer("player-local", 1, "transfer-player-1", &east, &package_hash)
@@ -1150,8 +1943,35 @@ mod tests {
             [origin.clone(), east.clone()],
         )
         .expect("prepared directory reopens");
+        let prepare_proof = prepare_proof(
+            directory
+                .transfer("transfer-player-1")
+                .expect("prepared transfer exists"),
+        );
+        let mut forged_prepare = prepare_proof.clone();
+        forged_prepare.source_event_sequence = 0;
+        assert!(
+            directory
+                .record_source_prepared("transfer-player-1", &forged_prepare)
+                .is_err()
+        );
+        directory
+            .record_source_prepared("transfer-player-1", &prepare_proof)
+            .expect("source prepare proof commits");
+        assert!(directory.commit_transfer("transfer-player-1", 1).is_err());
+        let quarantine_proof = quarantine_proof(
+            directory
+                .transfer("transfer-player-1")
+                .expect("prepared transfer remains"),
+            &receipt_hash,
+        );
         let quarantined = directory
-            .record_quarantine("transfer-player-1", &package_hash, &receipt_hash)
+            .record_quarantine(
+                "transfer-player-1",
+                &package_hash,
+                &receipt_hash,
+                &quarantine_proof,
+            )
             .expect("quarantine commits");
         assert_eq!(quarantined.phase, TransferPhase::Quarantined);
         drop(directory);
@@ -1172,7 +1992,7 @@ mod tests {
         assert_eq!(placement.cell_key, east);
         assert_eq!(placement.placement_generation, 2);
         assert_eq!(placement.state, AggregatePlacementState::InTransit);
-        assert!(directory.abort_transfer("transfer-player-1").is_err());
+        assert!(directory.request_abort("transfer-player-1").is_err());
         drop(directory);
 
         let mut directory = LocalCellDirectory::open(
@@ -1181,23 +2001,51 @@ mod tests {
             [origin.clone(), east.clone()],
         )
         .expect("committed directory reopens");
+        let import_proof = import_proof(
+            directory
+                .transfer("transfer-player-1")
+                .expect("committed transfer exists"),
+            &receipt_hash,
+        );
+        let mut forged_import = import_proof.clone();
+        forged_import.destination_fencing_token = 0;
+        assert!(
+            directory
+                .record_imported("transfer-player-1", &forged_import)
+                .is_err()
+        );
         let imported = directory
-            .record_imported("transfer-player-1")
+            .record_imported("transfer-player-1", &import_proof)
             .expect("import commits");
         assert_eq!(imported.phase, TransferPhase::Imported);
         assert_eq!(
             directory
-                .record_imported("transfer-player-1")
+                .record_imported("transfer-player-1", &import_proof)
                 .expect("import retry reconciles"),
             imported
         );
         drop(directory);
 
-        let mut directory =
-            LocalCellDirectory::open(directory_root.path(), &manifest, [origin, east.clone()])
-                .expect("imported directory reopens");
+        let mut directory = LocalCellDirectory::open(
+            directory_root.path(),
+            &manifest,
+            [origin.clone(), east.clone()],
+        )
+        .expect("imported directory reopens");
+        let finalization_proof = finalization_proof(
+            directory
+                .transfer("transfer-player-1")
+                .expect("imported transfer exists"),
+        );
+        let mut forged_finalization = finalization_proof.clone();
+        forged_finalization.source_event_sequence = 0;
+        assert!(
+            directory
+                .finalize_transfer("transfer-player-1", &forged_finalization)
+                .is_err()
+        );
         let finalized = directory
-            .finalize_transfer("transfer-player-1")
+            .finalize_transfer("transfer-player-1", &finalization_proof)
             .expect("finalization commits");
         assert_eq!(finalized.phase, TransferPhase::Finalized);
         let placement = directory
@@ -1207,10 +2055,30 @@ mod tests {
         assert_eq!(placement.placement_generation, 2);
         assert_eq!(placement.state, AggregatePlacementState::Resident);
         assert!(placement.active_transfer_id.is_none());
+
+        directory
+            .recover_assignment(&origin, 1, "worker-origin-successor", 6)
+            .expect("source successor binds a second generation and fence");
+        drop(directory);
+        let path = directory_root.path().join(DIRECTORY_FILE);
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("directory reads"))
+                .expect("directory parses");
+        document["transfers"]["transfer-player-1"]["finalization_proof"]["source_assignment_generation"] =
+            serde_json::json!(2);
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&document).expect("tampered directory serializes"),
+        )
+        .expect("tampered directory writes");
+        assert!(matches!(
+            LocalCellDirectory::open(directory_root.path(), &manifest, [origin, east]),
+            Err(CellDirectoryError::InvalidDirectory(_))
+        ));
     }
 
     #[test]
-    fn only_precommit_transfer_can_abort_back_to_source() {
+    fn precommit_abort_remains_pinned_until_both_cell_cleanups_are_proved() {
         let directory_root = tempdir().expect("temporary directory");
         let manifest = manifest(707);
         let [origin, east] = proof_cell_keys().expect("proof keys build");
@@ -1222,10 +2090,10 @@ mod tests {
         )
         .expect("directory opens");
         directory
-            .claim(&origin, 0, "worker-origin")
+            .claim(&origin, 0, "worker-origin", 5)
             .expect("source assignment commits");
         directory
-            .claim(&east, 0, "worker-east")
+            .claim(&east, 0, "worker-east", 9)
             .expect("destination assignment commits");
         directory
             .register_placement("grid-mobile", MobileAggregateKind::Grid, &origin)
@@ -1239,16 +2107,18 @@ mod tests {
                 &package_hash,
             )
             .expect("prepare commits");
-        let aborted = directory
-            .abort_transfer("transfer-grid-abort")
-            .expect("precommit abort succeeds");
-        assert_eq!(aborted.phase, TransferPhase::Aborted);
+        let aborting = directory
+            .request_abort("transfer-grid-abort")
+            .expect("precommit abort begins");
+        assert_eq!(aborting.phase, TransferPhase::Aborting);
+        assert!(directory.finalize_abort("transfer-grid-abort").is_err());
+        assert!(directory.release(&origin, 1, "worker-origin").is_err());
         let placement = directory
             .placement("grid-mobile")
             .expect("placement exists");
         assert_eq!(placement.cell_key, origin);
         assert_eq!(placement.placement_generation, 1);
-        assert_eq!(placement.state, AggregatePlacementState::Resident);
+        assert_eq!(placement.state, AggregatePlacementState::Preparing);
     }
 
     #[test]

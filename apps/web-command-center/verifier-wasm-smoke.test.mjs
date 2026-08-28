@@ -26,7 +26,7 @@ const proofCommitments = {
   expected_content_hash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   expected_universe_id: "universe-vector",
   expected_celestial_registry_hash: "f00517b0fbef09d7924fde2cb11f2c74066627992ab900a6a9e0bd3ac3dc7311",
-  expected_universe_manifest_hash: "a3d5eb718f859d6010854f231a0e2cb4518c9618580020762311b4c3e43e3e06",
+  expected_universe_manifest_hash: "551b4f30761a3fe8eed2bc3a9525e46f81d16563f9118b305bf5f2a3b9e63346",
 };
 
 async function readVector(name) {
