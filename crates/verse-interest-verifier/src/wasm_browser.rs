@@ -117,9 +117,6 @@ impl BrowserInterestVerifier {
         let Some(verifier) = self.verifier.as_mut() else {
             return self.init_failure();
         };
-        if self.pending.is_some() {
-            return failure("pending_stage", "a browser transition is already pending");
-        }
         let token = match verifier.stage(raw_json.as_bytes()) {
             Ok(token) => token,
             Err(error) => return verifier_failure(&error),
@@ -274,6 +271,7 @@ const fn stage_kind(kind: StageKind) -> &'static str {
     match kind {
         StageKind::Welcome => "welcome",
         StageKind::Registry => "registry",
+        StageKind::Handoff => "handoff",
         StageKind::Baseline => "baseline",
         StageKind::Delta => "delta",
         StageKind::IntentAccepted => "intent_accepted",

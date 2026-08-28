@@ -2449,9 +2449,9 @@ mod tests {
 
     use verse_interest_verifier::{ErrorCode, InterestVerifier, StageKind, VerifierConfig};
     use verse_protocol::{
-        BlockKind, CELESTIAL_REGISTRY_SCHEMA_VERSION, IVec3, InventoryContents, InventoryDomain,
-        PROTOCOL_VERSION, PlayerDeathCause, Quat, ServerMessage, SessionRole,
-        UNIVERSE_MANIFEST_SCHEMA_VERSION,
+        BlockKind, CELESTIAL_REGISTRY_SCHEMA_VERSION, HandoffPhase, HandoffStatus, IVec3,
+        InventoryContents, InventoryDomain, LocomotionKind, PROTOCOL_VERSION, PlayerDeathCause,
+        Quat, ServerMessage, SessionRole, UNIVERSE_MANIFEST_SCHEMA_VERSION,
     };
 
     use super::*;
@@ -2722,7 +2722,29 @@ mod tests {
 
     #[test]
     fn transfer_link_is_one_time_destination_bound_and_independently_verified() {
-        let world = world_with_two_actors();
+        let mut world = WorldState::genesis(41);
+        world.fencing_token = 11;
+        let source_key = celestial::cell_origin_key();
+        let destination_key =
+            celestial::neighbor_cell_key(&source_key, [1, 0, 0]).expect("destination cell derives");
+        let boundary_address = celestial::address_from_origin_offset_um(
+            &world.cell_address,
+            [i128::from(celestial::CELL_EDGE_UM / 2), 0, 0],
+        )
+        .expect("boundary address canonicalizes");
+        let boundary_position =
+            celestial::local_position_from_address(&world.cell_address, &boundary_address)
+                .expect("source boundary position hydrates");
+        let player = world.player.get_mut("player-local").expect("source player");
+        player.address = boundary_address;
+        player.position = boundary_position;
+        player.locomotion.kind = LocomotionKind::Eva;
+        player.locomotion.support = None;
+        player.locomotion.magnetic_boots_enabled = false;
+        world
+            .validate_player_roster()
+            .expect("source crossing remains canonical");
+
         let role = SessionRole::Player {
             player_id: "player-local".into(),
         };
@@ -2746,10 +2768,95 @@ mod tests {
             .expect("initial view commits")
             .interest_epoch;
 
+        let context = crate::PlayerTransferContext {
+            transfer_id: "transfer-session-proof".into(),
+            source_cell_key: source_key.clone(),
+            destination_cell_key: destination_key.clone(),
+            source_assignment_generation: 1,
+            destination_assignment_generation: 1,
+            source_fencing_token: world.fencing_token,
+            prior_placement_generation: 1,
+            resulting_placement_generation: 2,
+        };
+        let package = crate::prepare_eva_player_transfer(&world, "player-local", &context)
+            .expect("cross-cell package prepares");
+        let mut destination =
+            WorldState::genesis_for_cell(41, &destination_key).expect("destination cell builds");
+        destination.fencing_token = 17;
+        let directory_root = tempfile::tempdir().expect("temporary directory");
+        let manifest =
+            crate::universe_manifest(41, crate::WORLD_SCHEMA_VERSION, crate::EVENT_SCHEMA_VERSION)
+                .expect("universe manifest");
+        let mut directory = crate::LocalCellDirectory::open(
+            directory_root.path(),
+            &manifest,
+            [source_key.clone(), destination_key.clone()],
+        )
+        .expect("cell directory opens");
+        directory
+            .claim(&source_key, 0, "worker-source")
+            .expect("source cell claims");
+        directory
+            .claim(&destination_key, 0, "worker-destination")
+            .expect("destination cell claims");
+        directory
+            .register_placement(
+                "player-local",
+                crate::MobileAggregateKind::Player,
+                &source_key,
+            )
+            .expect("source placement registers");
+        let prepared = directory
+            .prepare_transfer(
+                "player-local",
+                1,
+                &package.transfer_id,
+                &destination_key,
+                &package.package_hash,
+            )
+            .expect("directory prepare commits");
+        let locked_source = crate::stage_prepared_eva_lock(&world, &package, &prepared)
+            .expect("source closure locks");
+        let (reserved_destination, receipt) =
+            crate::stage_eva_player_quarantine(&destination, destination.fencing_token, &package)
+                .expect("destination quarantine commits");
+        directory
+            .record_quarantine(
+                &package.transfer_id,
+                &package.package_hash,
+                &receipt.receipt_hash,
+            )
+            .expect("directory records quarantine");
+        let committed = directory
+            .commit_transfer(&package.transfer_id, 1)
+            .expect("directory placement CAS commits");
+        let exported = crate::stage_committed_eva_export(&locked_source, &package, &committed)
+            .expect("source export commits");
+        let imported = crate::stage_committed_eva_import(
+            &reserved_destination,
+            &package,
+            &receipt,
+            &committed,
+        )
+        .expect("destination import commits");
+        assert!(exported.player.get("player-local").is_none());
+        assert_eq!(
+            imported.player.get("player-local"),
+            Some(&package.destination_player)
+        );
+
+        let mut stale_source_cursor = cursor.clone();
+        let stale_source_delta = world
+            .project_interest_delta(&mut stale_source_cursor, &BTreeMap::new())
+            .expect("source can form a delta before handoff");
         cursor
-            .fresh_transfer_baseline("transfer-session-proof", celestial::cell_origin_key(), 8)
+            .fresh_transfer_baseline(
+                &package.transfer_id,
+                destination_key.clone(),
+                context.resulting_placement_generation,
+            )
             .expect("committed placement installs a fresh transfer baseline");
-        let linked = world
+        let linked = imported
             .project_interest_baseline(&mut cursor)
             .expect("linked destination baseline projects");
         let link = linked
@@ -2758,8 +2865,90 @@ mod tests {
             .as_ref()
             .expect("destination baseline carries the one-time link");
         assert_eq!(link.transfer_id, "transfer-session-proof");
-        assert_eq!(link.placement_generation, 8);
+        assert_eq!(link.placement_generation, 2);
         assert_eq!(linked.interest.interest_epoch, initial_epoch + 1);
+
+        let handoff = |phase| ServerMessage::Handoff {
+            handoff: HandoffStatus {
+                transfer_id: package.transfer_id.clone(),
+                phase,
+                destination_cell_key: destination_key.clone(),
+                placement_generation: context.resulting_placement_generation,
+            },
+        };
+        let stale_source_raw = serde_json::to_vec(&ServerMessage::InterestDelta {
+            delta: Box::new(stale_source_delta.clone()),
+        })
+        .expect("stale source delta serializes");
+        let stale_source_token = verifier
+            .stage(&stale_source_raw)
+            .expect("source delta stages before the prepare boundary");
+        let preparing_raw =
+            serde_json::to_vec(&handoff(HandoffPhase::Preparing)).expect("handoff serializes");
+        let preparing_token = verifier
+            .stage(&preparing_raw)
+            .expect("handoff supersedes an uncommitted source frame");
+        assert_eq!(verifier.pending_kind(), Some(StageKind::Handoff),);
+        assert_eq!(
+            verifier
+                .commit(stale_source_token)
+                .expect_err("superseded source token is invalid")
+                .code(),
+            ErrorCode::InvalidStageToken
+        );
+        assert_eq!(
+            verifier
+                .commit(preparing_token)
+                .expect("preparing handoff commits")
+                .kind,
+            StageKind::Handoff
+        );
+        assert!(
+            verifier.committed_view().is_none(),
+            "preparing immediately discards the source presentation"
+        );
+        assert_eq!(
+            verifier
+                .stage(
+                    &serde_json::to_vec(&ServerMessage::InterestDelta {
+                        delta: Box::new(stale_source_delta),
+                    })
+                    .expect("stale source delta serializes"),
+                )
+                .expect_err("old-cell deltas are rejected during handoff")
+                .code(),
+            ErrorCode::UnexpectedMessage
+        );
+        assert_eq!(
+            verifier
+                .stage(
+                    &serde_json::to_vec(&ServerMessage::InterestBaseline {
+                        baseline: Box::new(linked.clone()),
+                    })
+                    .expect("premature destination serializes"),
+                )
+                .expect_err("destination cannot appear before its verification phase")
+                .code(),
+            ErrorCode::FrontierMismatch
+        );
+        assert_eq!(
+            commit_wire(&mut verifier, &handoff(HandoffPhase::Importing)),
+            StageKind::Handoff
+        );
+        assert_eq!(
+            verifier
+                .stage(
+                    &serde_json::to_vec(&handoff(HandoffPhase::Preparing))
+                        .expect("regressed phase serializes"),
+                )
+                .expect_err("handoff phase cannot regress")
+                .code(),
+            ErrorCode::FrontierMismatch
+        );
+        assert_eq!(
+            commit_wire(&mut verifier, &handoff(HandoffPhase::VerifyingDestination),),
+            StageKind::Handoff
+        );
 
         let mut tampered = linked.clone();
         tampered
@@ -2790,7 +2979,7 @@ mod tests {
             StageKind::Baseline
         );
 
-        let delta = world
+        let delta = imported
             .project_interest_delta(&mut cursor, &BTreeMap::new())
             .expect("post-handoff delta projects");
         assert!(
@@ -2817,12 +3006,12 @@ mod tests {
         wrong_cell
             .fresh_transfer_baseline(
                 "transfer-wrong-cell",
-                celestial::neighbor_cell_key(&celestial::cell_origin_key(), [1, 0, 0])
+                celestial::neighbor_cell_key(&destination_key, [1, 0, 0])
                     .expect("neighbor derives"),
-                8,
+                2,
             )
             .expect("well-formed link installs before world binding");
-        assert!(world.project_interest_baseline(&mut wrong_cell).is_err());
+        assert!(imported.project_interest_baseline(&mut wrong_cell).is_err());
     }
 
     #[test]
