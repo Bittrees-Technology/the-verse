@@ -7,6 +7,7 @@ mod cell_directory;
 mod content;
 mod engine;
 mod event;
+mod handoff;
 mod model;
 mod persistence;
 mod projection;
@@ -31,9 +32,14 @@ pub use event::{
     PRODUCTION_SCHEDULE_OCCURRENCE_SCHEMA_VERSION, ProductionMachineOutcome,
     ProductionMachineOutcomeKind, ProductionScheduleOccurrence,
 };
+pub use handoff::{
+    HandoffError, PlayerTransferConservation, PlayerTransferContext, PlayerTransferPackage,
+    PlayerTransferQuarantineReceipt, TRANSFER_PACKAGE_SCHEMA_VERSION, prepare_eva_player_transfer,
+    quarantine_eva_player_transfer,
+};
 pub use model::{
-    Block, Grid, InventoryRecord, Ledger, Player, ProductionClock, VoxelField,
-    WORLD_SCHEMA_VERSION, WorldState,
+    ActorOperationHistory, Block, Grid, InventoryRecord, Ledger, Player, ProductionClock,
+    VoxelField, WORLD_SCHEMA_VERSION, WorldState,
 };
 pub use persistence::{CellLifecycleStatus, LifecycleMode, PersistenceError, Store, TrustedClock};
 pub use projection::{
