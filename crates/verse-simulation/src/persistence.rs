@@ -9,7 +9,7 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
-use verse_protocol::UniverseManifestSnapshot;
+use verse_protocol::{CellKeyV1, UniverseManifestSnapshot};
 
 use crate::event::{
     CanonicalEvent, EVENT_SCHEMA_NAME, EVENT_SCHEMA_VERSION, ProductionScheduleOccurrence,
@@ -70,6 +70,8 @@ pub enum PersistenceError {
     },
     #[error("world state does not match the opened universe manifest")]
     WorldUniverseBindingMismatch,
+    #[error("cell identity is invalid: {0}")]
+    InvalidCellIdentity(String),
     #[error("event universe binding mismatch at {context}")]
     EventUniverseBindingMismatch { context: String },
     #[error("snapshot schema {found} is unsupported; expected {expected}")]
@@ -182,6 +184,8 @@ struct EventHeader {
     #[serde(default)]
     universe_id: Option<String>,
     #[serde(default)]
+    cell_id: Option<String>,
+    #[serde(default)]
     universe_manifest_hash: Option<String>,
     #[serde(default)]
     celestial_registry_hash: Option<String>,
@@ -255,6 +259,8 @@ pub struct Store {
     lifecycle: CellLifecycleRecord,
     last_trusted_unix_ms: u64,
     world_seed: u64,
+    cell_key: CellKeyV1,
+    cell_id: String,
     universe_manifest: UniverseManifestSnapshot,
     clock: Arc<dyn TrustedClock>,
     write_enabled: bool,
@@ -273,6 +279,27 @@ impl Store {
         requested_seed: u64,
         clock: Arc<dyn TrustedClock>,
     ) -> Result<Self, PersistenceError> {
+        Self::open_for_cell_with_clock(root, requested_seed, celestial::cell_origin_key(), clock)
+    }
+
+    pub fn open_for_cell(
+        root: impl AsRef<Path>,
+        requested_seed: u64,
+        cell_key: CellKeyV1,
+    ) -> Result<Self, PersistenceError> {
+        Self::open_for_cell_with_clock(root, requested_seed, cell_key, Arc::new(SystemTrustedClock))
+    }
+
+    pub fn open_for_cell_with_clock(
+        root: impl AsRef<Path>,
+        requested_seed: u64,
+        cell_key: CellKeyV1,
+        clock: Arc<dyn TrustedClock>,
+    ) -> Result<Self, PersistenceError> {
+        celestial::validate_cell_key(&cell_key)
+            .map_err(|source| PersistenceError::InvalidCellIdentity(source.to_string()))?;
+        let cell_id = celestial::cell_id(&cell_key)
+            .map_err(|source| PersistenceError::InvalidCellIdentity(source.to_string()))?;
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root).map_err(|source| io_error(&root, source))?;
 
@@ -299,6 +326,11 @@ impl Store {
             EVENT_SCHEMA_VERSION,
         )
         .map_err(|source| PersistenceError::InvalidRuntimeUniverseManifest(source.to_string()))?;
+        if cell_key.universe_id != runtime_manifest.universe_id {
+            return Err(PersistenceError::InvalidCellIdentity(
+                "cell key belongs to a different universe".into(),
+            ));
+        }
         if manifest_path.exists() {
             let stored_value: serde_json::Value = read_json(&manifest_path)?;
             let stored: UniverseManifestSnapshot = serde_json::from_value(stored_value.clone())
@@ -341,7 +373,7 @@ impl Store {
         let lifecycle_path = root.join(LIFECYCLE_FILE);
         let previous_lifecycle = if lifecycle_path.exists() {
             let lifecycle = read_json::<CellLifecycleRecord>(&lifecycle_path)?;
-            validate_prior_lifecycle(&lifecycle, &runtime_manifest)?;
+            validate_prior_lifecycle(&lifecycle, &runtime_manifest, &cell_id)?;
             Some(lifecycle)
         } else {
             let existing_snapshot = root.join(SNAPSHOT_FILE).exists();
@@ -388,7 +420,7 @@ impl Store {
         let lifecycle = CellLifecycleRecord {
             schema_version: LIFECYCLE_CONTROL_SCHEMA_VERSION,
             universe_id: runtime_manifest.universe_id.clone(),
-            cell_id: celestial::ACTIVE_CELL_ID.into(),
+            cell_id: cell_id.clone(),
             universe_manifest_hash: runtime_manifest.manifest_hash.clone(),
             celestial_registry_hash: runtime_manifest.celestial_registry_hash.clone(),
             lifecycle_revision,
@@ -439,6 +471,8 @@ impl Store {
             lifecycle,
             last_trusted_unix_ms: acquired_at_unix_ms,
             world_seed: requested_seed,
+            cell_key,
+            cell_id,
             universe_manifest: runtime_manifest,
             clock,
             write_enabled: true,
@@ -450,6 +484,14 @@ impl Store {
 
     pub const fn fencing_token(&self) -> u64 {
         self.fencing_token
+    }
+
+    pub const fn cell_key(&self) -> &CellKeyV1 {
+        &self.cell_key
+    }
+
+    pub fn cell_id(&self) -> &str {
+        &self.cell_id
     }
 
     pub(crate) fn root_path(&self) -> &Path {
@@ -554,7 +596,8 @@ impl Store {
             }
             snapshot.state
         } else {
-            let state = WorldState::genesis(self.world_seed);
+            let state = WorldState::genesis_for_cell(self.world_seed, &self.cell_key)
+                .map_err(PersistenceError::InvalidCellIdentity)?;
             if !self.world_binding_matches(&state) {
                 return Err(PersistenceError::WorldUniverseBindingMismatch);
             }
@@ -1012,12 +1055,16 @@ impl Store {
             && state.content_manifest_version == self.universe_manifest.content_manifest_version
             && state.universe_manifest_hash == self.universe_manifest.manifest_hash
             && state.celestial_registry_hash == self.universe_manifest.celestial_registry_hash
+            && state.cell_id == self.cell_id
+            && celestial::cell_key_from_address(&state.cell_address)
+                .is_ok_and(|cell_key| cell_key == self.cell_key)
     }
 
     fn event_header_binding_matches(&self, header: &EventHeader) -> bool {
         header.content_manifest_version.as_deref()
             == Some(self.universe_manifest.content_manifest_version.as_str())
             && header.universe_id.as_deref() == Some(self.universe_manifest.universe_id.as_str())
+            && header.cell_id.as_deref() == Some(self.cell_id.as_str())
             && header.universe_manifest_hash.as_deref()
                 == Some(self.universe_manifest.manifest_hash.as_str())
             && header.celestial_registry_hash.as_deref()
@@ -1027,6 +1074,7 @@ impl Store {
     fn event_binding_matches(&self, event: &CanonicalEvent) -> bool {
         event.content_manifest_version == self.universe_manifest.content_manifest_version
             && event.universe_id == self.universe_manifest.universe_id
+            && event.cell_id == self.cell_id
             && event.universe_manifest_hash == self.universe_manifest.manifest_hash
             && event.celestial_registry_hash == self.universe_manifest.celestial_registry_hash
     }
@@ -1272,6 +1320,7 @@ fn valid_lifecycle_transition(from: LifecycleMode, to: LifecycleMode) -> bool {
 fn validate_prior_lifecycle(
     lifecycle: &CellLifecycleRecord,
     manifest: &UniverseManifestSnapshot,
+    expected_cell_id: &str,
 ) -> Result<(), PersistenceError> {
     if lifecycle.schema_version != LIFECYCLE_CONTROL_SCHEMA_VERSION {
         return Err(PersistenceError::InvalidLifecycleControl(format!(
@@ -1280,7 +1329,7 @@ fn validate_prior_lifecycle(
         )));
     }
     if lifecycle.universe_id != manifest.universe_id
-        || lifecycle.cell_id != celestial::ACTIVE_CELL_ID
+        || lifecycle.cell_id != expected_cell_id
         || lifecycle.universe_manifest_hash != manifest.manifest_hash
         || lifecycle.celestial_registry_hash != manifest.celestial_registry_hash
     {

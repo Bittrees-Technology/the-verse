@@ -5,7 +5,7 @@ use std::ops::{Deref, DerefMut};
 
 use serde::{Deserialize, Serialize};
 use verse_protocol::{
-    BlockKind, BlockSnapshot, CareerSnapshot, ConservationSnapshot, DeathDropSnapshot,
+    BlockKind, BlockSnapshot, CareerSnapshot, CellKeyV1, ConservationSnapshot, DeathDropSnapshot,
     EnvironmentSnapshot, GridMotionSnapshot, GridSnapshot, IVec3, IntentReceipt, InventoryContents,
     InventoryDomain, InventorySnapshot, LocomotionKind, MotionSnapshot, PlayerDeathCause,
     PlayerLifeState, PlayerLocomotionSnapshot, PlayerMotionSnapshot, PlayerSnapshot, PowerSnapshot,
@@ -238,6 +238,13 @@ pub struct PlayerRoster {
 }
 
 impl PlayerRoster {
+    pub fn empty() -> Self {
+        Self {
+            primary_player_id: String::new(),
+            by_id: BTreeMap::new(),
+        }
+    }
+
     pub fn from_primary(player: Player) -> Self {
         let primary_player_id = player.player_id.clone();
         Self {
@@ -259,6 +266,9 @@ impl PlayerRoster {
     }
 
     pub fn validate(&self) -> Result<(), &'static str> {
+        if self.primary_player_id.is_empty() && self.by_id.is_empty() {
+            return Ok(());
+        }
         if self.primary_player_id.trim().is_empty()
             || !self.by_id.contains_key(&self.primary_player_id)
         {
@@ -970,20 +980,33 @@ impl WorldState {
             crate::event::EVENT_SCHEMA_VERSION,
         )
         .map_err(|source| format!("world universe manifest is invalid: {source}"))?;
+        let cell_key = celestial::cell_key_from_address(&self.cell_address)
+            .map_err(|source| format!("world cell key is invalid: {source}"))?;
+        let expected_cell_id = celestial::cell_id(&cell_key)
+            .map_err(|source| format!("world cell ID is invalid: {source}"))?;
+        let origin_cell = cell_key == celestial::cell_origin_key();
+        let body_binding_valid = if origin_cell {
+            self.gravity_body_id == celestial::GRAVITY_BODY_ID
+                && self.voxel_body_id == celestial::VOXEL_BODY_ID
+                && registry
+                    .bodies
+                    .iter()
+                    .any(|body| body.body_id == self.gravity_body_id)
+                && registry
+                    .bodies
+                    .iter()
+                    .any(|body| body.body_id == self.voxel_body_id && body.voxel_field_id.is_some())
+        } else {
+            self.gravity_body_id.is_empty()
+                && self.voxel_body_id.is_empty()
+                && self.voxels.occupied.is_empty()
+                && self.voxels.ferrite_ore.is_empty()
+        };
         if self.universe_id != registry.universe_id
             || self.universe_manifest_hash != universe_manifest.manifest_hash
             || self.celestial_registry_hash != registry.registry_hash
-            || self.cell_address != celestial::cell_origin_address()
-            || self.gravity_body_id != celestial::GRAVITY_BODY_ID
-            || self.voxel_body_id != celestial::VOXEL_BODY_ID
-            || !registry
-                .bodies
-                .iter()
-                .any(|body| body.body_id == self.gravity_body_id)
-            || !registry
-                .bodies
-                .iter()
-                .any(|body| body.body_id == self.voxel_body_id && body.voxel_field_id.is_some())
+            || self.cell_id != expected_cell_id
+            || !body_binding_valid
         {
             return Err(
                 "world identity must match the immutable universe manifest and celestial registry"
@@ -1649,7 +1672,8 @@ impl WorldState {
             schema_version: WORLD_SCHEMA_VERSION,
             content_manifest_version: content::manifest().manifest_version.clone(),
             universe_id: registry.universe_id,
-            cell_id: celestial::ACTIVE_CELL_ID.into(),
+            cell_id: celestial::cell_id(&celestial::cell_origin_key())
+                .expect("embedded origin cell ID is valid"),
             universe_manifest_hash: universe_manifest.manifest_hash,
             celestial_registry_hash: registry.registry_hash,
             cell_address,
@@ -1722,6 +1746,60 @@ impl WorldState {
             },
             processed_operations: BTreeMap::new(),
         }
+    }
+
+    pub fn genesis_for_cell(seed: u64, cell_key: &CellKeyV1) -> Result<Self, String> {
+        celestial::validate_cell_key(cell_key)
+            .map_err(|source| format!("cell key is invalid: {source}"))?;
+        if cell_key == &celestial::cell_origin_key() {
+            return Ok(Self::genesis(seed));
+        }
+
+        let registry = celestial::registry_snapshot(seed)
+            .map_err(|source| format!("celestial registry is invalid: {source}"))?;
+        if cell_key.universe_id != registry.universe_id {
+            return Err("cell key belongs to a different universe".into());
+        }
+        let universe_manifest = celestial::universe_manifest(
+            seed,
+            WORLD_SCHEMA_VERSION,
+            crate::event::EVENT_SCHEMA_VERSION,
+        )
+        .map_err(|source| format!("universe manifest is invalid: {source}"))?;
+        let state = Self {
+            schema_version: WORLD_SCHEMA_VERSION,
+            content_manifest_version: content::manifest().manifest_version.clone(),
+            universe_id: registry.universe_id,
+            cell_id: celestial::cell_id(cell_key)
+                .map_err(|source| format!("cell ID is invalid: {source}"))?,
+            universe_manifest_hash: universe_manifest.manifest_hash,
+            celestial_registry_hash: registry.registry_hash,
+            cell_address: celestial::cell_address_from_key(cell_key)
+                .map_err(|source| format!("cell address is invalid: {source}"))?,
+            gravity_body_id: String::new(),
+            voxel_body_id: String::new(),
+            world_seed: seed,
+            event_sequence: 0,
+            simulation_tick: 0,
+            physics_step_phase: 0,
+            active_contact_pairs: BTreeSet::new(),
+            fencing_token: 0,
+            last_event_hash: String::new(),
+            player: PlayerRoster::empty(),
+            voxels: VoxelField {
+                occupied: BTreeSet::new(),
+                ferrite_ore: BTreeSet::new(),
+            },
+            grids: BTreeMap::new(),
+            inventories: BTreeMap::new(),
+            production_queues: BTreeMap::new(),
+            production_clock: ProductionClock::default(),
+            death_drops: BTreeMap::new(),
+            ledger: Ledger::default(),
+            processed_operations: BTreeMap::new(),
+        };
+        state.validate_player_roster()?;
+        Ok(state)
     }
 
     pub fn state_hash(&self) -> String {
@@ -2053,8 +2131,38 @@ mod tests {
         assert_eq!(world.universe_manifest_hash, manifest.manifest_hash);
         assert_eq!(world.celestial_registry_hash, registry.registry_hash);
         assert_eq!(world.cell_address, celestial::cell_origin_address());
+        assert_eq!(
+            world.cell_id,
+            celestial::cell_id(&celestial::cell_origin_key()).expect("origin cell ID derives")
+        );
         assert_eq!(world.gravity_body_id, celestial::GRAVITY_BODY_ID);
         assert_eq!(world.voxel_body_id, celestial::VOXEL_BODY_ID);
+        assert!(world.validate_player_roster().is_ok());
+    }
+
+    #[test]
+    fn adjacent_cell_genesis_is_empty_canonical_and_conserved() {
+        let origin = celestial::cell_origin_key();
+        let east =
+            celestial::neighbor_cell_key(&origin, [1, 0, 0]).expect("adjacent proof cell derives");
+        let world = WorldState::genesis_for_cell(128, &east).expect("empty cell builds");
+
+        assert_eq!(
+            world.cell_id,
+            celestial::cell_id(&east).expect("east cell ID derives")
+        );
+        assert_eq!(
+            celestial::cell_key_from_address(&world.cell_address).expect("world key derives"),
+            east
+        );
+        assert!(world.player.by_id.is_empty());
+        assert!(world.grids.is_empty());
+        assert!(world.inventories.is_empty());
+        assert!(world.voxels.occupied.is_empty());
+        assert!(world.voxels.ferrite_ore.is_empty());
+        assert!(world.gravity_body_id.is_empty());
+        assert!(world.voxel_body_id.is_empty());
+        assert!(world.conservation().valid);
         assert!(world.validate_player_roster().is_ok());
     }
 
