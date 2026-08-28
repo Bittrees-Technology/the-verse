@@ -196,8 +196,19 @@ async function launchBrowser() {
         exited,
         delay(2_000),
       ]);
-      if (child.exitCode === null) child.kill("SIGKILL");
-      await rm(profileDirectory, { recursive: true, force: true });
+      if (child.exitCode === null) {
+        child.kill("SIGKILL");
+        await Promise.race([
+          exited,
+          delay(2_000),
+        ]);
+      }
+      await rm(profileDirectory, {
+        recursive: true,
+        force: true,
+        maxRetries: 5,
+        retryDelay: 100,
+      });
     },
   };
 }
