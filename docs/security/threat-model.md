@@ -19,6 +19,8 @@
 - Canonical universe addresses and fixed-body identity.
 - Session interest boundaries, actor-private projections, and replication
   epochs.
+- Cell assignment generations, aggregate placement generations, transfer
+  packages, and directory commit records.
 
 ## Adversaries
 
@@ -52,7 +54,10 @@ Bots and AI participation are allowed. The security objective is not to prove hu
 | Celestial registry substitution | Domain-separated content hashes, universe-manifest binding, schema compatibility, fail-before-replay validation |
 | Body overlap or movement | Integer exclusion-volume validation, immutable fixed addresses, explicit migration receipts |
 | Invalid moon ancestry | Required existing planet parent, self/non-planet/cycle rejection, sorted registry validation |
-| Cross-cell double ownership | Fenced leases, prepare/commit transfer, aggregate versions |
+| Cross-cell double ownership | Per-cell lease fencing plus independent aggregate placement generation; one directory compare-and-swap commit; pre-commit abort/post-commit roll-forward |
+| Stale source mutation after handoff | Directory placement read, generation checks on every aggregate mutation, committed export tombstone, stale-route rejection |
+| Transfer package substitution or smuggling | Content-addressed canonical package, immutable transfer ID binding, server-derived closure, trusted-root and conservation validation, bounded quarantine |
+| Quarantined destination copy becoming live early | No physics/production/projection authority before directory commit; import requires current destination fence and committed placement generation |
 | Private-server import | Namespace validation at every canonical boundary |
 | Creative asset laundering | Separate namespace, non-economic flag, provenance checks |
 | AMM receipt insolvency | Continuous custody-to-supply reconciliation, paused deposits, invariant alarms |
@@ -172,6 +177,37 @@ secrecy, fog of war, or zero-knowledge state.
 - Catch-up is sequential and bounded. Backlog is visible and cannot be hidden
   by skipping, coalescing, or one oversized elapsed-time event.
 
+## P1.7 assignment and handoff incident controls
+
+- The P1.7 schema tuple is protocol `18`, projection `4`, world `20`, event
+  `16`, content `11`, manifest `p1.5.0`, registry `1`, universe manifest `4`,
+  interest `2`, operation fingerprint `2`, lifecycle control `1`, production
+  occurrence `1`, cell directory `1`, and transfer/package `1`; partial
+  deployment is not allowed.
+- Every cell mutation revalidates the current assignment and lease fence.
+  Every mobile-aggregate mutation additionally revalidates its directory
+  placement generation. A valid lease for the wrong cell is insufficient.
+- The source derives the dependency closure from canonical contacts, support,
+  ownership, inventory, and system edges. Clients cannot nominate a hidden
+  subject, destination, package, generation, receipt, or commit.
+- Package hash, roots, ordered identities, finite physics values, quantities,
+  queues, escrow, lineages, and conservation vector validate before quarantine
+  or import. Conflicting bytes under one transfer ID are quarantined as an
+  integrity incident.
+- Directory uncertainty after a commit attempt forbids source unlock. Operators
+  may retry or quarantine a stuck transfer but cannot edit package contents,
+  lower placement generation, or select a conflicting owner.
+- Handoff discards source route, controls, interest state, acknowledgements,
+  verifier stages, and private overlays. The session returns to `LIVE` only
+  after a transfer-linked destination baseline is independently verified.
+- Transfer subject, package, inventory, queue, route, and destination details
+  remain private. Public status and source `transferred` removals expose only
+  bounded generic health and authorized evidence.
+- Repeated boundary oscillation, package size, closure breadth, retained
+  history, quarantine age, retries, and recovery work have explicit tested
+  limits. These implementation budgets do not become permanent product size
+  caps.
+
 ## Security gates
 
 Before public alpha:
@@ -184,6 +220,8 @@ Before public alpha:
 - Address normalization, registry hash/parent/separation, and interest
   baseline/delta fuzzing.
 - Cross-session privacy and slow-consumer resource-budget tests.
+- Two-cell assignment races, full handoff hard-crash matrix, package tamper,
+  stale-placement, and cross-cell conservation tests.
 - Mod sandbox tests.
 - Economy invariant suite.
 

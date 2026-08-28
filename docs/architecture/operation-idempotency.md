@@ -1,6 +1,6 @@
 # Operation idempotency and retry contract
 
-**Status:** P1.3 implementation contract
+**Status:** P1.3 implementation contract; P1.7 cross-cell extension accepted
 
 ## Client-visible rules
 
@@ -42,6 +42,27 @@ replacement for the economic operation sequence.
 
 The P1.3 browser remains a spectator and creates no gameplay sequences.
 
+## P1.7 retry continuity across cells
+
+Operation fingerprint schema `2` removes the current cell ID from the
+fingerprint. It remains bound to the immutable universe and authenticated
+actor, protocol and fingerprint schemas, positive operation sequence, and
+exact canonical message bytes. Changing the route after an accepted operation
+therefore cannot turn the same sequence and payload into a new mutation.
+
+The player's retained receipt suffix, rolling compaction commitment, committed
+frontier, pending input queue, and movement/input frontiers move inside the
+content-addressed transfer package. The destination validates and imports them
+before it admits actor intents. A lost source receipt immediately before
+handoff returns the original receipt after import; changed material at that
+sequence remains `operation_conflict`, including after compaction and restart.
+
+The transfer saga is a system operation and consumes no client operation
+sequence. Controls received under the retired source movement epoch reject
+without advancing the destination frontier. A gateway or client may retry a
+message but cannot rewrite its sequence, fingerprint material, destination, or
+placement generation.
+
 ## Server invariants
 
 - Session binding supplies the actor; the payload cannot select it.
@@ -72,11 +93,14 @@ Tests must cover:
 - deterministic 128-record/131,072-byte/4,096-byte bounds;
 - private frontier isolation in HTTP, spectator, and other-player JSON;
 - reconnect reconciliation with an in-flight native mutation; and
+- lost receipt immediately before handoff, destination retry after import, and
+  changed-payload conflict across source/destination restart;
 - long randomized campaigns that conserve inventory while histories compact.
 
 ## Deliberate limits
 
-P1.3 does not provide production authentication, cross-cell transaction
-coordination, market settlement nonces, or physical journal archival. Those
-systems may build on this primitive only after defining their own commit and
-reconciliation boundaries.
+P1.3 alone does not provide production authentication, cross-cell transaction
+coordination, market settlement nonces, or physical journal archival. P1.7
+adds only the bounded two-cell operation-history movement described above; the
+directory and transfer package retain their own commit and reconciliation
+boundaries.

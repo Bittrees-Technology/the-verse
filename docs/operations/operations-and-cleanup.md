@@ -31,6 +31,37 @@ Each simulation worker exposes:
 
 A cell may be drained and replaced without losing canonical state.
 
+### P1.7 two-cell directory and handoff proof
+
+The bounded P1.7 operator view covers both proof cells and the durable local
+directory. It reports:
+
+- canonical cell key and ID, assignment state/generation, desired worker,
+  lifecycle mode, current holder, lease fence, and renewal margin;
+- aggregate placement cell/generation and transfer phase;
+- source/destination cells, immutable transfer ID, package hash/size, subject
+  count, quarantine receipt, and age;
+- prepare, quarantine, directory commit, import, finalization, abort, and retry
+  latency;
+- stale assignment, cell-fence, placement-generation, route, frame, and control
+  rejections;
+- source/package/destination conservation reconciliation and event frontiers;
+- sleeping-destination activation, catch-up, import, production re-arm, and
+  verified-baseline timing; and
+- bounded actionable alerts for stuck pre-commit and post-commit transfers.
+
+Package subjects, inventories, production queues, actor IDs, and destinations
+are not exposed in public health. An operator may request exact pre-commit
+abort, retry quarantine/import/finalization, or quarantine an integrity
+conflict. An operator cannot manually rewrite a package, decrement a placement
+generation, invent a commit, or choose a second authoritative owner.
+
+Recovery always reads the directory before taking action. A transfer without a
+directory commit may reconcile or abort to the source. A committed transfer is
+roll-forward only to the recorded destination, even if the source still holds
+locked recovery bytes. Each cell independently follows the P1.6 lifecycle and
+lease recovery rules.
+
 ## Unpowered cleanup
 
 ### Qualifying power
@@ -170,6 +201,10 @@ Release operations require:
 Runbooks must exist for:
 
 - Cell crash.
+- Cell assignment conflict or stale holder.
+- Stuck cross-cell transfer before and after directory commit.
+- Transfer package or conservation mismatch.
+- Gateway handoff or destination-baseline verification failure.
 - Database failover.
 - Event-stream outage.
 - Inventory invariant failure.
