@@ -96,7 +96,7 @@ jobs:
       - name: Build and smoke-test native package
         env:
           GODOT_BIN: ${{ matrix.godot_binary }}
-          VERSE_RELEASE_VERSION: p1.5.0-ci-${{ github.sha }}
+          VERSE_RELEASE_VERSION: p1.7.0-ci-${{ github.sha }}
         run: tools/release/package-native.sh
       - name: Verify P1.5 cross-platform registry and interest client
         env:

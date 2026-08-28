@@ -47,7 +47,7 @@ func _test_stage_commit_discard_reset() -> void:
 	)
 
 	var tampered_welcome := _welcome()
-	tampered_welcome["world_schema_version"] = 20
+	tampered_welcome["world_schema_version"] = 21
 	var tampered: Dictionary = verifier.call(
 		"stage_server_message", JSON.stringify(tampered_welcome).to_utf8_buffer()
 	)
@@ -64,7 +64,7 @@ func _test_stage_commit_discard_reset() -> void:
 	_check(
 		sanitized is Dictionary
 		and String(sanitized.get("type", "")) == "welcome"
-		and int(sanitized.get("protocol_version", -1)) == 17
+		and int(sanitized.get("protocol_version", -1)) == 18
 		and sanitized.get("session_role", {}) is Dictionary
 		and String(sanitized.get("session_role", {}).get("player_id", "")) == "player-local",
 		"only typed sanitized JSON is exposed",
@@ -114,14 +114,14 @@ func _reset(verifier: Object) -> Dictionary:
 	return verifier.call(
 		"reset_player",
 		"player-local",
-		19,
-		15,
+		20,
+		16,
 		11,
 		"p1.5.0",
 		"fc61c05b335fb951868010ecf2942a92ec4f03d00d0a75d3acba8c6f5162b6bd",
 		"the-verse-local",
 		"4c367bbfa04218ece14104f0a3a7ec2c7e9fefcc37d4cf78a265df2d711a59da",
-		"c9bfd3baa1e64ab7665e60c4f989491e745e9af0d2512989f41625b57b546ace",
+		"ce89422bd5d0c4a2ddc50f22883439a7ee1ecd7dd14165a46bb500623fd0b7eb",
 	)
 
 
@@ -133,14 +133,14 @@ func _test_portable_player_vector() -> void:
 	var reset: Dictionary = verifier.call(
 		"reset_player",
 		"player-vector",
-		19,
-		15,
+		20,
+		16,
 		11,
 		"p1.5.0",
 		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		"universe-vector",
 		"f00517b0fbef09d7924fde2cb11f2c74066627992ab900a6a9e0bd3ac3dc7311",
-		"5b54eedd8dfe2cae6f5bdc9f4f09ab8131873b12f28d2faaba5cf98012d72bab",
+		"a3d5eb718f859d6010854f231a0e2cb4518c9618580020762311b4c3e43e3e06",
 	)
 	_check(bool(reset.get("ok", false)), "portable player verifier resets")
 	for name in ["welcome.json", "registry.json"]:
@@ -217,14 +217,14 @@ func _test_portable_player_vector() -> void:
 	var integrated_reset: Dictionary = integrated_verifier.call(
 		"reset_player",
 		"player-vector",
-		19,
-		15,
+		20,
+		16,
 		11,
 		"p1.5.0",
 		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		"universe-vector",
 		"f00517b0fbef09d7924fde2cb11f2c74066627992ab900a6a9e0bd3ac3dc7311",
-		"5b54eedd8dfe2cae6f5bdc9f4f09ab8131873b12f28d2faaba5cf98012d72bab",
+		"a3d5eb718f859d6010854f231a0e2cb4518c9618580020762311b4c3e43e3e06",
 	)
 	_check(bool(integrated_reset.get("ok", false)), "integrated portable verifier resets")
 	var integrated_client := _vector_client(integrated_verifier)
@@ -322,14 +322,14 @@ func _reset_vector(verifier: Object) -> Dictionary:
 	return verifier.call(
 		"reset_player",
 		"player-vector",
-		19,
-		15,
+		20,
+		16,
 		11,
 		"p1.5.0",
 		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		"universe-vector",
 		"f00517b0fbef09d7924fde2cb11f2c74066627992ab900a6a9e0bd3ac3dc7311",
-		"5b54eedd8dfe2cae6f5bdc9f4f09ab8131873b12f28d2faaba5cf98012d72bab",
+		"a3d5eb718f859d6010854f231a0e2cb4518c9618580020762311b4c3e43e3e06",
 	)
 
 
@@ -380,15 +380,15 @@ func _stage_welcome(verifier: Object) -> Dictionary:
 func _welcome() -> Dictionary:
 	return {
 		"type": "welcome",
-		"protocol_version": 17,
-		"projection_schema_version": 3,
-		"world_schema_version": 19,
-		"event_schema_version": 15,
+		"protocol_version": 18,
+		"projection_schema_version": 4,
+		"world_schema_version": 20,
+		"event_schema_version": 16,
 		"content_schema_version": 11,
 		"content_manifest_version": "p1.5.0",
 		"celestial_registry_schema_version": 1,
-		"universe_manifest_schema_version": 3,
-		"interest_schema_version": 1,
+		"universe_manifest_schema_version": 4,
+		"interest_schema_version": 2,
 		"server_name": "native-verifier-smoke",
 		"session_role": {"kind": "player", "player_id": "player-local"},
 	}

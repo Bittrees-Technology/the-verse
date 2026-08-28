@@ -271,15 +271,15 @@ func _wire(value: Dictionary) -> Dictionary:
 func _welcome() -> Dictionary:
 	return {
 		"type": "welcome",
-		"protocol_version": 17,
-		"projection_schema_version": 3,
-		"world_schema_version": 19,
-		"event_schema_version": 15,
+		"protocol_version": 18,
+		"projection_schema_version": 4,
+		"world_schema_version": 20,
+		"event_schema_version": 16,
 		"content_schema_version": 11,
 		"content_manifest_version": "p1.5.0",
 		"celestial_registry_schema_version": 1,
-		"universe_manifest_schema_version": 3,
-		"interest_schema_version": 1,
+		"universe_manifest_schema_version": 4,
+		"interest_schema_version": 2,
 		"server_name": "test",
 		"session_role": {"kind": "player", "player_id": "player-local"},
 	}
@@ -287,7 +287,7 @@ func _welcome() -> Dictionary:
 
 func _manifest() -> Dictionary:
 	return {
-		"schema_version": 3,
+		"schema_version": 4,
 		"manifest_hash": HASH_A,
 		"universe_id": "the-verse-local",
 		"world_seed": "test",
@@ -302,8 +302,8 @@ func _manifest() -> Dictionary:
 		"content_schema_version": 11,
 		"content_manifest_version": "p1.5.0",
 		"content_hash": HASH_C,
-		"world_schema_version": 19,
-		"event_schema_version": 15,
+		"world_schema_version": 20,
+		"event_schema_version": 16,
 		"lifecycle_control_schema_version": 1,
 		"production_schedule_occurrence_schema_version": 1,
 		"lifecycle_policy_hash": "5bc077cc8a2eb101fcaecdce5513c13aa243e1f68a5af839a602dd689859ff3a",
@@ -350,8 +350,8 @@ func _baseline() -> Dictionary:
 	var grid := _grid(2_000_000)
 	var chunk := _chunk(1, 0, "rock")
 	return {
-		"projection_schema_version": 3,
-		"schema_version": 19,
+		"projection_schema_version": 4,
+		"schema_version": 20,
 		"content_manifest_version": "p1.5.0",
 		"universe_id": "the-verse-local",
 		"cell_id": "origin",
@@ -377,8 +377,8 @@ func _baseline() -> Dictionary:
 
 func _delta(sequence: int, previous_hash: String, view_hash: String) -> Dictionary:
 	return {
-		"projection_schema_version": 3,
-		"schema_version": 19,
+		"projection_schema_version": 4,
+		"schema_version": 20,
 		"content_manifest_version": "p1.5.0",
 		"universe_id": "the-verse-local",
 		"cell_id": "origin",
@@ -399,7 +399,7 @@ func _delta(sequence: int, previous_hash: String, view_hash: String) -> Dictiona
 
 func _interest(kind: String, sequence: int, previous_hash: String, view_hash: String) -> Dictionary:
 	var interest := {
-		"schema_version": 1,
+		"schema_version": 2,
 		"frame_kind": kind,
 		"session_epoch": "session-a",
 		"interest_epoch": 1,
@@ -437,7 +437,7 @@ func _projection(kind: String, entity_id: String, value: Dictionary, revision: i
 		"entity_id": entity_id,
 		"kind": kind,
 		"projected_revision": revision,
-		"component_schema_version": 3,
+		"component_schema_version": 4,
 		"payload": {"entity_kind": kind, "value": value},
 	}
 

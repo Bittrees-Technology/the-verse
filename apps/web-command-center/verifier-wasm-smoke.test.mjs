@@ -26,7 +26,7 @@ const proofCommitments = {
   expected_content_hash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   expected_universe_id: "universe-vector",
   expected_celestial_registry_hash: "f00517b0fbef09d7924fde2cb11f2c74066627992ab900a6a9e0bd3ac3dc7311",
-  expected_universe_manifest_hash: "5b54eedd8dfe2cae6f5bdc9f4f09ab8131873b12f28d2faaba5cf98012d72bab",
+  expected_universe_manifest_hash: "a3d5eb718f859d6010854f231a0e2cb4518c9618580020762311b4c3e43e3e06",
 };
 
 async function readVector(name) {
@@ -51,8 +51,8 @@ function portableVerifier() {
   return new BrowserInterestVerifier(JSON.stringify({
     expected_role: "player",
     expected_player_id: "player-vector",
-    world_schema_version: "19",
-    event_schema_version: "15",
+    world_schema_version: "20",
+    event_schema_version: "16",
     content_schema_version: "11",
     content_manifest_version: "p1.5.0",
     ...proofCommitments,
@@ -62,8 +62,8 @@ function portableVerifier() {
 test("generated string-only WASM verifier initializes and rejects malformed frames", () => {
   const verifier = new BrowserInterestVerifier(JSON.stringify({
     expected_role: "spectator",
-    world_schema_version: "19",
-    event_schema_version: "15",
+    world_schema_version: "20",
+    event_schema_version: "16",
     content_schema_version: "11",
     content_manifest_version: "p1.5.0",
     ...proofCommitments,
@@ -87,8 +87,8 @@ test("generated WASM verifies the exact bound-player portable stream without los
   const verifier = new BrowserInterestVerifier(JSON.stringify({
     expected_role: "player",
     expected_player_id: "player-vector",
-    world_schema_version: "19",
-    event_schema_version: "15",
+    world_schema_version: "20",
+    event_schema_version: "16",
     content_schema_version: "11",
     content_manifest_version: "p1.5.0",
     ...proofCommitments,
@@ -123,8 +123,8 @@ test("generated WASM rejects a tampered portable baseline without advancing stat
   const verifier = new BrowserInterestVerifier(JSON.stringify({
     expected_role: "player",
     expected_player_id: "player-vector",
-    world_schema_version: "19",
-    event_schema_version: "15",
+    world_schema_version: "20",
+    event_schema_version: "16",
     content_schema_version: "11",
     content_manifest_version: "p1.5.0",
     ...proofCommitments,

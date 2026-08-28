@@ -11,21 +11,21 @@ const PLANET_SHADER: Shader = preload("res://shaders/planet_surface.gdshader")
 const ATMOSPHERE_SHADER: Shader = preload("res://shaders/planet_atmosphere.gdshader")
 const CLOUD_SHADER: Shader = preload("res://shaders/planet_clouds.gdshader")
 const BLOCK_DAMAGE_SHADER: Shader = preload("res://shaders/block_damage.gdshader")
-const PROTOCOL_VERSION := 17
-const PROJECTION_SCHEMA_VERSION := 3
-const WORLD_SCHEMA_VERSION := 19
-const EVENT_SCHEMA_VERSION := 15
+const PROTOCOL_VERSION := 18
+const PROJECTION_SCHEMA_VERSION := 4
+const WORLD_SCHEMA_VERSION := 20
+const EVENT_SCHEMA_VERSION := 16
 const CONTENT_SCHEMA_VERSION := 11
 const CONTENT_MANIFEST_VERSION := "p1.5.0"
 const CELESTIAL_REGISTRY_SCHEMA_VERSION := 1
-const UNIVERSE_MANIFEST_SCHEMA_VERSION := 3
+const UNIVERSE_MANIFEST_SCHEMA_VERSION := 4
 const LIFECYCLE_CONTROL_SCHEMA_VERSION := 1
 const PRODUCTION_SCHEDULE_OCCURRENCE_SCHEMA_VERSION := 1
 const LIFECYCLE_POLICY_HASH := "5bc077cc8a2eb101fcaecdce5513c13aa243e1f68a5af839a602dd689859ff3a"
-const INTEREST_SCHEMA_VERSION := 1
+const INTEREST_SCHEMA_VERSION := 2
 const EXPECTED_UNIVERSE_ID := "the-verse-local"
 const EXPECTED_CELESTIAL_REGISTRY_HASH := "4c367bbfa04218ece14104f0a3a7ec2c7e9fefcc37d4cf78a265df2d711a59da"
-const EXPECTED_UNIVERSE_MANIFEST_HASH := "c9bfd3baa1e64ab7665e60c4f989491e745e9af0d2512989f41625b57b546ace"
+const EXPECTED_UNIVERSE_MANIFEST_HASH := "ce89422bd5d0c4a2ddc50f22883439a7ee1ecd7dd14165a46bb500623fd0b7eb"
 const EXPECTED_CONTENT_HASH := "fc61c05b335fb951868010ecf2942a92ec4f03d00d0a75d3acba8c6f5162b6bd"
 const DEFAULT_SERVER := "ws://127.0.0.1:7777/ws"
 const DEFAULT_PLAYER_ID := "player-local"
@@ -700,7 +700,7 @@ func _actor_private_matches(candidate: Variant, event_sequence: int) -> bool:
 		) < 0
 	):
 		return false
-	# Protocol 16 nests the overlay in the outer interest frame, making the
+	# Protocol 18 nests the overlay in the outer interest frame, making the
 	# outer sequence authoritative. Honor a future explicit sequence only when
 	# it agrees, so malformed extensions still fail closed.
 	return (
@@ -2177,7 +2177,7 @@ func _handle_server_message(message: Dictionary) -> void:
 				operation_frontier_observed = false
 				observed_operation_frontier = -1
 			_set_message(
-				"Protocol 16 linked to %s // %s // loading registry"
+				"Protocol 18 linked to %s // %s // loading registry"
 				% [message.get("server_name", "The Verse"), _controlled_player_id()]
 			)
 		"registry":
