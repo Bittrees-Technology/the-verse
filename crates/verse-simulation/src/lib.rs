@@ -35,11 +35,12 @@ pub use event::{
 pub use handoff::{
     HandoffError, PlayerTransferConservation, PlayerTransferContext, PlayerTransferPackage,
     PlayerTransferQuarantineReceipt, TRANSFER_PACKAGE_SCHEMA_VERSION, prepare_eva_player_transfer,
-    quarantine_eva_player_transfer,
+    quarantine_eva_player_transfer, stage_committed_eva_export, stage_committed_eva_import,
 };
 pub use model::{
     ActorOperationHistory, Block, Grid, InventoryRecord, Ledger, Player, ProductionClock,
-    VoxelField, WORLD_SCHEMA_VERSION, WorldState,
+    TransferConservationWitness, TransferWitnessDirection, VoxelField, WORLD_SCHEMA_VERSION,
+    WorldState,
 };
 pub use persistence::{CellLifecycleStatus, LifecycleMode, PersistenceError, Store, TrustedClock};
 pub use projection::{

@@ -7,7 +7,11 @@ use thiserror::Error;
 use verse_protocol::{CellKeyV1, InventoryContents, InventoryDomain, LocomotionKind, Vec3};
 
 use crate::celestial;
-use crate::model::{ActorOperationHistory, InventoryRecord, Player, WorldState, valid_blake3_hex};
+use crate::cell_directory::{CellTransferRecord, MobileAggregateKind, TransferPhase};
+use crate::model::{
+    ActorOperationHistory, InventoryRecord, Player, TransferConservationWitness,
+    TransferWitnessDirection, WorldState, valid_blake3_hex,
+};
 
 pub const TRANSFER_PACKAGE_SCHEMA_VERSION: u32 = 1;
 
@@ -84,6 +88,8 @@ pub enum HandoffError {
     InvalidPackage(String),
     #[error("destination quarantine rejected the package: {0}")]
     QuarantineRejected(String),
+    #[error("committed player handoff rejected the state transition: {0}")]
+    CommittedStateRejected(String),
 }
 
 impl PlayerTransferPackage {
@@ -202,6 +208,23 @@ impl PlayerTransferQuarantineReceipt {
 
     pub fn hash_is_valid(&self) -> bool {
         valid_blake3_hex(&self.receipt_hash) && self.receipt_hash == self.calculate_hash()
+    }
+
+    pub fn validate(&self) -> Result<(), HandoffError> {
+        if self.schema_version != TRANSFER_PACKAGE_SCHEMA_VERSION
+            || !valid_stable_id(&self.transfer_id)
+            || !valid_blake3_hex(&self.package_hash)
+            || !valid_blake3_hex(&self.destination_cell_id)
+            || self.destination_assignment_generation == 0
+            || self.destination_fencing_token == 0
+            || !valid_blake3_hex(&self.destination_world_hash)
+            || !self.hash_is_valid()
+        {
+            return Err(HandoffError::QuarantineRejected(
+                "receipt identity, generation, fence, frontier, or hash is invalid".into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -324,7 +347,237 @@ pub fn quarantine_eva_player_transfer(
         receipt_hash: String::new(),
     };
     receipt.receipt_hash = receipt.calculate_hash();
+    receipt.validate()?;
     Ok(receipt)
+}
+
+pub fn stage_committed_eva_export(
+    source: &WorldState,
+    package: &PlayerTransferPackage,
+    transfer: &CellTransferRecord,
+) -> Result<WorldState, HandoffError> {
+    package.validate()?;
+    validate_committed_transfer(package, transfer)?;
+    let witness = transfer_witness(package, TransferWitnessDirection::Export);
+    if let Some(existing) = source.transfer_witnesses.get(&package.transfer_id) {
+        if existing != &witness
+            || source.player.get(&package.aggregate_id).is_some()
+            || source
+                .inventories
+                .contains_key(&package.inventory.inventory_id)
+            || source
+                .processed_operations
+                .contains_key(&package.aggregate_id)
+        {
+            return Err(HandoffError::CommittedStateRejected(
+                "source retry conflicts with the durable export witness".into(),
+            ));
+        }
+        validate_staged_world(source)?;
+        return Ok(source.clone());
+    }
+    if source.state_hash() != package.source_world_hash
+        || source.cell_id != package.source_cell_id
+        || source.fencing_token != package.source_fencing_token
+        || source.player.get(&package.aggregate_id) != Some(&package.source_player)
+        || source.inventories.get(&package.inventory.inventory_id) != Some(&package.inventory)
+        || source.processed_operations.get(&package.aggregate_id)
+            != package.operation_history.as_ref()
+    {
+        return Err(HandoffError::CommittedStateRejected(
+            "source world no longer matches the exact prepared package".into(),
+        ));
+    }
+
+    let mut staged = source.clone();
+    staged.player.by_id.remove(&package.aggregate_id);
+    staged.inventories.remove(&package.inventory.inventory_id);
+    staged.processed_operations.remove(&package.aggregate_id);
+    if staged.player.primary_player_id == package.aggregate_id {
+        staged.player.primary_player_id = staged
+            .player
+            .by_id
+            .keys()
+            .next()
+            .cloned()
+            .unwrap_or_default();
+    }
+    add_transfer_witness(&mut staged, witness)?;
+    validate_staged_world(&staged)?;
+    Ok(staged)
+}
+
+pub fn stage_committed_eva_import(
+    destination: &WorldState,
+    package: &PlayerTransferPackage,
+    receipt: &PlayerTransferQuarantineReceipt,
+    transfer: &CellTransferRecord,
+) -> Result<WorldState, HandoffError> {
+    package.validate()?;
+    receipt.validate()?;
+    validate_committed_transfer(package, transfer)?;
+    if receipt.transfer_id != package.transfer_id
+        || receipt.package_hash != package.package_hash
+        || receipt.destination_cell_id != package.destination_cell_id
+        || receipt.destination_assignment_generation != package.destination_assignment_generation
+        || transfer.quarantine_receipt_hash.as_deref() != Some(&receipt.receipt_hash)
+    {
+        return Err(HandoffError::CommittedStateRejected(
+            "quarantine receipt is not bound to the committed transfer".into(),
+        ));
+    }
+    let witness = transfer_witness(package, TransferWitnessDirection::Import);
+    if let Some(existing) = destination.transfer_witnesses.get(&package.transfer_id) {
+        if existing != &witness
+            || destination.player.get(&package.aggregate_id) != Some(&package.destination_player)
+            || destination.inventories.get(&package.inventory.inventory_id)
+                != Some(&package.inventory)
+            || destination.processed_operations.get(&package.aggregate_id)
+                != package.operation_history.as_ref()
+        {
+            return Err(HandoffError::CommittedStateRejected(
+                "destination retry conflicts with the durable import witness".into(),
+            ));
+        }
+        validate_staged_world(destination)?;
+        return Ok(destination.clone());
+    }
+    if destination.state_hash() != receipt.destination_world_hash
+        || destination.cell_id != package.destination_cell_id
+        || destination.fencing_token != receipt.destination_fencing_token
+        || destination.event_sequence != receipt.destination_event_sequence
+        || destination.player.get(&package.aggregate_id).is_some()
+        || destination
+            .inventories
+            .contains_key(&package.inventory.inventory_id)
+        || destination
+            .processed_operations
+            .contains_key(&package.aggregate_id)
+    {
+        return Err(HandoffError::CommittedStateRejected(
+            "destination world no longer matches the exact quarantine boundary".into(),
+        ));
+    }
+
+    let mut staged = destination.clone();
+    if staged.player.by_id.is_empty() {
+        staged
+            .player
+            .primary_player_id
+            .clone_from(&package.aggregate_id);
+    }
+    staged.player.by_id.insert(
+        package.aggregate_id.clone(),
+        package.destination_player.clone(),
+    );
+    staged.inventories.insert(
+        package.inventory.inventory_id.clone(),
+        package.inventory.clone(),
+    );
+    if let Some(history) = &package.operation_history {
+        staged
+            .processed_operations
+            .insert(package.aggregate_id.clone(), history.clone());
+    }
+    add_transfer_witness(&mut staged, witness)?;
+    validate_staged_world(&staged)?;
+    Ok(staged)
+}
+
+fn validate_committed_transfer(
+    package: &PlayerTransferPackage,
+    transfer: &CellTransferRecord,
+) -> Result<(), HandoffError> {
+    if !matches!(
+        transfer.phase,
+        TransferPhase::Committed | TransferPhase::Imported | TransferPhase::Finalized
+    ) || transfer.aggregate_kind != MobileAggregateKind::Player
+        || transfer.transfer_id != package.transfer_id
+        || transfer.aggregate_id != package.aggregate_id
+        || transfer.source_cell_key != package.source_cell_key
+        || transfer.source_cell_id != package.source_cell_id
+        || transfer.destination_cell_key != package.destination_cell_key
+        || transfer.destination_cell_id != package.destination_cell_id
+        || transfer.source_assignment_generation != package.source_assignment_generation
+        || transfer.destination_assignment_generation != package.destination_assignment_generation
+        || transfer.prior_placement_generation != package.prior_placement_generation
+        || transfer.resulting_placement_generation != package.resulting_placement_generation
+        || transfer.package_hash != package.package_hash
+        || transfer.quarantine_receipt_hash.is_none()
+    {
+        return Err(HandoffError::CommittedStateRejected(
+            "directory commit does not match the immutable player package".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn transfer_witness(
+    package: &PlayerTransferPackage,
+    direction: TransferWitnessDirection,
+) -> TransferConservationWitness {
+    TransferConservationWitness {
+        transfer_id: package.transfer_id.clone(),
+        package_hash: package.package_hash.clone(),
+        counterparty_cell_id: match direction {
+            TransferWitnessDirection::Import => package.source_cell_id.clone(),
+            TransferWitnessDirection::Export => package.destination_cell_id.clone(),
+        },
+        direction,
+        contents: package.conservation.inventory_contents.clone(),
+    }
+}
+
+fn add_transfer_witness(
+    world: &mut WorldState,
+    witness: TransferConservationWitness,
+) -> Result<(), HandoffError> {
+    let contents = &witness.contents;
+    let ledger = &mut world.ledger;
+    match witness.direction {
+        TransferWitnessDirection::Import => {
+            ledger.transfer_imported_ore = checked_add(ledger.transfer_imported_ore, contents.ore)?;
+            ledger.transfer_imported_refined =
+                checked_add(ledger.transfer_imported_refined, contents.refined_material)?;
+            ledger.transfer_imported_components =
+                checked_add(ledger.transfer_imported_components, contents.components)?;
+        }
+        TransferWitnessDirection::Export => {
+            ledger.transfer_exported_ore = checked_add(ledger.transfer_exported_ore, contents.ore)?;
+            ledger.transfer_exported_refined =
+                checked_add(ledger.transfer_exported_refined, contents.refined_material)?;
+            ledger.transfer_exported_components =
+                checked_add(ledger.transfer_exported_components, contents.components)?;
+        }
+    }
+    if world
+        .transfer_witnesses
+        .insert(witness.transfer_id.clone(), witness)
+        .is_some()
+    {
+        return Err(HandoffError::CommittedStateRejected(
+            "transfer witness was already present".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn checked_add(left: u64, right: u64) -> Result<u64, HandoffError> {
+    left.checked_add(right).ok_or_else(|| {
+        HandoffError::CommittedStateRejected("transfer conservation counter overflowed".into())
+    })
+}
+
+fn validate_staged_world(world: &WorldState) -> Result<(), HandoffError> {
+    world
+        .validate_player_roster()
+        .map_err(HandoffError::CommittedStateRejected)?;
+    if !world.conservation().valid {
+        return Err(HandoffError::CommittedStateRejected(
+            "cell conservation failed across the transfer boundary".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn destination_player(
@@ -363,7 +616,11 @@ fn valid_stable_id(value: &str) -> bool {
 mod tests {
     use super::*;
     use crate::model::WORLD_SCHEMA_VERSION;
-    use crate::{EVENT_SCHEMA_VERSION, neighbor_cell_key};
+    use crate::{
+        EVENT_SCHEMA_VERSION, LocalCellDirectory, MobileAggregateKind, neighbor_cell_key,
+        proof_cell_keys, universe_manifest,
+    };
+    use tempfile::tempdir;
 
     fn crossing_fixture() -> (WorldState, WorldState, PlayerTransferContext) {
         let mut source = WorldState::genesis(801);
@@ -486,5 +743,170 @@ mod tests {
             .locomotion
             .magnetic_boots_enabled = true;
         assert!(prepare_eva_player_transfer(&source, "player-local", &context).is_err());
+    }
+
+    #[test]
+    fn committed_directory_handoff_moves_player_and_cargo_exactly_once() {
+        let (source, destination, mut context) = crossing_fixture();
+        context.source_assignment_generation = 1;
+        context.destination_assignment_generation = 1;
+        context.prior_placement_generation = 1;
+        context.resulting_placement_generation = 2;
+        let package = prepare_eva_player_transfer(&source, "player-local", &context)
+            .expect("EVA package prepares");
+        assert!(package.conservation.inventory_contents.components > 0);
+
+        let directory_root = tempdir().expect("temporary directory");
+        let manifest = universe_manifest(801, WORLD_SCHEMA_VERSION, EVENT_SCHEMA_VERSION)
+            .expect("test manifest builds");
+        let [origin, east] = proof_cell_keys().expect("proof cells build");
+        let mut directory = LocalCellDirectory::open(
+            directory_root.path(),
+            &manifest,
+            [origin.clone(), east.clone()],
+        )
+        .expect("directory opens");
+        directory
+            .claim(&origin, 0, "worker-origin")
+            .expect("source assignment commits");
+        directory
+            .claim(&east, 0, "worker-east")
+            .expect("destination assignment commits");
+        directory
+            .register_placement("player-local", MobileAggregateKind::Player, &origin)
+            .expect("initial placement commits");
+        directory
+            .prepare_transfer(
+                "player-local",
+                1,
+                &package.transfer_id,
+                &east,
+                &package.package_hash,
+            )
+            .expect("directory prepare commits");
+        let receipt =
+            quarantine_eva_player_transfer(&destination, destination.fencing_token, &package)
+                .expect("destination quarantine succeeds");
+        directory
+            .record_quarantine(
+                &package.transfer_id,
+                &package.package_hash,
+                &receipt.receipt_hash,
+            )
+            .expect("quarantine receipt commits");
+        let committed = directory
+            .commit_transfer(&package.transfer_id, 1)
+            .expect("placement CAS commits");
+
+        let exported = stage_committed_eva_export(&source, &package, &committed)
+            .expect("source export stages atomically");
+        let imported = stage_committed_eva_import(&destination, &package, &receipt, &committed)
+            .expect("destination import stages atomically");
+        assert!(exported.player.get("player-local").is_none());
+        assert!(
+            !exported
+                .inventories
+                .contains_key(&package.inventory.inventory_id)
+        );
+        assert_eq!(
+            imported.player.get("player-local"),
+            Some(&package.destination_player)
+        );
+        assert_eq!(
+            imported.inventories.get(&package.inventory.inventory_id),
+            Some(&package.inventory)
+        );
+        assert!(exported.conservation().valid);
+        assert!(imported.conservation().valid);
+        assert_eq!(
+            exported
+                .transfer_witnesses
+                .get(&package.transfer_id)
+                .expect("source export witness")
+                .direction,
+            TransferWitnessDirection::Export
+        );
+        assert_eq!(
+            imported
+                .transfer_witnesses
+                .get(&package.transfer_id)
+                .expect("destination import witness")
+                .direction,
+            TransferWitnessDirection::Import
+        );
+
+        assert_eq!(
+            stage_committed_eva_export(&exported, &package, &committed)
+                .expect("source export retry converges"),
+            exported
+        );
+        assert_eq!(
+            stage_committed_eva_import(&imported, &package, &receipt, &committed)
+                .expect("destination import retry converges"),
+            imported
+        );
+
+        let imported_record = directory
+            .record_imported(&package.transfer_id)
+            .expect("directory records destination import");
+        let finalized = directory
+            .finalize_transfer(&package.transfer_id)
+            .expect("directory finalizes handoff");
+        assert_eq!(imported_record.phase, TransferPhase::Imported);
+        assert_eq!(finalized.phase, TransferPhase::Finalized);
+        assert_eq!(
+            stage_committed_eva_export(&exported, &package, &finalized)
+                .expect("finalized source retry converges"),
+            exported
+        );
+        assert_eq!(
+            stage_committed_eva_import(&imported, &package, &receipt, &finalized)
+                .expect("finalized destination retry converges"),
+            imported
+        );
+    }
+
+    #[test]
+    fn world_materialization_rejects_precommit_and_conflicting_retries() {
+        let (source, destination, context) = crossing_fixture();
+        let package = prepare_eva_player_transfer(&source, "player-local", &context)
+            .expect("EVA package prepares");
+        let receipt =
+            quarantine_eva_player_transfer(&destination, destination.fencing_token, &package)
+                .expect("destination quarantine succeeds");
+        let mut transfer = CellTransferRecord {
+            transfer_id: package.transfer_id.clone(),
+            aggregate_id: package.aggregate_id.clone(),
+            aggregate_kind: MobileAggregateKind::Player,
+            source_cell_key: package.source_cell_key.clone(),
+            source_cell_id: package.source_cell_id.clone(),
+            destination_cell_key: package.destination_cell_key.clone(),
+            destination_cell_id: package.destination_cell_id.clone(),
+            source_assignment_generation: package.source_assignment_generation,
+            destination_assignment_generation: package.destination_assignment_generation,
+            prior_placement_generation: package.prior_placement_generation,
+            resulting_placement_generation: package.resulting_placement_generation,
+            package_hash: package.package_hash.clone(),
+            quarantine_receipt_hash: Some(receipt.receipt_hash.clone()),
+            phase: TransferPhase::Quarantined,
+        };
+        assert!(stage_committed_eva_export(&source, &package, &transfer).is_err());
+        assert!(stage_committed_eva_import(&destination, &package, &receipt, &transfer).is_err());
+
+        transfer.phase = TransferPhase::Committed;
+        let mut exported =
+            stage_committed_eva_export(&source, &package, &transfer).expect("export succeeds");
+        exported
+            .transfer_witnesses
+            .get_mut(&package.transfer_id)
+            .expect("witness exists")
+            .package_hash = "0".repeat(64);
+        assert!(stage_committed_eva_export(&exported, &package, &transfer).is_err());
+
+        let mut stale_destination = destination.clone();
+        stale_destination.simulation_tick += 1;
+        assert!(
+            stage_committed_eva_import(&stale_destination, &package, &receipt, &transfer).is_err()
+        );
     }
 }
