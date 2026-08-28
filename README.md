@@ -2,11 +2,11 @@
 
 The Verse is an open-source persistent voxel space universe, work-and-economy simulator, and Web3 marketplace.
 
-The repository now contains the **cross-platform verified P0.10 simulation proof**, including authoritative grounded locomotion, EVA, orbital operations, contact physics, survival death, mining, production, construction, and exact recovery. P1 work adds a session-bound deterministic player roster, one atomic physics outcome for every living roster member and grid, server-reconstructed closest-visible hand-tool targeting, and a P1.1 actor-owned industry boundary. A fresh local universe pre-admits two loopback-only development pilots; either native client identity can bind, move independently, aim, mine, and render the other pilot, while ownership prevents one pilot from spending or constructively operating the other's assets. This remains a development multiplayer cell, not yet the public universe or real-value economy.
+The repository now contains the **locally cross-process verified P1.5 playable proof**, including authoritative grounded locomotion, EVA, orbital operations, contact physics, survival death, mining, physical production, construction, exact recovery, a fixed celestial registry, and interest-managed multiplayer streaming. A fresh local universe pre-admits two loopback-only development pilots; either native client identity can bind, move independently, aim, mine, and render the other pilot, while ownership prevents one pilot from spending or constructively operating the other's assets. The native client and browser command center now consume the same server-owned celestial identities and bounded public world views. This remains a development multiplayer cell, not yet the production-scale public universe or real-value economy.
 
 ## Play it on macOS
 
-Requirements: Apple Silicon or Intel macOS, Rust, Node.js, `curl`, and `jq`.
+Requirements: Apple Silicon macOS, Rust, Node.js, `curl`, and `jq`.
 
 ```bash
 tools/dev/bootstrap-macos.sh
@@ -100,7 +100,54 @@ Start with [the documentation map](docs/README.md), then read:
 
 ## Current status
 
-P0.10 retains durable input-only controls and one atomic Jolt-backed character/grid physics step. A 1.8 m dynamic capsule owns radial upright alignment, tangent walk/sprint, buffered jump, slope handling, bounded steps, ground snap, magnetic attachment, and moving-support velocity inheritance. The active P1.4 transport uses protocol 15: every gameplay mutation carries a contiguous actor-local operation sequence plus a typed, server-derived intent fingerprint, while actor-private projections hide inventory, production queues, progression, exact oxygen, operation history, and cargo-inclusive mass. The canonical universe contains two independently controlled loopback pilots, the original salvage skiff, and a separate powered industrial platform with physical cargo, conveyor, refinery, and assembler blocks. Mining, construction, welding, cutting, and grid operations remain server-authoritative and spatially validated. Refining and manufacturing now reserve cargo input into conserved FIFO job escrow, advance on one-second integer quanta only when the machine has a valid conveyor route and qualifying power, retain blocked output safely, and recover or drop escrow exactly once. Legacy pocket refine/craft inputs fail closed. The native engineering terminal exposes inventory and production tabs, queues refinery/assembler work, shows authoritative progress and pause reasons, and offers the three new industrial blocks on construction keys `6`–`8`. The complete local cross-process loop mines ore, transfers it to the industrial grid, refines material, assembles a component, transfers it back, builds a block, and proves restart convergence without accepted shortcuts. Hosted P1.4 evidence and sleeping-cell production remain pending. Drop recovery/expiry, global streaming, safe zones, accounts, AMMs, and blockchain settlement remain in the [delivery roadmap](docs/roadmap/roadmap.md). See [Physical refining and manufacturing](docs/gameplay/physical-industry.md), [Actor-owned industry and engineering](docs/gameplay/actor-owned-industry.md), [Private player state projection](docs/gameplay/private-state-projection.md), and [Operation idempotency and retry contract](docs/architecture/operation-idempotency.md) for the exact current authority, visibility, and recovery contracts.
+P0.10 retains durable input-only controls and one atomic Jolt-backed
+character/grid physics step. A 1.8 m dynamic capsule owns radial upright
+alignment, tangent walk/sprint, buffered jump, slope handling, bounded steps,
+ground snap, magnetic attachment, and moving-support velocity inheritance. The
+active P1.5 transport uses protocol 16: gameplay mutations retain actor-local
+idempotency while connections receive a registry-bound interest baseline
+followed by acknowledged sparse deltas, bounded recovery baselines, and exact
+enter/replace/remove semantics. Actor-private projections hide inventory,
+production queues, progression, exact oxygen, operation history, and
+cargo-inclusive mass. Before either official client applies a view, one shared
+Apache-licensed verifier independently reconstructs it from the raw typed
+message, checks the pinned universe/content/registry/manifest trust roots and
+BLAKE3 commitment, and alone emits the exact acknowledgement. The browser runs
+that core in a same-origin WASM Worker; the native client uses a Godot extension
+and preserves protocol `u64` values losslessly even beyond Godot's signed
+integer range. Neither client has an unverified fallback.
+
+The canonical proof universe contains fixed Khepri Prime, Sable, an origin
+asteroid field, two independently controlled loopback pilots, the salvage
+skiff, and a powered industrial platform with physical cargo, conveyor,
+refinery, and assembler blocks. Mining, construction, welding, cutting, and
+grid operations remain server-authoritative and spatially validated. Refining
+and manufacturing reserve cargo input into conserved FIFO job escrow, advance
+on one-second integer quanta only with a valid conveyor route and qualifying
+power, retain blocked output safely, and recover or drop escrow exactly once.
+The native engineering terminal exposes inventory and production tabs and the
+browser separates a local operations view from a registry-derived universe
+map.
+
+The complete local cross-process loop mines ore, transfers it to the industrial
+grid, refines material, assembles a component, transfers it back, builds a
+block, exercises two-player visibility and privacy, independently verifies
+native and browser views, rejects an in-flight tamper without applying or
+acknowledging it, recovers from an invalid frontier, and proves restart
+convergence without accepted shortcuts. [Hosted CI run
+33128613104](https://github.com/Bittrees-Technology/the-verse/actions/runs/33128613104)
+passes the complete Linux replay, Linux container probe, independent browser
+and native verifier suites, and Linux/Apple Silicon packages for implementation
+revision `71e955c`. Production active-player load, the production binary codec,
+and sleeping-cell production remain pending. Drop recovery/expiry, global cell
+execution, safe zones, accounts, AMMs, and blockchain settlement remain in the
+[delivery roadmap](docs/roadmap/roadmap.md). See [Celestial registry and
+interest-managed visibility](docs/gameplay/celestial-registry-and-interest-management.md),
+[Physical refining and manufacturing](docs/gameplay/physical-industry.md),
+[Private player state projection](docs/gameplay/private-state-projection.md),
+and [Operation idempotency and retry
+contract](docs/architecture/operation-idempotency.md) for the exact current
+authority, visibility, and recovery contracts.
 
 ## Licensing
 

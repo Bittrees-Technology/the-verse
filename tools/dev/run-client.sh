@@ -12,6 +12,7 @@ if [[ ! -x "${godot_binary}" ]]; then
   echo "The pinned Godot client is missing. Run tools/dev/bootstrap-macos.sh first." >&2
   exit 1
 fi
+tools/ci/build-native-verifier.sh debug
 
 echo "Connecting authoritative pilot ${player_id} to ${server_url}"
 "${godot_binary}" \

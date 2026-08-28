@@ -1,6 +1,6 @@
 {
-  "schema_version": 10,
-  "manifest_version": "p1.4.0",
+  "schema_version": 11,
+  "manifest_version": "p1.5.0",
   "license": "AGPL-3.0-or-later",
   "physics": {
     "fixed_step_hz": 60,
@@ -66,6 +66,73 @@
   "production": {
     "scheduler_interval_millis": 1000,
     "queue_limit_per_machine": 32
+  },
+  "celestial": {
+    "minimum_fixed_body_surface_gap_um": 3000000000,
+    "geometry_definition_ids": [
+      "procedural-voxel-v1",
+      "sphere-heightfield-v1"
+    ],
+    "voxel_definition_ids": [
+      "origin-voxel-field-v1"
+    ],
+    "material_definition_ids": [
+      "airless-regolith-v1",
+      "ferrite-regolith-v1",
+      "terrestrial-regolith-v1"
+    ],
+    "gravity_definition_ids": [
+      "none-v1",
+      "radial-inverse-square-v1"
+    ],
+    "atmosphere_definition_ids": [
+      "none-v1",
+      "oxygen-gradient-v1"
+    ],
+    "resource_definition_ids": [
+      "ferrite-deposit-v1",
+      "none-v1"
+    ]
+  },
+  "interest": {
+    "spatial_bucket_edge_m": 256,
+    "enter_radius_m": 2000,
+    "exit_radius_m": 2250,
+    "exit_consecutive_ticks": 2,
+    "maximum_visible_entities": 4096,
+    "selected_context_margin_m": 250,
+    "maximum_selected_context_entities": 64,
+    "public_spectator_anchor_um": { "x": 0, "y": 0, "z": 0 },
+    "entity_bands": [
+      {
+        "kind": "player",
+        "enter_radius_m": 2000,
+        "exit_radius_m": 2250,
+        "update_interval_ticks": 1,
+        "maximum_entities": 1024
+      },
+      {
+        "kind": "grid",
+        "enter_radius_m": 2000,
+        "exit_radius_m": 2250,
+        "update_interval_ticks": 1,
+        "maximum_entities": 1024
+      },
+      {
+        "kind": "voxel_chunk",
+        "enter_radius_m": 512,
+        "exit_radius_m": 640,
+        "update_interval_ticks": 6,
+        "maximum_entities": 1536
+      },
+      {
+        "kind": "death_drop",
+        "enter_radius_m": 2000,
+        "exit_radius_m": 2250,
+        "update_interval_ticks": 60,
+        "maximum_entities": 512
+      }
+    ]
   },
   "experience_rewards": {
     "mined_ore_unit": 5,

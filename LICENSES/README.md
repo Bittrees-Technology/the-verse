@@ -15,4 +15,9 @@ The root [LICENSE](../LICENSE) contains the GNU Affero General Public License v3
 
 Third-party dependencies and assets must be added to a software or content bill of materials before release.
 
-The current P0 dependency record is in [THIRD_PARTY.md](THIRD_PARTY.md). `Cargo.lock` is the canonical version lock for the Rust dependency graph.
+The repository also carries verbatim third-party license texts when a shipped
+runtime dependency requires a license not already represented by the component
+licenses. Godot-rust's Mozilla Public License 2.0 is included in
+[`MPL-2.0.txt`](MPL-2.0.txt).
+
+The current P1.5 dependency record is in [THIRD_PARTY.md](THIRD_PARTY.md). `Cargo.lock` is the canonical version lock for the Rust dependency graph.

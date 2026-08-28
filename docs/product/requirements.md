@@ -33,6 +33,7 @@ Requirement IDs are stable references for issues, pull requests, tests, and rele
 - **WORLD-006 — Long travel:** Interplanetary travel without jump technology shall take real-world days.
 - **WORLD-007 — Offline travel:** Autopilot travel shall continue while a user is offline and remain observable through browser interfaces.
 - **WORLD-008 — Partitioned execution:** One logical universe shall be simulated by many dynamically managed cells.
+- **WORLD-009 — Canonical celestial identity:** Every materialized celestial body shall have one immutable ID and normalized hierarchical universe address pinned by a versioned registry hash. Authorized voxel edits or later rule changes shall not silently move or re-identify an existing body.
 
 ## Voxels and grids
 
@@ -48,6 +49,8 @@ Requirement IDs are stable references for issues, pull requests, tests, and rele
 - **SIM-010 — Grounded locomotion authority:** The authoritative cell shall derive grounded, airborne, EVA, and magnetic locomotion from gravity, collision queries, and stable support identity. Walking, sprinting, jumping, slope and step traversal, and moving-support inheritance shall not be selected by a client transform or client-reported contact.
 - **SIM-011 — Session-bound player authority:** Every authenticated gameplay connection shall be bound by the server to exactly one canonical player identity. Every mutation, input frontier, inventory permission, life-support transition, receipt, and audit event shall identify that actor; one connection shall not be able to act as another player by changing client payload fields.
 - **SIM-012 — Multi-player cell:** An active simulation cell shall advance and replicate multiple canonical players in one shared fixed-step world. Each player shall have independent durable movement state, inventory, life state, operation-id namespace, and reconnect frontier while sharing the same authoritative voxel, grid, contact, and event order.
+- **SIM-013 — Server-derived spatial interest:** A real-time connection shall receive a bounded spatial view selected from authoritative position and server policy. A client-supplied camera or subscription hint shall never grant gameplay authority, reveal actor-private state, or change canonical simulation.
+- **SIM-014 — Interest-view convergence:** Interest baselines and deltas shall use deterministic ordering, explicit enter/update/remove semantics, a connection-local epoch and sequence, bounded latest-state backpressure, and a resnapshot path that converges after loss, duplication, reordering, or reconnect without requiring a global world snapshot.
 
 ## Persistence, death, and cleanup
 

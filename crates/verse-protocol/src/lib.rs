@@ -9,16 +9,257 @@
 use serde::{Deserialize, Serialize};
 
 /// The only protocol version accepted by this build.
-pub const PROTOCOL_VERSION: u32 = 15;
+pub const PROTOCOL_VERSION: u32 = 16;
 
-/// The actor-aware public/private projection contract carried by protocol 15.
-pub const PROJECTION_SCHEMA_VERSION: u32 = 2;
+/// The actor-aware, interest-managed projection contract carried by protocol 16.
+pub const PROJECTION_SCHEMA_VERSION: u32 = 3;
+pub const CELESTIAL_REGISTRY_SCHEMA_VERSION: u32 = 1;
+pub const UNIVERSE_MANIFEST_SCHEMA_VERSION: u32 = 2;
+pub const INTEREST_SCHEMA_VERSION: u32 = 1;
 pub const INTENT_FINGERPRINT_SCHEMA_VERSION: u32 = 1;
+
+/// An exact bounded local coordinate in integer micrometres.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(deny_unknown_fields)]
+pub struct I64Vec3 {
+    pub x: i64,
+    pub y: i64,
+    pub z: i64,
+}
+
+impl I64Vec3 {
+    pub const ZERO: Self = Self { x: 0, y: 0, z: 0 };
+
+    pub const fn new(x: i64, y: i64, z: i64) -> Self {
+        Self { x, y, z }
+    }
+}
+
+/// Sector axes are strings on JSON surfaces so signed 128-bit coordinates
+/// never pass through a JavaScript number.
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SectorCoordinate {
+    pub x: String,
+    pub y: String,
+    pub z: String,
+}
+
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(deny_unknown_fields)]
+pub struct CellCoordinate {
+    pub x: u32,
+    pub y: u32,
+    pub z: u32,
+}
+
+/// Canonical universe address schema 1. `local_um` is normalized into the
+/// cell-centred half-open interval selected by the universe manifest.
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UniverseAddress {
+    pub universe_id: String,
+    pub sector: SectorCoordinate,
+    pub cell: CellCoordinate,
+    pub local_um: I64Vec3,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CelestialBodyKind {
+    Planet,
+    Moon,
+    Asteroid,
+    AsteroidField,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CelestialScaleClass {
+    Proof,
+    Production,
+}
+
+/// Immutable public registry record. Physical/environment quantities are
+/// integer encoded so the registry hash is independent of floating-point
+/// serialization.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CelestialBodySnapshot {
+    pub body_id: String,
+    pub display_name: String,
+    pub kind: CelestialBodyKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_body_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field_id: Option<String>,
+    pub center: UniverseAddress,
+    pub surface_radius_um: u64,
+    pub exclusion_radius_um: u64,
+    pub fixed_orientation_microradians: I64Vec3,
+    pub surface_gravity_millimetres_per_second_squared: u64,
+    pub atmosphere_height_um: u64,
+    pub oxygen_parts_per_million: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voxel_field_id: Option<String>,
+    pub geometry_definition_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voxel_definition_id: Option<String>,
+    pub material_definition_id: String,
+    pub gravity_definition_id: String,
+    pub atmosphere_definition_id: String,
+    pub resource_definition_id: String,
+    pub visual_descriptor_id: String,
+    pub scale_class: CelestialScaleClass,
+    pub generation_seed: String,
+    pub generation_rule_version: String,
+    pub materialized_registry_version: u64,
+    pub content_manifest_version: String,
+    pub content_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CelestialRegistrySnapshot {
+    pub schema_version: u32,
+    pub registry_hash: String,
+    pub license: String,
+    pub universe_id: String,
+    pub generation_rule_version: String,
+    pub minimum_fixed_body_surface_gap_um: u64,
+    pub bodies: Vec<CelestialBodySnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UniverseManifestSnapshot {
+    pub schema_version: u32,
+    pub manifest_hash: String,
+    pub universe_id: String,
+    pub world_seed: String,
+    pub address_schema_version: u32,
+    pub sector_edge_um: u64,
+    pub cell_edge_um: u64,
+    pub cells_per_sector_axis: u32,
+    pub generation_rule_version: String,
+    pub frontier_policy_version: String,
+    pub celestial_registry_schema_version: u32,
+    pub celestial_registry_hash: String,
+    pub content_schema_version: u32,
+    pub content_manifest_version: String,
+    pub content_hash: String,
+    pub world_schema_version: u32,
+    pub event_schema_version: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InterestObserverClass {
+    BoundPlayer,
+    PublicOriginSpectator,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InterestFrameKind {
+    Baseline,
+    Delta,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InterestEntityKind {
+    Player,
+    Grid,
+    VoxelChunk,
+    DeathDrop,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InterestEntityRef {
+    pub entity_id: String,
+    pub kind: InterestEntityKind,
+    pub projected_revision: u64,
+}
+
+/// Complete audience-safe entity value used for first entry, re-entry, and
+/// absolute replacement. Payload variants contain no actor-private overlay.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "entity_kind", content = "value", rename_all = "snake_case")]
+pub enum InterestEntityPayload {
+    Player(PublicPlayerSnapshot),
+    Grid(PublicGridSnapshot),
+    VoxelChunk(PublicVoxelChunkSnapshot),
+    DeathDrop(PublicDeathDropSnapshot),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InterestEntityProjection {
+    pub entity_id: String,
+    pub kind: InterestEntityKind,
+    pub projected_revision: u64,
+    pub component_schema_version: u32,
+    pub payload: InterestEntityPayload,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InterestRemovalReason {
+    OutOfInterest,
+    Destroyed,
+    Transferred,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InterestRemoval {
+    pub entity_id: String,
+    pub kind: InterestEntityKind,
+    pub reason: InterestRemovalReason,
+}
+
+/// Connection-local replication frontier. The global commitment is retained
+/// as a documented timing/hash side channel; `view_hash` is the convergence
+/// commitment for the audience-safe subset.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InterestSnapshot {
+    pub schema_version: u32,
+    pub frame_kind: InterestFrameKind,
+    pub session_epoch: String,
+    pub interest_epoch: u64,
+    pub baseline_id: String,
+    pub delta_sequence: u64,
+    pub observer_class: InterestObserverClass,
+    pub cell_address: UniverseAddress,
+    pub local_origin_address: UniverseAddress,
+    pub registry_hash: String,
+    pub universe_manifest_hash: String,
+    pub canonical_event_sequence: u64,
+    pub canonical_tick: u64,
+    pub canonical_world_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_view_hash: Option<String>,
+    pub view_hash: String,
+    /// Complete first-entry or re-entry projections in canonical entity order.
+    pub entered: Vec<InterestEntityProjection>,
+    /// Complete absolute replacements for already-visible entities. These are
+    /// never arithmetic patches and do not depend on hidden intermediate state.
+    pub replaced: Vec<InterestEntityProjection>,
+    pub removed: Vec<InterestRemoval>,
+}
 
 /// A stable integer voxel or block coordinate.
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
+#[serde(deny_unknown_fields)]
 pub struct IVec3 {
     pub x: i32,
     pub y: i32,
@@ -57,6 +298,7 @@ impl IVec3 {
 
 /// A local floating-point coordinate used for rendering and active-cell motion.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Vec3 {
     pub x: f64,
     pub y: f64,
@@ -124,6 +366,7 @@ impl std::ops::Sub for Vec3 {
 /// A normalized local-space rotation. Components use the same ordering as
 /// Godot and Jolt (`x`, `y`, `z`, `w`).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Quat {
     pub x: f32,
     pub y: f32,
@@ -349,6 +592,10 @@ pub struct DeathDropSnapshot {
     pub death_id: String,
     pub inventory_id: String,
     pub owner_player_id: String,
+    pub address: UniverseAddress,
+    /// Derived active-cell convenience pose. Canonical snapshot JSON carries
+    /// only `address`; projections may derive a bounded renderer position.
+    #[serde(skip, default)]
     pub position: Vec3,
     pub created_event_sequence: u64,
     pub cause: PlayerDeathCause,
@@ -358,6 +605,9 @@ pub struct DeathDropSnapshot {
 #[allow(clippy::struct_excessive_bools)]
 pub struct PlayerSnapshot {
     pub player_id: String,
+    pub address: UniverseAddress,
+    /// Derived active-cell convenience pose; never canonical snapshot bytes.
+    #[serde(skip, default)]
     pub position: Vec3,
     pub orientation: Quat,
     pub linear_velocity: Vec3,
@@ -388,11 +638,17 @@ pub struct PlayerSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EnvironmentSnapshot {
     pub celestial_body_id: String,
     pub celestial_body_name: String,
+    pub celestial_scale_class: CelestialScaleClass,
+    pub nearest_body_id: String,
+    pub nearest_body_name: String,
     pub planet_center: Vec3,
     pub surface_radius_m: f64,
+    pub distance_to_center_m: f64,
+    pub distance_to_surface_m: f64,
     pub altitude_m: f64,
     pub gravity: Vec3,
     pub gravity_m_s2: f64,
@@ -423,6 +679,7 @@ pub struct BlockSnapshot {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PowerSnapshot {
     pub produced: f64,
     pub required: f64,
@@ -434,6 +691,9 @@ pub struct PowerSnapshot {
 pub struct GridSnapshot {
     pub grid_id: String,
     pub owner_player_id: String,
+    pub address: UniverseAddress,
+    /// Derived active-cell convenience pose; never canonical snapshot bytes.
+    #[serde(skip, default)]
     pub position: Vec3,
     pub orientation: Quat,
     pub linear_velocity: Vec3,
@@ -448,6 +708,9 @@ pub struct GridSnapshot {
 #[allow(clippy::struct_excessive_bools)]
 pub struct PlayerMotionSnapshot {
     pub player_id: String,
+    pub address: UniverseAddress,
+    /// Derived active-cell convenience pose; never canonical motion bytes.
+    #[serde(skip, default)]
     pub position: Vec3,
     pub orientation: Quat,
     pub linear_velocity: Vec3,
@@ -472,6 +735,9 @@ pub struct PlayerMotionSnapshot {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GridMotionSnapshot {
     pub grid_id: String,
+    pub address: UniverseAddress,
+    /// Derived active-cell convenience pose; never canonical motion bytes.
+    #[serde(skip, default)]
     pub position: Vec3,
     pub orientation: Quat,
     pub linear_velocity: Vec3,
@@ -480,6 +746,9 @@ pub struct GridMotionSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MotionSnapshot {
+    pub universe_manifest_hash: String,
+    pub celestial_registry_hash: String,
+    pub cell_address: UniverseAddress,
     pub event_sequence: u64,
     pub simulation_tick: u64,
     pub world_hash: String,
@@ -511,6 +780,11 @@ pub struct WorldSnapshot {
     pub content_manifest_version: String,
     pub universe_id: String,
     pub cell_id: String,
+    pub universe_manifest_hash: String,
+    pub celestial_registry_hash: String,
+    pub cell_address: UniverseAddress,
+    pub gravity_body_id: String,
+    pub voxel_body_id: String,
     pub event_sequence: u64,
     pub simulation_tick: u64,
     pub fencing_token: u64,
@@ -541,8 +815,12 @@ pub enum PublicPlayerLifeState {
 /// Control values, input frontiers, inventories, progression, oxygen, and
 /// private suit state intentionally exist only in the actor-private view.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PublicPlayerSnapshot {
     pub player_id: String,
+    pub address: UniverseAddress,
+    /// Renderer-only convenience pose derived from `address`.
+    #[serde(skip, default)]
     pub position: Vec3,
     pub orientation: Quat,
     pub linear_velocity: Vec3,
@@ -557,6 +835,7 @@ pub struct PublicPlayerSnapshot {
 /// A public block view. Cargo inventory identity is an authority edge and is
 /// therefore absent even when the block itself is visible.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PublicBlockSnapshot {
     pub block_id: String,
     pub coordinate: IVec3,
@@ -565,14 +844,29 @@ pub struct PublicBlockSnapshot {
     pub health: u16,
     pub max_health: u16,
     pub construction_complete: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_state: Option<PublicMachineState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicMachineState {
+    Idle,
+    Operating,
+    Paused,
+    Blocked,
 }
 
 /// A public grid view. Cargo-inclusive mass is owner-private because it leaks
 /// protected inventory contents through deterministic mass differences.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PublicGridSnapshot {
     pub grid_id: String,
     pub owner_player_id: String,
+    pub address: UniverseAddress,
+    /// Renderer-only convenience pose derived from `address`.
+    #[serde(skip, default)]
     pub position: Vec3,
     pub orientation: Quat,
     pub linear_velocity: Vec3,
@@ -580,6 +874,27 @@ pub struct PublicGridSnapshot {
     pub anchored: bool,
     pub power: PowerSnapshot,
     pub blocks: Vec<PublicBlockSnapshot>,
+}
+
+/// Public salvage marker. Ownership, source death, inventory identity, cause,
+/// and contents remain actor-private authority records.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicDeathDropSnapshot {
+    pub drop_id: String,
+    pub address: UniverseAddress,
+}
+
+/// Complete authorized replacement for one body-local voxel chunk. Individual
+/// voxels remain integer body-local coordinates; clients never infer chunk
+/// identity or revision from total visible voxel count.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicVoxelChunkSnapshot {
+    pub chunk_id: String,
+    pub body_id: String,
+    pub revision: u64,
+    pub voxels: Vec<VoxelSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -608,23 +923,61 @@ pub struct ActorPrivateSnapshot {
 /// timing and hash changes can still reveal that hidden state changed; this
 /// schema protects field values, not timing or aggregate-hash side channels.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectedWorldSnapshot {
     pub projection_schema_version: u32,
     pub schema_version: u32,
     pub content_manifest_version: String,
     pub universe_id: String,
     pub cell_id: String,
+    pub universe_manifest_hash: String,
+    pub celestial_registry_hash: String,
+    pub cell_address: UniverseAddress,
+    pub gravity_body_id: String,
+    pub voxel_body_id: String,
     pub event_sequence: u64,
     pub simulation_tick: u64,
     pub fencing_token: u64,
     pub world_hash: String,
     pub players: Vec<PublicPlayerSnapshot>,
     pub environment: EnvironmentSnapshot,
-    pub voxels: Vec<VoxelSnapshot>,
+    pub voxel_chunks: Vec<PublicVoxelChunkSnapshot>,
     pub grids: Vec<PublicGridSnapshot>,
+    pub death_drops: Vec<PublicDeathDropSnapshot>,
     pub conservation_valid: bool,
+    pub interest: InterestSnapshot,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actor_private: Option<ActorPrivateSnapshot>,
+}
+
+/// A contiguous cumulative delta from one acknowledged interest view to the
+/// newest audience-safe view. Public enters/replacements/removals live in
+/// `interest`; optional private values are complete actor-bound replacements.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectedInterestDelta {
+    pub projection_schema_version: u32,
+    pub schema_version: u32,
+    pub content_manifest_version: String,
+    pub universe_id: String,
+    pub cell_id: String,
+    pub universe_manifest_hash: String,
+    pub celestial_registry_hash: String,
+    pub cell_address: UniverseAddress,
+    pub gravity_body_id: String,
+    pub voxel_body_id: String,
+    pub event_sequence: u64,
+    pub simulation_tick: u64,
+    pub world_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<EnvironmentSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conservation_valid: Option<bool>,
+    pub interest: InterestSnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_private: Option<ActorPrivateSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_private_motion: Option<PlayerMotionSnapshot>,
 }
 
 /// Public high-rate motion for a player. Exact locomotion, input frontiers,
@@ -632,6 +985,9 @@ pub struct ProjectedWorldSnapshot {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PublicPlayerMotionSnapshot {
     pub player_id: String,
+    pub address: UniverseAddress,
+    /// Renderer-only convenience pose derived from `address`.
+    #[serde(skip, default)]
     pub position: Vec3,
     pub orientation: Quat,
     pub linear_velocity: Vec3,
@@ -645,6 +1001,9 @@ pub struct PublicPlayerMotionSnapshot {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PublicGridMotionSnapshot {
     pub grid_id: String,
+    pub address: UniverseAddress,
+    /// Renderer-only convenience pose derived from `address`.
+    #[serde(skip, default)]
     pub position: Vec3,
     pub orientation: Quat,
     pub linear_velocity: Vec3,
@@ -657,11 +1016,14 @@ pub struct PublicGridMotionSnapshot {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProjectedMotionSnapshot {
     pub projection_schema_version: u32,
+    pub universe_manifest_hash: String,
+    pub celestial_registry_hash: String,
     pub event_sequence: u64,
     pub simulation_tick: u64,
     pub world_hash: String,
     pub players: Vec<PublicPlayerMotionSnapshot>,
     pub grids: Vec<PublicGridMotionSnapshot>,
+    pub interest: InterestSnapshot,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actor_private: Option<PlayerMotionSnapshot>,
 }
@@ -695,6 +1057,13 @@ pub enum ClientMessage {
         authentication: ClientAuthentication,
     },
     RequestSnapshot,
+    AcknowledgeInterest {
+        session_epoch: String,
+        interest_epoch: u64,
+        baseline_id: String,
+        delta_sequence: u64,
+        view_hash: String,
+    },
     SetPlayerControl {
         operation_sequence: u64,
         operation_id: String,
@@ -789,7 +1158,7 @@ pub enum ClientMessage {
 impl ClientMessage {
     pub fn set_operation_sequence(&mut self, sequence: u64) -> bool {
         match self {
-            Self::Hello { .. } | Self::RequestSnapshot => false,
+            Self::Hello { .. } | Self::RequestSnapshot | Self::AcknowledgeInterest { .. } => false,
             Self::SetPlayerControl {
                 operation_sequence, ..
             }
@@ -837,7 +1206,7 @@ impl ClientMessage {
 
     pub fn operation_sequence(&self) -> Option<u64> {
         match self {
-            Self::Hello { .. } | Self::RequestSnapshot => None,
+            Self::Hello { .. } | Self::RequestSnapshot | Self::AcknowledgeInterest { .. } => None,
             Self::SetPlayerControl {
                 operation_sequence, ..
             }
@@ -882,7 +1251,7 @@ impl ClientMessage {
 
     pub fn operation_id(&self) -> Option<&str> {
         match self {
-            Self::Hello { .. } | Self::RequestSnapshot => None,
+            Self::Hello { .. } | Self::RequestSnapshot | Self::AcknowledgeInterest { .. } => None,
             Self::SetPlayerControl { operation_id, .. }
             | Self::SetSuitMode { operation_id, .. }
             | Self::RespawnPlayer { operation_id, .. }
@@ -914,9 +1283,30 @@ pub struct IntentReceipt {
 pub enum ServerMessage {
     Welcome {
         protocol_version: u32,
+        projection_schema_version: u32,
+        world_schema_version: u32,
+        event_schema_version: u32,
+        content_schema_version: u32,
+        content_manifest_version: String,
+        celestial_registry_schema_version: u32,
+        universe_manifest_schema_version: u32,
+        interest_schema_version: u32,
         server_name: String,
         session_role: SessionRole,
     },
+    Registry {
+        registry: Box<CelestialRegistrySnapshot>,
+        universe_manifest: Box<UniverseManifestSnapshot>,
+    },
+    InterestBaseline {
+        baseline: Box<ProjectedWorldSnapshot>,
+    },
+    InterestDelta {
+        delta: Box<ProjectedInterestDelta>,
+    },
+    /// Protocol-15 compatibility shape. Protocol-16 official clients must use
+    /// `interest_baseline` and `interest_delta` and workers must never mix the
+    /// two state-stream families within one session.
     Snapshot {
         snapshot: Box<ProjectedWorldSnapshot>,
     },
@@ -941,6 +1331,164 @@ pub enum ServerMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_address() -> UniverseAddress {
+        UniverseAddress {
+            universe_id: "the-verse-local".into(),
+            sector: SectorCoordinate {
+                x: "0".into(),
+                y: "0".into(),
+                z: "0".into(),
+            },
+            cell: CellCoordinate {
+                x: 500,
+                y: 500,
+                z: 500,
+            },
+            local_um: I64Vec3::ZERO,
+        }
+    }
+
+    #[test]
+    fn exact_address_json_rejects_unknown_fields_at_every_level() {
+        let mut top = serde_json::to_value(test_address()).expect("address serializes");
+        top.as_object_mut()
+            .expect("address is an object")
+            .insert("unexpected".into(), serde_json::json!(true));
+        assert!(serde_json::from_value::<UniverseAddress>(top).is_err());
+
+        let mut nested = serde_json::to_value(test_address()).expect("address serializes");
+        nested["sector"]
+            .as_object_mut()
+            .expect("sector is an object")
+            .insert("unexpected".into(), serde_json::json!(true));
+        assert!(serde_json::from_value::<UniverseAddress>(nested).is_err());
+    }
+
+    #[test]
+    fn protocol_v16_registry_manifest_and_interest_reject_unknown_fields() {
+        let body = CelestialBodySnapshot {
+            body_id: "body-test".into(),
+            display_name: "Body Test".into(),
+            kind: CelestialBodyKind::Asteroid,
+            parent_body_id: None,
+            field_id: Some("field-test".into()),
+            center: test_address(),
+            surface_radius_um: 1_000_000,
+            exclusion_radius_um: 2_000_000,
+            fixed_orientation_microradians: I64Vec3::ZERO,
+            surface_gravity_millimetres_per_second_squared: 0,
+            atmosphere_height_um: 0,
+            oxygen_parts_per_million: 0,
+            voxel_field_id: Some("voxel-test".into()),
+            geometry_definition_id: "geometry-test".into(),
+            voxel_definition_id: Some("voxel-definition-test".into()),
+            material_definition_id: "material-test".into(),
+            gravity_definition_id: "gravity-test".into(),
+            atmosphere_definition_id: "atmosphere-test".into(),
+            resource_definition_id: "resource-test".into(),
+            visual_descriptor_id: "visual-test".into(),
+            scale_class: CelestialScaleClass::Proof,
+            generation_seed: "1".into(),
+            generation_rule_version: "rule-1".into(),
+            materialized_registry_version: 1,
+            content_manifest_version: "p1.5.0".into(),
+            content_hash: "content-hash".into(),
+        };
+        let registry = CelestialRegistrySnapshot {
+            schema_version: CELESTIAL_REGISTRY_SCHEMA_VERSION,
+            registry_hash: "registry-hash".into(),
+            license: "CC-BY-SA-4.0".into(),
+            universe_id: "the-verse-local".into(),
+            generation_rule_version: "rule-1".into(),
+            minimum_fixed_body_surface_gap_um: 1,
+            bodies: vec![body],
+        };
+        let mut registry_value = serde_json::to_value(registry).expect("registry serializes");
+        registry_value["bodies"][0]
+            .as_object_mut()
+            .expect("body object")
+            .insert("unexpected".into(), serde_json::json!(true));
+        assert!(serde_json::from_value::<CelestialRegistrySnapshot>(registry_value).is_err());
+
+        let manifest = UniverseManifestSnapshot {
+            schema_version: UNIVERSE_MANIFEST_SCHEMA_VERSION,
+            manifest_hash: "manifest-hash".into(),
+            universe_id: "the-verse-local".into(),
+            world_seed: "1".into(),
+            address_schema_version: 1,
+            sector_edge_um: 20_000_000_000_000,
+            cell_edge_um: 20_000_000_000,
+            cells_per_sector_axis: 1_000,
+            generation_rule_version: "rule-1".into(),
+            frontier_policy_version: "frontier-1".into(),
+            celestial_registry_schema_version: CELESTIAL_REGISTRY_SCHEMA_VERSION,
+            celestial_registry_hash: "registry-hash".into(),
+            content_schema_version: 11,
+            content_manifest_version: "p1.5.0".into(),
+            content_hash: "content-hash".into(),
+            world_schema_version: 18,
+            event_schema_version: 14,
+        };
+        let mut manifest_value = serde_json::to_value(manifest).expect("manifest serializes");
+        manifest_value
+            .as_object_mut()
+            .expect("manifest object")
+            .insert("unexpected".into(), serde_json::json!(true));
+        assert!(serde_json::from_value::<UniverseManifestSnapshot>(manifest_value).is_err());
+
+        let mut interest_value =
+            serde_json::to_value(test_interest()).expect("interest serializes");
+        interest_value
+            .as_object_mut()
+            .expect("interest object")
+            .insert("unexpected".into(), serde_json::json!(true));
+        assert!(serde_json::from_value::<InterestSnapshot>(interest_value).is_err());
+    }
+
+    fn test_environment(altitude_m: f64) -> EnvironmentSnapshot {
+        EnvironmentSnapshot {
+            celestial_body_id: "khepri-prime".into(),
+            celestial_body_name: "Khepri Prime".into(),
+            celestial_scale_class: CelestialScaleClass::Proof,
+            nearest_body_id: "origin-asteroid".into(),
+            nearest_body_name: "Origin Asteroid".into(),
+            planet_center: Vec3::ZERO,
+            surface_radius_m: 1_200.0,
+            distance_to_center_m: 1_200.0 + altitude_m,
+            distance_to_surface_m: altitude_m,
+            altitude_m,
+            gravity: Vec3::ZERO,
+            gravity_m_s2: 0.0,
+            atmosphere_density: 0.0,
+            oxygen_fraction: 0.0,
+            breathable: false,
+        }
+    }
+
+    fn test_interest() -> InterestSnapshot {
+        InterestSnapshot {
+            schema_version: INTEREST_SCHEMA_VERSION,
+            frame_kind: InterestFrameKind::Baseline,
+            session_epoch: "session-test".into(),
+            interest_epoch: 1,
+            baseline_id: "baseline-test".into(),
+            delta_sequence: 0,
+            observer_class: InterestObserverClass::PublicOriginSpectator,
+            cell_address: test_address(),
+            local_origin_address: test_address(),
+            registry_hash: "registry-hash".into(),
+            universe_manifest_hash: "manifest-hash".into(),
+            canonical_event_sequence: 8,
+            canonical_tick: 13,
+            canonical_world_hash: "canonical-hash".into(),
+            previous_view_hash: None,
+            view_hash: "view-hash".into(),
+            entered: Vec::new(),
+            replaced: Vec::new(),
+            removed: Vec::new(),
+        }
+    }
 
     #[test]
     fn client_messages_use_stable_tagged_json() {
@@ -1064,9 +1612,9 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v15_preserves_tagged_life_state_and_death_cause() {
-        assert_eq!(PROTOCOL_VERSION, 15);
-        assert_eq!(PROJECTION_SCHEMA_VERSION, 2);
+    fn protocol_v16_preserves_tagged_life_state_and_death_cause() {
+        assert_eq!(PROTOCOL_VERSION, 16);
+        assert_eq!(PROJECTION_SCHEMA_VERSION, 3);
         let life_state = PlayerLifeState::Incapacitated {
             death_id: "death-player-local-42".into(),
             cause: PlayerDeathCause::OxygenDepleted,
@@ -1091,12 +1639,14 @@ mod tests {
             death_id: "death-player-local-42".into(),
             inventory_id: "inventory-drop-player-local-42".into(),
             owner_player_id: "player-local".into(),
+            address: test_address(),
             position: Vec3::new(1.0, 2.0, 3.0),
             created_event_sequence: 42,
             cause: PlayerDeathCause::OxygenDepleted,
         };
         let player = PlayerSnapshot {
             player_id: "player-local".into(),
+            address: test_address(),
             position: death_drop.position,
             orientation: Quat::IDENTITY,
             linear_velocity: Vec3::ZERO,
@@ -1135,42 +1685,25 @@ mod tests {
             critical_oxygen_milli: 100,
             helmet_closed: true,
             jetpack_enabled: false,
-            environment: Some(EnvironmentSnapshot {
-                celestial_body_id: "khepri-prime".into(),
-                celestial_body_name: "Khepri Prime".into(),
-                planet_center: Vec3::ZERO,
-                surface_radius_m: 1_200.0,
-                altitude_m: 3_000.0,
-                gravity: Vec3::ZERO,
-                gravity_m_s2: 0.0,
-                atmosphere_density: 0.0,
-                oxygen_fraction: 0.0,
-                breathable: false,
-            }),
+            environment: Some(test_environment(3_000.0)),
         };
         let world = WorldSnapshot {
             schema_version: 15,
             content_manifest_version: "p1.1.0".into(),
             universe_id: "the-verse-local".into(),
             cell_id: "cell-origin".into(),
+            universe_manifest_hash: "manifest-hash".into(),
+            celestial_registry_hash: "registry-hash".into(),
+            cell_address: test_address(),
+            gravity_body_id: "khepri-prime".into(),
+            voxel_body_id: "origin-asteroid".into(),
             event_sequence: 42,
             simulation_tick: 0,
             fencing_token: 1,
             world_hash: "hash".into(),
             players: vec![player.clone()],
             player,
-            environment: EnvironmentSnapshot {
-                celestial_body_id: "khepri-prime".into(),
-                celestial_body_name: "Khepri Prime".into(),
-                planet_center: Vec3::ZERO,
-                surface_radius_m: 1_200.0,
-                altitude_m: 3_000.0,
-                gravity: Vec3::ZERO,
-                gravity_m_s2: 0.0,
-                atmosphere_density: 0.0,
-                oxygen_fraction: 0.0,
-                breathable: false,
-            },
+            environment: test_environment(3_000.0),
             voxels: Vec::new(),
             grids: Vec::new(),
             inventories: Vec::new(),
@@ -1183,10 +1716,17 @@ mod tests {
         assert_eq!(value["players"][0]["player_id"], "player-local");
         assert_eq!(value["death_drops"][0]["drop_id"], death_drop.drop_id);
         assert_eq!(value["death_drops"][0]["cause"]["kind"], "oxygen_depleted");
+        assert!(value["player"].get("position").is_none());
+        assert!(value["players"][0].get("position").is_none());
+        assert!(value["death_drops"][0].get("position").is_none());
+        let decoded = serde_json::from_value::<WorldSnapshot>(value.clone())
+            .expect("world snapshot deserializes");
+        assert_eq!(decoded.player.address, world.player.address);
+        assert_eq!(decoded.players[0].address, world.players[0].address);
+        assert_eq!(decoded.death_drops[0].address, death_drop.address);
         assert_eq!(
-            serde_json::from_value::<WorldSnapshot>(value.clone())
-                .expect("world snapshot deserializes"),
-            world
+            serde_json::to_value(decoded).expect("decoded snapshot serializes canonically"),
+            value
         );
         let mut legacy = value;
         legacy["player"]
@@ -1221,6 +1761,14 @@ mod tests {
 
         let welcome = ServerMessage::Welcome {
             protocol_version: PROTOCOL_VERSION,
+            projection_schema_version: PROJECTION_SCHEMA_VERSION,
+            world_schema_version: 18,
+            event_schema_version: 14,
+            content_schema_version: 11,
+            content_manifest_version: "p1.5.0".into(),
+            celestial_registry_schema_version: CELESTIAL_REGISTRY_SCHEMA_VERSION,
+            universe_manifest_schema_version: UNIVERSE_MANIFEST_SCHEMA_VERSION,
+            interest_schema_version: INTEREST_SCHEMA_VERSION,
             server_name: "test".into(),
             session_role: SessionRole::Player {
                 player_id: "player-local".into(),
@@ -1236,6 +1784,7 @@ mod tests {
         let grid = GridSnapshot {
             grid_id: "grid-starter".into(),
             owner_player_id: "player-local".into(),
+            address: test_address(),
             position: Vec3::ZERO,
             orientation: Quat::IDENTITY,
             linear_velocity: Vec3::ZERO,
@@ -1273,12 +1822,18 @@ mod tests {
             content_manifest_version: "p1.1.0".into(),
             universe_id: "the-verse-local".into(),
             cell_id: "cell-origin".into(),
+            universe_manifest_hash: "manifest-hash".into(),
+            celestial_registry_hash: "registry-hash".into(),
+            cell_address: test_address(),
+            gravity_body_id: "khepri-prime".into(),
+            voxel_body_id: "origin-asteroid".into(),
             event_sequence: 8,
             simulation_tick: 13,
             fencing_token: 2,
             world_hash: "canonical-hash".into(),
             players: vec![PublicPlayerSnapshot {
                 player_id: "player-local".into(),
+                address: test_address(),
                 position: Vec3::ZERO,
                 orientation: Quat::IDENTITY,
                 linear_velocity: Vec3::ZERO,
@@ -1289,21 +1844,12 @@ mod tests {
                 helmet_closed: true,
                 jetpack_enabled: true,
             }],
-            environment: EnvironmentSnapshot {
-                celestial_body_id: "khepri-prime".into(),
-                celestial_body_name: "Khepri Prime".into(),
-                planet_center: Vec3::ZERO,
-                surface_radius_m: 1_200.0,
-                altitude_m: 0.0,
-                gravity: Vec3::new(0.0, -6.2, 0.0),
-                gravity_m_s2: 6.2,
-                atmosphere_density: 1.0,
-                oxygen_fraction: 0.21,
-                breathable: true,
-            },
-            voxels: Vec::new(),
+            environment: test_environment(0.0),
+            voxel_chunks: Vec::new(),
             grids: Vec::new(),
+            death_drops: Vec::new(),
             conservation_valid: true,
+            interest: test_interest(),
             actor_private: None,
         };
         let message = ServerMessage::Snapshot {
@@ -1314,7 +1860,7 @@ mod tests {
         assert_eq!(value["snapshot"]["world_hash"], "canonical-hash");
         assert!(value["snapshot"].get("actor_private").is_none());
         assert!(value["snapshot"].get("inventories").is_none());
-        assert!(value["snapshot"].get("death_drops").is_none());
+        assert_eq!(value["snapshot"]["death_drops"], serde_json::json!([]));
         assert_eq!(
             serde_json::from_value::<ServerMessage>(value).expect("message deserializes"),
             message

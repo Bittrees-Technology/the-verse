@@ -1,6 +1,6 @@
 # P0.6 orbital operations checkpoint
 
-**Status:** Implemented local proof
+**Status:** Implemented P0.6 local proof; P1.5 registry presentation specified
 
 ## Player promise
 
@@ -9,7 +9,7 @@ The opening salvage site must read as an asteroid operation in planetary orbit, 
 ## Orbital separation
 
 1. The mineable asteroid and starter grid remain around the origin cell.
-2. Khepri Prime has a 1,200-meter proof radius and its nearest surface is more than 3,000 meters from the asteroid origin.
+2. Khepri Prime has a 1,200-meter **proof radius** and its nearest surface is more than 3,000 meters from the asteroid origin. This test scale validates mechanics and is not a production-scale planet or multi-day-travel claim.
 3. The starting field has no atmosphere and is not breathable.
 4. Khepri still contributes a weak inverse-square gravity vector in orbit. Surface gravity, atmosphere, oxygen, and collision rules remain authoritative near the planet.
 5. The server test suite proves both orbital vacuum at genesis and breathable gravity near the modeled surface.
@@ -39,6 +39,38 @@ The opening salvage site must read as an asteroid operation in planetary orbit, 
 4. The planet and asteroid are separate objects with separate authoritative coordinates; visual perspective cannot imply physical contact at the genesis camera.
 5. Generated reusable textures carry CC BY-SA 4.0 sidecars and source-prompt records in the native asset register.
 
+## P1.5 celestial continuation
+
+[Fixed celestial registry and interest-managed visibility](celestial-registry-and-interest-management.md)
+supersedes only the hard-coded presentation boundary, not the verified P0.6
+gravity, atmosphere, oxygen, collision, inventory, or EVA behavior.
+
+1. Khepri's center, proof radius, gravity/atmosphere model, scale class, visual
+   descriptor, and name come from one authoritative registry entry.
+2. The origin asteroid has an independent registered body ID, fixed address,
+   body-local voxel chunks, and render transform. It is never positioned as an
+   unregistered child of the planet.
+3. Any visible moon resolves to a registry entry or is removed. Decorative
+   celestial geometry cannot imply a body that the universe does not know.
+4. A distant proxy preserves canonical direction and angular diameter by
+   scaling body distance and radius together. Range labels remain canonical.
+5. Near/far tiers overlap or cross-fade without a visible shift in direction,
+   size, or light response.
+6. Stars use an effectively infinite camera-centered sky and do not parallax
+   during local EVA translation. Nearby dust remains visibly local particulate.
+7. The HUD distinguishes current gravity source, nearest known body, distance
+   to center and surface, altitude, gravity, atmosphere, breathability, and
+   proof-versus-production scale.
+8. From the genesis camera, automated geometry checks and macOS/Linux visual
+   evidence confirm that the asteroid and Khepri silhouettes do not imply
+   physical contact.
+
 ## Explicit limits
 
-The current planet is a distant rendered and simulated test body rather than a streamed landing destination. The client does not yet change rendering tiers during a multi-kilometer approach, stream editable planetary voxels, generate terrain collision patches, or provide an airtight-room oxygen graph. The compact inventory has one suit and one connected cargo container because the proof world currently owns only those inventories; production queues and conveyor-network enumeration remain later checkpoints.
+The current planet is a distant rendered and simulated proof-scale body rather
+than a production-scale planet or streamed landing destination. P1.5 adds
+registry-driven rendering tiers but does not stream editable planetary voxels,
+generate terrain collision patches, add landing gameplay, or provide an
+airtight-room oxygen graph. Physical cargo, conveyors, and production queues
+are now covered by the P1.4 industry slice. Production planet dimensions,
+separation, cruise speeds, and multi-day journey targets remain an OQ-010 gate.

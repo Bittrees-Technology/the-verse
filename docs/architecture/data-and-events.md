@@ -1,6 +1,6 @@
 # Data and event architecture
 
-**Status:** Proposed baseline
+**Status:** Proposed service baseline; P1.5 spatial and event bindings accepted
 
 ## Canonical principles
 
@@ -9,6 +9,10 @@
 - Derived read models can be rebuilt from durable events and snapshots.
 - Destructive lifecycle events are explicit; disappearance is never an unexplained database deletion.
 - Blockchain settlement is a projection of canonical events, not the primary gameplay database.
+- Persistent spatial subjects use normalized canonical universe addresses;
+  floating origins and session interest are derived state.
+- Every opened world and appended event is bound to one universe-manifest and
+  celestial-registry hash.
 
 ## Event envelope
 
@@ -31,11 +35,41 @@ correlation_id
 subject_ids
 payload
 content_manifest_version
+content_manifest_hash
+universe_manifest_schema_version
+universe_manifest_hash
+celestial_registry_schema_version
+celestial_registry_hash
 previous_subject_hash
 event_hash
 ```
 
 Administrative events additionally contain authority scope, reason code, and approving identity.
+
+Event schema `14` requires the P1.5 universe and registry bindings. A mismatch
+fails before an event is prepared, appended, replayed, or projected. Registry
+and content definitions are addressed by immutable IDs and hashes rather than
+being copied as mutable floating-point constants into each event.
+
+## Canonical spatial identity
+
+Universe manifest schema `2` defines the universe, address dimensions,
+generation policy, content binding, and celestial registry schema `1` hash.
+`UniverseAddressV1` normalizes universe, signed 128-bit sector coordinates,
+bounded cell indexes, and signed integer-micrometre local components. JSON uses
+canonical decimal strings for signed 128-bit values.
+
+Celestial entries are immutable and sorted by body ID. Supported body kinds are
+planet, moon, asteroid, and bounded asteroid field. A moon requires an existing
+planet parent; missing, self, non-planet, and cyclic ancestry is invalid. Fixed
+body centres and gameplay orientations never change through ordinary events.
+Voxel edits reference a body and body-local chunk; they do not mutate registry
+identity.
+
+Registry schema `1` and universe manifest schema `2` use domain-separated
+BLAKE3 hashes over canonical floating-point-free bytes. Content schema `11` and
+manifest `p1.5.0` pin the proof registry, its `3,000 m` minimum fixed-body
+surface gap, and interest policy.
 
 ## Asset identity
 
@@ -94,6 +128,7 @@ Terminal states retain tombstone events and provenance.
 
 - Append-only local event journal.
 - Periodic content-addressed snapshots.
+- Universe-manifest and celestial-registry hash binding.
 - Voxel seeds plus sparse chunk deltas.
 - Grid snapshots plus post-snapshot events.
 
@@ -116,6 +151,11 @@ Terminal states retain tombstone events and provenance.
 
 Read models are never write authorities.
 
+The universe map is a read model over immutable registry entries. Live spatial
+interest baselines, deltas, membership, epochs, acknowledgements, and view
+hashes are disposable per-session projections and are never written to the
+canonical journal or economic stores.
+
 ## Event ordering
 
 Global total ordering is neither required nor scalable. Ordering guarantees are:
@@ -134,13 +174,35 @@ A worker recovery process:
 
 1. Loads the latest verified snapshot.
 2. Validates its content hash and schema.
-3. Replays events after the snapshot.
-4. Rebuilds derived physics structures.
-5. Confirms aggregate hashes.
-6. Acquires a new fenced lease.
-7. Resumes writes.
+3. Confirms world schema `18`, event schema `14`, content manifest `p1.5.0`,
+   universe manifest schema `2`, registry schema `1`, and exact hashes agree.
+4. Replays events after the snapshot, rejecting any per-event binding mismatch.
+5. Rebuilds derived physics structures from normalized cell-local addresses.
+6. Confirms aggregate hashes.
+7. Acquires a new fenced lease.
+8. Resumes writes.
 
 Cleanup timers and long travel use durable scheduled events and never depend on one process's wall clock.
+
+Session reconnect never restores replication state from persistence. Protocol
+`16` creates new session and interest epochs and one fresh projection schema
+`3` baseline. The baseline/delta stream carries the canonical event/tick
+frontier and global canonical commitment alongside a view hash over only the
+audience-authorized subset.
+
+## P1.5 compatibility and migration
+
+The P1.5 set is protocol `16`, projection schema `3`, world schema `18`, event
+schema `14`, content schema `11`, content manifest `p1.5.0`, celestial registry
+schema `1`, universe manifest schema `2`, and interest schema `1`. Partial
+combinations are rejected.
+
+The local P1.4 proof is archived and reset because its snapshots and events do
+not bind a registry. A future persistent migration runs offline, normalizes
+every address, validates all parent and separation rules, produces a receipt
+with old/new hashes, proves replay equality, and atomically changes the active
+manifest pointer. Rollback restores matching prior binaries, manifests, and
+read-only data; an older executable never interprets a newer world or journal.
 
 ## Settlement batches
 

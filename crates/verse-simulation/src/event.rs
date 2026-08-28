@@ -3,17 +3,21 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use verse_protocol::{
-    IVec3, InventoryContents, PlayerDeathCause, PlayerLocomotionSnapshot, Quat, ResourceKind, Vec3,
-    VoxelMaterial,
+    IVec3, InventoryContents, PlayerDeathCause, PlayerLocomotionSnapshot, Quat, ResourceKind,
+    UniverseAddress, Vec3, VoxelMaterial,
 };
 
+use crate::celestial;
 use crate::model::{Block, ContactPairKey, DeathDrop, InventoryRecord, ProductionJob};
 
 pub const EVENT_SCHEMA_NAME: &str = "verse.world_event";
-pub const EVENT_SCHEMA_VERSION: u32 = 13;
+pub const EVENT_SCHEMA_VERSION: u32 = 14;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "event_type", rename_all = "snake_case")]
+#[serde(tag = "event_type", rename_all = "snake_case", deny_unknown_fields)]
+// Stable event variants intentionally carry complete authoritative outcomes;
+// boxing them would complicate the versioned replay API without changing JSON.
+#[allow(clippy::large_enum_variant)]
 pub enum EventPayload {
     PlayerControlSet {
         movement_epoch: u64,
@@ -39,6 +43,8 @@ pub enum EventPayload {
         player_id: String,
         death_id: String,
         cause: PlayerDeathCause,
+        address: UniverseAddress,
+        #[serde(skip, default)]
         position: Vec3,
         previous_oxygen_milli: u16,
         dropped_inventory: Option<InventoryRecord>,
@@ -46,6 +52,8 @@ pub enum EventPayload {
     },
     PlayerRespawned {
         death_id: String,
+        address: UniverseAddress,
+        #[serde(skip, default)]
         position: Vec3,
         suit_oxygen_milli: u16,
         helmet_closed: bool,
@@ -130,11 +138,14 @@ pub enum EventPayload {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 // These independent booleans are explicit fields in the versioned event
 // schema; combining them into an enum would remove valid input combinations.
 #[allow(clippy::struct_excessive_bools)]
 pub struct PlayerPhysicsOutcome {
     pub player_id: String,
+    pub address: UniverseAddress,
+    #[serde(skip, default)]
     pub position: Vec3,
     pub orientation: Quat,
     pub linear_velocity: Vec3,
@@ -150,8 +161,11 @@ pub struct PlayerPhysicsOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PhysicsBodyOutcome {
     pub grid_id: String,
+    pub address: UniverseAddress,
+    #[serde(skip, default)]
     pub position: Vec3,
     pub orientation: Quat,
     pub linear_velocity: Vec3,
@@ -159,12 +173,15 @@ pub struct PhysicsBodyOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PhysicsContactOutcome {
     pub substep_index: u8,
     pub body_a_id: String,
     pub collider_a_id: String,
     pub body_b_id: String,
     pub collider_b_id: String,
+    pub point_address: UniverseAddress,
+    #[serde(skip, default)]
     pub point: Vec3,
     pub normal: Vec3,
     pub penetration_m: f64,
@@ -179,6 +196,63 @@ pub struct PhysicsContactOutcome {
 pub enum PhysicsContactPhase {
     Began,
     Persisted,
+}
+
+impl EventPayload {
+    pub fn hydrate_spatial_poses(&mut self, cell_address: &UniverseAddress) -> Result<(), String> {
+        let hydrate = |address: &UniverseAddress| {
+            celestial::local_position_from_address(cell_address, address)
+                .map_err(|source| format!("event spatial address is invalid: {source}"))
+        };
+        match self {
+            Self::PlayerIncapacitated {
+                address,
+                position,
+                death_drop,
+                ..
+            } => {
+                *position = hydrate(address)?;
+                if let Some(drop) = death_drop {
+                    drop.position = hydrate(&drop.address)?;
+                }
+            }
+            Self::PlayerRespawned {
+                address, position, ..
+            } => *position = hydrate(address)?,
+            Self::PhysicsStepCommitted {
+                bodies,
+                players,
+                contacts,
+                ..
+            } => {
+                for body in bodies {
+                    body.position = hydrate(&body.address)?;
+                }
+                for player in players {
+                    player.position = hydrate(&player.address)?;
+                }
+                for contact in contacts {
+                    contact.point = hydrate(&contact.point_address)?;
+                }
+            }
+            Self::PlayerControlSet { .. }
+            | Self::SuitModeChanged { .. }
+            | Self::SuitOxygenChanged { .. }
+            | Self::VoxelMined { .. }
+            | Self::OreRefined { .. }
+            | Self::ComponentCrafted { .. }
+            | Self::ProductionQueued { .. }
+            | Self::ProductionAdvanced { .. }
+            | Self::ProductionOutputDelivered { .. }
+            | Self::InventoryTransferred { .. }
+            | Self::BlockBuilt { .. }
+            | Self::BlockWelded { .. }
+            | Self::GridControlSet { .. }
+            | Self::GridAnchorSet { .. }
+            | Self::BlockDamaged { .. } => {}
+        }
+        Ok(())
+    }
 }
 
 impl EventPayload {
@@ -324,10 +398,13 @@ impl EventPayload {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CanonicalEvent {
     pub schema_name: String,
     pub schema_version: u32,
     pub content_manifest_version: String,
+    pub universe_manifest_hash: String,
+    pub celestial_registry_hash: String,
     pub event_id: String,
     pub event_sequence: u64,
     pub occurred_at_unix_ms: u64,
@@ -351,6 +428,8 @@ struct EventHashMaterial<'a> {
     schema_name: &'a str,
     schema_version: u32,
     content_manifest_version: &'a str,
+    universe_manifest_hash: &'a str,
+    celestial_registry_hash: &'a str,
     event_id: &'a str,
     event_sequence: u64,
     occurred_at_unix_ms: u64,
@@ -371,6 +450,8 @@ impl CanonicalEvent {
     pub fn new(
         event_sequence: u64,
         content_manifest_version: impl Into<String>,
+        universe_manifest_hash: impl Into<String>,
+        celestial_registry_hash: impl Into<String>,
         universe_id: impl Into<String>,
         cell_id: impl Into<String>,
         authority_fencing_token: u64,
@@ -392,6 +473,8 @@ impl CanonicalEvent {
             schema_name: EVENT_SCHEMA_NAME.into(),
             schema_version: EVENT_SCHEMA_VERSION,
             content_manifest_version: content_manifest_version.into(),
+            universe_manifest_hash: universe_manifest_hash.into(),
+            celestial_registry_hash: celestial_registry_hash.into(),
             event_id: Uuid::new_v4().to_string(),
             event_sequence,
             occurred_at_unix_ms,
@@ -416,6 +499,8 @@ impl CanonicalEvent {
             schema_name: &self.schema_name,
             schema_version: self.schema_version,
             content_manifest_version: &self.content_manifest_version,
+            universe_manifest_hash: &self.universe_manifest_hash,
+            celestial_registry_hash: &self.celestial_registry_hash,
             event_id: &self.event_id,
             event_sequence: self.event_sequence,
             occurred_at_unix_ms: self.occurred_at_unix_ms,
@@ -447,7 +532,9 @@ mod tests {
     fn event_hash_detects_payload_tampering() {
         let mut event = CanonicalEvent::new(
             1,
-            "p1.1.0",
+            "p1.5.0",
+            "1".repeat(64),
+            "2".repeat(64),
             "universe",
             "cell",
             9,
@@ -480,6 +567,128 @@ mod tests {
             expires_at_simulation_tick: 18,
         };
         assert!(!event.hash_is_valid());
+    }
+
+    #[test]
+    fn event_hash_detects_universe_binding_tampering() {
+        let event = CanonicalEvent::new(
+            1,
+            "p1.5.0",
+            "1".repeat(64),
+            "2".repeat(64),
+            "universe",
+            "cell",
+            9,
+            None,
+            "system",
+            None,
+            None,
+            None,
+            "",
+            EventPayload::SuitOxygenChanged {
+                player_id: "player".into(),
+                previous_oxygen_milli: 1_000,
+                new_oxygen_milli: 995,
+            },
+        );
+        assert!(event.hash_is_valid());
+
+        let mut universe_tampered = event.clone();
+        universe_tampered.universe_manifest_hash = "3".repeat(64);
+        assert!(!universe_tampered.hash_is_valid());
+
+        let mut registry_tampered = event;
+        registry_tampered.celestial_registry_hash = "4".repeat(64);
+        assert!(!registry_tampered.hash_is_valid());
+    }
+
+    #[test]
+    fn canonical_spatial_event_hashes_exact_addresses_and_omits_derived_poses() {
+        let origin = celestial::cell_origin_address();
+        let address = celestial::address_from_origin_offset_um(&origin, [1_234_567, -8_765_432, 9])
+            .expect("event address canonicalizes");
+        let position = celestial::local_position_from_address(&origin, &address)
+            .expect("event address hydrates");
+        let payload = EventPayload::PhysicsStepCommitted {
+            fixed_step_hz: 60,
+            step_count: 1,
+            remaining_step_phase: 0,
+            bodies: vec![PhysicsBodyOutcome {
+                grid_id: "grid-spatial".into(),
+                address: address.clone(),
+                position,
+                orientation: Quat::IDENTITY,
+                linear_velocity: Vec3::ZERO,
+                angular_velocity: Vec3::ZERO,
+            }],
+            players: Vec::new(),
+            contacts: vec![PhysicsContactOutcome {
+                substep_index: 0,
+                body_a_id: "grid-spatial".into(),
+                collider_a_id: "block-spatial".into(),
+                body_b_id: "voxel".into(),
+                collider_b_id: "voxel-spatial".into(),
+                point_address: address.clone(),
+                point: position,
+                normal: Vec3::new(1.0, 0.0, 0.0),
+                penetration_m: 0.0,
+                closing_speed_mm_per_second: 0,
+                estimated_normal_impulse_millinewton_seconds: 0,
+                reduced_translational_mass_grams: 1,
+                phase: PhysicsContactPhase::Began,
+            }],
+            active_contacts_after: Vec::new(),
+        };
+        let event = CanonicalEvent::new(
+            1,
+            "p1.5.0",
+            "1".repeat(64),
+            "2".repeat(64),
+            origin.universe_id.clone(),
+            "cell-origin",
+            9,
+            None,
+            "system",
+            None,
+            None,
+            None,
+            "",
+            payload,
+        );
+        let encoded = serde_json::to_value(&event).expect("event serializes");
+        let body = &encoded["payload"]["bodies"][0];
+        let contact = &encoded["payload"]["contacts"][0];
+        assert_eq!(body["address"], serde_json::to_value(&address).unwrap());
+        assert!(body.get("position").is_none());
+        assert_eq!(
+            contact["point_address"],
+            serde_json::to_value(&address).unwrap()
+        );
+        assert!(contact.get("point").is_none());
+
+        let mut decoded = serde_json::from_value::<CanonicalEvent>(encoded.clone())
+            .expect("canonical spatial event deserializes");
+        assert!(decoded.hash_is_valid());
+        let hash = decoded.event_hash.clone();
+        decoded
+            .payload
+            .hydrate_spatial_poses(&origin)
+            .expect("event poses hydrate from exact addresses");
+        let EventPayload::PhysicsStepCommitted {
+            bodies, contacts, ..
+        } = &mut decoded.payload
+        else {
+            unreachable!();
+        };
+        assert_eq!(bodies[0].position, position);
+        assert_eq!(contacts[0].point, position);
+        bodies[0].position.x += 100.0;
+        contacts[0].point.y -= 100.0;
+        assert_eq!(decoded.calculate_hash(), hash);
+        assert_eq!(
+            serde_json::to_value(decoded).expect("hydrated event remains canonical"),
+            encoded
+        );
     }
 
     #[test]

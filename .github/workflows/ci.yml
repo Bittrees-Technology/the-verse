@@ -12,11 +12,30 @@ permissions:
 jobs:
   verify:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install pinned Node.js runtime
+        uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: 24.8.0
+          cache: npm
+          cache-dependency-path: tools/markdownlint/package-lock.json
       - name: Install pinned Rust toolchain
-        run: rustup toolchain install 1.96.0 --profile minimal --component clippy,rustfmt
+        run: rustup toolchain install 1.96.0 --profile minimal --component clippy,rustfmt --target wasm32-unknown-unknown
+      - name: Restore pinned wasm-bindgen CLI
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/bin/wasm-bindgen
+            ~/.cargo/bin/wasm-bindgen-test-runner
+          key: wasm-bindgen-cli-linux-0.2.127-rust-1.96.0
+      - name: Install pinned wasm-bindgen CLI
+        run: |
+          if ! command -v wasm-bindgen >/dev/null 2>&1 || \
+             [[ "$(wasm-bindgen --version)" != "wasm-bindgen 0.2.127" ]]; then
+            cargo install wasm-bindgen-cli --version 0.2.127 --locked
+          fi
       - name: Install Godot 4.7.2
         run: |
           curl -L --fail --show-error -o /tmp/godot.zip \
@@ -77,16 +96,25 @@ jobs:
       - name: Build and smoke-test native package
         env:
           GODOT_BIN: ${{ matrix.godot_binary }}
-          VERSE_RELEASE_VERSION: p0.10.0-ci-${{ github.sha }}
+          VERSE_RELEASE_VERSION: p1.5.0-ci-${{ github.sha }}
         run: tools/release/package-native.sh
-      - name: Measure Linux P0.10 physics distribution
+      - name: Verify P1.5 cross-platform registry and interest client
+        env:
+          GODOT_BIN: ${{ matrix.godot_binary }}
+        run: |
+          cargo test --locked -p verse-simulation \
+            celestial::tests::registry_and_universe_manifest_match_cross_platform_golden_hashes \
+            -- --exact
+          "${GODOT_BIN}" --headless --path apps/native-client \
+            --script res://tests/p15_interest_stream_smoke.gd
+      - name: Measure inherited grounded-locomotion distribution
         if: runner.os == 'Linux'
         env:
           GODOT_BIN: ${{ matrix.godot_binary }}
         run: |
-          benchmark_file="artifacts/release/P0.10-grounded-locomotion-linux.txt"
+          benchmark_file="artifacts/release/P1.5-grounded-locomotion-linux.txt"
           {
-            echo "The Verse P0.10 hosted Linux release distribution"
+            echo "The Verse P1.5 hosted Linux release distribution"
             uname -a
             lscpu
             rustc --version
@@ -103,7 +131,7 @@ jobs:
       - name: Upload native development package
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: the-verse-p0.10.0-${{ matrix.package }}
+          name: the-verse-p1.5.0-${{ matrix.package }}
           path: |
             artifacts/release/*.zip
             artifacts/release/*.tar.gz

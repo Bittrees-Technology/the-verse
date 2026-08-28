@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import assert from "node:assert/strict";
+import { COMPATIBILITY, Protocol16InterestStream } from "./interest-stream.mjs";
 
 const url = process.argv[2] ?? "ws://127.0.0.1:17777/ws";
 const recoveryMode = process.argv[3] === "--verify-recovery";
@@ -13,7 +14,7 @@ const remoteMiningOperation = "two-player-e2e-remote-mining-operation";
 const remoteRefiningOperation = "two-player-e2e-remote-refining-operation";
 const remoteCraftingOperation = "two-player-e2e-remote-crafting-operation";
 const remoteDamageOperation = "two-player-e2e-non-owner-damage-operation";
-const PROTOCOL_VERSION = 15;
+const PROTOCOL_VERSION = COMPATIBILITY.protocol_version;
 const CHARACTER_EYE_OFFSET = 1.62 - 1.8 / 2;
 const CHARACTER_MAXIMUM_ANGULAR_SPEED = 2.5;
 const TOOL_RANGE = 9.0;
@@ -30,20 +31,31 @@ class ProtocolClient {
     this.committedOperationSequence = 0;
     this.lastProjectedOperationSequence = 0;
     this.operationSequenceById = new Map();
+    this.lastFatal = undefined;
+    this.interestStream = new Protocol16InterestStream({
+      expectedPlayerId: playerId,
+      send: (message) => this.socket.send(JSON.stringify(message)),
+    });
     this.socket.addEventListener("message", (event) => {
       this.dispatch(JSON.parse(event.data));
     });
     this.socket.addEventListener("close", () => {
-      this.rejectWaiters(new Error(`${this.playerId} socket closed`));
+      const fatal = this.lastFatal
+        ? ` after ${this.lastFatal.code}: ${this.lastFatal.message}`
+        : "";
+      this.rejectWaiters(new Error(`${this.playerId} socket closed${fatal}`));
     });
     this.socket.addEventListener("error", () => {
       this.rejectWaiters(new Error(`${this.playerId} socket failed`));
     });
   }
 
-  dispatch(message) {
-    if (message.type === "snapshot" && message.snapshot.actor_private) {
-      const frontier = message.snapshot.actor_private.committed_operation_sequence;
+  dispatch(rawMessage) {
+    const message = this.interestStream.receive(rawMessage);
+    if (message.type === "fatal") this.lastFatal = message;
+    if (message.type === "interest_state" && message.projection.actor_private) {
+      const frontier =
+        message.projection.actor_private.committed_operation_sequence;
       assert.ok(
         Number.isSafeInteger(frontier) && frontier >= 0,
         `${this.playerId} receives a valid private operation frontier`,
@@ -73,7 +85,7 @@ class ProtocolClient {
     }
   }
 
-  waitFor(predicate, description, timeoutMillis = 8_000) {
+  waitFor(predicate, description, timeoutMillis = 20_000) {
     const index = this.buffered.findIndex(predicate);
     if (index >= 0) {
       return Promise.resolve(this.buffered.splice(index, 1)[0]);
@@ -96,7 +108,9 @@ class ProtocolClient {
     if (typeof message.operation_id === "string") {
       let operationSequence = message.operation_sequence;
       if (operationSequence === undefined) {
-        operationSequence = this.operationSequenceById.get(message.operation_id);
+        operationSequence = this.operationSequenceById.get(
+          message.operation_id,
+        );
       }
       if (operationSequence === undefined) {
         operationSequence = this.committedOperationSequence + 1;
@@ -143,12 +157,22 @@ class ProtocolClient {
       kind: "player",
       player_id: this.playerId,
     });
+    const registry = await this.waitFor(
+      (message) => message.type === "registry",
+      "immutable celestial registry",
+    );
+    assert.equal(
+      registry.universe_manifest.celestial_registry_hash,
+      registry.registry.registry_hash,
+    );
     return (
       await this.waitFor(
-        (message) => message.type === "snapshot",
-        "initial authoritative snapshot",
+        (message) =>
+          message.type === "interest_state" &&
+          message.frame_kind === "baseline",
+        "initial authoritative interest baseline",
       )
-    ).snapshot;
+    ).projection;
   }
 
   async close() {
@@ -190,8 +214,27 @@ function assertCanonicalRoster(state, description) {
 }
 
 function publicProjection(state) {
-  const { actor_private: _privateState, ...shared } = state;
+  const {
+    actor_private: _privateState,
+    interest: _connectionLocalInterest,
+    environment: _observerLocalEnvironment,
+    ...shared
+  } = state;
   return shared;
+}
+
+function normalizeSignedZeros(value) {
+  if (typeof value === "number") return value === 0 ? 0 : value;
+  if (Array.isArray(value)) return value.map(normalizeSignedZeros);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, nested]) => [
+        key,
+        normalizeSignedZeros(nested),
+      ]),
+    );
+  }
+  return value;
 }
 
 function assertActorPrivate(state, expectedPlayerId, description) {
@@ -216,14 +259,25 @@ function assertActorPrivate(state, expectedPlayerId, description) {
   }
 }
 
-function combineActorSnapshots(local, remote, description) {
-  assert.deepEqual(
-    publicProjection(local),
-    publicProjection(remote),
-    `${description} exposes identical public state`,
-  );
+function combineActorSnapshots(
+  local,
+  remote,
+  description,
+  requireIdenticalPublicState = true,
+) {
+  if (requireIdenticalPublicState) {
+    assert.deepEqual(
+      normalizeSignedZeros(publicProjection(local)),
+      normalizeSignedZeros(publicProjection(remote)),
+      `${description} exposes identical public state`,
+    );
+  }
   assertActorPrivate(local, "player-local", `${description} local projection`);
-  assertActorPrivate(remote, "player-remote", `${description} remote projection`);
+  assertActorPrivate(
+    remote,
+    "player-remote",
+    `${description} remote projection`,
+  );
 
   const localInventoryIds = new Set(
     local.actor_private.inventories.map((inventory) => inventory.inventory_id),
@@ -232,7 +286,9 @@ function combineActorSnapshots(local, remote, description) {
     remote.actor_private.inventories.map((inventory) => inventory.inventory_id),
   );
   assert.ok(
-    [...localInventoryIds].every((inventoryId) => !remoteInventoryIds.has(inventoryId)),
+    [...localInventoryIds].every(
+      (inventoryId) => !remoteInventoryIds.has(inventoryId),
+    ),
     `${description} keeps actor inventory overlays disjoint`,
   );
 
@@ -246,9 +302,16 @@ function combineActorSnapshots(local, remote, description) {
       ...remote.actor_private.owned_grid_masses,
     ].map((entry) => [entry.grid_id, entry.mass_kg]),
   );
-  const shared = publicProjection(local);
+  const shared = publicProjection(
+    !requireIdenticalPublicState &&
+      remote.event_sequence > local.event_sequence
+      ? remote
+      : local,
+  );
   return {
     ...shared,
+    environment: local.environment,
+    interest: local.interest,
     player: local.actor_private.player,
     players: shared.players.map(
       (player) => privatePlayers.get(player.player_id) ?? player,
@@ -262,11 +325,14 @@ function combineActorSnapshots(local, remote, description) {
     inventories: [
       ...local.actor_private.inventories,
       ...remote.actor_private.inventories,
-    ].sort((left, right) => left.inventory_id.localeCompare(right.inventory_id)),
+    ].sort((left, right) =>
+      left.inventory_id.localeCompare(right.inventory_id),
+    ),
     death_drops: [
       ...local.actor_private.death_drops,
       ...remote.actor_private.death_drops,
     ].sort((left, right) => left.death_id.localeCompare(right.death_id)),
+    voxels: shared.voxel_chunks.flatMap((chunk) => chunk.voxels),
     conservation: { valid: shared.conservation_valid },
   };
 }
@@ -298,8 +364,8 @@ function combineActorMotion(local, remote, description) {
       "surface_contact",
     ]) {
       assert.deepEqual(
-        privatePlayer[field],
-        publicPlayer[field],
+        normalizeSignedZeros(privatePlayer[field]),
+        normalizeSignedZeros(publicPlayer[field]),
         `${description} ${privatePlayer.player_id} ${field} is internally consistent`,
       );
     }
@@ -500,7 +566,7 @@ function visibleVoxel(state, player, preferredMaterial = undefined) {
       Number(right.material === preferredMaterial) -
         Number(left.material === preferredMaterial) ||
       distanceSquared(left.coordinate, eye) -
-      distanceSquared(right.coordinate, eye),
+        distanceSquared(right.coordinate, eye),
   );
   for (const voxel of candidates) {
     const direction = normalizeVector(subtractVector(voxel.coordinate, eye));
@@ -516,7 +582,10 @@ function visibleVoxel(state, player, preferredMaterial = undefined) {
 }
 
 function gridBlockWorldPosition(grid, block) {
-  return addVector(grid.position, rotateVector(grid.orientation, block.coordinate));
+  return addVector(
+    grid.position,
+    rotateVector(grid.orientation, block.coordinate),
+  );
 }
 
 function visibleBlock(state, player) {
@@ -559,49 +628,84 @@ async function waitForCommonSnapshot(
   remote,
   minimumEventSequence,
   description,
-  timeoutMillis = 12_000,
+  timeoutMillis = 30_000,
+  frameKind = undefined,
 ) {
   const predicate = (message) =>
-    message.type === "snapshot" &&
-    message.snapshot.event_sequence >= minimumEventSequence;
+    message.type === "interest_state" &&
+    (frameKind === undefined || message.frame_kind === frameKind) &&
+    message.projection.event_sequence >= minimumEventSequence;
   let [localMessage, remoteMessage] = await Promise.all([
     local.waitFor(predicate, `${description} on local`, timeoutMillis),
     remote.waitFor(predicate, `${description} on remote`, timeoutMillis),
   ]);
   while (
-    localMessage.snapshot.event_sequence !==
-    remoteMessage.snapshot.event_sequence
+    localMessage.projection.event_sequence !==
+    remoteMessage.projection.event_sequence
   ) {
     if (
-      localMessage.snapshot.event_sequence <
-      remoteMessage.snapshot.event_sequence
+      localMessage.projection.event_sequence <
+      remoteMessage.projection.event_sequence
     ) {
-      const minimum = remoteMessage.snapshot.event_sequence;
+      const minimum = remoteMessage.projection.event_sequence;
       localMessage = await local.waitFor(
         (message) =>
-          predicate(message) && message.snapshot.event_sequence >= minimum,
+          predicate(message) && message.projection.event_sequence >= minimum,
         `${description} convergence on local`,
         timeoutMillis,
       );
     } else {
-      const minimum = localMessage.snapshot.event_sequence;
+      const minimum = localMessage.projection.event_sequence;
       remoteMessage = await remote.waitFor(
         (message) =>
-          predicate(message) && message.snapshot.event_sequence >= minimum,
+          predicate(message) && message.projection.event_sequence >= minimum,
         `${description} convergence on remote`,
         timeoutMillis,
       );
     }
   }
   assert.equal(
-    localMessage.snapshot.world_hash,
-    remoteMessage.snapshot.world_hash,
+    localMessage.projection.world_hash,
+    remoteMessage.projection.world_hash,
     `${description} converges on one structural hash`,
   );
   return combineActorSnapshots(
-    localMessage.snapshot,
-    remoteMessage.snapshot,
+    localMessage.projection,
+    remoteMessage.projection,
     description,
+  );
+}
+
+async function waitForCommonVoxelRemoval(
+  local,
+  remote,
+  minimumEventSequence,
+  coordinate,
+  description,
+) {
+  // Voxel chunks have a lower per-kind update cadence than control state.
+  // Two observer sessions may therefore hold different valid chunk revisions
+  // at the same canonical event frontier. Rebase each view and require both
+  // independently to expose the committed removal.
+  local.send({ type: "request_snapshot" });
+  remote.send({ type: "request_snapshot" });
+  const predicate = (message) =>
+    message.type === "interest_state" &&
+    message.projection.event_sequence >= minimumEventSequence &&
+    !message.projection.voxel_chunks.some((chunk) =>
+      chunk.voxels.some(
+        (voxel) => coordinateKey(voxel.coordinate) === coordinateKey(coordinate),
+      ),
+    );
+  const [localMessage, remoteMessage] = await Promise.all([
+    local.waitFor(predicate, `${description} on local`),
+    remote.waitFor(predicate, `${description} on remote`),
+  ]);
+  return combineActorSnapshots(
+    localMessage.projection,
+    remoteMessage.projection,
+    description,
+    false,
   );
 }
 
@@ -617,9 +721,9 @@ async function waitForCommonMotion(
     remote.lastReceiptEventSequence,
   );
   const motionPredicate = (message) =>
-    message.type === "motion_state" &&
-    message.motion.players !== undefined &&
-    message.motion.event_sequence >= minimumReceiptSequence;
+    message.type === "interest_state" &&
+    message.projection.players !== undefined &&
+    message.projection.event_sequence >= minimumReceiptSequence;
   let [localMessage, remoteMessage] = await Promise.all([
     local.waitFor(motionPredicate, `${description} on local`, timeoutMillis),
     remote.waitFor(motionPredicate, `${description} on remote`, timeoutMillis),
@@ -627,27 +731,33 @@ async function waitForCommonMotion(
 
   for (;;) {
     const combined = combineActorMotion(
-      localMessage.motion,
-      remoteMessage.motion,
+      {
+        ...localMessage.projection,
+        actor_private: localMessage.projection.actor_private.player,
+      },
+      {
+        ...remoteMessage.projection,
+        actor_private: remoteMessage.projection.actor_private.player,
+      },
       description,
     );
     assertCanonicalRoster(combined, `${description} combined motion`);
     if (predicate(combined)) return combined;
 
-    const localSequence = localMessage.motion.event_sequence;
-    const remoteSequence = remoteMessage.motion.event_sequence;
+    const localSequence = localMessage.projection.event_sequence;
+    const remoteSequence = remoteMessage.projection.event_sequence;
     [localMessage, remoteMessage] = await Promise.all([
       local.waitFor(
         (message) =>
           motionPredicate(message) &&
-          message.motion.event_sequence > localSequence,
+          message.projection.event_sequence > localSequence,
         `${description} progress on local`,
         timeoutMillis,
       ),
       remote.waitFor(
         (message) =>
           motionPredicate(message) &&
-          message.motion.event_sequence > remoteSequence,
+          message.projection.event_sequence > remoteSequence,
         `${description} progress on remote`,
         timeoutMillis,
       ),
@@ -707,12 +817,7 @@ async function waitForReceipt(client, operationId, description) {
   return message.receipt;
 }
 
-async function expectRejection(
-  client,
-  intent,
-  expectedCode,
-  description,
-) {
+async function expectRejection(client, intent, expectedCode, description) {
   const outbound = client.send(intent);
   const message = await client.waitFor(
     (candidate) =>
@@ -729,7 +834,12 @@ async function expectRejection(
   return message;
 }
 
-async function requestCommonSnapshot(local, remote, minimumSequence, description) {
+async function requestCommonSnapshot(
+  local,
+  remote,
+  minimumSequence,
+  description,
+) {
   local.send({ type: "request_snapshot" });
   remote.send({ type: "request_snapshot" });
   return waitForCommonSnapshot(
@@ -737,6 +847,8 @@ async function requestCommonSnapshot(local, remote, minimumSequence, description
     remote,
     minimumSequence,
     description,
+    30_000,
+    "baseline",
   );
 }
 
@@ -877,13 +989,11 @@ async function approachVisibleBlock(
     const operationId = `two-player-approach-${playerId}-${targetingOperationSequence}`;
     const inputSequence = player.last_received_input_sequence + 1;
     client.send(
-      controlFor(
-        player,
-        operationId,
-        inputSequence,
-        linearInput,
-        { x: 0, y: 0, z: 0 },
-      ),
+      controlFor(player, operationId, inputSequence, linearInput, {
+        x: 0,
+        y: 0,
+        z: 0,
+      }),
     );
     await waitForReceipt(client, operationId, `${description} control receipt`);
     const motion = await waitForCommonMotion(
@@ -940,7 +1050,10 @@ async function run() {
     const starterGrid = localSnapshot.grids.find(
       (grid) => grid.grid_id === "grid-starter",
     );
-    assert.ok(starterGrid, "the starter grid exposes its canonical local owner");
+    assert.ok(
+      starterGrid,
+      "the starter grid exposes its canonical local owner",
+    );
     assert.ok(initialPrimary, "the local player is in the canonical roster");
     assert.ok(initialRemote, "the remote player is in the canonical roster");
 
@@ -978,8 +1091,7 @@ async function run() {
         operation_id: "two-player-remote-operation-gap",
         helmet_closed: initialRemote.helmet_closed,
         jetpack_enabled: initialRemote.jetpack_enabled,
-        magnetic_boots_enabled:
-          initialRemote.locomotion.magnetic_boots_enabled,
+        magnetic_boots_enabled: initialRemote.locomotion.magnetic_boots_enabled,
       },
       "operation_sequence_gap",
       "remote actor operation gap",
@@ -1107,15 +1219,15 @@ async function run() {
     );
 
     const localFrontierBeforeIsolation = local.committedOperationSequence;
-    const remoteFrontierBeforeLocalIsolation = remote.committedOperationSequence;
+    const remoteFrontierBeforeLocalIsolation =
+      remote.committedOperationSequence;
     const localIsolationOperation = "two-player-local-frontier-isolation";
     local.send({
       type: "set_suit_mode",
       operation_id: localIsolationOperation,
       helmet_closed: initialPrimary.helmet_closed,
       jetpack_enabled: initialPrimary.jetpack_enabled,
-      magnetic_boots_enabled:
-        !initialPrimary.locomotion.magnetic_boots_enabled,
+      magnetic_boots_enabled: !initialPrimary.locomotion.magnetic_boots_enabled,
     });
     const localIsolationReceipt = await waitForReceipt(
       local,
@@ -1149,8 +1261,7 @@ async function run() {
       operation_id: localIsolationRestoreOperation,
       helmet_closed: initialPrimary.helmet_closed,
       jetpack_enabled: initialPrimary.jetpack_enabled,
-      magnetic_boots_enabled:
-        initialPrimary.locomotion.magnetic_boots_enabled,
+      magnetic_boots_enabled: initialPrimary.locomotion.magnetic_boots_enabled,
     });
     const localIsolationRestoreReceipt = await waitForReceipt(
       local,
@@ -1314,10 +1425,11 @@ async function run() {
       remoteMiningOperation,
       "remote mining receipt",
     );
-    const minedSnapshot = await waitForCommonSnapshot(
+    const minedSnapshot = await waitForCommonVoxelRemoval(
       local,
       remote,
       miningReceipt.event_sequence,
+      target.coordinate,
       "remote mining publication",
     );
     assert.equal(
@@ -1499,10 +1611,11 @@ async function run() {
         operationId,
         `remote additional mining receipt ${attempt + 1}`,
       );
-      industrySnapshot = await waitForCommonSnapshot(
+      industrySnapshot = await waitForCommonVoxelRemoval(
         local,
         remote,
         receipt.event_sequence,
+        additionalTarget.coordinate,
         `remote additional mining publication ${attempt + 1}`,
       );
     }

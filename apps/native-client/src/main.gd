@@ -11,8 +11,19 @@ const PLANET_SHADER: Shader = preload("res://shaders/planet_surface.gdshader")
 const ATMOSPHERE_SHADER: Shader = preload("res://shaders/planet_atmosphere.gdshader")
 const CLOUD_SHADER: Shader = preload("res://shaders/planet_clouds.gdshader")
 const BLOCK_DAMAGE_SHADER: Shader = preload("res://shaders/block_damage.gdshader")
-const PROTOCOL_VERSION := 15
-const PROJECTION_SCHEMA_VERSION := 2
+const PROTOCOL_VERSION := 16
+const PROJECTION_SCHEMA_VERSION := 3
+const WORLD_SCHEMA_VERSION := 18
+const EVENT_SCHEMA_VERSION := 14
+const CONTENT_SCHEMA_VERSION := 11
+const CONTENT_MANIFEST_VERSION := "p1.5.0"
+const CELESTIAL_REGISTRY_SCHEMA_VERSION := 1
+const UNIVERSE_MANIFEST_SCHEMA_VERSION := 2
+const INTEREST_SCHEMA_VERSION := 1
+const EXPECTED_UNIVERSE_ID := "the-verse-local"
+const EXPECTED_CELESTIAL_REGISTRY_HASH := "4c367bbfa04218ece14104f0a3a7ec2c7e9fefcc37d4cf78a265df2d711a59da"
+const EXPECTED_UNIVERSE_MANIFEST_HASH := "08f96738abee769d2f9998a9666970ef6cd8474f3270977aec1a50672aad814e"
+const EXPECTED_CONTENT_HASH := "fc61c05b335fb951868010ecf2942a92ec4f03d00d0a75d3acba8c6f5162b6bd"
 const DEFAULT_SERVER := "ws://127.0.0.1:7777/ws"
 const DEFAULT_PLAYER_ID := "player-local"
 const STARTER_GRID := "grid-starter"
@@ -27,7 +38,15 @@ const PREDICTION_HISTORY_LIMIT := 180
 const MUTATION_QUEUE_LIMIT := 32
 const MUTATION_RETRY_INTERVAL := 1.5
 const MUTATION_RETRY_LIMIT := 3
+const AUTO_RECONNECT_ATTEMPT_LIMIT := 5
+const AUTO_RECONNECT_BASE_DELAY := 0.5
+const AUTO_RECONNECT_MAX_DELAY := 8.0
 const JSON_SAFE_INTEGER_MAX := 9007199254740991
+const LOSSLESS_INTEGER_PREFIX := "__VERSE_LOSSLESS_INTEGER__:"
+const LOSSLESS_STRING_PREFIX := "__VERSE_LOSSLESS_STRING__:"
+const I64_MAX_DECIMAL := "9223372036854775807"
+const I64_MIN_MAGNITUDE_DECIMAL := "9223372036854775808"
+const U64_MAX_DECIMAL := "18446744073709551615"
 const POSITION_SNAP_DISTANCE := 2.0
 const ORIENTATION_SNAP_ANGLE := PI / 3.0
 const CHARACTER_COLLISION_RADIUS := 0.34
@@ -60,9 +79,7 @@ const TOOL_DDA_MAX_STEPS := 512
 const MINE_DURATION := 0.72
 const WELD_DURATION := 0.52
 const DAMAGE_DURATION := 0.46
-const PLANET_VISUAL_CENTER := Vector3(900.0, -2200.0, -3800.0)
-const PLANET_VISUAL_RADIUS := 1200.0
-const PLANET_ATMOSPHERE_RADIUS := 1242.0
+const RENDER_DISTANCE_LIMIT_M := 12_000.0
 const VOXEL_CHUNK_SIZE := 8
 const ISO_LEVEL := 0.5
 const MARCHING_CORNERS: Array[Vector3i] = [
@@ -88,6 +105,27 @@ var requested_player_id := DEFAULT_PLAYER_ID
 var bound_player_id := ""
 var connected := false
 var handshake_sent := false
+var welcome_received := false
+var registry_received := false
+var replication_state := "loading"
+var replication_detail := "WAITING FOR PROTOCOL HANDSHAKE"
+var stream_family := ""
+var registry_snapshot: Dictionary = {}
+var universe_manifest: Dictionary = {}
+var interest_entities: Dictionary = {}
+var interest_session_epoch := ""
+var interest_epoch := -1
+var interest_baseline_id := ""
+var interest_delta_sequence := -1
+var interest_view_hash := ""
+var interest_local_origin: Dictionary = {}
+var baseline_request_pending := false
+var interest_verifier: Object
+var interest_recovery_used := false
+var connection_generation := 0
+var auto_reconnect_attempts := 0
+var auto_reconnect_elapsed := 0.0
+var auto_reconnect_scheduled := false
 var operation_counter := 0
 var committed_operation_sequence := 0
 var committed_operation_actor_id := ""
@@ -144,8 +182,10 @@ var session_role_kind := ""
 var voxel_lookup: Dictionary = {}
 var voxel_coordinate_lookup: Dictionary = {}
 var voxel_chunk_nodes: Dictionary = {}
+var rendered_voxel_chunk_fingerprints: Dictionary = {}
 var grid_lookup: Dictionary = {}
 var grid_node_lookup: Dictionary = {}
+var grid_topology_fingerprints: Dictionary = {}
 var remote_player_nodes: Dictionary = {}
 var rendered_voxel_count := -1
 var selected_block_kind := "structural"
@@ -159,6 +199,9 @@ var smoke_operation := ""
 var smoke_input_sequence := 0
 var smoke_receipt_received := false
 var smoke_visual_ready := false
+var test_fail_interest_presentation := false
+var test_capture_transport := false
+var test_outbound_trace: Array[String] = []
 var recovery_operation := ""
 var last_socket_state := -1
 var closed_reported := false
@@ -228,6 +271,9 @@ var mining_fragments: GPUParticles3D
 var suit_light: SpotLight3D
 var inventory_overlay: Control
 var planet_cloud_layer: MeshInstance3D
+var celestial_visuals: Dictionary = {}
+var rendered_celestial_registry_hash := ""
+var rendered_celestial_origin: Dictionary = {}
 var critical_oxygen_panel: ColorRect
 var critical_oxygen_label: Label
 var incapacitated_overlay: Control
@@ -246,6 +292,9 @@ func _ready() -> void:
 	_build_viewmodel()
 	_build_interface()
 	Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
+	if not _initialize_interest_verifier():
+		_client_fatal("NATIVE INTEREST VERIFIER EXTENSION UNAVAILABLE")
+		return
 	_connect_to_server()
 
 
@@ -255,6 +304,7 @@ func _exit_tree() -> void:
 
 func _process(delta: float) -> void:
 	elapsed_time += delta
+	_advance_auto_reconnect(delta)
 	if planet_cloud_layer != null:
 		planet_cloud_layer.rotation.y += delta * 0.0025
 	_poll_socket()
@@ -293,7 +343,7 @@ func _physics_process(delta: float) -> void:
 
 func _input(event: InputEvent) -> void:
 	if event is InputEventKey and _reconnect_shortcut(event):
-		_connect_to_server()
+		_connect_to_server(true)
 		get_viewport().set_input_as_handled()
 		return
 
@@ -502,7 +552,7 @@ func _protocol_nonnegative_integer(value: Variant) -> int:
 	var value_type := typeof(value)
 	if value_type == TYPE_INT:
 		var integer_value := int(value)
-		if integer_value >= 0 and integer_value <= JSON_SAFE_INTEGER_MAX:
+		if integer_value >= 0:
 			return integer_value
 		return -1
 	if value_type != TYPE_FLOAT:
@@ -516,6 +566,108 @@ func _protocol_nonnegative_integer(value: Variant) -> int:
 	):
 		return -1
 	return int(float_value)
+
+
+func _protocol_signed_integer(value: Variant) -> Variant:
+	if typeof(value) == TYPE_INT:
+		return int(value)
+	if typeof(value) != TYPE_FLOAT:
+		return null
+	var float_value := float(value)
+	if (
+		not is_finite(float_value)
+		or absf(float_value) > float(JSON_SAFE_INTEGER_MAX)
+		or floor(float_value) != float_value
+	):
+		return null
+	return int(float_value)
+
+
+func _decode_lossless_protocol_integers(value: Variant) -> bool:
+	if value is Dictionary:
+		var dictionary: Dictionary = value
+		for key in dictionary.keys():
+			var child: Variant = dictionary[key]
+			if child is String:
+				var decoded: Variant = _decode_lossless_integer_string(String(child))
+				if decoded == null and String(child).begins_with(LOSSLESS_INTEGER_PREFIX):
+					return false
+				dictionary[key] = decoded if decoded != null else child
+			elif not _decode_lossless_protocol_integers(child):
+				return false
+		return true
+	if value is Array:
+		var array: Array = value
+		for index in array.size():
+			var child: Variant = array[index]
+			if child is String:
+				var decoded: Variant = _decode_lossless_integer_string(String(child))
+				if decoded == null and String(child).begins_with(LOSSLESS_INTEGER_PREFIX):
+					return false
+				array[index] = decoded if decoded != null else child
+			elif not _decode_lossless_protocol_integers(child):
+				return false
+		return true
+	return true
+
+
+func _decode_lossless_integer_string(value: String) -> Variant:
+	if value.begins_with(LOSSLESS_STRING_PREFIX):
+		return value.substr(LOSSLESS_STRING_PREFIX.length())
+	if not value.begins_with(LOSSLESS_INTEGER_PREFIX):
+		return null
+	var decimal := value.substr(LOSSLESS_INTEGER_PREFIX.length())
+	if decimal.is_empty() or decimal == "-0" or decimal.begins_with("+"):
+		return null
+	var negative := decimal.begins_with("-")
+	var magnitude := decimal.substr(1) if negative else decimal
+	if magnitude.is_empty() or (magnitude.length() > 1 and magnitude.begins_with("0")):
+		return null
+	for index in magnitude.length():
+		var code := magnitude.unicode_at(index)
+		if code < 48 or code > 57:
+			return null
+	if negative:
+		if _decimal_compare(magnitude, I64_MIN_MAGNITUDE_DECIMAL) > 0:
+			return null
+		if magnitude == I64_MIN_MAGNITUDE_DECIMAL:
+			return -9223372036854775807 - 1
+		return -int(magnitude)
+	if _decimal_compare(magnitude, U64_MAX_DECIMAL) > 0:
+		return null
+	if _decimal_compare(magnitude, I64_MAX_DECIMAL) > 0:
+		# Godot Variant integers are signed i64. Preserve the verifier-typed u64
+		# lexeme for identity/fingerprint fields that do not require arithmetic.
+		return decimal
+	return int(magnitude)
+
+
+func _protocol_exact_unsigned_text(value: Variant) -> String:
+	if typeof(value) == TYPE_INT:
+		var integer_value := int(value)
+		return str(integer_value) if integer_value >= 0 else ""
+	if typeof(value) == TYPE_FLOAT:
+		var float_value := float(value)
+		if (
+			is_finite(float_value)
+			and float_value >= 0.0
+			and float_value <= float(JSON_SAFE_INTEGER_MAX)
+			and floor(float_value) == float_value
+		):
+			return str(int(float_value))
+		return ""
+	if value is String:
+		var decimal := String(value)
+		if decimal == "0":
+			return decimal
+		if decimal.is_empty() or decimal.begins_with("0") or decimal.begins_with("-"):
+			return ""
+		for index in decimal.length():
+			var code := decimal.unicode_at(index)
+			if code < 48 or code > 57:
+				return ""
+		return decimal if _decimal_compare(decimal, U64_MAX_DECIMAL) <= 0 else ""
+	return ""
 
 
 func _actor_private_matches(candidate: Variant, event_sequence: int) -> bool:
@@ -545,7 +697,7 @@ func _actor_private_matches(candidate: Variant, event_sequence: int) -> bool:
 		) < 0
 	):
 		return false
-	# Protocol 15 nests the overlay in the outer projected snapshot, making the
+	# Protocol 16 nests the overlay in the outer interest frame, making the
 	# outer sequence authoritative. Honor a future explicit sequence only when
 	# it agrees, so malformed extensions still fail closed.
 	return (
@@ -679,7 +831,7 @@ func _build_environment() -> void:
 	stars_root.name = "Starfield"
 	add_child(stars_root)
 	planet_root = Node3D.new()
-	planet_root.name = "KhepriPrime"
+	planet_root.name = "RegisteredCelestialBodies"
 	add_child(planet_root)
 
 	var asteroid_material := ShaderMaterial.new()
@@ -711,7 +863,6 @@ func _build_environment() -> void:
 		"hologram": _hologram_material(),
 	}
 	_build_starfield()
-	_build_distant_world()
 	_build_orbital_dust()
 	_build_target_highlight()
 	_build_action_feedback()
@@ -765,62 +916,104 @@ func _glass_material() -> StandardMaterial3D:
 	return material
 
 
-func _build_distant_world() -> void:
-	var planet := MeshInstance3D.new()
-	planet.name = "KhepriPrimeSurface"
-	var planet_mesh := SphereMesh.new()
-	planet_mesh.radius = PLANET_VISUAL_RADIUS
-	planet_mesh.height = PLANET_VISUAL_RADIUS * 2.0
-	planet_mesh.radial_segments = 192
-	planet_mesh.rings = 96
-	var surface_material := ShaderMaterial.new()
-	surface_material.shader = PLANET_SHADER
-	surface_material.set_shader_parameter("planet_albedo", PLANET_TEXTURE)
-	planet_mesh.material = surface_material
-	planet.mesh = planet_mesh
-	planet.position = PLANET_VISUAL_CENTER
-	planet.rotation_degrees = Vector3(0.0, -32.0, -11.0)
-	planet_root.add_child(planet)
-
-	planet_cloud_layer = MeshInstance3D.new()
-	planet_cloud_layer.name = "KhepriCloudLayer"
-	var cloud_mesh := SphereMesh.new()
-	cloud_mesh.radius = PLANET_VISUAL_RADIUS + 12.0
-	cloud_mesh.height = (PLANET_VISUAL_RADIUS + 12.0) * 2.0
-	cloud_mesh.radial_segments = 160
-	cloud_mesh.rings = 80
-	var cloud_material := ShaderMaterial.new()
-	cloud_material.shader = CLOUD_SHADER
-	cloud_mesh.material = cloud_material
-	planet_cloud_layer.mesh = cloud_mesh
-	planet_cloud_layer.position = PLANET_VISUAL_CENTER
-	planet_cloud_layer.rotation_degrees = Vector3(0.0, -20.0, -11.0)
-	planet_root.add_child(planet_cloud_layer)
-
-	var atmosphere := MeshInstance3D.new()
-	atmosphere.name = "KhepriAtmosphere"
-	var atmosphere_mesh := SphereMesh.new()
-	atmosphere_mesh.radius = PLANET_ATMOSPHERE_RADIUS
-	atmosphere_mesh.height = PLANET_ATMOSPHERE_RADIUS * 2.0
-	atmosphere_mesh.radial_segments = 128
-	atmosphere_mesh.rings = 64
-	var atmosphere_material := ShaderMaterial.new()
-	atmosphere_material.shader = ATMOSPHERE_SHADER
-	atmosphere_mesh.material = atmosphere_material
-	atmosphere.mesh = atmosphere_mesh
-	atmosphere.position = PLANET_VISUAL_CENTER
-	planet_root.add_child(atmosphere)
-
-	var moon := MeshInstance3D.new()
-	var moon_mesh := SphereMesh.new()
-	moon_mesh.radius = 84.0
-	moon_mesh.height = 168.0
-	moon_mesh.radial_segments = 48
-	moon_mesh.rings = 24
-	moon_mesh.material = _material(Color(0.22, 0.18, 0.16), 0.98, 0.01)
-	moon.mesh = moon_mesh
-	moon.position = Vector3(2250.0, -730.0, -5100.0)
-	planet_root.add_child(moon)
+func _rebuild_registered_celestials() -> void:
+	if planet_root == null or not registry_received or interest_local_origin.is_empty():
+		return
+	var registry_hash := String(registry_snapshot.get("registry_hash", ""))
+	if (
+		registry_hash == rendered_celestial_registry_hash
+		and interest_local_origin == rendered_celestial_origin
+	):
+		return
+	for child in planet_root.get_children():
+		planet_root.remove_child(child)
+		child.queue_free()
+	celestial_visuals.clear()
+	planet_cloud_layer = null
+	if asteroid_root != null:
+		var voxel_body := _registered_body(String(snapshot.get("voxel_body_id", "")))
+		var voxel_center: Variant = _address_relative_m(voxel_body.get("center", {}), interest_local_origin)
+		if voxel_center is Vector3:
+			asteroid_root.position = voxel_center
+	for body_value in registry_snapshot.get("bodies", []):
+		if not body_value is Dictionary:
+			continue
+		var body: Dictionary = body_value
+		var descriptor := String(body.get("visual_descriptor_id", ""))
+		# The registered procedural origin asteroid is rendered from authoritative
+		# voxel chunks. A second sphere would conceal mining changes.
+		if descriptor == "origin-regolith-v1" and body.has("voxel_field_id"):
+			continue
+		var center_value: Variant = _address_relative_m(body.get("center", {}), interest_local_origin)
+		if not center_value is Vector3:
+			continue
+		var center: Vector3 = center_value
+		if center.length() > RENDER_DISTANCE_LIMIT_M * 2.0:
+			continue
+		var radius := float(body.get("surface_radius_um", 0)) / 1_000_000.0
+		if not is_finite(radius) or radius <= 0.0:
+			continue
+		var visual := MeshInstance3D.new()
+		visual.name = "Celestial_%s" % String(body.get("body_id", "unknown"))
+		var mesh := SphereMesh.new()
+		mesh.radius = radius
+		mesh.height = radius * 2.0
+		mesh.radial_segments = 192 if body.get("kind", "") == "planet" else 64
+		mesh.rings = 96 if body.get("kind", "") == "planet" else 32
+		if descriptor == "khepri-prime-terrestrial-v1":
+			var surface_material := ShaderMaterial.new()
+			surface_material.shader = PLANET_SHADER
+			surface_material.set_shader_parameter("planet_albedo", PLANET_TEXTURE)
+			mesh.material = surface_material
+		elif descriptor == "sable-airless-v1":
+			mesh.material = _material(Color(0.22, 0.18, 0.16), 0.98, 0.01)
+		else:
+			# Unknown descriptors remain visible but never borrow a misleading
+			# authored appearance from a different registered body.
+			mesh.material = _material(Color(0.34, 0.38, 0.42), 0.92, 0.08)
+			visual.set_meta("verse_visual_descriptor", "neutral_proxy")
+		visual.mesh = mesh
+		visual.position = center
+		var orientation: Dictionary = body.get("fixed_orientation_microradians", {})
+		visual.rotation = Vector3(
+			float(orientation.get("x", 0)) / 1_000_000.0,
+			float(orientation.get("y", 0)) / 1_000_000.0,
+			float(orientation.get("z", 0)) / 1_000_000.0
+		)
+		planet_root.add_child(visual)
+		celestial_visuals[String(body.get("body_id", ""))] = visual
+		var atmosphere_height := float(body.get("atmosphere_height_um", 0)) / 1_000_000.0
+		if atmosphere_height <= 0.0:
+			continue
+		var atmosphere := MeshInstance3D.new()
+		atmosphere.name = "%s_Atmosphere" % visual.name
+		var atmosphere_mesh := SphereMesh.new()
+		atmosphere_mesh.radius = radius + atmosphere_height
+		atmosphere_mesh.height = atmosphere_mesh.radius * 2.0
+		atmosphere_mesh.radial_segments = 128
+		atmosphere_mesh.rings = 64
+		var atmosphere_material := ShaderMaterial.new()
+		atmosphere_material.shader = ATMOSPHERE_SHADER
+		atmosphere_mesh.material = atmosphere_material
+		atmosphere.mesh = atmosphere_mesh
+		atmosphere.position = center
+		planet_root.add_child(atmosphere)
+		if descriptor == "khepri-prime-terrestrial-v1":
+			planet_cloud_layer = MeshInstance3D.new()
+			planet_cloud_layer.name = "%s_Clouds" % visual.name
+			var cloud_mesh := SphereMesh.new()
+			cloud_mesh.radius = radius + minf(12.0, atmosphere_height * 0.2)
+			cloud_mesh.height = cloud_mesh.radius * 2.0
+			cloud_mesh.radial_segments = 160
+			cloud_mesh.rings = 80
+			var cloud_material := ShaderMaterial.new()
+			cloud_material.shader = CLOUD_SHADER
+			cloud_mesh.material = cloud_material
+			planet_cloud_layer.mesh = cloud_mesh
+			planet_cloud_layer.position = center
+			planet_root.add_child(planet_cloud_layer)
+	rendered_celestial_registry_hash = registry_hash
+	rendered_celestial_origin = interest_local_origin.duplicate(true)
 
 
 func _build_orbital_dust() -> void:
@@ -1718,13 +1911,19 @@ func _terminal_style(background: Color, border: Color, width: int) -> StyleBoxFl
 	return style
 
 
-func _connect_to_server() -> void:
+func _connect_to_server(manual_retry := false) -> void:
+	if manual_retry:
+		auto_reconnect_attempts = 0
+		auto_reconnect_scheduled = false
+		auto_reconnect_elapsed = 0.0
 	socket.close()
+	if not _begin_connection_generation():
+		_client_fatal("NATIVE INTEREST VERIFIER RESET FAILED")
+		return
 	socket = WebSocketPeer.new()
 	socket.inbound_buffer_size = 8 * 1024 * 1024
 	socket.outbound_buffer_size = 1024 * 1024
 	connected = false
-	_begin_player_resync()
 	recovery_operation = ""
 	handshake_sent = false
 	closed_reported = false
@@ -1734,8 +1933,17 @@ func _connect_to_server() -> void:
 		print("VERSE_SMOKE_CONNECT url=%s result=%d" % [server_url, result])
 	if result != OK:
 		_set_message("Unable to begin connection: %s" % error_string(result), true)
+		_schedule_auto_reconnect()
 	else:
 		_set_message("Connecting to %s" % server_url)
+
+
+func _begin_connection_generation() -> bool:
+	connection_generation += 1
+	if not _reset_interest_verifier():
+		return false
+	_begin_player_resync()
+	return true
 
 
 func _poll_socket() -> void:
@@ -1751,20 +1959,21 @@ func _poll_socket() -> void:
 			_send_transport({
 				"type": "hello",
 				"protocol_version": PROTOCOL_VERSION,
-				"client_name": "godot-native-p1.4",
+				"client_name": "godot-native-p1.5",
 				"authentication": {
 					"kind": "local_development",
 					"player_id": requested_player_id,
 				},
 			})
 		while socket.get_available_packet_count() > 0:
-			var text := socket.get_packet().get_string_from_utf8()
-			var parsed: Variant = JSON.parse_string(text)
-			if parsed is Dictionary:
-				_handle_server_message(parsed)
+			var packet := socket.get_packet()
+			if not _accept_server_packet(packet, socket.was_string_packet()):
+				return
 	elif state == WebSocketPeer.STATE_CLOSED:
-		if smoke_test and not connected and not closed_reported:
-			closed_reported = true
+		if closed_reported:
+			return
+		closed_reported = true
+		if smoke_test and not connected:
 			print(
 				"VERSE_SMOKE_CLOSED code=%d reason=%s"
 				% [socket.get_close_code(), socket.get_close_reason()]
@@ -1776,14 +1985,175 @@ func _poll_socket() -> void:
 				true
 			)
 		connected = false
-		_begin_player_resync()
+		if replication_state != "fatal":
+			_begin_player_resync()
+			_schedule_auto_reconnect()
 		recovery_operation = ""
 		handshake_sent = false
+
+
+func _accept_server_packet(packet: PackedByteArray, was_string_packet: bool) -> bool:
+	if not was_string_packet:
+		_client_fatal("BINARY SERVER FRAME REJECTED")
+		return false
+	_verify_and_handle_packet(packet)
+	return replication_state != "fatal"
+
+
+func _reconnect_delay_for_attempt(attempt: int) -> float:
+	if attempt <= 0:
+		return 0.0
+	return minf(
+		AUTO_RECONNECT_BASE_DELAY * pow(2.0, float(attempt - 1)),
+		AUTO_RECONNECT_MAX_DELAY,
+	)
+
+
+func _schedule_auto_reconnect() -> bool:
+	if replication_state == "fatal" or auto_reconnect_attempts >= AUTO_RECONNECT_ATTEMPT_LIMIT:
+		auto_reconnect_scheduled = false
+		return false
+	if auto_reconnect_scheduled:
+		return true
+	auto_reconnect_attempts += 1
+	auto_reconnect_elapsed = _reconnect_delay_for_attempt(auto_reconnect_attempts)
+	auto_reconnect_scheduled = true
+	_set_message(
+		"LINK LOST // RETRY %d/%d IN %.1fs // F5 RETRIES NOW"
+		% [auto_reconnect_attempts, AUTO_RECONNECT_ATTEMPT_LIMIT, auto_reconnect_elapsed],
+		true,
+	)
+	return true
+
+
+func _advance_auto_reconnect(delta: float) -> bool:
+	if not auto_reconnect_scheduled or replication_state == "fatal":
+		return false
+	auto_reconnect_elapsed = maxf(0.0, auto_reconnect_elapsed - maxf(delta, 0.0))
+	if auto_reconnect_elapsed > 0.0:
+		return false
+	auto_reconnect_scheduled = false
+	_connect_to_server(false)
+	return true
+
+
+func _initialize_interest_verifier() -> bool:
+	if not ClassDB.class_exists("VerseInterestVerifier"):
+		interest_verifier = null
+		return false
+	interest_verifier = ClassDB.instantiate("VerseInterestVerifier")
+	return interest_verifier != null and _reset_interest_verifier()
+
+
+func _reset_interest_verifier() -> bool:
+	if interest_verifier == null:
+		return false
+	var reset: Variant = interest_verifier.call(
+		"reset_player",
+		requested_player_id,
+		WORLD_SCHEMA_VERSION,
+		EVENT_SCHEMA_VERSION,
+		CONTENT_SCHEMA_VERSION,
+		CONTENT_MANIFEST_VERSION,
+		EXPECTED_CONTENT_HASH,
+		EXPECTED_UNIVERSE_ID,
+		EXPECTED_CELESTIAL_REGISTRY_HASH,
+		EXPECTED_UNIVERSE_MANIFEST_HASH,
+	)
+	interest_recovery_used = false
+	return reset is Dictionary and bool(reset.get("ok", false))
+
+
+func _verify_and_handle_packet(packet: PackedByteArray) -> void:
+	if interest_verifier == null:
+		_client_fatal("NATIVE INTEREST VERIFIER EXTENSION UNAVAILABLE")
+		return
+	var staged: Variant = interest_verifier.call("stage_server_message", packet)
+	if not staged is Dictionary or not bool(staged.get("ok", false)):
+		var error_code := String(staged.get("error_code", "adapter_failure")) if staged is Dictionary else "adapter_failure"
+		if error_code == "frontier_mismatch" and not interest_recovery_used:
+			interest_recovery_used = true
+			_request_fresh_interest_baseline("VERIFIED INTEREST FRONTIER MISMATCH")
+			return
+		_client_fatal("INTEREST VERIFIER %s" % error_code.to_upper())
+		return
+	var token := int(staged.get("token", -1))
+	var parsed: Variant = JSON.parse_string(String(staged.get("sanitized_frame", "")))
+	if not parsed is Dictionary:
+		_discard_interest_stage(token)
+		_client_fatal("VERIFIER SANITIZED FRAME INVALID")
+		return
+	if not _decode_lossless_protocol_integers(parsed):
+		_discard_interest_stage(token)
+		_client_fatal("VERIFIER PRESENTATION INTEGER OUT OF RANGE")
+		return
+	var message: Dictionary = parsed
+	var candidate: Dictionary = {}
+	match String(message.get("type", "")):
+		"interest_baseline":
+			candidate = _prepare_interest_baseline(message.get("baseline", {}))
+		"interest_delta":
+			candidate = _prepare_interest_delta(message.get("delta", {}))
+	if String(message.get("type", "")) in ["interest_baseline", "interest_delta"] and candidate.is_empty():
+		_discard_interest_stage(token)
+		_client_fatal("VERIFIED FRAME FAILED MODEL STAGING")
+		return
+	var committed: Variant = interest_verifier.call("commit", token)
+	if not committed is Dictionary or not bool(committed.get("ok", false)):
+		_client_fatal("INTEREST VERIFIER COMMIT FAILED")
+		return
+	if candidate.is_empty():
+		_handle_server_message(message)
+		return
+	var acknowledgement: Variant = committed.get("acknowledgement", null)
+	if not acknowledgement is PackedByteArray:
+		_client_fatal("VERIFIER ACKNOWLEDGEMENT MISSING")
+		return
+	_finalize_committed_interest(candidate, acknowledgement)
+
+
+func _finalize_committed_interest(
+	candidate: Dictionary, acknowledgement: PackedByteArray
+) -> bool:
+	_install_verified_interest_model(candidate)
+	if not _send_verifier_acknowledgement(acknowledgement):
+		_client_fatal("VERIFIER ACKNOWLEDGEMENT SEND FAILED")
+		return false
+	replication_state = "ready"
+	replication_detail = "INTEREST VIEW CURRENT"
+	auto_reconnect_attempts = 0
+	auto_reconnect_scheduled = false
+	auto_reconnect_elapsed = 0.0
+	_dispatch_next_mutation()
+	if not _present_verified_interest_model(candidate.get("world", {})):
+		replication_detail = "INTEREST VIEW CURRENT // PRESENTATION DEGRADED"
+		_set_message("VERIFIED MODEL CURRENT // PRESENTATION REFRESH DEFERRED", true)
+	return true
+
+
+func _discard_interest_stage(token: int) -> void:
+	if interest_verifier != null:
+		interest_verifier.call("discard", token)
+
+
+func _send_verifier_acknowledgement(encoded: PackedByteArray) -> bool:
+	if test_capture_transport:
+		test_outbound_trace.append("interest_ack")
+		return true
+	if socket.get_ready_state() != WebSocketPeer.STATE_OPEN:
+		return false
+	return socket.send(encoded, WebSocketPeer.WRITE_MODE_TEXT) == OK
 
 
 func _handle_server_message(message: Dictionary) -> void:
 	match message.get("type", ""):
 		"welcome":
+			if welcome_received or not _welcome_tuple_valid(message):
+				_client_fatal("PROTOCOL TUPLE MISMATCH")
+				return
+			welcome_received = true
+			replication_state = "loading"
+			replication_detail = "VALIDATING CELESTIAL REGISTRY"
 			var session_role: Dictionary = message.get("session_role", {})
 			session_role_kind = String(session_role.get("kind", ""))
 			_clear_actor_private_state()
@@ -1804,13 +2174,25 @@ func _handle_server_message(message: Dictionary) -> void:
 				operation_frontier_observed = false
 				observed_operation_frontier = -1
 			_set_message(
-				"Connected to %s // %s"
+				"Protocol 16 linked to %s // %s // loading registry"
 				% [message.get("server_name", "The Verse"), _controlled_player_id()]
 			)
-		"snapshot":
-			_apply_snapshot(message.get("snapshot", {}))
-		"motion_state":
-			_apply_motion_state(message.get("motion", {}))
+		"registry":
+			if not welcome_received or registry_received:
+				_client_fatal("REGISTRY ORDER VIOLATION")
+				return
+			if not _install_registry(message):
+				_client_fatal("REGISTRY OR MANIFEST BINDING INVALID")
+				return
+			registry_received = true
+			replication_detail = "WAITING FOR INTEREST BASELINE"
+			_set_message("CELESTIAL REGISTRY VERIFIED // WAITING FOR LOCAL VIEW")
+		"interest_baseline":
+			_client_fatal("UNVERIFIED INTEREST BASELINE BYPASSED NATIVE VERIFIER")
+		"interest_delta":
+			_client_fatal("UNVERIFIED INTEREST DELTA BYPASSED NATIVE VERIFIER")
+		"snapshot", "motion_state":
+			_client_fatal("LEGACY REPLICATION FAMILY REJECTED")
 		"intent_accepted":
 			var receipt: Dictionary = message.get("receipt", {})
 			if _handle_intent_accepted(receipt):
@@ -1832,33 +2214,572 @@ func _handle_server_message(message: Dictionary) -> void:
 					true
 				)
 		"fatal":
-			mutation_resync_required = true
-			operation_frontier_ready = false
-			authoritative_player_ready = false
-			_set_message(
-				"FATAL %s — %s" % [message.get("code", ""), message.get("message", "")],
-				true
+			_client_fatal(
+				"SERVER %s — %s" % [message.get("code", ""), message.get("message", "")]
 			)
+		_:
+			_client_fatal("UNKNOWN SERVER MESSAGE TYPE")
 
 
-func _apply_snapshot(authoritative: Dictionary) -> void:
-	if authoritative.is_empty():
-		return
-	var event_sequence := int(authoritative.get("event_sequence", 0))
-	if not _full_snapshot_event_is_current(
-		event_sequence, last_authoritative_event_sequence
+func _welcome_tuple_valid(message: Dictionary) -> bool:
+	var role: Variant = message.get("session_role", {})
+	if not role is Dictionary or not String(role.get("kind", "")) in ["player", "spectator"]:
+		return false
+	if String(role.get("kind", "")) == "player" and (
+		String(role.get("player_id", "")).is_empty()
+		or String(role.get("player_id", "")) != requested_player_id
 	):
+		return false
+	return (
+		int(message.get("protocol_version", -1)) == PROTOCOL_VERSION
+		and int(message.get("projection_schema_version", -1)) == PROJECTION_SCHEMA_VERSION
+		and int(message.get("world_schema_version", -1)) == WORLD_SCHEMA_VERSION
+		and int(message.get("event_schema_version", -1)) == EVENT_SCHEMA_VERSION
+		and int(message.get("content_schema_version", -1)) == CONTENT_SCHEMA_VERSION
+		and String(message.get("content_manifest_version", "")) == CONTENT_MANIFEST_VERSION
+		and int(message.get("celestial_registry_schema_version", -1))
+		== CELESTIAL_REGISTRY_SCHEMA_VERSION
+		and int(message.get("universe_manifest_schema_version", -1))
+		== UNIVERSE_MANIFEST_SCHEMA_VERSION
+		and int(message.get("interest_schema_version", -1)) == INTEREST_SCHEMA_VERSION
+	)
+
+
+func _install_registry(message: Dictionary) -> bool:
+	var registry_value: Variant = message.get("registry", {})
+	var manifest_value: Variant = message.get("universe_manifest", {})
+	if not registry_value is Dictionary or not manifest_value is Dictionary:
+		return false
+	var registry: Dictionary = registry_value
+	var manifest: Dictionary = manifest_value
+	var registry_hash := String(registry.get("registry_hash", ""))
+	var manifest_hash := String(manifest.get("manifest_hash", ""))
+	var universe_id := String(registry.get("universe_id", ""))
+	if (
+		int(registry.get("schema_version", -1)) != CELESTIAL_REGISTRY_SCHEMA_VERSION
+		or int(manifest.get("schema_version", -1)) != UNIVERSE_MANIFEST_SCHEMA_VERSION
+		or not _valid_hash(registry_hash)
+		or not _valid_hash(manifest_hash)
+		or universe_id.is_empty()
+		or String(manifest.get("universe_id", "")) != universe_id
+		or String(manifest.get("celestial_registry_hash", "")) != registry_hash
+		or int(manifest.get("celestial_registry_schema_version", -1))
+		!= CELESTIAL_REGISTRY_SCHEMA_VERSION
+		or int(manifest.get("content_schema_version", -1)) != CONTENT_SCHEMA_VERSION
+		or String(manifest.get("content_manifest_version", "")) != CONTENT_MANIFEST_VERSION
+		or int(manifest.get("world_schema_version", -1)) != WORLD_SCHEMA_VERSION
+		or int(manifest.get("event_schema_version", -1)) != EVENT_SCHEMA_VERSION
+		or String(manifest.get("generation_rule_version", ""))
+		!= String(registry.get("generation_rule_version", ""))
+		or int(manifest.get("address_schema_version", -1)) != 1
+		or int(manifest.get("cells_per_sector_axis", -1)) <= 0
+		or int(manifest.get("cell_edge_um", 0)) <= 0
+		or int(manifest.get("sector_edge_um", 0)) <= 0
+		or not registry.get("bodies", []) is Array
+		or registry.get("bodies", []).is_empty()
+	):
+		if smoke_test:
+			printerr(
+				"VERSE_SMOKE_REGISTRY_HEADER_INVALID registry_schema=%s manifest_schema=%s "
+				+ "registry_hash=%s manifest_hash=%s sector_edge=%s cell_edge=%s cells=%s"
+				% [
+					registry.get("schema_version", null), manifest.get("schema_version", null),
+					registry_hash, manifest_hash, manifest.get("sector_edge_um", null),
+					manifest.get("cell_edge_um", null), manifest.get("cells_per_sector_axis", null),
+				]
+			)
+		return false
+	var ids: Dictionary = {}
+	for body_value in registry.get("bodies", []):
+		if not body_value is Dictionary:
+			return false
+		var body: Dictionary = body_value
+		var body_id := String(body.get("body_id", ""))
+		if (
+			body_id.is_empty()
+			or ids.has(body_id)
+			or not String(body.get("kind", "")) in ["planet", "moon", "asteroid", "asteroid_field"]
+			or not _universe_address_valid(body.get("center", {}), manifest)
+			or int(body.get("surface_radius_um", 0)) <= 0
+			or int(body.get("exclusion_radius_um", 0)) < int(body.get("surface_radius_um", 0))
+			or String(body.get("content_manifest_version", "")) != CONTENT_MANIFEST_VERSION
+			or String(body.get("content_hash", "")) != String(manifest.get("content_hash", ""))
+			or String(body.get("generation_rule_version", ""))
+			!= String(registry.get("generation_rule_version", ""))
+			or String(body.get("geometry_definition_id", "")).is_empty()
+			or String(body.get("material_definition_id", "")).is_empty()
+			or String(body.get("gravity_definition_id", "")).is_empty()
+			or String(body.get("atmosphere_definition_id", "")).is_empty()
+			or String(body.get("resource_definition_id", "")).is_empty()
+			or String(body.get("visual_descriptor_id", "")).is_empty()
+		):
+			if smoke_test:
+				printerr(
+					"VERSE_SMOKE_REGISTRY_BODY_INVALID id=%s kind=%s address=%s radius=%s exclusion=%s version=%s content=%s"
+					% [
+						body_id, body.get("kind", null),
+						_universe_address_valid(body.get("center", {}), manifest),
+						body.get("surface_radius_um", null), body.get("exclusion_radius_um", null),
+						body.get("content_manifest_version", null), body.get("content_hash", null),
+					]
+				)
+			return false
+		ids[body_id] = true
+	var parents: Dictionary = {}
+	for body_value in registry.get("bodies", []):
+		var parent_id := String(body_value.get("parent_body_id", ""))
+		if not parent_id.is_empty() and (not ids.has(parent_id) or parent_id == body_value.get("body_id", "")):
+			return false
+		parents[String(body_value.get("body_id", ""))] = parent_id
+	for body_id in parents:
+		var visited: Dictionary = {}
+		var cursor := String(body_id)
+		while not cursor.is_empty():
+			if visited.has(cursor):
+				return false
+			visited[cursor] = true
+			cursor = String(parents.get(cursor, ""))
+	registry_snapshot = registry.duplicate(true)
+	universe_manifest = manifest.duplicate(true)
+	return true
+
+
+func _prepare_interest_baseline(authoritative: Dictionary) -> Dictionary:
+	if not welcome_received or not registry_received or authoritative.is_empty():
+		return {}
+	if not stream_family.is_empty() and stream_family != "interest":
+		return {}
+	var interest_value: Variant = authoritative.get("interest", {})
+	if not interest_value is Dictionary:
+		return {}
+	var interest: Dictionary = interest_value
+	if (
+		not _interest_outer_bindings_valid(authoritative, interest)
+		or String(interest.get("frame_kind", "")) != "baseline"
+		or int(interest.get("delta_sequence", -1)) != 0
+		or interest.get("previous_view_hash", null) != null
+		or String(interest.get("session_epoch", "")).is_empty()
+		or String(interest.get("baseline_id", "")).is_empty()
+		or not _valid_hash(String(interest.get("view_hash", "")))
+		or not interest.get("replaced", []) is Array
+		or not interest.get("removed", []) is Array
+		or not interest.get("replaced", []).is_empty()
+		or not interest.get("removed", []).is_empty()
+	):
+		return {}
+	var origin: Dictionary = interest.get("local_origin_address", {})
+	var staged := _empty_interest_entities()
+	if not _apply_interest_operations(staged, interest, origin, true):
+		return {}
+	if not _baseline_arrays_match_interest(authoritative, staged):
+		return {}
+	var world := _world_from_interest(authoritative, staged, origin, true)
+	if (
+		world.is_empty()
+		or not _private_projection_candidate_valid(world)
+		or not _full_snapshot_event_is_current(
+			int(authoritative.get("event_sequence", -1)), last_authoritative_event_sequence
+		)
+	):
+		return {}
+	return {
+		"baseline": true,
+		"world": world,
+		"entities": staged,
+		"origin": origin.duplicate(true),
+		"session_epoch": String(interest.get("session_epoch", "")),
+		"interest_epoch": int(interest.get("interest_epoch", -1)),
+		"baseline_id": String(interest.get("baseline_id", "")),
+		"delta_sequence": 0,
+		"view_hash": String(interest.get("view_hash", "")),
+	}
+
+
+func _prepare_interest_delta(authoritative: Dictionary) -> Dictionary:
+	if stream_family != "interest" or interest_delta_sequence < 0 or baseline_request_pending:
+		return {}
+	if int(authoritative.get("event_sequence", -1)) < last_authoritative_event_sequence:
+		return {}
+	var interest_value: Variant = authoritative.get("interest", {})
+	if not interest_value is Dictionary:
+		return {}
+	var interest: Dictionary = interest_value
+	if (
+		not _interest_outer_bindings_valid(authoritative, interest)
+		or String(interest.get("frame_kind", "")) != "delta"
+		or String(interest.get("session_epoch", "")) != interest_session_epoch
+		or int(interest.get("interest_epoch", -1)) != interest_epoch
+		or String(interest.get("baseline_id", "")) != interest_baseline_id
+		or int(interest.get("delta_sequence", -1)) != interest_delta_sequence + 1
+		or String(interest.get("previous_view_hash", "")) != interest_view_hash
+		or not _valid_hash(String(interest.get("view_hash", "")))
+	):
+		return {}
+	var origin: Dictionary = interest.get("local_origin_address", {})
+	var staged: Dictionary = interest_entities.duplicate(true)
+	if not _apply_interest_operations(staged, interest, origin, false):
+		return {}
+	if not _rehydrate_interest_entities(staged, origin):
+		return {}
+	var world := _world_from_interest(authoritative, staged, origin, false)
+	if world.is_empty() or not _private_projection_candidate_valid(world):
+		return {}
+	return {
+		"baseline": false,
+		"world": world,
+		"entities": staged,
+		"origin": origin.duplicate(true),
+		"session_epoch": interest_session_epoch,
+		"interest_epoch": interest_epoch,
+		"baseline_id": interest_baseline_id,
+		"delta_sequence": int(interest.get("delta_sequence", -1)),
+		"view_hash": String(interest.get("view_hash", "")),
+	}
+
+
+func _install_verified_interest_model(candidate: Dictionary) -> void:
+	var world: Dictionary = candidate.get("world", {}).duplicate(true)
+	var private_candidate: Dictionary = world.get("actor_private", {}).duplicate(true)
+	world.erase("actor_private")
+	snapshot = world
+	actor_private_snapshot = private_candidate
+	if not actor_private_snapshot.get("production_queues", []) is Array:
+		actor_private_snapshot["production_queues"] = []
+	_reconcile_operation_frontier(
+		_protocol_nonnegative_integer(
+			actor_private_snapshot.get("committed_operation_sequence", null)
+		)
+	)
+	interest_entities = candidate.get("entities", {}).duplicate(true)
+	interest_session_epoch = String(candidate.get("session_epoch", ""))
+	interest_epoch = int(candidate.get("interest_epoch", -1))
+	interest_baseline_id = String(candidate.get("baseline_id", ""))
+	interest_delta_sequence = int(candidate.get("delta_sequence", -1))
+	interest_view_hash = String(candidate.get("view_hash", ""))
+	interest_local_origin = candidate.get("origin", {}).duplicate(true)
+	stream_family = "interest"
+	baseline_request_pending = false
+	var player := _local_player()
+	_capture_prediction_gravity({"player": player, "environment": _local_environment()})
+	_apply_authoritative_player(
+		player,
+		int(snapshot.get("simulation_tick", 0)),
+		int(snapshot.get("event_sequence", 0)),
+		String(snapshot.get("world_hash", "")),
+		"snapshot",
+	)
+
+
+func _interest_outer_bindings_valid(authoritative: Dictionary, interest: Dictionary) -> bool:
+	var registry_hash := String(registry_snapshot.get("registry_hash", ""))
+	var manifest_hash := String(universe_manifest.get("manifest_hash", ""))
+	var expected_observer := "bound_player" if session_role_kind == "player" else "public_origin_spectator"
+	return (
+		int(authoritative.get("projection_schema_version", -1)) == PROJECTION_SCHEMA_VERSION
+		and int(authoritative.get("schema_version", -1)) == WORLD_SCHEMA_VERSION
+		and String(authoritative.get("content_manifest_version", "")) == CONTENT_MANIFEST_VERSION
+		and String(authoritative.get("universe_id", "")) == String(universe_manifest.get("universe_id", ""))
+		and String(authoritative.get("universe_manifest_hash", "")) == manifest_hash
+		and String(authoritative.get("celestial_registry_hash", "")) == registry_hash
+		and int(interest.get("schema_version", -1)) == INTEREST_SCHEMA_VERSION
+		and String(interest.get("registry_hash", "")) == registry_hash
+		and String(interest.get("universe_manifest_hash", "")) == manifest_hash
+		and String(interest.get("observer_class", "")) == expected_observer
+		and int(interest.get("canonical_event_sequence", -1)) == int(authoritative.get("event_sequence", -2))
+		and int(interest.get("canonical_tick", -1)) == int(authoritative.get("simulation_tick", -2))
+		and String(interest.get("canonical_world_hash", "")) == String(authoritative.get("world_hash", ""))
+		and _universe_address_valid(authoritative.get("cell_address", {}), universe_manifest)
+		and authoritative.get("cell_address", {}) == interest.get("cell_address", {})
+		and _universe_address_valid(interest.get("local_origin_address", {}), universe_manifest)
+		and interest.get("entered", []) is Array
+		and interest.get("replaced", []) is Array
+		and interest.get("removed", []) is Array
+	)
+
+
+func _empty_interest_entities() -> Dictionary:
+	return {"player": {}, "grid": {}, "voxel_chunk": {}, "death_drop": {}}
+
+
+func _apply_interest_operations(
+	staged: Dictionary, interest: Dictionary, origin: Dictionary, baseline: bool
+) -> bool:
+	var seen: Dictionary = {}
+	for operation_name in ["entered", "replaced"]:
+		for projection_value in interest.get(operation_name, []):
+			if not projection_value is Dictionary:
+				return false
+			var projection: Dictionary = projection_value
+			var identity := _validated_interest_projection(projection, origin)
+			if identity.is_empty():
+				return false
+			var key := "%s:%s" % [identity["kind"], identity["entity_id"]]
+			if seen.has(key):
+				return false
+			seen[key] = true
+			var collection: Dictionary = staged[identity["kind"]]
+			var exists := collection.has(identity["entity_id"])
+			if (operation_name == "entered" and exists) or (operation_name == "replaced" and not exists):
+				return false
+			collection[identity["entity_id"]] = identity["value"]
+			staged[identity["kind"]] = collection
+	for removal_value in interest.get("removed", []):
+		if not removal_value is Dictionary:
+			return false
+		var kind := String(removal_value.get("kind", ""))
+		var entity_id := String(removal_value.get("entity_id", ""))
+		var key := "%s:%s" % [kind, entity_id]
+		if (
+			not staged.has(kind)
+			or entity_id.is_empty()
+			or seen.has(key)
+			or not String(removal_value.get("reason", "")) in ["out_of_interest", "destroyed", "transferred"]
+		):
+			return false
+		var collection: Dictionary = staged[kind]
+		if not collection.has(entity_id):
+			return false
+		collection.erase(entity_id)
+		staged[kind] = collection
+		seen[key] = true
+	return not baseline or interest.get("replaced", []).is_empty() and interest.get("removed", []).is_empty()
+
+
+func _validated_interest_projection(projection: Dictionary, origin: Dictionary) -> Dictionary:
+	var kind := String(projection.get("kind", ""))
+	var entity_id := String(projection.get("entity_id", ""))
+	var payload_value: Variant = projection.get("payload", {})
+	if (
+		not kind in ["player", "grid", "voxel_chunk", "death_drop"]
+		or entity_id.is_empty()
+		or int(projection.get("component_schema_version", -1)) != PROJECTION_SCHEMA_VERSION
+		or not payload_value is Dictionary
+		or String(payload_value.get("entity_kind", "")) != kind
+		or not payload_value.get("value", {}) is Dictionary
+	):
+		return {}
+	var value: Dictionary = payload_value.get("value", {}).duplicate(true)
+	var natural_id_field: String = {
+		"player": "player_id", "grid": "grid_id", "voxel_chunk": "chunk_id", "death_drop": "drop_id",
+	}[kind]
+	if String(value.get(natural_id_field, "")) != entity_id:
+		return {}
+	if kind in ["player", "grid", "death_drop"]:
+		var position: Variant = _address_relative_m(value.get("address", {}), origin)
+		if not position is Vector3:
+			return {}
+		value["position"] = _protocol_vec3(position)
+	return {"kind": kind, "entity_id": entity_id, "value": value}
+
+
+func _rehydrate_interest_entities(staged: Dictionary, origin: Dictionary) -> bool:
+	for kind in ["player", "grid", "death_drop"]:
+		var collection: Dictionary = staged[kind]
+		for entity_id in collection:
+			var value: Dictionary = collection[entity_id]
+			var position: Variant = _address_relative_m(value.get("address", {}), origin)
+			if not position is Vector3:
+				return false
+			value["position"] = _protocol_vec3(position)
+			collection[entity_id] = value
+		staged[kind] = collection
+	return true
+
+
+func _baseline_arrays_match_interest(authoritative: Dictionary, staged: Dictionary) -> bool:
+	for mapping in [
+		["players", "player", "player_id"],
+		["grids", "grid", "grid_id"],
+		["voxel_chunks", "voxel_chunk", "chunk_id"],
+		["death_drops", "death_drop", "drop_id"],
+	]:
+		var values: Variant = authoritative.get(mapping[0], [])
+		if not values is Array or values.size() != staged[mapping[1]].size():
+			return false
+		var seen: Dictionary = {}
+		for value in values:
+			if not value is Dictionary:
+				return false
+			var entity_id := String(value.get(mapping[2], ""))
+			if entity_id.is_empty() or seen.has(entity_id) or not staged[mapping[1]].has(entity_id):
+				return false
+			seen[entity_id] = true
+	return true
+
+
+func _world_from_interest(
+	authoritative: Dictionary, staged: Dictionary, origin: Dictionary, baseline: bool
+) -> Dictionary:
+	var world := authoritative.duplicate(true) if baseline else snapshot.duplicate(true)
+	for field in [
+		"projection_schema_version", "schema_version", "content_manifest_version", "universe_id",
+		"cell_id", "universe_manifest_hash", "celestial_registry_hash", "cell_address",
+		"gravity_body_id", "voxel_body_id", "event_sequence", "simulation_tick", "world_hash", "interest",
+	]:
+		world[field] = authoritative.get(field)
+	if authoritative.has("environment"):
+		world["environment"] = authoritative.get("environment", {}).duplicate(true)
+		var environment: Dictionary = world["environment"]
+		var gravity_body := _registered_body(String(environment.get("celestial_body_id", "")))
+		var planet_center: Variant = _address_relative_m(gravity_body.get("center", {}), origin)
+		if planet_center is Vector3:
+			environment["planet_center"] = _protocol_vec3(planet_center)
+		world["environment"] = environment
+	if authoritative.has("conservation_valid"):
+		world["conservation_valid"] = bool(authoritative.get("conservation_valid", false))
+	world["players"] = _ordered_entity_values(staged["player"])
+	world["grids"] = _ordered_entity_values(staged["grid"])
+	world["voxel_chunks"] = _ordered_entity_values(staged["voxel_chunk"])
+	world["death_drops"] = _ordered_entity_values(staged["death_drop"])
+	var voxels: Array = []
+	for chunk in world["voxel_chunks"]:
+		voxels.append_array(chunk.get("voxels", []))
+	world["voxels"] = voxels
+	var private_value: Variant = authoritative.get("actor_private", null)
+	if private_value == null and not baseline:
+		private_value = actor_private_snapshot.duplicate(true)
+	if private_value is Dictionary and not private_value.is_empty():
+		var private_projection: Dictionary = private_value.duplicate(true)
+		if not _hydrate_private_spatial_state(private_projection, origin):
+			return {}
+		world["actor_private"] = private_projection
+	var private_motion: Variant = authoritative.get("actor_private_motion", null)
+	if private_motion is Dictionary:
+		if not world.get("actor_private", {}) is Dictionary:
+			return {}
+		var motion: Dictionary = private_motion.duplicate(true)
+		var position: Variant = _address_relative_m(motion.get("address", {}), origin)
+		if not position is Vector3:
+			return {}
+		motion["position"] = _protocol_vec3(position)
+		var private_projection: Dictionary = world["actor_private"]
+		var player: Dictionary = private_projection.get("player", {}).duplicate(true)
+		if String(player.get("player_id", "")) != String(motion.get("player_id", "")):
+			return {}
+		for field in motion:
+			player[field] = motion[field]
+		private_projection["player"] = player
+		world["actor_private"] = private_projection
+	return world
+
+
+func _ordered_entity_values(collection: Dictionary) -> Array:
+	var ids: Array = collection.keys()
+	ids.sort()
+	var values: Array = []
+	for entity_id in ids:
+		values.append(collection[entity_id].duplicate(true))
+	return values
+
+
+func _registered_body(body_id: String) -> Dictionary:
+	for body_value in registry_snapshot.get("bodies", []):
+		if body_value is Dictionary and String(body_value.get("body_id", "")) == body_id:
+			return body_value
+	return {}
+
+
+func _hydrate_private_spatial_state(private_projection: Dictionary, origin: Dictionary) -> bool:
+	var player: Variant = private_projection.get("player", {})
+	if not player is Dictionary:
+		return false
+	var player_position: Variant = _address_relative_m(player.get("address", {}), origin)
+	if not player_position is Vector3:
+		return false
+	player["position"] = _protocol_vec3(player_position)
+	var environment: Variant = player.get("environment", null)
+	if environment is Dictionary:
+		var gravity_body := _registered_body(String(environment.get("celestial_body_id", "")))
+		var planet_center: Variant = _address_relative_m(gravity_body.get("center", {}), origin)
+		if planet_center is Vector3:
+			environment["planet_center"] = _protocol_vec3(planet_center)
+		player["environment"] = environment
+	private_projection["player"] = player
+	for drop_value in private_projection.get("death_drops", []):
+		if not drop_value is Dictionary:
+			return false
+		var drop_position: Variant = _address_relative_m(drop_value.get("address", {}), origin)
+		if not drop_position is Vector3:
+			return false
+		drop_value["position"] = _protocol_vec3(drop_position)
+	return true
+
+
+func _private_projection_candidate_valid(world: Dictionary) -> bool:
+	if session_role_kind == "spectator":
+		return not world.has("actor_private") or world.get("actor_private", {}) == null
+	var candidate: Variant = world.get("actor_private", {})
+	if not _actor_private_matches(candidate, int(world.get("event_sequence", -1))):
+		return false
+	var frontier := _protocol_nonnegative_integer(candidate.get("committed_operation_sequence", null))
+	if not _operation_frontier_candidate_valid(frontier):
+		return false
+	return true
+
+
+func _operation_frontier_candidate_valid(frontier: int) -> bool:
+	if frontier < 0 or not _mutation_actor_matches_session():
+		return false
+	var observed_floor := committed_operation_sequence
+	if operation_frontier_observed:
+		observed_floor = maxi(observed_floor, observed_operation_frontier)
+	if operation_frontier_observed and committed_operation_actor_id == bound_player_id and frontier < observed_floor:
+		return false
+	if (
+		operation_frontier_observed
+		and not committed_operation_actor_id.is_empty()
+		and committed_operation_actor_id != bound_player_id
+	):
+		return false
+	if not in_flight_mutation.is_empty():
+		var pending_sequence := int(in_flight_mutation.get("operation_sequence", 0))
+		if pending_sequence <= 0 or frontier < pending_sequence - 1:
+			return false
+	return true
+
+
+func _request_fresh_interest_baseline(reason: String) -> void:
+	if replication_state == "fatal":
 		return
-	var private_candidate: Variant = authoritative.get("actor_private", {})
-	snapshot = authoritative.duplicate(true)
-	snapshot.erase("actor_private")
+	replication_state = "stale"
+	replication_detail = reason
+	authoritative_player_ready = false
+	operation_frontier_ready = false
+	mutation_resync_required = true
+	baseline_request_pending = true
+	interest_delta_sequence = -1
+	_set_message("%s // REQUESTING FRESH BASELINE" % reason, true)
+	if socket.get_ready_state() == WebSocketPeer.STATE_OPEN:
+		_send_transport({"type": "request_snapshot"})
+
+
+func _client_fatal(reason: String) -> void:
+	if smoke_test:
+		printerr("VERSE_SMOKE_CLIENT_FATAL %s" % reason)
+	replication_state = "fatal"
+	replication_detail = reason
+	authoritative_player_ready = false
+	operation_frontier_ready = false
+	mutation_resync_required = true
+	auto_reconnect_scheduled = false
+	auto_reconnect_elapsed = 0.0
+	_set_message("FATAL CLIENT PROTOCOL ERROR // %s" % reason, true)
+	if socket.get_ready_state() == WebSocketPeer.STATE_OPEN:
+		socket.close(1002, reason)
+	if smoke_test:
+		get_tree().quit(1)
+
+
+func _present_verified_interest_model(authoritative: Dictionary) -> bool:
+	if test_fail_interest_presentation:
+		return false
+	_rebuild_registered_celestials()
+	var event_sequence := int(authoritative.get("event_sequence", 0))
 	var players: Array = snapshot.get("players", [])
 	_sync_remote_players(players)
 
 	var voxels: Array = snapshot.get("voxels", [])
-	if voxels.size() != rendered_voxel_count:
-		rendered_voxel_count = voxels.size()
-		_rebuild_voxels(voxels)
+	if _sync_voxel_projection(snapshot.get("voxel_chunks", []), voxels):
 		if pending_mine_position != null:
 			var mined_coordinate: Vector3i = pending_mine_position
 			if not voxel_lookup.has(_coord_key(mined_coordinate)):
@@ -1867,51 +2788,20 @@ func _apply_snapshot(authoritative: Dictionary) -> void:
 	_rebuild_grids(snapshot.get("grids", []))
 	if smoke_test:
 		print("VERSE_SMOKE_STRUCTURAL_READY event=%d" % event_sequence)
-
-	var public_player := _player_from_roster(players, bound_player_id)
-	var projection_valid := (
-		int(snapshot.get("projection_schema_version", 0)) == PROJECTION_SCHEMA_VERSION
-		and not public_player.is_empty()
-		and _install_actor_private(private_candidate, event_sequence)
-	)
-	if not projection_valid:
-		if smoke_test:
-			printerr(
-				"VERSE_SMOKE_PRIVATE_PROJECTION_INVALID actor=%s event=%d"
-				% [bound_player_id, event_sequence]
-			)
-		_clear_actor_private_state()
-		authoritative_player_ready = false
-		last_authoritative_event_sequence = event_sequence
-		last_authoritative_simulation_tick = int(snapshot.get("simulation_tick", 0))
-		_set_message(
-			"PRIVATE INVENTORY LINK UNAVAILABLE // RESYNC REQUIRED",
-			true
-		)
-		return
-
 	var player := _local_player()
-	_capture_prediction_gravity({"player": player, "environment": _local_environment()})
 	var level := int(player.get("level", 1))
 	if level > last_level:
 		_set_message("CLEARANCE ADVANCED // SALVAGER LEVEL %d" % level)
 		tool_kick = 1.0
 	last_level = level
-	_apply_authoritative_player(
-		player,
-		int(snapshot.get("simulation_tick", 0)),
-		event_sequence,
-		String(snapshot.get("world_hash", "")),
-		"snapshot"
-	)
-	_dispatch_next_mutation()
 	if smoke_test and not smoke_visual_ready:
 		print("VERSE_SMOKE_VISUAL_ASSERTIONS_START event=%d" % event_sequence)
 		if not _run_visual_smoke_assertions():
 			get_tree().quit(1)
-			return
+			return false
 		smoke_visual_ready = true
 		print("VERSE_SMOKE_VISUAL_ASSERTIONS_COMPLETE event=%d" % event_sequence)
+	return true
 
 
 func _full_snapshot_event_is_current(incoming_sequence: int, current_sequence: int) -> bool:
@@ -2368,6 +3258,21 @@ func _correction_requires_snap(
 
 func _begin_player_resync() -> void:
 	authoritative_player_ready = false
+	welcome_received = false
+	registry_received = false
+	replication_state = "loading"
+	replication_detail = "WAITING FOR PROTOCOL HANDSHAKE"
+	stream_family = ""
+	registry_snapshot = {}
+	universe_manifest = {}
+	interest_entities = _empty_interest_entities()
+	interest_session_epoch = ""
+	interest_epoch = -1
+	interest_baseline_id = ""
+	interest_delta_sequence = -1
+	interest_view_hash = ""
+	interest_local_origin = {}
+	baseline_request_pending = false
 	bound_player_id = ""
 	session_role_kind = ""
 	_clear_actor_private_state()
@@ -2398,6 +3303,37 @@ func _reset_control_prediction_after_rejection() -> void:
 	control_send_elapsed = 0.0
 	_clear_transient_character_input()
 	require_neutral_baseline = true
+
+
+func _sync_voxel_projection(chunks: Array, voxels: Array) -> bool:
+	var next_fingerprints: Dictionary = {}
+	for chunk_value in chunks:
+		if not chunk_value is Dictionary:
+			continue
+		var chunk: Dictionary = chunk_value
+		var chunk_id := String(chunk.get("chunk_id", ""))
+		var revision := _protocol_exact_unsigned_text(chunk.get("revision", null))
+		if chunk_id.is_empty() or revision.is_empty():
+			continue
+		next_fingerprints[chunk_id] = "%s|%s|%s" % [
+			String(chunk.get("body_id", "")),
+			revision,
+			JSON.stringify(chunk.get("voxels", [])),
+		]
+	# Structural smoke fixtures predating chunked interest snapshots still use
+	# the flattened array. Keep that path exact without weakening the live
+	# per-chunk revision and payload fingerprints.
+	if chunks.is_empty() and not voxels.is_empty():
+		next_fingerprints["__flattened__"] = JSON.stringify(voxels)
+	if (
+		next_fingerprints == rendered_voxel_chunk_fingerprints
+		and rendered_voxel_count == voxels.size()
+	):
+		return false
+	rendered_voxel_chunk_fingerprints = next_fingerprints
+	rendered_voxel_count = voxels.size()
+	_rebuild_voxels(voxels)
+	return true
 
 
 func _rebuild_voxels(voxels: Array) -> void:
@@ -2476,6 +3412,8 @@ func _rebuild_voxel_chunk(chunk: Vector3i) -> void:
 	var chunk_key := _coord_key(chunk)
 	var previous: MeshInstance3D = voxel_chunk_nodes.get(chunk_key, null)
 	if previous != null:
+		if previous.get_parent() == asteroid_root:
+			asteroid_root.remove_child(previous)
 		previous.queue_free()
 		voxel_chunk_nodes.erase(chunk_key)
 	var origin := chunk * VOXEL_CHUNK_SIZE
@@ -2650,37 +3588,132 @@ func _position_variation(position: Vector3) -> float:
 
 
 func _rebuild_grids(grids: Array) -> void:
-	for child in grids_root.get_children():
-		child.queue_free()
-	grid_lookup.clear()
-	grid_node_lookup.clear()
-	for grid in grids:
-		var grid_id: String = grid.get("grid_id", "")
-		grid_lookup[grid_id] = grid
-		var grid_node := Node3D.new()
-		grid_node.name = grid_id
-		grid_node.position = _vec3(grid.get("position", {}))
-		grid_node.quaternion = _grid_quaternion(grid)
-		for block in grid.get("blocks", []):
-			var block_visual := _build_block_visual(block)
-			var coordinate: Dictionary = block.get("coordinate", {})
-			block_visual.position = Vector3(
-				float(coordinate.get("x", 0)),
-				float(coordinate.get("y", 0)),
-				float(coordinate.get("z", 0))
-			)
-			block_visual.rotation.y = deg_to_rad(float(int(block.get("orientation", 0)) * 90))
-			grid_node.add_child(block_visual)
-		if grid.get("power", {}).get("online", false):
-			var work_light := OmniLight3D.new()
-			work_light.light_color = Color(0.24, 0.72, 1.0)
-			work_light.light_energy = 1.35
-			work_light.omni_range = 10.0
-			work_light.shadow_enabled = true
-			work_light.position = Vector3(0.0, 2.2, 0.0)
-			grid_node.add_child(work_light)
-		grids_root.add_child(grid_node)
-		grid_node_lookup[grid_id] = grid_node
+	var next_lookup: Dictionary = {}
+	var next_nodes: Dictionary = {}
+	var next_fingerprints: Dictionary = {}
+	for grid_value in grids:
+		if not grid_value is Dictionary:
+			continue
+		var grid: Dictionary = grid_value
+		var grid_id := String(grid.get("grid_id", ""))
+		if grid_id.is_empty():
+			continue
+		var topology_fingerprint := _grid_topology_fingerprint(grid)
+		var grid_node: Node3D = grid_node_lookup.get(grid_id, null)
+		if (
+			grid_node == null
+			or String(grid_topology_fingerprints.get(grid_id, "")) != topology_fingerprint
+		):
+			if grid_node != null:
+				if grid_node.get_parent() == grids_root:
+					grids_root.remove_child(grid_node)
+				grid_node.queue_free()
+			grid_node = _create_grid_node(grid)
+			grids_root.add_child(grid_node)
+		else:
+			grid_node.position = _vec3(grid.get("position", {}))
+			grid_node.quaternion = _grid_quaternion(grid)
+			_sync_grid_power_visual(grid_node, bool(grid.get("power", {}).get("online", false)))
+		next_lookup[grid_id] = grid
+		next_nodes[grid_id] = grid_node
+		next_fingerprints[grid_id] = topology_fingerprint
+	for previous_id in grid_node_lookup.keys():
+		if next_nodes.has(previous_id):
+			continue
+		var removed: Node3D = grid_node_lookup.get(previous_id, null)
+		if removed == null:
+			continue
+		if removed.get_parent() == grids_root:
+			grids_root.remove_child(removed)
+		removed.queue_free()
+	grid_lookup = next_lookup
+	grid_node_lookup = next_nodes
+	grid_topology_fingerprints = next_fingerprints
+
+
+func _create_grid_node(grid: Dictionary) -> Node3D:
+	var grid_node := Node3D.new()
+	grid_node.name = String(grid.get("grid_id", "grid"))
+	grid_node.position = _vec3(grid.get("position", {}))
+	grid_node.quaternion = _grid_quaternion(grid)
+	for block_value in grid.get("blocks", []):
+		if not block_value is Dictionary:
+			continue
+		var block: Dictionary = block_value
+		var block_visual := _build_block_visual(block)
+		var coordinate: Dictionary = block.get("coordinate", {})
+		block_visual.position = Vector3(
+			float(coordinate.get("x", 0)),
+			float(coordinate.get("y", 0)),
+			float(coordinate.get("z", 0))
+		)
+		block_visual.rotation.y = deg_to_rad(float(int(block.get("orientation", 0)) * 90))
+		grid_node.add_child(block_visual)
+	_sync_grid_power_visual(grid_node, bool(grid.get("power", {}).get("online", false)))
+	return grid_node
+
+
+func _sync_grid_power_visual(grid_node: Node3D, online: bool) -> void:
+	var existing: Node = grid_node.get_node_or_null("VersePowerWorkLight")
+	if not online:
+		if existing != null:
+			grid_node.remove_child(existing)
+			existing.queue_free()
+		return
+	if existing != null:
+		return
+	var work_light := OmniLight3D.new()
+	work_light.name = "VersePowerWorkLight"
+	work_light.light_color = Color(0.24, 0.72, 1.0)
+	work_light.light_energy = 1.35
+	work_light.omni_range = 10.0
+	work_light.shadow_enabled = true
+	work_light.position = Vector3(0.0, 2.2, 0.0)
+	grid_node.add_child(work_light)
+
+
+func _grid_topology_fingerprint(grid: Dictionary) -> String:
+	var blocks: Array = grid.get("blocks", []).duplicate(true)
+	blocks.sort_custom(func(first: Variant, second: Variant) -> bool:
+		return _grid_block_sort_key(first) < _grid_block_sort_key(second)
+	)
+	var topology: Array = []
+	for block_value in blocks:
+		if not block_value is Dictionary:
+			continue
+		var block: Dictionary = block_value
+		var coordinate: Dictionary = block.get("coordinate", {})
+		var health := int(block.get("health", 1))
+		var max_health := maxi(int(block.get("max_health", health)), 1)
+		topology.append({
+			"block_id": String(block.get("block_id", "")),
+			"kind": String(block.get("kind", "structural")),
+			"coordinate": {
+				"x": int(coordinate.get("x", 0)),
+				"y": int(coordinate.get("y", 0)),
+				"z": int(coordinate.get("z", 0)),
+			},
+			"orientation": int(block.get("orientation", 0)),
+			"health": health,
+			"max_health": max_health,
+			"construction_complete": bool(
+				block.get("construction_complete", health >= max_health)
+			),
+		})
+	return JSON.stringify(topology)
+
+
+func _grid_block_sort_key(value: Variant) -> String:
+	if not value is Dictionary:
+		return ""
+	var block: Dictionary = value
+	var coordinate: Dictionary = block.get("coordinate", {})
+	return "%s|%012d|%012d|%012d" % [
+		String(block.get("block_id", "")),
+		int(coordinate.get("x", 0)),
+		int(coordinate.get("y", 0)),
+		int(coordinate.get("z", 0)),
+	]
 
 
 func _build_block_visual(block: Dictionary) -> Node3D:
@@ -5255,6 +6288,11 @@ func _send_transport(message: Dictionary) -> bool:
 
 
 func _send_text_transport(encoded_message: String) -> bool:
+	if test_capture_transport:
+		var parsed: Variant = JSON.parse_string(encoded_message)
+		var message_type := String(parsed.get("type", "unknown")) if parsed is Dictionary else "invalid"
+		test_outbound_trace.append("gameplay:%s" % message_type)
+		return true
 	if socket.get_ready_state() != WebSocketPeer.STATE_OPEN:
 		_set_message("No authoritative server connection — press F5", true)
 		return false
@@ -5325,14 +6363,25 @@ func _owned_death_drop_recorded(player: Dictionary) -> bool:
 
 
 func _update_interface() -> void:
-	connection_label.text = (
-		"● LINKED // ORIGIN CELL"
-		if connected
-		else "○ RELAY OFFLINE // F5 TO RETRY"
-	)
+	var link_text := "○ RELAY OFFLINE // F5 TO RETRY"
+	if connected:
+		match replication_state:
+			"ready":
+				link_text = "● LINKED // INTEREST VIEW %d" % interest_delta_sequence
+			"stale":
+				link_text = "◐ LINK STALE // SAFE RESYNC IN PROGRESS"
+			"fatal":
+				link_text = "× PROTOCOL HALTED // %s" % replication_detail
+			_:
+				link_text = "◌ LINK LOADING // %s" % replication_detail
+	connection_label.text = link_text
 	connection_label.add_theme_color_override(
 		"font_color",
-		Color(0.35, 0.95, 0.62) if connected else Color(1.0, 0.38, 0.25)
+		Color(0.35, 0.95, 0.62)
+		if connected and replication_state == "ready"
+		else Color(1.0, 0.72, 0.24)
+		if connected and replication_state in ["loading", "stale"]
+		else Color(1.0, 0.38, 0.25)
 	)
 	var player := _local_player()
 	_update_life_support_interface(player)
@@ -5765,6 +6814,180 @@ func _coord_vector(value: Dictionary) -> Vector3:
 		float(value.get("y", 0)),
 		float(value.get("z", 0))
 	)
+
+
+func _valid_hash(value: String) -> bool:
+	if value.length() != 64:
+		return false
+	for index in value.length():
+		var code := value.unicode_at(index)
+		if not (code >= 48 and code <= 57) and not (code >= 97 and code <= 102):
+			return false
+	return true
+
+
+func _universe_address_valid(value: Variant, manifest: Dictionary) -> bool:
+	if not value is Dictionary:
+		return false
+	var address: Dictionary = value
+	var sector: Variant = address.get("sector", {})
+	var cell: Variant = address.get("cell", {})
+	var local: Variant = address.get("local_um", {})
+	if not sector is Dictionary or not cell is Dictionary or not local is Dictionary:
+		return false
+	if String(address.get("universe_id", "")) != String(manifest.get("universe_id", "")):
+		return false
+	var cells_per_axis := int(manifest.get("cells_per_sector_axis", 0))
+	var cell_edge := int(manifest.get("cell_edge_um", 0))
+	var sector_edge := int(manifest.get("sector_edge_um", 0))
+	if (
+		cells_per_axis <= 0
+		or cell_edge <= 0
+		or sector_edge != cell_edge * cells_per_axis
+		or cell_edge % 2 != 0
+	):
+		return false
+	var half := cell_edge / 2
+	for axis in ["x", "y", "z"]:
+		if not _canonical_i128_decimal(String(sector.get(axis, ""))):
+			return false
+		var cell_component := _protocol_nonnegative_integer(cell.get(axis, null))
+		if cell_component < 0 or cell_component >= cells_per_axis:
+			return false
+		var local_value: Variant = _protocol_signed_integer(local.get(axis, null))
+		if local_value == null:
+			return false
+		var local_component := int(local_value)
+		if local_component < -half or local_component >= half:
+			return false
+	return true
+
+
+func _canonical_i128_decimal(value: String) -> bool:
+	if value.is_empty() or value == "-0" or value.begins_with("+"):
+		return false
+	var negative := value.begins_with("-")
+	var magnitude := value.substr(1) if negative else value
+	if magnitude.is_empty() or (magnitude.length() > 1 and magnitude.begins_with("0")):
+		return false
+	for index in magnitude.length():
+		var code := magnitude.unicode_at(index)
+		if code < 48 or code > 57:
+			return false
+	var maximum := (
+		"170141183460469231731687303715884105728"
+		if negative
+		else "170141183460469231731687303715884105727"
+	)
+	return _decimal_compare(magnitude, maximum) <= 0
+
+
+func _address_relative_m(address_value: Variant, origin_value: Variant) -> Variant:
+	if (
+		not _universe_address_valid(address_value, universe_manifest)
+		or not _universe_address_valid(origin_value, universe_manifest)
+	):
+		return null
+	var address: Dictionary = address_value
+	var origin: Dictionary = origin_value
+	var sector_edge := int(universe_manifest.get("sector_edge_um", 0))
+	var cell_edge := int(universe_manifest.get("cell_edge_um", 0))
+	var components: Array[float] = []
+	for axis in ["x", "y", "z"]:
+		var sector_delta: Variant = _signed_decimal_difference_limited(
+			String(address["sector"].get(axis, "0")),
+			String(origin["sector"].get(axis, "0")),
+			4
+		)
+		if sector_delta == null:
+			return null
+		var offset_um := (
+			int(sector_delta) * sector_edge
+			+ (int(address["cell"].get(axis, 0)) - int(origin["cell"].get(axis, 0))) * cell_edge
+			+ int(address["local_um"].get(axis, 0))
+			- int(origin["local_um"].get(axis, 0))
+		)
+		if absi(offset_um) > int(RENDER_DISTANCE_LIMIT_M * 2.0 * 1_000_000.0):
+			return null
+		components.append(float(offset_um) / 1_000_000.0)
+	return Vector3(components[0], components[1], components[2])
+
+
+func _signed_decimal_difference_limited(left: String, right: String, limit: int) -> Variant:
+	var left_negative := left.begins_with("-")
+	var right_negative := right.begins_with("-")
+	var left_magnitude := left.substr(1) if left_negative else left
+	var right_magnitude := right.substr(1) if right_negative else right
+	var magnitude := "0"
+	var negative := false
+	if left_negative == right_negative:
+		var comparison := _decimal_compare(left_magnitude, right_magnitude)
+		if comparison >= 0:
+			magnitude = _decimal_subtract(left_magnitude, right_magnitude)
+			negative = left_negative and magnitude != "0"
+		else:
+			magnitude = _decimal_subtract(right_magnitude, left_magnitude)
+			negative = not left_negative and magnitude != "0"
+	else:
+		magnitude = _decimal_add(left_magnitude, right_magnitude)
+		negative = left_negative
+	if _decimal_compare(magnitude, str(limit)) > 0:
+		return null
+	var value := int(magnitude)
+	return -value if negative else value
+
+
+func _decimal_compare(left: String, right: String) -> int:
+	var normalized_left := left.lstrip("0")
+	var normalized_right := right.lstrip("0")
+	if normalized_left.is_empty():
+		normalized_left = "0"
+	if normalized_right.is_empty():
+		normalized_right = "0"
+	if normalized_left.length() != normalized_right.length():
+		return -1 if normalized_left.length() < normalized_right.length() else 1
+	if normalized_left == normalized_right:
+		return 0
+	return -1 if normalized_left < normalized_right else 1
+
+
+func _decimal_add(left: String, right: String) -> String:
+	var left_index := left.length() - 1
+	var right_index := right.length() - 1
+	var carry := 0
+	var result := ""
+	while left_index >= 0 or right_index >= 0 or carry > 0:
+		var digit := carry
+		if left_index >= 0:
+			digit += int(left.substr(left_index, 1))
+			left_index -= 1
+		if right_index >= 0:
+			digit += int(right.substr(right_index, 1))
+			right_index -= 1
+		result = str(digit % 10) + result
+		carry = floori(float(digit) / 10.0)
+	return result
+
+
+func _decimal_subtract(larger: String, smaller: String) -> String:
+	var larger_index := larger.length() - 1
+	var smaller_index := smaller.length() - 1
+	var borrow := 0
+	var result := ""
+	while larger_index >= 0:
+		var digit := int(larger.substr(larger_index, 1)) - borrow
+		if smaller_index >= 0:
+			digit -= int(smaller.substr(smaller_index, 1))
+		if digit < 0:
+			digit += 10
+			borrow = 1
+		else:
+			borrow = 0
+		result = str(digit) + result
+		larger_index -= 1
+		smaller_index -= 1
+	var normalized := result.lstrip("0")
+	return "0" if normalized.is_empty() else normalized
 
 
 func _vec3(value: Dictionary) -> Vector3:

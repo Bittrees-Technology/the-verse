@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-use std::collections::BTreeSet;
-use std::sync::Arc;
-use std::time::Duration;
+use std::collections::{BTreeMap, BTreeSet};
+use std::io;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use axum::{
     Json, Router,
@@ -20,24 +21,49 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use serde::Serialize;
-use tokio::sync::watch;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tower_http::{
     cors::CorsLayer,
     trace::{DefaultMakeSpan, TraceLayer},
 };
 use tracing::{error, info, warn};
+#[cfg(test)]
+use verse_protocol::ProjectedMotionSnapshot;
 use verse_protocol::{
-    ClientAuthentication, ClientMessage, IntentReceipt, MotionSnapshot, PROTOCOL_VERSION,
-    ProjectedMotionSnapshot, ProjectedWorldSnapshot, ServerMessage, SessionRole, WorldSnapshot,
+    CELESTIAL_REGISTRY_SCHEMA_VERSION, CelestialRegistrySnapshot, ClientAuthentication,
+    ClientMessage, INTEREST_SCHEMA_VERSION, IntentReceipt, InterestSnapshot, MotionSnapshot,
+    PROJECTION_SCHEMA_VERSION, PROTOCOL_VERSION, ProjectedWorldSnapshot, ServerMessage,
+    SessionRole, UNIVERSE_MANIFEST_SCHEMA_VERSION, UniverseManifestSnapshot, WorldSnapshot,
 };
-use verse_simulation::{AdvanceImpact, IntentError, ProjectionError, Runtime, RuntimeError};
+use verse_simulation::{
+    AdvanceImpact, EVENT_SCHEMA_VERSION, IntentError, InterestEntityIdentity,
+    InterestProjectionState, ProjectedInterestFrame, ProjectionError, ProjectionSource, Runtime,
+    RuntimeError, WORLD_SCHEMA_VERSION, WorldState, registry_snapshot, universe_manifest,
+};
 
 const COMMAND_CENTER_HTML: &str = include_str!("../../../apps/web-command-center/index.html");
 const COMMAND_CENTER_JS: &str = include_str!("../../../apps/web-command-center/app.js");
 const COMMAND_CENTER_CSS: &str = include_str!("../../../apps/web-command-center/styles.css");
+const VERIFIER_WORKER_JS: &str =
+    include_str!("../../../apps/web-command-center/verifier-worker.js");
+const VERIFIER_WORKER_CORE_JS: &str =
+    include_str!("../../../apps/web-command-center/verifier-worker-core.js");
 const REPLICATION_PERIOD: Duration = Duration::from_nanos(16_666_667);
 const DYNAMIC_CACHE_CONTROL: &str = "no-store";
 const MAX_CLIENT_NAME_BYTES: usize = 128;
+const MAX_SERVER_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_SERIALIZATION_TIME: Duration = Duration::from_millis(500);
+const SERVER_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const UNACKNOWLEDGED_FRAME_TIMEOUT: Duration = Duration::from_secs(30);
+const RECOVERY_WINDOW: Duration = Duration::from_secs(10);
+const MAX_RECOVERIES_PER_WINDOW: u8 = 4;
+const MAX_CONCURRENT_CONNECTIONS: usize = 1_024;
+const MAX_CONCURRENT_HTTP_PROJECTIONS: usize = 1;
+const HTTP_PROJECTION_MIN_REFRESH: Duration = Duration::from_millis(250);
+#[cfg(not(test))]
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReplicationKind {
@@ -126,7 +152,12 @@ impl ReplicationCursor {
             .expect("only state replication messages advance the cursor");
         debug_assert!(sequence >= self.event_sequence);
         self.event_sequence = self.event_sequence.max(sequence);
-        if matches!(message, ServerMessage::Snapshot { .. }) {
+        if matches!(
+            message,
+            ServerMessage::InterestBaseline { .. }
+                | ServerMessage::InterestDelta { .. }
+                | ServerMessage::Snapshot { .. }
+        ) {
             self.full_snapshot_sequence = self.full_snapshot_sequence.max(sequence);
         }
     }
@@ -140,8 +171,20 @@ enum PendingReplication {
 
 fn replication_event_sequence(message: &ServerMessage) -> Option<u64> {
     match message {
+        ServerMessage::InterestBaseline { baseline } => Some(baseline.event_sequence),
+        ServerMessage::InterestDelta { delta } => Some(delta.event_sequence),
         ServerMessage::Snapshot { snapshot } => Some(snapshot.event_sequence),
         ServerMessage::MotionState { motion } => Some(motion.event_sequence),
+        _ => None,
+    }
+}
+
+fn replication_interest(message: &ServerMessage) -> Option<&InterestSnapshot> {
+    match message {
+        ServerMessage::InterestBaseline { baseline } => Some(&baseline.interest),
+        ServerMessage::InterestDelta { delta } => Some(&delta.interest),
+        ServerMessage::Snapshot { snapshot } => Some(&snapshot.interest),
+        ServerMessage::MotionState { motion } => Some(&motion.interest),
         _ => None,
     }
 }
@@ -151,15 +194,69 @@ pub struct AppState {
     runtime: Mutex<Runtime>,
     updates: watch::Sender<ReplicationFeed>,
     connected_players: Mutex<BTreeSet<String>>,
+    session_admission: Arc<Semaphore>,
+    http_projection_admission: Arc<Semaphore>,
+    public_world_cache: Mutex<Option<CachedPublicWorld>>,
+    projection_revision: Mutex<Arc<ProjectionRevision>>,
+    registry: CelestialRegistrySnapshot,
+    universe_manifest: UniverseManifestSnapshot,
+}
+
+#[derive(Debug, Clone)]
+struct CachedPublicWorld {
+    event_sequence: u64,
+    generated_at: Instant,
+    encoded: Arc<str>,
+}
+
+#[derive(Debug)]
+struct ProjectionRevision {
+    world: WorldState,
+    source: OnceLock<Result<Arc<ProjectionSource>, String>>,
+}
+
+impl ProjectionRevision {
+    fn new(world: WorldState) -> Self {
+        Self {
+            world,
+            source: OnceLock::new(),
+        }
+    }
+
+    fn source(&self) -> Result<Arc<ProjectionSource>, ProjectionError> {
+        self.source
+            .get_or_init(|| {
+                self.world
+                    .projection_source()
+                    .map(Arc::new)
+                    .map_err(|source| source.to_string())
+            })
+            .as_ref()
+            .cloned()
+            .map_err(|source| ProjectionError::InvalidCanonicalSnapshot(source.clone()))
+    }
 }
 
 impl AppState {
     pub fn new(runtime: Runtime) -> Arc<Self> {
+        let world_seed = runtime.state().world_seed;
+        let registry = registry_snapshot(world_seed)
+            .expect("the runtime's validated celestial registry remains available");
+        let universe_manifest =
+            universe_manifest(world_seed, WORLD_SCHEMA_VERSION, EVENT_SCHEMA_VERSION)
+                .expect("the runtime's validated universe manifest remains available");
+        let projection_revision = Arc::new(ProjectionRevision::new(runtime.state().clone()));
         let (updates, _) = watch::channel(ReplicationFeed::default());
         Arc::new(Self {
             runtime: Mutex::new(runtime),
             updates,
             connected_players: Mutex::new(BTreeSet::new()),
+            session_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS)),
+            http_projection_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_HTTP_PROJECTIONS)),
+            public_world_cache: Mutex::new(None),
+            projection_revision: Mutex::new(projection_revision),
+            registry,
+            universe_manifest,
         })
     }
 
@@ -181,6 +278,7 @@ impl AppState {
             .project_world_snapshot(actor_player_id)
     }
 
+    #[cfg(test)]
     fn projected_motion_snapshot(
         &self,
         actor_player_id: Option<&str>,
@@ -189,6 +287,38 @@ impl AppState {
             .lock()
             .state()
             .project_motion_snapshot(actor_player_id)
+    }
+
+    fn projected_interest_frame(
+        &self,
+        projection: &mut InterestProjectionState,
+    ) -> Result<ProjectedInterestFrame, ProjectionError> {
+        let revision = self.projection_revision.lock().clone();
+        let source = revision.source()?;
+        source.project_interest_frame(projection, &BTreeMap::<InterestEntityIdentity, _>::new())
+    }
+
+    fn bounded_public_world_json(&self) -> Result<Arc<str>, String> {
+        let current_sequence = self.runtime.lock().state().event_sequence;
+        if let Some(cached) = self.public_world_cache.lock().as_ref()
+            && (cached.event_sequence == current_sequence
+                || cached.generated_at.elapsed() < HTTP_PROJECTION_MIN_REFRESH)
+        {
+            return Ok(cached.encoded.clone());
+        }
+
+        let snapshot = self
+            .projected_snapshot(None)
+            .map_err(|source| source.to_string())?;
+        let event_sequence = snapshot.event_sequence;
+        let encoded = encode_bounded_json(&snapshot).map_err(|source| source.to_string())?;
+        let encoded = Arc::<str>::from(encoded);
+        *self.public_world_cache.lock() = Some(CachedPublicWorld {
+            event_sequence,
+            generated_at: Instant::now(),
+            encoded: encoded.clone(),
+        });
+        Ok(encoded)
     }
 
     pub fn persist_snapshot(&self) -> Result<(), RuntimeError> {
@@ -208,6 +338,7 @@ impl AppState {
             AdvanceImpact::Structural => Some(ReplicationKind::Structural),
         };
         if let Some(update_kind) = update_kind {
+            self.publish_projection_revision(&runtime);
             self.publish_update(update_kind, runtime.state().event_sequence);
         }
         Ok(outcome.changed())
@@ -231,8 +362,14 @@ impl AppState {
         };
         // Keep mutation and publication in the same runtime critical section so
         // every subscriber observes structural and motion state in event order.
+        self.publish_projection_revision(&runtime);
         self.publish_update(update_kind, runtime.state().event_sequence);
         Ok(receipt)
+    }
+
+    fn publish_projection_revision(&self, runtime: &Runtime) {
+        *self.projection_revision.lock() =
+            Arc::new(ProjectionRevision::new(runtime.state().clone()));
     }
 
     fn publish_update(&self, kind: ReplicationKind, event_sequence: u64) {
@@ -246,6 +383,13 @@ impl AppState {
 
     fn release_player(&self, player_id: &str) {
         self.connected_players.lock().remove(player_id);
+    }
+
+    fn registry_message(&self) -> ServerMessage {
+        ServerMessage::Registry {
+            registry: Box::new(self.registry.clone()),
+            universe_manifest: Box::new(self.universe_manifest.clone()),
+        }
     }
 }
 
@@ -273,6 +417,204 @@ impl SessionBinding {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InterestFrontier {
+    session_epoch: String,
+    interest_epoch: u64,
+    baseline_id: String,
+    delta_sequence: u64,
+    view_hash: String,
+}
+
+#[derive(Debug, Clone)]
+struct PendingInterestFrame {
+    projection: InterestProjectionState,
+    frontier: InterestFrontier,
+    sent_at: tokio::time::Instant,
+    recovery: bool,
+}
+
+#[derive(Debug)]
+struct SessionTransport {
+    acknowledged_projection: InterestProjectionState,
+    acknowledged_frontier: Option<InterestFrontier>,
+    pending: Option<PendingInterestFrame>,
+    superseded_frontier: Option<InterestFrontier>,
+    recovery_window_started_at: tokio::time::Instant,
+    recoveries_in_window: u8,
+}
+
+impl SessionTransport {
+    fn new(binding: &SessionBinding) -> Self {
+        let session_epoch = uuid::Uuid::new_v4().to_string();
+        let acknowledged_projection = match binding {
+            SessionBinding::Spectator => {
+                InterestProjectionState::public_origin_spectator(session_epoch)
+            }
+            SessionBinding::Player(player_id) => {
+                InterestProjectionState::bound_player(session_epoch, player_id.clone())
+            }
+        };
+        Self {
+            acknowledged_projection,
+            acknowledged_frontier: None,
+            pending: None,
+            superseded_frontier: None,
+            recovery_window_started_at: tokio::time::Instant::now(),
+            recoveries_in_window: 0,
+        }
+    }
+
+    fn awaiting_acknowledgement(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    fn pending_timed_out(&self) -> bool {
+        self.pending
+            .as_ref()
+            .is_some_and(|pending| pending.sent_at.elapsed() >= UNACKNOWLEDGED_FRAME_TIMEOUT)
+    }
+
+    fn recovery_is_pending(&self) -> bool {
+        self.pending
+            .as_ref()
+            .is_some_and(|pending| pending.recovery)
+    }
+
+    fn permit_recovery(&mut self) -> bool {
+        if self.recovery_window_started_at.elapsed() >= RECOVERY_WINDOW {
+            self.recovery_window_started_at = tokio::time::Instant::now();
+            self.recoveries_in_window = 0;
+        }
+        if self.recoveries_in_window >= MAX_RECOVERIES_PER_WINDOW {
+            return false;
+        }
+        self.recoveries_in_window += 1;
+        true
+    }
+
+    fn acknowledge(
+        &mut self,
+        session_epoch: &str,
+        interest_epoch: u64,
+        baseline_id: &str,
+        delta_sequence: u64,
+        view_hash: &str,
+    ) -> bool {
+        if let Some(pending) = self.pending.as_ref()
+            && pending.frontier.matches_acknowledgement(
+                session_epoch,
+                interest_epoch,
+                baseline_id,
+                delta_sequence,
+                view_hash,
+            )
+        {
+            let pending = self.pending.take().expect("the matched frame exists");
+            self.acknowledged_projection = pending.projection;
+            self.acknowledged_frontier = Some(pending.frontier);
+            self.superseded_frontier = None;
+            return true;
+        }
+        self.acknowledged_frontier.as_ref().is_some_and(|frontier| {
+            frontier.matches_acknowledgement(
+                session_epoch,
+                interest_epoch,
+                baseline_id,
+                delta_sequence,
+                view_hash,
+            )
+        })
+    }
+
+    fn matches_superseded_acknowledgement(
+        &self,
+        session_epoch: &str,
+        interest_epoch: u64,
+        baseline_id: &str,
+        delta_sequence: u64,
+        view_hash: &str,
+    ) -> bool {
+        self.superseded_frontier.as_ref().is_some_and(|frontier| {
+            frontier.matches_acknowledgement(
+                session_epoch,
+                interest_epoch,
+                baseline_id,
+                delta_sequence,
+                view_hash,
+            )
+        })
+    }
+
+    fn stage(
+        &mut self,
+        state: &AppState,
+        fresh_baseline: bool,
+    ) -> Result<ServerMessage, ProjectionError> {
+        if fresh_baseline {
+            self.superseded_frontier = self
+                .pending
+                .as_ref()
+                .map(|pending| pending.frontier.clone());
+        }
+        let mut candidate = if fresh_baseline {
+            self.pending.as_ref().map_or_else(
+                || self.acknowledged_projection.clone(),
+                |pending| pending.projection.clone(),
+            )
+        } else {
+            self.acknowledged_projection.clone()
+        };
+        if fresh_baseline {
+            candidate.fresh_baseline()?;
+        }
+        let message = match state.projected_interest_frame(&mut candidate)? {
+            ProjectedInterestFrame::Baseline(baseline) => ServerMessage::InterestBaseline {
+                baseline: Box::new(baseline),
+            },
+            ProjectedInterestFrame::Delta(delta) => ServerMessage::InterestDelta {
+                delta: Box::new(delta),
+            },
+        };
+        let interest = replication_interest(&message)
+            .expect("an interest frame always contains an interest frontier");
+        self.pending = Some(PendingInterestFrame {
+            projection: candidate,
+            frontier: InterestFrontier::from_interest(interest),
+            sent_at: tokio::time::Instant::now(),
+            recovery: fresh_baseline,
+        });
+        Ok(message)
+    }
+}
+
+impl InterestFrontier {
+    fn from_interest(interest: &InterestSnapshot) -> Self {
+        Self {
+            session_epoch: interest.session_epoch.clone(),
+            interest_epoch: interest.interest_epoch,
+            baseline_id: interest.baseline_id.clone(),
+            delta_sequence: interest.delta_sequence,
+            view_hash: interest.view_hash.clone(),
+        }
+    }
+
+    fn matches_acknowledgement(
+        &self,
+        session_epoch: &str,
+        interest_epoch: u64,
+        baseline_id: &str,
+        delta_sequence: u64,
+        view_hash: &str,
+    ) -> bool {
+        self.session_epoch == session_epoch
+            && self.interest_epoch == interest_epoch
+            && self.baseline_id == baseline_id
+            && self.delta_sequence == delta_sequence
+            && self.view_hash == view_hash
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct StatusDocument {
     service: &'static str,
@@ -297,8 +639,22 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/", get(command_center))
         .route("/app.js", get(command_center_javascript))
         .route("/styles.css", get(command_center_styles))
+        .route("/verifier-worker.js", get(verifier_worker_javascript))
+        .route(
+            "/verifier-worker-core.js",
+            get(verifier_worker_core_javascript),
+        )
+        .route(
+            "/generated/verse_interest_verifier.js",
+            get(generated_verifier_javascript),
+        )
+        .route(
+            "/generated/verse_interest_verifier_bg.wasm",
+            get(generated_verifier_wasm),
+        )
         .route("/healthz", get(health))
         .route("/api/v1/status", get(status))
+        .route("/api/v1/registry", get(registry))
         .route("/api/v1/world", get(world))
         .route("/ws", get(websocket_upgrade))
         .layer(
@@ -309,22 +665,81 @@ pub fn router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
-async fn command_center() -> Html<&'static str> {
-    Html(COMMAND_CENTER_HTML)
+async fn command_center() -> Response {
+    no_store(Html(COMMAND_CENTER_HTML).into_response())
 }
 
-async fn command_center_javascript() -> impl IntoResponse {
-    (
-        [(CONTENT_TYPE, "text/javascript; charset=utf-8")],
-        COMMAND_CENTER_JS,
+async fn command_center_javascript() -> Response {
+    no_store(
+        (
+            [(CONTENT_TYPE, "text/javascript; charset=utf-8")],
+            COMMAND_CENTER_JS,
+        )
+            .into_response(),
     )
 }
 
-async fn command_center_styles() -> impl IntoResponse {
-    (
-        [(CONTENT_TYPE, "text/css; charset=utf-8")],
-        COMMAND_CENTER_CSS,
+async fn command_center_styles() -> Response {
+    no_store(
+        (
+            [(CONTENT_TYPE, "text/css; charset=utf-8")],
+            COMMAND_CENTER_CSS,
+        )
+            .into_response(),
     )
+}
+
+async fn verifier_worker_javascript() -> Response {
+    no_store(
+        (
+            [(CONTENT_TYPE, "text/javascript; charset=utf-8")],
+            VERIFIER_WORKER_JS,
+        )
+            .into_response(),
+    )
+}
+
+async fn verifier_worker_core_javascript() -> Response {
+    no_store(
+        (
+            [(CONTENT_TYPE, "text/javascript; charset=utf-8")],
+            VERIFIER_WORKER_CORE_JS,
+        )
+            .into_response(),
+    )
+}
+
+async fn generated_verifier_javascript() -> Response {
+    generated_browser_asset(
+        "verse_interest_verifier.js",
+        "text/javascript; charset=utf-8",
+    )
+    .await
+}
+
+async fn generated_verifier_wasm() -> Response {
+    generated_browser_asset("verse_interest_verifier_bg.wasm", "application/wasm").await
+}
+
+async fn generated_browser_asset(file_name: &str, content_type: &'static str) -> Response {
+    let directory = std::env::var_os("VERSE_BROWSER_VERIFIER_ASSET_DIR").map_or_else(
+        || {
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../apps/web-command-center/generated")
+        },
+        std::path::PathBuf::from,
+    );
+    match tokio::fs::read(directory.join(file_name)).await {
+        Ok(bytes) => no_store(([(CONTENT_TYPE, content_type)], bytes).into_response()),
+        Err(_) => no_store(
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(CONTENT_TYPE, content_type)],
+                "browser verifier asset is unavailable; run tools/ci/build-browser-verifier.sh",
+            )
+                .into_response(),
+        ),
+    }
 }
 
 async fn health(State(state): State<Arc<AppState>>) -> StatusCode {
@@ -364,8 +779,23 @@ async fn status(State(state): State<Arc<AppState>>) -> Response {
 }
 
 async fn world(State(state): State<Arc<AppState>>) -> Response {
-    match state.projected_snapshot(None) {
-        Ok(snapshot) => no_store(Json(snapshot).into_response()),
+    let Ok(_permit) = state.http_projection_admission.clone().try_acquire_owned() else {
+        return no_store(
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "public world projection capacity is currently full",
+            )
+                .into_response(),
+        );
+    };
+    match state.bounded_public_world_json() {
+        Ok(encoded) => no_store(
+            (
+                [(CONTENT_TYPE, "application/json; charset=utf-8")],
+                encoded.as_ref().to_owned(),
+            )
+                .into_response(),
+        ),
         Err(_) => no_store(
             (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -376,16 +806,27 @@ async fn world(State(state): State<Arc<AppState>>) -> Response {
     }
 }
 
+async fn registry(State(state): State<Arc<AppState>>) -> Response {
+    no_store(Json(state.registry_message()).into_response())
+}
+
 async fn websocket_upgrade(
     upgrade: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
 ) -> Response {
+    let Ok(permit) = state.session_admission.clone().try_acquire_owned() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the bounded session capacity is currently full",
+        )
+            .into_response();
+    };
     upgrade
         .max_message_size(8 * 1024 * 1024)
-        .on_upgrade(move |socket| websocket_session(socket, state))
+        .on_upgrade(move |socket| websocket_session(socket, state, permit))
 }
 
-async fn websocket_session(socket: WebSocket, state: Arc<AppState>) {
+async fn websocket_session(socket: WebSocket, state: Arc<AppState>, _permit: OwnedSemaphorePermit) {
     let (mut sender, mut receiver) = socket.split();
     let Some((client_name, binding)) = complete_handshake(&mut receiver, &mut sender, &state).await
     else {
@@ -396,7 +837,8 @@ async fn websocket_session(socket: WebSocket, state: Arc<AppState>) {
     // Subscribe before projecting so a mutation between projection and delivery
     // is retained as a canonical marker and cannot be missed by this session.
     let mut updates = state.updates.subscribe();
-    let Ok(initial_message) = projected_snapshot_message(&state, &binding) else {
+    let mut transport = SessionTransport::new(&binding);
+    let Ok(initial_message) = transport.stage(&state, false) else {
         send_projection_failure(&mut sender).await;
         if let Some(player_id) = binding.player_id() {
             state.release_player(player_id);
@@ -410,12 +852,30 @@ async fn websocket_session(socket: WebSocket, state: Arc<AppState>) {
         &mut sender,
         &ServerMessage::Welcome {
             protocol_version: PROTOCOL_VERSION,
+            projection_schema_version: PROJECTION_SCHEMA_VERSION,
+            world_schema_version: state.universe_manifest.world_schema_version,
+            event_schema_version: state.universe_manifest.event_schema_version,
+            content_schema_version: state.universe_manifest.content_schema_version,
+            content_manifest_version: state.universe_manifest.content_manifest_version.clone(),
+            celestial_registry_schema_version: CELESTIAL_REGISTRY_SCHEMA_VERSION,
+            universe_manifest_schema_version: UNIVERSE_MANIFEST_SCHEMA_VERSION,
+            interest_schema_version: INTEREST_SCHEMA_VERSION,
             server_name: "The Verse local universe".into(),
             session_role: binding.role(),
         },
     )
     .await
     .is_err()
+    {
+        if let Some(player_id) = binding.player_id() {
+            state.release_player(player_id);
+        }
+        return;
+    }
+
+    if send_server_message(&mut sender, &state.registry_message())
+        .await
+        .is_err()
     {
         if let Some(player_id) = binding.player_id() {
             state.release_player(player_id);
@@ -450,6 +910,7 @@ async fn websocket_session(socket: WebSocket, state: Arc<AppState>) {
                             &binding,
                             &mut sender,
                             &mut replication_cursor,
+                            &mut transport,
                         ).await {
                             break;
                         }
@@ -462,11 +923,33 @@ async fn websocket_session(socket: WebSocket, state: Arc<AppState>) {
                 }
             }
             _ = replication_interval.tick() => {
+                if transport.pending_timed_out() {
+                    if transport.recovery_is_pending() || !transport.permit_recovery() {
+                        send_fatal_and_close(
+                            &mut sender,
+                            "interest_ack_timeout",
+                            "the client did not acknowledge the recovery baseline in time",
+                        ).await;
+                        break;
+                    }
+                    let Ok(message) = transport.stage(&state, true) else {
+                        send_projection_failure(&mut sender).await;
+                        break;
+                    };
+                    if send_server_message(&mut sender, &message).await.is_err() {
+                        break;
+                    }
+                    replication_cursor.record(&message);
+                    continue;
+                }
+                if transport.awaiting_acknowledgement() {
+                    continue;
+                }
                 let pending = updates.borrow_and_update().next_after(replication_cursor);
-                let Some(pending) = pending else {
+                let Some(_pending) = pending else {
                     continue;
                 };
-                let Ok(message) = projected_replication_message(&state, &binding, pending) else {
+                let Ok(message) = transport.stage(&state, false) else {
                     send_projection_failure(&mut sender).await;
                     break;
                 };
@@ -483,6 +966,7 @@ async fn websocket_session(socket: WebSocket, state: Arc<AppState>) {
     }
 }
 
+#[cfg(test)]
 fn projected_snapshot_message(
     state: &AppState,
     binding: &SessionBinding,
@@ -494,6 +978,7 @@ fn projected_snapshot_message(
         })
 }
 
+#[cfg(test)]
 fn projected_replication_message(
     state: &AppState,
     binding: &SessionBinding,
@@ -516,14 +1001,26 @@ async fn complete_handshake(
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
     state: &Arc<AppState>,
 ) -> Option<(String, SessionBinding)> {
+    let deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
     loop {
-        let message = match receiver.next().await {
-            Some(Ok(message)) => message,
-            Some(Err(source)) => {
-                warn!(%source, "websocket handshake receive failed");
+        let message = match tokio::time::timeout_at(deadline, receiver.next()).await {
+            Err(_) => {
+                send_fatal_and_close(
+                    sender,
+                    "protocol_handshake_timeout",
+                    "send one compatible hello before the fixed handshake deadline",
+                )
+                .await;
                 return None;
             }
-            None => return None,
+            Ok(message) => match message {
+                Some(Ok(message)) => message,
+                Some(Err(source)) => {
+                    warn!(%source, "websocket handshake receive failed");
+                    return None;
+                }
+                None => return None,
+            },
         };
         match message {
             Message::Text(text) => match serde_json::from_str::<ClientMessage>(&text) {
@@ -600,7 +1097,11 @@ async fn complete_handshake(
                 }
             },
             Message::Ping(payload) => {
-                if sender.send(Message::Pong(payload)).await.is_err() {
+                if !matches!(
+                    tokio::time::timeout(SERVER_WRITE_TIMEOUT, sender.send(Message::Pong(payload)))
+                        .await,
+                    Ok(Ok(()))
+                ) {
                     return None;
                 }
             }
@@ -633,6 +1134,7 @@ async fn handle_client_message(
     binding: &SessionBinding,
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
     replication_cursor: &mut ReplicationCursor,
+    transport: &mut SessionTransport,
 ) -> bool {
     let Message::Text(text) = message else {
         return !matches!(message, Message::Close(_));
@@ -665,7 +1167,66 @@ async fn handle_client_message(
             false
         }
         ClientMessage::RequestSnapshot => {
-            let Ok(message) = projected_snapshot_message(state, binding) else {
+            if transport.recovery_is_pending() {
+                return true;
+            }
+            if !transport.permit_recovery() {
+                send_fatal_and_close(
+                    sender,
+                    "interest_recovery_rate_limited",
+                    "the client requested repeated interest recovery before convergence",
+                )
+                .await;
+                return false;
+            }
+            let Ok(message) = transport.stage(state, true) else {
+                send_projection_failure(sender).await;
+                return false;
+            };
+            if send_server_message(sender, &message).await.is_ok() {
+                replication_cursor.record(&message);
+                true
+            } else {
+                false
+            }
+        }
+        ClientMessage::AcknowledgeInterest {
+            session_epoch,
+            interest_epoch,
+            baseline_id,
+            delta_sequence,
+            view_hash,
+        } => {
+            if transport.acknowledge(
+                &session_epoch,
+                interest_epoch,
+                &baseline_id,
+                delta_sequence,
+                &view_hash,
+            ) {
+                return true;
+            }
+            if transport.recovery_is_pending()
+                && transport.matches_superseded_acknowledgement(
+                    &session_epoch,
+                    interest_epoch,
+                    &baseline_id,
+                    delta_sequence,
+                    &view_hash,
+                )
+            {
+                return true;
+            }
+            if transport.recovery_is_pending() || !transport.permit_recovery() {
+                send_fatal_and_close(
+                    sender,
+                    "interest_recovery_rate_limited",
+                    "the client repeated an invalid interest acknowledgement before convergence",
+                )
+                .await;
+                return false;
+            }
+            let Ok(message) = transport.stage(state, true) else {
                 send_projection_failure(sender).await;
                 return false;
             };
@@ -778,8 +1339,40 @@ async fn send_server_message(
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
     message: &ServerMessage,
 ) -> Result<(), axum::Error> {
-    let text = serde_json::to_string(message).map_err(axum::Error::new)?;
-    sender.send(Message::Text(text.into())).await
+    let text = encode_server_message(message)?;
+    tokio::time::timeout(
+        SERVER_WRITE_TIMEOUT,
+        sender.send(Message::Text(text.into())),
+    )
+    .await
+    .map_err(|_| {
+        axum::Error::new(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "server message write exceeded the bounded deadline",
+        ))
+    })?
+}
+
+fn encode_server_message(message: &ServerMessage) -> Result<String, axum::Error> {
+    encode_bounded_json(message).map_err(axum::Error::new)
+}
+
+fn encode_bounded_json<T: Serialize>(value: &T) -> Result<String, io::Error> {
+    let started_at = std::time::Instant::now();
+    let text = serde_json::to_string(value).map_err(io::Error::other)?;
+    if started_at.elapsed() > MAX_SERIALIZATION_TIME {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "server message serialization exceeded the bounded deadline",
+        ));
+    }
+    if text.len() > MAX_SERVER_MESSAGE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "server message exceeded the bounded byte budget",
+        ));
+    }
+    Ok(text)
 }
 
 async fn send_fatal_and_close(
@@ -795,7 +1388,7 @@ async fn send_fatal_and_close(
         },
     )
     .await;
-    let _ = sender.send(Message::Close(None)).await;
+    let _ = tokio::time::timeout(SERVER_WRITE_TIMEOUT, sender.send(Message::Close(None))).await;
 }
 
 async fn send_projection_failure(sender: &mut futures_util::stream::SplitSink<WebSocket, Message>) {
@@ -849,7 +1442,12 @@ mod tests {
         {
             let mut store = Store::open(&directory, 199).expect("fixture store opens");
             let mut world = store.load_world().expect("fixture world loads");
-            world.player.position = Vec3::new(900.0, -990.0, -3_800.0);
+            let position = Vec3::new(900.0, -990.0, -3_800.0);
+            let address = world
+                .address_for_active_position(position)
+                .expect("fixture position has a canonical address");
+            world.player.position = position;
+            world.player.address = address;
             world
                 .inventories
                 .get_mut("inventory-cargo-industry-starter")
@@ -885,12 +1483,7 @@ mod tests {
         (socket, state, server)
     }
 
-    async fn receive_server_message(socket: &mut TestSocket) -> ServerMessage {
-        serde_json::from_value(receive_server_json(socket).await)
-            .expect("server message is valid protocol JSON")
-    }
-
-    async fn receive_server_json(socket: &mut TestSocket) -> serde_json::Value {
+    async fn receive_wire_json(socket: &mut TestSocket) -> serde_json::Value {
         loop {
             let message = tokio::time::timeout(Duration::from_secs(2), socket.next())
                 .await
@@ -899,6 +1492,118 @@ mod tests {
                 .expect("websocket message is valid");
             if let ClientWebSocketMessage::Text(text) = message {
                 return serde_json::from_str(&text).expect("server message is valid JSON");
+            }
+        }
+    }
+
+    async fn receive_wire_message(socket: &mut TestSocket) -> ServerMessage {
+        serde_json::from_value(receive_wire_json(socket).await)
+            .expect("server message is valid protocol JSON")
+    }
+
+    async fn acknowledge_interest(socket: &mut TestSocket, interest: &InterestSnapshot) {
+        send_client_message(
+            socket,
+            &ClientMessage::AcknowledgeInterest {
+                session_epoch: interest.session_epoch.clone(),
+                interest_epoch: interest.interest_epoch,
+                baseline_id: interest.baseline_id.clone(),
+                delta_sequence: interest.delta_sequence,
+                view_hash: interest.view_hash.clone(),
+            },
+        )
+        .await;
+    }
+
+    async fn receive_server_message(socket: &mut TestSocket) -> ServerMessage {
+        loop {
+            let message = receive_wire_message(socket).await;
+            match message {
+                ServerMessage::Registry { .. } => {}
+                ServerMessage::InterestBaseline { baseline } => {
+                    acknowledge_interest(socket, &baseline.interest).await;
+                    return ServerMessage::Snapshot { snapshot: baseline };
+                }
+                ServerMessage::InterestDelta { delta } => {
+                    acknowledge_interest(socket, &delta.interest).await;
+                    return ServerMessage::InterestDelta { delta };
+                }
+                other => return other,
+            }
+        }
+    }
+
+    fn interest_delta_as_legacy_snapshot(
+        delta: &verse_protocol::ProjectedInterestDelta,
+    ) -> serde_json::Value {
+        let mut players = Vec::new();
+        let mut grids = Vec::new();
+        let mut voxel_chunks = Vec::new();
+        let mut death_drops = Vec::new();
+        for projected in delta
+            .interest
+            .entered
+            .iter()
+            .chain(&delta.interest.replaced)
+        {
+            let value = serde_json::to_value(&projected.payload).expect("payload serializes");
+            match value["entity_kind"].as_str() {
+                Some("player") => players.push(value["value"].clone()),
+                Some("grid") => grids.push(value["value"].clone()),
+                Some("voxel_chunk") => voxel_chunks.push(value["value"].clone()),
+                Some("death_drop") => death_drops.push(value["value"].clone()),
+                _ => panic!("interest payload uses a known entity kind"),
+            }
+        }
+        let mut snapshot = serde_json::json!({
+            "projection_schema_version": delta.projection_schema_version,
+            "schema_version": delta.schema_version,
+            "content_manifest_version": delta.content_manifest_version,
+            "universe_id": delta.universe_id,
+            "cell_id": delta.cell_id,
+            "universe_manifest_hash": delta.universe_manifest_hash,
+            "celestial_registry_hash": delta.celestial_registry_hash,
+            "cell_address": delta.cell_address,
+            "gravity_body_id": delta.gravity_body_id,
+            "voxel_body_id": delta.voxel_body_id,
+            "event_sequence": delta.event_sequence,
+            "simulation_tick": delta.simulation_tick,
+            "world_hash": delta.world_hash,
+            "players": players,
+            "environment": delta.environment,
+            "voxel_chunks": voxel_chunks,
+            "grids": grids,
+            "death_drops": death_drops,
+            "conservation_valid": delta.conservation_valid,
+            "interest": delta.interest,
+            "actor_private": delta.actor_private,
+        });
+        if snapshot["actor_private"].is_null() {
+            snapshot
+                .as_object_mut()
+                .expect("snapshot is an object")
+                .remove("actor_private");
+        }
+        snapshot
+    }
+
+    async fn receive_server_json(socket: &mut TestSocket) -> serde_json::Value {
+        loop {
+            let message = receive_wire_message(socket).await;
+            match message {
+                ServerMessage::Registry { .. } => {}
+                ServerMessage::InterestBaseline { baseline } => {
+                    acknowledge_interest(socket, &baseline.interest).await;
+                    return serde_json::json!({ "type": "snapshot", "snapshot": baseline });
+                }
+                ServerMessage::InterestDelta { delta } => {
+                    acknowledge_interest(socket, &delta.interest).await;
+                    return serde_json::json!({
+                        "type": "snapshot",
+                        "snapshot": interest_delta_as_legacy_snapshot(&delta),
+                    });
+                }
+                other => return serde_json::to_value(other).expect("server message serializes"),
             }
         }
     }
@@ -969,20 +1674,55 @@ mod tests {
         additional
     }
 
+    async fn wait_for_player_release(state: &AppState, player_id: &str) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while state.connected_players.lock().contains(player_id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("closed gameplay session releases its player binding");
+    }
+
     async fn complete_session(socket: &mut TestSocket, hello: &ClientMessage) -> serde_json::Value {
         send_client_message(socket, hello).await;
         assert!(matches!(
-            receive_server_message(socket).await,
+            receive_wire_message(socket).await,
             ServerMessage::Welcome { .. }
         ));
-        receive_json_type(socket, "snapshot", false).await
+        assert!(matches!(
+            receive_wire_message(socket).await,
+            ServerMessage::Registry { .. }
+        ));
+        let ServerMessage::InterestBaseline { baseline } = receive_wire_message(socket).await
+        else {
+            panic!("protocol-16 session must begin with an interest baseline");
+        };
+        acknowledge_interest(socket, &baseline.interest).await;
+        serde_json::json!({ "type": "snapshot", "snapshot": baseline })
     }
 
     fn assert_public_fields_are_redacted(snapshot: &serde_json::Value) {
         assert!(snapshot.get("inventories").is_none());
-        assert!(snapshot.get("death_drops").is_none());
         assert!(snapshot.get("conservation").is_none());
         assert!(snapshot.get("committed_operation_sequence").is_none());
+        for drop in snapshot["death_drops"]
+            .as_array()
+            .expect("public death-drop list")
+        {
+            for private_field in [
+                "owner_player_id",
+                "inventory_id",
+                "source_death_id",
+                "cause",
+                "contents",
+            ] {
+                assert!(
+                    drop.get(private_field).is_none(),
+                    "public death drop leaked {private_field}"
+                );
+            }
+        }
         for player in snapshot["players"]
             .as_array()
             .expect("public player roster")
@@ -1055,29 +1795,6 @@ mod tests {
                     }
                 }
             }
-        }
-    }
-
-    fn assert_motion_audience(message: &serde_json::Value, expected_actor: Option<&str>) {
-        assert_eq!(message["type"], "motion_state");
-        let motion = &message["motion"];
-        for player in motion["players"].as_array().expect("public motion roster") {
-            for private_field in [
-                "movement_epoch",
-                "last_received_input_sequence",
-                "last_processed_input_sequence",
-                "control_linear_input",
-                "locomotion",
-            ] {
-                assert!(
-                    player.get(private_field).is_none(),
-                    "public motion leaked {private_field}"
-                );
-            }
-        }
-        match expected_actor {
-            None => assert!(motion.get("actor_private").is_none()),
-            Some(player_id) => assert_eq!(motion["actor_private"]["player_id"], player_id),
         }
     }
 
@@ -1177,11 +1894,40 @@ mod tests {
             .player
     }
 
-    fn actor_motion(motion: &ProjectedMotionSnapshot) -> &verse_protocol::PlayerMotionSnapshot {
-        motion
-            .actor_private
-            .as_ref()
-            .expect("authenticated player motion has an actor-private view")
+    struct ActorDeltaView {
+        movement_epoch: u64,
+        last_received_input_sequence: u64,
+        last_processed_input_sequence: u64,
+        linear_velocity: verse_protocol::Vec3,
+        locomotion: verse_protocol::PlayerLocomotionSnapshot,
+        jetpack_enabled: bool,
+    }
+
+    fn actor_delta(delta: &verse_protocol::ProjectedInterestDelta) -> ActorDeltaView {
+        let player = if let Some(private) = &delta.actor_private {
+            &private.player
+        } else {
+            let motion = delta
+                .actor_private_motion
+                .as_ref()
+                .expect("authenticated delta has private structure or private motion");
+            return ActorDeltaView {
+                movement_epoch: motion.movement_epoch,
+                last_received_input_sequence: motion.last_received_input_sequence,
+                last_processed_input_sequence: motion.last_processed_input_sequence,
+                linear_velocity: motion.linear_velocity,
+                locomotion: motion.locomotion.clone(),
+                jetpack_enabled: motion.jetpack_enabled,
+            };
+        };
+        ActorDeltaView {
+            movement_epoch: player.movement_epoch,
+            last_received_input_sequence: player.last_received_input_sequence,
+            last_processed_input_sequence: player.last_processed_input_sequence,
+            linear_velocity: player.linear_velocity,
+            locomotion: player.locomotion.clone(),
+            jetpack_enabled: player.jetpack_enabled,
+        }
     }
 
     async fn assert_socket_closes(socket: &mut TestSocket) {
@@ -1207,6 +1953,140 @@ mod tests {
             panic!("the slow consumer receives the latest coalesced motion state");
         };
         assert_eq!(feed.latest_motion_sequence, Some(4_096));
+    }
+
+    #[test]
+    fn session_projection_does_not_hold_or_wait_for_the_authoritative_runtime_lock() {
+        let state = test_state();
+        let projecting_state = state.clone();
+        let runtime_guard = state.runtime.lock();
+        let (result_sender, result_receiver) = std::sync::mpsc::channel();
+        let projection = std::thread::spawn(move || {
+            let mut cursor = InterestProjectionState::public_origin_spectator("lock-proof");
+            let result = projecting_state.projected_interest_frame(&mut cursor);
+            result_sender.send(result).expect("projection result sends");
+        });
+
+        let result = result_receiver.recv_timeout(Duration::from_secs(1));
+        drop(runtime_guard);
+        projection.join().expect("projection thread joins");
+        assert!(matches!(
+            result.expect("projection completes while the runtime lock is held"),
+            Ok(ProjectedInterestFrame::Baseline(_))
+        ));
+    }
+
+    #[test]
+    fn outbound_messages_and_interest_recovery_are_strictly_bounded() {
+        let normal = ServerMessage::Fatal {
+            code: "bounded".into(),
+            message: "small".into(),
+        };
+        assert!(encode_server_message(&normal).is_ok());
+        let oversized = ServerMessage::Fatal {
+            code: "bounded".into(),
+            message: "x".repeat(MAX_SERVER_MESSAGE_BYTES),
+        };
+        assert!(encode_server_message(&oversized).is_err());
+
+        let state = test_state();
+        let mut transport = SessionTransport::new(&SessionBinding::Spectator);
+        let first = transport
+            .stage(&state, false)
+            .expect("initial bounded baseline stages");
+        let first_frontier = replication_interest(&first)
+            .map(InterestFrontier::from_interest)
+            .expect("initial baseline has a frontier");
+        assert!(!transport.pending_timed_out());
+        transport.pending.as_mut().expect("pending frame").sent_at =
+            tokio::time::Instant::now() - UNACKNOWLEDGED_FRAME_TIMEOUT;
+        assert!(transport.pending_timed_out());
+        assert!(!transport.recovery_is_pending());
+        assert!(transport.permit_recovery());
+        let recovery = transport
+            .stage(&state, true)
+            .expect("a timed-out ordinary frame rebases once");
+        let recovery_frontier = replication_interest(&recovery)
+            .map(InterestFrontier::from_interest)
+            .expect("recovery baseline has a frontier");
+        assert_eq!(
+            recovery_frontier.interest_epoch,
+            first_frontier.interest_epoch + 1
+        );
+        assert_ne!(recovery_frontier.baseline_id, first_frontier.baseline_id);
+        assert!(transport.recovery_is_pending());
+        assert!(transport.matches_superseded_acknowledgement(
+            &first_frontier.session_epoch,
+            first_frontier.interest_epoch,
+            &first_frontier.baseline_id,
+            first_frontier.delta_sequence,
+            &first_frontier.view_hash,
+        ));
+        transport
+            .pending
+            .as_mut()
+            .expect("recovery pending")
+            .sent_at = tokio::time::Instant::now() - UNACKNOWLEDGED_FRAME_TIMEOUT;
+        assert!(transport.pending_timed_out() && transport.recovery_is_pending());
+
+        let mut bounded = SessionTransport::new(&SessionBinding::Spectator);
+        for _ in 0..MAX_RECOVERIES_PER_WINDOW {
+            assert!(bounded.permit_recovery());
+        }
+        assert!(!bounded.permit_recovery());
+    }
+
+    #[test]
+    fn public_http_projection_is_bounded_cached_and_rate_constrained() {
+        let state = test_state();
+        let first = state
+            .bounded_public_world_json()
+            .expect("initial public HTTP projection");
+        assert!(first.len() <= MAX_SERVER_MESSAGE_BYTES);
+        let same = state
+            .bounded_public_world_json()
+            .expect("same revision uses cache");
+        assert!(Arc::ptr_eq(&first, &same));
+
+        let before_snapshot = state.snapshot();
+        let before = before_snapshot.event_sequence;
+        state
+            .execute_as(
+                "player-local",
+                &ClientMessage::SetSuitMode {
+                    operation_sequence: 1,
+                    operation_id: "http-cache-refresh".into(),
+                    helmet_closed: !before_snapshot.player.helmet_closed,
+                    jetpack_enabled: before_snapshot.player.jetpack_enabled,
+                    magnetic_boots_enabled: before_snapshot
+                        .player
+                        .locomotion
+                        .magnetic_boots_enabled,
+                },
+            )
+            .expect("structural world change commits");
+        let after = state.snapshot().event_sequence;
+        assert!(after > before);
+        let rate_limited = state
+            .bounded_public_world_json()
+            .expect("fresh cache is served during the refresh floor");
+        assert!(Arc::ptr_eq(&first, &rate_limited));
+
+        state
+            .public_world_cache
+            .lock()
+            .as_mut()
+            .expect("cache exists")
+            .generated_at = Instant::now()
+            .checked_sub(HTTP_PROJECTION_MIN_REFRESH)
+            .expect("test refresh floor fits monotonic time");
+        let refreshed = state
+            .bounded_public_world_json()
+            .expect("stale cache refreshes once");
+        assert!(!Arc::ptr_eq(&first, &refreshed));
+        let refreshed_value: serde_json::Value =
+            serde_json::from_str(&refreshed).expect("cached response is JSON");
+        assert_eq!(refreshed_value["event_sequence"], after);
     }
 
     #[test]
@@ -1281,9 +2161,15 @@ mod tests {
             .actor_private
             .as_ref()
             .expect("player receives actor-private state");
+        let canonical_progress =
+            state.runtime.lock().state().production_queues["block-refinery"][0].progress_ticks;
 
         assert_eq!(actor_player(&after).suit_oxygen_milli, before_oxygen);
-        assert_eq!(private.production_queues[0].jobs[0].progress_ticks, 60);
+        assert_eq!(canonical_progress, 60);
+        assert!(
+            private.production_queues.is_empty(),
+            "remote production details stay outside the actor's interest view"
+        );
         assert_eq!(feed.latest_structural_sequence, Some(after.event_sequence));
         assert_eq!(feed.latest_motion_sequence, None);
         assert!(after.event_sequence > queued.event_sequence);
@@ -1437,6 +2323,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn silent_and_ping_only_handshakes_expire_and_release_admission() {
+        let (mut silent, state, server) = connect_test_socket().await;
+        assert_eq!(
+            state.session_admission.available_permits(),
+            MAX_CONCURRENT_CONNECTIONS - 1
+        );
+        assert!(matches!(
+            receive_wire_message(&mut silent).await,
+            ServerMessage::Fatal { ref code, .. } if code == "protocol_handshake_timeout"
+        ));
+        assert_socket_closes(&mut silent).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while state.session_admission.available_permits() != MAX_CONCURRENT_CONNECTIONS {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("silent handshake releases its admission permit");
+        server.abort();
+
+        let (mut ping_only, state, server) = connect_test_socket().await;
+        ping_only
+            .send(ClientWebSocketMessage::Ping(vec![1].into()))
+            .await
+            .expect("first ping sends");
+        tokio::time::sleep(HANDSHAKE_TIMEOUT / 2).await;
+        ping_only
+            .send(ClientWebSocketMessage::Ping(vec![2].into()))
+            .await
+            .expect("second ping sends");
+        assert!(matches!(
+            receive_wire_message(&mut ping_only).await,
+            ServerMessage::Fatal { ref code, .. } if code == "protocol_handshake_timeout"
+        ));
+        assert_socket_closes(&mut ping_only).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while state.session_admission.available_permits() != MAX_CONCURRENT_CONNECTIONS {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("ping-only handshake releases its admission permit");
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn websocket_requires_hello_before_snapshot_or_mutation() {
         let (mut socket, state, server) = connect_test_socket().await;
         send_client_message(
@@ -1501,6 +2433,170 @@ mod tests {
             ServerMessage::Snapshot { .. }
         ));
         socket.close(None).await.expect("test socket closes");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn protocol16_orders_full_compatibility_registry_then_interest_baseline() {
+        let (mut socket, state, server) = connect_test_socket().await;
+        send_client_message(
+            &mut socket,
+            &ClientMessage::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                client_name: "interest-ordering".into(),
+                authentication: ClientAuthentication::Spectator,
+            },
+        )
+        .await;
+
+        let welcome = receive_wire_message(&mut socket).await;
+        assert!(matches!(
+            welcome,
+            ServerMessage::Welcome {
+                protocol_version: PROTOCOL_VERSION,
+                projection_schema_version: PROJECTION_SCHEMA_VERSION,
+                world_schema_version: WORLD_SCHEMA_VERSION,
+                event_schema_version: EVENT_SCHEMA_VERSION,
+                content_schema_version: 11,
+                ref content_manifest_version,
+                celestial_registry_schema_version: CELESTIAL_REGISTRY_SCHEMA_VERSION,
+                universe_manifest_schema_version: UNIVERSE_MANIFEST_SCHEMA_VERSION,
+                interest_schema_version: INTEREST_SCHEMA_VERSION,
+                session_role: SessionRole::Spectator,
+                ..
+            } if content_manifest_version == "p1.5.0"
+        ));
+        let ServerMessage::Registry {
+            registry,
+            universe_manifest,
+        } = receive_wire_message(&mut socket).await
+        else {
+            panic!("registry must precede cell state");
+        };
+        let ServerMessage::InterestBaseline { baseline } = receive_wire_message(&mut socket).await
+        else {
+            panic!("first cell state must be an interest baseline");
+        };
+        assert_eq!(baseline.interest.interest_epoch, 1);
+        assert_eq!(baseline.interest.delta_sequence, 0);
+        assert_eq!(
+            baseline.interest.observer_class,
+            verse_protocol::InterestObserverClass::PublicOriginSpectator
+        );
+        assert_eq!(baseline.interest.registry_hash, registry.registry_hash);
+        assert_eq!(
+            baseline.interest.universe_manifest_hash,
+            universe_manifest.manifest_hash
+        );
+        assert_eq!(baseline.world_hash, state.snapshot().world_hash);
+        assert!(uuid::Uuid::parse_str(&baseline.interest.session_epoch).is_ok());
+
+        socket.close(None).await.expect("test socket closes");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn one_wrong_ack_rebases_and_a_repeat_closes_without_world_mutation() {
+        let (mut socket, state, server) = connect_test_socket().await;
+        send_client_message(
+            &mut socket,
+            &ClientMessage::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                client_name: "adversarial-interest-ack".into(),
+                authentication: ClientAuthentication::Spectator,
+            },
+        )
+        .await;
+        assert!(matches!(
+            receive_wire_message(&mut socket).await,
+            ServerMessage::Welcome { .. }
+        ));
+        assert!(matches!(
+            receive_wire_message(&mut socket).await,
+            ServerMessage::Registry { .. }
+        ));
+        let ServerMessage::InterestBaseline { baseline: first } =
+            receive_wire_message(&mut socket).await
+        else {
+            panic!("initial baseline");
+        };
+        let before = state.snapshot();
+
+        let mut wrong_hash = first.interest.clone();
+        wrong_hash.view_hash = "0".repeat(64);
+        acknowledge_interest(&mut socket, &wrong_hash).await;
+        let ServerMessage::InterestBaseline { baseline: second } =
+            receive_wire_message(&mut socket).await
+        else {
+            panic!("wrong hash must produce one fresh baseline");
+        };
+        assert_eq!(second.interest.interest_epoch, 2);
+        assert_ne!(second.interest.baseline_id, first.interest.baseline_id);
+
+        acknowledge_interest(&mut socket, &first.interest).await;
+        assert_no_server_message(&mut socket).await;
+        acknowledge_interest(&mut socket, &wrong_hash).await;
+        assert!(matches!(
+            receive_wire_message(&mut socket).await,
+            ServerMessage::Fatal { ref code, .. }
+                if code == "interest_recovery_rate_limited"
+        ));
+        assert_socket_closes(&mut socket).await;
+
+        let after = state.snapshot();
+        assert_eq!(after.event_sequence, before.event_sequence);
+        assert_eq!(after.world_hash, before.world_hash);
+        assert_eq!(after.simulation_tick, before.simulation_tick);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reconnect_uses_a_new_opaque_session_epoch_and_baseline() {
+        let (mut first, _state, server) = connect_test_socket().await;
+        let initial = complete_session(
+            &mut first,
+            &ClientMessage::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                client_name: "session-epoch-first".into(),
+                authentication: ClientAuthentication::Spectator,
+            },
+        )
+        .await;
+        let first_epoch = initial["snapshot"]["interest"]["session_epoch"]
+            .as_str()
+            .expect("session epoch")
+            .to_owned();
+        let first_baseline = initial["snapshot"]["interest"]["baseline_id"]
+            .as_str()
+            .expect("baseline ID")
+            .to_owned();
+        let address = server_address(&first);
+        first.close(None).await.expect("first socket closes");
+
+        let (mut second, _) = connect_async(format!("ws://{address}/ws"))
+            .await
+            .expect("reconnected test websocket connects");
+        let reconnected = complete_session(
+            &mut second,
+            &ClientMessage::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                client_name: "session-epoch-second".into(),
+                authentication: ClientAuthentication::Spectator,
+            },
+        )
+        .await;
+        assert_eq!(reconnected["snapshot"]["interest"]["interest_epoch"], 1);
+        assert_ne!(
+            reconnected["snapshot"]["interest"]["session_epoch"],
+            first_epoch
+        );
+        assert_ne!(
+            reconnected["snapshot"]["interest"]["baseline_id"],
+            first_baseline
+        );
+
+        second.close(None).await.expect("second socket closes");
         server.abort();
     }
 
@@ -1960,24 +3056,35 @@ mod tests {
             panic!("accepted character control must receive a receipt");
         };
         assert_eq!(receipt.operation_id, operation_id);
-        let ServerMessage::MotionState { motion } = receive_server_message(&mut socket).await
+        let ServerMessage::InterestDelta { delta } = receive_server_message(&mut socket).await
         else {
-            panic!("character control must publish lightweight motion state");
+            panic!("character control must publish a contiguous interest delta");
         };
-        assert_eq!(motion.event_sequence, receipt.event_sequence);
-        assert_eq!(actor_motion(&motion).last_received_input_sequence, 1);
-        assert_eq!(actor_motion(&motion).last_processed_input_sequence, 0);
-        assert_eq!(actor_motion(&motion).movement_epoch, movement_epoch);
-        assert_eq!(motion.grids.len(), snapshot.grids.len());
-        assert_eq!(motion.world_hash, state.snapshot().world_hash);
+        assert_eq!(delta.event_sequence, receipt.event_sequence);
+        assert_eq!(actor_delta(&delta).last_received_input_sequence, 1);
+        assert_eq!(actor_delta(&delta).last_processed_input_sequence, 0);
+        assert_eq!(actor_delta(&delta).movement_epoch, movement_epoch);
+        assert_eq!(delta.world_hash, state.snapshot().world_hash);
+        assert_eq!(delta.interest.delta_sequence, 1);
+        assert_eq!(
+            delta.interest.previous_view_hash.as_deref(),
+            Some(snapshot.interest.view_hash.as_str())
+        );
+        assert_eq!(delta.interest.baseline_id, snapshot.interest.baseline_id);
+        let first_delta_hash = delta.interest.view_hash.clone();
         assert!(state.advance(17).expect("authoritative physics advances"));
-        let ServerMessage::MotionState { motion } = receive_server_message(&mut socket).await
+        let ServerMessage::InterestDelta { delta } = receive_server_message(&mut socket).await
         else {
-            panic!("consumed character control must publish authoritative motion state");
+            panic!("consumed character control must publish an authoritative interest delta");
         };
-        assert_eq!(actor_motion(&motion).last_received_input_sequence, 1);
-        assert_eq!(actor_motion(&motion).last_processed_input_sequence, 1);
-        assert!(actor_motion(&motion).linear_velocity.magnitude() > 0.0);
+        assert_eq!(actor_delta(&delta).last_received_input_sequence, 1);
+        assert_eq!(actor_delta(&delta).last_processed_input_sequence, 1);
+        assert!(actor_delta(&delta).linear_velocity.magnitude() > 0.0);
+        assert_eq!(delta.interest.delta_sequence, 2);
+        assert_eq!(
+            delta.interest.previous_view_hash.as_deref(),
+            Some(first_delta_hash.as_str())
+        );
         socket.close(None).await.expect("test socket closes");
         server.abort();
     }
@@ -2014,10 +3121,11 @@ mod tests {
             receive_server_message(&mut socket).await,
             ServerMessage::IntentAccepted { .. }
         ));
-        let ServerMessage::Snapshot { snapshot } = receive_server_message(&mut socket).await else {
-            panic!("suit-mode intent must publish a complete authoritative snapshot");
+        let ServerMessage::InterestDelta { delta } = receive_server_message(&mut socket).await
+        else {
+            panic!("suit-mode intent must publish an authoritative interest delta");
         };
-        let player = actor_player(&snapshot);
+        let player = actor_delta(&delta);
         assert!(!player.jetpack_enabled);
         assert!(player.locomotion.magnetic_boots_enabled);
         assert_eq!(
@@ -2044,23 +3152,23 @@ mod tests {
             receive_server_message(&mut socket).await,
             ServerMessage::IntentAccepted { .. }
         ));
-        let ServerMessage::MotionState { motion } = receive_server_message(&mut socket).await
+        let ServerMessage::InterestDelta { delta } = receive_server_message(&mut socket).await
         else {
-            panic!("jump input receipt must publish lightweight authoritative motion");
+            panic!("jump input receipt must publish an interest delta");
         };
-        assert_eq!(actor_motion(&motion).last_received_input_sequence, 1);
-        assert_eq!(actor_motion(&motion).last_processed_input_sequence, 0);
-        assert!(actor_motion(&motion).locomotion.magnetic_boots_enabled);
+        assert_eq!(actor_delta(&delta).last_received_input_sequence, 1);
+        assert_eq!(actor_delta(&delta).last_processed_input_sequence, 0);
+        assert!(actor_delta(&delta).locomotion.magnetic_boots_enabled);
         assert!(state.advance(17).expect("authoritative jump edge advances"));
-        let ServerMessage::MotionState { motion } = receive_server_message(&mut socket).await
+        let ServerMessage::InterestDelta { delta } = receive_server_message(&mut socket).await
         else {
-            panic!("processed jump edge must publish authoritative motion");
+            panic!("processed jump edge must publish authoritative interest");
         };
-        assert_eq!(actor_motion(&motion).last_processed_input_sequence, 1);
-        assert!(actor_motion(&motion).locomotion.jump_held);
-        assert!(actor_motion(&motion).locomotion.magnetic_boots_enabled);
+        assert_eq!(actor_delta(&delta).last_processed_input_sequence, 1);
+        assert!(actor_delta(&delta).locomotion.jump_held);
+        assert!(actor_delta(&delta).locomotion.magnetic_boots_enabled);
         assert_eq!(
-            actor_motion(&motion).locomotion.kind,
+            actor_delta(&delta).locomotion.kind,
             verse_protocol::LocomotionKind::Airborne
         );
 
@@ -2105,6 +3213,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn registry_endpoint_is_public_complete_and_never_cacheable() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/registry")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(CACHE_CONTROL),
+            Some(&HeaderValue::from_static(DYNAMIC_CACHE_CONTROL))
+        );
+        let body = to_bytes(response.into_body(), 8 * 1024 * 1024)
+            .await
+            .expect("body");
+        let message: ServerMessage = serde_json::from_slice(&body).expect("protocol registry");
+        let ServerMessage::Registry {
+            registry,
+            universe_manifest,
+        } = message
+        else {
+            panic!("registry endpoint must return the protocol registry document");
+        };
+        assert_eq!(registry.schema_version, CELESTIAL_REGISTRY_SCHEMA_VERSION);
+        assert_eq!(
+            universe_manifest.schema_version,
+            UNIVERSE_MANIFEST_SCHEMA_VERSION
+        );
+        assert_eq!(
+            registry.registry_hash,
+            universe_manifest.celestial_registry_hash
+        );
+        assert!(!registry.bodies.is_empty());
+    }
+
+    #[tokio::test]
     async fn initial_and_requested_snapshots_are_session_private_and_convergent() {
         let (mut local, state, server) = connect_test_socket().await;
         let mut remote = connect_additional(&local).await;
@@ -2130,6 +3277,14 @@ mod tests {
         assert_snapshot_audience(&local_initial, Some("player-local"));
         assert_snapshot_audience(&remote_initial, Some("player-remote"));
         assert_snapshot_audience(&spectator_initial, None);
+        assert_ne!(
+            local_initial["snapshot"]["interest"]["view_hash"],
+            remote_initial["snapshot"]["interest"]["view_hash"]
+        );
+        assert_ne!(
+            local_initial["snapshot"]["interest"]["view_hash"],
+            spectator_initial["snapshot"]["interest"]["view_hash"]
+        );
         assert_eq!(
             local_initial["snapshot"]["actor_private"]["committed_operation_sequence"],
             0
@@ -2450,15 +3605,12 @@ mod tests {
         let remote_structural = receive_json_type(&mut remote, "snapshot", true).await;
         let spectator_structural = receive_json_type(&mut spectator, "snapshot", true).await;
         assert_snapshot_audience(&local_structural, Some("player-local"));
-        assert_snapshot_audience(&remote_structural, Some("player-remote"));
+        assert_public_fields_are_redacted(&remote_structural["snapshot"]);
+        assert!(remote_structural["snapshot"].get("actor_private").is_none());
         assert_snapshot_audience(&spectator_structural, None);
         assert_eq!(
             local_structural["snapshot"]["actor_private"]["committed_operation_sequence"],
             1
-        );
-        assert_eq!(
-            remote_structural["snapshot"]["actor_private"]["committed_operation_sequence"],
-            0
         );
         let local_inventories = local_structural["snapshot"]["actor_private"]["inventories"]
             .as_array()
@@ -2508,19 +3660,23 @@ mod tests {
             receive_until(&mut local, |message| matches!(message, ServerMessage::IntentAccepted { receipt } if receipt.operation_id == "private-motion-control")).await,
             ServerMessage::IntentAccepted { .. }
         ));
-        let local_motion = receive_json_type(&mut local, "motion_state", false).await;
-        let remote_motion = receive_json_type(&mut remote, "motion_state", true).await;
-        let spectator_motion = receive_json_type(&mut spectator, "motion_state", true).await;
-        assert_motion_audience(&local_motion, Some("player-local"));
-        assert_motion_audience(&remote_motion, Some("player-remote"));
-        assert_motion_audience(&spectator_motion, None);
+        let local_motion = receive_json_type(&mut local, "snapshot", false).await;
+        let remote_motion = receive_json_type(&mut remote, "snapshot", true).await;
+        let spectator_motion = receive_json_type(&mut spectator, "snapshot", true).await;
+        assert_snapshot_audience(&local_motion, Some("player-local"));
+        assert_public_fields_are_redacted(&remote_motion["snapshot"]);
+        assert!(remote_motion["snapshot"].get("actor_private").is_none());
+        assert_snapshot_audience(&spectator_motion, None);
         let authoritative = state.snapshot();
         for candidate in [&local_motion, &remote_motion, &spectator_motion] {
             assert_eq!(
-                candidate["motion"]["event_sequence"],
+                candidate["snapshot"]["event_sequence"],
                 authoritative.event_sequence
             );
-            assert_eq!(candidate["motion"]["world_hash"], authoritative.world_hash);
+            assert_eq!(
+                candidate["snapshot"]["world_hash"],
+                authoritative.world_hash
+            );
         }
 
         for socket in [&mut local, &mut remote, &mut spectator] {
@@ -2596,12 +3752,19 @@ mod tests {
         );
         for foreign in [&remote_initial, &spectator_initial] {
             let encoded = serde_json::to_string(foreign).expect("message serializes");
-            assert!(!encoded.contains(&drop_id));
+            assert!(
+                foreign["snapshot"]["death_drops"]
+                    .as_array()
+                    .expect("public death drops")
+                    .iter()
+                    .any(|drop| drop["drop_id"] == drop_id),
+                "a nearby salvage marker is public"
+            );
             assert!(!encoded.contains(&drop_inventory_id));
         }
 
         local.close(None).await.expect("local closes");
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        wait_for_player_release(&state, "player-local").await;
         let mut reconnected = connect_additional(&remote).await;
         let reconnect_snapshot = complete_session(
             &mut reconnected,
@@ -2696,6 +3859,8 @@ mod tests {
             ("/", "text/html"),
             ("/app.js", "text/javascript"),
             ("/styles.css", "text/css"),
+            ("/verifier-worker.js", "text/javascript"),
+            ("/verifier-worker-core.js", "text/javascript"),
         ] {
             let response = test_app()
                 .oneshot(
@@ -2713,6 +3878,43 @@ mod tests {
                     .get(CONTENT_TYPE)
                     .and_then(|value| value.to_str().ok())
                     .is_some_and(|value| value.starts_with(expected_content_type))
+            );
+            assert_eq!(
+                response.headers().get(CACHE_CONTROL),
+                Some(&HeaderValue::from_static("no-store"))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn generated_browser_verifier_routes_are_typed_and_never_cached() {
+        for (uri, expected_content_type) in [
+            ("/generated/verse_interest_verifier.js", "text/javascript"),
+            (
+                "/generated/verse_interest_verifier_bg.wasm",
+                "application/wasm",
+            ),
+        ] {
+            let response = test_app()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(
+                response
+                    .headers()
+                    .get(CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|value| value.starts_with(expected_content_type))
+            );
+            assert_eq!(
+                response.headers().get(CACHE_CONTROL),
+                Some(&HeaderValue::from_static("no-store"))
             );
         }
     }
