@@ -250,6 +250,16 @@ pub struct InterestRemoval {
     pub reason: InterestRemovalReason,
 }
 
+/// One-time private proof that a destination baseline is the continuation of
+/// a committed cross-cell placement rather than an unrelated cell snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InterestTransferLink {
+    pub transfer_id: String,
+    pub destination_cell_key: CellKeyV1,
+    pub placement_generation: u64,
+}
+
 /// Connection-local replication frontier. The global commitment is retained
 /// as a documented timing/hash side channel; `view_hash` is the convergence
 /// commitment for the audience-safe subset.
@@ -267,6 +277,8 @@ pub struct InterestSnapshot {
     pub local_origin_address: UniverseAddress,
     pub registry_hash: String,
     pub universe_manifest_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transfer_link: Option<InterestTransferLink>,
     pub canonical_event_sequence: u64,
     pub canonical_tick: u64,
     pub canonical_world_hash: String,
@@ -1515,6 +1527,7 @@ mod tests {
             local_origin_address: test_address(),
             registry_hash: "registry-hash".into(),
             universe_manifest_hash: "manifest-hash".into(),
+            transfer_link: None,
             canonical_event_sequence: 8,
             canonical_tick: 13,
             canonical_world_hash: "canonical-hash".into(),
