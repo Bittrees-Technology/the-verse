@@ -3710,6 +3710,10 @@ impl DraftGridTransferCellStateV2 {
         &self.base
     }
 
+    pub(super) fn state_hash(&self) -> &str {
+        &self.state_hash
+    }
+
     #[cfg(test)]
     pub(super) fn advance_test_fence(&mut self) -> Result<(), DraftGridClosureError> {
         self.base.fencing_token = self.base.fencing_token.checked_add(1).ok_or_else(|| {

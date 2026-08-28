@@ -600,6 +600,23 @@ decoder rejects active snapshots, wrong manifests, whitespace aliases, and
 resealed schema/identity changes. This is the snapshot boundary the isolated
 protocol-19 Store will use; it does not modify the active Store.
 
+The first recovery-only world-21 Store slice now uses a separate
+`protocol-19-world-v21` namespace and an exclusive writer lock. Its canonical
+identity binds the complete protocol-19 tuple, externally expected cell key,
+manifest 5, cell and universe identity, migration-anchor hash, snapshot state
+hash, and retained event-16 frontier. A sealed initialization head is written
+last after the identity, manifest, snapshot, and empty event journal. The
+caller supplies an already durable per-cell root; the new namespace entry is
+then synchronized through that root. A missing head exposes no authority and
+initialization may replace only that known precommit debris, while uncertain
+head metadata fails closed without cleanup.
+
+Recovery performs bounded reads, revalidates the exact routed cell, manifest,
+and world-21 snapshot, refuses any nonempty event-17 journal, and fails closed
+on tampering, swapped cell namespaces, or a second writer. Its constructors
+remain test-only: this slice is not migration-install authority and cannot
+append events or activate the protocol-19 tuple.
+
 Implementation is staged behind that boundary. The private directory-v3 draft
 already validates ordered grid-and-rider membership, closure and conservation
 roots, package and receipt schemas, historical cell fences, phase-specific
