@@ -15,6 +15,7 @@ use super::{
     DraftGridClosureError, DraftGridClosurePackageV2, DraftGridCompatibilityTupleV19, hash_json,
     valid_blake3_hex, valid_stable_id,
 };
+use crate::cell_directory_v3::{ValidatedCellAuthorityV3, ValidatedGridTransferAuthorityV3};
 use crate::event::ProductionScheduleOccurrence;
 
 pub(super) const DRAFT_GRID_EVENT_SCHEMA_VERSION: u32 = 17;
@@ -22,6 +23,88 @@ const DRAFT_GRID_EVENT_SCHEMA_NAME: &str = "verse.world_event";
 const DRAFT_GRID_EVENT_PAYLOAD_HASH_DOMAIN: &[u8] = b"the-verse/grid-event-payload/v17\0";
 const DRAFT_GRID_EVENT_HASH_DOMAIN: &[u8] = b"the-verse/world-event/v17\0";
 const MAX_DRAFT_GRID_EVENT_BYTES: usize = 20 * 1_024 * 1_024;
+
+/// Serialized production authority is an event commitment, never a capability.
+/// Replay must resolve and compare the exact non-Serde directory capability.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct DraftProductionAuthorityClaimV17 {
+    directory_revision: u64,
+    directory_document_hash: String,
+    assignment_generation: u64,
+    fencing_token: u64,
+}
+
+impl DraftProductionAuthorityClaimV17 {
+    pub(super) fn from_validated(authority: &ValidatedCellAuthorityV3) -> Self {
+        Self {
+            directory_revision: authority.directory_revision(),
+            directory_document_hash: authority.directory_document_hash().to_owned(),
+            assignment_generation: authority.assignment_generation(),
+            fencing_token: authority.fencing_token(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_test(state: &DraftGridTransferCellStateV2) -> Self {
+        Self {
+            directory_revision: 1,
+            directory_document_hash: blake3::hash(state.base().cell_id.as_bytes())
+                .to_hex()
+                .to_string(),
+            assignment_generation: 1,
+            fencing_token: state.base().fencing_token,
+        }
+    }
+
+    fn validate(&self) -> bool {
+        self.directory_revision > 0
+            && valid_blake3_hex(&self.directory_document_hash)
+            && self.assignment_generation > 0
+            && self.fencing_token > 0
+    }
+
+    pub(super) fn directory_revision(&self) -> u64 {
+        self.directory_revision
+    }
+
+    pub(super) fn directory_document_hash(&self) -> &str {
+        &self.directory_document_hash
+    }
+
+    pub(super) fn assignment_generation(&self) -> u64 {
+        self.assignment_generation
+    }
+
+    pub(super) fn fencing_token(&self) -> u64 {
+        self.fencing_token
+    }
+
+    #[cfg(test)]
+    pub(super) fn advance_test_assignment_generation(&mut self) {
+        self.assignment_generation += 1;
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) enum ValidatedDraftGridEventAuthorityV17<'a> {
+    Grid(&'a ValidatedGridTransferAuthorityV3),
+    Production(&'a ValidatedCellAuthorityV3),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DraftGridEventAuthorityLookupV17<'a> {
+    Grid {
+        directory_revision: u64,
+        directory_document_hash: &'a str,
+        transfer_id: &'a str,
+    },
+    Production {
+        directory_revision: u64,
+        directory_document_hash: &'a str,
+        cell_id: &'a str,
+    },
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event_type", rename_all = "snake_case", deny_unknown_fields)]
@@ -58,6 +141,7 @@ pub(super) enum DraftGridEventPayloadV17 {
     ProductionQuantumCommitted {
         occurrence: ProductionScheduleOccurrence,
         accepted_trusted_at_unix_ms: u64,
+        authority: DraftProductionAuthorityClaimV17,
     },
 }
 
@@ -109,6 +193,15 @@ impl ValidatedDraftGridEventContextV17 {
             ));
         }
         Ok(())
+    }
+
+    pub(super) fn production_authority_claim(&self) -> Option<&DraftProductionAuthorityClaimV17> {
+        match &self.payload {
+            DraftGridEventPayloadV17::ProductionQuantumCommitted { authority, .. } => {
+                Some(authority)
+            }
+            _ => None,
+        }
     }
 }
 
@@ -169,12 +262,61 @@ impl DraftGridEventPayloadV17 {
                     authority.destination_fencing_token(),
                 ),
             },
-            Self::ProductionQuantumCommitted { occurrence, .. } => (&occurrence.cell_id, 0),
+            Self::ProductionQuantumCommitted {
+                occurrence,
+                authority,
+                ..
+            } => (&occurrence.cell_id, authority.fencing_token),
+        }
+    }
+
+    fn resolved_cell_authority(
+        &self,
+        authority: ValidatedDraftGridEventAuthorityV17<'_>,
+    ) -> Result<ValidatedCellAuthorityV3, DraftGridClosureError> {
+        match (self, authority) {
+            (
+                DraftGridEventPayloadV17::ProductionQuantumCommitted { .. },
+                ValidatedDraftGridEventAuthorityV17::Production(authority),
+            ) => Ok(authority.clone()),
+            (
+                DraftGridEventPayloadV17::GridTransferPrepared { .. }
+                | DraftGridEventPayloadV17::GridTransferQuarantined { .. }
+                | DraftGridEventPayloadV17::GridTransferExported { .. }
+                | DraftGridEventPayloadV17::GridTransferImported { .. }
+                | DraftGridEventPayloadV17::GridTransferActivated { .. }
+                | DraftGridEventPayloadV17::GridTransferFinalized { .. }
+                | DraftGridEventPayloadV17::GridTransferAborted { .. },
+                ValidatedDraftGridEventAuthorityV17::Grid(authority),
+            ) => {
+                let (expected_cell, _) = self.expected_cell_and_fence();
+                if expected_cell == authority.source_cell_id() {
+                    authority.source_cell_authority().map_err(|source| {
+                        DraftGridClosureError::Invalid(format!(
+                            "event-17 source cell authority is not live: {source}"
+                        ))
+                    })
+                } else if expected_cell == authority.destination_cell_id() {
+                    authority.destination_cell_authority().map_err(|source| {
+                        DraftGridClosureError::Invalid(format!(
+                            "event-17 destination cell authority is not live: {source}"
+                        ))
+                    })
+                } else {
+                    Err(DraftGridClosureError::Invalid(
+                        "event-17 grid capability belongs to different cells".into(),
+                    ))
+                }
+            }
+            _ => Err(DraftGridClosureError::Invalid(
+                "event-17 operation received the wrong authority capability kind".into(),
+            )),
         }
     }
 }
 
 impl DraftCanonicalGridEventV17 {
+    #[cfg(test)]
     pub(super) fn new_system(
         state: &DraftGridTransferCellStateV2,
         event_id: impl Into<String>,
@@ -214,6 +356,49 @@ impl DraftCanonicalGridEventV17 {
         Ok(event)
     }
 
+    #[cfg(test)]
+    pub(super) fn new_proven_system(
+        state: &DraftGridTransferCellStateV2,
+        event_id: impl Into<String>,
+        occurred_at_unix_ms: u64,
+        payload: DraftGridEventPayloadV17,
+        authority: ValidatedDraftGridEventAuthorityV17<'_>,
+    ) -> Result<Self, DraftGridClosureError> {
+        let cell_authority = payload.resolved_cell_authority(authority)?;
+        let rebound = state.rebind_validated_cell_authority(&cell_authority)?;
+        let base = rebound.base();
+        let event_sequence = base.event_sequence.checked_add(1).ok_or_else(|| {
+            DraftGridClosureError::Unsupported("draft event-17 sequence exhausted".into())
+        })?;
+        let mut event = Self {
+            schema_name: DRAFT_GRID_EVENT_SCHEMA_NAME.into(),
+            schema_version: DRAFT_GRID_EVENT_SCHEMA_VERSION,
+            compatibility: DraftGridCompatibilityTupleV19::canonical(),
+            content_manifest_version: base.content_manifest_version.clone(),
+            universe_manifest_hash: base.universe_manifest_hash.clone(),
+            celestial_registry_hash: base.celestial_registry_hash.clone(),
+            event_id: event_id.into(),
+            event_sequence,
+            occurred_at_unix_ms,
+            universe_id: base.universe_id.clone(),
+            cell_id: base.cell_id.clone(),
+            authority_fencing_token: base.fencing_token,
+            actor_player_id: None,
+            actor_type: "system".into(),
+            operation_id: None,
+            operation_sequence: None,
+            intent_fingerprint: None,
+            previous_event_hash: base.last_event_hash.clone(),
+            event_payload_hash: String::new(),
+            payload,
+            event_hash: String::new(),
+        };
+        event.event_payload_hash = event.calculate_payload_hash()?;
+        event.event_hash = event.calculate_hash()?;
+        event.bind_for_state(&rebound, authority)?;
+        Ok(event)
+    }
+
     fn calculate_payload_hash(&self) -> Result<String, DraftGridClosureError> {
         hash_json(DRAFT_GRID_EVENT_PAYLOAD_HASH_DOMAIN, &self.payload)
     }
@@ -224,7 +409,7 @@ impl DraftCanonicalGridEventV17 {
         hash_json(DRAFT_GRID_EVENT_HASH_DOMAIN, &material)
     }
 
-    pub(super) fn validate_for_state(
+    fn validate_envelope_for_state(
         &self,
         state: &DraftGridTransferCellStateV2,
     ) -> Result<ValidatedDraftGridEventContextV17, DraftGridClosureError> {
@@ -246,11 +431,6 @@ impl DraftCanonicalGridEventV17 {
                 ));
             }
         }
-        let effective_payload_fence = if payload_fence == 0 {
-            self.authority_fencing_token
-        } else {
-            payload_fence
-        };
         if self.schema_name != DRAFT_GRID_EVENT_SCHEMA_NAME
             || self.schema_version != DRAFT_GRID_EVENT_SCHEMA_VERSION
             || self.compatibility != DraftGridCompatibilityTupleV19::canonical()
@@ -264,7 +444,7 @@ impl DraftCanonicalGridEventV17 {
             || self.cell_id != base.cell_id
             || self.cell_id != expected_cell
             || self.authority_fencing_token != base.fencing_token
-            || self.authority_fencing_token != effective_payload_fence
+            || self.authority_fencing_token != payload_fence
             || self.actor_player_id.is_some()
             || self.actor_type != "system"
             || self.operation_id.is_some()
@@ -283,6 +463,7 @@ impl DraftCanonicalGridEventV17 {
         if let DraftGridEventPayloadV17::ProductionQuantumCommitted {
             occurrence,
             accepted_trusted_at_unix_ms,
+            authority,
         } = &self.payload
             && (occurrence.schema_version
                 != crate::event::PRODUCTION_SCHEDULE_OCCURRENCE_SCHEMA_VERSION
@@ -298,6 +479,7 @@ impl DraftCanonicalGridEventV17 {
                 || occurrence.scheduled_for_unix_ms == 0
                 || occurrence.universe_manifest_hash != base.universe_manifest_hash
                 || occurrence.celestial_registry_hash != base.celestial_registry_hash
+                || !authority.validate()
                 || *accepted_trusted_at_unix_ms < occurrence.scheduled_for_unix_ms
                 || self.occurred_at_unix_ms != *accepted_trusted_at_unix_ms)
         {
@@ -316,7 +498,148 @@ impl DraftCanonicalGridEventV17 {
         })
     }
 
-    fn encode_canonical(&self) -> Result<Vec<u8>, DraftGridClosureError> {
+    #[cfg(test)]
+    pub(super) fn validate_for_state(
+        &self,
+        state: &DraftGridTransferCellStateV2,
+    ) -> Result<ValidatedDraftGridEventContextV17, DraftGridClosureError> {
+        self.validate_envelope_for_state(state)
+    }
+
+    pub(super) fn bind_for_state(
+        &self,
+        state: &DraftGridTransferCellStateV2,
+        authority: ValidatedDraftGridEventAuthorityV17<'_>,
+    ) -> Result<ValidatedDraftGridEventContextV17, DraftGridClosureError> {
+        match (&self.payload, authority) {
+            (
+                payload @ (DraftGridEventPayloadV17::GridTransferPrepared {
+                    authority: claimed,
+                    ..
+                }
+                | DraftGridEventPayloadV17::GridTransferQuarantined {
+                    authority: claimed,
+                    ..
+                }
+                | DraftGridEventPayloadV17::GridTransferExported {
+                    authority: claimed,
+                    ..
+                }
+                | DraftGridEventPayloadV17::GridTransferImported {
+                    authority: claimed,
+                    ..
+                }
+                | DraftGridEventPayloadV17::GridTransferActivated {
+                    authority: claimed,
+                    ..
+                }
+                | DraftGridEventPayloadV17::GridTransferFinalized {
+                    authority: claimed,
+                    ..
+                }
+                | DraftGridEventPayloadV17::GridTransferAborted {
+                    authority: claimed, ..
+                }),
+                ValidatedDraftGridEventAuthorityV17::Grid(validated),
+            ) => {
+                let trusted = DraftGridDirectoryAuthorityV2::from_validated_v3(validated);
+                let (package, _) = payload
+                    .package_authority()
+                    .expect("grid payload has package");
+                if claimed != &trusted
+                    || validated.transfer_id() != package.transfer_id
+                    || validated.package_hash() != package.package_hash
+                    || validated.universe_id() != self.universe_id
+                    || validated.universe_manifest_hash() != self.universe_manifest_hash
+                {
+                    return Err(DraftGridClosureError::Invalid(
+                        "event-17 grid authority claim does not equal the exact historical directory capability"
+                            .into(),
+                    ));
+                }
+            }
+            (
+                DraftGridEventPayloadV17::ProductionQuantumCommitted {
+                    occurrence,
+                    authority: claimed,
+                    ..
+                },
+                ValidatedDraftGridEventAuthorityV17::Production(validated),
+            ) => {
+                if claimed != &DraftProductionAuthorityClaimV17::from_validated(validated)
+                    || validated.universe_id() != self.universe_id
+                    || validated.universe_manifest_hash() != self.universe_manifest_hash
+                    || validated.cell_id() != self.cell_id
+                    || validated.cell_id() != occurrence.cell_id
+                {
+                    return Err(DraftGridClosureError::Invalid(
+                        "event-17 production authority claim does not equal the exact historical directory capability"
+                            .into(),
+                    ));
+                }
+            }
+            _ => {
+                return Err(DraftGridClosureError::Invalid(
+                    "event-17 operation received the wrong authority capability kind".into(),
+                ));
+            }
+        }
+        self.validate_envelope_for_state(state)
+    }
+
+    pub(super) fn rebind_for_state(
+        &self,
+        state: &DraftGridTransferCellStateV2,
+        authority: ValidatedDraftGridEventAuthorityV17<'_>,
+    ) -> Result<DraftGridTransferCellStateV2, DraftGridClosureError> {
+        let cell_authority = self.payload.resolved_cell_authority(authority)?;
+        state.rebind_validated_cell_authority(&cell_authority)
+    }
+
+    pub(super) fn payload(&self) -> &DraftGridEventPayloadV17 {
+        &self.payload
+    }
+
+    pub(super) fn authority_lookup(&self) -> DraftGridEventAuthorityLookupV17<'_> {
+        match &self.payload {
+            DraftGridEventPayloadV17::GridTransferPrepared { authority, .. }
+            | DraftGridEventPayloadV17::GridTransferQuarantined { authority, .. }
+            | DraftGridEventPayloadV17::GridTransferExported { authority, .. }
+            | DraftGridEventPayloadV17::GridTransferImported { authority, .. }
+            | DraftGridEventPayloadV17::GridTransferActivated { authority, .. }
+            | DraftGridEventPayloadV17::GridTransferFinalized { authority, .. }
+            | DraftGridEventPayloadV17::GridTransferAborted { authority, .. } => {
+                DraftGridEventAuthorityLookupV17::Grid {
+                    directory_revision: authority.directory_revision(),
+                    directory_document_hash: authority.directory_document_hash(),
+                    transfer_id: authority.transfer_id(),
+                }
+            }
+            DraftGridEventPayloadV17::ProductionQuantumCommitted {
+                authority,
+                occurrence,
+                ..
+            } => DraftGridEventAuthorityLookupV17::Production {
+                directory_revision: authority.directory_revision(),
+                directory_document_hash: authority.directory_document_hash(),
+                cell_id: &occurrence.cell_id,
+            },
+        }
+    }
+
+    pub(super) fn event_sequence(&self) -> u64 {
+        self.event_sequence
+    }
+
+    pub(super) fn event_hash(&self) -> &str {
+        &self.event_hash
+    }
+
+    pub(super) fn event_payload_hash(&self) -> &str {
+        &self.event_payload_hash
+    }
+
+    pub(super) fn encode_canonical(&self) -> Result<Vec<u8>, DraftGridClosureError> {
         let bytes = serde_json::to_vec(self).map_err(|source| {
             DraftGridClosureError::Invalid(format!("draft event-17 cannot encode: {source}"))
         })?;
@@ -326,7 +649,7 @@ impl DraftCanonicalGridEventV17 {
         Ok(bytes)
     }
 
-    fn decode_canonical(bytes: &[u8]) -> Result<Self, DraftGridClosureError> {
+    pub(super) fn decode_canonical(bytes: &[u8]) -> Result<Self, DraftGridClosureError> {
         if bytes.len() > MAX_DRAFT_GRID_EVENT_BYTES {
             return Err(DraftGridClosureError::TooLarge);
         }
@@ -420,7 +743,7 @@ mod tests {
     #[test]
     fn canonical_round_trip_rehydrates_grid_and_rider_poses() {
         let (state, package, authority) = prepared_fixture();
-        assert_ne!(package.grid.position, Default::default());
+        assert_ne!(package.grid.position, verse_protocol::Vec3::default());
         let event = prepare_event(&state, &package, &authority);
         let bytes = event.encode_canonical().expect("event encodes");
         let decoded = DraftCanonicalGridEventV17::decode_canonical(&bytes)
