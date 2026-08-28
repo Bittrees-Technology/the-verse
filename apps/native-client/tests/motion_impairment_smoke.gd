@@ -84,7 +84,7 @@ func _new_client(add_to_tree := false) -> Node3D:
 	client.set("camera", camera)
 	var player := _base_player()
 	client.set("snapshot", {
-		"projection_schema_version": 3,
+		"projection_schema_version": 4,
 		"event_sequence": 0,
 		"simulation_tick": 0,
 		"world_hash": "impairment-0",
@@ -386,11 +386,11 @@ func _test_reconnect_policy_and_generation_reset() -> void:
 	client.set("interest_verifier", verifier)
 	_check(bool(client.call("_reset_interest_verifier")), "generation verifier initializes")
 	var welcome := {
-		"type": "welcome", "protocol_version": 17, "projection_schema_version": 3,
-		"world_schema_version": 19, "event_schema_version": 15,
+		"type": "welcome", "protocol_version": 18, "projection_schema_version": 4,
+		"world_schema_version": 20, "event_schema_version": 16,
 		"content_schema_version": 11, "content_manifest_version": "p1.5.0",
-		"celestial_registry_schema_version": 1, "universe_manifest_schema_version": 3,
-		"interest_schema_version": 1, "server_name": "generation-test",
+		"celestial_registry_schema_version": 1, "universe_manifest_schema_version": 4,
+		"interest_schema_version": 2, "server_name": "generation-test",
 		"session_role": {"kind": "player", "player_id": "impairment-player"},
 	}
 	var staged: Dictionary = verifier.call(
@@ -468,7 +468,7 @@ func _motion_message(
 	grids: Array = []
 ) -> Dictionary:
 	return {
-		"projection_schema_version": 3,
+		"projection_schema_version": 4,
 		"event_sequence": event_sequence,
 		"simulation_tick": simulation_tick,
 		"world_hash": "impairment-%d" % event_sequence,
@@ -936,7 +936,7 @@ func _test_private_projection_lifecycle() -> void:
 	spoofed_public_motion["position"] = _protocol_vec3(Vector3(1.0, 0.0, 0.0))
 	spoofed_public_motion["last_processed_input_sequence"] = 99
 	client.call("_apply_motion_state", {
-		"projection_schema_version": 3,
+		"projection_schema_version": 4,
 		"event_sequence": 1,
 		"simulation_tick": 1,
 		"world_hash": "public-only-motion",
@@ -957,7 +957,7 @@ func _test_private_projection_lifecycle() -> void:
 	private_motion["last_received_input_sequence"] = 2
 	private_motion["last_processed_input_sequence"] = 2
 	client.call("_apply_motion_state", {
-		"projection_schema_version": 3,
+		"projection_schema_version": 4,
 		"event_sequence": 2,
 		"simulation_tick": 2,
 		"world_hash": "private-motion",
@@ -986,7 +986,7 @@ func _test_private_projection_lifecycle() -> void:
 	wrong_private_motion["player_id"] = "player-foreign"
 	client.set("authoritative_player_ready", true)
 	client.call("_apply_motion_state", {
-		"projection_schema_version": 3,
+		"projection_schema_version": 4,
 		"event_sequence": 3,
 		"simulation_tick": 3,
 		"world_hash": "wrong-private-actor-motion",
@@ -1435,7 +1435,7 @@ func _test_bound_player_roster_selection() -> void:
 	)
 	remote["position"] = _protocol_vec3(Vector3(9.0, 1.0, -2.0))
 	client.call("_apply_motion_state", {
-		"projection_schema_version": 3,
+		"projection_schema_version": 4,
 		"event_sequence": 1,
 		"simulation_tick": 1,
 		"world_hash": "impairment-roster-1",
