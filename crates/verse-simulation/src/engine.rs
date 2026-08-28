@@ -636,6 +636,10 @@ impl Runtime {
         if self.halted {
             return Err(RuntimeError::Halted);
         }
+        if let Err(source) = self.store.renew_lease() {
+            self.halted = true;
+            return Err(source.into());
+        }
         let moving_grid = self.state.grids.values().any(|grid| {
             !grid.anchored
                 && (grid.linear_velocity.magnitude() > f64::EPSILON
@@ -956,6 +960,17 @@ impl Runtime {
             return Err(source.into());
         }
         self.events_since_snapshot = 0;
+        Ok(())
+    }
+
+    pub fn renew_lease(&mut self) -> Result<(), RuntimeError> {
+        if self.halted {
+            return Err(RuntimeError::Halted);
+        }
+        if let Err(source) = self.store.renew_lease() {
+            self.halted = true;
+            return Err(source.into());
+        }
         Ok(())
     }
 
@@ -2518,7 +2533,7 @@ impl WorldState {
             self.celestial_registry_hash.clone(),
             self.universe_id.clone(),
             self.cell_id.clone(),
-            self.fencing_token,
+            self.fencing_token.max(1),
             actor_player_id.map(str::to_owned),
             actor_type,
             operation_id,
@@ -2796,6 +2811,13 @@ impl WorldState {
             return Err(IntentError::rejected(
                 "replay_player_incapacitated",
                 "incapacitated players cannot commit gameplay events before recovery",
+            ));
+        }
+        if event.authority_fencing_token == 0 || event.authority_fencing_token < self.fencing_token
+        {
+            return Err(IntentError::rejected(
+                "event_fencing_token_invalid",
+                "event fencing token must be positive and nondecreasing",
             ));
         }
 
@@ -4192,6 +4214,7 @@ impl WorldState {
         }
 
         self.event_sequence = event.event_sequence;
+        self.fencing_token = event.authority_fencing_token;
         self.last_event_hash.clone_from(&event.event_hash);
         if let (
             Some(actor_player_id),
@@ -13245,7 +13268,7 @@ mod tests {
     fn lost_writer_authority_halts_without_mutating_world() {
         let directory = tempdir().expect("tempdir");
         let mut runtime = Runtime::open(directory.path(), 73, 100).expect("runtime opens");
-        let lock_path = directory.path().join("writer.lock");
+        let lock_path = directory.path().join("cell-lifecycle.json");
         let mut lease: serde_json::Value =
             serde_json::from_slice(&fs::read(&lock_path).expect("lease reads"))
                 .expect("lease parses");

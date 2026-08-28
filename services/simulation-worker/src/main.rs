@@ -83,6 +83,18 @@ async fn main() -> Result<()> {
             .with_context(|| format!("failed to pre-admit development player {player_id}"))?;
     }
     let state = AppState::new(runtime);
+    let lease_state = Arc::clone(&state);
+    let lease_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            if let Err(source) = lease_state.renew_lease() {
+                error!(%source, "authoritative lease renewal failed; worker is fenced");
+                break;
+            }
+        }
+    });
     let tick_task = if arguments.pause_simulation {
         None
     } else {
@@ -120,6 +132,7 @@ async fn main() -> Result<()> {
     if let Some(tick_task) = tick_task {
         tick_task.abort();
     }
+    lease_task.abort();
     state
         .persist_snapshot()
         .context("failed to persist shutdown snapshot")?;

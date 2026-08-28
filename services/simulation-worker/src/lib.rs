@@ -77,6 +77,12 @@ struct ReplicationFeed {
     latest_motion_sequence: Option<u64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WorkerAuthorityStatus {
+    Active,
+    Fenced(Arc<str>),
+}
+
 impl ReplicationFeed {
     fn publish(&mut self, kind: ReplicationKind, sequence: u64) -> bool {
         match kind {
@@ -193,6 +199,7 @@ fn replication_interest(message: &ServerMessage) -> Option<&InterestSnapshot> {
 pub struct AppState {
     runtime: Mutex<Runtime>,
     updates: watch::Sender<ReplicationFeed>,
+    authority: watch::Sender<WorkerAuthorityStatus>,
     connected_players: Mutex<BTreeSet<String>>,
     session_admission: Arc<Semaphore>,
     http_projection_admission: Arc<Semaphore>,
@@ -247,9 +254,11 @@ impl AppState {
                 .expect("the runtime's validated universe manifest remains available");
         let projection_revision = Arc::new(ProjectionRevision::new(runtime.state().clone()));
         let (updates, _) = watch::channel(ReplicationFeed::default());
+        let (authority, _) = watch::channel(WorkerAuthorityStatus::Active);
         Arc::new(Self {
             runtime: Mutex::new(runtime),
             updates,
+            authority,
             connected_players: Mutex::new(BTreeSet::new()),
             session_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS)),
             http_projection_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_HTTP_PROJECTIONS)),
@@ -325,13 +334,37 @@ impl AppState {
         self.runtime.lock().persist_snapshot()
     }
 
+    pub fn renew_lease(&self) -> Result<(), RuntimeError> {
+        let mut runtime = self.runtime.lock();
+        let result = runtime.renew_lease();
+        let halted = runtime.is_halted();
+        drop(runtime);
+        if halted {
+            self.publish_fenced(result.as_ref().err().map_or_else(
+                || "authoritative runtime halted".into(),
+                ToString::to_string,
+            ));
+        }
+        result
+    }
+
     pub fn is_halted(&self) -> bool {
         self.runtime.lock().is_halted()
     }
 
     pub fn advance(&self, delta_millis: u16) -> Result<bool, RuntimeError> {
         let mut runtime = self.runtime.lock();
-        let outcome = runtime.advance_with_outcome(delta_millis)?;
+        let outcome = match runtime.advance_with_outcome(delta_millis) {
+            Ok(outcome) => outcome,
+            Err(source) => {
+                let halted = runtime.is_halted();
+                drop(runtime);
+                if halted {
+                    self.publish_fenced(source.to_string());
+                }
+                return Err(source);
+            }
+        };
         let update_kind = match outcome.impact {
             AdvanceImpact::None => None,
             AdvanceImpact::Motion => Some(ReplicationKind::Motion),
@@ -351,7 +384,17 @@ impl AppState {
     ) -> Result<IntentReceipt, RuntimeError> {
         let mut runtime = self.runtime.lock();
         let before_event_sequence = runtime.state().event_sequence;
-        let receipt = runtime.execute_as(actor_player_id, intent)?;
+        let receipt = match runtime.execute_as(actor_player_id, intent) {
+            Ok(receipt) => receipt,
+            Err(source) => {
+                let halted = runtime.is_halted();
+                drop(runtime);
+                if halted {
+                    self.publish_fenced(source.to_string());
+                }
+                return Err(source);
+            }
+        };
         if runtime.state().event_sequence == before_event_sequence {
             return Ok(receipt);
         }
@@ -375,6 +418,21 @@ impl AppState {
     fn publish_update(&self, kind: ReplicationKind, event_sequence: u64) {
         self.updates
             .send_if_modified(|feed| feed.publish(kind, event_sequence));
+    }
+
+    fn publish_fenced(&self, reason: String) {
+        if matches!(&*self.authority.borrow(), WorkerAuthorityStatus::Fenced(_)) {
+            return;
+        }
+        self.authority
+            .send_replace(WorkerAuthorityStatus::Fenced(Arc::from(reason)));
+    }
+
+    fn fenced_reason(&self) -> Option<Arc<str>> {
+        match &*self.authority.borrow() {
+            WorkerAuthorityStatus::Active => None,
+            WorkerAuthorityStatus::Fenced(reason) => Some(Arc::clone(reason)),
+        }
     }
 
     fn claim_player(&self, player_id: &str) -> bool {
@@ -814,6 +872,13 @@ async fn websocket_upgrade(
     upgrade: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
 ) -> Response {
+    if state.fenced_reason().is_some() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "authoritative cell is fenced and cannot admit sessions",
+        )
+            .into_response();
+    }
     let Ok(permit) = state.session_admission.clone().try_acquire_owned() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -828,11 +893,23 @@ async fn websocket_upgrade(
 
 async fn websocket_session(socket: WebSocket, state: Arc<AppState>, _permit: OwnedSemaphorePermit) {
     let (mut sender, mut receiver) = socket.split();
+    let mut authority = state.authority.subscribe();
+    if let Some(reason) = state.fenced_reason() {
+        send_fatal_and_close(&mut sender, "authority_fenced", reason.as_ref()).await;
+        return;
+    }
     let Some((client_name, binding)) = complete_handshake(&mut receiver, &mut sender, &state).await
     else {
         return;
     };
     info!(%client_name, role = ?binding, "client completed protocol handshake");
+    if let Some(reason) = state.fenced_reason() {
+        send_fatal_and_close(&mut sender, "authority_fenced", reason.as_ref()).await;
+        if let Some(player_id) = binding.player_id() {
+            state.release_player(player_id);
+        }
+        return;
+    }
 
     // Subscribe before projecting so a mutation between projection and delivery
     // is retained as a canonical marker and cannot be missed by this session.
@@ -901,6 +978,17 @@ async fn websocket_session(socket: WebSocket, state: Arc<AppState>, _permit: Own
 
     loop {
         tokio::select! {
+            changed = authority.changed() => {
+                let reason = match changed {
+                    Ok(()) => match &*authority.borrow_and_update() {
+                        WorkerAuthorityStatus::Active => continue,
+                        WorkerAuthorityStatus::Fenced(reason) => Arc::clone(reason),
+                    },
+                    Err(_) => Arc::from("authoritative lifecycle supervisor stopped"),
+                };
+                send_fatal_and_close(&mut sender, "authority_fenced", reason.as_ref()).await;
+                break;
+            }
             client_message = receiver.next() => {
                 match client_message {
                     Some(Ok(message)) => {
@@ -1455,6 +1543,7 @@ mod tests {
                 .contents
                 .ore = 2;
             world.ledger.genesis_ore += 2;
+            world.fencing_token = store.fencing_token();
             assert!(world.conservation().valid);
             store
                 .save_snapshot(&world)
@@ -2433,6 +2522,37 @@ mod tests {
             ServerMessage::Snapshot { .. }
         ));
         socket.close(None).await.expect("test socket closes");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn authority_fencing_closes_existing_sessions_and_rejects_new_admission() {
+        let (mut socket, state, server) = connect_test_socket().await;
+        let address = server_address(&socket);
+        complete_session(&mut socket, &local_player_hello("fenced-session")).await;
+
+        state.publish_fenced("test lease ownership changed".into());
+        assert!(matches!(
+            receive_wire_message(&mut socket).await,
+            ServerMessage::Fatal { ref code, ref message }
+                if code == "authority_fenced" && message.contains("lease ownership changed")
+        ));
+        tokio::time::timeout(SERVER_WRITE_TIMEOUT + Duration::from_secs(1), async {
+            while state.session_admission.available_permits() != MAX_CONCURRENT_CONNECTIONS {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fenced server session releases its admission permit");
+
+        let result = connect_async(format!("ws://{address}/ws")).await;
+        let error = result.expect_err("fenced authority rejects a new websocket");
+        assert!(matches!(
+            error,
+            tokio_tungstenite::tungstenite::Error::Http(response)
+                if response.status() == StatusCode::SERVICE_UNAVAILABLE
+        ));
+        let _ = socket.close(None).await;
         server.abort();
     }
 
