@@ -209,6 +209,7 @@ impl DirectoryPhaseProofV3 {
             prior_event_hash: self.prior_event_hash.clone()?,
             event_sequence: self.event_sequence,
             event_hash: self.event_hash.clone(),
+            event_payload_hash: self.event_payload_hash.clone()?,
             prior_draft_world_hash: self.prior_draft_world_hash.clone()?,
             resulting_active_world_hash: self.world_hash.clone(),
             quarantine_receipt_hash: self.quarantine_receipt_hash.clone()?,
@@ -242,6 +243,7 @@ impl DirectoryPhaseProofV3 {
             prior_event_hash: self.prior_event_hash.clone()?,
             event_sequence: self.event_sequence,
             event_hash: self.event_hash.clone(),
+            event_payload_hash: self.event_payload_hash.clone()?,
             prior_active_world_hash: self.prior_active_world_hash.clone()?,
             resulting_active_world_hash: self.world_hash.clone(),
             quarantine_receipt_hash: self.quarantine_receipt_hash.clone()?,
@@ -271,6 +273,7 @@ impl DirectoryPhaseProofV3 {
             prior_event_hash: self.prior_event_hash.clone()?,
             event_sequence: self.event_sequence,
             event_hash: self.event_hash.clone(),
+            event_payload_hash: self.event_payload_hash.clone()?,
             prior_active_world_hash: self.prior_active_world_hash.clone()?,
             resulting_active_world_hash: self.world_hash.clone(),
             source_export_proof_hash: self.source_export_proof_hash.clone()?,
@@ -505,8 +508,12 @@ impl ValidatedGridTransferAuthorityV3 {
             source_cell_id: proof.cell_id.clone(),
             assignment_generation: proof.assignment_generation,
             fencing_token: proof.fencing_token,
+            prior_event_sequence: proof.prior_event_sequence?,
+            prior_event_hash: proof.prior_event_hash.clone()?,
             event_sequence: proof.event_sequence,
             event_hash: proof.event_hash.clone(),
+            event_payload_hash: proof.event_payload_hash.clone()?,
+            prior_draft_world_hash: proof.prior_draft_world_hash.clone()?,
             resulting_active_world_hash: proof.world_hash.clone(),
             quarantine_receipt_hash: proof.quarantine_receipt_hash.clone()?,
             exported_at_unix_ms: proof.trusted_time_unix_ms?,
@@ -995,8 +1002,15 @@ impl CellTransferRecordV3 {
                         source_cell_id: proof.cell_id.clone(),
                         assignment_generation: proof.assignment_generation,
                         fencing_token: proof.fencing_token,
+                        prior_event_sequence: proof.prior_event_sequence.unwrap_or_default(),
+                        prior_event_hash: proof.prior_event_hash.clone().unwrap_or_default(),
                         event_sequence: proof.event_sequence,
                         event_hash: proof.event_hash.clone(),
+                        event_payload_hash: proof.event_payload_hash.clone().unwrap_or_default(),
+                        prior_draft_world_hash: proof
+                            .prior_draft_world_hash
+                            .clone()
+                            .unwrap_or_default(),
                         resulting_active_world_hash: proof.world_hash.clone(),
                         quarantine_receipt_hash: proof
                             .quarantine_receipt_hash
@@ -1054,6 +1068,7 @@ impl CellTransferRecordV3 {
                     prior_event_hash: prior_event_hash.clone(),
                     event_sequence: proof.event_sequence,
                     event_hash: proof.event_hash.clone(),
+                    event_payload_hash: proof.event_payload_hash.clone().unwrap_or_default(),
                     prior_draft_world_hash: prior_draft_world_hash.clone(),
                     resulting_active_world_hash: proof.world_hash.clone(),
                     quarantine_receipt_hash: proof
@@ -1097,6 +1112,13 @@ impl CellTransferRecordV3 {
                 && proof.source_exported_at_unix_ms.is_none()
                 && proof.destination_production_lifecycle_generation.is_none()
         } else if is_abort {
+            proof.import_proof_hash.is_none()
+                && proof.prior_draft_world_hash.is_some()
+                && proof.quarantined_at_unix_ms.is_none()
+                && proof.source_export_proof_hash.is_none()
+                && proof.source_exported_at_unix_ms.is_none()
+                && proof.destination_production_lifecycle_generation.is_none()
+        } else if expected_kind == DirectoryPhaseProofKindV3::SourceExport {
             proof.import_proof_hash.is_none()
                 && proof.prior_draft_world_hash.is_some()
                 && proof.quarantined_at_unix_ms.is_none()
@@ -1147,6 +1169,7 @@ impl CellTransferRecordV3 {
                     prior_event_hash: prior_event_hash.clone(),
                     event_sequence: proof.event_sequence,
                     event_hash: proof.event_hash.clone(),
+                    event_payload_hash: proof.event_payload_hash.clone().unwrap_or_default(),
                     prior_active_world_hash: prior_active_world_hash.clone(),
                     resulting_active_world_hash: proof.world_hash.clone(),
                     quarantine_receipt_hash: proof
@@ -1236,6 +1259,7 @@ impl CellTransferRecordV3 {
             expected_kind,
             DirectoryPhaseProofKindV3::SourcePrepare
                 | DirectoryPhaseProofKindV3::DestinationQuarantine
+                | DirectoryPhaseProofKindV3::SourceExport
                 | DirectoryPhaseProofKindV3::DestinationImport
                 | DirectoryPhaseProofKindV3::DestinationActivation
                 | DirectoryPhaseProofKindV3::SourceFinalization
@@ -1271,13 +1295,7 @@ impl CellTransferRecordV3 {
                     && proof.prepared_at_simulation_tick.is_none()
             }
         };
-        let event_payload_binding_valid = matches!(
-            expected_kind,
-            DirectoryPhaseProofKindV3::SourcePrepare
-                | DirectoryPhaseProofKindV3::DestinationQuarantine
-                | DirectoryPhaseProofKindV3::SourceAbort
-                | DirectoryPhaseProofKindV3::DestinationAbort
-        ) == proof.event_payload_hash.is_some();
+        let event_payload_binding_valid = proof.event_payload_hash.is_some();
         let ledger_binding_valid = matches!(
             expected_kind,
             DirectoryPhaseProofKindV3::SourceExport | DirectoryPhaseProofKindV3::DestinationImport
@@ -2109,7 +2127,7 @@ fn stage_v3_destination_imported(
         fencing_token: import.fencing_token,
         event_sequence: import.event_sequence,
         event_hash: import.event_hash.clone(),
-        event_payload_hash: None,
+        event_payload_hash: Some(import.event_payload_hash.clone()),
         world_hash: import.resulting_active_world_hash.clone(),
         quarantine_receipt_hash: Some(import.quarantine_receipt_hash.clone()),
         export_proof_hash: None,
@@ -2216,7 +2234,7 @@ fn stage_v3_source_exported(
         fencing_token: export.fencing_token,
         event_sequence: export.event_sequence,
         event_hash: export.event_hash.clone(),
-        event_payload_hash: None,
+        event_payload_hash: Some(export.event_payload_hash.clone()),
         world_hash: export.resulting_active_world_hash.clone(),
         quarantine_receipt_hash: Some(export.quarantine_receipt_hash.clone()),
         export_proof_hash: Some(export.proof_hash.clone()),
@@ -2226,9 +2244,9 @@ fn stage_v3_source_exported(
         activation_proof_hash: None,
         finalization_proof_hash: None,
         destination_import_proof_hash: None,
-        prior_event_sequence: None,
-        prior_event_hash: None,
-        prior_draft_world_hash: None,
+        prior_event_sequence: Some(export.prior_event_sequence),
+        prior_event_hash: Some(export.prior_event_hash.clone()),
+        prior_draft_world_hash: Some(export.prior_draft_world_hash.clone()),
         prior_active_world_hash: None,
         quarantined_at_unix_ms: None,
         imported_at_unix_ms: None,
@@ -2312,7 +2330,7 @@ fn stage_v3_destination_activated(
         fencing_token: activation.fencing_token,
         event_sequence: activation.event_sequence,
         event_hash: activation.event_hash.clone(),
-        event_payload_hash: None,
+        event_payload_hash: Some(activation.event_payload_hash.clone()),
         world_hash: activation.resulting_active_world_hash.clone(),
         quarantine_receipt_hash: Some(activation.quarantine_receipt_hash.clone()),
         export_proof_hash: None,
@@ -2408,7 +2426,7 @@ fn stage_v3_source_finalized(
         fencing_token: finalization.fencing_token,
         event_sequence: finalization.event_sequence,
         event_hash: finalization.event_hash.clone(),
-        event_payload_hash: None,
+        event_payload_hash: Some(finalization.event_payload_hash.clone()),
         world_hash: finalization.resulting_active_world_hash.clone(),
         quarantine_receipt_hash: None,
         export_proof_hash: None,
@@ -3157,8 +3175,18 @@ mod tests {
                 source_cell_id: proof.cell_id.clone(),
                 assignment_generation: proof.assignment_generation,
                 fencing_token: proof.fencing_token,
+                prior_event_sequence: proof.event_sequence - 1,
+                prior_event_hash: blake3::hash(b"source export prior event")
+                    .to_hex()
+                    .to_string(),
                 event_sequence: proof.event_sequence,
                 event_hash: String::new(),
+                event_payload_hash: blake3::hash(b"source export event payload")
+                    .to_hex()
+                    .to_string(),
+                prior_draft_world_hash: blake3::hash(b"source export prior draft world")
+                    .to_hex()
+                    .to_string(),
                 resulting_active_world_hash: proof.world_hash.clone(),
                 quarantine_receipt_hash: proof
                     .quarantine_receipt_hash
@@ -3173,6 +3201,10 @@ mod tests {
                 .seal_hashes_for_test()
                 .expect("source export proof seals");
             proof.event_hash = export.event_hash;
+            proof.event_payload_hash = Some(export.event_payload_hash);
+            proof.prior_event_sequence = Some(export.prior_event_sequence);
+            proof.prior_event_hash = Some(export.prior_event_hash);
+            proof.prior_draft_world_hash = Some(export.prior_draft_world_hash);
             proof.export_proof_hash = Some(export.proof_hash);
             proof.mutation_witness_hash = Some(export.mutation_witness_hash);
             proof.ledger_vector = Some(ledger_vector);
@@ -3205,6 +3237,9 @@ mod tests {
                     .to_string(),
                 event_sequence: proof.event_sequence,
                 event_hash: String::new(),
+                event_payload_hash: blake3::hash(b"destination import event payload")
+                    .to_hex()
+                    .to_string(),
                 prior_draft_world_hash: blake3::hash(b"destination import prior draft world")
                     .to_hex()
                     .to_string(),
@@ -3234,6 +3269,7 @@ mod tests {
                 .seal_hashes_for_test()
                 .expect("destination import proof seals");
             proof.event_hash = import.event_hash;
+            proof.event_payload_hash = Some(import.event_payload_hash);
             proof.import_proof_hash = Some(import.proof_hash);
             proof.prior_event_sequence = Some(import.prior_event_sequence);
             proof.prior_event_hash = Some(import.prior_event_hash);
@@ -3293,6 +3329,9 @@ mod tests {
                 prior_event_hash,
                 event_sequence: proof.event_sequence,
                 event_hash: String::new(),
+                event_payload_hash: blake3::hash(b"destination activation event payload")
+                    .to_hex()
+                    .to_string(),
                 prior_active_world_hash,
                 resulting_active_world_hash: proof.world_hash.clone(),
                 quarantine_receipt_hash: proof.quarantine_receipt_hash.clone().unwrap_or_else(
@@ -3315,6 +3354,7 @@ mod tests {
                 .seal_hashes_for_test()
                 .expect("destination activation proof seals");
             proof.event_hash = activation.event_hash;
+            proof.event_payload_hash = Some(activation.event_payload_hash);
             proof.activation_proof_hash = Some(activation.proof_hash);
             proof.destination_import_proof_hash = Some(activation.destination_import_proof_hash);
             proof.prior_event_sequence = Some(activation.prior_event_sequence);
@@ -3374,6 +3414,9 @@ mod tests {
                 ),
                 event_sequence: proof.event_sequence,
                 event_hash: String::new(),
+                event_payload_hash: blake3::hash(b"source finalization event payload")
+                    .to_hex()
+                    .to_string(),
                 prior_active_world_hash: source_export.map_or_else(
                     || {
                         blake3::hash(b"source finalization prior world")
@@ -3399,6 +3442,7 @@ mod tests {
                 .seal_hashes_for_test()
                 .expect("source finalization proof seals");
             proof.event_hash = finalization.event_hash;
+            proof.event_payload_hash = Some(finalization.event_payload_hash);
             proof.activation_proof_hash = Some(finalization.destination_activation_proof_hash);
             proof.finalization_proof_hash = Some(finalization.proof_hash);
             proof.destination_import_proof_hash = Some(finalization.destination_import_proof_hash);
