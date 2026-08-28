@@ -154,6 +154,24 @@ secrecy, fog of war, or zero-knowledge state.
   simulation. Backpressure cannot change ownership, interest authority, or
   canonical destruction.
 
+## P1.6 lifecycle incident controls
+
+- The P1.6 schema tuple is protocol `17`, projection `3`, world `19`, event
+  `15`, content `11`, manifest `p1.5.0`, registry `1`, universe manifest `3`,
+  interest `1`, lifecycle control `1`, and schedule occurrence `1`; partial
+  deployment is not allowed.
+- Every event append and snapshot rechecks the exact live holder, nonzero
+  fencing token, expiry, universe, cell and trust roots. Renewal uncertainty
+  stops mutation, and a successor token must exceed every recovered token.
+- Scheduler redelivery uses a stable occurrence key. Duplicate delivery cannot
+  repeat production; changed material at the same key, a skipped sequence, a
+  clock rollback, arithmetic overflow, or corrupt control record fails closed.
+- Background mode has no physics, player, oxygen, combat, AI, cleanup, market,
+  or replication authority. Anonymous observation cannot wake or retain the
+  fixed proof cell.
+- Catch-up is sequential and bounded. Backlog is visible and cannot be hidden
+  by skipping, coalescing, or one oversized elapsed-time event.
+
 ## Security gates
 
 Before public alpha:

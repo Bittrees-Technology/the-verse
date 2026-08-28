@@ -1,6 +1,7 @@
 # System architecture
 
-**Status:** Proposed production baseline with accepted P1.5 local scale contracts
+**Status:** Proposed production baseline with published P1.5 and accepted P1.6
+single-cell contracts
 
 ## Architectural goals
 
@@ -117,9 +118,12 @@ entity never grants authority and never changes simulation ownership.
 ## Deployment principles
 
 - Simulation workers are disposable; canonical events and snapshots are durable.
-- A cell worker must hold a renewable lease with a monotonically increasing fencing token before writing.
-- A worker must verify universe manifest schema `2`, celestial registry schema
-  `1`, and their hashes before opening world schema `18` or event schema `14`.
+- A cell worker must hold a renewable lease with a monotonically increasing
+  fencing token before writing. Every append and snapshot revalidates the live
+  holder, unexpired token and exact embedded fence.
+- A P1.6 worker must verify universe manifest schema `3`, celestial registry
+  schema `1`, lifecycle-control schema `1`, schedule-occurrence schema `1`, and
+  their hashes before opening world schema `19` or event schema `15`.
 - Cross-cell transfers use an idempotent prepare/commit protocol.
 - Economic writes use stable operation IDs and double-entry accounting.
 - Blockchain consumers wait for chain-specific confirmation policy and tolerate reorganization.
@@ -148,6 +152,25 @@ This slice is an architecture and local proof boundary. It does not establish
 multi-process cell scheduling, cross-cell handoff, a final binary codec, or a
 thousand-player production envelope. Universe-scale concurrency still depends
 on the partitioning in ADR-0002 plus published scheduler and handoff evidence.
+
+## P1.6 durable one-cell lifecycle slice
+
+The accepted next slice hosts one already generated fixed cell through
+`Sleeping`, `Background`, `Activating`, `Active`, and `Draining`. A local
+coordinator owns desired mode, due-occurrence dispatch, lease renewal and
+acknowledgement; the simulation aggregate remains the only authority for
+production state and its committed occurrence frontier.
+
+Active and Background call one deterministic whole-cell production planner and
+commit one ordered event per one-second occurrence. Background constructs no
+physics scene and advances no gravity, contact, oxygen, damage, combat, AI,
+cleanup, travel, or market timer. Catch-up is sequential and bounded. Public
+spectators cannot wake or retain the cell, and gameplay receives a fresh
+verified baseline only after activation catch-up and snapshot complete.
+
+This local proof does not implement a universe directory, multiple-cell
+placement, handoff, multi-host lease availability, frontier expansion, or a
+thousand-player capacity envelope.
 
 ## Initial implementation choice
 

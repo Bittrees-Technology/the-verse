@@ -63,6 +63,7 @@ This register reconciles the planning conversations into explicit project decisi
 | D-055 | The Verse DAO deploys official AMMs and provides initial capital-market liquidity | Accepted; exact pools, curves, fees, and reserve sizes require simulation and public governance parameters | MKT-010, OQ-004 |
 | D-056 | bNOTE and Base BIT/bridge details wait until gameplay, voxel mining, and the internal economy are validated | Accepted sequencing decision; required before P3 testnet integration | CHAIN-008, OQ-002/003 |
 | D-057 | P1.5 combines a fixed canonical celestial registry with deterministic single-cell spatial interest | Accepted as a bounded correctness slice; dynamic cells, handoff, frontier materialization, and production scale remain later | WORLD-009, SIM-013/014, F-014/059 |
+| D-058 | P1.6 proves a fenced durable lifecycle and production-only background execution for one fixed cell | Accepted as the next bounded dependency; it must reuse one atomic canonical production quantum and does not complete multi-cell scheduling or handoff | SIM-006/015, F-023/060, ADR-0022 |
 
 ## Amendment rule
 

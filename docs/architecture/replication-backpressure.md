@@ -162,6 +162,19 @@ schema `18`, event schema `14`, content schema `11`, content manifest
 `p1.5.0`, registry schema `1`, universe manifest schema `2`, and interest
 schema `1`.
 
+P1.6 Sleeping and Background cells host no gameplay replication session.
+Authenticated gameplay ingress coalesces around one activation, waits behind
+bounded production catch-up through the captured wake cut-off, and receives no
+canonical state until activation and snapshot succeed. Activation creates new
+session and interest epochs plus one independently verified baseline. Any
+pre-drain delta, acknowledgement, pending verification stage, or baseline is
+invalid. A public spectator request does not wake or retain the cell.
+
+The coordinated P1.6 boundary is protocol `17`, projection schema `3`, world
+schema `19`, event schema `15`, content schema `11`, content manifest
+`p1.5.0`, registry schema `1`, universe manifest schema `3`, interest schema
+`1`, lifecycle-control schema `1`, and schedule-occurrence schema `1`.
+
 ## Evidence gates
 
 Existing tests cover 4,096-motion coalescing, structural ordering,
