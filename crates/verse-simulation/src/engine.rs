@@ -2180,7 +2180,7 @@ impl WorldState {
         Ok(())
     }
 
-    fn production_machine_outcome_after_one_second(
+    pub(crate) fn production_machine_outcome_after_one_second(
         &self,
         machine_block_id: &str,
     ) -> Result<ProductionMachineOutcome, IntentError> {
@@ -2279,7 +2279,7 @@ impl WorldState {
         Ok(base(kind, new_progress_ticks, outputs))
     }
 
-    fn apply_production_machine_outcome(
+    pub(crate) fn apply_production_machine_outcome(
         &mut self,
         outcome: &ProductionMachineOutcome,
     ) -> Result<(), IntentError> {

@@ -201,13 +201,29 @@ proof without moving assets, ticking production, or changing conservation.
 Restart validation reconstructs the exact pre-activation active world at that
 event. Later gameplay may change the activated grid, and historical evidence
 does not blacklist its root from a future transfer ID. Per-machine holds retain
-the full packaged queue hash and sealed import boundary until a distinct
-release transaction. Dormant directory
-v3 persists and reconstructs both typed import and activation proofs; late
-Imported/Finalized retries require exact equality with the local historical
-results. Source finalization, production eligibility release/scheduler wiring,
-and the crash matrix remain disabled until their atomic transactions are
-implemented. Production remains
+the full packaged queue hash and sealed import boundary until a whole-cell
+production occurrence consumes them. That dormant occurrence now derives one
+ordered decision for every queue-bearing machine: pre-boundary imports emit an
+explicit transfer pause without inspecting power, route, or capacity, while
+due imports release and run the ordinary one-second outcome in the same
+cloned-state mutation as unrelated machines. It validates trusted due time,
+advances the production clock exactly once, retains complete occurrence and
+release evidence outside the active-world payload while committing its compact
+append-only head and count inside that hash, and reconstructs and replays the
+exact predecessor at the release frontier. Live and released eligibility
+records form an exclusive partition of every original import root, so silent
+disappearance, resurrection, queue substitution, historical deletion, and
+another handoff while a cell-bound hold remains fail closed. Release may
+precede the independent gameplay activation because its boundary is derived
+from import time. Dormant directory v3 persists and reconstructs both typed
+import and activation proofs; late Imported/Finalized retries require exact
+equality with the local historical results. Source finalization,
+event-17/runtime scheduler and durable wake-up wiring, and the persistence
+failpoint crash matrix remain disabled until their atomic paths are
+implemented. The dormant proof harness also remains bounded and
+snapshot-heavy; activation must place occurrence durability in the canonical
+event journal and reserve evidence capacity before accepting an import.
+Production remains
 pinned to protocol 18/directory 2/package 1 until the complete protocol-19
 tuple activates together. Production active-player load, the
 production binary codec, general multi-cell execution, safe zones, accounts,

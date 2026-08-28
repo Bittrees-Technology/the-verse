@@ -11,8 +11,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use super::production::{
-    DraftImportedProductionEligibilityV2, DraftProductionImportAuthorityV2,
-    DraftProductionJobOriginV2, derive_imported_production_eligibilities,
+    DraftImportedProductionEligibilityV2, DraftImportedProductionOccurrenceControlsV2,
+    DraftProductionImportAuthorityV2, DraftProductionJobOriginV2,
+    DraftProductionMachineControlKindV2, DraftProductionMachineControlV2,
+    derive_imported_production_eligibilities, derive_imported_production_occurrence_controls,
     imported_production_eligibility_map_root, validate_production_job_origins,
 };
 use super::{
@@ -28,7 +30,9 @@ use super::{
 };
 use crate::cell_directory::TransferPhase;
 use crate::cell_directory_v3::{DirectoryPhaseProofV3, ValidatedGridTransferAuthorityV3};
-use crate::model::{TransferConservationWitness, TransferWitnessDirection};
+use crate::event::ProductionMachineOutcome;
+use crate::model::{Ledger, TransferConservationWitness, TransferWitnessDirection};
+use verse_protocol::CareerSnapshot;
 
 const DRAFT_GRID_CELL_STATE_SCHEMA_VERSION: u32 = 21;
 const MAX_DRAFT_GRID_CELL_STATE_BYTES: usize = 32 * 1_024 * 1_024;
@@ -48,6 +52,18 @@ const ACTIVATION_WITNESS_HASH_DOMAIN: &[u8] = b"the-verse/grid-transfer-activati
 const ACTIVATION_EVENT_HASH_DOMAIN: &[u8] = b"the-verse/grid-transfer-activation-event/v2\0";
 const ACTIVATION_PROOF_HASH_DOMAIN: &[u8] = b"the-verse/grid-transfer-activation-proof/v2\0";
 const ACTIVATION_RECORD_HASH_DOMAIN: &[u8] = b"the-verse/grid-transfer-activation-record/v2\0";
+const PRODUCTION_RELEASE_WITNESS_HASH_DOMAIN: &[u8] =
+    b"the-verse/grid-transfer-production-release-witness/v2\0";
+const PRODUCTION_RELEASE_EVENT_HASH_DOMAIN: &[u8] =
+    b"the-verse/grid-transfer-production-release-event/v2\0";
+const PRODUCTION_RELEASE_PROOF_HASH_DOMAIN: &[u8] =
+    b"the-verse/grid-transfer-production-release-proof/v2\0";
+const PRODUCTION_RELEASE_RECORD_HASH_DOMAIN: &[u8] =
+    b"the-verse/grid-transfer-production-release-record/v2\0";
+const PRODUCTION_RELEASE_OUTCOMES_ROOT_DOMAIN: &[u8] =
+    b"the-verse/grid-transfer-production-release-outcomes/v2\0";
+const PRODUCTION_OCCURRENCE_HISTORY_ENTRY_DOMAIN: &[u8] =
+    b"the-verse/grid-transfer-production-occurrence-history/v2\0";
 const DRAFT_ACTIVE_WORLD_HASH_DOMAIN: &[u8] = b"the-verse/grid-transfer-active-world/v21\0";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -253,6 +269,56 @@ struct DraftGridActivationRecordV2 {
     record_hash: String,
 }
 
+/// Historical proof that one exact destination production occurrence removed
+/// every imported machine hold whose re-arm boundary was due and applied the
+/// ordinary whole-cell production outcome exactly once. Its append-only history
+/// link keeps earlier pauses and releases committed by the active world.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DraftImportedProductionReleaseRecordV2 {
+    schema_version: u32,
+    controls: DraftImportedProductionOccurrenceControlsV2,
+    outcomes: Vec<DraftProductionMachineOccurrenceOutcomeV2>,
+    released_eligibilities: BTreeMap<String, DraftImportedProductionEligibilityV2>,
+    prior_production_job_origins: BTreeMap<String, DraftProductionJobOriginV2>,
+    prior_production_queues: BTreeMap<String, std::collections::VecDeque<super::ProductionJob>>,
+    prior_destination_inventory_contents: BTreeMap<String, InventoryContents>,
+    prior_ledger: Ledger,
+    prior_owners: BTreeMap<String, DraftProductionOwnerSnapshotV2>,
+    prior_event_sequence: u64,
+    prior_event_hash: String,
+    release_event_sequence: u64,
+    release_event_hash: String,
+    prior_active_world_hash: String,
+    resulting_active_world_hash: String,
+    prior_production_quantum_sequence: u64,
+    prior_production_scheduled_for_unix_ms: u64,
+    prior_history_count: u64,
+    prior_history_head: String,
+    resulting_history_count: u64,
+    resulting_history_head: String,
+    history_entry_hash: String,
+    live_fencing_token: u64,
+    accepted_trusted_at_unix_ms: u64,
+    mutation_witness_hash: String,
+    proof_hash: String,
+    record_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DraftProductionMachineOccurrenceOutcomeV2 {
+    control: DraftProductionMachineControlV2,
+    ordinary_outcome: Option<ProductionMachineOutcome>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DraftProductionOwnerSnapshotV2 {
+    experience: u64,
+    career: CareerSnapshot,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DraftGridExportProofV2 {
@@ -325,6 +391,31 @@ pub(crate) struct DraftGridActivationProofV2 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct DraftImportedProductionReleaseProofV2 {
+    pub(crate) controls_root: String,
+    pub(crate) occurrence: crate::event::ProductionScheduleOccurrence,
+    pub(crate) released_eligibility_root: String,
+    pub(crate) outcomes_root: String,
+    pub(crate) prior_event_sequence: u64,
+    pub(crate) prior_event_hash: String,
+    pub(crate) event_sequence: u64,
+    pub(crate) event_hash: String,
+    pub(crate) prior_active_world_hash: String,
+    pub(crate) resulting_active_world_hash: String,
+    pub(crate) prior_production_quantum_sequence: u64,
+    pub(crate) prior_production_scheduled_for_unix_ms: u64,
+    pub(crate) prior_history_count: u64,
+    pub(crate) prior_history_head: String,
+    pub(crate) resulting_history_count: u64,
+    pub(crate) resulting_history_head: String,
+    pub(crate) history_entry_hash: String,
+    pub(crate) live_fencing_token: u64,
+    pub(crate) accepted_trusted_at_unix_ms: u64,
+    pub(crate) mutation_witness_hash: String,
+    pub(crate) proof_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct DraftGridAbortCleanupProofV2 {
     pub(crate) side: DraftGridTransferAbortSideV2,
     pub(crate) transfer_id: String,
@@ -354,6 +445,9 @@ pub(super) struct DraftGridTransferCellStateV2 {
     committed_exports: BTreeMap<String, DraftGridExportRecordV2>,
     committed_imports: BTreeMap<String, DraftGridImportRecordV2>,
     committed_activations: BTreeMap<String, DraftGridActivationRecordV2>,
+    committed_production_releases: BTreeMap<String, DraftImportedProductionReleaseRecordV2>,
+    production_occurrence_history_count: u64,
+    production_occurrence_history_head: String,
     abort_witnesses: BTreeMap<String, DraftGridTransferAbortWitnessV2>,
     state_hash: String,
 }
@@ -367,6 +461,8 @@ struct DraftActiveWorldHashMaterialV2<'a> {
     aggregate_reservations: &'a BTreeMap<String, DraftAggregateTransferReservationV2>,
     pending_imports: &'a BTreeMap<String, DraftPendingGridImportV2>,
     imported_production_eligibilities: &'a BTreeMap<String, DraftImportedProductionEligibilityV2>,
+    production_occurrence_history_count: u64,
+    production_occurrence_history_head: &'a str,
 }
 
 #[derive(Serialize)]
@@ -407,6 +503,35 @@ struct DraftGridActivationEventHashMaterialV2<'a> {
     imported_at_unix_ms: u64,
     activated_at_unix_ms: u64,
     production_eligibility_root: &'a str,
+    mutation_witness_hash: &'a str,
+}
+
+#[derive(Serialize)]
+struct DraftImportedProductionReleaseEventHashMaterialV2<'a> {
+    controls_root: &'a str,
+    occurrence: &'a crate::event::ProductionScheduleOccurrence,
+    released_eligibility_root: &'a str,
+    outcomes_root: &'a str,
+    prior_event_sequence: u64,
+    prior_event_hash: &'a str,
+    event_sequence: u64,
+    prior_production_quantum_sequence: u64,
+    prior_production_scheduled_for_unix_ms: u64,
+    prior_history_count: u64,
+    prior_history_head: &'a str,
+    resulting_history_count: u64,
+    live_fencing_token: u64,
+    accepted_trusted_at_unix_ms: u64,
+    mutation_witness_hash: &'a str,
+}
+
+#[derive(Serialize)]
+struct DraftProductionOccurrenceHistoryEntryMaterialV2<'a> {
+    prior_history_count: u64,
+    prior_history_head: &'a str,
+    resulting_history_count: u64,
+    controls_root: &'a str,
+    event_hash: &'a str,
     mutation_witness_hash: &'a str,
 }
 
@@ -1826,6 +1951,378 @@ impl DraftGridActivationProofV2 {
     }
 }
 
+impl DraftImportedProductionReleaseRecordV2 {
+    fn new(
+        state: &DraftGridTransferCellStateV2,
+        controls: DraftImportedProductionOccurrenceControlsV2,
+        outcomes: Vec<DraftProductionMachineOccurrenceOutcomeV2>,
+        released_eligibilities: BTreeMap<String, DraftImportedProductionEligibilityV2>,
+        accepted_trusted_at_unix_ms: u64,
+    ) -> Result<Self, DraftGridClosureError> {
+        controls.validate_for_world(&state.base, &state.imported_production_eligibilities)?;
+        let release_event_sequence = state.base.event_sequence.checked_add(1).ok_or_else(|| {
+            DraftGridClosureError::Unsupported(
+                "production eligibility release event sequence exhausted".into(),
+            )
+        })?;
+        let prior_destination_inventory_contents = outcomes
+            .iter()
+            .filter_map(|outcome| outcome.ordinary_outcome.as_ref())
+            .map(|outcome| {
+                state
+                    .base
+                    .inventories
+                    .get(&outcome.destination_inventory_id)
+                    .map(|inventory| {
+                        (
+                            outcome.destination_inventory_id.clone(),
+                            inventory.contents.clone(),
+                        )
+                    })
+                    .ok_or_else(|| {
+                        DraftGridClosureError::Invalid(
+                            "production release outcome lost its destination inventory".into(),
+                        )
+                    })
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        let prior_owners = outcomes
+            .iter()
+            .filter_map(|outcome| outcome.ordinary_outcome.as_ref())
+            .map(|outcome| {
+                let job = state
+                    .base
+                    .production_queues
+                    .get(&outcome.machine_block_id)
+                    .and_then(|queue| queue.front())
+                    .ok_or_else(|| {
+                        DraftGridClosureError::Invalid(
+                            "production release outcome lost its queue head".into(),
+                        )
+                    })?;
+                let owner = state.base.player.get(&job.owner_player_id).ok_or_else(|| {
+                    DraftGridClosureError::Invalid(
+                        "production release outcome lost its queue owner".into(),
+                    )
+                })?;
+                Ok((
+                    job.owner_player_id.clone(),
+                    DraftProductionOwnerSnapshotV2 {
+                        experience: owner.experience,
+                        career: owner.career.clone(),
+                    },
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>, DraftGridClosureError>>()?;
+        let resulting_history_count = state
+            .production_occurrence_history_count
+            .checked_add(1)
+            .ok_or_else(|| {
+                DraftGridClosureError::Unsupported(
+                    "production occurrence history count exhausted".into(),
+                )
+            })?;
+        let mut record = Self {
+            schema_version: DRAFT_GRID_TRANSFER_RECEIPT_SCHEMA_VERSION,
+            controls,
+            outcomes,
+            released_eligibilities,
+            prior_production_job_origins: state.production_job_origins.clone(),
+            prior_production_queues: state.base.production_queues.clone(),
+            prior_destination_inventory_contents,
+            prior_ledger: state.base.ledger.clone(),
+            prior_owners,
+            prior_event_sequence: state.base.event_sequence,
+            prior_event_hash: state.base.last_event_hash.clone(),
+            release_event_sequence,
+            release_event_hash: String::new(),
+            prior_active_world_hash: state.calculate_active_world_hash()?,
+            resulting_active_world_hash: String::new(),
+            prior_production_quantum_sequence: state
+                .base
+                .production_clock
+                .last_committed_quantum_sequence,
+            prior_production_scheduled_for_unix_ms: state
+                .base
+                .production_clock
+                .last_scheduled_for_unix_ms,
+            prior_history_count: state.production_occurrence_history_count,
+            prior_history_head: state.production_occurrence_history_head.clone(),
+            resulting_history_count,
+            resulting_history_head: String::new(),
+            history_entry_hash: String::new(),
+            live_fencing_token: state.base.fencing_token,
+            accepted_trusted_at_unix_ms,
+            mutation_witness_hash: String::new(),
+            proof_hash: String::new(),
+            record_hash: String::new(),
+        };
+        record.mutation_witness_hash = record.calculate_mutation_hash()?;
+        record.release_event_hash = record.proof()?.calculate_event_hash()?;
+        record.history_entry_hash = record.calculate_history_entry_hash()?;
+        record
+            .resulting_history_head
+            .clone_from(&record.history_entry_hash);
+        record.validate_static()?;
+        Ok(record)
+    }
+
+    fn seal_resulting_active_world_hash(
+        &mut self,
+        state: &DraftGridTransferCellStateV2,
+    ) -> Result<(), DraftGridClosureError> {
+        self.resulting_active_world_hash = state.calculate_active_world_hash()?;
+        self.proof_hash = self.proof()?.calculate_hash()?;
+        self.record_hash = self.calculate_hash()?;
+        self.validate_static()
+    }
+
+    fn calculate_mutation_hash(&self) -> Result<String, DraftGridClosureError> {
+        let mut material = self.clone();
+        material.release_event_hash.clear();
+        material.resulting_active_world_hash.clear();
+        material.resulting_history_head.clear();
+        material.history_entry_hash.clear();
+        material.mutation_witness_hash.clear();
+        material.proof_hash.clear();
+        material.record_hash.clear();
+        hash_json(PRODUCTION_RELEASE_WITNESS_HASH_DOMAIN, &material)
+    }
+
+    fn calculate_history_entry_hash(&self) -> Result<String, DraftGridClosureError> {
+        hash_json(
+            PRODUCTION_OCCURRENCE_HISTORY_ENTRY_DOMAIN,
+            &DraftProductionOccurrenceHistoryEntryMaterialV2 {
+                prior_history_count: self.prior_history_count,
+                prior_history_head: &self.prior_history_head,
+                resulting_history_count: self.resulting_history_count,
+                controls_root: self.controls.controls_root(),
+                event_hash: &self.release_event_hash,
+                mutation_witness_hash: &self.mutation_witness_hash,
+            },
+        )
+    }
+
+    fn calculate_hash(&self) -> Result<String, DraftGridClosureError> {
+        let mut material = self.clone();
+        material.record_hash.clear();
+        hash_json(PRODUCTION_RELEASE_RECORD_HASH_DOMAIN, &material)
+    }
+
+    fn proof(&self) -> Result<DraftImportedProductionReleaseProofV2, DraftGridClosureError> {
+        Ok(DraftImportedProductionReleaseProofV2 {
+            controls_root: self.controls.controls_root().to_owned(),
+            occurrence: self.controls.occurrence().clone(),
+            released_eligibility_root: imported_production_eligibility_map_root(
+                &self.released_eligibilities,
+            )?,
+            outcomes_root: hash_json(PRODUCTION_RELEASE_OUTCOMES_ROOT_DOMAIN, &self.outcomes)?,
+            prior_event_sequence: self.prior_event_sequence,
+            prior_event_hash: self.prior_event_hash.clone(),
+            event_sequence: self.release_event_sequence,
+            event_hash: self.release_event_hash.clone(),
+            prior_active_world_hash: self.prior_active_world_hash.clone(),
+            resulting_active_world_hash: self.resulting_active_world_hash.clone(),
+            prior_production_quantum_sequence: self.prior_production_quantum_sequence,
+            prior_production_scheduled_for_unix_ms: self.prior_production_scheduled_for_unix_ms,
+            prior_history_count: self.prior_history_count,
+            prior_history_head: self.prior_history_head.clone(),
+            resulting_history_count: self.resulting_history_count,
+            resulting_history_head: self.resulting_history_head.clone(),
+            history_entry_hash: self.history_entry_hash.clone(),
+            live_fencing_token: self.live_fencing_token,
+            accepted_trusted_at_unix_ms: self.accepted_trusted_at_unix_ms,
+            mutation_witness_hash: self.mutation_witness_hash.clone(),
+            proof_hash: self.proof_hash.clone(),
+        })
+    }
+
+    fn validate_static(&self) -> Result<(), DraftGridClosureError> {
+        self.controls.validate_canonical()?;
+        let proof = self.proof()?;
+        let occurrence = self.controls.occurrence();
+        let expected_releases = self
+            .controls
+            .machines()
+            .iter()
+            .filter(|control| {
+                control.kind() == DraftProductionMachineControlKindV2::ReleaseAndEvaluate
+            })
+            .map(|control| {
+                (
+                    control.machine_block_id(),
+                    control.eligibility_hash().unwrap_or_default(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let released_match_controls =
+            self.released_eligibilities
+                .iter()
+                .all(|(machine_id, eligibility)| {
+                    expected_releases.get(machine_id.as_str()).copied()
+                        == Some(eligibility.eligibility_hash())
+                        && eligibility.machine_block_id() == machine_id
+                        && eligibility.eligible_at_unix_ms() <= occurrence.scheduled_for_unix_ms
+                })
+                && expected_releases.len() == self.released_eligibilities.len();
+        let outcomes_match_controls = self.outcomes.len() == self.controls.machines().len()
+            && self
+                .outcomes
+                .iter()
+                .zip(self.controls.machines())
+                .all(|(outcome, control)| {
+                    &outcome.control == control
+                        && match control.kind() {
+                            DraftProductionMachineControlKindV2::TransferPaused => {
+                                outcome.ordinary_outcome.is_none()
+                            }
+                            DraftProductionMachineControlKindV2::Evaluate
+                            | DraftProductionMachineControlKindV2::ReleaseAndEvaluate => {
+                                outcome.ordinary_outcome.as_ref().is_some_and(|ordinary| {
+                                    ordinary.grid_id == control.grid_id()
+                                        && ordinary.machine_block_id == control.machine_block_id()
+                                })
+                            }
+                        }
+                });
+        let occurrence_is_next = self.prior_production_quantum_sequence.checked_add(1)
+            == Some(occurrence.production_quantum_sequence);
+        let occurrence_time_is_next = if self.prior_production_quantum_sequence == 0 {
+            occurrence.scheduled_for_unix_ms > 0
+        } else {
+            self.prior_production_scheduled_for_unix_ms
+                .checked_add(1_000)
+                .is_some_and(|earliest| occurrence.scheduled_for_unix_ms >= earliest)
+        };
+        if self.schema_version != DRAFT_GRID_TRANSFER_RECEIPT_SCHEMA_VERSION
+            || !released_match_controls
+            || !outcomes_match_controls
+            || !occurrence_is_next
+            || !occurrence_time_is_next
+            || (self.prior_history_count == 0 && !self.prior_history_head.is_empty())
+            || (self.prior_history_count > 0 && !valid_blake3_hex(&self.prior_history_head))
+            || self.prior_history_count.checked_add(1) != Some(self.resulting_history_count)
+            || !valid_blake3_hex(&self.history_entry_hash)
+            || self.history_entry_hash != self.calculate_history_entry_hash()?
+            || self.resulting_history_head != self.history_entry_hash
+            || self.live_fencing_token == 0
+            || self.accepted_trusted_at_unix_ms < occurrence.scheduled_for_unix_ms
+            || (self.prior_event_sequence == 0 && !self.prior_event_hash.is_empty())
+            || (self.prior_event_sequence > 0 && !valid_blake3_hex(&self.prior_event_hash))
+            || self.prior_event_sequence.checked_add(1) != Some(self.release_event_sequence)
+            || !valid_blake3_hex(&self.release_event_hash)
+            || self.release_event_hash != proof.calculate_event_hash()?
+            || !valid_blake3_hex(&self.prior_active_world_hash)
+            || (!self.resulting_active_world_hash.is_empty()
+                && !valid_blake3_hex(&self.resulting_active_world_hash))
+            || !valid_blake3_hex(&self.mutation_witness_hash)
+            || self.mutation_witness_hash != self.calculate_mutation_hash()?
+            || (!self.proof_hash.is_empty() && self.proof_hash != proof.calculate_hash()?)
+            || (!self.record_hash.is_empty() && self.record_hash != self.calculate_hash()?)
+        {
+            return Err(DraftGridClosureError::Invalid(
+                "imported production release record identity, occurrence, or hash is invalid"
+                    .into(),
+            ));
+        }
+        for eligibility in self.released_eligibilities.values() {
+            eligibility.validate_release_occurrence(occurrence)?;
+        }
+        Ok(())
+    }
+}
+
+impl DraftImportedProductionReleaseProofV2 {
+    fn calculate_event_hash(&self) -> Result<String, DraftGridClosureError> {
+        hash_json(
+            PRODUCTION_RELEASE_EVENT_HASH_DOMAIN,
+            &DraftImportedProductionReleaseEventHashMaterialV2 {
+                controls_root: &self.controls_root,
+                occurrence: &self.occurrence,
+                released_eligibility_root: &self.released_eligibility_root,
+                outcomes_root: &self.outcomes_root,
+                prior_event_sequence: self.prior_event_sequence,
+                prior_event_hash: &self.prior_event_hash,
+                event_sequence: self.event_sequence,
+                prior_production_quantum_sequence: self.prior_production_quantum_sequence,
+                prior_production_scheduled_for_unix_ms: self.prior_production_scheduled_for_unix_ms,
+                prior_history_count: self.prior_history_count,
+                prior_history_head: &self.prior_history_head,
+                resulting_history_count: self.resulting_history_count,
+                live_fencing_token: self.live_fencing_token,
+                accepted_trusted_at_unix_ms: self.accepted_trusted_at_unix_ms,
+                mutation_witness_hash: &self.mutation_witness_hash,
+            },
+        )
+    }
+
+    fn calculate_hash(&self) -> Result<String, DraftGridClosureError> {
+        let mut material = self.clone();
+        material.proof_hash.clear();
+        hash_json(PRODUCTION_RELEASE_PROOF_HASH_DOMAIN, &material)
+    }
+
+    fn calculate_history_entry_hash(&self) -> Result<String, DraftGridClosureError> {
+        hash_json(
+            PRODUCTION_OCCURRENCE_HISTORY_ENTRY_DOMAIN,
+            &DraftProductionOccurrenceHistoryEntryMaterialV2 {
+                prior_history_count: self.prior_history_count,
+                prior_history_head: &self.prior_history_head,
+                resulting_history_count: self.resulting_history_count,
+                controls_root: &self.controls_root,
+                event_hash: &self.event_hash,
+                mutation_witness_hash: &self.mutation_witness_hash,
+            },
+        )
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        let occurrence = &self.occurrence;
+        if !valid_blake3_hex(&self.controls_root)
+            || occurrence.schema_version
+                != crate::event::PRODUCTION_SCHEDULE_OCCURRENCE_SCHEMA_VERSION
+            || occurrence.universe_id.trim().is_empty()
+            || !valid_blake3_hex(&occurrence.cell_id)
+            || occurrence.lifecycle_generation == 0
+            || occurrence.production_quantum_sequence == 0
+            || occurrence.scheduled_for_unix_ms == 0
+            || !valid_blake3_hex(&occurrence.universe_manifest_hash)
+            || !valid_blake3_hex(&occurrence.celestial_registry_hash)
+            || !valid_blake3_hex(&self.released_eligibility_root)
+            || !valid_blake3_hex(&self.outcomes_root)
+            || (self.prior_history_count == 0 && !self.prior_history_head.is_empty())
+            || (self.prior_history_count > 0 && !valid_blake3_hex(&self.prior_history_head))
+            || self.prior_history_count.checked_add(1) != Some(self.resulting_history_count)
+            || !valid_blake3_hex(&self.history_entry_hash)
+            || self.history_entry_hash
+                != self
+                    .calculate_history_entry_hash()
+                    .map_err(|source| source.to_string())?
+            || self.resulting_history_head != self.history_entry_hash
+            || self.live_fencing_token == 0
+            || self.accepted_trusted_at_unix_ms < occurrence.scheduled_for_unix_ms
+            || (self.prior_event_sequence == 0 && !self.prior_event_hash.is_empty())
+            || (self.prior_event_sequence > 0 && !valid_blake3_hex(&self.prior_event_hash))
+            || self.prior_event_sequence.checked_add(1) != Some(self.event_sequence)
+            || !valid_blake3_hex(&self.event_hash)
+            || self.event_hash
+                != self
+                    .calculate_event_hash()
+                    .map_err(|source| source.to_string())?
+            || !valid_blake3_hex(&self.prior_active_world_hash)
+            || !valid_blake3_hex(&self.resulting_active_world_hash)
+            || !valid_blake3_hex(&self.mutation_witness_hash)
+            || !valid_blake3_hex(&self.proof_hash)
+            || self.proof_hash != self.calculate_hash().map_err(|source| source.to_string())?
+        {
+            return Err(
+                "imported production release proof is not canonical occurrence material".into(),
+            );
+        }
+        Ok(())
+    }
+}
+
 impl DraftGridTransferAbortWitnessV2 {
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -2034,6 +2531,9 @@ impl DraftGridTransferCellStateV2 {
             committed_exports: BTreeMap::new(),
             committed_imports: BTreeMap::new(),
             committed_activations: BTreeMap::new(),
+            committed_production_releases: BTreeMap::new(),
+            production_occurrence_history_count: 0,
+            production_occurrence_history_head: String::new(),
             abort_witnesses: BTreeMap::new(),
             state_hash: String::new(),
         };
@@ -2058,6 +2558,8 @@ impl DraftGridTransferCellStateV2 {
                 aggregate_reservations: &self.aggregate_reservations,
                 pending_imports: &self.pending_imports,
                 imported_production_eligibilities: &self.imported_production_eligibilities,
+                production_occurrence_history_count: self.production_occurrence_history_count,
+                production_occurrence_history_head: &self.production_occurrence_history_head,
             },
         )
     }
@@ -2066,6 +2568,41 @@ impl DraftGridTransferCellStateV2 {
         self.state_hash.clear();
         self.state_hash = self.calculate_hash()?;
         self.validate()
+    }
+
+    fn original_eligibilities_for_transfer(
+        &self,
+        transfer_id: &str,
+    ) -> Result<BTreeMap<String, DraftImportedProductionEligibilityV2>, DraftGridClosureError> {
+        let mut records = self
+            .imported_production_eligibilities
+            .iter()
+            .filter(|(_, eligibility)| eligibility.transfer_id() == transfer_id)
+            .map(|(machine_id, eligibility)| (machine_id.clone(), eligibility.clone()))
+            .collect::<BTreeMap<_, _>>();
+        for release in self.committed_production_releases.values() {
+            for (machine_id, eligibility) in &release.released_eligibilities {
+                if eligibility.transfer_id() == transfer_id
+                    && records
+                        .insert(machine_id.clone(), eligibility.clone())
+                        .is_some()
+                {
+                    return Err(DraftGridClosureError::Invalid(
+                        "import eligibility is both live and historically released".into(),
+                    ));
+                }
+            }
+        }
+        Ok(records)
+    }
+
+    fn production_origin_is_active_or_released(&self, transfer_id: &str, job_id: &str) -> bool {
+        self.production_job_origins.contains_key(job_id)
+            || self.committed_production_releases.values().any(|release| {
+                release.released_eligibilities.values().any(|eligibility| {
+                    eligibility.transfer_id() == transfer_id && eligibility.contains_job_id(job_id)
+                }) && release.prior_production_job_origins.contains_key(job_id)
+            })
     }
 
     fn validate(&self) -> Result<(), DraftGridClosureError> {
@@ -2095,6 +2632,13 @@ impl DraftGridTransferCellStateV2 {
             || self.aggregate_reservations.len() > MAX_DRAFT_TRANSFERS_PER_CELL
             || self.pending_imports.len() > MAX_DRAFT_TRANSFERS_PER_CELL
             || self.committed_activations.len() > MAX_DRAFT_TRANSFERS_PER_CELL
+            || self.committed_production_releases.len() > MAX_DRAFT_PRODUCTION_OCCURRENCES_PER_CELL
+            || usize::try_from(self.production_occurrence_history_count).ok()
+                != Some(self.committed_production_releases.len())
+            || (self.production_occurrence_history_count == 0
+                && !self.production_occurrence_history_head.is_empty())
+            || (self.production_occurrence_history_count > 0
+                && !valid_blake3_hex(&self.production_occurrence_history_head))
             || self.imported_production_eligibilities.len()
                 > MAX_DRAFT_IMPORTED_PRODUCTION_ELIGIBILITIES_PER_CELL
             || self.committed_exports.len() > MAX_DRAFT_TRANSFERS_PER_CELL
@@ -2147,12 +2691,11 @@ impl DraftGridTransferCellStateV2 {
         }
         for (transfer_id, pending) in &self.pending_imports {
             pending.validate()?;
-            let eligibilities = self
-                .imported_production_eligibilities
-                .iter()
-                .filter(|(_, eligibility)| eligibility.transfer_id() == transfer_id)
-                .map(|(machine_id, eligibility)| (machine_id.clone(), eligibility.clone()))
-                .collect::<BTreeMap<_, _>>();
+            let eligibilities = self.original_eligibilities_for_transfer(transfer_id)?;
+            let every_eligibility_is_live =
+                eligibilities.iter().all(|(machine_id, eligibility)| {
+                    self.imported_production_eligibilities.get(machine_id) == Some(eligibility)
+                });
             if transfer_id != &pending.reservation.binding.transfer_id
                 || pending.reservation.binding.destination_cell_id != self.base.cell_id
                 || self.base.fencing_token < pending.live_fencing_token
@@ -2162,13 +2705,14 @@ impl DraftGridTransferCellStateV2 {
                 || (self.base.event_sequence == pending.import_event_sequence
                     && self.base.last_event_hash != pending.import_event_hash)
                 || !transfer_ids.insert(transfer_id)
-                || !frozen_closure_is_present(&self.base, &pending.reservation.frozen)
-                || pending
-                    .reservation
-                    .frozen
-                    .job_ids
-                    .iter()
-                    .any(|job_id| !self.production_job_origins.contains_key(job_id))
+                || !(if every_eligibility_is_live {
+                    frozen_closure_is_present(&self.base, &pending.reservation.frozen)
+                } else {
+                    frozen_closure_subjects_are_present(&self.base, &pending.reservation.frozen)
+                })
+                || pending.reservation.frozen.job_ids.iter().any(|job_id| {
+                    !self.production_origin_is_active_or_released(transfer_id, job_id)
+                })
                 || self.base.transfer_witnesses.get(transfer_id)
                     != Some(&pending.conservation_witness)
                 || self
@@ -2204,6 +2748,14 @@ impl DraftGridTransferCellStateV2 {
             }
             let import_boundary = pending.import_boundary();
             for (machine_id, eligibility) in &eligibilities {
+                if self.imported_production_eligibilities.get(machine_id) != Some(eligibility) {
+                    eligibility.validate_persisted_import_boundary(
+                        transfer_id,
+                        &pending.reservation.binding.package_hash,
+                        &import_boundary,
+                    )?;
+                    continue;
+                }
                 let queue = self.base.production_queues.get(machine_id).ok_or_else(|| {
                     DraftGridClosureError::Invalid(
                         "pending import eligibility lost its resident machine queue".into(),
@@ -2323,12 +2875,11 @@ impl DraftGridTransferCellStateV2 {
             } else {
                 true
             };
-            let eligibilities = self
-                .imported_production_eligibilities
-                .iter()
-                .filter(|(_, eligibility)| eligibility.transfer_id() == transfer_id)
-                .map(|(machine_id, eligibility)| (machine_id.clone(), eligibility.clone()))
-                .collect::<BTreeMap<_, _>>();
+            let eligibilities = self.original_eligibilities_for_transfer(transfer_id)?;
+            let every_eligibility_is_live =
+                eligibilities.iter().all(|(machine_id, eligibility)| {
+                    self.imported_production_eligibilities.get(machine_id) == Some(eligibility)
+                });
             if transfer_id != &activation.pending.reservation.binding.transfer_id
                 || activation.pending.reservation.binding.destination_cell_id != self.base.cell_id
                 || self.base.fencing_token < activation.live_fencing_token
@@ -2341,10 +2892,17 @@ impl DraftGridTransferCellStateV2 {
                 || !prior_active_world_matches
                 || self.pending_imports.contains_key(transfer_id)
                 || (at_activation_frontier
-                    && !frozen_closure_is_present(
-                        &self.base,
-                        &activation.pending.reservation.frozen,
-                    ))
+                    && !(if every_eligibility_is_live {
+                        frozen_closure_is_present(
+                            &self.base,
+                            &activation.pending.reservation.frozen,
+                        )
+                    } else {
+                        frozen_closure_subjects_are_present(
+                            &self.base,
+                            &activation.pending.reservation.frozen,
+                        )
+                    }))
                 || self.base.transfer_witnesses.get(transfer_id)
                     != Some(&activation.pending.conservation_witness)
                 || self
@@ -2368,6 +2926,14 @@ impl DraftGridTransferCellStateV2 {
                 ));
             }
             for (machine_id, eligibility) in &eligibilities {
+                if self.imported_production_eligibilities.get(machine_id) != Some(eligibility) {
+                    eligibility.validate_persisted_import_boundary(
+                        transfer_id,
+                        &activation.pending.reservation.binding.package_hash,
+                        &import_boundary,
+                    )?;
+                    continue;
+                }
                 let queue = self.base.production_queues.get(machine_id).ok_or_else(|| {
                     DraftGridClosureError::Invalid(
                         "activated import eligibility lost its resident machine queue".into(),
@@ -2380,6 +2946,199 @@ impl DraftGridTransferCellStateV2 {
                     &import_boundary,
                 )?;
             }
+        }
+        let mut production_occurrence_history = self
+            .committed_production_releases
+            .values()
+            .collect::<Vec<_>>();
+        production_occurrence_history.sort_by_key(|release| release.resulting_history_count);
+        let mut expected_history_count = 0_u64;
+        let mut expected_history_head = String::new();
+        let mut production_occurrence_keys = BTreeSet::new();
+        for release in production_occurrence_history {
+            let occurrence = release.controls.occurrence();
+            if release.prior_history_count != expected_history_count
+                || release.prior_history_head != expected_history_head
+                || release.resulting_history_count != expected_history_count.saturating_add(1)
+                || release.resulting_history_head != release.history_entry_hash
+                || !production_occurrence_keys.insert((
+                    occurrence.lifecycle_generation,
+                    occurrence.production_quantum_sequence,
+                ))
+            {
+                return Err(DraftGridClosureError::Invalid(
+                    "production occurrence history is not one canonical append-only chain".into(),
+                ));
+            }
+            expected_history_count = release.resulting_history_count;
+            expected_history_head.clone_from(&release.resulting_history_head);
+        }
+        if expected_history_count != self.production_occurrence_history_count
+            || expected_history_head != self.production_occurrence_history_head
+        {
+            return Err(DraftGridClosureError::Invalid(
+                "production occurrence history head does not match its retained chain".into(),
+            ));
+        }
+
+        let mut released_eligibility_hashes = BTreeSet::new();
+        for (controls_root, release) in &self.committed_production_releases {
+            release.validate_static()?;
+            let proof = release.proof()?;
+            proof.validate().map_err(DraftGridClosureError::Invalid)?;
+            if controls_root != release.controls.controls_root()
+                || release.controls.occurrence().universe_id != self.base.universe_id
+                || release.controls.occurrence().cell_id != self.base.cell_id
+                || release.controls.occurrence().lifecycle_generation
+                    != self.base.production_clock.lifecycle_generation
+                || release.controls.occurrence().universe_manifest_hash
+                    != self.base.universe_manifest_hash
+                || release.controls.occurrence().celestial_registry_hash
+                    != self.base.celestial_registry_hash
+                || self.base.event_sequence < release.release_event_sequence
+                || self.base.fencing_token < release.live_fencing_token
+                || release.released_eligibilities.values().any(|eligibility| {
+                    !released_eligibility_hashes.insert(eligibility.eligibility_hash().to_owned())
+                        || self
+                            .imported_production_eligibilities
+                            .get(eligibility.machine_block_id())
+                            == Some(eligibility)
+                })
+            {
+                return Err(DraftGridClosureError::Invalid(
+                    "historical imported production occurrence is conflicting or misplaced".into(),
+                ));
+            }
+            for eligibility in release.released_eligibilities.values() {
+                let import = self
+                    .committed_imports
+                    .get(eligibility.transfer_id())
+                    .ok_or_else(|| {
+                        DraftGridClosureError::Invalid(
+                            "released eligibility has no committed destination import".into(),
+                        )
+                    })?;
+                eligibility.validate_persisted_import_boundary(
+                    eligibility.transfer_id(),
+                    &import.pending.reservation.binding.package_hash,
+                    &import.pending.import_boundary(),
+                )?;
+            }
+            if self.base.event_sequence == release.release_event_sequence {
+                if self.base.last_event_hash != release.release_event_hash
+                    || self.calculate_active_world_hash()? != release.resulting_active_world_hash
+                {
+                    return Err(DraftGridClosureError::Invalid(
+                        "production release frontier changed its event or resulting world".into(),
+                    ));
+                }
+                let mut prior = self.clone();
+                prior.committed_production_releases.remove(controls_root);
+                prior.base.event_sequence = release.prior_event_sequence;
+                prior
+                    .base
+                    .last_event_hash
+                    .clone_from(&release.prior_event_hash);
+                prior.base.production_clock.last_committed_quantum_sequence =
+                    release.prior_production_quantum_sequence;
+                prior.base.production_clock.last_scheduled_for_unix_ms =
+                    release.prior_production_scheduled_for_unix_ms;
+                prior.production_occurrence_history_count = release.prior_history_count;
+                prior
+                    .production_occurrence_history_head
+                    .clone_from(&release.prior_history_head);
+                prior.production_job_origins = release.prior_production_job_origins.clone();
+                prior.base.production_queues = release.prior_production_queues.clone();
+                prior.base.ledger = release.prior_ledger.clone();
+                for (inventory_id, contents) in &release.prior_destination_inventory_contents {
+                    prior
+                        .base
+                        .inventories
+                        .get_mut(inventory_id)
+                        .ok_or_else(|| {
+                            DraftGridClosureError::Invalid(
+                                "release predecessor lost a destination inventory".into(),
+                            )
+                        })?
+                        .contents
+                        .clone_from(contents);
+                }
+                for (player_id, snapshot) in &release.prior_owners {
+                    let player = prior.base.player.get_mut(player_id).ok_or_else(|| {
+                        DraftGridClosureError::Invalid(
+                            "release predecessor lost a production owner".into(),
+                        )
+                    })?;
+                    player.experience = snapshot.experience;
+                    player.career.clone_from(&snapshot.career);
+                }
+                for (machine_id, eligibility) in &release.released_eligibilities {
+                    if prior
+                        .imported_production_eligibilities
+                        .insert(machine_id.clone(), eligibility.clone())
+                        .is_some()
+                    {
+                        return Err(DraftGridClosureError::Invalid(
+                            "release predecessor duplicated an imported eligibility".into(),
+                        ));
+                    }
+                }
+                if prior.calculate_active_world_hash()? != release.prior_active_world_hash {
+                    return Err(DraftGridClosureError::Invalid(
+                        "production release cannot reconstruct its exact predecessor world".into(),
+                    ));
+                }
+                release
+                    .controls
+                    .validate_for_world(&prior.base, &prior.imported_production_eligibilities)?;
+                let (mut replayed_world, replayed_outcomes) =
+                    plan_imported_production_occurrence_v2(&prior.base, &release.controls)?;
+                if replayed_outcomes != release.outcomes {
+                    return Err(DraftGridClosureError::Invalid(
+                        "production release outcomes do not replay from their predecessor".into(),
+                    ));
+                }
+                replayed_world.event_sequence = release.release_event_sequence;
+                replayed_world
+                    .last_event_hash
+                    .clone_from(&release.release_event_hash);
+                let mut replayed = prior;
+                replayed.base = replayed_world;
+                let remaining_job_ids = replayed
+                    .base
+                    .production_queues
+                    .values()
+                    .flatten()
+                    .map(|job| job.job_id.as_str())
+                    .collect::<BTreeSet<_>>();
+                replayed
+                    .production_job_origins
+                    .retain(|job_id, _| remaining_job_ids.contains(job_id.as_str()));
+                for machine_id in release.released_eligibilities.keys() {
+                    replayed
+                        .imported_production_eligibilities
+                        .remove(machine_id);
+                }
+                replayed.production_occurrence_history_count = release.resulting_history_count;
+                replayed
+                    .production_occurrence_history_head
+                    .clone_from(&release.resulting_history_head);
+                if replayed.calculate_active_world_hash()? != release.resulting_active_world_hash
+                    || replayed.base != self.base
+                    || replayed.imported_production_eligibilities
+                        != self.imported_production_eligibilities
+                    || replayed.production_job_origins != self.production_job_origins
+                {
+                    return Err(DraftGridClosureError::Invalid(
+                        "production release did not commit one exact whole-cell occurrence".into(),
+                    ));
+                }
+            }
+        }
+        if released_eligibility_hashes.len() + self.imported_production_eligibilities.len()
+            > MAX_DRAFT_IMPORTED_PRODUCTION_HISTORY_PER_CELL
+        {
+            return Err(DraftGridClosureError::TooLarge);
         }
         for (machine_id, eligibility) in &self.imported_production_eligibilities {
             eligibility.validate()?;
@@ -2508,6 +3267,14 @@ impl DraftGridTransferCellStateV2 {
             self.base.grids.get(grid_id).ok_or_else(|| {
                 DraftGridClosureError::Invalid("source grid is not resident".into())
             })?;
+        if grid.blocks.keys().any(|block_id| {
+            self.imported_production_eligibilities
+                .contains_key(block_id)
+        }) {
+            return Err(DraftGridClosureError::Invalid(
+                "grid cannot hand off while a destination-bound production hold is live".into(),
+            ));
+        }
         let job_ids = grid
             .blocks
             .keys()
@@ -2530,6 +3297,8 @@ impl DraftGridTransferCellStateV2 {
 const MAX_DRAFT_TRANSFERS_PER_CELL: usize = 1_024;
 const MAX_DRAFT_IMPORTED_PRODUCTION_ELIGIBILITIES_PER_CELL: usize =
     MAX_DRAFT_GRID_PRODUCTION_QUEUES;
+const MAX_DRAFT_PRODUCTION_OCCURRENCES_PER_CELL: usize = 2_048;
+const MAX_DRAFT_IMPORTED_PRODUCTION_HISTORY_PER_CELL: usize = 8_192;
 
 fn draft_transfer_count(state: &DraftGridTransferCellStateV2) -> usize {
     state
@@ -2564,6 +3333,35 @@ fn sorted_intersects<T: Ord>(left: &[T], right: &[T]) -> bool {
 }
 
 fn frozen_closure_is_present(world: &WorldState, frozen: &DraftFrozenClosureIdsV2) -> bool {
+    if !frozen_closure_subjects_are_present(world, frozen) {
+        return false;
+    }
+    let grid = &world.grids[&frozen.grid_id];
+    let machine_ids = grid
+        .blocks
+        .keys()
+        .filter(|block_id| world.production_queues.contains_key(*block_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    if machine_ids != frozen.machine_block_ids {
+        return false;
+    }
+    let job_ids = frozen
+        .machine_block_ids
+        .iter()
+        .filter_map(|machine| world.production_queues.get(machine))
+        .flatten()
+        .map(|job| job.job_id.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    job_ids == frozen.job_ids
+}
+
+fn frozen_closure_subjects_are_present(
+    world: &WorldState,
+    frozen: &DraftFrozenClosureIdsV2,
+) -> bool {
     let Some(grid) = world.grids.get(&frozen.grid_id) else {
         return false;
     };
@@ -2585,27 +3383,6 @@ fn frozen_closure_is_present(world: &WorldState, frozen: &DraftFrozenClosureIdsV
             .iter()
             .any(|contact| !world.active_contact_pairs.contains(contact))
     {
-        return false;
-    }
-    let machine_ids = grid
-        .blocks
-        .keys()
-        .filter(|block_id| world.production_queues.contains_key(*block_id))
-        .cloned()
-        .collect::<Vec<_>>();
-    if machine_ids != frozen.machine_block_ids {
-        return false;
-    }
-    let job_ids = frozen
-        .machine_block_ids
-        .iter()
-        .filter_map(|machine| world.production_queues.get(machine))
-        .flatten()
-        .map(|job| job.job_id.clone())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    if job_ids != frozen.job_ids {
         return false;
     }
     let closure_bodies = std::iter::once(frozen.grid_id.clone())
@@ -2848,6 +3625,11 @@ fn stage_prepared_grid_lock_v2(
     }
     if state.base.cell_id != package.source_cell_id
         || state.base.fencing_token != authority.live_source_fencing_token
+        || package.production_queues.keys().any(|machine_id| {
+            state
+                .imported_production_eligibilities
+                .contains_key(machine_id)
+        })
         || package
             .production_job_origins
             .iter()
@@ -3621,6 +4403,150 @@ fn stage_imported_grid_activation_v2(
     Ok((next, proof))
 }
 
+fn plan_imported_production_occurrence_v2(
+    world: &WorldState,
+    controls: &DraftImportedProductionOccurrenceControlsV2,
+) -> Result<(WorldState, Vec<DraftProductionMachineOccurrenceOutcomeV2>), DraftGridClosureError> {
+    let mut planning = world.clone();
+    let mut outcomes = Vec::with_capacity(controls.machines().len());
+    for control in controls.machines() {
+        let ordinary_outcome = match control.kind() {
+            DraftProductionMachineControlKindV2::TransferPaused => None,
+            DraftProductionMachineControlKindV2::Evaluate
+            | DraftProductionMachineControlKindV2::ReleaseAndEvaluate => {
+                let outcome = planning
+                    .production_machine_outcome_after_one_second(control.machine_block_id())
+                    .map_err(|source| DraftGridClosureError::Invalid(source.to_string()))?;
+                if outcome.changes_state() {
+                    planning
+                        .apply_production_machine_outcome(&outcome)
+                        .map_err(|source| DraftGridClosureError::Invalid(source.to_string()))?;
+                }
+                Some(outcome)
+            }
+        };
+        outcomes.push(DraftProductionMachineOccurrenceOutcomeV2 {
+            control: control.clone(),
+            ordinary_outcome,
+        });
+    }
+    planning.production_clock.last_committed_quantum_sequence =
+        controls.occurrence().production_quantum_sequence;
+    planning.production_clock.last_scheduled_for_unix_ms =
+        controls.occurrence().scheduled_for_unix_ms;
+    Ok((planning, outcomes))
+}
+
+fn stage_imported_production_occurrence_v2(
+    state: &DraftGridTransferCellStateV2,
+    accepted_trusted_now_unix_ms: u64,
+    occurrence: crate::event::ProductionScheduleOccurrence,
+) -> Result<
+    (
+        DraftGridTransferCellStateV2,
+        DraftImportedProductionOccurrenceControlsV2,
+        DraftImportedProductionReleaseProofV2,
+    ),
+    DraftGridClosureError,
+> {
+    state.validate()?;
+    if accepted_trusted_now_unix_ms < occurrence.scheduled_for_unix_ms {
+        return Err(DraftGridClosureError::Invalid(
+            "production occurrence was delivered before its trusted scheduled time".into(),
+        ));
+    }
+    if let Some(existing) = state
+        .committed_production_releases
+        .values()
+        .find(|record| record.controls.occurrence() == &occurrence)
+    {
+        existing.validate_static()?;
+        let proof = existing.proof()?;
+        proof.validate().map_err(DraftGridClosureError::Invalid)?;
+        return Ok((state.clone(), existing.controls.clone(), proof));
+    }
+    if state.imported_production_eligibilities.is_empty() {
+        return Err(DraftGridClosureError::Invalid(
+            "imported production staging requires at least one live eligibility".into(),
+        ));
+    }
+    let controls = derive_imported_production_occurrence_controls(
+        &state.base,
+        &state.imported_production_eligibilities,
+        occurrence,
+    )?;
+    let (mut resulting_world, outcomes) =
+        plan_imported_production_occurrence_v2(&state.base, &controls)?;
+    let released_eligibilities = controls
+        .machines()
+        .iter()
+        .filter(|control| control.kind() == DraftProductionMachineControlKindV2::ReleaseAndEvaluate)
+        .map(|control| {
+            state
+                .imported_production_eligibilities
+                .get(control.machine_block_id())
+                .cloned()
+                .map(|eligibility| (control.machine_block_id().to_owned(), eligibility))
+                .ok_or_else(|| {
+                    DraftGridClosureError::Changed(
+                        "due imported production eligibility disappeared before commit".into(),
+                    )
+                })
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    let mut record = DraftImportedProductionReleaseRecordV2::new(
+        state,
+        controls.clone(),
+        outcomes,
+        released_eligibilities.clone(),
+        accepted_trusted_now_unix_ms,
+    )?;
+    resulting_world.event_sequence = record.release_event_sequence;
+    resulting_world
+        .last_event_hash
+        .clone_from(&record.release_event_hash);
+    let mut next = state.clone();
+    next.base = resulting_world;
+    next.production_occurrence_history_count = record.resulting_history_count;
+    next.production_occurrence_history_head
+        .clone_from(&record.resulting_history_head);
+    let remaining_job_ids = next
+        .base
+        .production_queues
+        .values()
+        .flatten()
+        .map(|job| job.job_id.as_str())
+        .collect::<BTreeSet<_>>();
+    next.production_job_origins
+        .retain(|job_id, _| remaining_job_ids.contains(job_id.as_str()));
+    for (machine_id, eligibility) in &released_eligibilities {
+        if next
+            .imported_production_eligibilities
+            .remove(machine_id)
+            .as_ref()
+            != Some(eligibility)
+        {
+            return Err(DraftGridClosureError::Changed(
+                "production occurrence could not consume its exact due eligibility".into(),
+            ));
+        }
+    }
+    record.seal_resulting_active_world_hash(&next)?;
+    let proof = record.proof()?;
+    if next
+        .committed_production_releases
+        .insert(controls.controls_root().to_owned(), record)
+        .is_some()
+    {
+        return Err(DraftGridClosureError::Changed(
+            "production occurrence overwrote historical gate evidence".into(),
+        ));
+    }
+    next.seal()?;
+    proof.validate().map_err(DraftGridClosureError::Invalid)?;
+    Ok((next, controls, proof))
+}
+
 fn stage_aborted_grid_cleanup_v2(
     state: &DraftGridTransferCellStateV2,
     trusted_now_unix_ms: u64,
@@ -3782,6 +4708,7 @@ mod tests {
 
     use super::super::tests::package_fixture;
     use super::*;
+    use crate::content;
     use crate::model::{Block, ProductionJob, production_recipe_quantities};
     use verse_protocol::{BlockKind, ProductionRecipeKind};
 
@@ -3874,7 +4801,9 @@ mod tests {
                 batches: 1,
                 source_inventory_id: cargo_inventory_id.clone(),
                 destination_inventory_id: cargo_inventory_id,
-                progress_ticks: 0,
+                progress_ticks: duration_ticks
+                    .checked_sub(u64::from(content::manifest().physics.fixed_step_hz))
+                    .expect("fixture job has at least one production quantum remaining"),
                 duration_ticks,
                 reserved_inputs,
                 pending_outputs: InventoryContents::default(),
@@ -4091,6 +5020,27 @@ mod tests {
 
     fn materialized_import_state_fixture() -> DraftGridTransferCellStateV2 {
         materialized_import_fixture().0
+    }
+
+    fn next_occurrence(
+        state: &DraftGridTransferCellStateV2,
+        scheduled_for_unix_ms: u64,
+    ) -> crate::event::ProductionScheduleOccurrence {
+        crate::event::ProductionScheduleOccurrence {
+            schema_version: crate::event::PRODUCTION_SCHEDULE_OCCURRENCE_SCHEMA_VERSION,
+            universe_id: state.base.universe_id.clone(),
+            cell_id: state.base.cell_id.clone(),
+            lifecycle_generation: state.base.production_clock.lifecycle_generation,
+            production_quantum_sequence: state
+                .base
+                .production_clock
+                .last_committed_quantum_sequence
+                .checked_add(1)
+                .expect("fixture occurrence sequence advances"),
+            scheduled_for_unix_ms,
+            universe_manifest_hash: state.base.universe_manifest_hash.clone(),
+            celestial_registry_hash: state.base.celestial_registry_hash.clone(),
+        }
     }
 
     #[test]
@@ -4497,9 +5447,35 @@ mod tests {
             placement: next_plan,
             production_job_origins: BTreeMap::new(),
         };
+        assert!(
+            transfer_ready
+                .capture_grid_closure(&package.root_aggregate_id, &next_context)
+                .is_err(),
+            "a destination-bound production hold cannot leak into another handoff"
+        );
+        let eligible_at = transfer_ready
+            .imported_production_eligibilities
+            .values()
+            .next()
+            .expect("activated fixture still has a production hold")
+            .eligible_at_unix_ms();
+        let occurrence = next_occurrence(&transfer_ready, eligible_at);
+        let (mut transfer_ready, _, _) = stage_imported_production_occurrence_v2(
+            &transfer_ready,
+            occurrence.scheduled_for_unix_ms,
+            occurrence,
+        )
+        .expect("eligible production releases before the next handoff");
+        transfer_ready.base.event_sequence += 1;
+        transfer_ready.base.last_event_hash = blake3::hash(b"post-release transfer boundary")
+            .to_hex()
+            .to_string();
+        transfer_ready
+            .seal()
+            .expect("a later boundary may follow the production occurrence");
         let next_package = transfer_ready
             .capture_grid_closure(&package.root_aggregate_id, &next_context)
-            .expect("activated grid can form a later transfer under a new ID");
+            .expect("released grid can form a later transfer under a new ID");
         let next_authority =
             DraftGridDirectoryAuthorityV2::for_package(&next_package, TransferPhase::Prepared);
         let relocked = stage_prepared_grid_lock_v2(&transfer_ready, &next_package, &next_authority)
@@ -4546,6 +5522,231 @@ mod tests {
         .expect("successor retries historical activation under its live fence");
         assert_eq!(successor_retry, successor_state);
         assert_eq!(successor_proof, proof);
+    }
+
+    #[test]
+    fn imported_production_gate_pauses_then_releases_inside_exact_whole_cell_occurrence() {
+        let (imported, package, authority) = materialized_import_fixture();
+        let (machine_id, eligibility) = imported
+            .imported_production_eligibilities
+            .first_key_value()
+            .map(|(machine_id, eligibility)| (machine_id.clone(), eligibility.clone()))
+            .expect("fixture carries one imported machine hold");
+        let initial_queue = imported.base.production_queues[&machine_id].clone();
+        let initial_clock = imported.base.production_clock.clone();
+        let initial_ledger = imported.base.ledger.clone();
+        let completed_job_id = initial_queue[0].job_id.clone();
+        let eligible_at = eligibility.eligible_at_unix_ms();
+
+        let early_occurrence = next_occurrence(&imported, eligible_at - 1);
+        assert!(
+            stage_imported_production_occurrence_v2(
+                &imported,
+                early_occurrence.scheduled_for_unix_ms - 1,
+                early_occurrence.clone(),
+            )
+            .is_err()
+        );
+        let (paused, paused_controls, paused_proof) = stage_imported_production_occurrence_v2(
+            &imported,
+            early_occurrence.scheduled_for_unix_ms,
+            early_occurrence.clone(),
+        )
+        .expect("pre-boundary occurrence commits an explicit transfer pause");
+        paused_proof.validate().expect("paused proof validates");
+        assert_eq!(paused.base.production_queues[&machine_id], initial_queue);
+        assert_eq!(
+            paused.imported_production_eligibilities[&machine_id],
+            eligibility
+        );
+        assert_eq!(
+            paused.base.production_clock.last_committed_quantum_sequence,
+            initial_clock.last_committed_quantum_sequence + 1
+        );
+        assert_eq!(
+            paused_controls.machines()[0].kind(),
+            DraftProductionMachineControlKindV2::TransferPaused
+        );
+        assert!(
+            paused.committed_production_releases[paused_controls.controls_root()].outcomes[0]
+                .ordinary_outcome
+                .is_none()
+        );
+        assert_eq!(
+            DraftGridTransferCellStateV2::decode_canonical(
+                &paused.encode_canonical().expect("paused state encodes")
+            )
+            .expect("paused state restarts"),
+            paused
+        );
+        let (paused_retry, paused_retry_controls, paused_retry_proof) =
+            stage_imported_production_occurrence_v2(
+                &paused,
+                early_occurrence.scheduled_for_unix_ms + 10,
+                early_occurrence.clone(),
+            )
+            .expect("paused occurrence redelivery is exact");
+        assert_eq!(paused_retry, paused);
+        assert_eq!(paused_retry_controls, paused_controls);
+        assert_eq!(paused_retry_proof, paused_proof);
+
+        let due_occurrence = next_occurrence(&paused, eligible_at + 999);
+        let (released, release_controls, release_proof) = stage_imported_production_occurrence_v2(
+            &paused,
+            due_occurrence.scheduled_for_unix_ms,
+            due_occurrence.clone(),
+        )
+        .expect("first eligible occurrence releases and evaluates exactly once");
+        release_proof.validate().expect("release proof validates");
+        let mut substituted_history_head = release_proof.clone();
+        substituted_history_head.history_entry_hash = "ab".repeat(32);
+        substituted_history_head
+            .resulting_history_head
+            .clone_from(&substituted_history_head.history_entry_hash);
+        substituted_history_head.proof_hash = substituted_history_head
+            .calculate_hash()
+            .expect("substituted proof reseals");
+        assert!(
+            substituted_history_head.validate().is_err(),
+            "a resealed proof cannot substitute an unbound occurrence-history head"
+        );
+        assert_eq!(
+            release_controls.machines()[0].kind(),
+            DraftProductionMachineControlKindV2::ReleaseAndEvaluate
+        );
+        assert!(released.imported_production_eligibilities.is_empty());
+        assert!(!released.base.production_queues.contains_key(&machine_id));
+        assert!(
+            !released
+                .production_job_origins
+                .contains_key(&completed_job_id)
+        );
+        assert_eq!(
+            released.base.ledger.refine_batches,
+            initial_ledger.refine_batches + 1
+        );
+        assert!(
+            released.committed_production_releases[release_controls.controls_root()].outcomes[0]
+                .ordinary_outcome
+                .is_some()
+        );
+        assert_eq!(
+            released
+                .base
+                .production_clock
+                .last_committed_quantum_sequence,
+            initial_clock.last_committed_quantum_sequence + 2
+        );
+        assert_eq!(
+            released.locked_transfer_for_subject(&package.root_aggregate_id),
+            Some(package.transfer_id.as_str())
+        );
+        assert_eq!(
+            DraftGridTransferCellStateV2::decode_canonical(
+                &released.encode_canonical().expect("released state encodes")
+            )
+            .expect("released state restarts"),
+            released
+        );
+        let (released_retry, released_retry_controls, released_retry_proof) =
+            stage_imported_production_occurrence_v2(
+                &released,
+                due_occurrence.scheduled_for_unix_ms + 10,
+                due_occurrence.clone(),
+            )
+            .expect("released occurrence redelivery is exact");
+        assert_eq!(released_retry, released);
+        assert_eq!(released_retry_controls, release_controls);
+        assert_eq!(released_retry_proof, release_proof);
+
+        let (historical_pause_retry, historical_pause_controls, historical_pause_proof) =
+            stage_imported_production_occurrence_v2(
+                &released,
+                due_occurrence.scheduled_for_unix_ms + 11,
+                early_occurrence,
+            )
+            .expect("an older paused occurrence remains exactly retryable");
+        assert_eq!(historical_pause_retry, released);
+        assert_eq!(historical_pause_controls, paused_controls);
+        assert_eq!(historical_pause_proof, paused_proof);
+
+        let mut deleted_historical_pause = released.clone();
+        deleted_historical_pause
+            .committed_production_releases
+            .remove(paused_controls.controls_root());
+        assert!(
+            deleted_historical_pause.seal().is_err(),
+            "the active history head detects deletion behind the current frontier"
+        );
+
+        let (activated, _) =
+            stage_imported_grid_activation_v2(&released, eligible_at + 2_000, &package, &authority)
+                .expect("production may re-arm before the independent gameplay activation");
+        assert!(activated.pending_imports.is_empty());
+        assert!(activated.imported_production_eligibilities.is_empty());
+        activated
+            .validate()
+            .expect("post-release activation validates");
+    }
+
+    #[test]
+    fn imported_production_occurrence_rejects_queue_and_release_history_tamper() {
+        let imported = materialized_import_state_fixture();
+        let eligibility = imported
+            .imported_production_eligibilities
+            .first_key_value()
+            .map(|(_, eligibility)| eligibility.clone())
+            .expect("fixture carries one imported machine hold");
+        let occurrence = next_occurrence(&imported, eligibility.eligible_at_unix_ms());
+
+        let mut queue_tamper = imported.clone();
+        queue_tamper
+            .base
+            .production_queues
+            .values_mut()
+            .next()
+            .and_then(|queue| queue.front_mut())
+            .expect("fixture queue exists")
+            .progress_ticks += 1;
+        assert!(
+            stage_imported_production_occurrence_v2(
+                &queue_tamper,
+                occurrence.scheduled_for_unix_ms,
+                occurrence.clone(),
+            )
+            .is_err()
+        );
+
+        let (released, controls, _) = stage_imported_production_occurrence_v2(
+            &imported,
+            occurrence.scheduled_for_unix_ms,
+            occurrence,
+        )
+        .expect("eligible occurrence commits");
+        let mut resurrected = released.clone();
+        resurrected.imported_production_eligibilities.insert(
+            eligibility.machine_block_id().to_owned(),
+            eligibility.clone(),
+        );
+        assert!(resurrected.seal().is_err());
+
+        let mut missing_history = released.clone();
+        missing_history
+            .committed_production_releases
+            .remove(controls.controls_root());
+        assert!(missing_history.seal().is_err());
+
+        let mut outcome_tamper = released;
+        outcome_tamper
+            .committed_production_releases
+            .get_mut(controls.controls_root())
+            .expect("release history exists")
+            .outcomes[0]
+            .ordinary_outcome
+            .as_mut()
+            .expect("release has ordinary outcome")
+            .new_progress_ticks += 1;
+        assert!(outcome_tamper.seal().is_err());
     }
 
     #[test]
@@ -4796,7 +5997,7 @@ mod tests {
         assert_eq!(receipt.destination_draft_world_hash, state.state_hash);
         assert_eq!(
             receipt.receipt_hash,
-            "682436ef198cf9a198cc6cbcbda1627db76a57665392b2d5726f2afc7b62e253"
+            "0f0bb1f856571843ce4ba48554359091636faa669e367bc61e563cb46635e9c0"
         );
 
         let (retry_state, retry_receipt) =

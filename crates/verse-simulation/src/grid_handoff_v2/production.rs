@@ -25,6 +25,8 @@ const IMPORTED_PRODUCTION_ELIGIBILITY_HASH_DOMAIN: &[u8] =
 const IMPORTED_PRODUCTION_ELIGIBILITY_MAP_ROOT_DOMAIN: &[u8] =
     b"the-verse/imported-production-eligibility-map/v2\0";
 const IMPORTED_PRODUCTION_QUEUE_HASH_DOMAIN: &[u8] = b"the-verse/imported-production-queue/v2\0";
+const IMPORTED_PRODUCTION_CONTROLS_ROOT_DOMAIN: &[u8] =
+    b"the-verse/imported-production-controls/v2\0";
 const PRODUCTION_IMPORT_REARM_MILLIS: u64 = 1_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -177,10 +179,36 @@ pub(super) struct DraftProductionImportAuthorityV2 {
     destination_production_lifecycle_generation: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(super) enum DraftImportedProductionDecisionV2 {
     TransferPaused,
     ReleaseAndEvaluate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum DraftProductionMachineControlKindV2 {
+    Evaluate,
+    TransferPaused,
+    ReleaseAndEvaluate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct DraftProductionMachineControlV2 {
+    grid_id: String,
+    machine_block_id: String,
+    kind: DraftProductionMachineControlKindV2,
+    eligibility_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct DraftImportedProductionOccurrenceControlsV2 {
+    occurrence: ProductionScheduleOccurrence,
+    machines: Vec<DraftProductionMachineControlV2>,
+    controls_root: String,
 }
 
 impl DraftImportedProductionEligibilityV2 {
@@ -294,6 +322,7 @@ impl DraftImportedProductionEligibilityV2 {
             || self.universe_manifest_hash != world.universe_manifest_hash
             || self.celestial_registry_hash != world.celestial_registry_hash
             || self.destination_cell_id != world.cell_id
+            || world.fencing_token < self.destination_fencing_token
             || self.destination_production_lifecycle_generation
                 != world.production_clock.lifecycle_generation
             || self
@@ -325,6 +354,37 @@ impl DraftImportedProductionEligibilityV2 {
 
     pub(super) fn eligibility_hash(&self) -> &str {
         &self.eligibility_hash
+    }
+
+    pub(super) fn contains_job_id(&self, job_id: &str) -> bool {
+        self.ordered_job_ids
+            .iter()
+            .any(|candidate| candidate == job_id)
+    }
+
+    pub(super) fn eligible_at_unix_ms(&self) -> u64 {
+        self.eligible_at_unix_ms
+    }
+
+    pub(super) fn validate_release_occurrence(
+        &self,
+        occurrence: &ProductionScheduleOccurrence,
+    ) -> Result<(), DraftGridClosureError> {
+        self.validate()?;
+        if occurrence.schema_version != PRODUCTION_SCHEDULE_OCCURRENCE_SCHEMA_VERSION
+            || occurrence.universe_id != self.universe_id
+            || occurrence.cell_id != self.destination_cell_id
+            || occurrence.lifecycle_generation != self.destination_production_lifecycle_generation
+            || occurrence.production_quantum_sequence == 0
+            || occurrence.scheduled_for_unix_ms < self.eligible_at_unix_ms
+            || occurrence.universe_manifest_hash != self.universe_manifest_hash
+            || occurrence.celestial_registry_hash != self.celestial_registry_hash
+        {
+            return Err(DraftGridClosureError::Invalid(
+                "released eligibility does not bind its exact production occurrence".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub(super) fn validate_persisted_import_boundary(
@@ -485,6 +545,209 @@ impl DraftImportedProductionEligibilityV2 {
     }
 }
 
+impl DraftImportedProductionOccurrenceControlsV2 {
+    fn calculate_root(&self) -> Result<String, DraftGridClosureError> {
+        let mut material = self.clone();
+        material.controls_root.clear();
+        hash_json(IMPORTED_PRODUCTION_CONTROLS_ROOT_DOMAIN, &material)
+    }
+
+    pub(super) fn validate_for_world(
+        &self,
+        world: &WorldState,
+        eligibilities: &BTreeMap<String, DraftImportedProductionEligibilityV2>,
+    ) -> Result<(), DraftGridClosureError> {
+        self.validate_canonical()?;
+        validate_next_occurrence_for_world(world, &self.occurrence)?;
+        if self.machines.len() != world.production_queues.len() {
+            return Err(DraftGridClosureError::Invalid(
+                "imported production controls do not bind one exact cell occurrence".into(),
+            ));
+        }
+        let expected = derive_imported_production_occurrence_controls(
+            world,
+            eligibilities,
+            self.occurrence.clone(),
+        )?;
+        if self != &expected {
+            return Err(DraftGridClosureError::Invalid(
+                "imported production controls differ from the canonical machine decisions".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn validate_canonical(&self) -> Result<(), DraftGridClosureError> {
+        if self.machines.is_empty()
+            || self.machines.iter().any(|control| {
+                !valid_stable_id(&control.grid_id)
+                    || !valid_stable_id(&control.machine_block_id)
+                    || match control.kind {
+                        DraftProductionMachineControlKindV2::Evaluate => {
+                            control.eligibility_hash.is_some()
+                        }
+                        DraftProductionMachineControlKindV2::TransferPaused
+                        | DraftProductionMachineControlKindV2::ReleaseAndEvaluate => control
+                            .eligibility_hash
+                            .as_ref()
+                            .is_none_or(|hash| !valid_blake3_hex(hash)),
+                    }
+            })
+            || self.machines.windows(2).any(|pair| {
+                (&pair[0].grid_id, &pair[0].machine_block_id)
+                    >= (&pair[1].grid_id, &pair[1].machine_block_id)
+            })
+            || !valid_blake3_hex(&self.controls_root)
+            || self.controls_root != self.calculate_root()?
+        {
+            return Err(DraftGridClosureError::Invalid(
+                "imported production controls are not canonical ordered decisions".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn occurrence(&self) -> &ProductionScheduleOccurrence {
+        &self.occurrence
+    }
+
+    pub(super) fn machines(&self) -> &[DraftProductionMachineControlV2] {
+        &self.machines
+    }
+
+    pub(super) fn controls_root(&self) -> &str {
+        &self.controls_root
+    }
+}
+
+impl DraftProductionMachineControlV2 {
+    pub(super) fn grid_id(&self) -> &str {
+        &self.grid_id
+    }
+
+    pub(super) fn machine_block_id(&self) -> &str {
+        &self.machine_block_id
+    }
+
+    pub(super) fn kind(&self) -> DraftProductionMachineControlKindV2 {
+        self.kind
+    }
+
+    pub(super) fn eligibility_hash(&self) -> Option<&str> {
+        self.eligibility_hash.as_deref()
+    }
+}
+
+fn validate_next_occurrence_for_world(
+    world: &WorldState,
+    occurrence: &ProductionScheduleOccurrence,
+) -> Result<(), DraftGridClosureError> {
+    let expected_sequence = world
+        .production_clock
+        .last_committed_quantum_sequence
+        .checked_add(1)
+        .ok_or_else(|| {
+            DraftGridClosureError::Unsupported("production occurrence sequence is exhausted".into())
+        })?;
+    let time_is_valid = if world.production_clock.last_committed_quantum_sequence == 0 {
+        occurrence.scheduled_for_unix_ms > 0
+    } else {
+        world
+            .production_clock
+            .last_scheduled_for_unix_ms
+            .checked_add(PRODUCTION_IMPORT_REARM_MILLIS)
+            .is_some_and(|earliest| occurrence.scheduled_for_unix_ms >= earliest)
+    };
+    if occurrence.schema_version != PRODUCTION_SCHEDULE_OCCURRENCE_SCHEMA_VERSION
+        || occurrence.universe_id != world.universe_id
+        || occurrence.cell_id != world.cell_id
+        || occurrence.lifecycle_generation != world.production_clock.lifecycle_generation
+        || occurrence.production_quantum_sequence != expected_sequence
+        || occurrence.universe_manifest_hash != world.universe_manifest_hash
+        || occurrence.celestial_registry_hash != world.celestial_registry_hash
+        || !time_is_valid
+    {
+        return Err(DraftGridClosureError::Invalid(
+            "production occurrence is not the exact next destination cell quantum".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn derive_imported_production_occurrence_controls(
+    world: &WorldState,
+    eligibilities: &BTreeMap<String, DraftImportedProductionEligibilityV2>,
+    occurrence: ProductionScheduleOccurrence,
+) -> Result<DraftImportedProductionOccurrenceControlsV2, DraftGridClosureError> {
+    validate_next_occurrence_for_world(world, &occurrence)?;
+    for (machine_id, eligibility) in eligibilities {
+        let queue = world.production_queues.get(machine_id).ok_or_else(|| {
+            DraftGridClosureError::Invalid(
+                "import eligibility has no queue in the destination occurrence".into(),
+            )
+        })?;
+        if machine_id != eligibility.machine_block_id() {
+            return Err(DraftGridClosureError::Invalid(
+                "import eligibility key changed before scheduler evaluation".into(),
+            ));
+        }
+        eligibility.validate_persisted_in_world(world, queue)?;
+    }
+
+    let mut scheduled = world
+        .production_queues
+        .keys()
+        .map(|machine_block_id| {
+            world
+                .block_grid(machine_block_id)
+                .map(|(grid, _)| (grid.grid_id.clone(), machine_block_id.clone()))
+                .ok_or_else(|| {
+                    DraftGridClosureError::Invalid(
+                        "imported production control references a missing machine".into(),
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    scheduled.sort();
+    let mut machines = Vec::with_capacity(scheduled.len());
+    for (grid_id, machine_block_id) in scheduled {
+        let queue = &world.production_queues[&machine_block_id];
+        let (kind, eligibility_hash) = if let Some(eligibility) =
+            eligibilities.get(&machine_block_id)
+        {
+            let ordered_job_ids = queue
+                .iter()
+                .map(|job| job.job_id.clone())
+                .collect::<Vec<_>>();
+            let decision = eligibility.decision_for_occurrence(&ordered_job_ids, &occurrence)?;
+            let kind = match decision {
+                DraftImportedProductionDecisionV2::TransferPaused => {
+                    DraftProductionMachineControlKindV2::TransferPaused
+                }
+                DraftImportedProductionDecisionV2::ReleaseAndEvaluate => {
+                    DraftProductionMachineControlKindV2::ReleaseAndEvaluate
+                }
+            };
+            (kind, Some(eligibility.eligibility_hash().to_owned()))
+        } else {
+            (DraftProductionMachineControlKindV2::Evaluate, None)
+        };
+        machines.push(DraftProductionMachineControlV2 {
+            grid_id,
+            machine_block_id,
+            kind,
+            eligibility_hash,
+        });
+    }
+    let mut controls = DraftImportedProductionOccurrenceControlsV2 {
+        occurrence,
+        machines,
+        controls_root: String::new(),
+    };
+    controls.controls_root = controls.calculate_root()?;
+    Ok(controls)
+}
+
 impl DraftProductionImportAuthorityV2 {
     /// Builds the private production capability after the destination import
     /// transaction has derived every field from validated directory, cell
@@ -602,6 +865,7 @@ pub(super) fn imported_production_eligibility_map_root(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use verse_protocol::{InventoryContents, ProductionRecipeKind};
 
     fn eligibility() -> DraftImportedProductionEligibilityV2 {
         DraftImportedProductionEligibilityV2::test_fixture()
@@ -619,6 +883,65 @@ mod tests {
             universe_manifest_hash: boundary.universe_manifest_hash,
             celestial_registry_hash: boundary.celestial_registry_hash,
         }
+    }
+
+    #[test]
+    fn whole_cell_controls_use_canonical_grid_then_machine_order() {
+        let mut world = WorldState::genesis(801);
+        let industry = world
+            .grids
+            .remove("grid-industry-starter")
+            .expect("starter industry grid exists");
+        let mut first_grid = industry.clone();
+        first_grid.grid_id = "grid-a".into();
+        first_grid
+            .blocks
+            .retain(|block_id, _| block_id == "block-refinery");
+        let mut second_grid = industry;
+        second_grid.grid_id = "grid-z".into();
+        second_grid
+            .blocks
+            .retain(|block_id, _| block_id == "block-assembler");
+        world.grids.insert(first_grid.grid_id.clone(), first_grid);
+        world.grids.insert(second_grid.grid_id.clone(), second_grid);
+        let job = |job_id: &str, machine_block_id: &str| ProductionJob {
+            job_id: job_id.into(),
+            operation_id: format!("operation-{job_id}"),
+            owner_player_id: world.player.primary_player_id.clone(),
+            machine_block_id: machine_block_id.into(),
+            recipe: ProductionRecipeKind::Refining,
+            content_manifest_version: world.content_manifest_version.clone(),
+            batches: 1,
+            source_inventory_id: world.player.inventory_id.clone(),
+            destination_inventory_id: world.player.inventory_id.clone(),
+            progress_ticks: 0,
+            duration_ticks: 60,
+            reserved_inputs: InventoryContents::default(),
+            pending_outputs: InventoryContents::default(),
+            queued_event_sequence: 1,
+        };
+        world.production_queues.insert(
+            "block-assembler".into(),
+            VecDeque::from([job("job-assembler", "block-assembler")]),
+        );
+        world.production_queues.insert(
+            "block-refinery".into(),
+            VecDeque::from([job("job-refinery", "block-refinery")]),
+        );
+        let occurrence = world
+            .next_production_occurrence_at(1_800_000_000_000)
+            .expect("occurrence derives");
+        let controls =
+            derive_imported_production_occurrence_controls(&world, &BTreeMap::new(), occurrence)
+                .expect("controls derive");
+        assert_eq!(
+            controls
+                .machines()
+                .iter()
+                .map(|control| (control.grid_id(), control.machine_block_id()))
+                .collect::<Vec<_>>(),
+            vec![("grid-a", "block-refinery"), ("grid-z", "block-assembler")]
+        );
     }
 
     #[test]
