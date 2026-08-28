@@ -18,6 +18,7 @@ use crate::cell_directory::{
 };
 use crate::grid_handoff_v2::state::{
     DraftGridAbortCleanupProofV2, DraftGridExportProofV2, DraftGridTransferAbortSideV2,
+    DraftGridTransferLedgerVectorV2,
 };
 use crate::{celestial, model::valid_blake3_hex};
 
@@ -71,6 +72,9 @@ pub(super) struct DirectoryPhaseProofV3 {
     world_hash: String,
     quarantine_receipt_hash: Option<String>,
     export_proof_hash: Option<String>,
+    mutation_witness_hash: Option<String>,
+    ledger_vector: Option<DraftGridTransferLedgerVectorV2>,
+    trusted_time_unix_ms: Option<u64>,
     abort_witness_hash: Option<String>,
     resulting_draft_world_hash: Option<String>,
     abort_removed_authority: Option<bool>,
@@ -107,6 +111,10 @@ impl DirectoryPhaseProofV3 {
 
     pub(super) fn export_proof_hash(&self) -> Option<&str> {
         self.export_proof_hash.as_deref()
+    }
+
+    pub(super) fn trusted_time_unix_ms(&self) -> Option<u64> {
+        self.trusted_time_unix_ms
     }
 }
 
@@ -617,6 +625,9 @@ impl CellTransferRecordV3 {
         if let Some(hash) = &proof.export_proof_hash {
             validate_hash(hash, "source-export proof")?;
         }
+        if let Some(hash) = &proof.mutation_witness_hash {
+            validate_hash(hash, "source-export mutation witness")?;
+        }
         if let Some(hash) = &proof.resulting_draft_world_hash {
             validate_hash(hash, "resulting draft world")?;
         }
@@ -625,9 +636,40 @@ impl CellTransferRecordV3 {
             DirectoryPhaseProofKindV3::SourceAbort | DirectoryPhaseProofKindV3::DestinationAbort
         );
         let export_binding_valid = if expected_kind == DirectoryPhaseProofKindV3::SourceExport {
-            proof.export_proof_hash.is_some()
+            proof
+                .export_proof_hash
+                .as_ref()
+                .zip(proof.mutation_witness_hash.as_ref())
+                .zip(proof.ledger_vector)
+                .is_some_and(|((proof_hash, mutation_witness_hash), ledger_vector)| {
+                    DraftGridExportProofV2 {
+                        transfer_id: proof.transfer_id.clone(),
+                        root_aggregate_id: self.root_aggregate_id.clone(),
+                        member_root: proof.member_root.clone(),
+                        package_hash: proof.package_hash.clone(),
+                        source_cell_id: proof.cell_id.clone(),
+                        assignment_generation: proof.assignment_generation,
+                        fencing_token: proof.fencing_token,
+                        event_sequence: proof.event_sequence,
+                        event_hash: proof.event_hash.clone(),
+                        resulting_active_world_hash: proof.world_hash.clone(),
+                        quarantine_receipt_hash: proof
+                            .quarantine_receipt_hash
+                            .clone()
+                            .unwrap_or_default(),
+                        exported_at_unix_ms: proof.trusted_time_unix_ms.unwrap_or_default(),
+                        mutation_witness_hash: mutation_witness_hash.clone(),
+                        proof_hash: proof_hash.clone(),
+                        ledger_vector,
+                    }
+                    .validate()
+                    .is_ok()
+                })
         } else {
             proof.export_proof_hash.is_none()
+                && proof.mutation_witness_hash.is_none()
+                && proof.ledger_vector.is_none()
+                && proof.trusted_time_unix_ms.is_none()
         };
         let abort_binding_valid = if is_abort {
             proof.resulting_draft_world_hash.as_deref() == Some(proof.world_hash.as_str())
@@ -1338,6 +1380,9 @@ fn stage_v3_source_exported(
         world_hash: export.resulting_active_world_hash.clone(),
         quarantine_receipt_hash: Some(export.quarantine_receipt_hash.clone()),
         export_proof_hash: Some(export.proof_hash.clone()),
+        mutation_witness_hash: Some(export.mutation_witness_hash.clone()),
+        ledger_vector: Some(export.ledger_vector),
+        trusted_time_unix_ms: Some(export.exported_at_unix_ms),
         abort_witness_hash: None,
         resulting_draft_world_hash: None,
         abort_removed_authority: None,
@@ -1505,6 +1550,9 @@ fn stage_v3_abort_cleanup(
         world_hash: cleanup.resulting_draft_world_hash.clone(),
         quarantine_receipt_hash: cleanup.quarantine_receipt_hash.clone(),
         export_proof_hash: None,
+        mutation_witness_hash: None,
+        ledger_vector: None,
+        trusted_time_unix_ms: None,
         abort_witness_hash: Some(cleanup.abort_witness_hash.clone()),
         resulting_draft_world_hash: Some(cleanup.resulting_draft_world_hash.clone()),
         abort_removed_authority: Some(cleanup.removed_authority),
@@ -1984,8 +2032,10 @@ mod tests {
             } else {
                 None
             },
-            export_proof_hash: (kind == DirectoryPhaseProofKindV3::SourceExport)
-                .then(|| blake3::hash(b"source export proof").to_hex().to_string()),
+            export_proof_hash: None,
+            mutation_witness_hash: None,
+            ledger_vector: None,
+            trusted_time_unix_ms: None,
             abort_witness_hash: is_abort.then(|| {
                 blake3::hash(&[label, b"-witness"].concat())
                     .to_hex()
@@ -1994,6 +2044,41 @@ mod tests {
             resulting_draft_world_hash: is_abort.then_some(world_hash),
             abort_removed_authority: is_abort.then_some(true),
         };
+        if kind == DirectoryPhaseProofKindV3::SourceExport {
+            let ledger_vector = DraftGridTransferLedgerVectorV2 {
+                ore: 3,
+                refined_material: 5,
+                components: 7,
+            };
+            let mut export = DraftGridExportProofV2 {
+                transfer_id: proof.transfer_id.clone(),
+                root_aggregate_id: transfer.root_aggregate_id.clone(),
+                member_root: proof.member_root.clone(),
+                package_hash: proof.package_hash.clone(),
+                source_cell_id: proof.cell_id.clone(),
+                assignment_generation: proof.assignment_generation,
+                fencing_token: proof.fencing_token,
+                event_sequence: proof.event_sequence,
+                event_hash: String::new(),
+                resulting_active_world_hash: proof.world_hash.clone(),
+                quarantine_receipt_hash: proof
+                    .quarantine_receipt_hash
+                    .clone()
+                    .expect("source export binds quarantine receipt"),
+                exported_at_unix_ms: 1_800_000_000_000,
+                mutation_witness_hash: blake3::hash(b"source export mutation").to_hex().to_string(),
+                proof_hash: String::new(),
+                ledger_vector,
+            };
+            export
+                .seal_hashes_for_test()
+                .expect("source export proof seals");
+            proof.event_hash = export.event_hash;
+            proof.export_proof_hash = Some(export.proof_hash);
+            proof.mutation_witness_hash = Some(export.mutation_witness_hash);
+            proof.ledger_vector = Some(ledger_vector);
+            proof.trusted_time_unix_ms = Some(export.exported_at_unix_ms);
+        }
         if is_abort {
             let mut cleanup = DraftGridAbortCleanupProofV2 {
                 side: match kind {
@@ -2757,6 +2842,30 @@ mod tests {
             .export_proof_hash = None;
         missing_export_witness.document_hash = missing_export_witness.calculate_hash().unwrap();
         assert!(missing_export_witness.validate().is_err());
+
+        let mut substituted_export_world = finalized_document();
+        substituted_export_world
+            .transfers
+            .get_mut("transfer-grid-v3-proof")
+            .expect("transfer exists")
+            .source_export_proof
+            .as_mut()
+            .expect("source export exists")
+            .world_hash = "ab".repeat(32);
+        substituted_export_world.document_hash = substituted_export_world.calculate_hash().unwrap();
+        assert!(substituted_export_world.validate().is_err());
+
+        let mut missing_export_mutation = finalized_document();
+        missing_export_mutation
+            .transfers
+            .get_mut("transfer-grid-v3-proof")
+            .expect("transfer exists")
+            .source_export_proof
+            .as_mut()
+            .expect("source export exists")
+            .mutation_witness_hash = None;
+        missing_export_mutation.document_hash = missing_export_mutation.calculate_hash().unwrap();
+        assert!(missing_export_mutation.validate().is_err());
 
         let mut finalized = finalized_document();
         finalized

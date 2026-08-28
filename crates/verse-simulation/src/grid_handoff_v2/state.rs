@@ -22,7 +22,7 @@ use super::{
     valid_blake3_hex, valid_stable_id, validate_adjacent_cells, validate_destination_conflicts,
 };
 use crate::cell_directory::TransferPhase;
-use crate::cell_directory_v3::ValidatedGridTransferAuthorityV3;
+use crate::cell_directory_v3::{DirectoryPhaseProofV3, ValidatedGridTransferAuthorityV3};
 use crate::model::{TransferConservationWitness, TransferWitnessDirection};
 
 const DRAFT_GRID_CELL_STATE_SCHEMA_VERSION: u32 = 21;
@@ -149,10 +149,10 @@ struct DraftGridTransferAbortWitnessV2 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct DraftGridTransferLedgerVectorV2 {
-    ore: u64,
-    refined_material: u64,
-    components: u64,
+pub(crate) struct DraftGridTransferLedgerVectorV2 {
+    pub(crate) ore: u64,
+    pub(crate) refined_material: u64,
+    pub(crate) components: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -192,9 +192,10 @@ pub(crate) struct DraftGridExportProofV2 {
     pub(crate) event_hash: String,
     pub(crate) resulting_active_world_hash: String,
     pub(crate) quarantine_receipt_hash: String,
+    pub(crate) exported_at_unix_ms: u64,
     pub(crate) mutation_witness_hash: String,
     pub(crate) proof_hash: String,
-    ledger_vector: DraftGridTransferLedgerVectorV2,
+    pub(crate) ledger_vector: DraftGridTransferLedgerVectorV2,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -254,11 +255,50 @@ struct DraftGridDirectoryAuthorityV2 {
     phase: TransferPhase,
     quarantine_receipt_hash: Option<String>,
     source_export_proof_hash: Option<String>,
+    source_exported_at_unix_ms: Option<u64>,
     proofs: BTreeSet<DraftGridDirectoryProofKindV2>,
     live_source_assignment_generation: u64,
     live_source_fencing_token: u64,
     live_destination_assignment_generation: u64,
     live_destination_fencing_token: u64,
+}
+
+/// Sealed import boundary built only by the destination state transaction.
+/// Production scheduling may read it but cannot construct scalar authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ValidatedDraftGridImportBoundaryV2 {
+    destination_assignment_generation: u64,
+    destination_fencing_token: u64,
+    import_event_sequence: u64,
+    import_event_hash: String,
+    trusted_import_unix_ms: u64,
+    destination_production_lifecycle_generation: u64,
+}
+
+impl ValidatedDraftGridImportBoundaryV2 {
+    pub(super) fn destination_assignment_generation(&self) -> u64 {
+        self.destination_assignment_generation
+    }
+
+    pub(super) fn destination_fencing_token(&self) -> u64 {
+        self.destination_fencing_token
+    }
+
+    pub(super) fn import_event_sequence(&self) -> u64 {
+        self.import_event_sequence
+    }
+
+    pub(super) fn import_event_hash(&self) -> &str {
+        &self.import_event_hash
+    }
+
+    pub(super) fn trusted_import_unix_ms(&self) -> u64 {
+        self.trusted_import_unix_ms
+    }
+
+    pub(super) fn destination_production_lifecycle_generation(&self) -> u64 {
+        self.destination_production_lifecycle_generation
+    }
 }
 
 impl DraftGridTransferBindingV2 {
@@ -419,6 +459,9 @@ impl DraftGridDirectoryAuthorityV2 {
                 .source_export_proof()
                 .and_then(|proof| proof.export_proof_hash())
                 .map(str::to_owned),
+            source_exported_at_unix_ms: authority
+                .source_export_proof()
+                .and_then(DirectoryPhaseProofV3::trusted_time_unix_ms),
             proofs,
             live_source_assignment_generation: authority.live_source_assignment_generation(),
             live_source_fencing_token: authority.live_source_fencing_token(),
@@ -435,6 +478,7 @@ impl DraftGridDirectoryAuthorityV2 {
             phase,
             quarantine_receipt_hash: None,
             source_export_proof_hash: None,
+            source_exported_at_unix_ms: None,
             proofs: BTreeSet::new(),
             live_source_assignment_generation: package.source_assignment_generation,
             live_source_fencing_token: package.source_fencing_token,
@@ -528,6 +572,7 @@ impl DraftGridDirectoryAuthorityV2 {
         } && (has_receipt == has_quarantine)
             && (!has_quarantine || has_prepare)
             && (has_export == self.source_export_proof_hash.is_some())
+            && (has_export == self.source_exported_at_unix_ms.is_some())
             && (!has_import || has_export)
             && (!has_activation || has_import)
             && (!has_finalization || has_activation);
@@ -559,6 +604,7 @@ impl DraftGridDirectoryAuthorityV2 {
                 .source_export_proof_hash
                 .as_ref()
                 .is_some_and(|hash| !valid_blake3_hex(hash))
+            || self.source_exported_at_unix_ms == Some(0)
         {
             return Err(DraftGridClosureError::Invalid(
                 "directory authority does not bind the exact grid package".into(),
@@ -966,6 +1012,7 @@ impl DraftGridExportRecordV2 {
             event_hash: self.export_event_hash.clone(),
             resulting_active_world_hash: self.resulting_active_world_hash.clone(),
             quarantine_receipt_hash: self.quarantine_receipt_hash.clone(),
+            exported_at_unix_ms: self.exported_at_unix_ms,
             mutation_witness_hash: self.mutation_witness_hash.clone(),
             proof_hash: self.proof_hash.clone(),
             ledger_vector: self.ledger_vector,
@@ -1005,6 +1052,17 @@ impl DraftGridExportProofV2 {
         hash_json(EXPORT_PROOF_HASH_DOMAIN, &material)
     }
 
+    #[cfg(test)]
+    pub(crate) fn seal_hashes_for_test(&mut self) -> Result<(), String> {
+        self.event_hash.clear();
+        self.proof_hash.clear();
+        self.event_hash = self
+            .calculate_event_hash()
+            .map_err(|source| source.to_string())?;
+        self.proof_hash = self.calculate_hash().map_err(|source| source.to_string())?;
+        self.validate()
+    }
+
     pub(crate) fn validate(&self) -> Result<(), String> {
         if !valid_stable_id(&self.transfer_id)
             || !valid_stable_id(&self.root_aggregate_id)
@@ -1021,6 +1079,7 @@ impl DraftGridExportProofV2 {
                     .map_err(|source| source.to_string())?
             || !valid_blake3_hex(&self.resulting_active_world_hash)
             || !valid_blake3_hex(&self.quarantine_receipt_hash)
+            || self.exported_at_unix_ms == 0
             || !valid_blake3_hex(&self.mutation_witness_hash)
             || !valid_blake3_hex(&self.proof_hash)
             || self.proof_hash != self.calculate_hash().map_err(|source| source.to_string())?
@@ -2602,6 +2661,7 @@ mod tests {
             .proofs
             .insert(DraftGridDirectoryProofKindV2::SourceExport);
         directory_proven.source_export_proof_hash = Some(proof.proof_hash.clone());
+        directory_proven.source_exported_at_unix_ms = Some(proof.exported_at_unix_ms);
         let (_, committed_proof_retry) = stage_committed_grid_export_v2(
             &exported,
             1_800_000_025_000,
