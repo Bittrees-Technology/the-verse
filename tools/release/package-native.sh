@@ -4,7 +4,7 @@ set -euo pipefail
 
 verse_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 godot_binary="${GODOT_BIN:-}"
-release_version="${VERSE_RELEASE_VERSION:-p0.10.0-dev}"
+release_version="${VERSE_RELEASE_VERSION:-p1.5.0-dev}"
 release_root="${verse_root}/artifacts/release"
 staging_root="${release_root}/staging"
 
@@ -21,20 +21,20 @@ sha256_file() {
   fi
 }
 
-case "$(uname -s)" in
-  Darwin)
+case "$(uname -s)-$(uname -m)" in
+  Darwin-arm64)
     release_platform="macos-arm64"
     export_preset="macOS Universal"
     default_godot="${verse_root}/artifacts/toolchains/godot-4.7.2/Godot.app/Contents/MacOS/Godot"
     export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-11.0}"
     ;;
-  Linux)
+  Linux-x86_64)
     release_platform="linux-x86_64"
     export_preset="Linux x86_64"
     default_godot=""
     ;;
   *)
-    echo "Unsupported packaging host: $(uname -s)" >&2
+    echo "Unsupported packaging host: $(uname -s) $(uname -m)" >&2
     exit 1
     ;;
 esac
@@ -54,7 +54,7 @@ fi
 package_name="the-verse-${release_version}-${release_platform}"
 staging_directory="${staging_root}/${package_name}"
 rm -rf "${staging_directory}"
-mkdir -p "${staging_directory}/licenses"
+mkdir -p "${staging_directory}/browser-verifier" "${staging_directory}/licenses"
 
 cd "${verse_root}"
 commit_sha="$(git rev-parse HEAD)"
@@ -68,6 +68,18 @@ else
   source_revision="${commit_sha}"
 fi
 cargo build --locked --release -p verse-simulation-worker
+tools/ci/build-native-verifier.sh release
+for browser_asset in \
+  verse_interest_verifier.js \
+  verse_interest_verifier_bg.wasm; do
+  if [[ ! -s "apps/web-command-center/generated/${browser_asset}" ]]; then
+    echo "Missing committed browser verifier asset: ${browser_asset}" >&2
+    exit 1
+  fi
+  cp \
+    "apps/web-command-center/generated/${browser_asset}" \
+    "${staging_directory}/browser-verifier/${browser_asset}"
+done
 
 if [[ "${release_platform}" == "macos-arm64" ]]; then
   "${godot_binary}" \
@@ -99,10 +111,17 @@ cp tools/release/runtime/README.txt "${staging_directory}/README.txt"
 printf '%s\n' \
   "The Verse ${release_version}" \
   "Source revision: ${source_revision}" \
-  "Content manifest: p0.10.0" \
-  "Protocol: 10" \
-  "World schema: 13" \
-  "Event schema: 8" \
+  "Content manifest: p1.5.0" \
+  "Content schema: 11" \
+  "Protocol: 16" \
+  "Projection schema: 3" \
+  "World schema: 18" \
+  "Event schema: 14" \
+  "Celestial registry schema: 1" \
+  "Universe manifest schema: 2" \
+  "Interest schema: 1" \
+  "Interest verifier encoding: 1" \
+  "Browser verifier generator: wasm-bindgen 0.2.127" \
   "Package: ${release_platform}" \
   "Channel: development" \
   > "${staging_directory}/VERSION.txt"

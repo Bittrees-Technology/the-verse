@@ -1,0 +1,134 @@
+{
+  "schema_version": 1,
+  "license": "CC-BY-SA-4.0",
+  "universe_id": "the-verse-local",
+  "generation_rule_version": "p1.5-proof-1",
+  "minimum_fixed_body_surface_gap_um": 3000000000,
+  "bodies": [
+    {
+      "body_id": "khepri-prime",
+      "display_name": "Khepri Prime",
+      "kind": "planet",
+      "center": {
+        "universe_id": "the-verse-local",
+        "sector": { "x": "0", "y": "0", "z": "0" },
+        "cell": { "x": 500, "y": 500, "z": 500 },
+        "local_um": { "x": 900000000, "y": -2200000000, "z": -3800000000 }
+      },
+      "surface_radius_um": 1200000000,
+      "exclusion_radius_um": 1380000000,
+      "fixed_orientation_microradians": { "x": 0, "y": -558505, "z": -191986 },
+      "surface_gravity_millimetres_per_second_squared": 6200,
+      "atmosphere_height_um": 180000000,
+      "oxygen_parts_per_million": 190000,
+      "geometry_definition_id": "sphere-heightfield-v1",
+      "material_definition_id": "terrestrial-regolith-v1",
+      "gravity_definition_id": "radial-inverse-square-v1",
+      "atmosphere_definition_id": "oxygen-gradient-v1",
+      "resource_definition_id": "none-v1",
+      "visual_descriptor_id": "khepri-prime-terrestrial-v1",
+      "scale_class": "proof",
+      "generation_seed_offset": 101,
+      "materialized_registry_version": 1
+    },
+    {
+      "body_id": "origin-asteroid",
+      "display_name": "Origin Ferrite Asteroid",
+      "kind": "asteroid",
+      "field_id": "origin-field",
+      "center": {
+        "universe_id": "the-verse-local",
+        "sector": { "x": "0", "y": "0", "z": "0" },
+        "cell": { "x": 500, "y": 500, "z": 500 },
+        "local_um": { "x": 0, "y": 0, "z": 0 }
+      },
+      "surface_radius_um": 10000000,
+      "exclusion_radius_um": 12000000,
+      "fixed_orientation_microradians": { "x": 0, "y": 0, "z": 0 },
+      "surface_gravity_millimetres_per_second_squared": 0,
+      "atmosphere_height_um": 0,
+      "oxygen_parts_per_million": 0,
+      "voxel_field_id": "voxel-field-origin",
+      "geometry_definition_id": "procedural-voxel-v1",
+      "voxel_definition_id": "origin-voxel-field-v1",
+      "material_definition_id": "ferrite-regolith-v1",
+      "gravity_definition_id": "none-v1",
+      "atmosphere_definition_id": "none-v1",
+      "resource_definition_id": "ferrite-deposit-v1",
+      "visual_descriptor_id": "origin-regolith-v1",
+      "scale_class": "proof",
+      "generation_seed_offset": 0,
+      "materialized_registry_version": 1
+    },
+    {
+      "body_id": "origin-field",
+      "display_name": "Origin Asteroid Field",
+      "kind": "asteroid_field",
+      "field_id": "origin-field",
+      "center": {
+        "universe_id": "the-verse-local",
+        "sector": {
+          "x": "0",
+          "y": "0",
+          "z": "0"
+        },
+        "cell": {
+          "x": 500,
+          "y": 500,
+          "z": 500
+        },
+        "local_um": {
+          "x": -50000000,
+          "y": 0,
+          "z": 0
+        }
+      },
+      "surface_radius_um": 100000000,
+      "exclusion_radius_um": 100000000,
+      "fixed_orientation_microradians": {
+        "x": 0,
+        "y": 0,
+        "z": 0
+      },
+      "surface_gravity_millimetres_per_second_squared": 0,
+      "atmosphere_height_um": 0,
+      "oxygen_parts_per_million": 0,
+      "geometry_definition_id": "procedural-voxel-v1",
+      "material_definition_id": "ferrite-regolith-v1",
+      "gravity_definition_id": "none-v1",
+      "atmosphere_definition_id": "none-v1",
+      "resource_definition_id": "ferrite-deposit-v1",
+      "visual_descriptor_id": "origin-regolith-v1",
+      "scale_class": "proof",
+      "generation_seed_offset": 1,
+      "materialized_registry_version": 1
+    },
+    {
+      "body_id": "sable-moon",
+      "display_name": "Sable",
+      "kind": "moon",
+      "parent_body_id": "khepri-prime",
+      "center": {
+        "universe_id": "the-verse-local",
+        "sector": { "x": "0", "y": "0", "z": "0" },
+        "cell": { "x": 500, "y": 500, "z": 500 },
+        "local_um": { "x": 5200000000, "y": 1600000000, "z": -8800000000 }
+      },
+      "surface_radius_um": 84000000,
+      "exclusion_radius_um": 84000000,
+      "fixed_orientation_microradians": { "x": 0, "y": 0, "z": 0 },
+      "surface_gravity_millimetres_per_second_squared": 0,
+      "atmosphere_height_um": 0,
+      "oxygen_parts_per_million": 0,
+      "geometry_definition_id": "sphere-heightfield-v1",
+      "material_definition_id": "airless-regolith-v1",
+      "gravity_definition_id": "none-v1",
+      "atmosphere_definition_id": "none-v1",
+      "resource_definition_id": "none-v1",
+      "visual_descriptor_id": "sable-airless-v1",
+      "scale_class": "proof",
+      "generation_seed_offset": 211,
+      "materialized_registry_version": 1
+    }
+  ]
+}

@@ -71,4 +71,5 @@ fi
 cmake --version | head -1
 cd "${verse_root}"
 cargo build -p verse-simulation-worker
+tools/ci/build-native-verifier.sh debug
 echo "VERSE_BOOTSTRAP_OK"

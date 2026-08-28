@@ -1,6 +1,6 @@
 # Clients and public APIs
 
-**Status:** Proposed baseline
+**Status:** Proposed product API baseline; P1.5 replication contract accepted
 
 ## Native client
 
@@ -18,6 +18,43 @@ The native macOS/Linux client is responsible for:
 It is not authoritative for inventory, damage, physics results, voxel changes, production, contracts, or market settlement.
 
 Character clients submit bounded controls with a server-owned movement epoch and monotonic input sequence, never transforms. A durable receipt advances the canonical received sequence; it does not claim that physics has consumed the control. The authoritative cell persists a bounded FIFO and consumes at most one transition per fixed substep, advancing a separate processed sequence that the native client uses to discard and replay prediction inputs. Reconnect resumes sequence allocation after the received frontier. The cell owns EVA pose, velocity, gravity, Jolt-backed collision, capsule support, locomotion kind, radial upright alignment, walk/sprint, jump, steps, slope transitions, magnetic attachment, moving-support velocity, and the compatibility `surface_contact` result under [ADR-0013](../decisions/ADR-0013-input-only-authoritative-character-motion.md) and [ADR-0014](../decisions/ADR-0014-authoritative-grounded-and-magnetic-locomotion.md).
+
+## P1.5 gameplay replication
+
+Protocol `16`, projection schema `3`, and interest schema `1` replace the
+complete-cell state stream with a server-derived session view. A player anchor
+comes only from the immutable authenticated actor binding. A spectator anchor
+requires a server-side grant. A camera, query coordinate, client-provided
+radius, or requested entity ID cannot widen the view.
+
+The first state message is a complete interest baseline carrying session and
+interest epochs, a baseline ID, observer class, cell and derived local-origin
+addresses, fixed registry and universe-manifest hashes, canonical event/tick
+frontier, global world commitment, and view hash. Contiguous deltas then carry
+ordered full enters, absolute component replacements, bounded removals, and an
+explicit absolute rebase when the derived local origin changes. The client
+applies a delta only when epoch, baseline, sequence, and previous hash match;
+otherwise it clears the partial view and requests one new baseline.
+
+The stream's `view_hash` covers only the complete audience-authorized projected
+view. It is a convergence check, not authority. Protocol `16` also carries the
+canonical event/tick frontier and global world commitment required by existing
+authoritative reconciliation. Those global values can signal out-of-view
+activity but do not describe hidden entities; subset clients converge with the
+view hash and must not infer hidden state from the global commitment.
+Actor-private inventory, production, operation, oxygen, drop, control, and
+exact owned-mass fields remain in the bound actor's overlay and are never
+inferred from spatial proximity. Carried inventory and control reconciliation
+remain control critical; ownership alone does not stream detailed remote cargo,
+mass, or production when the owning public grid or machine is outside the
+authorized active-cell view.
+
+Clients may predict already authorized local motion. An entity leaving
+interest is removed from presentation and targeting caches. That removal does
+not establish that the canonical entity was destroyed, and a loaded entity
+does not establish that an intent against it is valid. The server always
+reconstructs range, visibility, collision, ownership, and permissions from
+canonical state.
 
 ## Browser command center
 
@@ -70,6 +107,8 @@ No hidden “human-only” endpoint is required, but system NPCs must be identif
 ### Public reads
 
 - Universe and celestial registry.
+- Universe manifest schema/version/hash and celestial registry
+  schema/version/hash.
 - Market pools, quotes, trades, and liquidity.
 - Public companies and governance.
 - Public asset provenance.
@@ -102,7 +141,9 @@ No hidden “human-only” endpoint is required, but system NPCs must be identif
 - REST for commands and simple resources.
 - GraphQL for composed browser queries.
 - WebSocket or server-sent events for subscriptions.
-- Binary real-time protocol for native simulation replication.
+- Versioned real-time protocol for native simulation replication; P1.5 pins
+  baseline/delta semantics while the final production binary codec remains
+  later work.
 - Webhooks for approved server-to-server notifications.
 
 ## Versioning
@@ -111,6 +152,25 @@ No hidden “human-only” endpoint is required, but system NPCs must be identif
 - Breaking changes require a parallel support window.
 - Event schemas are immutable after publication; a new version creates a new schema name/version.
 - SDK releases identify the compatible API and content-manifest ranges.
+
+The P1.5 compatibility tuple is indivisible:
+
+| Boundary | Version |
+| --- | --- |
+| Gameplay protocol | `16` |
+| Projection schema | `3` |
+| World schema | `18` |
+| Event schema | `14` |
+| Content schema | `11` |
+| Content manifest | `p1.5.0` |
+| Celestial registry | `1` |
+| Universe manifest | `2` |
+| Interest schema | `1` |
+
+Handshake rejects any mismatch before state delivery. Protocol `15` may remain
+only on an explicitly local diagnostic endpoint and is never an automatic
+public downgrade. Reconnect creates a new session epoch and complete baseline;
+clients do not reuse old deltas or acknowledgements.
 
 ## Permission examples
 

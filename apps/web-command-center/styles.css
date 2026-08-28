@@ -130,6 +130,9 @@ main {
 .workspace { display: grid; grid-template-columns: minmax(0, 1fr) 350px; gap: 12px; }
 .map-panel { min-width: 0; padding: 16px; }
 .panel-heading { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+.map-toolbar { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 5px; }
+.map-toolbar button { min-width: 38px; min-height: 32px; padding: 6px 8px; }
+.map-toolbar button[aria-pressed="true"] { border-color: var(--cyan); background: #1b4055; }
 
 canvas {
   display: block;
@@ -137,7 +140,15 @@ canvas {
   min-height: 420px;
   border: 1px solid #193349;
   background: #03070c;
+  cursor: crosshair;
+  touch-action: none;
 }
+
+canvas.stale { filter: saturate(0.35); opacity: 0.76; }
+.layer-controls { display: flex; gap: 16px; align-items: center; padding-top: 9px; color: var(--muted); font-size: 0.7rem; }
+.layer-controls label { color: var(--muted); cursor: pointer; letter-spacing: 0.06em; }
+.layer-controls input { accent-color: var(--cyan); }
+.layer-controls span { margin-left: auto; color: var(--cyan); font-variant-numeric: tabular-nums; }
 
 aside { display: flex; flex-direction: column; gap: 12px; }
 .panel { padding: 17px; }

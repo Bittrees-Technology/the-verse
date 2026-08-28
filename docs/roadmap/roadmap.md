@@ -11,16 +11,69 @@ The bNOTE acquisition interface and Base BIT/bridge deployment manifest are inte
 ## Active P1 sequencing
 
 The [P1.4 physical-industry slice](../gameplay/physical-industry.md) is
-implemented and locally verified in the current authoritative cell before full
-interest management. Its queues and escrow are actor-private and do not depend
-on public-scale replication. Hosted CI remains its evidence gate. Interest
-management must next include visible machine state without exposing private
-queue or inventory fields.
+implemented and verified in the current authoritative cell. Its queues and
+escrow remain actor-private under the implemented P1.5 interest projection;
+visible machines expose only their permitted public structure and operating
+state.
 
 The first P1.4 slice advances production only in an active cell. Dynamic cell
 scheduling must reuse the same integer-tick production event before the project
 claims sleeping-cell, background, or offline production. This ordering improves
 the playable work loop without inventing a second production state machine.
+
+P1.5 is the active fixed-celestial and interest-management correctness slice. It pins
+the current planet and asteroid to immutable hierarchical universe addresses,
+validates a versioned proof separation threshold, and replaces whole-cell
+fanout with deterministic server-derived interest baselines and deltas. Player
+views follow authoritative position. The browser receives a bounded public
+spectator view. Visible machines may expose only coarse operating state; actor
+inventories, production queues, job details, progress, cargo handles, and
+escrow remain private.
+
+The local implementation now builds immutable public projection material once
+on first demand for each authoritative revision, uses exact-address spatial
+buckets for per-session candidate queries, and projects outside the runtime
+lock. The local distribution harness has admitted and resynchronized `2`, `8`,
+`16`, `32`, and `64` simultaneous public spectators with 25 visible entities
+per session. A synthetic regression adds 2,048 irrelevant far entities and
+proves the queried bucket count, visited candidate count, selected identities,
+and resulting view remain unchanged. These are local correctness and bounded-
+work results, not a production-capacity claim. The current revision
+independently reconstructs and hashes raw native and browser frames through one
+shared verifier, pins all four connection trust roots, preserves exact protocol
+integers, and proves a shipped browser page applies and acknowledges an
+untouched view while rejecting an in-flight tamper without either action.
+[CI run 33128613104](https://github.com/Bittrees-Technology/the-verse/actions/runs/33128613104)
+passes the complete Linux replay, Linux container probe, those independent
+verifier suites, and Linux/Apple Silicon packaging for implementation revision
+`71e955c`. Active-player load and the partitioned thousand-participant envelope
+remain open gates.
+
+P1.5 deliberately remains inside one active authoritative cell. It does not
+materialize frontier sectors, allocate workers dynamically, hand entities
+between cells, simulate multi-day routes, stream editable planets, provide
+arbitrary remote spectator cameras, or claim thousands-player capacity. Its
+correctness semantics are encoding-independent; the production binary codec,
+cross-cell execution, and public-scale soak evidence remain later P1 work.
+
+P1.5 acceptance requires:
+
+- Deterministic registry identity, normalized addresses, minimum-separation
+  validation, persistence binding, and exact recovery.
+- Explicit rejection of duplicate IDs, malformed or overflowing addresses,
+  registry-hash mismatch, and silent body relocation.
+- Deterministic interest ordering, hysteretic enter/leave behavior, complete
+  entity entry, explicit removal, and structural-before-motion delivery.
+- Exact baseline convergence after delayed, duplicated, reordered, stale-epoch,
+  disconnected, or backpressured delivery.
+- Proof that interest projection cannot mutate canonical state, authority,
+  conservation, event order, or the world hash.
+- Raw spectator and other-player messages containing no private inventory or
+  production fields while coarse visible machine state remains available.
+- Scaling evidence showing that out-of-view decoy entities do not make a
+  connection's payload proportional to the total cell population.
+- Existing multiplayer, industry, recovery, native, and browser evidence
+  remaining green.
 
 ## Phase S0 — Canonical specification
 
@@ -91,8 +144,8 @@ Build:
 - Server-issued session authority bound to one durable player identity.
 - Multiple users in a cell with independent input, inventory, life, and recovery state.
 - Deterministic shared-player physics and replication budgets.
-- Interest management.
-- Fixed celestial registry.
+- Deterministic single-cell interest management.
+- Fixed canonical celestial registry.
 - Dynamic cell scheduling.
 - Cross-cell handoff.
 - Capital safe zone.
@@ -157,7 +210,7 @@ Exit gate:
 
 Build:
 
-- Expanding frontier.
+- Procedural frontier-sector materialization and continued resource expansion.
 - Multi-day routes.
 - Regional markets.
 - PvP/PvE.

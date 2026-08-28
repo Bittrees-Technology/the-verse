@@ -1,0 +1,28 @@
+[package]
+name = "verse-interest-verifier"
+description = "Portable protocol-16 interest-view verifier for The Verse"
+license = "Apache-2.0"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+browser-wasm = []
+
+[dependencies]
+blake3.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+verse-protocol = { path = "../verse-protocol" }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "=0.2.127"
+
+[lints]
+workspace = true

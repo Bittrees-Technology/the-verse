@@ -1,0 +1,32 @@
+[package]
+name = "verse-godot-interest-adapter"
+description = "Godot GDExtension bridge for The Verse interest-view verifier"
+license = "AGPL-3.0-or-later"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+godot.workspace = true
+serde_json.workspace = true
+verse-interest-verifier = { path = "../verse-interest-verifier" }
+verse-protocol = { path = "../verse-protocol" }
+
+[lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+unused_must_use = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+too_many_lines = "allow"

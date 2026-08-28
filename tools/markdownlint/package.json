@@ -1,0 +1,8 @@
+{
+  "name": "the-verse-markdownlint",
+  "private": true,
+  "license": "AGPL-3.0-or-later",
+  "devDependencies": {
+    "markdownlint-cli2": "0.23.2"
+  }
+}
