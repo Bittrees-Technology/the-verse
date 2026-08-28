@@ -826,7 +826,56 @@ pub struct ActorOperationHistory {
     pub committed_through: u64,
     pub compacted_through: u64,
     pub compacted_history_hash: String,
+    #[serde(with = "retained_operation_records")]
     pub retained: BTreeMap<u64, ProcessedOperationRecord>,
+}
+
+mod retained_operation_records {
+    use std::collections::BTreeMap;
+
+    use serde::de::Error as _;
+    use serde::ser::SerializeMap as _;
+    use serde::{Deserialize as _, Deserializer, Serializer};
+
+    use super::ProcessedOperationRecord;
+
+    pub fn serialize<S>(
+        records: &BTreeMap<u64, ProcessedOperationRecord>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(records.len()))?;
+        for (sequence, record) in records {
+            map.serialize_entry(&sequence.to_string(), record)?;
+        }
+        map.end()
+    }
+
+    pub fn deserialize<'de, D>(
+        deserializer: D,
+    ) -> Result<BTreeMap<u64, ProcessedOperationRecord>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let encoded = BTreeMap::<String, ProcessedOperationRecord>::deserialize(deserializer)?;
+        let mut records = BTreeMap::new();
+        for (key, record) in encoded {
+            let sequence = key.parse::<u64>().map_err(D::Error::custom)?;
+            if sequence.to_string() != key {
+                return Err(D::Error::custom(
+                    "retained operation sequence keys must be canonical unsigned integers",
+                ));
+            }
+            if records.insert(sequence, record).is_some() {
+                return Err(D::Error::custom(
+                    "retained operation sequence keys must be unique",
+                ));
+            }
+        }
+        Ok(records)
+    }
 }
 
 impl ActorOperationHistory {

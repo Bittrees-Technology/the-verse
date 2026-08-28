@@ -240,6 +240,11 @@ produced its directory route, preventing that completion from being replayed
 as a second in-session handoff. Route, immutable world revision, and retained
 completion are captured under one coordinator lock; completion publication
 uses that same lock, so setup cannot observe a new route without its marker.
+The assembled process-restart gate reopens the exact roots after a live transfer
+and requires the recovered pilot to retain the destination route, carried
+inventory, movement epoch, and operation frontier. Transfer-event indexing
+therefore decodes the retained numeric operation-history keys explicitly even
+when the tagged event envelope buffers JSON object keys as strings.
 
 Player and public-spectator replication use separate cell-scoped update
 frontiers. The public feed remains pinned to the origin cell, receives the
