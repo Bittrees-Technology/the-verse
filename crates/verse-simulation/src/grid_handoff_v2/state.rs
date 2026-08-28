@@ -10,14 +10,15 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
+use super::production::{DraftProductionJobOriginV2, validate_production_job_origins};
 use super::{
     BundledPlacementMember, BundledPlacementPlan, CellKeyV1, ContactPairKey,
     DRAFT_GRID_TRANSFER_PACKAGE_SCHEMA_VERSION, DRAFT_GRID_TRANSFER_RECEIPT_SCHEMA_VERSION,
     DraftGridClosureError, DraftGridClosurePackageV2, DraftGridTransferContextV2,
     MAX_DRAFT_GRID_BLOCKS, MAX_DRAFT_GRID_CARGO_INVENTORIES, MAX_DRAFT_GRID_CONTACTS,
     MAX_DRAFT_GRID_MEMBERS, MAX_DRAFT_GRID_PRODUCTION_JOBS, MAX_DRAFT_GRID_PRODUCTION_QUEUES,
-    MobileAggregateKind, WorldState, celestial, extract_draft_grid_closure, hash_json,
-    player_body_id_v2, valid_blake3_hex, valid_stable_id, validate_adjacent_cells,
+    MobileAggregateKind, WorldState, celestial, extract_draft_grid_closure_from_validated_world,
+    hash_json, player_body_id_v2, valid_blake3_hex, valid_stable_id, validate_adjacent_cells,
     validate_destination_conflicts,
 };
 use crate::cell_directory::TransferPhase;
@@ -76,6 +77,7 @@ struct DraftAggregateTransferLockV2 {
     source_event_hash: String,
     source_base_world_hash: String,
     prepared_at_simulation_tick: u64,
+    production_job_origins: BTreeMap<String, DraftProductionJobOriginV2>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -159,9 +161,10 @@ pub(crate) struct DraftGridAbortCleanupProofV2 {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct DraftGridTransferCellStateV2 {
+pub(super) struct DraftGridTransferCellStateV2 {
     schema_version: u32,
     base: WorldState,
+    production_job_origins: BTreeMap<String, DraftProductionJobOriginV2>,
     aggregate_locks: BTreeMap<String, DraftAggregateTransferLockV2>,
     aggregate_reservations: BTreeMap<String, DraftAggregateTransferReservationV2>,
     abort_witnesses: BTreeMap<String, DraftGridTransferAbortWitnessV2>,
@@ -172,6 +175,7 @@ struct DraftGridTransferCellStateV2 {
 struct DraftActiveWorldHashMaterialV2<'a> {
     schema_version: u32,
     base: &'a WorldState,
+    production_job_origins: &'a BTreeMap<String, DraftProductionJobOriginV2>,
     aggregate_locks: &'a BTreeMap<String, DraftAggregateTransferLockV2>,
     aggregate_reservations: &'a BTreeMap<String, DraftAggregateTransferReservationV2>,
 }
@@ -559,6 +563,7 @@ impl DraftAggregateTransferLockV2 {
             source_event_hash: package.source_event_hash.clone(),
             source_base_world_hash: package.source_world_hash.clone(),
             prepared_at_simulation_tick: package.prepared_at_simulation_tick,
+            production_job_origins: package.production_job_origins.clone(),
         }
     }
 
@@ -852,9 +857,17 @@ impl DraftGridAbortCleanupProofV2 {
 
 impl DraftGridTransferCellStateV2 {
     fn new(base: WorldState) -> Result<Self, DraftGridClosureError> {
+        Self::new_with_production_origins(base, BTreeMap::new())
+    }
+
+    pub(super) fn new_with_production_origins(
+        base: WorldState,
+        production_job_origins: BTreeMap<String, DraftProductionJobOriginV2>,
+    ) -> Result<Self, DraftGridClosureError> {
         let mut state = Self {
             schema_version: DRAFT_GRID_CELL_STATE_SCHEMA_VERSION,
             base,
+            production_job_origins,
             aggregate_locks: BTreeMap::new(),
             aggregate_reservations: BTreeMap::new(),
             abort_witnesses: BTreeMap::new(),
@@ -876,6 +889,7 @@ impl DraftGridTransferCellStateV2 {
             &DraftActiveWorldHashMaterialV2 {
                 schema_version: self.schema_version,
                 base: &self.base,
+                production_job_origins: &self.production_job_origins,
                 aggregate_locks: &self.aggregate_locks,
                 aggregate_reservations: &self.aggregate_reservations,
             },
@@ -890,8 +904,25 @@ impl DraftGridTransferCellStateV2 {
 
     fn validate(&self) -> Result<(), DraftGridClosureError> {
         self.base
-            .validate_player_roster()
+            .validate_player_roster_with_job_frontier(|job| {
+                self.production_job_origins
+                    .get(&job.job_id)
+                    .is_some_and(|origin| {
+                        origin.frontier_is_valid_in_cell(
+                            &self.base.cell_id,
+                            self.base.event_sequence,
+                            job,
+                        )
+                    })
+            })
             .map_err(DraftGridClosureError::Invalid)?;
+        validate_production_job_origins(
+            &self.base.universe_id,
+            &self.base.cell_id,
+            self.base.event_sequence,
+            &self.base.production_queues,
+            &self.production_job_origins,
+        )?;
         if self.schema_version != DRAFT_GRID_CELL_STATE_SCHEMA_VERSION
             || !self.base.conservation().valid
             || self.aggregate_locks.len() > MAX_DRAFT_TRANSFERS_PER_CELL
@@ -978,14 +1009,14 @@ impl DraftGridTransferCellStateV2 {
         Ok(())
     }
 
-    fn encode_canonical(&self) -> Result<Vec<u8>, DraftGridClosureError> {
+    pub(super) fn encode_canonical(&self) -> Result<Vec<u8>, DraftGridClosureError> {
         self.validate()?;
         serde_json::to_vec(self).map_err(|source| {
             DraftGridClosureError::Invalid(format!("draft cell state cannot encode: {source}"))
         })
     }
 
-    fn decode_canonical(bytes: &[u8]) -> Result<Self, DraftGridClosureError> {
+    pub(super) fn decode_canonical(bytes: &[u8]) -> Result<Self, DraftGridClosureError> {
         if bytes.len() > MAX_DRAFT_GRID_CELL_STATE_BYTES {
             return Err(DraftGridClosureError::TooLarge);
         }
@@ -1014,6 +1045,34 @@ impl DraftGridTransferCellStateV2 {
                 .contains_subject(subject_id)
                 .then_some(lock.binding.transfer_id.as_str())
         })
+    }
+
+    pub(super) fn capture_grid_closure(
+        &self,
+        grid_id: &str,
+        context: &DraftGridTransferContextV2,
+    ) -> Result<DraftGridClosurePackageV2, DraftGridClosureError> {
+        self.validate()?;
+        let grid =
+            self.base.grids.get(grid_id).ok_or_else(|| {
+                DraftGridClosureError::Invalid("source grid is not resident".into())
+            })?;
+        let job_ids = grid
+            .blocks
+            .keys()
+            .filter_map(|block_id| self.base.production_queues.get(block_id))
+            .flatten()
+            .map(|job| job.job_id.as_str())
+            .collect::<BTreeSet<_>>();
+        let derived_origins = self
+            .production_job_origins
+            .iter()
+            .filter(|(job_id, _)| job_ids.contains(job_id.as_str()))
+            .map(|(job_id, origin)| (job_id.clone(), origin.clone()))
+            .collect();
+        let mut derived_context = context.clone();
+        derived_context.production_job_origins = derived_origins;
+        extract_draft_grid_closure_from_validated_world(&self.base, grid_id, &derived_context)
     }
 }
 
@@ -1119,16 +1178,20 @@ fn locked_closure_matches(world: &WorldState, lock: &DraftAggregateTransferLockV
             members: lock.binding.members.clone(),
             member_root: lock.binding.member_root.clone(),
         },
+        production_job_origins: lock.production_job_origins.clone(),
     };
     let mut live_context = context;
     live_context.source_fencing_token = world.fencing_token;
-    extract_draft_grid_closure(world, &lock.binding.root_aggregate_id, &live_context).is_ok_and(
-        |current| {
-            current.closure_root == lock.binding.closure_root
-                && current.conservation_root == lock.binding.conservation_root
-                && DraftFrozenClosureIdsV2::from_package(&current) == lock.frozen
-        },
+    extract_draft_grid_closure_from_validated_world(
+        world,
+        &lock.binding.root_aggregate_id,
+        &live_context,
     )
+    .is_ok_and(|current| {
+        current.closure_root == lock.binding.closure_root
+            && current.conservation_root == lock.binding.conservation_root
+            && DraftFrozenClosureIdsV2::from_package(&current) == lock.frozen
+    })
 }
 
 fn source_lock_matches(world: &WorldState, lock: &DraftAggregateTransferLockV2) -> bool {
@@ -1233,9 +1296,13 @@ fn stage_prepared_grid_lock_v2(
     }
     if state.base.cell_id != package.source_cell_id
         || state.base.fencing_token != authority.live_source_fencing_token
+        || package
+            .production_job_origins
+            .iter()
+            .any(|(job_id, origin)| state.production_job_origins.get(job_id) != Some(origin))
     {
         return Err(DraftGridClosureError::Invalid(
-            "source draft cell does not own the package fence".into(),
+            "source draft cell does not own the package fence and authoritative job origins".into(),
         ));
     }
     let expected = DraftAggregateTransferLockV2::from_package(package);
@@ -1525,6 +1592,7 @@ fn context_from_package(package: &DraftGridClosurePackageV2) -> DraftGridTransfe
             members: package.members.clone(),
             member_root: package.member_root.clone(),
         },
+        production_job_origins: package.production_job_origins.clone(),
     }
 }
 
@@ -1639,7 +1707,7 @@ mod tests {
         assert_eq!(receipt.destination_draft_world_hash, state.state_hash);
         assert_eq!(
             receipt.receipt_hash,
-            "792feadf1b20fef3433c1a05385907eb7476396dec1672a8822310e2bbe95ed4"
+            "dcbcf6936a008e0dc46c6e9886e5b85b9af7fb8ad32f3d0c11002a2518c43fce"
         );
 
         let (retry_state, retry_receipt) =
