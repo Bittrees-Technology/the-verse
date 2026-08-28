@@ -12,10 +12,10 @@ use verse_physics::{
     SphereColliderSpec, Vec3 as PhysicsVec3,
 };
 use verse_protocol::{
-    BlockKind, CareerSnapshot, ClientMessage, INTENT_FINGERPRINT_SCHEMA_VERSION, IVec3,
+    BlockKind, CareerSnapshot, CellKeyV1, ClientMessage, INTENT_FINGERPRINT_SCHEMA_VERSION, IVec3,
     IntentReceipt, InventoryContents, InventoryDomain, LocomotionKind, LocomotionSupportSnapshot,
     MotionSnapshot, PROTOCOL_VERSION, PlayerDeathCause, PlayerLifeState, PlayerLocomotionSnapshot,
-    ProductionRecipeKind, Quat, ResourceKind, Vec3, WorldSnapshot,
+    ProductionRecipeKind, Quat, ResourceKind, UniverseAddress, Vec3, WorldSnapshot,
 };
 
 use crate::cell_directory::{
@@ -1293,6 +1293,22 @@ impl Runtime {
         &mut self,
         delta_millis: u16,
     ) -> Result<AdvanceOutcome, RuntimeError> {
+        self.advance_with_outcome_in_topology(delta_millis, None)
+    }
+
+    pub(crate) fn advance_with_outcome_in_cells(
+        &mut self,
+        delta_millis: u16,
+        hosted_cells: &BTreeSet<CellKeyV1>,
+    ) -> Result<AdvanceOutcome, RuntimeError> {
+        self.advance_with_outcome_in_topology(delta_millis, Some(hosted_cells))
+    }
+
+    fn advance_with_outcome_in_topology(
+        &mut self,
+        delta_millis: u16,
+        hosted_cells: Option<&BTreeSet<CellKeyV1>>,
+    ) -> Result<AdvanceOutcome, RuntimeError> {
         if self.halted {
             return Err(RuntimeError::Halted);
         }
@@ -1329,6 +1345,7 @@ impl Runtime {
         let delta_millis = delta_millis.clamp(1, 250);
         let mut outcome = AdvanceOutcome::default();
         if physics_active {
+            let physics_step_phase_before = self.physics_step_phase;
             let fixed_step_hz = content::manifest().physics.fixed_step_hz;
             self.physics_step_phase = self
                 .physics_step_phase
@@ -1503,9 +1520,35 @@ impl Runtime {
                     contacts,
                     active_contacts_after: active_contacts.into_iter().collect(),
                 };
-                if let Err(source) = self.commit_system_event(payload) {
-                    self.halted = true;
-                    return Err(source);
+                let topology_admits = match hosted_cells {
+                    None => true,
+                    Some(hosted_cells) => match physics_outcome_is_within_hosted_topology(
+                        &payload,
+                        &self.state.cell_address,
+                        hosted_cells,
+                    ) {
+                        Ok(admits) => admits,
+                        Err(source) => {
+                            self.halted = true;
+                            return Err(RuntimeError::CanonicalInvariant(format!(
+                                "physics topology address is invalid: {source}"
+                            )));
+                        }
+                    },
+                };
+                if topology_admits {
+                    if let Err(source) = self.commit_system_event(payload) {
+                        self.halted = true;
+                        return Err(source);
+                    }
+                } else {
+                    // The bounded coordinator hosts only an explicit topology.
+                    // Discard an unsupported final physics pose before it can
+                    // become canonical, restore the exact fractional phase,
+                    // and rebuild native physics from the unchanged world.
+                    // The player may submit a new inward control without an
+                    // out-of-topology address ever entering the journal.
+                    self.physics_step_phase = physics_step_phase_before;
                 }
                 let lifecycle_mode = self.store.lifecycle_mode();
                 let physics = self
@@ -1522,7 +1565,9 @@ impl Runtime {
                 {
                     self.physics_full_rebuilds += 1;
                 }
-                outcome.record(AdvanceImpact::Motion);
+                if topology_admits {
+                    outcome.record(AdvanceImpact::Motion);
+                }
             }
         }
 
@@ -7376,6 +7421,34 @@ fn physics_body_outcome(
         angular_velocity: from_physics_vec3(body.angular_velocity)
             .clamped(f64::from(limits.max_angular_velocity_radians_per_second)),
     })
+}
+
+fn physics_outcome_is_within_hosted_topology(
+    payload: &EventPayload,
+    source_cell_address: &UniverseAddress,
+    hosted_cells: &BTreeSet<CellKeyV1>,
+) -> Result<bool, celestial::CelestialError> {
+    let source_cell = celestial::cell_key_from_address(source_cell_address)?;
+    let EventPayload::PhysicsStepCommitted {
+        bodies, players, ..
+    } = payload
+    else {
+        return Ok(true);
+    };
+    for player in players {
+        let addressed_cell = celestial::cell_key_from_address(&player.address)?;
+        if !hosted_cells.contains(&addressed_cell) {
+            return Ok(false);
+        }
+    }
+    for body in bodies {
+        let addressed_cell = celestial::cell_key_from_address(&body.address)?;
+        if addressed_cell != source_cell {
+            // Grid handoff is not part of the implemented EVA checkpoint.
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn player_physics_outcome(

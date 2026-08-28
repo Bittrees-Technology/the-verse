@@ -33,6 +33,22 @@ A cell may be drained and replaced without losing canonical state.
 
 ### P1.7 two-cell directory and handoff proof
 
+For a fresh local proof universe, run the worker with
+`--two-cell-universe --data-directory data/two-cell-universe`. This mode owns
+both adjacent proof-cell roots and their directory; it rejects a standalone
+cell key and paused single-cell startup. It is a local correctness/test mode,
+not a production topology or capacity claim.
+
+The coordinator fences the whole local authority after directory, transfer,
+artifact, persistence, or canonical-invariant failure. Ordinary rejected
+player intent and an explicitly stale session route remain bounded client
+errors. This classification also covers bootstrap/route reads, explicit
+snapshot persistence, lease renewal, and drain persistence; they cannot leave
+the public authority status active after a fatal coordinator failure. Physics
+that would leave the hosted two-cell topology, including every grid crossing
+until grid handoff is implemented, is rejected before journal commit and
+rebuilt from the last canonical state.
+
 The bounded P1.7 operator view covers both proof cells and the durable local
 directory. It reports:
 

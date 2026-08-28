@@ -191,15 +191,18 @@ current world state.
 Directory-managed cell roots reject the standalone runtime constructor. Only
 the universe coordinator holds the internal open capability, and it completes
 assignment binding, transfer reconciliation, and resident registration before
-a future multi-cell gateway may admit a gameplay session.
+the bounded local gateway admits a gameplay session. The worker's explicit
+`--two-cell-universe` mode hosts both proof cells behind that coordinator; the
+ordinary one-cell mode cannot open either managed root.
 
-An EVA actor or isolated ordinary unanchored grid crosses through one durable
-handoff saga. The source locks the complete dependency closure and publishes an
-immutable package, the destination validates it into non-live quarantine, and
-the directory atomically advances the aggregate placement generation. Before
-that commit recovery may abort to the source; afterward only destination
-roll-forward is legal. Import, source finalization, operation retry history,
-and the transfer-linked destination view are all idempotent.
+The accepted contract carries an EVA actor or isolated ordinary unanchored grid
+through one durable handoff saga. The current executable checkpoint exercises
+the EVA closure only. The source locks the complete dependency closure and
+publishes an immutable package, the destination validates it into non-live
+quarantine, and the directory atomically advances the aggregate placement
+generation. Before that commit recovery may abort to the source; afterward
+only destination roll-forward is legal. Import, source finalization, operation
+retry history, and the transfer-linked destination view are all idempotent.
 
 Abort is a two-cell cleanup saga: the directory first enters `Aborting`, pins
 both assignments, collects canonical source and destination cleanup proofs,
@@ -222,6 +225,35 @@ This proof also does not yet implement bounded compaction of terminal transfer
 records, assignment-fence history, transfer-boundary journals, or world
 witnesses. Production-scale retention requires a future hash-chained archival
 and compaction design that preserves verification of retained roots.
+
+The implemented gateway checkpoint routes an EVA player's WebSocket session
+with a cell-key/placement-generation permit. Terminal durable completion
+presents `Preparing`, `Importing`, and `VerifyingDestination` in order, then a
+transfer-linked destination baseline. The old permit remains the mutation
+permit until the exact baseline acknowledgement, so queued source controls
+fail without consuming their operation sequence. An unacknowledged initial
+source baseline, skipped placement generation, or unrelated completion closes
+the session for directory-routed reconnect. Grid transfer, arbitrary-cell
+routing, multi-host operation, and retention bounds remain release gates.
+Fresh connection setup recognizes an exact retained completion that already
+produced its directory route, preventing that completion from being replayed
+as a second in-session handoff. Route, immutable world revision, and retained
+completion are captured under one coordinator lock; completion publication
+uses that same lock, so setup cannot observe a new route without its marker.
+
+Player and public-spectator replication use separate cell-scoped update
+frontiers. The public feed remains pinned to the origin cell, receives the
+source structural change, and supplies canonical `transferred` evidence for a
+previously visible departing player without exposing the destination or an
+actor-private overlay. Origin world revision and removal evidence are one
+versioned projection bundle rather than independently sampled state.
+
+Physics is also topology-contained before durability: a player outcome may
+enter only one of the hosted proof cells, and a grid outcome must remain in its
+source cell until grid handoff exists. An unsupported outcome is discarded
+before the physics event is appended and native physics is rebuilt from the
+unchanged canonical world. This is a correctness barrier, not the final
+player-facing boundary response or a general multi-cell traversal claim.
 
 ## Initial implementation choice
 
