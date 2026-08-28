@@ -1187,6 +1187,8 @@ fn valid_stable_id(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
     use crate::model::WORLD_SCHEMA_VERSION;
     use crate::{
@@ -1271,6 +1273,86 @@ mod tests {
                 .expect("destination quarantines exact package");
         assert!(receipt.hash_is_valid());
         assert_eq!(receipt.package_hash, package.package_hash);
+    }
+
+    #[test]
+    fn eva_package_with_retained_operation_history_round_trips_through_json() {
+        let (mut source, _, context) = crossing_fixture();
+        source.processed_operations.insert(
+            "player-local".into(),
+            ActorOperationHistory {
+                committed_through: 1,
+                compacted_through: 0,
+                compacted_history_hash: String::new(),
+                retained: BTreeMap::from([(
+                    1,
+                    crate::model::ProcessedOperationRecord {
+                        operation_id: "handoff-operation-1".into(),
+                        intent_fingerprint: "a".repeat(64),
+                        receipt_origin_cell_id: "b".repeat(64),
+                        receipt: verse_protocol::IntentReceipt {
+                            operation_sequence: 1,
+                            operation_id: "handoff-operation-1".into(),
+                            event_sequence: 1,
+                            code: "fixture_committed".into(),
+                            message: "Fixture committed".into(),
+                        },
+                    },
+                )]),
+            },
+        );
+        let package = prepare_eva_player_transfer(&source, "player-local", &context)
+            .expect("EVA package with operation history prepares");
+        let encoded = serde_json::to_string(&package).expect("package serializes");
+        let decoded: PlayerTransferPackage =
+            serde_json::from_str(&encoded).expect("durable package JSON round-trips");
+        assert_eq!(decoded.operation_history, package.operation_history);
+        assert!(decoded.hash_is_valid());
+        let encoded_history = serde_json::to_string(
+            package
+                .operation_history
+                .as_ref()
+                .expect("fixture package carries operation history"),
+        )
+        .expect("operation history serializes");
+        let aliased_history = encoded_history.replacen("\"1\":", "\"01\":", 1);
+        assert!(
+            serde_json::from_str::<ActorOperationHistory>(&aliased_history).is_err(),
+            "non-canonical numeric key aliases are rejected"
+        );
+
+        let prepared = CellTransferRecord {
+            transfer_id: package.transfer_id.clone(),
+            aggregate_id: package.aggregate_id.clone(),
+            aggregate_kind: MobileAggregateKind::Player,
+            source_cell_key: package.source_cell_key.clone(),
+            source_cell_id: package.source_cell_id.clone(),
+            destination_cell_key: package.destination_cell_key.clone(),
+            destination_cell_id: package.destination_cell_id.clone(),
+            source_assignment_generation: package.source_assignment_generation,
+            destination_assignment_generation: package.destination_assignment_generation,
+            prior_placement_generation: package.prior_placement_generation,
+            resulting_placement_generation: package.resulting_placement_generation,
+            package_hash: package.package_hash.clone(),
+            quarantine_receipt_hash: None,
+            source_prepare_proof: None,
+            destination_quarantine_proof: None,
+            import_proof: None,
+            finalization_proof: None,
+            source_abort_proof: None,
+            destination_abort_proof: None,
+            phase: TransferPhase::Prepared,
+        };
+        let event = source.prepare_system_event(EventPayload::PlayerTransferPrepared {
+            package,
+            directory_transfer: prepared,
+        });
+        let decoded_event = round_trip_event(&event);
+        assert!(decoded_event.hash_is_valid());
+        let EventPayload::PlayerTransferPrepared { package, .. } = decoded_event.payload else {
+            panic!("the transfer event retains its payload variant");
+        };
+        assert_eq!(package.operation_history, decoded.operation_history);
     }
 
     #[test]

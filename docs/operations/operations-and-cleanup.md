@@ -39,6 +39,15 @@ both adjacent proof-cell roots and their directory; it rejects a standalone
 cell key and paused single-cell startup. It is a local correctness/test mode,
 not a production topology or capacity claim.
 
+Run `tools/e2e/verify-two-cell-handoff.sh` for the isolated assembled-binary
+gate. It generates a temporary near-boundary universe, drives one live
+same-session EVA handoff, proves the destination acknowledgement barrier and
+public-origin isolation, gracefully restarts the worker, and verifies the
+destination route, carried inventory, movement epoch, and actor operation
+frontier from the recovered roots. The script removes only its own `mktemp`
+directory and accepts an alternate loopback port through
+`VERSE_TWO_CELL_E2E_PORT`.
+
 The coordinator fences the whole local authority after directory, transfer,
 artifact, persistence, or canonical-invariant failure. Ordinary rejected
 player intent and an explicitly stale session route remain bounded client

@@ -550,6 +550,17 @@ is acknowledged fails closed and requires reconnect. This checkpoint does not
 satisfy the grid, opposing-transfer, multi-process, load, packaging, or
 retention acceptance gates below.
 
+`tools/e2e/verify-two-cell-handoff.sh` now exercises that flow through the
+assembled worker rather than an in-process fixture. It creates a canonical
+pilot 25 centimeters inside the east boundary, crosses through ordinary
+authenticated thrust, verifies spectator isolation and origin-pinned public
+status, stops the process, then reopens the same two-cell roots. Reconnect must
+resolve directly to the destination with the same movement epoch, operation
+frontier, and carried inventory and without replaying the one-time transfer
+link. The durable event decoder has a regression for retained numeric
+operation-history keys inside tagged transfer events, so a successful live
+handoff that cannot be indexed after restart fails this gate.
+
 Player and public-origin spectator sockets consume independent, cell-scoped
 update frontiers. After the crossing, the player follows only the verified
 destination baseline while an already connected spectator remains on the
