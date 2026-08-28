@@ -48,6 +48,7 @@ const DRAFT_DIRECTORY_HISTORY_ENTRY_HASH_DOMAIN: &[u8] =
     b"the-verse/cell-directory-history-entry/v3\0";
 const MAX_DRAFT_DIRECTORY_HISTORY_BYTES: u64 = 512 * 1_024 * 1_024;
 const MAX_DRAFT_DIRECTORY_HISTORY_LINE_BYTES: usize = MAX_DRAFT_DIRECTORY_V3_BYTES + 4_096;
+const MAX_DRAFT_DIRECTORY_HISTORY_HEAD_BYTES: u64 = 16 * 1_024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -560,11 +561,39 @@ enum DraftDirectoryHistoryFailpointV3 {
     AfterHeadDirectorySyncBeforeMemory,
 }
 
+#[cfg(test)]
+pub(crate) struct DraftDirectoryV3AuthoritySeed {
+    pub(crate) universe_id: String,
+    pub(crate) universe_manifest_hash: String,
+    pub(crate) transfer_id: String,
+    pub(crate) root_aggregate_id: String,
+    pub(crate) source_cell_key: CellKeyV1,
+    pub(crate) destination_cell_key: CellKeyV1,
+    pub(crate) source_assignment_generation: u64,
+    pub(crate) source_fencing_token: u64,
+    pub(crate) destination_assignment_generation: u64,
+    pub(crate) destination_fencing_token: u64,
+    pub(crate) package_schema_version: u32,
+    pub(crate) receipt_schema_version: u32,
+    pub(crate) closure_root: String,
+    pub(crate) conservation_root: String,
+    pub(crate) package_hash: String,
+    pub(crate) members: Vec<BundledPlacementMember>,
+    pub(crate) member_root: String,
+}
+
+#[cfg(test)]
+pub(crate) struct DraftDirectoryV3AuthorityHarness {
+    document: CellDirectoryDocumentV3,
+    requested: CellTransferRecordV3,
+    history: Vec<CellDirectoryDocumentV3>,
+}
+
 /// Dormant, isolated protocol-19 history store. The crate-private module has no
-/// active runtime call site; it exists so exact historical authority resolution
-/// and crash behavior can be completed before the compatibility tuple activates.
+/// active runtime constructor; test-only construction remains gated until a
+/// validated manifest-5 capability and the world-21 store exist.
 #[derive(Debug)]
-struct DraftCellDirectoryHistoryStoreV3 {
+pub(super) struct DraftCellDirectoryHistoryStoreV3 {
     root: PathBuf,
     lock_file: File,
     history_file: File,
@@ -577,37 +606,61 @@ struct DraftCellDirectoryHistoryStoreV3 {
 }
 
 impl DraftCellDirectoryHistoryStoreV3 {
-    fn initialize(
+    #[cfg(test)]
+    fn open_or_initialize(
         base_root: impl AsRef<Path>,
         initial: CellDirectoryDocumentV3,
     ) -> Result<Self, CellDirectoryError> {
         initial.validate()?;
-        let root = base_root
-            .as_ref()
-            .join(DRAFT_DIRECTORY_HISTORY_SUBDIRECTORY);
+        let base_root = base_root.as_ref();
+        fs::create_dir_all(base_root).map_err(|source| io_error_v3(base_root, source))?;
+        let root = base_root.join(DRAFT_DIRECTORY_HISTORY_SUBDIRECTORY);
         fs::create_dir_all(&root).map_err(|source| io_error_v3(&root, source))?;
+        File::open(base_root)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|source| io_error_v3(base_root, source))?;
         let lock_file = lock_history_writer_v3(&root)?;
         let head_path = root.join(DRAFT_DIRECTORY_HISTORY_HEAD_FILE);
         let history_path = root.join(DRAFT_DIRECTORY_HISTORY_FILE);
-        if head_path.exists() || history_path.exists() {
-            return Err(invalid(
-                "v3 directory history already exists and must be reopened",
-            ));
-        }
-        let history_file = OpenOptions::new()
-            .create_new(true)
+        let history_file = match OpenOptions::new()
             .read(true)
             .append(true)
             .open(&history_path)
-            .map_err(|source| io_error_v3(&history_path, source))?;
-        history_file
-            .sync_all()
-            .map_err(|source| io_error_v3(&history_path, source))?;
-        File::open(&root)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|source| io_error_v3(&root, source))?;
-
-        let head = DraftDirectoryHistoryHeadV3::empty(&initial);
+        {
+            Ok(file) => file,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                let file = OpenOptions::new()
+                    .create_new(true)
+                    .read(true)
+                    .append(true)
+                    .open(&history_path)
+                    .map_err(|source| io_error_v3(&history_path, source))?;
+                file.sync_all()
+                    .map_err(|source| io_error_v3(&history_path, source))?;
+                File::open(&root)
+                    .and_then(|directory| directory.sync_all())
+                    .map_err(|source| io_error_v3(&root, source))?;
+                file
+            }
+            Err(source) => return Err(io_error_v3(&history_path, source)),
+        };
+        let history_is_empty = history_file
+            .metadata()
+            .map_err(|source| io_error_v3(&history_path, source))?
+            .len()
+            == 0;
+        let head = if head_path.exists() {
+            let head = read_history_head_v3(&head_path)?;
+            head.validate_identity(&initial.universe_id, &initial.universe_manifest_hash)?;
+            head
+        } else if history_is_empty {
+            DraftDirectoryHistoryHeadV3::empty(&initial)
+        } else {
+            return Err(invalid(
+                "v3 directory history has records but no durable head",
+            ));
+        };
+        let head_existed = head_path.exists();
         let mut store = Self {
             root,
             lock_file,
@@ -619,12 +672,26 @@ impl DraftCellDirectoryHistoryStoreV3 {
             #[cfg(test)]
             failpoint: None,
         };
-        let empty_head = store.head.clone();
-        store.persist_head(&empty_head)?;
-        store.append_document(None, None, initial)?;
+        if !head_existed {
+            let empty_head = store.head.clone();
+            store.persist_head(&empty_head)?;
+        }
+        store.recover()?;
+        if store.current.is_none() {
+            store.append_document(None, None, initial)?;
+        } else if store.index.first_key_value().map(|(revision, _)| *revision)
+            != Some(initial.directory_revision)
+            || store.resolve_document(initial.directory_revision, &initial.document_hash)?
+                != initial
+        {
+            return Err(invalid(
+                "v3 directory history genesis differs from initialization input",
+            ));
+        }
         Ok(store)
     }
 
+    #[cfg(test)]
     fn open(
         base_root: impl AsRef<Path>,
         expected_universe_id: &str,
@@ -639,13 +706,7 @@ impl DraftCellDirectoryHistoryStoreV3 {
         let lock_file = lock_history_writer_v3(&root)?;
         let head_path = root.join(DRAFT_DIRECTORY_HISTORY_HEAD_FILE);
         let history_path = root.join(DRAFT_DIRECTORY_HISTORY_FILE);
-        let head_bytes = fs::read(&head_path).map_err(|source| io_error_v3(&head_path, source))?;
-        let head = serde_json::from_slice::<DraftDirectoryHistoryHeadV3>(&head_bytes).map_err(
-            |source| CellDirectoryError::Json {
-                path: head_path.clone(),
-                source,
-            },
-        )?;
+        let head = read_history_head_v3(&head_path)?;
         head.validate_identity(expected_universe_id, expected_manifest_hash)?;
         let history_file = OpenOptions::new()
             .read(true)
@@ -664,6 +725,7 @@ impl DraftCellDirectoryHistoryStoreV3 {
             failpoint: None,
         };
         store.recover()?;
+        store.current()?;
         Ok(store)
     }
 
@@ -716,7 +778,7 @@ impl DraftCellDirectoryHistoryStoreV3 {
         Ok(entry.document)
     }
 
-    fn resolve_grid_authority(
+    pub(super) fn resolve_historical_grid_authority(
         &self,
         directory_revision: u64,
         document_hash: &str,
@@ -726,7 +788,7 @@ impl DraftCellDirectoryHistoryStoreV3 {
             .validated_grid_transfer_authority(transfer_id)
     }
 
-    fn resolve_cell_authority(
+    pub(super) fn resolve_historical_cell_authority(
         &self,
         directory_revision: u64,
         document_hash: &str,
@@ -929,7 +991,12 @@ impl DraftCellDirectoryHistoryStoreV3 {
         loop {
             let start = offset;
             let mut record = Vec::new();
-            let read = reader
+            let read = (&mut reader)
+                .take(
+                    u64::try_from(MAX_DRAFT_DIRECTORY_HISTORY_LINE_BYTES)
+                        .expect("history line bound fits u64")
+                        + 2,
+                )
                 .read_until(b'\n', &mut record)
                 .map_err(|source| io_error_v3(&history_path, source))?;
             if read == 0 {
@@ -1022,6 +1089,12 @@ impl DraftCellDirectoryHistoryStoreV3 {
             path: head_path.clone(),
             source,
         })?;
+        if bytes.is_empty()
+            || u64::try_from(bytes.len()).unwrap_or(u64::MAX)
+                > MAX_DRAFT_DIRECTORY_HISTORY_HEAD_BYTES
+        {
+            return Err(invalid("v3 directory history head exceeds its byte bound"));
+        }
         let temp_path = self.root.join(format!(
             ".{DRAFT_DIRECTORY_HISTORY_HEAD_FILE}.tmp-{}-{}",
             std::process::id(),
@@ -1084,6 +1157,277 @@ impl DraftCellDirectoryHistoryStoreV3 {
     }
 }
 
+#[cfg(test)]
+impl DraftDirectoryV3AuthorityHarness {
+    pub(crate) fn new(seed: DraftDirectoryV3AuthoritySeed) -> Result<Self, CellDirectoryError> {
+        fn assignment(
+            cell_key: CellKeyV1,
+            generation: u64,
+            fence: u64,
+            holder: &str,
+        ) -> Result<CellAssignmentRecord, CellDirectoryError> {
+            let first_fence = fence
+                .checked_sub(generation.saturating_sub(1))
+                .ok_or_else(|| invalid("test v3 authority seed has impossible fence history"))?;
+            let cell_id =
+                celestial::cell_id(&cell_key).map_err(|source| invalid(source.to_string()))?;
+            Ok(CellAssignmentRecord {
+                cell_key,
+                cell_id,
+                assignment_generation: generation,
+                authority_fencing_token: fence,
+                fencing_history: (1..=generation)
+                    .map(|generation| (generation, first_fence + generation - 1))
+                    .collect(),
+                state: CellAssignmentState::Assigned,
+                holder_id: Some(holder.into()),
+            })
+        }
+
+        let source_cell_id = celestial::cell_id(&seed.source_cell_key)
+            .map_err(|source| invalid(source.to_string()))?;
+        let destination_cell_id = celestial::cell_id(&seed.destination_cell_key)
+            .map_err(|source| invalid(source.to_string()))?;
+        let source_assignment = assignment(
+            seed.source_cell_key.clone(),
+            seed.source_assignment_generation,
+            seed.source_fencing_token,
+            "test-source-holder",
+        )?;
+        let destination_assignment = assignment(
+            seed.destination_cell_key.clone(),
+            seed.destination_assignment_generation,
+            seed.destination_fencing_token,
+            "test-destination-holder",
+        )?;
+        let placements = seed
+            .members
+            .iter()
+            .map(|member| {
+                (
+                    member.aggregate_id.clone(),
+                    AggregatePlacementRecord {
+                        aggregate_id: member.aggregate_id.clone(),
+                        aggregate_kind: member.aggregate_kind,
+                        cell_key: seed.source_cell_key.clone(),
+                        cell_id: source_cell_id.clone(),
+                        placement_generation: member.prior_placement_generation,
+                        state: AggregatePlacementState::Resident,
+                        active_transfer_id: None,
+                    },
+                )
+            })
+            .collect();
+        let requested = CellTransferRecordV3 {
+            transfer_id: seed.transfer_id,
+            root_aggregate_id: seed.root_aggregate_id,
+            source_cell_key: seed.source_cell_key,
+            source_cell_id,
+            destination_cell_key: seed.destination_cell_key,
+            destination_cell_id,
+            source_assignment_generation: seed.source_assignment_generation,
+            source_fencing_token: seed.source_fencing_token,
+            destination_assignment_generation: seed.destination_assignment_generation,
+            destination_fencing_token: seed.destination_fencing_token,
+            bundle: DirectoryBundleV3 {
+                package_schema_version: seed.package_schema_version,
+                receipt_schema_version: seed.receipt_schema_version,
+                aggregate_kind: MobileAggregateKind::Grid,
+                closure_root: seed.closure_root,
+                conservation_root: seed.conservation_root,
+                package_hash: seed.package_hash,
+                members: seed.members,
+                member_root: seed.member_root,
+            },
+            quarantine_receipt_hash: None,
+            source_prepare_proof: None,
+            destination_quarantine_proof: None,
+            source_export_proof: None,
+            import_proof: None,
+            destination_activation_proof: None,
+            finalization_proof: None,
+            source_abort_proof: None,
+            destination_abort_proof: None,
+            phase: TransferPhase::Prepared,
+        };
+        let mut document = CellDirectoryDocumentV3 {
+            schema_version: DRAFT_CELL_DIRECTORY_V3_SCHEMA_VERSION,
+            universe_id: seed.universe_id,
+            universe_manifest_hash: seed.universe_manifest_hash,
+            directory_revision: 1,
+            assignments: BTreeMap::from([
+                (source_assignment.cell_id.clone(), source_assignment),
+                (
+                    destination_assignment.cell_id.clone(),
+                    destination_assignment,
+                ),
+            ]),
+            placements,
+            transfers: BTreeMap::new(),
+            document_hash: String::new(),
+        };
+        document.seal()?;
+        Ok(Self {
+            history: vec![document.clone()],
+            document,
+            requested,
+        })
+    }
+
+    fn retain_current(&mut self) {
+        self.history.push(self.document.clone());
+    }
+
+    pub(crate) fn prepare(&mut self) -> Result<(), CellDirectoryError> {
+        self.document = stage_v3_prepare(&self.document, &self.requested)?;
+        self.retain_current();
+        Ok(())
+    }
+
+    pub(crate) fn authority(&self) -> Result<ValidatedGridTransferAuthorityV3, CellDirectoryError> {
+        self.document
+            .validated_grid_transfer_authority(&self.requested.transfer_id)
+    }
+
+    pub(crate) fn cell_authority(
+        &self,
+        cell_id: &str,
+    ) -> Result<ValidatedCellAuthorityV3, CellDirectoryError> {
+        self.document.validated_cell_authority(cell_id)
+    }
+
+    pub(crate) fn advance_cell_authority(
+        &mut self,
+        cell_id: &str,
+    ) -> Result<(), CellDirectoryError> {
+        let mut next = self.document.clone();
+        let assignment = next
+            .assignments
+            .get_mut(cell_id)
+            .ok_or_else(|| CellDirectoryError::UnknownCell(cell_id.to_owned()))?;
+        assignment.assignment_generation = assignment
+            .assignment_generation
+            .checked_add(1)
+            .ok_or_else(|| CellDirectoryError::AssignmentGenerationExhausted(cell_id.into()))?;
+        assignment.authority_fencing_token = assignment
+            .authority_fencing_token
+            .checked_add(1)
+            .ok_or_else(|| invalid("test v3 authority fence exhausted"))?;
+        assignment.fencing_history.insert(
+            assignment.assignment_generation,
+            assignment.authority_fencing_token,
+        );
+        self.document = finish_v3_transaction(&self.document, next)?;
+        self.retain_current();
+        Ok(())
+    }
+
+    pub(crate) fn record_prepare(
+        &mut self,
+        proof: &DraftGridPrepareProofV2,
+    ) -> Result<(), CellDirectoryError> {
+        self.document =
+            stage_v3_source_prepared(&self.document, &self.requested.transfer_id, proof)?;
+        self.retain_current();
+        Ok(())
+    }
+
+    pub(crate) fn record_quarantine(
+        &mut self,
+        proof: &DraftGridQuarantineProofV2,
+    ) -> Result<(), CellDirectoryError> {
+        self.document = stage_v3_quarantine(&self.document, &self.requested.transfer_id, proof)?;
+        self.retain_current();
+        Ok(())
+    }
+
+    pub(crate) fn commit_placement(&mut self) -> Result<(), CellDirectoryError> {
+        self.document = stage_v3_commit(
+            &self.document,
+            &self.requested.transfer_id,
+            &self.requested.bundle.member_root,
+        )?;
+        self.retain_current();
+        Ok(())
+    }
+
+    pub(crate) fn record_export(
+        &mut self,
+        proof: &DraftGridExportProofV2,
+    ) -> Result<(), CellDirectoryError> {
+        self.document =
+            stage_v3_source_exported(&self.document, &self.requested.transfer_id, proof)?;
+        self.retain_current();
+        Ok(())
+    }
+
+    pub(crate) fn record_import(
+        &mut self,
+        proof: &DraftGridImportProofV2,
+    ) -> Result<(), CellDirectoryError> {
+        self.document =
+            stage_v3_destination_imported(&self.document, &self.requested.transfer_id, proof)?;
+        self.retain_current();
+        Ok(())
+    }
+
+    pub(crate) fn record_activation(
+        &mut self,
+        proof: &DraftGridActivationProofV2,
+    ) -> Result<(), CellDirectoryError> {
+        self.document =
+            stage_v3_destination_activated(&self.document, &self.requested.transfer_id, proof)?;
+        self.retain_current();
+        Ok(())
+    }
+
+    pub(crate) fn record_finalization(
+        &mut self,
+        proof: &DraftGridFinalizationProofV2,
+    ) -> Result<(), CellDirectoryError> {
+        self.document =
+            stage_v3_source_finalized(&self.document, &self.requested.transfer_id, proof)?;
+        self.retain_current();
+        Ok(())
+    }
+
+    pub(crate) fn request_abort(&mut self) -> Result<(), CellDirectoryError> {
+        self.document = stage_v3_request_abort(&self.document, &self.requested.transfer_id)?;
+        self.retain_current();
+        Ok(())
+    }
+
+    pub(crate) fn record_abort(
+        &mut self,
+        proof: &DraftGridAbortCleanupProofV2,
+    ) -> Result<(), CellDirectoryError> {
+        self.document = stage_v3_abort_cleanup(&self.document, &self.requested.transfer_id, proof)?;
+        self.retain_current();
+        Ok(())
+    }
+
+    pub(crate) fn persist_history(
+        &self,
+        root: impl AsRef<Path>,
+    ) -> Result<DraftCellDirectoryHistoryStoreV3, CellDirectoryError> {
+        let mut store = DraftCellDirectoryHistoryStoreV3::open_or_initialize(
+            root,
+            self.history
+                .first()
+                .expect("test authority history has genesis")
+                .clone(),
+        )?;
+        for pair in self.history.windows(2) {
+            store.commit(
+                pair[0].directory_revision,
+                &pair[0].document_hash,
+                pair[1].clone(),
+            )?;
+        }
+        Ok(store)
+    }
+}
+
 fn lock_history_writer_v3(root: &Path) -> Result<File, CellDirectoryError> {
     let lock_path = root.join(DRAFT_DIRECTORY_HISTORY_LOCK_FILE);
     let lock_file = OpenOptions::new()
@@ -1101,6 +1445,32 @@ fn lock_history_writer_v3(root: &Path) -> Result<File, CellDirectoryError> {
         }
     })?;
     Ok(lock_file)
+}
+
+#[cfg(test)]
+fn read_history_head_v3(path: &Path) -> Result<DraftDirectoryHistoryHeadV3, CellDirectoryError> {
+    let length = fs::metadata(path)
+        .map_err(|source| io_error_v3(path, source))?
+        .len();
+    if length == 0 || length > MAX_DRAFT_DIRECTORY_HISTORY_HEAD_BYTES {
+        return Err(invalid("v3 directory history head exceeds its byte bound"));
+    }
+    let bytes = fs::read(path).map_err(|source| io_error_v3(path, source))?;
+    let head = serde_json::from_slice::<DraftDirectoryHistoryHeadV3>(&bytes).map_err(|source| {
+        CellDirectoryError::Json {
+            path: path.to_path_buf(),
+            source,
+        }
+    })?;
+    let canonical =
+        serde_json::to_vec_pretty(&head).map_err(|source| CellDirectoryError::Json {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if canonical != bytes {
+        return Err(invalid("v3 directory history head bytes are not canonical"));
+    }
+    Ok(head)
 }
 
 fn io_error_v3(path: impl AsRef<Path>, source: std::io::Error) -> CellDirectoryError {
@@ -1123,6 +1493,30 @@ pub(super) struct ValidatedCellAuthorityV3 {
 }
 
 impl ValidatedCellAuthorityV3 {
+    fn try_from_document_assignment(
+        directory_revision: u64,
+        directory_document_hash: &str,
+        universe_id: &str,
+        universe_manifest_hash: &str,
+        assignment: &CellAssignmentRecord,
+    ) -> Result<Self, CellDirectoryError> {
+        if assignment.state != CellAssignmentState::Assigned
+            || assignment.holder_id.as_deref().is_none_or(str::is_empty)
+        {
+            return Err(CellDirectoryError::AssignmentConflict {
+                cell_id: assignment.cell_id.clone(),
+                reason: "v3 historical cell is not assigned to a live authority holder".into(),
+            });
+        }
+        Ok(Self {
+            directory_revision,
+            directory_document_hash: directory_document_hash.to_owned(),
+            universe_id: universe_id.to_owned(),
+            universe_manifest_hash: universe_manifest_hash.to_owned(),
+            assignment: assignment.clone(),
+        })
+    }
+
     pub(super) fn directory_revision(&self) -> u64 {
         self.directory_revision
     }
@@ -1168,6 +1562,8 @@ impl ValidatedCellAuthorityV3 {
 pub(super) struct ValidatedGridTransferAuthorityV3 {
     directory_revision: u64,
     directory_document_hash: String,
+    universe_id: String,
+    universe_manifest_hash: String,
     record: CellTransferRecordV3,
     source_assignment: CellAssignmentRecord,
     destination_assignment: CellAssignmentRecord,
@@ -1180,6 +1576,38 @@ impl ValidatedGridTransferAuthorityV3 {
 
     pub(super) fn directory_document_hash(&self) -> &str {
         &self.directory_document_hash
+    }
+
+    pub(super) fn universe_id(&self) -> &str {
+        &self.universe_id
+    }
+
+    pub(super) fn universe_manifest_hash(&self) -> &str {
+        &self.universe_manifest_hash
+    }
+
+    pub(super) fn source_cell_authority(
+        &self,
+    ) -> Result<ValidatedCellAuthorityV3, CellDirectoryError> {
+        ValidatedCellAuthorityV3::try_from_document_assignment(
+            self.directory_revision,
+            &self.directory_document_hash,
+            &self.universe_id,
+            &self.universe_manifest_hash,
+            &self.source_assignment,
+        )
+    }
+
+    pub(super) fn destination_cell_authority(
+        &self,
+    ) -> Result<ValidatedCellAuthorityV3, CellDirectoryError> {
+        ValidatedCellAuthorityV3::try_from_document_assignment(
+            self.directory_revision,
+            &self.directory_document_hash,
+            &self.universe_id,
+            &self.universe_manifest_hash,
+            &self.destination_assignment,
+        )
     }
 
     pub(super) fn package_schema_version(&self) -> u32 {
@@ -1913,14 +2341,7 @@ impl CellTransferRecordV3 {
                 && proof.source_export_proof_hash.is_none()
                 && proof.source_exported_at_unix_ms.is_none()
                 && proof.destination_production_lifecycle_generation.is_none()
-        } else if is_abort {
-            proof.import_proof_hash.is_none()
-                && proof.prior_draft_world_hash.is_some()
-                && proof.quarantined_at_unix_ms.is_none()
-                && proof.source_export_proof_hash.is_none()
-                && proof.source_exported_at_unix_ms.is_none()
-                && proof.destination_production_lifecycle_generation.is_none()
-        } else if expected_kind == DirectoryPhaseProofKindV3::SourceExport {
+        } else if is_abort || expected_kind == DirectoryPhaseProofKindV3::SourceExport {
             proof.import_proof_hash.is_none()
                 && proof.prior_draft_world_hash.is_some()
                 && proof.quarantined_at_unix_ms.is_none()
@@ -2210,19 +2631,13 @@ impl CellDirectoryDocumentV3 {
             .assignments
             .get(cell_id)
             .ok_or_else(|| CellDirectoryError::UnknownCell(cell_id.to_owned()))?;
-        if assignment.state != CellAssignmentState::Assigned || assignment.holder_id.is_none() {
-            return Err(CellDirectoryError::AssignmentConflict {
-                cell_id: cell_id.to_owned(),
-                reason: "v3 historical cell is not assigned to a live authority holder".into(),
-            });
-        }
-        Ok(ValidatedCellAuthorityV3 {
-            directory_revision: self.directory_revision,
-            directory_document_hash: self.document_hash.clone(),
-            universe_id: self.universe_id.clone(),
-            universe_manifest_hash: self.universe_manifest_hash.clone(),
-            assignment: assignment.clone(),
-        })
+        ValidatedCellAuthorityV3::try_from_document_assignment(
+            self.directory_revision,
+            &self.document_hash,
+            &self.universe_id,
+            &self.universe_manifest_hash,
+            assignment,
+        )
     }
 
     pub(super) fn validated_grid_transfer_authority(
@@ -2234,6 +2649,8 @@ impl CellDirectoryDocumentV3 {
         Ok(ValidatedGridTransferAuthorityV3 {
             directory_revision: self.directory_revision,
             directory_document_hash: self.document_hash.clone(),
+            universe_id: self.universe_id.clone(),
+            universe_manifest_hash: self.universe_manifest_hash.clone(),
             source_assignment: self
                 .assignments
                 .get(&record.source_cell_id)
@@ -4886,8 +5303,9 @@ mod tests {
         );
         successor.seal().expect("successor authority seals");
 
-        let mut store = DraftCellDirectoryHistoryStoreV3::initialize(root.path(), initial.clone())
-            .expect("history initializes");
+        let mut store =
+            DraftCellDirectoryHistoryStoreV3::open_or_initialize(root.path(), initial.clone())
+                .expect("history initializes");
         store
             .commit(
                 initial.directory_revision,
@@ -4896,14 +5314,14 @@ mod tests {
             )
             .expect("successor authority commits");
         let old = store
-            .resolve_cell_authority(
+            .resolve_historical_cell_authority(
                 initial.directory_revision,
                 &initial.document_hash,
                 &source_id,
             )
             .expect("old authority resolves exactly");
         let live = store
-            .resolve_cell_authority(
+            .resolve_historical_cell_authority(
                 successor.directory_revision,
                 &successor.document_hash,
                 &source_id,
@@ -4933,6 +5351,48 @@ mod tests {
         assignment.holder_id = None;
         sleeping.seal().expect("sleeping document seals");
         assert!(sleeping.validated_cell_authority(&source_id).is_err());
+
+        let mut finalized_document = finalized_document();
+        let finalized_source_id = finalized_document.transfers["transfer-grid-v3-proof"]
+            .source_cell_id
+            .clone();
+        let finalized_source = finalized_document
+            .assignments
+            .get_mut(&finalized_source_id)
+            .expect("finalized source assignment exists");
+        finalized_source.state = CellAssignmentState::Sleeping;
+        finalized_source.holder_id = None;
+        finalized_document
+            .seal()
+            .expect("terminal finalized document permits a sleeping source");
+        let finalized = finalized_document
+            .validated_grid_transfer_authority("transfer-grid-v3-proof")
+            .expect("finalized transfer authority resolves");
+        assert!(finalized.source_cell_authority().is_err());
+        finalized
+            .destination_cell_authority()
+            .expect("finalized destination remains assigned");
+
+        let mut aborted_document = aborted_document();
+        let aborted_destination_id = aborted_document.transfers["transfer-grid-v3-proof"]
+            .destination_cell_id
+            .clone();
+        let aborted_destination = aborted_document
+            .assignments
+            .get_mut(&aborted_destination_id)
+            .expect("aborted destination assignment exists");
+        aborted_destination.state = CellAssignmentState::Sleeping;
+        aborted_destination.holder_id = None;
+        aborted_document
+            .seal()
+            .expect("terminal aborted document permits a sleeping destination");
+        let aborted = aborted_document
+            .validated_grid_transfer_authority("transfer-grid-v3-proof")
+            .expect("aborted transfer authority resolves");
+        aborted
+            .source_cell_authority()
+            .expect("aborted source remains assigned");
+        assert!(aborted.destination_cell_authority().is_err());
     }
 
     #[test]
@@ -5730,13 +6190,61 @@ mod tests {
     }
 
     #[test]
+    fn dormant_v3_initialization_resumes_exact_empty_crash_states() {
+        enum EmptyCrashState {
+            HistoryOnly,
+            EmptyHead,
+        }
+
+        for crash_state in [EmptyCrashState::HistoryOnly, EmptyCrashState::EmptyHead] {
+            let root = tempdir().expect("temporary directory");
+            let initial = complete_directory_history()[0].clone();
+            let isolated = root.path().join(DRAFT_DIRECTORY_HISTORY_SUBDIRECTORY);
+            fs::create_dir_all(&isolated).expect("isolated history directory creates");
+            File::create(isolated.join(DRAFT_DIRECTORY_HISTORY_FILE))
+                .expect("empty history file creates");
+            if matches!(crash_state, EmptyCrashState::EmptyHead) {
+                let head = DraftDirectoryHistoryHeadV3::empty(&initial);
+                fs::write(
+                    isolated.join(DRAFT_DIRECTORY_HISTORY_HEAD_FILE),
+                    serde_json::to_vec_pretty(&head).expect("empty head encodes"),
+                )
+                .expect("empty head writes");
+                assert!(
+                    DraftCellDirectoryHistoryStoreV3::open(
+                        root.path(),
+                        &initial.universe_id,
+                        &initial.universe_manifest_hash,
+                    )
+                    .is_err(),
+                    "ordinary reopen never exposes a store without genesis"
+                );
+            }
+
+            let store =
+                DraftCellDirectoryHistoryStoreV3::open_or_initialize(root.path(), initial.clone())
+                    .expect("empty initialization crash resumes");
+            assert_eq!(store.current().expect("genesis exists"), &initial);
+            assert_eq!(store.head.entry_count, 1);
+            drop(store);
+            let reopened = DraftCellDirectoryHistoryStoreV3::open(
+                root.path(),
+                &initial.universe_id,
+                &initial.universe_manifest_hash,
+            )
+            .expect("resumed history reopens normally");
+            assert_eq!(reopened.current().expect("genesis exists"), &initial);
+        }
+    }
+
+    #[test]
     fn dormant_v3_history_resolves_every_exact_authority_after_later_commits() {
         let root = tempdir().expect("temporary directory");
         let documents = complete_directory_history();
         let universe_id = documents[0].universe_id.clone();
         let manifest_hash = documents[0].universe_manifest_hash.clone();
         let mut store =
-            DraftCellDirectoryHistoryStoreV3::initialize(root.path(), documents[0].clone())
+            DraftCellDirectoryHistoryStoreV3::open_or_initialize(root.path(), documents[0].clone())
                 .expect("history initializes");
         assert!(!root.path().join("cell-directory.json").exists());
         assert!(!root.path().join("cell-directory.lock").exists());
@@ -5760,7 +6268,7 @@ mod tests {
         );
         for document in documents.iter().skip(1) {
             let authority = store
-                .resolve_grid_authority(
+                .resolve_historical_grid_authority(
                     document.directory_revision,
                     &document.document_hash,
                     "transfer-grid-v3-proof",
@@ -5775,7 +6283,7 @@ mod tests {
         }
         assert!(
             store
-                .resolve_grid_authority(
+                .resolve_historical_grid_authority(
                     documents[1].directory_revision,
                     &documents[2].document_hash,
                     "transfer-grid-v3-proof",
@@ -5835,7 +6343,7 @@ mod tests {
             let universe_id = initial.universe_id.clone();
             let manifest_hash = initial.universe_manifest_hash.clone();
             let mut store =
-                DraftCellDirectoryHistoryStoreV3::initialize(root.path(), initial.clone())
+                DraftCellDirectoryHistoryStoreV3::open_or_initialize(root.path(), initial.clone())
                     .expect("history initializes");
             store.set_failpoint(failpoint);
             assert!(
@@ -5858,15 +6366,7 @@ mod tests {
                 &initial
             };
             assert_eq!(reopened.current().expect("tip exists"), expected);
-            if !successor_is_durable {
-                reopened
-                    .commit(
-                        initial.directory_revision,
-                        &initial.document_hash,
-                        successor.clone(),
-                    )
-                    .expect("prior state remains appendable");
-            } else {
+            if successor_is_durable {
                 reopened
                     .commit(
                         successor.directory_revision,
@@ -5874,6 +6374,14 @@ mod tests {
                         successor.clone(),
                     )
                     .expect("durable ambiguous commit reconciles as an exact retry");
+            } else {
+                reopened
+                    .commit(
+                        initial.directory_revision,
+                        &initial.document_hash,
+                        successor.clone(),
+                    )
+                    .expect("prior state remains appendable");
             }
             assert_eq!(reopened.head.entry_count, 2);
             let history = fs::read_to_string(
@@ -5892,8 +6400,9 @@ mod tests {
         let documents = complete_directory_history();
         let initial = documents[0].clone();
         let prepared = documents[1].clone();
-        let mut store = DraftCellDirectoryHistoryStoreV3::initialize(root.path(), initial.clone())
-            .expect("history initializes");
+        let mut store =
+            DraftCellDirectoryHistoryStoreV3::open_or_initialize(root.path(), initial.clone())
+                .expect("history initializes");
 
         assert!(
             store
@@ -5964,7 +6473,10 @@ mod tests {
             DeleteMiddle,
             DeleteHeadedSuffix,
             CompleteGarbageSuffix,
+            OversizedCompleteSuffix,
             MissingHead,
+            NonCanonicalHead,
+            OversizedHead,
         }
 
         for tamper in [
@@ -5972,15 +6484,20 @@ mod tests {
             Tamper::DeleteMiddle,
             Tamper::DeleteHeadedSuffix,
             Tamper::CompleteGarbageSuffix,
+            Tamper::OversizedCompleteSuffix,
             Tamper::MissingHead,
+            Tamper::NonCanonicalHead,
+            Tamper::OversizedHead,
         ] {
             let root = tempdir().expect("temporary directory");
             let documents = complete_directory_history();
             let universe_id = documents[0].universe_id.clone();
             let manifest_hash = documents[0].universe_manifest_hash.clone();
-            let mut store =
-                DraftCellDirectoryHistoryStoreV3::initialize(root.path(), documents[0].clone())
-                    .expect("history initializes");
+            let mut store = DraftCellDirectoryHistoryStoreV3::open_or_initialize(
+                root.path(),
+                documents[0].clone(),
+            )
+            .expect("history initializes");
             for pair in documents[..3].windows(2) {
                 store
                     .commit(
@@ -6031,8 +6548,32 @@ mod tests {
                         .write_all(b"{\"complete\":\"garbage\"}\n")
                         .expect("garbage suffix writes");
                 }
+                Tamper::OversizedCompleteSuffix => {
+                    let mut file = OpenOptions::new()
+                        .append(true)
+                        .open(&history_path)
+                        .expect("history opens");
+                    file.write_all(&vec![b' '; MAX_DRAFT_DIRECTORY_HISTORY_LINE_BYTES + 1])
+                        .and_then(|()| file.write_all(b"\n"))
+                        .expect("oversized complete suffix writes");
+                }
                 Tamper::MissingHead => {
                     fs::remove_file(&head_path).expect("head removes");
+                }
+                Tamper::NonCanonicalHead => {
+                    let head = read_history_head_v3(&head_path).expect("head reads");
+                    fs::write(
+                        &head_path,
+                        serde_json::to_vec(&head).expect("compact head encodes"),
+                    )
+                    .expect("noncanonical head writes");
+                }
+                Tamper::OversizedHead => {
+                    fs::write(
+                        &head_path,
+                        vec![b' '; MAX_DRAFT_DIRECTORY_HISTORY_HEAD_BYTES as usize + 1],
+                    )
+                    .expect("oversized head writes");
                 }
             }
             assert!(

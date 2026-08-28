@@ -653,11 +653,11 @@ assignment-generation-to-cell-fence histories. Validation requires every proof
 to use an authority pair the directory actually issued, and rejects a resealed
 cross-pair even when its individual numbers are in range. Successor workers use
 separate event-free reconciliation transactions, so an already committed event
-is never invented again during recovery. A proof-only replay dispatcher must
-resolve the exact historical directory revision and compare it with the event
-payload; serialized authority is not itself a trust root. The dormant
-directory-v3 path now retains every full sealed revision in a canonical NDJSON
-hash chain under an isolated protocol-19 namespace. An atomically replaced head
+is never invented again during recovery. The dormant proof-only replay
+dispatcher now resolves the exact historical directory revision and compares it
+with the event payload; serialized authority is not itself a trust root. The
+dormant directory-v3 path now retains every full sealed revision in a canonical
+NDJSON hash chain under an isolated protocol-19 namespace. An atomically replaced head
 pins its exact entry count, record boundary, revision, document hash, and chain
 hash, so deleting a durable suffix fails closed while a valid journal record
 that reached disk before its head is safely adopted on restart. Recovery
@@ -666,10 +666,25 @@ historical transfer and assigned-cell capabilities resolve only by revision plus
 document hash; stale CAS attempts, revision forks, rewritten predecessors,
 complete garbage suffixes, and live directory-v2 filename collisions reject.
 The history remains dormant because its head advertises the indivisible
-protocol-19 tuple and no active runtime calls it.
+protocol-19 tuple and no active runtime calls it. Its constructors are compiled
+only for tests until a validated manifest-5 capability exists; a merely
+well-formed manifest hash cannot activate the store.
+The dispatcher total-matches all eight event-17 operation kinds, rebinds only a
+directory-proven successor lease fence while preserving the gameplay and event
+frontiers, and calls only exact-predecessor transactions—never reconciliation.
+Grid claims must equal the independently reconstructed transfer capability.
+Production events now commit directory revision, document hash, assignment
+generation, and fence, and their retained release record and proof bind the same
+four values. Canonical-but-fabricated claims, generation/fence cross-pairs,
+wrong capability kinds, second application, and successor-document substitution
+reject before mutation. A round-tripped old event still resolves its precise
+historical authority after later directory revisions. Historical authority is
+replay evidence only: live event sealing is test-only until the locked world-21
+store can mint a distinct current-authority append lease. There will be no
+historical-to-live capability conversion.
 The active event-17 runtime/store adapter, scheduler and durable wake-up path,
-the trusted proof-only dispatcher, and whole-world persistence failpoint
-crash/replay integration remain to be implemented before activation. All drafts are
+and whole-world persistence failpoint crash/replay integration remain to be
+implemented before activation. All drafts are
 intentionally unreachable from the production directory-v2/package-v1 paths
 until every version in the table above moves in one coordinated activation.
 The dormant proof harness retains bounded predecessor projections for replay;

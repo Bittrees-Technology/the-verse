@@ -6,6 +6,8 @@
 //! entry point. The active protocol-18/package-v1 path remains EVA-only until
 //! the complete ADR-0024 compatibility tuple activates atomically.
 
+#[cfg(test)]
+mod dispatcher_v17;
 #[allow(dead_code)]
 mod event_v17;
 #[allow(dead_code)]
@@ -55,6 +57,7 @@ const PACKAGE_HASH_DOMAIN: &[u8] = b"the-verse/grid-transfer-package/v2\0";
 /// from drifting while both remain isolated from the protocol-18 runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[allow(clippy::struct_field_names)]
 pub(super) struct DraftGridCompatibilityTupleV19 {
     protocol_version: u32,
     projection_schema_version: u32,
@@ -1871,6 +1874,25 @@ mod tests {
         let (source, context) = crossing_fixture();
         let package = extract_draft_grid_closure(&source, STARTER_GRID_ID, &context)
             .expect("grid closure extracts");
+        (source, context, package)
+    }
+
+    pub(super) fn package_v3_directory_fixture() -> (
+        WorldState,
+        DraftGridTransferContextV2,
+        DraftGridClosurePackageV2,
+    ) {
+        let (source, mut context) = crossing_fixture();
+        for member in &mut context.placement.members {
+            member.prior_placement_generation = 1;
+            member.resulting_placement_generation = 2;
+        }
+        context.placement.member_root = context
+            .placement
+            .calculate_member_root()
+            .expect("v3 fixture member root derives");
+        let package = extract_draft_grid_closure(&source, STARTER_GRID_ID, &context)
+            .expect("v3 directory grid closure extracts");
         (source, context, package)
     }
 

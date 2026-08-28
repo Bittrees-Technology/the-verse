@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 #[cfg(test)]
-use super::event_v17::DraftCanonicalGridEventV17;
+use super::event_v17::{DraftCanonicalGridEventV17, DraftProductionAuthorityClaimV17};
 use super::event_v17::{DraftGridEventPayloadV17, ValidatedDraftGridEventContextV17};
 use super::production::{
     DraftImportedProductionEligibilityV2, DraftImportedProductionOccurrenceControlsV2,
@@ -32,6 +32,7 @@ use super::{
     validate_destination_conflicts_in_validated_world_v21,
 };
 use crate::cell_directory::TransferPhase;
+use crate::cell_directory_v3::ValidatedCellAuthorityV3;
 use crate::cell_directory_v3::{DirectoryPhaseProofV3, ValidatedGridTransferAuthorityV3};
 use crate::event::ProductionMachineOutcome;
 use crate::model::{Ledger, TransferConservationWitness, TransferWitnessDirection};
@@ -431,6 +432,9 @@ struct DraftImportedProductionReleaseRecordV2 {
     resulting_history_count: u64,
     resulting_history_head: String,
     history_entry_hash: String,
+    authority_directory_revision: u64,
+    authority_directory_document_hash: String,
+    authority_assignment_generation: u64,
     live_fencing_token: u64,
     accepted_trusted_at_unix_ms: u64,
     mutation_witness_hash: String,
@@ -579,6 +583,9 @@ pub(crate) struct DraftImportedProductionReleaseProofV2 {
     pub(crate) resulting_history_count: u64,
     pub(crate) resulting_history_head: String,
     pub(crate) history_entry_hash: String,
+    pub(crate) authority_directory_revision: u64,
+    pub(crate) authority_directory_document_hash: String,
+    pub(crate) authority_assignment_generation: u64,
     pub(crate) live_fencing_token: u64,
     pub(crate) accepted_trusted_at_unix_ms: u64,
     pub(crate) mutation_witness_hash: String,
@@ -759,6 +766,9 @@ struct DraftImportedProductionReleaseEventHashMaterialV2<'a> {
     prior_history_count: u64,
     prior_history_head: &'a str,
     resulting_history_count: u64,
+    authority_directory_revision: u64,
+    authority_directory_document_hash: &'a str,
+    authority_assignment_generation: u64,
     live_fencing_token: u64,
     accepted_trusted_at_unix_ms: u64,
     mutation_witness_hash: &'a str,
@@ -1058,6 +1068,18 @@ impl DraftGridDirectoryAuthorityV2 {
                 .live_destination_assignment_generation(),
             live_destination_fencing_token: authority.live_destination_fencing_token(),
         }
+    }
+
+    pub(super) fn directory_revision(&self) -> u64 {
+        self.directory_revision
+    }
+
+    pub(super) fn directory_document_hash(&self) -> &str {
+        &self.directory_document_hash
+    }
+
+    pub(super) fn transfer_id(&self) -> &str {
+        &self.binding.transfer_id
     }
 
     #[cfg(test)]
@@ -3022,6 +3044,11 @@ impl DraftImportedProductionReleaseRecordV2 {
         event: &ValidatedDraftGridEventContextV17,
     ) -> Result<Self, DraftGridClosureError> {
         controls.validate_for_world(&state.base, &state.imported_production_eligibilities)?;
+        let authority = event.production_authority_claim().ok_or_else(|| {
+            DraftGridClosureError::Invalid(
+                "production release record has no validated directory authority claim".into(),
+            )
+        })?;
         let prior_destination_inventory_contents = outcomes
             .iter()
             .filter_map(|outcome| outcome.ordinary_outcome.as_ref())
@@ -3109,6 +3136,9 @@ impl DraftImportedProductionReleaseRecordV2 {
             resulting_history_count,
             resulting_history_head: String::new(),
             history_entry_hash: String::new(),
+            authority_directory_revision: authority.directory_revision(),
+            authority_directory_document_hash: authority.directory_document_hash().to_owned(),
+            authority_assignment_generation: authority.assignment_generation(),
             live_fencing_token: event.authority_fencing_token,
             accepted_trusted_at_unix_ms: event.occurred_at_unix_ms,
             mutation_witness_hash: String::new(),
@@ -3188,6 +3218,9 @@ impl DraftImportedProductionReleaseRecordV2 {
             resulting_history_count: self.resulting_history_count,
             resulting_history_head: self.resulting_history_head.clone(),
             history_entry_hash: self.history_entry_hash.clone(),
+            authority_directory_revision: self.authority_directory_revision,
+            authority_directory_document_hash: self.authority_directory_document_hash.clone(),
+            authority_assignment_generation: self.authority_assignment_generation,
             live_fencing_token: self.live_fencing_token,
             accepted_trusted_at_unix_ms: self.accepted_trusted_at_unix_ms,
             mutation_witness_hash: self.mutation_witness_hash.clone(),
@@ -3263,6 +3296,9 @@ impl DraftImportedProductionReleaseRecordV2 {
             || !valid_blake3_hex(&self.history_entry_hash)
             || self.history_entry_hash != self.calculate_history_entry_hash()?
             || self.resulting_history_head != self.history_entry_hash
+            || self.authority_directory_revision == 0
+            || !valid_blake3_hex(&self.authority_directory_document_hash)
+            || self.authority_assignment_generation == 0
             || self.live_fencing_token == 0
             || self.accepted_trusted_at_unix_ms < occurrence.scheduled_for_unix_ms
             || (self.prior_event_sequence == 0 && !self.prior_event_hash.is_empty())
@@ -3308,6 +3344,9 @@ impl DraftImportedProductionReleaseProofV2 {
                 prior_history_count: self.prior_history_count,
                 prior_history_head: &self.prior_history_head,
                 resulting_history_count: self.resulting_history_count,
+                authority_directory_revision: self.authority_directory_revision,
+                authority_directory_document_hash: &self.authority_directory_document_hash,
+                authority_assignment_generation: self.authority_assignment_generation,
                 live_fencing_token: self.live_fencing_token,
                 accepted_trusted_at_unix_ms: self.accepted_trusted_at_unix_ms,
                 mutation_witness_hash: &self.mutation_witness_hash,
@@ -3358,6 +3397,9 @@ impl DraftImportedProductionReleaseProofV2 {
                     .calculate_history_entry_hash()
                     .map_err(|source| source.to_string())?
             || self.resulting_history_head != self.history_entry_hash
+            || self.authority_directory_revision == 0
+            || !valid_blake3_hex(&self.authority_directory_document_hash)
+            || self.authority_assignment_generation == 0
             || self.live_fencing_token == 0
             || self.accepted_trusted_at_unix_ms < occurrence.scheduled_for_unix_ms
             || (self.prior_event_sequence == 0 && !self.prior_event_hash.is_empty())
@@ -3651,6 +3693,57 @@ impl DraftGridTransferCellStateV2 {
             DraftGridClosureError::Unsupported("test successor fence exhausted".into())
         })?;
         self.seal()
+    }
+
+    #[cfg(test)]
+    pub(super) fn replace_test_fence(
+        &mut self,
+        fencing_token: u64,
+    ) -> Result<(), DraftGridClosureError> {
+        self.base.fencing_token = fencing_token;
+        self.seal()
+    }
+
+    pub(super) fn rebind_validated_cell_authority(
+        &self,
+        authority: &ValidatedCellAuthorityV3,
+    ) -> Result<Self, DraftGridClosureError> {
+        self.validate()?;
+        let prior_event_sequence = self.base.event_sequence;
+        let prior_event_hash = self.base.last_event_hash.clone();
+        let prior_active_world_hash = self.calculate_active_world_hash()?;
+        let prior_fence_occurrences = authority
+            .fencing_history()
+            .values()
+            .filter(|&&fence| fence == self.base.fencing_token)
+            .count();
+        if authority.universe_id() != self.base.universe_id
+            || authority.universe_manifest_hash() != self.base.universe_manifest_hash
+            || authority.cell_id() != self.base.cell_id
+            || authority.fencing_token() < self.base.fencing_token
+            || prior_fence_occurrences != 1
+            || authority
+                .fencing_history()
+                .get(&authority.assignment_generation())
+                .copied()
+                != Some(authority.fencing_token())
+        {
+            return Err(DraftGridClosureError::Invalid(
+                "validated directory authority cannot rebind this cell state".into(),
+            ));
+        }
+        let mut next = self.clone();
+        next.base.fencing_token = authority.fencing_token();
+        next.seal()?;
+        if next.base.event_sequence != prior_event_sequence
+            || next.base.last_event_hash != prior_event_hash
+            || next.calculate_active_world_hash()? != prior_active_world_hash
+        {
+            return Err(DraftGridClosureError::Invalid(
+                "directory authority rebind changed the gameplay or event frontier".into(),
+            ));
+        }
+        Ok(next)
     }
 
     fn new(base: WorldState) -> Result<Self, DraftGridClosureError> {
@@ -6490,9 +6583,18 @@ pub(super) fn stage_imported_production_occurrence_event_v17(
     DraftGridClosureError,
 > {
     state.validate()?;
+    let authority = event
+        .production_authority_claim()
+        .ok_or_else(|| {
+            DraftGridClosureError::Invalid(
+                "production event-17 context has no directory authority claim".into(),
+            )
+        })?
+        .clone();
     event.require_payload(&DraftGridEventPayloadV17::ProductionQuantumCommitted {
         occurrence: occurrence.clone(),
         accepted_trusted_at_unix_ms: event.occurred_at_unix_ms,
+        authority,
     })?;
     if event.occurred_at_unix_ms < occurrence.scheduled_for_unix_ms {
         return Err(DraftGridClosureError::Invalid(
@@ -6652,6 +6754,7 @@ fn stage_imported_production_occurrence_v2(
         DraftGridEventPayloadV17::ProductionQuantumCommitted {
             occurrence: occurrence.clone(),
             accepted_trusted_at_unix_ms: accepted_trusted_now_unix_ms,
+            authority: DraftProductionAuthorityClaimV17::for_test(state),
         },
     )?;
     let context = event.validate_for_state(state)?;
@@ -9299,6 +9402,7 @@ mod tests {
             DraftGridEventPayloadV17::ProductionQuantumCommitted {
                 occurrence: occurrence.clone(),
                 accepted_trusted_at_unix_ms: 1_800_000_021_000,
+                authority: DraftProductionAuthorityClaimV17::for_test(&activated),
             },
         )
         .expect("production event seals");
