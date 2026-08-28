@@ -53,6 +53,7 @@ const VERIFIER_WORKER_JS: &str =
 const VERIFIER_WORKER_CORE_JS: &str =
     include_str!("../../../apps/web-command-center/verifier-worker-core.js");
 const REPLICATION_PERIOD: Duration = Duration::from_nanos(16_666_667);
+const MAX_ACTIVE_ELAPSED_MILLIS: u16 = 250;
 const DYNAMIC_CACHE_CONTROL: &str = "no-store";
 const MAX_CLIENT_NAME_BYTES: usize = 128;
 const MAX_SERVER_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
@@ -316,6 +317,13 @@ impl ProjectionRevision {
             .cloned()
             .map_err(|source| ProjectionError::InvalidCanonicalSnapshot(source.clone()))
     }
+}
+
+fn bounded_active_elapsed(elapsed: Duration) -> u16 {
+    let elapsed_millis = elapsed
+        .as_millis()
+        .clamp(1, u128::from(MAX_ACTIVE_ELAPSED_MILLIS));
+    u16::try_from(elapsed_millis).expect("bounded active elapsed milliseconds fit u16")
 }
 
 impl AppState {
@@ -942,21 +950,34 @@ impl AppState {
         let mut active_interval =
             tokio::time::interval(Duration::from_millis(u64::from(tick_millis)));
         active_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last_active_advance = None;
         loop {
             match self.lifecycle_mode() {
                 LifecycleMode::Active => {
                     active_interval.tick().await;
+                    let advance_started_at = Instant::now();
+                    let elapsed_millis = last_active_advance
+                        .replace(advance_started_at)
+                        .map_or(tick_millis, |prior| {
+                            bounded_active_elapsed(advance_started_at.duration_since(prior))
+                        });
                     let coordinator_managed = self.runtime.lock().coordinator.is_some();
                     if !coordinator_managed
                         && self.connected_players.lock().is_empty()
                         && self.last_player_activity.lock().elapsed() >= idle_drain_after
                     {
                         self.drain_to_background_or_sleeping()?;
+                        last_active_advance = None;
                         continue;
                     }
-                    self.advance(tick_millis)?;
+                    // Persistence and snapshot synchronization can take longer than the
+                    // configured poll interval. Feed the authoritative runtime the real
+                    // elapsed wall time so its fixed-step accumulator catches up instead
+                    // of slowing the universe and producing uneven motion.
+                    self.advance(elapsed_millis)?;
                 }
                 LifecycleMode::Background => {
+                    last_active_advance = None;
                     let wait_millis = self.production_wait_millis()?.unwrap_or(0);
                     if wait_millis > 0 {
                         tokio::select! {
@@ -966,9 +987,18 @@ impl AppState {
                     }
                     self.background_dispatch_step()?;
                 }
-                LifecycleMode::Sleeping => self.lifecycle_signal.notified().await,
-                LifecycleMode::Activating => self.ensure_active().await?,
-                LifecycleMode::Draining => tokio::task::yield_now().await,
+                LifecycleMode::Sleeping => {
+                    last_active_advance = None;
+                    self.lifecycle_signal.notified().await;
+                }
+                LifecycleMode::Activating => {
+                    last_active_advance = None;
+                    self.ensure_active().await?;
+                }
+                LifecycleMode::Draining => {
+                    last_active_advance = None;
+                    tokio::task::yield_now().await;
+                }
             }
         }
     }
@@ -2813,6 +2843,17 @@ mod tests {
         PersistenceError, Store, TrustedClock, address_from_origin_offset_um, cell_id,
         local_position_from_address, proof_cell_keys,
     };
+
+    #[test]
+    fn active_elapsed_uses_real_time_and_stays_within_runtime_bounds() {
+        assert_eq!(bounded_active_elapsed(Duration::ZERO), 1);
+        assert_eq!(bounded_active_elapsed(Duration::from_millis(16)), 16);
+        assert_eq!(bounded_active_elapsed(Duration::from_millis(27)), 27);
+        assert_eq!(
+            bounded_active_elapsed(Duration::from_secs(2)),
+            MAX_ACTIVE_ELAPSED_MILLIS
+        );
+    }
 
     use super::*;
 

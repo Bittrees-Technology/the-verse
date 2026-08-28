@@ -5,6 +5,7 @@ set -euo pipefail
 package_directory="$(cd "$(dirname "$0")" && pwd)"
 universe_directory="${VERSE_DATA_DIR:-${HOME}/Library/Application Support/The Verse Earth Playtest/universe}"
 genesis_profile="${VERSE_GENESIS_PROFILE:-earth-start}"
+snapshot_every="${VERSE_SNAPSHOT_EVERY:-600}"
 export VERSE_BROWSER_VERIFIER_ASSET_DIR="${package_directory}/browser-verifier"
 server_pid=""
 
@@ -20,6 +21,7 @@ mkdir -p "${universe_directory}"
 "${package_directory}/verse-simulation-worker" \
   --data-directory "${universe_directory}" \
   --genesis-profile "${genesis_profile}" \
+  --snapshot-every "${snapshot_every}" \
   --bind 127.0.0.1:7777 \
   >"${universe_directory}/server.log" 2>&1 &
 server_pid="$!"

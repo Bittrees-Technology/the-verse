@@ -65,6 +65,7 @@ const CHARACTER_ANGULAR_DAMPENER_ACCELERATION := 7.0
 const CHARACTER_MAXIMUM_SPEED := 12.0
 const CHARACTER_BOOST_MAXIMUM_SPEED := 24.0
 const CHARACTER_MAXIMUM_ANGULAR_SPEED := 2.5
+const CHARACTER_MAXIMUM_VIEW_PITCH := 85.0 * PI / 180.0
 const CHARACTER_UPRIGHT_ALIGNMENT_ACCELERATION := 28.0
 const CHARACTER_WALK_SPEED := 4.5
 const CHARACTER_SPRINT_SPEED := 7.5
@@ -160,6 +161,11 @@ var last_authoritative_simulation_tick := 0
 var predicted_simulation_tick := 0
 var predicted_position := Vector3.ZERO
 var predicted_orientation := Quaternion.IDENTITY
+var previous_predicted_position := Vector3.ZERO
+var previous_predicted_orientation := Quaternion.IDENTITY
+var predicted_view_pitch_radians := 0.0
+var previous_predicted_view_pitch_radians := 0.0
+var prediction_presentation_ready := false
 var predicted_linear_velocity := Vector3.ZERO
 var predicted_angular_velocity := Vector3.ZERO
 var predicted_surface_contact := false
@@ -182,6 +188,7 @@ var roll_right_held := false
 var pending_roll_transitions: Array[float] = []
 var presentation_position_offset := Vector3.ZERO
 var presentation_orientation_offset := Quaternion.IDENTITY
+var last_presented_eye_offset := Vector3.UP * CHARACTER_EYE_OFFSET
 var require_neutral_baseline := true
 var last_player_id := ""
 var last_player_life_state := ""
@@ -354,6 +361,7 @@ func _physics_process(delta: float) -> void:
 		if _should_send_player_control(control) and _send_player_control(control, false):
 			if sampled_roll_transition and not pending_roll_transitions.is_empty():
 				pending_roll_transitions.pop_front()
+	_capture_prediction_presentation_step()
 	_predict_player_step(control, CHARACTER_FIXED_DELTA, true)
 
 
@@ -2460,6 +2468,7 @@ func _discard_source_view_for_handoff() -> void:
 	_clear_transient_character_input()
 	presentation_position_offset = Vector3.ZERO
 	presentation_orientation_offset = Quaternion.IDENTITY
+	prediction_presentation_ready = false
 	require_neutral_baseline = true
 	last_authoritative_event_sequence = -1
 	last_authoritative_simulation_tick = 0
@@ -3338,7 +3347,7 @@ func _apply_authoritative_player(
 		or incoming_epoch != movement_epoch
 		or source == "reconnect"
 	)
-	var old_present_position := camera.position - _camera_eye_offset()
+	var old_present_position := camera.position - last_presented_eye_offset
 	var old_present_orientation := camera.quaternion
 	var old_history := prediction_history.duplicate(true)
 	var old_predicted_simulation_tick := predicted_simulation_tick
@@ -3355,6 +3364,11 @@ func _apply_authoritative_player(
 
 	predicted_position = _vec3(player.get("position", {}))
 	predicted_orientation = _quat(player.get("orientation", {}))
+	predicted_view_pitch_radians = clampf(
+		float(incoming_locomotion.get("view_pitch_radians", 0.0)),
+		-CHARACTER_MAXIMUM_VIEW_PITCH,
+		CHARACTER_MAXIMUM_VIEW_PITCH
+	)
 	predicted_linear_velocity = _vec3(player.get("linear_velocity", {}))
 	predicted_angular_velocity = _vec3(player.get("angular_velocity", {}))
 	predicted_surface_contact = bool(player.get("surface_contact", false))
@@ -3419,7 +3433,7 @@ func _apply_authoritative_player(
 		desired_magnetic_boots = bool(incoming_locomotion.get("magnetic_boots_enabled", false))
 
 	var correction_distance := old_present_position.distance_to(predicted_position)
-	var target_view_orientation := _player_view_orientation(
+	var target_view_orientation := _predicted_player_view_orientation(
 		predicted_orientation, incoming_locomotion
 	)
 	var correction_angle := _quaternion_angular_distance(
@@ -3430,13 +3444,15 @@ func _apply_authoritative_player(
 	):
 		presentation_position_offset = Vector3.ZERO
 		presentation_orientation_offset = Quaternion.IDENTITY
-		camera.position = predicted_position + _camera_eye_offset()
+		last_presented_eye_offset = _prediction_camera_eye_offset(predicted_orientation)
+		camera.position = predicted_position + last_presented_eye_offset
 		camera.quaternion = target_view_orientation
 	else:
 		presentation_position_offset = old_present_position - predicted_position
 		presentation_orientation_offset = (
 			old_present_orientation * target_view_orientation.inverse()
 		).normalized()
+	_reset_prediction_presentation_baseline()
 
 	authoritative_player_ready = true
 	awaiting_reconnect_baseline = false
@@ -3551,6 +3567,7 @@ func _begin_player_resync() -> void:
 	_clear_transient_character_input()
 	presentation_position_offset = Vector3.ZERO
 	presentation_orientation_offset = Quaternion.IDENTITY
+	prediction_presentation_ready = false
 	require_neutral_baseline = true
 	last_authoritative_event_sequence = -1
 	_sync_remote_players([])
@@ -3565,6 +3582,7 @@ func _reset_control_prediction_after_rejection() -> void:
 	last_sent_control = {}
 	control_send_elapsed = 0.0
 	_clear_transient_character_input()
+	prediction_presentation_ready = false
 	require_neutral_baseline = true
 
 
@@ -4398,6 +4416,20 @@ func _player_control_message(
 	}
 
 
+func _capture_prediction_presentation_step() -> void:
+	previous_predicted_position = predicted_position
+	previous_predicted_orientation = predicted_orientation
+	previous_predicted_view_pitch_radians = predicted_view_pitch_radians
+	prediction_presentation_ready = true
+
+
+func _reset_prediction_presentation_baseline() -> void:
+	previous_predicted_position = predicted_position
+	previous_predicted_orientation = predicted_orientation
+	previous_predicted_view_pitch_radians = predicted_view_pitch_radians
+	prediction_presentation_ready = true
+
+
 func _predict_player_step(control: Dictionary, delta: float, record_history: bool) -> void:
 	var player := _local_player()
 	var locomotion: Dictionary = player.get("locomotion", {})
@@ -4405,6 +4437,14 @@ func _predict_player_step(control: Dictionary, delta: float, record_history: boo
 	var jump_held := bool(control.get("jump", false))
 	prediction_control["jump"] = jump_held and not predicted_jump_held
 	predicted_jump_held = jump_held
+	if not bool(player.get("jetpack_enabled", true)):
+		var angular_input: Vector3 = prediction_control.get("angular_input", Vector3.ZERO)
+		predicted_view_pitch_radians = clampf(
+			predicted_view_pitch_radians
+			+ angular_input.x * CHARACTER_MAXIMUM_ANGULAR_SPEED * delta,
+			-CHARACTER_MAXIMUM_VIEW_PITCH,
+			CHARACTER_MAXIMUM_VIEW_PITCH
+		)
 	var result := _integrate_player_motion(
 		predicted_position,
 		predicted_orientation,
@@ -4693,14 +4733,23 @@ func _player_position_is_clear(position: Vector3) -> bool:
 func _update_player_presentation(delta: float) -> void:
 	if not authoritative_player_ready:
 		return
-	var blend := clampf(delta * 12.0, 0.0, 1.0)
+	var blend := 1.0 - exp(-12.0 * maxf(delta, 0.0))
 	presentation_position_offset = presentation_position_offset.lerp(Vector3.ZERO, blend)
 	presentation_orientation_offset = _shortest_slerp(
 		presentation_orientation_offset, Quaternion.IDENTITY, blend
 	)
 	var locomotion: Dictionary = _local_player().get("locomotion", {})
-	var view_orientation := _player_view_orientation(predicted_orientation, locomotion)
-	camera.position = predicted_position + presentation_position_offset + _camera_eye_offset()
+	var interpolation_fraction := clampf(
+		Engine.get_physics_interpolation_fraction(), 0.0, 1.0
+	)
+	var render_position := _interpolated_prediction_position(interpolation_fraction)
+	var render_orientation := _interpolated_prediction_orientation(interpolation_fraction)
+	var render_view_pitch := _interpolated_prediction_view_pitch(interpolation_fraction)
+	var view_orientation := _view_orientation(
+		render_orientation, locomotion, render_view_pitch
+	)
+	last_presented_eye_offset = _prediction_camera_eye_offset(render_orientation)
+	camera.position = render_position + presentation_position_offset + last_presented_eye_offset
 	camera.quaternion = (presentation_orientation_offset * view_orientation).normalized()
 	var boost_amount := clampf(
 		predicted_linear_velocity.length() / CHARACTER_BOOST_MAXIMUM_SPEED, 0.0, 1.0
@@ -4723,10 +4772,61 @@ func _camera_eye_offset() -> Vector3:
 	return _camera_up() * CHARACTER_EYE_OFFSET
 
 
+func _prediction_camera_eye_offset(body_orientation: Quaternion) -> Vector3:
+	var up := (Basis(body_orientation) * Vector3.UP).normalized()
+	if up.length_squared() <= 0.000001:
+		up = _camera_up()
+	return up * CHARACTER_EYE_OFFSET
+
+
+func _interpolated_prediction_position(fraction: float) -> Vector3:
+	if not prediction_presentation_ready:
+		return predicted_position
+	return previous_predicted_position.lerp(predicted_position, clampf(fraction, 0.0, 1.0))
+
+
+func _interpolated_prediction_orientation(fraction: float) -> Quaternion:
+	if not prediction_presentation_ready:
+		return predicted_orientation
+	return _shortest_slerp(
+		previous_predicted_orientation,
+		predicted_orientation,
+		clampf(fraction, 0.0, 1.0)
+	)
+
+
+func _interpolated_prediction_view_pitch(fraction: float) -> float:
+	if not prediction_presentation_ready:
+		return predicted_view_pitch_radians
+	return lerpf(
+		previous_predicted_view_pitch_radians,
+		predicted_view_pitch_radians,
+		clampf(fraction, 0.0, 1.0)
+	)
+
+
 func _player_view_orientation(body_orientation: Quaternion, locomotion: Dictionary) -> Quaternion:
+	return _view_orientation(
+		body_orientation,
+		locomotion,
+		float(locomotion.get("view_pitch_radians", 0.0))
+	)
+
+
+func _predicted_player_view_orientation(
+	body_orientation: Quaternion, locomotion: Dictionary
+) -> Quaternion:
+	return _view_orientation(body_orientation, locomotion, predicted_view_pitch_radians)
+
+
+func _view_orientation(
+	body_orientation: Quaternion, locomotion: Dictionary, view_pitch_radians: float
+) -> Quaternion:
 	if String(locomotion.get("kind", "eva")) == "eva":
 		return body_orientation
-	var pitch := float(locomotion.get("view_pitch_radians", 0.0))
+	var pitch := clampf(
+		view_pitch_radians, -CHARACTER_MAXIMUM_VIEW_PITCH, CHARACTER_MAXIMUM_VIEW_PITCH
+	)
 	return (body_orientation * Quaternion(Vector3.RIGHT, pitch)).normalized()
 
 
