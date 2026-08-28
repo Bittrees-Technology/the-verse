@@ -33,7 +33,8 @@ pub use event::{
     ProductionMachineOutcomeKind, ProductionScheduleOccurrence,
 };
 pub use handoff::{
-    HandoffError, PlayerTransferConservation, PlayerTransferContext, PlayerTransferPackage,
+    HandoffArtifactError, HandoffError, LocalHandoffArtifactStore, MAX_TRANSFER_ARTIFACT_BYTES,
+    PlayerTransferConservation, PlayerTransferContext, PlayerTransferPackage,
     PlayerTransferQuarantineReceipt, TRANSFER_PACKAGE_SCHEMA_VERSION, prepare_eva_player_transfer,
     quarantine_eva_player_transfer, stage_committed_eva_export, stage_committed_eva_import,
 };

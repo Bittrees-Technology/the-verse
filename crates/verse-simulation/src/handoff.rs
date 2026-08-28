@@ -2,8 +2,13 @@
 
 //! Content-addressed P1.7 player handoff packages and destination quarantine.
 
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use uuid::Uuid;
 use verse_protocol::{CellKeyV1, InventoryContents, InventoryDomain, LocomotionKind, Vec3};
 
 use crate::celestial;
@@ -14,6 +19,10 @@ use crate::model::{
 };
 
 pub const TRANSFER_PACKAGE_SCHEMA_VERSION: u32 = 1;
+pub const MAX_TRANSFER_ARTIFACT_BYTES: usize = 2 * 1_024 * 1_024;
+
+const PACKAGE_FILE: &str = "package.json";
+const QUARANTINE_RECEIPT_FILE: &str = "quarantine-receipt.json";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlayerTransferContext {
@@ -92,7 +101,53 @@ pub enum HandoffError {
     CommittedStateRejected(String),
 }
 
+#[derive(Debug, Error)]
+pub enum HandoffArtifactError {
+    #[error("handoff artifact I/O error at {path}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("handoff artifact JSON is invalid at {path}: {source}")]
+    Json {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("handoff artifact is invalid: {0}")]
+    Invalid(String),
+    #[error("handoff artifact conflicts with durable material for transfer {0}")]
+    Conflict(String),
+    #[error("handoff artifact exceeds the {MAX_TRANSFER_ARTIFACT_BYTES}-byte bound")]
+    TooLarge,
+    #[error("injected handoff artifact failure after file sync")]
+    InjectedAfterFileSync,
+}
+
+#[derive(Debug)]
+pub struct LocalHandoffArtifactStore {
+    root: PathBuf,
+    fail_after_file_sync: bool,
+}
+
 impl PlayerTransferPackage {
+    pub fn hydrate_spatial_poses(&mut self) -> Result<(), HandoffError> {
+        let source_origin = celestial::cell_address_from_key(&self.source_cell_key)
+            .map_err(|source| HandoffError::InvalidPackage(source.to_string()))?;
+        self.source_player.position =
+            celestial::local_position_from_address(&source_origin, &self.source_player.address)
+                .map_err(|source| HandoffError::InvalidPackage(source.to_string()))?;
+        let destination_origin = celestial::cell_address_from_key(&self.destination_cell_key)
+            .map_err(|source| HandoffError::InvalidPackage(source.to_string()))?;
+        self.destination_player.position = celestial::local_position_from_address(
+            &destination_origin,
+            &self.destination_player.address,
+        )
+        .map_err(|source| HandoffError::InvalidPackage(source.to_string()))?;
+        Ok(())
+    }
+
     pub fn calculate_hash(&self) -> String {
         let mut material = self.clone();
         material.package_hash.clear();
@@ -226,6 +281,236 @@ impl PlayerTransferQuarantineReceipt {
         }
         Ok(())
     }
+}
+
+impl LocalHandoffArtifactStore {
+    pub fn open(root: impl AsRef<Path>) -> Result<Self, HandoffArtifactError> {
+        let root = root.as_ref().to_path_buf();
+        fs::create_dir_all(&root).map_err(|source| artifact_io_error(&root, source))?;
+        cleanup_temporary_artifacts(&root)?;
+        Ok(Self {
+            root,
+            fail_after_file_sync: false,
+        })
+    }
+
+    pub fn persist_package(
+        &mut self,
+        package: &PlayerTransferPackage,
+    ) -> Result<(), HandoffArtifactError> {
+        package
+            .validate()
+            .map_err(|source| HandoffArtifactError::Invalid(source.to_string()))?;
+        let path = self.artifact_path(&package.transfer_id, PACKAGE_FILE)?;
+        let bytes = artifact_json_bytes(package)?;
+        if path.exists() {
+            let existing = Self::read_package_path(&path)?;
+            return if existing == *package {
+                Ok(())
+            } else {
+                Err(HandoffArtifactError::Conflict(package.transfer_id.clone()))
+            };
+        }
+        self.publish_atomic(&path, &bytes)?;
+        let existing = Self::read_package_path(&path)?;
+        if existing != *package {
+            return Err(HandoffArtifactError::Conflict(package.transfer_id.clone()));
+        }
+        Ok(())
+    }
+
+    pub fn load_package(
+        &self,
+        transfer_id: &str,
+    ) -> Result<PlayerTransferPackage, HandoffArtifactError> {
+        let path = self.artifact_path(transfer_id, PACKAGE_FILE)?;
+        Self::read_package_path(&path)
+    }
+
+    pub fn persist_quarantine_receipt(
+        &mut self,
+        receipt: &PlayerTransferQuarantineReceipt,
+    ) -> Result<(), HandoffArtifactError> {
+        receipt
+            .validate()
+            .map_err(|source| HandoffArtifactError::Invalid(source.to_string()))?;
+        let path = self.artifact_path(&receipt.transfer_id, QUARANTINE_RECEIPT_FILE)?;
+        let bytes = artifact_json_bytes(receipt)?;
+        if path.exists() {
+            let existing = Self::read_receipt_path(&path)?;
+            return if existing == *receipt {
+                Ok(())
+            } else {
+                Err(HandoffArtifactError::Conflict(receipt.transfer_id.clone()))
+            };
+        }
+        self.publish_atomic(&path, &bytes)?;
+        let existing = Self::read_receipt_path(&path)?;
+        if existing != *receipt {
+            return Err(HandoffArtifactError::Conflict(receipt.transfer_id.clone()));
+        }
+        Ok(())
+    }
+
+    pub fn load_quarantine_receipt(
+        &self,
+        transfer_id: &str,
+    ) -> Result<PlayerTransferQuarantineReceipt, HandoffArtifactError> {
+        let path = self.artifact_path(transfer_id, QUARANTINE_RECEIPT_FILE)?;
+        Self::read_receipt_path(&path)
+    }
+
+    fn artifact_path(
+        &self,
+        transfer_id: &str,
+        file_name: &str,
+    ) -> Result<PathBuf, HandoffArtifactError> {
+        if !valid_stable_id(transfer_id) {
+            return Err(HandoffArtifactError::Invalid(
+                "transfer ID is not bounded canonical text".into(),
+            ));
+        }
+        let transfer_root = self.root.join(transfer_id);
+        fs::create_dir_all(&transfer_root)
+            .map_err(|source| artifact_io_error(&transfer_root, source))?;
+        Ok(transfer_root.join(file_name))
+    }
+
+    fn read_package_path(path: &Path) -> Result<PlayerTransferPackage, HandoffArtifactError> {
+        let mut package: PlayerTransferPackage = read_artifact_json(path)?;
+        package
+            .hydrate_spatial_poses()
+            .map_err(|source| HandoffArtifactError::Invalid(source.to_string()))?;
+        package
+            .validate()
+            .map_err(|source| HandoffArtifactError::Invalid(source.to_string()))?;
+        Ok(package)
+    }
+
+    fn read_receipt_path(
+        path: &Path,
+    ) -> Result<PlayerTransferQuarantineReceipt, HandoffArtifactError> {
+        let receipt: PlayerTransferQuarantineReceipt = read_artifact_json(path)?;
+        receipt
+            .validate()
+            .map_err(|source| HandoffArtifactError::Invalid(source.to_string()))?;
+        Ok(receipt)
+    }
+
+    fn publish_atomic(&mut self, path: &Path, bytes: &[u8]) -> Result<(), HandoffArtifactError> {
+        if bytes.len() > MAX_TRANSFER_ARTIFACT_BYTES {
+            return Err(HandoffArtifactError::TooLarge);
+        }
+        let parent = path.parent().ok_or_else(|| {
+            HandoffArtifactError::Invalid("artifact path has no parent directory".into())
+        })?;
+        let temp_path = parent.join(format!(
+            ".{}.tmp-{}-{}",
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("handoff-artifact"),
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temp_path)
+            .map_err(|source| artifact_io_error(&temp_path, source))?;
+        if let Err(source) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+            let _ = fs::remove_file(&temp_path);
+            return Err(artifact_io_error(&temp_path, source));
+        }
+        if self.consume_fail_after_file_sync() {
+            return Err(HandoffArtifactError::InjectedAfterFileSync);
+        }
+        match fs::hard_link(&temp_path, path) {
+            Ok(()) => {}
+            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(source) => {
+                let _ = fs::remove_file(&temp_path);
+                return Err(artifact_io_error(path, source));
+            }
+        }
+        fs::remove_file(&temp_path).map_err(|source| artifact_io_error(&temp_path, source))?;
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|source| artifact_io_error(parent, source))?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn fail_next_publish_after_file_sync(&mut self) {
+        self.fail_after_file_sync = true;
+    }
+
+    fn consume_fail_after_file_sync(&mut self) -> bool {
+        std::mem::take(&mut self.fail_after_file_sync)
+    }
+}
+
+fn artifact_json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, HandoffArtifactError> {
+    let bytes = serde_json::to_vec_pretty(value).map_err(|source| HandoffArtifactError::Json {
+        path: PathBuf::from("<memory>"),
+        source,
+    })?;
+    if bytes.len() > MAX_TRANSFER_ARTIFACT_BYTES {
+        return Err(HandoffArtifactError::TooLarge);
+    }
+    Ok(bytes)
+}
+
+fn read_artifact_json<T: for<'de> Deserialize<'de>>(
+    path: &Path,
+) -> Result<T, HandoffArtifactError> {
+    let bytes = fs::read(path).map_err(|source| artifact_io_error(path, source))?;
+    if bytes.len() > MAX_TRANSFER_ARTIFACT_BYTES {
+        return Err(HandoffArtifactError::TooLarge);
+    }
+    serde_json::from_slice(&bytes).map_err(|source| HandoffArtifactError::Json {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn artifact_io_error(path: impl AsRef<Path>, source: std::io::Error) -> HandoffArtifactError {
+    HandoffArtifactError::Io {
+        path: path.as_ref().to_path_buf(),
+        source,
+    }
+}
+
+fn cleanup_temporary_artifacts(root: &Path) -> Result<(), HandoffArtifactError> {
+    for transfer_entry in fs::read_dir(root).map_err(|source| artifact_io_error(root, source))? {
+        let transfer_entry = transfer_entry.map_err(|source| artifact_io_error(root, source))?;
+        if !transfer_entry
+            .file_type()
+            .map_err(|source| artifact_io_error(transfer_entry.path(), source))?
+            .is_dir()
+        {
+            continue;
+        }
+        let transfer_path = transfer_entry.path();
+        for artifact_entry in fs::read_dir(&transfer_path)
+            .map_err(|source| artifact_io_error(&transfer_path, source))?
+        {
+            let artifact_entry =
+                artifact_entry.map_err(|source| artifact_io_error(&transfer_path, source))?;
+            let name = artifact_entry.file_name();
+            let name = name.to_string_lossy();
+            if artifact_entry
+                .file_type()
+                .map_err(|source| artifact_io_error(artifact_entry.path(), source))?
+                .is_file()
+                && name.starts_with('.')
+                && name.contains(".tmp-")
+            {
+                fs::remove_file(artifact_entry.path())
+                    .map_err(|source| artifact_io_error(artifact_entry.path(), source))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn prepare_eva_player_transfer(
@@ -908,5 +1193,72 @@ mod tests {
         assert!(
             stage_committed_eva_import(&stale_destination, &package, &receipt, &transfer).is_err()
         );
+    }
+
+    #[test]
+    fn durable_artifacts_publish_after_sync_and_reconcile_exact_retries() {
+        let (source, destination, context) = crossing_fixture();
+        let package = prepare_eva_player_transfer(&source, "player-local", &context)
+            .expect("EVA package prepares");
+        let receipt =
+            quarantine_eva_player_transfer(&destination, destination.fencing_token, &package)
+                .expect("destination quarantine succeeds");
+        let artifact_root = tempdir().expect("temporary artifact directory");
+        let mut artifacts =
+            LocalHandoffArtifactStore::open(artifact_root.path()).expect("artifact store opens");
+
+        artifacts.fail_next_publish_after_file_sync();
+        assert!(matches!(
+            artifacts.persist_package(&package),
+            Err(HandoffArtifactError::InjectedAfterFileSync)
+        ));
+        assert!(artifacts.load_package(&package.transfer_id).is_err());
+        drop(artifacts);
+
+        let mut artifacts =
+            LocalHandoffArtifactStore::open(artifact_root.path()).expect("artifact store reopens");
+        artifacts
+            .persist_package(&package)
+            .expect("package publishes after recovery");
+        artifacts
+            .persist_package(&package)
+            .expect("package retry reconciles");
+        assert_eq!(
+            artifacts
+                .load_package(&package.transfer_id)
+                .expect("package reloads"),
+            package
+        );
+
+        let mut conflict = package.clone();
+        conflict.prepared_at_simulation_tick += 1;
+        conflict.package_hash = conflict.calculate_hash();
+        conflict
+            .validate()
+            .expect("conflicting package is canonical");
+        assert!(matches!(
+            artifacts.persist_package(&conflict),
+            Err(HandoffArtifactError::Conflict(_))
+        ));
+
+        artifacts
+            .persist_quarantine_receipt(&receipt)
+            .expect("receipt publishes");
+        artifacts
+            .persist_quarantine_receipt(&receipt)
+            .expect("receipt retry reconciles");
+        assert_eq!(
+            artifacts
+                .load_quarantine_receipt(&receipt.transfer_id)
+                .expect("receipt reloads"),
+            receipt
+        );
+        let mut receipt_conflict = receipt.clone();
+        receipt_conflict.destination_event_sequence += 1;
+        receipt_conflict.receipt_hash = receipt_conflict.calculate_hash();
+        assert!(matches!(
+            artifacts.persist_quarantine_receipt(&receipt_conflict),
+            Err(HandoffArtifactError::Conflict(_))
+        ));
     }
 }
