@@ -555,6 +555,16 @@ capability for another seed or universe cannot authorize the body. Manifest 5
 lives at the neutral simulation layer so neither the core world model nor the
 future Store depends back on the handoff subsystem.
 
+The outer schema-21 cell state now has a distinct validation gate over that
+context-aware body. It rechecks every closure, production-origin, proof,
+conservation, state-hash, and byte-budget invariant only after the exact
+manifest-5 capability validates the nested body, then returns a borrowed,
+non-serializable state capability. A manifest-4 body, the wrong manifest-5
+universe, inner schema 21, outer schema 20, or a resealed cell-identity change
+cannot mint it. Existing encode/decode and transaction entry points remain on
+their isolated test path until the migration receipt and world-21 Store consume
+this capability.
+
 Implementation is staged behind that boundary. The private directory-v3 draft
 already validates ordered grid-and-rider membership, closure and conservation
 roots, package and receipt schemas, historical cell fences, phase-specific
