@@ -22,6 +22,7 @@ func _run() -> void:
 	_test_exact_tool_targeting()
 	_test_private_projection_lifecycle()
 	_test_actor_owned_industry_selection()
+	_test_physical_production_client()
 	_test_mutation_frontier_reconciliation()
 	if not failures.is_empty():
 		for failure in failures:
@@ -29,7 +30,7 @@ func _run() -> void:
 		quit(1)
 		return
 	print(
-		"VERSE_NATIVE_IMPAIRMENT_OK queued_ack=ordered motion=monotonic corrections=bounded menu=neutral_prediction lifecycle=reset buffers=bounded roll_tap=durable idle=silent rebuild=none targeting=closest_hit ownership=filtered privacy=projected operations=serialized"
+		"VERSE_NATIVE_IMPAIRMENT_OK queued_ack=ordered motion=monotonic corrections=bounded menu=neutral_prediction lifecycle=reset buffers=bounded roll_tap=durable idle=silent rebuild=none targeting=closest_hit ownership=filtered privacy=projected operations=serialized production=physical"
 	)
 	quit(0)
 
@@ -49,7 +50,7 @@ func _new_client(add_to_tree := false) -> Node3D:
 	client.set("camera", camera)
 	var player := _base_player()
 	client.set("snapshot", {
-		"projection_schema_version": 1,
+		"projection_schema_version": 2,
 		"event_sequence": 0,
 		"simulation_tick": 0,
 		"world_hash": "impairment-0",
@@ -142,6 +143,7 @@ func _private_snapshot(
 		"inventories": private_inventories,
 		"death_drops": death_drops,
 		"owned_grid_masses": [],
+		"production_queues": [],
 	}
 
 
@@ -186,7 +188,7 @@ func _motion_message(
 	grids: Array = []
 ) -> Dictionary:
 	return {
-		"projection_schema_version": 1,
+		"projection_schema_version": 2,
 		"event_sequence": event_sequence,
 		"simulation_tick": simulation_tick,
 		"world_hash": "impairment-%d" % event_sequence,
@@ -654,7 +656,7 @@ func _test_private_projection_lifecycle() -> void:
 	spoofed_public_motion["position"] = _protocol_vec3(Vector3(1.0, 0.0, 0.0))
 	spoofed_public_motion["last_processed_input_sequence"] = 99
 	client.call("_apply_motion_state", {
-		"projection_schema_version": 1,
+		"projection_schema_version": 2,
 		"event_sequence": 1,
 		"simulation_tick": 1,
 		"world_hash": "public-only-motion",
@@ -675,7 +677,7 @@ func _test_private_projection_lifecycle() -> void:
 	private_motion["last_received_input_sequence"] = 2
 	private_motion["last_processed_input_sequence"] = 2
 	client.call("_apply_motion_state", {
-		"projection_schema_version": 1,
+		"projection_schema_version": 2,
 		"event_sequence": 2,
 		"simulation_tick": 2,
 		"world_hash": "private-motion",
@@ -704,7 +706,7 @@ func _test_private_projection_lifecycle() -> void:
 	wrong_private_motion["player_id"] = "player-foreign"
 	client.set("authoritative_player_ready", true)
 	client.call("_apply_motion_state", {
-		"projection_schema_version": 1,
+		"projection_schema_version": 2,
 		"event_sequence": 3,
 		"simulation_tick": 3,
 		"world_hash": "wrong-private-actor-motion",
@@ -742,6 +744,147 @@ func _test_private_projection_lifecycle() -> void:
 	_check(
 		not bool(client.get("authoritative_player_ready")),
 		"wrong-schema motion fails closed pending resnapshot"
+	)
+	client.free()
+
+
+func _test_physical_production_client() -> void:
+	var client := _new_client()
+	var player := _base_player()
+	var cargo_local := _target_block("cargo-local", Vector3i.ZERO, "cargo")
+	var refinery := _target_block("refinery-local", Vector3i(1, 0, 0), "refinery")
+	var assembler := _target_block("assembler-local", Vector3i(2, 0, 0), "assembler")
+	var unfinished := _target_block("refinery-frame", Vector3i(3, 0, 0), "refinery", "", false)
+	var foreign_refinery := _target_block("refinery-foreign", Vector3i.ZERO, "refinery")
+	var local_grid := _target_grid(
+		"grid-production", Vector3.ZERO, Quaternion.IDENTITY,
+		[cargo_local, refinery, assembler, unfinished], "impairment-player"
+	)
+	local_grid["power"] = {"online": true}
+	var foreign_grid := _target_grid(
+		"grid-foreign-production", Vector3.ZERO, Quaternion.IDENTITY,
+		[foreign_refinery], "player-foreign"
+	)
+	foreign_grid["power"] = {"online": true}
+	client.set("snapshot", {"grids": [foreign_grid, local_grid]})
+	var private_state := _private_snapshot(player, [
+		_inventory_snapshot("inventory-impairment-player", "player", "impairment-player"),
+		_inventory_snapshot("cargo-production", "cargo", "cargo-local"),
+	])
+	private_state["production_queues"] = [{
+		"machine_block_id": "refinery-local",
+		"jobs": [{
+			"job_id": "job-valid",
+			"owner_player_id": "impairment-player",
+			"machine_block_id": "refinery-local",
+			"recipe": "refining",
+			"batches": 1,
+			"source_inventory_id": "cargo-production",
+			"destination_inventory_id": "cargo-production",
+			"progress_ticks": 25,
+			"duration_ticks": 100,
+			"status": "output_blocked",
+			"reserved_inputs": {"ore": 2, "refined_material": 0, "components": 0},
+			"pending_outputs": {"ore": 0, "refined_material": 1, "components": 0},
+		}, {
+			"job_id": "job-foreign",
+			"owner_player_id": "player-foreign",
+			"machine_block_id": "refinery-local",
+			"recipe": "refining",
+			"batches": 9,
+			"progress_ticks": 99,
+			"duration_ticks": 100,
+			"status": "running",
+		}],
+	}]
+	client.set("actor_private_snapshot", private_state)
+
+	var refinery_route: Dictionary = client.call("_production_route", "refining")
+	var assembler_route: Dictionary = client.call("_production_route", "component")
+	_check(
+		String(refinery_route.get("machine_block_id", "")) == "refinery-local"
+		and String(refinery_route.get("inventory_id", "")) == "cargo-production",
+		"refining selects an owned completed refinery and same-grid owned cargo"
+	)
+	_check(
+		String(assembler_route.get("machine_block_id", "")) == "assembler-local",
+		"component production selects the owned completed assembler"
+	)
+	_check(
+		(client.call("_owned_machine_candidates", "refinery") as Array).size() == 1,
+		"foreign and unfinished production machines are filtered"
+	)
+
+	client.set("connected", true)
+	client.set("in_flight_mutation", {"type": "test-blocker", "operation_sequence": 1})
+	client.set("in_flight_mutation_actor_id", "impairment-player")
+	client.call("_queue_physical_production", "refining")
+	var queued: Array = client.get("mutation_queue")
+	var command: Dictionary = queued.back() if not queued.is_empty() else {}
+	_check(
+		String(command.get("type", "")) == "queue_production"
+		and String(command.get("machine_block_id", "")) == "refinery-local"
+		and String(command.get("recipe", "")) == "refining"
+		and int(command.get("batches", 0)) == 1
+		and String(command.get("source_inventory_id", "")) == "cargo-production"
+		and String(command.get("destination_inventory_id", "")) == "cargo-production"
+		and not command.has("operation_sequence"),
+		"physical production command has the exact typed shape before pipeline sequencing"
+	)
+	_check(
+		String(command.get("source_inventory_id", "")) != "inventory-impairment-player",
+		"physical production never routes through the suit inventory"
+	)
+
+	var machine_label := Label.new()
+	var queue_label := Label.new()
+	var route_label := Label.new()
+	var inventory_root := Control.new()
+	var production_root := Control.new()
+	var refine_button := Button.new()
+	var component_button := Button.new()
+	client.add_child(machine_label)
+	client.add_child(queue_label)
+	client.add_child(route_label)
+	client.add_child(inventory_root)
+	client.add_child(production_root)
+	client.add_child(refine_button)
+	client.add_child(component_button)
+	client.set("production_machine_label", machine_label)
+	client.set("production_queue_label", queue_label)
+	client.set("production_route_label", route_label)
+	client.set("inventory_content_root", inventory_root)
+	client.set("production_content_root", production_root)
+	client.set("production_buttons", {
+		"refining": refine_button, "component": component_button,
+	})
+	client.call("_update_production_terminal")
+	_check(
+		queue_label.text.contains("25%")
+		and queue_label.text.contains("OUTPUT BLOCKED")
+		and not queue_label.text.contains("×9"),
+		"production presentation is authoritative, includes blocked progress, and hides foreign jobs"
+	)
+	_check(machine_label.text.contains("POWER ONLINE"), "machine presentation exposes power state")
+	client.call("_set_inventory_tab", "production")
+	_check(
+		String(client.get("active_inventory_tab")) == "production"
+		and production_root.visible and not inventory_root.visible,
+		"production tab switches without replacing the inventory pane"
+	)
+	client.call("_set_inventory_tab", "inventory")
+	_check(inventory_root.visible and not production_root.visible, "inventory tab restores two-pane UX")
+
+	private_state["production_queues"] = {"malformed": true}
+	client.set("actor_private_snapshot", private_state)
+	client.call("_update_production_terminal")
+	_check(queue_label.text.contains("NO CANONICAL JOBS"), "malformed queue state fails safely")
+	client.set("snapshot", {"grids": [foreign_grid]})
+	client.call("_queue_physical_production", "component")
+	_check(
+		(client.get("mutation_queue") as Array).size() == 1
+		and String(client.get("recent_message")).contains("NO AUTHORIZED ASSEMBLER ROUTE"),
+		"missing authorized route is visible and queues no mutation"
 	)
 	client.free()
 
@@ -1012,7 +1155,7 @@ func _test_bound_player_roster_selection() -> void:
 	)
 	remote["position"] = _protocol_vec3(Vector3(9.0, 1.0, -2.0))
 	client.call("_apply_motion_state", {
-		"projection_schema_version": 1,
+		"projection_schema_version": 2,
 		"event_sequence": 1,
 		"simulation_tick": 1,
 		"world_hash": "impairment-roster-1",

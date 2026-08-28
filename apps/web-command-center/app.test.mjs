@@ -195,7 +195,7 @@ test("raw spectator UI marks economics private and ships no inventory reader", (
   assert.match(indexSource, /id="craft" disabled/);
   assert.equal(source.includes(".inventories"), false);
   assert.equal(source.includes("inventory_id"), false);
-  assert.match(source, /protocol_version: 14/);
+  assert.match(source, /protocol_version: 15/);
   assert.equal(source.includes("operation_id"), false);
   assert.equal(source.includes("operation_sequence"), false);
   assert.equal(source.includes("function intent"), false);

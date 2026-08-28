@@ -26,6 +26,7 @@ These documents form the initial specification baseline.
 - [P1.0 Authoritative Multi-player Cell](gameplay/authoritative-multiplayer-cell.md)
 - [P1.1 Actor-owned Industry and Engineering](gameplay/actor-owned-industry.md)
 - [P1.2 Private Player State Projection](gameplay/private-state-projection.md)
+- [P1.4 Physical Refining and Manufacturing](gameplay/physical-industry.md)
 - [Authoritative Hand-tool Targeting](gameplay/authoritative-hand-tool-targeting.md)
 
 ## Research

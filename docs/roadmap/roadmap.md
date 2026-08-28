@@ -8,6 +8,20 @@ The project will reconcile and specify systems before building them one by one.
 
 The bNOTE acquisition interface and Base BIT/bridge deployment manifest are intentionally deferred. They do not block P0 gameplay, P1 multiplayer, or P2's internal test-credit economy. They become required inputs before P3 testnet Web3 integration, after voxel mining and the economic lifecycle have been validated.
 
+## Active P1 sequencing
+
+The [P1.4 physical-industry slice](../gameplay/physical-industry.md) is
+implemented and locally verified in the current authoritative cell before full
+interest management. Its queues and escrow are actor-private and do not depend
+on public-scale replication. Hosted CI remains its evidence gate. Interest
+management must next include visible machine state without exposing private
+queue or inventory fields.
+
+The first P1.4 slice advances production only in an active cell. Dynamic cell
+scheduling must reuse the same integer-tick production event before the project
+claims sleeping-cell, background, or offline production. This ordering improves
+the playable work loop without inventing a second production state machine.
+
 ## Phase S0 — Canonical specification
 
 Deliverables:
@@ -85,7 +99,7 @@ Build:
 - Offline assets and powered defense.
 - Death drops.
 - Derelict cleanup.
-- Refining and manufacturing.
+- Physical refining, conveyor logistics, manufacturing, and production queues.
 - Browser status application.
 - Public read API.
 - Signed direct-download updater.

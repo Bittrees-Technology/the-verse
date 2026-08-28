@@ -6,6 +6,7 @@ verse_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 image_name="the-verse:p0-ci"
 container_name="verse-p0-ci-${GITHUB_RUN_ID:-$$}"
 host_port="${VERSE_CONTAINER_TEST_PORT:-17999}"
+expected_manifest="$(jq -r '.manifest_version' "${verse_root}/content/definitions/p0-content.json")"
 
 cleanup() {
   docker rm --force "${container_name}" >/dev/null 2>&1 || true
@@ -28,7 +29,7 @@ docker run \
 for _ in {1..200}; do
   if curl --fail --silent "http://127.0.0.1:${host_port}/healthz" >/dev/null; then
     status="$(curl --fail --silent "http://127.0.0.1:${host_port}/api/v1/status")"
-    [[ "$(jq -r '.content_manifest_version' <<<"${status}")" == "p1.1.0" ]]
+    [[ "$(jq -r '.content_manifest_version' <<<"${status}")" == "${expected_manifest}" ]]
     [[ "$(jq -r '.conservation_valid' <<<"${status}")" == "true" ]]
     echo "VERSE_CONTAINER_CHECK_OK"
     exit 0
