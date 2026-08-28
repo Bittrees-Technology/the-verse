@@ -11,7 +11,7 @@ use tokio::net::TcpListener;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 use verse_protocol::CellKeyV1;
-use verse_simulation::{LifecycleMode, Runtime, cell_origin_key};
+use verse_simulation::{LifecycleMode, LocalTwoCellRuntime, Runtime, cell_origin_key};
 use verse_simulation_worker::{AppState, router};
 
 #[derive(Debug, Parser)]
@@ -56,6 +56,11 @@ struct Arguments {
     /// Open the authoritative state for recovery inspection without advancing time.
     #[arg(long, env = "VERSE_PAUSE_SIMULATION", default_value_t = false)]
     pause_simulation: bool,
+
+    /// Run the bounded directory-managed adjacent-cell universe and route
+    /// sessions through its reconciled coordinator.
+    #[arg(long, env = "VERSE_TWO_CELL_UNIVERSE", default_value_t = false)]
+    two_cell_universe: bool,
 }
 
 #[tokio::main]
@@ -75,45 +80,75 @@ async fn main() -> Result<()> {
             "protocol 11 local-development player authentication is restricted to a loopback bind; use 127.0.0.1 or wait for the configured session authority"
         );
     }
-    let cell_key = arguments.cell_key_json.as_deref().map_or_else(
-        || Ok(cell_origin_key()),
-        |json| serde_json::from_str::<CellKeyV1>(json).context("VERSE_CELL_KEY_JSON is invalid"),
-    )?;
-    let mut runtime = if arguments.pause_simulation {
-        Runtime::open_for_cell(
-            &arguments.data_directory,
-            arguments.world_seed,
-            cell_key,
-            arguments.snapshot_every,
-        )
-    } else {
-        Runtime::open_hosted_for_cell(
-            &arguments.data_directory,
-            arguments.world_seed,
-            cell_key,
-            arguments.snapshot_every,
-        )
-    }
-    .with_context(|| {
-        format!(
-            "failed to open universe data at {}",
-            arguments.data_directory.display()
-        )
-    })?;
-    if runtime.state().player.by_id.is_empty() {
-        if !arguments.development_players.is_empty() {
-            info!(
-                "empty frontier cells ignore development-player admission until a canonical transfer arrives"
+    let state = if arguments.two_cell_universe {
+        if arguments.pause_simulation || arguments.cell_key_json.is_some() {
+            bail!(
+                "the two-cell universe owns both cell routes and does not accept pause or a standalone cell key"
             );
         }
-    } else {
+        let coordinator = LocalTwoCellRuntime::open(
+            &arguments.data_directory,
+            arguments.world_seed,
+            arguments.snapshot_every,
+            "simulation-gateway",
+        )
+        .with_context(|| {
+            format!(
+                "failed to reconcile the two-cell universe at {}",
+                arguments.data_directory.display()
+            )
+        })?;
         for player_id in &arguments.development_players {
-            runtime
-                .admit_development_player(player_id)
-                .with_context(|| format!("failed to pre-admit development player {player_id}"))?;
+            if coordinator.runtime_for_player(player_id).is_err() {
+                info!(%player_id, "two-cell gateway ignores development actors without a resident placement");
+            }
         }
-    }
-    let state = AppState::new(runtime);
+        AppState::new_two_cell(coordinator)
+    } else {
+        let cell_key = arguments.cell_key_json.as_deref().map_or_else(
+            || Ok(cell_origin_key()),
+            |json| {
+                serde_json::from_str::<CellKeyV1>(json).context("VERSE_CELL_KEY_JSON is invalid")
+            },
+        )?;
+        let mut runtime = if arguments.pause_simulation {
+            Runtime::open_for_cell(
+                &arguments.data_directory,
+                arguments.world_seed,
+                cell_key,
+                arguments.snapshot_every,
+            )
+        } else {
+            Runtime::open_hosted_for_cell(
+                &arguments.data_directory,
+                arguments.world_seed,
+                cell_key,
+                arguments.snapshot_every,
+            )
+        }
+        .with_context(|| {
+            format!(
+                "failed to open universe data at {}",
+                arguments.data_directory.display()
+            )
+        })?;
+        if runtime.state().player.by_id.is_empty() {
+            if !arguments.development_players.is_empty() {
+                info!(
+                    "empty frontier cells ignore development-player admission until a canonical transfer arrives"
+                );
+            }
+        } else {
+            for player_id in &arguments.development_players {
+                runtime
+                    .admit_development_player(player_id)
+                    .with_context(|| {
+                        format!("failed to pre-admit development player {player_id}")
+                    })?;
+            }
+        }
+        AppState::new(runtime)
+    };
     let lifecycle_task = if arguments.pause_simulation {
         let lease_state = Arc::clone(&state);
         Some(tokio::spawn(async move {

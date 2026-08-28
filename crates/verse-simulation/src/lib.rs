@@ -15,8 +15,9 @@ mod targeting;
 mod two_cell;
 
 pub use celestial::{
-    CelestialError, cell_address_from_key, cell_id, cell_key_from_address, cell_origin_key,
-    neighbor_cell_key, registry_snapshot, universe_manifest, validate_cell_key,
+    CelestialError, address_from_origin_offset_um, cell_address_from_key, cell_id,
+    cell_key_from_address, cell_origin_key, local_position_from_address, neighbor_cell_key,
+    registry_snapshot, universe_manifest, validate_cell_key,
 };
 pub use cell_directory::{
     AggregatePlacementRecord, AggregatePlacementState, CELL_DIRECTORY_SCHEMA_VERSION,
@@ -48,7 +49,10 @@ pub use model::{
 };
 pub use persistence::{CellLifecycleStatus, LifecycleMode, PersistenceError, Store, TrustedClock};
 pub use projection::{
-    InterestEntityIdentity, InterestProjectionState, ProjectedInterestFrame, ProjectionError,
-    ProjectionSource,
+    InterestEntityIdentity, InterestObserver, InterestProjectionState, ProjectedInterestFrame,
+    ProjectionError, ProjectionSource,
 };
-pub use two_cell::{CompletedPlayerHandoff, LocalTwoCellRuntime, TwoCellRuntimeError};
+pub use two_cell::{
+    CompletedPlayerHandoff, LocalTwoCellRuntime, ResidentPlayerRoute, TwoCellAdvanceOutcome,
+    TwoCellRuntimeError,
+};

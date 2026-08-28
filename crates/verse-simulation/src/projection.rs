@@ -3814,6 +3814,39 @@ mod tests {
     }
 
     #[test]
+    fn public_spectator_uses_worker_evidence_for_a_visible_player_transfer() {
+        let mut world = world_with_two_actors();
+        let origin_address = world.cell_address.clone();
+        let player = world
+            .player
+            .get_mut("player-remote")
+            .expect("remote player exists");
+        player.address = origin_address;
+        player.position = Vec3::ZERO;
+        let mut cursor = InterestProjectionState::public_origin_spectator("spectator-transfer");
+        world
+            .project_interest_baseline(&mut cursor)
+            .expect("public baseline");
+        assert!(cursor.contains(InterestEntityKind::Player, "player-remote"));
+
+        world.player.by_id.remove("player-remote");
+        world.inventories.remove("inventory-player-remote");
+        world.simulation_tick += 1;
+        let identity = InterestEntityIdentity::new(InterestEntityKind::Player, "player-remote");
+        let delta = world
+            .project_interest_delta(
+                &mut cursor,
+                &BTreeMap::from([(identity, InterestRemovalReason::Transferred)]),
+            )
+            .expect("public transfer delta");
+        assert_eq!(
+            removed_reason(&delta, "player-remote"),
+            InterestRemovalReason::Transferred
+        );
+        assert!(delta.actor_private.is_none());
+    }
+
+    #[test]
     fn removal_evidence_cannot_hide_or_relabel_an_existing_canonical_entity() {
         let world = world_with_two_actors();
         let mut cursor = InterestProjectionState::bound_player("evidence", "player-local");

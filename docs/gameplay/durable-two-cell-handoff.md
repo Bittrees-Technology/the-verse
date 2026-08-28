@@ -531,6 +531,46 @@ Operators receive bounded metrics and logs for:
 Public APIs may expose generic cell availability and transfer health. They do
 not expose private package subjects, inventories, queues, routes, or actor IDs.
 
+### Implemented local gateway checkpoint
+
+The bounded worker can be started in explicit two-cell coordinator mode. A
+resident EVA session is pinned to an exact cell key and placement generation;
+ordinary projection and mutation never follow a newer directory placement
+implicitly. After durable terminal transfer proof, the gateway emits the three
+ordered handoff presentation phases and one transfer-linked destination
+baseline in the existing session and a new interest epoch. Only an exact
+acknowledgement installs the destination route permit.
+
+The live socket regression crosses from the origin proof cell to its eastern
+neighbor, proves that snapshot recovery and stale acknowledgement cannot
+overtake the linked baseline, rejects a queued old-route control without
+advancing the operation frontier, and accepts the identical control after the
+destination acknowledgement. A crossing before the initial source baseline
+is acknowledged fails closed and requires reconnect. This checkpoint does not
+satisfy the grid, opposing-transfer, multi-process, load, packaging, or
+retention acceptance gates below.
+
+Player and public-origin spectator sockets consume independent, cell-scoped
+update frontiers. After the crossing, the player follows only the verified
+destination baseline while an already connected spectator remains on the
+origin feed. The source projection carries worker-owned `transferred` evidence
+for a previously visible player; it does not infer destruction and never
+exposes the destination or actor-private state. A fresh connection whose exact
+directory route was already produced by a retained completion treats that
+route as its initial state instead of replaying the completion. Bootstrap
+captures route, immutable world, and retained completion in one coordinator
+cut, while the origin world and removal evidence travel as one projection
+bundle. Timeout recovery, requested snapshots, invalid acknowledgements, and
+ordinary replication all defer a typed stale route until its handoff marker.
+
+The local coordinator passes its complete hosted-cell set into authoritative
+physics before commit. A player outcome outside that set, or any grid outcome
+outside its source cell while grid handoff remains unimplemented, is rejected
+before the physics journal append and native physics is rebuilt from canonical
+state. The actor therefore remains at the last valid pose. A polished boundary
+collision/feedback response and more than the eastern proof neighbor remain
+future work; this guard proves containment, not seamless arbitrary traversal.
+
 ## Acceptance criteria
 
 1. `CellKeyV1`, cell ID, neighbor, and normalization vectors match on macOS and

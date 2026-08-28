@@ -7,27 +7,52 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 use uuid::Uuid;
-use verse_protocol::CellKeyV1;
+use verse_protocol::{CellKeyV1, ClientMessage, IntentReceipt};
 
 use crate::cell_directory::{
     AggregatePlacementState, CellAssignmentState, CellDirectoryError, LocalCellDirectory,
     MobileAggregateKind, TransferPhase,
 };
-use crate::engine::{Runtime, RuntimeError};
+use crate::engine::{AdvanceImpact, Runtime, RuntimeError};
 use crate::handoff::{
     HandoffArtifactError, HandoffError, LocalHandoffArtifactStore, PlayerTransferContext,
     PlayerTransferPackage, prepare_eva_player_transfer, stage_eva_player_quarantine,
 };
 use crate::model::{TransferConservationWitness, TransferWitnessDirection, WorldState};
-use crate::{EVENT_SCHEMA_VERSION, WORLD_SCHEMA_VERSION, celestial};
+use crate::{CellLifecycleStatus, EVENT_SCHEMA_VERSION, WORLD_SCHEMA_VERSION, celestial};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompletedPlayerHandoff {
+    pub player_id: String,
     pub transfer_id: String,
     pub source_cell_key: CellKeyV1,
     pub destination_cell_key: CellKeyV1,
     pub placement_generation: u64,
     pub destination_movement_epoch: u64,
+}
+
+/// A session-scoped compare-and-swap permit for one resident player route.
+///
+/// The gateway retains this value until the player acknowledges a transfer-
+/// linked destination baseline. A route cannot silently follow the directory
+/// across a handoff and expose or mutate the destination ahead of that ACK.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResidentPlayerRoute {
+    pub cell_key: CellKeyV1,
+    pub placement_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TwoCellAdvanceOutcome {
+    pub impact: AdvanceImpact,
+    pub handoffs: Vec<CompletedPlayerHandoff>,
+}
+
+impl TwoCellAdvanceOutcome {
+    #[must_use]
+    pub const fn changed(&self) -> bool {
+        !matches!(self.impact, AdvanceImpact::None)
+    }
 }
 
 #[derive(Debug, Error)]
@@ -40,6 +65,12 @@ pub enum TwoCellRuntimeError {
     Handoff(#[from] HandoffError),
     #[error(transparent)]
     Artifact(#[from] HandoffArtifactError),
+    #[error("player {player_id} route is stale")]
+    StalePlayerRoute {
+        player_id: String,
+        requested: Box<ResidentPlayerRoute>,
+        current: Box<ResidentPlayerRoute>,
+    },
     #[error("two-cell coordinator invariant failed: {0}")]
     Invalid(String),
 }
@@ -59,6 +90,7 @@ pub struct LocalTwoCellRuntime {
     directory: LocalCellDirectory,
     artifacts: LocalHandoffArtifactStore,
     cells: Vec<CellSlot>,
+    halted: bool,
 }
 
 impl LocalTwoCellRuntime {
@@ -127,6 +159,7 @@ impl LocalTwoCellRuntime {
             directory,
             artifacts,
             cells,
+            halted: false,
         };
         coordinator.reconcile_transfers()?;
         coordinator.register_resident_players()?;
@@ -148,6 +181,178 @@ impl LocalTwoCellRuntime {
             .map(|cell| &cell.runtime)
     }
 
+    pub fn public_origin_runtime(&self) -> &Runtime {
+        self.runtime_for_cell(&crate::cell_origin_key())
+            .expect("the accepted proof topology always hosts the origin cell")
+    }
+
+    pub fn runtime_for_player(&self, player_id: &str) -> Result<&Runtime, TwoCellRuntimeError> {
+        let route = self.resident_player_route(player_id)?;
+        self.runtime_for_player_at(player_id, &route)
+    }
+
+    pub fn resident_player_route(
+        &self,
+        player_id: &str,
+    ) -> Result<ResidentPlayerRoute, TwoCellRuntimeError> {
+        let placement = self.directory.placement(player_id)?;
+        if placement.aggregate_kind != MobileAggregateKind::Player
+            || placement.state != AggregatePlacementState::Resident
+            || placement.active_transfer_id.is_some()
+        {
+            return Err(TwoCellRuntimeError::Invalid(
+                "player does not have one resident directory placement".into(),
+            ));
+        }
+        let route = ResidentPlayerRoute {
+            cell_key: placement.cell_key.clone(),
+            placement_generation: placement.placement_generation,
+        };
+        let runtime = self
+            .runtime_for_cell(&placement.cell_key)
+            .ok_or_else(|| TwoCellRuntimeError::Invalid("resident cell is not hosted".into()))?;
+        if runtime.state().player.get(player_id).is_none() {
+            return Err(TwoCellRuntimeError::Invalid(
+                "resident directory placement has no live player".into(),
+            ));
+        }
+        Ok(route)
+    }
+
+    pub fn runtime_for_player_at(
+        &self,
+        player_id: &str,
+        requested: &ResidentPlayerRoute,
+    ) -> Result<&Runtime, TwoCellRuntimeError> {
+        let current = self.resident_player_route(player_id)?;
+        if &current != requested {
+            return Err(TwoCellRuntimeError::StalePlayerRoute {
+                player_id: player_id.to_owned(),
+                requested: Box::new(requested.clone()),
+                current: Box::new(current),
+            });
+        }
+        self.runtime_for_cell(&requested.cell_key)
+            .ok_or_else(|| TwoCellRuntimeError::Invalid("resident cell is not hosted".into()))
+    }
+
+    pub fn lifecycle_status(&self) -> CellLifecycleStatus {
+        self.public_origin_runtime().lifecycle_status()
+    }
+
+    pub fn persist_snapshots(&mut self) -> Result<(), TwoCellRuntimeError> {
+        let result = self
+            .cells
+            .iter_mut()
+            .try_for_each(|cell| cell.runtime.persist_snapshot().map_err(Into::into));
+        if result.is_err() {
+            self.halted = true;
+        }
+        result
+    }
+
+    pub fn renew_leases(&mut self) -> Result<(), TwoCellRuntimeError> {
+        let result = self
+            .cells
+            .iter_mut()
+            .try_for_each(|cell| cell.runtime.renew_lease().map_err(Into::into));
+        if result.is_err() {
+            self.halted = true;
+        }
+        result
+    }
+
+    #[must_use]
+    pub fn is_halted(&self) -> bool {
+        self.halted || self.cells.iter().any(|cell| cell.runtime.is_halted())
+    }
+
+    pub fn execute_as_at(
+        &mut self,
+        player_id: &str,
+        requested: &ResidentPlayerRoute,
+        message: &ClientMessage,
+    ) -> Result<IntentReceipt, TwoCellRuntimeError> {
+        let result = self.execute_as_at_inner(player_id, requested, message);
+        if result.as_ref().is_err_and(two_cell_error_is_fatal) {
+            self.halted = true;
+        }
+        result
+    }
+
+    fn execute_as_at_inner(
+        &mut self,
+        player_id: &str,
+        requested: &ResidentPlayerRoute,
+        message: &ClientMessage,
+    ) -> Result<IntentReceipt, TwoCellRuntimeError> {
+        let current = self.resident_player_route(player_id)?;
+        if &current != requested {
+            return Err(TwoCellRuntimeError::StalePlayerRoute {
+                player_id: player_id.to_owned(),
+                requested: Box::new(requested.clone()),
+                current: Box::new(current),
+            });
+        }
+        let index = self
+            .cell_index(&requested.cell_key)
+            .ok_or_else(|| TwoCellRuntimeError::Invalid("resident cell is not hosted".into()))?;
+        Ok(self.cells[index].runtime.execute_as(player_id, message)?)
+    }
+
+    pub fn advance_with_outcome(
+        &mut self,
+        delta_millis: u16,
+    ) -> Result<TwoCellAdvanceOutcome, TwoCellRuntimeError> {
+        let result = self.advance_with_outcome_inner(delta_millis);
+        if result.is_err() {
+            self.halted = true;
+        }
+        result
+    }
+
+    fn advance_with_outcome_inner(
+        &mut self,
+        delta_millis: u16,
+    ) -> Result<TwoCellAdvanceOutcome, TwoCellRuntimeError> {
+        let hosted_cells = self
+            .cells
+            .iter()
+            .map(|cell| cell.key.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut impact = AdvanceImpact::None;
+        for cell in &mut self.cells {
+            impact = impact.combine(
+                cell.runtime
+                    .advance_with_outcome_in_cells(delta_millis, &hosted_cells)?
+                    .impact,
+            );
+        }
+
+        let mut crossings = Vec::new();
+        for cell in &self.cells {
+            for (player_id, player) in cell.runtime.state().player.iter() {
+                let placement = self.directory.placement(player_id)?;
+                let addressed_cell = celestial::cell_key_from_address(&player.address)
+                    .map_err(|source| TwoCellRuntimeError::Invalid(source.to_string()))?;
+                if placement.state == AggregatePlacementState::Resident
+                    && placement.cell_key == cell.key
+                    && addressed_cell != placement.cell_key
+                {
+                    crossings.push(player_id.clone());
+                }
+            }
+        }
+        crossings.sort();
+        crossings.dedup();
+        let mut handoffs = Vec::with_capacity(crossings.len());
+        for player_id in crossings {
+            handoffs.push(self.handoff_player(&player_id)?);
+            impact = AdvanceImpact::Structural;
+        }
+        Ok(TwoCellAdvanceOutcome { impact, handoffs })
+    }
+
     pub fn handoff_player(
         &mut self,
         player_id: &str,
@@ -164,11 +369,23 @@ impl LocalTwoCellRuntime {
         let source_index = self
             .cell_index(&placement.cell_key)
             .ok_or_else(|| TwoCellRuntimeError::Invalid("source cell is not hosted".into()))?;
-        let destination_index = (0..self.cells.len())
-            .find(|index| *index != source_index)
+        let source_player = self.cells[source_index]
+            .runtime
+            .state()
+            .player
+            .get(player_id)
+            .ok_or_else(|| TwoCellRuntimeError::Invalid("source player is absent".into()))?;
+        let destination_key = celestial::cell_key_from_address(&source_player.address)
+            .map_err(|source| TwoCellRuntimeError::Invalid(source.to_string()))?;
+        if destination_key == placement.cell_key {
+            return Err(TwoCellRuntimeError::Invalid(
+                "player has not crossed a canonical cell boundary".into(),
+            ));
+        }
+        let destination_index = self
+            .cell_index(&destination_key)
             .ok_or_else(|| TwoCellRuntimeError::Invalid("destination cell is not hosted".into()))?;
         let source_key = self.cells[source_index].key.clone();
-        let destination_key = self.cells[destination_index].key.clone();
         let source_assignment = self.directory.assignment(&source_key)?.clone();
         let destination_assignment = self.directory.assignment(&destination_key)?.clone();
         if source_assignment.state != CellAssignmentState::Assigned
@@ -229,6 +446,7 @@ impl LocalTwoCellRuntime {
             ));
         }
         Ok(CompletedPlayerHandoff {
+            player_id: player_id.to_owned(),
             transfer_id,
             source_cell_key: source_key,
             destination_cell_key: destination_key,
@@ -420,9 +638,21 @@ impl LocalTwoCellRuntime {
     }
 
     fn register_resident_players(&mut self) -> Result<(), TwoCellRuntimeError> {
+        let hosted_cells = self
+            .cells
+            .iter()
+            .map(|cell| cell.key.clone())
+            .collect::<std::collections::BTreeSet<_>>();
         let mut residents = BTreeMap::<String, CellKeyV1>::new();
         for cell in &self.cells {
-            for (player_id, _) in cell.runtime.state().player.iter() {
+            for (player_id, player) in cell.runtime.state().player.iter() {
+                let addressed_cell = celestial::cell_key_from_address(&player.address)
+                    .map_err(|source| TwoCellRuntimeError::Invalid(source.to_string()))?;
+                if addressed_cell != cell.key && !hosted_cells.contains(&addressed_cell) {
+                    return Err(TwoCellRuntimeError::Invalid(format!(
+                        "player {player_id} is outside the hosted proof topology"
+                    )));
+                }
                 if residents
                     .insert(player_id.clone(), cell.key.clone())
                     .is_some()
@@ -456,6 +686,14 @@ impl LocalTwoCellRuntime {
         }
         Ok(())
     }
+}
+
+fn two_cell_error_is_fatal(source: &TwoCellRuntimeError) -> bool {
+    !matches!(
+        source,
+        TwoCellRuntimeError::StalePlayerRoute { .. }
+            | TwoCellRuntimeError::Runtime(RuntimeError::Intent(_))
+    )
 }
 
 fn has_exact_transfer_witness(
@@ -529,6 +767,42 @@ mod tests {
             .save_snapshot(&world)
             .expect("boundary state persists");
         drop(store);
+        cells
+    }
+
+    fn initialize_near_unhosted_west_boundary(root: &Path, seed: u64) -> [CellKeyV1; 2] {
+        let manifest =
+            celestial::universe_manifest(seed, WORLD_SCHEMA_VERSION, EVENT_SCHEMA_VERSION)
+                .expect("manifest builds");
+        let cells = crate::proof_cell_keys().expect("proof cells build");
+        let directory = LocalCellDirectory::open(root, &manifest, cells.clone())
+            .expect("directory initializes");
+        let source_root = directory
+            .cell_store_root(&cells[0])
+            .expect("source root derives");
+        drop(directory);
+
+        let mut store =
+            Store::open_for_cell(&source_root, seed, cells[0].clone()).expect("source store opens");
+        let mut world = store.load_world().expect("source world loads");
+        world.fencing_token = store.fencing_token();
+        let address = celestial::address_from_origin_offset_um(
+            &world.cell_address,
+            [-i128::from(celestial::CELL_EDGE_UM / 2) + 1_000, 0, 0],
+        )
+        .expect("near-west-boundary address canonicalizes inside origin");
+        let position = celestial::local_position_from_address(&world.cell_address, &address)
+            .expect("near-west-boundary position hydrates");
+        let player = world.player.get_mut("player-local").expect("source player");
+        player.address = address;
+        player.position = position;
+        player.linear_velocity = Vec3::new(-10.0, 0.0, 0.0);
+        player.locomotion.kind = LocomotionKind::Eva;
+        player.locomotion.support = None;
+        player.locomotion.magnetic_boots_enabled = false;
+        store
+            .save_snapshot(&world)
+            .expect("near-boundary state persists");
         cells
     }
 
@@ -615,6 +889,9 @@ mod tests {
 
         let mut coordinator = LocalTwoCellRuntime::open(root.path(), seed, 20, "test-host")
             .expect("coordinator opens");
+        let source_route = coordinator
+            .resident_player_route("player-local")
+            .expect("source route resolves");
         let completed = coordinator
             .handoff_player("player-local")
             .expect("handoff completes");
@@ -622,6 +899,20 @@ mod tests {
         assert_eq!(completed.destination_cell_key, cells[1]);
         assert_eq!(completed.placement_generation, 2);
         assert_eq!(completed.destination_movement_epoch, 2);
+        assert!(matches!(
+            coordinator.runtime_for_player_at("player-local", &source_route),
+            Err(TwoCellRuntimeError::StalePlayerRoute { .. })
+        ));
+        let destination_route = coordinator
+            .resident_player_route("player-local")
+            .expect("destination route resolves");
+        assert_eq!(destination_route.cell_key, cells[1]);
+        assert_eq!(destination_route.placement_generation, 2);
+        assert!(
+            coordinator
+                .runtime_for_player_at("player-local", &destination_route)
+                .is_ok()
+        );
         let transfer = coordinator
             .directory()
             .transfer(&completed.transfer_id)
@@ -694,6 +985,65 @@ mod tests {
                 .player
                 .get("player-local")
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn coordinator_rejects_unhosted_face_before_physics_becomes_durable() {
+        let root = tempdir().expect("universe root");
+        let seed = 8_032;
+        let cells = initialize_near_unhosted_west_boundary(root.path(), seed);
+        let mut coordinator = LocalTwoCellRuntime::open(root.path(), seed, 20, "west-boundary")
+            .expect("coordinator opens");
+        let before = coordinator
+            .runtime_for_cell(&cells[0])
+            .expect("origin runtime exists")
+            .state()
+            .clone();
+
+        let outcome = coordinator
+            .advance_with_outcome(17)
+            .expect("unsupported final pose is contained without halting");
+        assert!(!outcome.changed());
+        assert!(outcome.handoffs.is_empty());
+        let after = coordinator
+            .runtime_for_cell(&cells[0])
+            .expect("origin runtime exists")
+            .state();
+        assert_eq!(after.event_sequence, before.event_sequence);
+        assert_eq!(after.state_hash(), before.state_hash());
+        assert_eq!(
+            celestial::cell_key_from_address(
+                &after
+                    .player
+                    .get("player-local")
+                    .expect("player remains live")
+                    .address
+            )
+            .expect("player address remains canonical"),
+            cells[0]
+        );
+        assert!(!coordinator.is_halted());
+
+        drop(coordinator);
+        let reopened = LocalTwoCellRuntime::open(root.path(), seed, 20, "west-boundary-reopen")
+            .expect("contained universe reopens");
+        let recovered = reopened
+            .runtime_for_cell(&cells[0])
+            .expect("reopened origin runtime exists")
+            .state();
+        assert_eq!(recovered.event_sequence, before.event_sequence);
+        assert_eq!(
+            recovered
+                .player
+                .get("player-local")
+                .expect("recovered player remains live")
+                .address,
+            before
+                .player
+                .get("player-local")
+                .expect("prior player remains live")
+                .address
         );
     }
 
