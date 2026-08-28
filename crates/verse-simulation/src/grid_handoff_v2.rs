@@ -7,6 +7,8 @@
 //! the complete ADR-0024 compatibility tuple activates atomically.
 
 #[allow(dead_code)]
+mod event_v17;
+#[allow(dead_code)]
 mod production;
 #[allow(dead_code)]
 pub(crate) mod state;

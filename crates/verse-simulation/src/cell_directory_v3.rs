@@ -16,10 +16,12 @@ use crate::cell_directory::{
     BundledPlacementPlan, BundledPlacementTransition, CellAssignmentRecord, CellAssignmentState,
     CellDirectoryError, MobileAggregateKind, TransferPhase, stage_bundled_placement_transition,
 };
+#[cfg(test)]
+use crate::grid_handoff_v2::state::DraftGridDirectoryAuthorityV2;
 use crate::grid_handoff_v2::state::{
     DraftGridAbortCleanupProofV2, DraftGridActivationProofV2, DraftGridExportProofV2,
-    DraftGridFinalizationProofV2, DraftGridImportProofV2, DraftGridTransferAbortSideV2,
-    DraftGridTransferLedgerVectorV2,
+    DraftGridFinalizationProofV2, DraftGridImportProofV2, DraftGridPrepareProofV2,
+    DraftGridQuarantineProofV2, DraftGridTransferAbortSideV2, DraftGridTransferLedgerVectorV2,
 };
 use crate::{celestial, model::valid_blake3_hex};
 
@@ -70,9 +72,12 @@ pub(super) struct DirectoryPhaseProofV3 {
     fencing_token: u64,
     event_sequence: u64,
     event_hash: String,
+    event_payload_hash: Option<String>,
     world_hash: String,
     quarantine_receipt_hash: Option<String>,
     export_proof_hash: Option<String>,
+    prepare_proof_hash: Option<String>,
+    quarantine_proof_hash: Option<String>,
     import_proof_hash: Option<String>,
     activation_proof_hash: Option<String>,
     finalization_proof_hash: Option<String>,
@@ -91,7 +96,9 @@ pub(super) struct DirectoryPhaseProofV3 {
     mutation_witness_hash: Option<String>,
     ledger_vector: Option<DraftGridTransferLedgerVectorV2>,
     trusted_time_unix_ms: Option<u64>,
+    prepared_at_simulation_tick: Option<u64>,
     abort_witness_hash: Option<String>,
+    abort_proof_hash: Option<String>,
     resulting_draft_world_hash: Option<String>,
     abort_removed_authority: Option<bool>,
 }
@@ -131,6 +138,59 @@ impl DirectoryPhaseProofV3 {
 
     pub(super) fn trusted_time_unix_ms(&self) -> Option<u64> {
         self.trusted_time_unix_ms
+    }
+
+    fn source_prepare_cell_proof(
+        &self,
+        root_aggregate_id: &str,
+    ) -> Option<DraftGridPrepareProofV2> {
+        let proof = DraftGridPrepareProofV2 {
+            transfer_id: self.transfer_id.clone(),
+            root_aggregate_id: root_aggregate_id.to_owned(),
+            member_root: self.member_root.clone(),
+            package_hash: self.package_hash.clone(),
+            source_cell_id: self.cell_id.clone(),
+            assignment_generation: self.assignment_generation,
+            fencing_token: self.fencing_token,
+            prior_event_sequence: self.prior_event_sequence?,
+            prior_event_hash: self.prior_event_hash.clone()?,
+            event_sequence: self.event_sequence,
+            event_hash: self.event_hash.clone(),
+            event_payload_hash: self.event_payload_hash.clone()?,
+            prior_active_world_hash: self.prior_active_world_hash.clone()?,
+            resulting_active_world_hash: self.world_hash.clone(),
+            prepared_at_simulation_tick: self.prepared_at_simulation_tick?,
+            mutation_witness_hash: self.mutation_witness_hash.clone()?,
+            proof_hash: self.prepare_proof_hash.clone()?,
+        };
+        proof.validate_for_directory().is_ok().then_some(proof)
+    }
+
+    fn destination_quarantine_cell_proof(
+        &self,
+        root_aggregate_id: &str,
+    ) -> Option<DraftGridQuarantineProofV2> {
+        let proof = DraftGridQuarantineProofV2 {
+            transfer_id: self.transfer_id.clone(),
+            root_aggregate_id: root_aggregate_id.to_owned(),
+            member_root: self.member_root.clone(),
+            package_hash: self.package_hash.clone(),
+            destination_cell_id: self.cell_id.clone(),
+            assignment_generation: self.assignment_generation,
+            fencing_token: self.fencing_token,
+            prior_event_sequence: self.prior_event_sequence?,
+            prior_event_hash: self.prior_event_hash.clone()?,
+            event_sequence: self.event_sequence,
+            event_hash: self.event_hash.clone(),
+            event_payload_hash: self.event_payload_hash.clone()?,
+            prior_active_world_hash: self.prior_active_world_hash.clone()?,
+            resulting_active_world_hash: self.world_hash.clone(),
+            quarantine_receipt_hash: self.quarantine_receipt_hash.clone()?,
+            quarantined_at_unix_ms: self.quarantined_at_unix_ms?,
+            mutation_witness_hash: self.mutation_witness_hash.clone()?,
+            proof_hash: self.quarantine_proof_hash.clone()?,
+        };
+        proof.validate_for_directory().is_ok().then_some(proof)
     }
 
     fn destination_import_cell_proof(
@@ -225,6 +285,35 @@ impl DirectoryPhaseProofV3 {
         };
         finalization.validate().is_ok().then_some(finalization)
     }
+
+    fn abort_cell_proof(
+        &self,
+        expected_side: DraftGridTransferAbortSideV2,
+    ) -> Option<DraftGridAbortCleanupProofV2> {
+        let proof = DraftGridAbortCleanupProofV2 {
+            side: expected_side,
+            transfer_id: self.transfer_id.clone(),
+            member_root: self.member_root.clone(),
+            package_hash: self.package_hash.clone(),
+            cell_id: self.cell_id.clone(),
+            assignment_generation: self.assignment_generation,
+            fencing_token: self.fencing_token,
+            event_sequence: self.event_sequence,
+            event_hash: self.event_hash.clone(),
+            event_payload_hash: self.event_payload_hash.clone()?,
+            prior_event_sequence: self.prior_event_sequence?,
+            prior_event_hash: self.prior_event_hash.clone()?,
+            prior_draft_world_hash: self.prior_draft_world_hash.clone()?,
+            resulting_draft_world_hash: self.resulting_draft_world_hash.clone()?,
+            trusted_time_unix_ms: self.trusted_time_unix_ms?,
+            mutation_witness_hash: self.mutation_witness_hash.clone()?,
+            quarantine_receipt_hash: self.quarantine_receipt_hash.clone(),
+            abort_witness_hash: self.abort_witness_hash.clone()?,
+            removed_authority: self.abort_removed_authority?,
+            proof_hash: self.abort_proof_hash.clone()?,
+        };
+        proof.validate().is_ok().then_some(proof)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -272,12 +361,22 @@ struct CellDirectoryDocumentV3 {
 /// directory authority from caller-supplied booleans.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ValidatedGridTransferAuthorityV3 {
+    directory_revision: u64,
+    directory_document_hash: String,
     record: CellTransferRecordV3,
     source_assignment: CellAssignmentRecord,
     destination_assignment: CellAssignmentRecord,
 }
 
 impl ValidatedGridTransferAuthorityV3 {
+    pub(super) fn directory_revision(&self) -> u64 {
+        self.directory_revision
+    }
+
+    pub(super) fn directory_document_hash(&self) -> &str {
+        &self.directory_document_hash
+    }
+
     pub(super) fn package_schema_version(&self) -> u32 {
         self.record.bundle.package_schema_version
     }
@@ -362,8 +461,30 @@ impl ValidatedGridTransferAuthorityV3 {
         self.record.source_prepare_proof.is_some()
     }
 
+    pub(super) fn source_prepare_proof(&self) -> Option<&DirectoryPhaseProofV3> {
+        self.record.source_prepare_proof.as_ref()
+    }
+
+    pub(super) fn source_prepare_cell_proof(&self) -> Option<DraftGridPrepareProofV2> {
+        self.record
+            .source_prepare_proof
+            .as_ref()?
+            .source_prepare_cell_proof(&self.record.root_aggregate_id)
+    }
+
     pub(super) fn destination_quarantine_proven(&self) -> bool {
         self.record.destination_quarantine_proof.is_some()
+    }
+
+    pub(super) fn destination_quarantine_proof(&self) -> Option<&DirectoryPhaseProofV3> {
+        self.record.destination_quarantine_proof.as_ref()
+    }
+
+    pub(super) fn destination_quarantine_cell_proof(&self) -> Option<DraftGridQuarantineProofV2> {
+        self.record
+            .destination_quarantine_proof
+            .as_ref()?
+            .destination_quarantine_cell_proof(&self.record.root_aggregate_id)
     }
 
     pub(super) fn source_export_proven(&self) -> bool {
@@ -439,12 +560,30 @@ impl ValidatedGridTransferAuthorityV3 {
         self.record.source_abort_proof.is_some()
     }
 
+    pub(super) fn source_abort_cell_proof(&self) -> Option<DraftGridAbortCleanupProofV2> {
+        self.record
+            .source_abort_proof
+            .as_ref()?
+            .abort_cell_proof(DraftGridTransferAbortSideV2::Source)
+    }
+
     pub(super) fn destination_abort_proven(&self) -> bool {
         self.record.destination_abort_proof.is_some()
     }
 
+    pub(super) fn destination_abort_cell_proof(&self) -> Option<DraftGridAbortCleanupProofV2> {
+        self.record
+            .destination_abort_proof
+            .as_ref()?
+            .abort_cell_proof(DraftGridTransferAbortSideV2::Destination)
+    }
+
     pub(super) fn live_source_assignment_generation(&self) -> u64 {
         self.source_assignment.assignment_generation
+    }
+
+    pub(super) fn source_fencing_history(&self) -> &BTreeMap<u64, u64> {
+        &self.source_assignment.fencing_history
     }
 
     pub(super) fn live_source_fencing_token(&self) -> u64 {
@@ -453,6 +592,10 @@ impl ValidatedGridTransferAuthorityV3 {
 
     pub(super) fn live_destination_assignment_generation(&self) -> u64 {
         self.destination_assignment.assignment_generation
+    }
+
+    pub(super) fn destination_fencing_history(&self) -> &BTreeMap<u64, u64> {
+        &self.destination_assignment.fencing_history
     }
 
     pub(super) fn live_destination_fencing_token(&self) -> u64 {
@@ -765,8 +908,20 @@ impl CellTransferRecordV3 {
         };
         validate_hash(&proof.event_hash, "phase event")?;
         validate_hash(&proof.world_hash, "phase world")?;
+        if let Some(hash) = &proof.event_payload_hash {
+            validate_hash(hash, "phase event payload")?;
+        }
+        if let Some(hash) = &proof.prepare_proof_hash {
+            validate_hash(hash, "source-prepare proof")?;
+        }
+        if let Some(hash) = &proof.quarantine_proof_hash {
+            validate_hash(hash, "destination-quarantine proof")?;
+        }
         if let Some(hash) = &proof.abort_witness_hash {
             validate_hash(hash, "abort witness")?;
+        }
+        if let Some(hash) = &proof.abort_proof_hash {
+            validate_hash(hash, "abort cleanup proof")?;
         }
         if let Some(hash) = &proof.export_proof_hash {
             validate_hash(hash, "source-export proof")?;
@@ -810,6 +965,21 @@ impl CellTransferRecordV3 {
             expected_kind,
             DirectoryPhaseProofKindV3::SourceAbort | DirectoryPhaseProofKindV3::DestinationAbort
         );
+        let prepare_binding_valid = if expected_kind == DirectoryPhaseProofKindV3::SourcePrepare {
+            proof
+                .source_prepare_cell_proof(&self.root_aggregate_id)
+                .is_some()
+        } else {
+            proof.prepare_proof_hash.is_none() && proof.prepared_at_simulation_tick.is_none()
+        };
+        let quarantine_binding_valid =
+            if expected_kind == DirectoryPhaseProofKindV3::DestinationQuarantine {
+                proof
+                    .destination_quarantine_cell_proof(&self.root_aggregate_id)
+                    .is_some()
+            } else {
+                proof.quarantine_proof_hash.is_none()
+            };
         let export_binding_valid = if expected_kind == DirectoryPhaseProofKindV3::SourceExport {
             proof
                 .export_proof_hash
@@ -919,6 +1089,20 @@ impl CellTransferRecordV3 {
                 && proof.source_export_proof_hash.is_some()
                 && proof.source_exported_at_unix_ms.is_some()
                 && proof.destination_production_lifecycle_generation.is_none()
+        } else if expected_kind == DirectoryPhaseProofKindV3::DestinationQuarantine {
+            proof.import_proof_hash.is_none()
+                && proof.prior_draft_world_hash.is_none()
+                && proof.quarantined_at_unix_ms.is_some()
+                && proof.source_export_proof_hash.is_none()
+                && proof.source_exported_at_unix_ms.is_none()
+                && proof.destination_production_lifecycle_generation.is_none()
+        } else if is_abort {
+            proof.import_proof_hash.is_none()
+                && proof.prior_draft_world_hash.is_some()
+                && proof.quarantined_at_unix_ms.is_none()
+                && proof.source_export_proof_hash.is_none()
+                && proof.source_exported_at_unix_ms.is_none()
+                && proof.destination_production_lifecycle_generation.is_none()
         } else {
             proof.import_proof_hash.is_none()
                 && proof.prior_draft_world_hash.is_none()
@@ -1000,6 +1184,15 @@ impl CellTransferRecordV3 {
                 && proof.destination_import_proof_hash.is_some()
                 && proof.prior_active_world_hash.is_some()
                 && proof.imported_at_unix_ms.is_some()
+        } else if matches!(
+            expected_kind,
+            DirectoryPhaseProofKindV3::SourcePrepare
+                | DirectoryPhaseProofKindV3::DestinationQuarantine
+        ) {
+            proof.activation_proof_hash.is_none()
+                && proof.destination_import_proof_hash.is_none()
+                && proof.prior_active_world_hash.is_some()
+                && proof.imported_at_unix_ms.is_none()
         } else {
             proof.activation_proof_hash.is_none()
                 && proof.destination_import_proof_hash.is_none()
@@ -1041,9 +1234,13 @@ impl CellTransferRecordV3 {
         };
         let has_event_predecessor = matches!(
             expected_kind,
-            DirectoryPhaseProofKindV3::DestinationImport
+            DirectoryPhaseProofKindV3::SourcePrepare
+                | DirectoryPhaseProofKindV3::DestinationQuarantine
+                | DirectoryPhaseProofKindV3::DestinationImport
                 | DirectoryPhaseProofKindV3::DestinationActivation
                 | DirectoryPhaseProofKindV3::SourceFinalization
+                | DirectoryPhaseProofKindV3::SourceAbort
+                | DirectoryPhaseProofKindV3::DestinationAbort
         );
         let event_predecessor_valid = has_event_predecessor
             == (proof.prior_event_sequence.is_some() && proof.prior_event_hash.is_some());
@@ -1052,17 +1249,35 @@ impl CellTransferRecordV3 {
             DirectoryPhaseProofKindV3::DestinationImport
                 | DirectoryPhaseProofKindV3::DestinationActivation
         ) == proof.production_eligibility_root.is_some();
-        let shared_handoff_binding_valid = if matches!(
-            expected_kind,
+        let shared_handoff_binding_valid = match expected_kind {
+            DirectoryPhaseProofKindV3::SourcePrepare => {
+                proof.mutation_witness_hash.is_some()
+                    && proof.trusted_time_unix_ms.is_none()
+                    && proof.prepared_at_simulation_tick.is_some()
+            }
+            DirectoryPhaseProofKindV3::DestinationQuarantine => {
+                proof.mutation_witness_hash.is_some()
+                    && proof.trusted_time_unix_ms.is_none()
+                    && proof.prepared_at_simulation_tick.is_none()
+            }
             DirectoryPhaseProofKindV3::SourceExport
-                | DirectoryPhaseProofKindV3::DestinationImport
-                | DirectoryPhaseProofKindV3::DestinationActivation
-                | DirectoryPhaseProofKindV3::SourceFinalization
-        ) {
-            proof.mutation_witness_hash.is_some() && proof.trusted_time_unix_ms.is_some()
-        } else {
-            proof.mutation_witness_hash.is_none() && proof.trusted_time_unix_ms.is_none()
+            | DirectoryPhaseProofKindV3::DestinationImport
+            | DirectoryPhaseProofKindV3::DestinationActivation
+            | DirectoryPhaseProofKindV3::SourceFinalization
+            | DirectoryPhaseProofKindV3::SourceAbort
+            | DirectoryPhaseProofKindV3::DestinationAbort => {
+                proof.mutation_witness_hash.is_some()
+                    && proof.trusted_time_unix_ms.is_some()
+                    && proof.prepared_at_simulation_tick.is_none()
+            }
         };
+        let event_payload_binding_valid = matches!(
+            expected_kind,
+            DirectoryPhaseProofKindV3::SourcePrepare
+                | DirectoryPhaseProofKindV3::DestinationQuarantine
+                | DirectoryPhaseProofKindV3::SourceAbort
+                | DirectoryPhaseProofKindV3::DestinationAbort
+        ) == proof.event_payload_hash.is_some();
         let ledger_binding_valid = matches!(
             expected_kind,
             DirectoryPhaseProofKindV3::SourceExport | DirectoryPhaseProofKindV3::DestinationImport
@@ -1092,18 +1307,43 @@ impl CellTransferRecordV3 {
                             fencing_token: proof.fencing_token,
                             event_sequence: proof.event_sequence,
                             event_hash: proof.event_hash.clone(),
+                            event_payload_hash: proof
+                                .event_payload_hash
+                                .clone()
+                                .unwrap_or_default(),
+                            prior_event_sequence: proof.prior_event_sequence.unwrap_or_default(),
+                            prior_event_hash: proof.prior_event_hash.clone().unwrap_or_default(),
+                            prior_draft_world_hash: proof
+                                .prior_draft_world_hash
+                                .clone()
+                                .unwrap_or_default(),
                             resulting_draft_world_hash: proof.world_hash.clone(),
+                            trusted_time_unix_ms: proof.trusted_time_unix_ms.unwrap_or_default(),
+                            mutation_witness_hash: proof
+                                .mutation_witness_hash
+                                .clone()
+                                .unwrap_or_default(),
                             quarantine_receipt_hash: proof.quarantine_receipt_hash.clone(),
                             abort_witness_hash: witness_hash.clone(),
                             removed_authority,
+                            proof_hash: proof.abort_proof_hash.clone().unwrap_or_default(),
                         }
                         .validate()
                         .is_ok()
                     })
         } else {
             proof.abort_witness_hash.is_none()
+                && proof.abort_proof_hash.is_none()
                 && proof.resulting_draft_world_hash.is_none()
                 && proof.abort_removed_authority.is_none()
+        };
+        let receipt_binding_valid = match expected_kind {
+            DirectoryPhaseProofKindV3::SourceAbort => proof
+                .quarantine_receipt_hash
+                .as_ref()
+                .is_none_or(|receipt| self.quarantine_receipt_hash.as_ref() == Some(receipt)),
+            _ if binds_receipt => proof.quarantine_receipt_hash == self.quarantine_receipt_hash,
+            _ => proof.quarantine_receipt_hash.is_none(),
         };
         if proof.kind != expected_kind
             || proof.transfer_id != self.transfer_id
@@ -1117,6 +1357,8 @@ impl CellTransferRecordV3 {
                 .copied()
                 != Some(proof.fencing_token)
             || proof.event_sequence == 0
+            || !prepare_binding_valid
+            || !quarantine_binding_valid
             || !export_binding_valid
             || !import_binding_valid
             || !activation_binding_valid
@@ -1124,10 +1366,10 @@ impl CellTransferRecordV3 {
             || !event_predecessor_valid
             || !production_root_valid
             || !shared_handoff_binding_valid
+            || !event_payload_binding_valid
             || !ledger_binding_valid
             || !abort_binding_valid
-            || (binds_receipt && proof.quarantine_receipt_hash != self.quarantine_receipt_hash)
-            || (!binds_receipt && proof.quarantine_receipt_hash.is_some())
+            || !receipt_binding_valid
         {
             return Err(invalid(format!(
                 "v3 transfer {} contains an invalid phase proof",
@@ -1146,6 +1388,8 @@ impl CellDirectoryDocumentV3 {
         self.validate()?;
         let record = v3_transfer(self, transfer_id)?.clone();
         Ok(ValidatedGridTransferAuthorityV3 {
+            directory_revision: self.directory_revision,
+            directory_document_hash: self.document_hash.clone(),
             source_assignment: self
                 .assignments
                 .get(&record.source_cell_id)
@@ -1598,6 +1842,65 @@ fn stage_v3_prepare(
 fn stage_v3_source_prepared(
     document: &CellDirectoryDocumentV3,
     transfer_id: &str,
+    prepare: &DraftGridPrepareProofV2,
+) -> Result<CellDirectoryDocumentV3, CellDirectoryError> {
+    prepare
+        .validate_for_directory()
+        .map_err(|source| invalid(format!("grid source-prepare proof is invalid: {source}")))?;
+    document.validate()?;
+    let current = v3_transfer(document, transfer_id)?;
+    if prepare.root_aggregate_id != current.root_aggregate_id {
+        return Err(conflict(
+            transfer_id,
+            "v3 source-prepare proof changed its root aggregate",
+        ));
+    }
+    let proof = DirectoryPhaseProofV3 {
+        kind: DirectoryPhaseProofKindV3::SourcePrepare,
+        transfer_id: prepare.transfer_id.clone(),
+        member_root: prepare.member_root.clone(),
+        package_hash: prepare.package_hash.clone(),
+        cell_id: prepare.source_cell_id.clone(),
+        assignment_generation: prepare.assignment_generation,
+        fencing_token: prepare.fencing_token,
+        event_sequence: prepare.event_sequence,
+        event_hash: prepare.event_hash.clone(),
+        event_payload_hash: Some(prepare.event_payload_hash.clone()),
+        world_hash: prepare.resulting_active_world_hash.clone(),
+        quarantine_receipt_hash: None,
+        export_proof_hash: None,
+        prepare_proof_hash: Some(prepare.proof_hash.clone()),
+        quarantine_proof_hash: None,
+        import_proof_hash: None,
+        activation_proof_hash: None,
+        finalization_proof_hash: None,
+        destination_import_proof_hash: None,
+        prior_event_sequence: Some(prepare.prior_event_sequence),
+        prior_event_hash: Some(prepare.prior_event_hash.clone()),
+        prior_draft_world_hash: None,
+        prior_active_world_hash: Some(prepare.prior_active_world_hash.clone()),
+        quarantined_at_unix_ms: None,
+        imported_at_unix_ms: None,
+        destination_activated_at_unix_ms: None,
+        source_export_proof_hash: None,
+        source_exported_at_unix_ms: None,
+        destination_production_lifecycle_generation: None,
+        production_eligibility_root: None,
+        mutation_witness_hash: Some(prepare.mutation_witness_hash.clone()),
+        ledger_vector: None,
+        trusted_time_unix_ms: None,
+        prepared_at_simulation_tick: Some(prepare.prepared_at_simulation_tick),
+        abort_witness_hash: None,
+        abort_proof_hash: None,
+        resulting_draft_world_hash: None,
+        abort_removed_authority: None,
+    };
+    apply_v3_source_prepare_proof(document, transfer_id, &proof)
+}
+
+fn apply_v3_source_prepare_proof(
+    document: &CellDirectoryDocumentV3,
+    transfer_id: &str,
     proof: &DirectoryPhaseProofV3,
 ) -> Result<CellDirectoryDocumentV3, CellDirectoryError> {
     document.validate()?;
@@ -1628,10 +1931,73 @@ fn stage_v3_source_prepared(
 fn stage_v3_quarantine(
     document: &CellDirectoryDocumentV3,
     transfer_id: &str,
-    receipt_hash: &str,
+    quarantine: &DraftGridQuarantineProofV2,
+) -> Result<CellDirectoryDocumentV3, CellDirectoryError> {
+    quarantine.validate_for_directory().map_err(|source| {
+        invalid(format!(
+            "grid destination-quarantine proof is invalid: {source}"
+        ))
+    })?;
+    document.validate()?;
+    let current = v3_transfer(document, transfer_id)?;
+    if quarantine.root_aggregate_id != current.root_aggregate_id {
+        return Err(conflict(
+            transfer_id,
+            "v3 destination-quarantine proof changed its root aggregate",
+        ));
+    }
+    let proof = DirectoryPhaseProofV3 {
+        kind: DirectoryPhaseProofKindV3::DestinationQuarantine,
+        transfer_id: quarantine.transfer_id.clone(),
+        member_root: quarantine.member_root.clone(),
+        package_hash: quarantine.package_hash.clone(),
+        cell_id: quarantine.destination_cell_id.clone(),
+        assignment_generation: quarantine.assignment_generation,
+        fencing_token: quarantine.fencing_token,
+        event_sequence: quarantine.event_sequence,
+        event_hash: quarantine.event_hash.clone(),
+        event_payload_hash: Some(quarantine.event_payload_hash.clone()),
+        world_hash: quarantine.resulting_active_world_hash.clone(),
+        quarantine_receipt_hash: Some(quarantine.quarantine_receipt_hash.clone()),
+        export_proof_hash: None,
+        prepare_proof_hash: None,
+        quarantine_proof_hash: Some(quarantine.proof_hash.clone()),
+        import_proof_hash: None,
+        activation_proof_hash: None,
+        finalization_proof_hash: None,
+        destination_import_proof_hash: None,
+        prior_event_sequence: Some(quarantine.prior_event_sequence),
+        prior_event_hash: Some(quarantine.prior_event_hash.clone()),
+        prior_draft_world_hash: None,
+        prior_active_world_hash: Some(quarantine.prior_active_world_hash.clone()),
+        quarantined_at_unix_ms: Some(quarantine.quarantined_at_unix_ms),
+        imported_at_unix_ms: None,
+        destination_activated_at_unix_ms: None,
+        source_export_proof_hash: None,
+        source_exported_at_unix_ms: None,
+        destination_production_lifecycle_generation: None,
+        production_eligibility_root: None,
+        mutation_witness_hash: Some(quarantine.mutation_witness_hash.clone()),
+        ledger_vector: None,
+        trusted_time_unix_ms: None,
+        prepared_at_simulation_tick: None,
+        abort_witness_hash: None,
+        abort_proof_hash: None,
+        resulting_draft_world_hash: None,
+        abort_removed_authority: None,
+    };
+    apply_v3_quarantine_proof(document, transfer_id, &proof)
+}
+
+fn apply_v3_quarantine_proof(
+    document: &CellDirectoryDocumentV3,
+    transfer_id: &str,
     proof: &DirectoryPhaseProofV3,
 ) -> Result<CellDirectoryDocumentV3, CellDirectoryError> {
     document.validate()?;
+    let receipt_hash = proof.quarantine_receipt_hash.as_deref().ok_or_else(|| {
+        invalid("typed destination-quarantine proof omits its receipt commitment")
+    })?;
     validate_hash(receipt_hash, "quarantine receipt")?;
     let current = v3_transfer(document, transfer_id)?.clone();
     if current.quarantine_receipt_hash.is_some() || current.destination_quarantine_proof.is_some() {
@@ -1645,7 +2011,12 @@ fn stage_v3_quarantine(
             "v3 quarantine retry changed its receipt or durable proof",
         ));
     }
-    if current.phase != TransferPhase::Prepared || current.source_prepare_proof.is_none() {
+    if !matches!(
+        current.phase,
+        TransferPhase::Prepared | TransferPhase::Aborting
+    ) || current.source_prepare_proof.is_none()
+        || current.destination_abort_proof.is_some()
+    {
         return Err(conflict(
             transfer_id,
             "v3 transfer is not awaiting its first quarantine proof",
@@ -1658,7 +2029,9 @@ fn stage_v3_quarantine(
         .expect("validated v3 transfer exists");
     transfer.quarantine_receipt_hash = Some(receipt_hash.to_owned());
     transfer.destination_quarantine_proof = Some(proof.clone());
-    transfer.phase = TransferPhase::Quarantined;
+    if transfer.phase == TransferPhase::Prepared {
+        transfer.phase = TransferPhase::Quarantined;
+    }
     finish_v3_transaction(document, next)
 }
 
@@ -1736,9 +2109,12 @@ fn stage_v3_destination_imported(
         fencing_token: import.fencing_token,
         event_sequence: import.event_sequence,
         event_hash: import.event_hash.clone(),
+        event_payload_hash: None,
         world_hash: import.resulting_active_world_hash.clone(),
         quarantine_receipt_hash: Some(import.quarantine_receipt_hash.clone()),
         export_proof_hash: None,
+        prepare_proof_hash: None,
+        quarantine_proof_hash: None,
         import_proof_hash: Some(import.proof_hash.clone()),
         activation_proof_hash: None,
         finalization_proof_hash: None,
@@ -1759,7 +2135,9 @@ fn stage_v3_destination_imported(
         mutation_witness_hash: Some(import.mutation_witness_hash.clone()),
         ledger_vector: Some(import.ledger_vector),
         trusted_time_unix_ms: Some(import.imported_at_unix_ms),
+        prepared_at_simulation_tick: None,
         abort_witness_hash: None,
+        abort_proof_hash: None,
         resulting_draft_world_hash: None,
         abort_removed_authority: None,
     };
@@ -1838,9 +2216,12 @@ fn stage_v3_source_exported(
         fencing_token: export.fencing_token,
         event_sequence: export.event_sequence,
         event_hash: export.event_hash.clone(),
+        event_payload_hash: None,
         world_hash: export.resulting_active_world_hash.clone(),
         quarantine_receipt_hash: Some(export.quarantine_receipt_hash.clone()),
         export_proof_hash: Some(export.proof_hash.clone()),
+        prepare_proof_hash: None,
+        quarantine_proof_hash: None,
         import_proof_hash: None,
         activation_proof_hash: None,
         finalization_proof_hash: None,
@@ -1859,7 +2240,9 @@ fn stage_v3_source_exported(
         mutation_witness_hash: Some(export.mutation_witness_hash.clone()),
         ledger_vector: Some(export.ledger_vector),
         trusted_time_unix_ms: Some(export.exported_at_unix_ms),
+        prepared_at_simulation_tick: None,
         abort_witness_hash: None,
+        abort_proof_hash: None,
         resulting_draft_world_hash: None,
         abort_removed_authority: None,
     };
@@ -1929,9 +2312,12 @@ fn stage_v3_destination_activated(
         fencing_token: activation.fencing_token,
         event_sequence: activation.event_sequence,
         event_hash: activation.event_hash.clone(),
+        event_payload_hash: None,
         world_hash: activation.resulting_active_world_hash.clone(),
         quarantine_receipt_hash: Some(activation.quarantine_receipt_hash.clone()),
         export_proof_hash: None,
+        prepare_proof_hash: None,
+        quarantine_proof_hash: None,
         import_proof_hash: None,
         activation_proof_hash: Some(activation.proof_hash.clone()),
         finalization_proof_hash: None,
@@ -1950,7 +2336,9 @@ fn stage_v3_destination_activated(
         mutation_witness_hash: Some(activation.mutation_witness_hash.clone()),
         ledger_vector: None,
         trusted_time_unix_ms: Some(activation.activated_at_unix_ms),
+        prepared_at_simulation_tick: None,
         abort_witness_hash: None,
+        abort_proof_hash: None,
         resulting_draft_world_hash: None,
         abort_removed_authority: None,
     };
@@ -2020,9 +2408,12 @@ fn stage_v3_source_finalized(
         fencing_token: finalization.fencing_token,
         event_sequence: finalization.event_sequence,
         event_hash: finalization.event_hash.clone(),
+        event_payload_hash: None,
         world_hash: finalization.resulting_active_world_hash.clone(),
         quarantine_receipt_hash: None,
         export_proof_hash: None,
+        prepare_proof_hash: None,
+        quarantine_proof_hash: None,
         import_proof_hash: None,
         activation_proof_hash: Some(finalization.destination_activation_proof_hash.clone()),
         finalization_proof_hash: Some(finalization.proof_hash.clone()),
@@ -2041,7 +2432,9 @@ fn stage_v3_source_finalized(
         mutation_witness_hash: Some(finalization.mutation_witness_hash.clone()),
         ledger_vector: None,
         trusted_time_unix_ms: Some(finalization.finalized_at_unix_ms),
+        prepared_at_simulation_tick: None,
         abort_witness_hash: None,
+        abort_proof_hash: None,
         resulting_draft_world_hash: None,
         abort_removed_authority: None,
     };
@@ -2135,16 +2528,19 @@ fn stage_v3_abort_cleanup(
         fencing_token: cleanup.fencing_token,
         event_sequence: cleanup.event_sequence,
         event_hash: cleanup.event_hash.clone(),
+        event_payload_hash: Some(cleanup.event_payload_hash.clone()),
         world_hash: cleanup.resulting_draft_world_hash.clone(),
         quarantine_receipt_hash: cleanup.quarantine_receipt_hash.clone(),
         export_proof_hash: None,
+        prepare_proof_hash: None,
+        quarantine_proof_hash: None,
         import_proof_hash: None,
         activation_proof_hash: None,
         finalization_proof_hash: None,
         destination_import_proof_hash: None,
-        prior_event_sequence: None,
-        prior_event_hash: None,
-        prior_draft_world_hash: None,
+        prior_event_sequence: Some(cleanup.prior_event_sequence),
+        prior_event_hash: Some(cleanup.prior_event_hash.clone()),
+        prior_draft_world_hash: Some(cleanup.prior_draft_world_hash.clone()),
         prior_active_world_hash: None,
         quarantined_at_unix_ms: None,
         imported_at_unix_ms: None,
@@ -2153,10 +2549,12 @@ fn stage_v3_abort_cleanup(
         source_exported_at_unix_ms: None,
         destination_production_lifecycle_generation: None,
         production_eligibility_root: None,
-        mutation_witness_hash: None,
+        mutation_witness_hash: Some(cleanup.mutation_witness_hash.clone()),
         ledger_vector: None,
-        trusted_time_unix_ms: None,
+        trusted_time_unix_ms: Some(cleanup.trusted_time_unix_ms),
+        prepared_at_simulation_tick: None,
         abort_witness_hash: Some(cleanup.abort_witness_hash.clone()),
+        abort_proof_hash: Some(cleanup.proof_hash.clone()),
         resulting_draft_world_hash: Some(cleanup.resulting_draft_world_hash.clone()),
         abort_removed_authority: Some(cleanup.removed_authority),
     };
@@ -2629,6 +3027,7 @@ mod tests {
             fencing_token,
             event_sequence,
             event_hash: blake3::hash(label).to_hex().to_string(),
+            event_payload_hash: None,
             world_hash: world_hash.clone(),
             quarantine_receipt_hash: if binds_receipt {
                 transfer.quarantine_receipt_hash.clone()
@@ -2636,6 +3035,8 @@ mod tests {
                 None
             },
             export_proof_hash: None,
+            prepare_proof_hash: None,
+            quarantine_proof_hash: None,
             import_proof_hash: None,
             activation_proof_hash: None,
             finalization_proof_hash: None,
@@ -2654,14 +3055,94 @@ mod tests {
             mutation_witness_hash: None,
             ledger_vector: None,
             trusted_time_unix_ms: None,
+            prepared_at_simulation_tick: None,
             abort_witness_hash: is_abort.then(|| {
                 blake3::hash(&[label, b"-witness"].concat())
                     .to_hex()
                     .to_string()
             }),
+            abort_proof_hash: None,
             resulting_draft_world_hash: is_abort.then_some(world_hash),
             abort_removed_authority: is_abort.then_some(true),
         };
+        if kind == DirectoryPhaseProofKindV3::SourcePrepare {
+            let mut prepare = DraftGridPrepareProofV2 {
+                transfer_id: proof.transfer_id.clone(),
+                root_aggregate_id: transfer.root_aggregate_id.clone(),
+                member_root: proof.member_root.clone(),
+                package_hash: proof.package_hash.clone(),
+                source_cell_id: proof.cell_id.clone(),
+                assignment_generation: proof.assignment_generation,
+                fencing_token: proof.fencing_token,
+                prior_event_sequence: proof.event_sequence - 1,
+                prior_event_hash: blake3::hash(b"directory prepare prior event")
+                    .to_hex()
+                    .to_string(),
+                event_sequence: proof.event_sequence,
+                event_hash: proof.event_hash.clone(),
+                event_payload_hash: blake3::hash(b"directory prepare event payload")
+                    .to_hex()
+                    .to_string(),
+                prior_active_world_hash: blake3::hash(b"directory prepare prior active world")
+                    .to_hex()
+                    .to_string(),
+                resulting_active_world_hash: proof.world_hash.clone(),
+                prepared_at_simulation_tick: 17,
+                mutation_witness_hash: String::new(),
+                proof_hash: String::new(),
+            };
+            prepare
+                .seal_hashes_for_test()
+                .expect("source-prepare proof seals");
+            proof.event_payload_hash = Some(prepare.event_payload_hash);
+            proof.prepare_proof_hash = Some(prepare.proof_hash);
+            proof.prior_event_sequence = Some(prepare.prior_event_sequence);
+            proof.prior_event_hash = Some(prepare.prior_event_hash);
+            proof.prior_active_world_hash = Some(prepare.prior_active_world_hash);
+            proof.mutation_witness_hash = Some(prepare.mutation_witness_hash);
+            proof.prepared_at_simulation_tick = Some(prepare.prepared_at_simulation_tick);
+        }
+        if kind == DirectoryPhaseProofKindV3::DestinationQuarantine {
+            let mut quarantine = DraftGridQuarantineProofV2 {
+                transfer_id: proof.transfer_id.clone(),
+                root_aggregate_id: transfer.root_aggregate_id.clone(),
+                member_root: proof.member_root.clone(),
+                package_hash: proof.package_hash.clone(),
+                destination_cell_id: proof.cell_id.clone(),
+                assignment_generation: proof.assignment_generation,
+                fencing_token: proof.fencing_token,
+                prior_event_sequence: proof.event_sequence - 1,
+                prior_event_hash: blake3::hash(b"directory quarantine prior event")
+                    .to_hex()
+                    .to_string(),
+                event_sequence: proof.event_sequence,
+                event_hash: proof.event_hash.clone(),
+                event_payload_hash: blake3::hash(b"directory quarantine event payload")
+                    .to_hex()
+                    .to_string(),
+                prior_active_world_hash: blake3::hash(b"directory quarantine prior active world")
+                    .to_hex()
+                    .to_string(),
+                resulting_active_world_hash: proof.world_hash.clone(),
+                quarantine_receipt_hash: proof
+                    .quarantine_receipt_hash
+                    .clone()
+                    .expect("quarantine proof binds receipt"),
+                quarantined_at_unix_ms: 1_800_000_000_051,
+                mutation_witness_hash: String::new(),
+                proof_hash: String::new(),
+            };
+            quarantine
+                .seal_hashes_for_test()
+                .expect("destination-quarantine proof seals");
+            proof.event_payload_hash = Some(quarantine.event_payload_hash);
+            proof.quarantine_proof_hash = Some(quarantine.proof_hash);
+            proof.prior_event_sequence = Some(quarantine.prior_event_sequence);
+            proof.prior_event_hash = Some(quarantine.prior_event_hash);
+            proof.prior_active_world_hash = Some(quarantine.prior_active_world_hash);
+            proof.quarantined_at_unix_ms = Some(quarantine.quarantined_at_unix_ms);
+            proof.mutation_witness_hash = Some(quarantine.mutation_witness_hash);
+        }
         if kind == DirectoryPhaseProofKindV3::SourceExport {
             let ledger_vector = DraftGridTransferLedgerVectorV2 {
                 ore: 3,
@@ -2932,6 +3413,28 @@ mod tests {
             proof.trusted_time_unix_ms = Some(finalization.finalized_at_unix_ms);
         }
         if is_abort {
+            proof.event_payload_hash = Some(
+                blake3::hash(&[label, b"-payload"].concat())
+                    .to_hex()
+                    .to_string(),
+            );
+            proof.prior_event_sequence = Some(proof.event_sequence - 1);
+            proof.prior_event_hash = Some(
+                blake3::hash(&[label, b"-prior-event"].concat())
+                    .to_hex()
+                    .to_string(),
+            );
+            proof.prior_draft_world_hash = Some(
+                blake3::hash(&[label, b"-prior-draft"].concat())
+                    .to_hex()
+                    .to_string(),
+            );
+            proof.mutation_witness_hash = Some(
+                blake3::hash(&[label, b"-mutation"].concat())
+                    .to_hex()
+                    .to_string(),
+            );
+            proof.trusted_time_unix_ms = Some(1_800_000_000_000 + proof.event_sequence);
             let mut cleanup = DraftGridAbortCleanupProofV2 {
                 side: match kind {
                     DirectoryPhaseProofKindV3::SourceAbort => DraftGridTransferAbortSideV2::Source,
@@ -2948,7 +3451,29 @@ mod tests {
                 fencing_token: proof.fencing_token,
                 event_sequence: proof.event_sequence,
                 event_hash: proof.event_hash.clone(),
+                event_payload_hash: proof
+                    .event_payload_hash
+                    .clone()
+                    .expect("abort payload hash exists"),
+                prior_event_sequence: proof
+                    .prior_event_sequence
+                    .expect("abort prior sequence exists"),
+                prior_event_hash: proof
+                    .prior_event_hash
+                    .clone()
+                    .expect("abort prior event exists"),
+                prior_draft_world_hash: proof
+                    .prior_draft_world_hash
+                    .clone()
+                    .expect("abort prior draft exists"),
                 resulting_draft_world_hash: proof.world_hash.clone(),
+                trusted_time_unix_ms: proof
+                    .trusted_time_unix_ms
+                    .expect("abort trusted time exists"),
+                mutation_witness_hash: proof
+                    .mutation_witness_hash
+                    .clone()
+                    .expect("abort mutation exists"),
                 quarantine_receipt_hash: proof.quarantine_receipt_hash.clone(),
                 abort_witness_hash: proof
                     .abort_witness_hash
@@ -2957,11 +3482,13 @@ mod tests {
                 removed_authority: proof
                     .abort_removed_authority
                     .expect("abort removal flag exists"),
+                proof_hash: String::new(),
             };
             cleanup
                 .seal_event_hash()
                 .expect("directory abort proof seals");
             proof.event_hash = cleanup.event_hash;
+            proof.abort_proof_hash = Some(cleanup.proof_hash);
         }
         proof
     }
@@ -2988,14 +3515,33 @@ mod tests {
             fencing_token: proof.fencing_token,
             event_sequence: proof.event_sequence,
             event_hash: proof.event_hash,
+            event_payload_hash: proof
+                .event_payload_hash
+                .expect("abort proof has payload hash"),
+            prior_event_sequence: proof
+                .prior_event_sequence
+                .expect("abort proof has prior sequence"),
+            prior_event_hash: proof.prior_event_hash.expect("abort proof has prior event"),
+            prior_draft_world_hash: proof
+                .prior_draft_world_hash
+                .expect("abort proof has prior draft"),
             resulting_draft_world_hash: proof
                 .resulting_draft_world_hash
                 .expect("abort proof has resulting world"),
+            trusted_time_unix_ms: proof
+                .trusted_time_unix_ms
+                .expect("abort proof has trusted time"),
+            mutation_witness_hash: proof
+                .mutation_witness_hash
+                .expect("abort proof has mutation"),
             quarantine_receipt_hash: proof.quarantine_receipt_hash,
             abort_witness_hash: proof
                 .abort_witness_hash
                 .expect("abort proof has witness hash"),
             removed_authority,
+            proof_hash: proof
+                .abort_proof_hash
+                .expect("abort proof has typed proof hash"),
         };
         cleanup
             .seal_event_hash()
@@ -3217,8 +3763,13 @@ mod tests {
             &prepared.transfers["transfer-grid-v3-proof"],
             DirectoryPhaseProofKindV3::SourcePrepare,
         );
+        let prepare_cell_proof = prepare_proof
+            .source_prepare_cell_proof(
+                &prepared.transfers["transfer-grid-v3-proof"].root_aggregate_id,
+            )
+            .expect("typed source-prepare proof reconstructs");
         let source_prepared =
-            stage_v3_source_prepared(&prepared, "transfer-grid-v3-proof", &prepare_proof)
+            stage_v3_source_prepared(&prepared, "transfer-grid-v3-proof", &prepare_cell_proof)
                 .expect("source proof commits");
         let receipt_hash = blake3::hash(b"authority view receipt").to_hex().to_string();
         let mut proof_material = source_prepared.transfers["transfer-grid-v3-proof"].clone();
@@ -3227,11 +3778,13 @@ mod tests {
             &proof_material,
             DirectoryPhaseProofKindV3::DestinationQuarantine,
         );
+        let quarantine_cell_proof = quarantine_proof
+            .destination_quarantine_cell_proof(&proof_material.root_aggregate_id)
+            .expect("typed destination-quarantine proof reconstructs");
         let quarantined = stage_v3_quarantine(
             &source_prepared,
             "transfer-grid-v3-proof",
-            &receipt_hash,
-            &quarantine_proof,
+            &quarantine_cell_proof,
         )
         .expect("quarantine commits");
         let view = quarantined
@@ -3247,6 +3800,21 @@ mod tests {
         assert!(!view.source_finalization_proven());
         assert!(!view.source_abort_proven());
         assert!(!view.destination_abort_proven());
+        let cell_authority = DraftGridDirectoryAuthorityV2::from_validated_v3(&view);
+        assert!(
+            cell_authority.has_valid_phase_matrix(),
+            "directory-to-cell authority keeps the exact typed proof matrix"
+        );
+        let authority_bytes =
+            serde_json::to_vec(&cell_authority).expect("cell authority bridge encodes");
+        let reopened_authority =
+            serde_json::from_slice::<DraftGridDirectoryAuthorityV2>(&authority_bytes)
+                .expect("cell authority bridge reopens");
+        assert_eq!(reopened_authority, cell_authority);
+        assert!(
+            reopened_authority.has_valid_phase_matrix(),
+            "reopened cell authority retains its proof matrix"
+        );
 
         let finalized = finalized_document();
         let view = finalized
@@ -3289,6 +3857,7 @@ mod tests {
         typed_import
             .validate()
             .expect("typed destination import proof validates");
+
         assert_eq!(
             typed_import.proof_hash,
             import
@@ -3314,6 +3883,28 @@ mod tests {
         );
         assert!(activation.event_sequence() > import.event_sequence());
         assert!(view.source_finalization_proof().is_some());
+
+        let aborted = aborted_document();
+        let view = aborted
+            .validated_grid_transfer_authority("transfer-grid-v3-proof")
+            .expect("aborted authority view derives");
+        let source_abort = view
+            .source_abort_cell_proof()
+            .expect("typed source-abort proof reconstructs");
+        let destination_abort = view
+            .destination_abort_cell_proof()
+            .expect("typed destination-abort proof reconstructs");
+        source_abort
+            .validate()
+            .expect("typed source-abort proof validates");
+        destination_abort
+            .validate()
+            .expect("typed destination-abort proof validates");
+        assert_eq!(source_abort.side, DraftGridTransferAbortSideV2::Source);
+        assert_eq!(
+            destination_abort.side,
+            DraftGridTransferAbortSideV2::Destination
+        );
     }
 
     #[test]
@@ -3330,8 +3921,13 @@ mod tests {
             &prepared.transfers["transfer-grid-v3-proof"],
             DirectoryPhaseProofKindV3::SourcePrepare,
         );
+        let prepare_cell_proof = prepare_proof
+            .source_prepare_cell_proof(
+                &prepared.transfers["transfer-grid-v3-proof"].root_aggregate_id,
+            )
+            .expect("typed source-prepare proof reconstructs");
         let source_prepared =
-            stage_v3_source_prepared(&prepared, "transfer-grid-v3-proof", &prepare_proof)
+            stage_v3_source_prepared(&prepared, "transfer-grid-v3-proof", &prepare_cell_proof)
                 .expect("source proof commits");
 
         let receipt_hash = blake3::hash(b"transaction receipt").to_hex().to_string();
@@ -3341,11 +3937,13 @@ mod tests {
             &quarantine_material,
             DirectoryPhaseProofKindV3::DestinationQuarantine,
         );
+        let quarantine_cell_proof = quarantine_proof
+            .destination_quarantine_cell_proof(&quarantine_material.root_aggregate_id)
+            .expect("typed destination-quarantine proof reconstructs");
         let quarantined = stage_v3_quarantine(
             &source_prepared,
             "transfer-grid-v3-proof",
-            &receipt_hash,
-            &quarantine_proof,
+            &quarantine_cell_proof,
         )
         .expect("quarantine commits");
         let premature_export_proof = phase_proof(
@@ -3591,6 +4189,10 @@ mod tests {
         let source_clean =
             stage_v3_abort_cleanup(&aborting, "transfer-grid-v3-proof", &source_proof)
                 .expect("source cleanup commits");
+        let source_clean = decode_v3(
+            &encode_v3(&source_clean).expect("source-clean directory encodes for restart"),
+        )
+        .expect("source-clean directory reopens after restart");
         assert_eq!(
             stage_v3_abort_cleanup(&source_clean, "transfer-grid-v3-proof", &source_proof)
                 .expect("source cleanup retry is exact"),
@@ -3614,6 +4216,12 @@ mod tests {
             stage_v3_abort_cleanup(&source_clean, "transfer-grid-v3-proof", &zero_frontier,)
                 .is_err()
         );
+        let mut changed_proof_hash = source_proof.clone();
+        changed_proof_hash.proof_hash = "ef".repeat(32);
+        assert!(
+            stage_v3_abort_cleanup(&source_clean, "transfer-grid-v3-proof", &changed_proof_hash,)
+                .is_err()
+        );
         let destination_proof = abort_cleanup_proof(
             &source_clean.transfers["transfer-grid-v3-proof"],
             DraftGridTransferAbortSideV2::Destination,
@@ -3624,6 +4232,8 @@ mod tests {
                 .expect("destination cleanup commits");
         let aborted = stage_v3_finalize_abort(&both_clean, "transfer-grid-v3-proof")
             .expect("abort finalizes");
+        let aborted = decode_v3(&encode_v3(&aborted).expect("aborted directory encodes"))
+            .expect("aborted directory reopens");
         for member in &requested.bundle.members {
             assert_eq!(
                 aborted.placements[&member.aggregate_id],
@@ -3634,6 +4244,99 @@ mod tests {
             stage_v3_finalize_abort(&aborted, "transfer-grid-v3-proof")
                 .expect("abort retry is exact"),
             aborted
+        );
+        let authority = aborted
+            .validated_grid_transfer_authority("transfer-grid-v3-proof")
+            .expect("aborted authority reopens");
+        assert_eq!(
+            authority
+                .source_abort_cell_proof()
+                .expect("source abort proof survives restart"),
+            source_proof
+        );
+        assert_eq!(
+            authority
+                .destination_abort_cell_proof()
+                .expect("destination abort proof survives restart"),
+            destination_proof
+        );
+    }
+
+    #[test]
+    fn aborting_directory_adopts_a_late_durable_quarantine_before_cleanup() {
+        let (initial, requested) = initial_document_and_request();
+        let prepared = stage_v3_prepare(&initial, &requested).expect("bundle prepares");
+        let prepare = phase_proof(
+            &prepared.transfers["transfer-grid-v3-proof"],
+            DirectoryPhaseProofKindV3::SourcePrepare,
+        )
+        .source_prepare_cell_proof(&requested.root_aggregate_id)
+        .expect("typed prepare proof reconstructs");
+        let source_prepared =
+            stage_v3_source_prepared(&prepared, "transfer-grid-v3-proof", &prepare)
+                .expect("source prepare proof commits");
+
+        let receipt = blake3::hash(b"late quarantine receipt")
+            .to_hex()
+            .to_string();
+        let mut quarantine_material = source_prepared.transfers["transfer-grid-v3-proof"].clone();
+        quarantine_material.quarantine_receipt_hash = Some(receipt.clone());
+        let late_quarantine = phase_proof(
+            &quarantine_material,
+            DirectoryPhaseProofKindV3::DestinationQuarantine,
+        )
+        .destination_quarantine_cell_proof(&requested.root_aggregate_id)
+        .expect("late typed quarantine proof reconstructs");
+
+        let aborting = stage_v3_request_abort(&source_prepared, "transfer-grid-v3-proof")
+            .expect("directory requests abort before seeing quarantine");
+        let source_cleanup = abort_cleanup_proof(
+            &aborting.transfers["transfer-grid-v3-proof"],
+            DraftGridTransferAbortSideV2::Source,
+            true,
+        );
+        let source_clean =
+            stage_v3_abort_cleanup(&aborting, "transfer-grid-v3-proof", &source_cleanup)
+                .expect("source cleanup commits before late quarantine is adopted");
+        let source_clean =
+            decode_v3(&encode_v3(&source_clean).expect("source-clean aborting directory encodes"))
+                .expect("source-clean aborting directory reopens");
+
+        let adopted =
+            stage_v3_quarantine(&source_clean, "transfer-grid-v3-proof", &late_quarantine)
+                .expect("aborting directory adopts exact cell-first quarantine");
+        assert_eq!(
+            adopted.transfers["transfer-grid-v3-proof"].phase,
+            TransferPhase::Aborting
+        );
+        assert_eq!(
+            adopted.transfers["transfer-grid-v3-proof"]
+                .quarantine_receipt_hash
+                .as_deref(),
+            Some(receipt.as_str())
+        );
+        assert_eq!(
+            adopted.transfers["transfer-grid-v3-proof"]
+                .source_abort_proof
+                .as_ref()
+                .and_then(|proof| proof.quarantine_receipt_hash.as_deref()),
+            None,
+            "an earlier source cleanup remains valid when the destination receipt arrives later"
+        );
+
+        let destination_cleanup = abort_cleanup_proof(
+            &adopted.transfers["transfer-grid-v3-proof"],
+            DraftGridTransferAbortSideV2::Destination,
+            true,
+        );
+        let both_clean =
+            stage_v3_abort_cleanup(&adopted, "transfer-grid-v3-proof", &destination_cleanup)
+                .expect("destination reservation cleanup commits");
+        let aborted = stage_v3_finalize_abort(&both_clean, "transfer-grid-v3-proof")
+            .expect("late-quarantine abort finalizes without a stranded reservation");
+        assert_eq!(
+            aborted.transfers["transfer-grid-v3-proof"].phase,
+            TransferPhase::Aborted
         );
     }
 

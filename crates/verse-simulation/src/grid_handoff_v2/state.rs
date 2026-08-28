@@ -10,6 +10,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(test)]
+use super::event_v17::DraftCanonicalGridEventV17;
+use super::event_v17::{DraftGridEventPayloadV17, ValidatedDraftGridEventContextV17};
 use super::production::{
     DraftImportedProductionEligibilityV2, DraftImportedProductionOccurrenceControlsV2,
     DraftProductionImportAuthorityV2, DraftProductionJobOriginV2,
@@ -37,9 +40,16 @@ use verse_protocol::CareerSnapshot;
 const DRAFT_GRID_CELL_STATE_SCHEMA_VERSION: u32 = 21;
 const MAX_DRAFT_GRID_CELL_STATE_BYTES: usize = 32 * 1_024 * 1_024;
 const DRAFT_CELL_STATE_HASH_DOMAIN: &[u8] = b"the-verse/grid-transfer-cell-state/v21\0";
+const PREPARE_WITNESS_HASH_DOMAIN: &[u8] = b"the-verse/grid-transfer-prepare-witness/v2\0";
+const PREPARE_EVENT_HASH_DOMAIN: &[u8] = b"the-verse/grid-transfer-prepare-event/v2\0";
+const PREPARE_PROOF_HASH_DOMAIN: &[u8] = b"the-verse/grid-transfer-prepare-proof/v2\0";
 const QUARANTINE_RECEIPT_HASH_DOMAIN: &[u8] = b"the-verse/grid-transfer-quarantine-receipt/v2\0";
+const QUARANTINE_WITNESS_HASH_DOMAIN: &[u8] = b"the-verse/grid-transfer-quarantine-witness/v2\0";
+const QUARANTINE_EVENT_HASH_DOMAIN: &[u8] = b"the-verse/grid-transfer-quarantine-event/v2\0";
+const QUARANTINE_PROOF_HASH_DOMAIN: &[u8] = b"the-verse/grid-transfer-quarantine-proof/v2\0";
 const ABORT_WITNESS_HASH_DOMAIN: &[u8] = b"the-verse/grid-transfer-abort-witness/v2\0";
 const ABORT_EVENT_HASH_DOMAIN: &[u8] = b"the-verse/grid-transfer-abort-event/v2\0";
+const ABORT_PROOF_HASH_DOMAIN: &[u8] = b"the-verse/grid-transfer-abort-proof/v2\0";
 const EXPORT_WITNESS_HASH_DOMAIN: &[u8] = b"the-verse/grid-transfer-export-witness/v2\0";
 const EXPORT_EVENT_HASH_DOMAIN: &[u8] = b"the-verse/grid-transfer-export-event/v2\0";
 const EXPORT_PROOF_HASH_DOMAIN: &[u8] = b"the-verse/grid-transfer-export-proof/v2\0";
@@ -117,11 +127,37 @@ struct DraftAggregateTransferLockV2 {
     source_base_world_hash: String,
     prepared_at_simulation_tick: u64,
     production_job_origins: BTreeMap<String, DraftProductionJobOriginV2>,
+    prepare_event_sequence: u64,
+    prepare_event_hash: String,
+    prepare_event_payload_hash: String,
+    prepare_mutation_witness_hash: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct DraftGridTransferQuarantineReceiptV2 {
+pub(crate) struct DraftGridPrepareProofV2 {
+    pub(crate) transfer_id: String,
+    pub(crate) root_aggregate_id: String,
+    pub(crate) member_root: String,
+    pub(crate) package_hash: String,
+    pub(crate) source_cell_id: String,
+    pub(crate) assignment_generation: u64,
+    pub(crate) fencing_token: u64,
+    pub(crate) prior_event_sequence: u64,
+    pub(crate) prior_event_hash: String,
+    pub(crate) event_sequence: u64,
+    pub(crate) event_hash: String,
+    pub(crate) event_payload_hash: String,
+    pub(crate) prior_active_world_hash: String,
+    pub(crate) resulting_active_world_hash: String,
+    pub(crate) prepared_at_simulation_tick: u64,
+    pub(crate) mutation_witness_hash: String,
+    pub(crate) proof_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct DraftGridTransferQuarantineReceiptV2 {
     schema_version: u32,
     transfer_id: String,
     root_aggregate_id: String,
@@ -149,6 +185,33 @@ struct DraftAggregateTransferReservationV2 {
     destination_base_world_hash: String,
     destination_draft_world_hash: String,
     quarantined_at_unix_ms: u64,
+    quarantine_event_sequence: u64,
+    quarantine_event_hash: String,
+    quarantine_event_payload_hash: String,
+    quarantine_mutation_witness_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DraftGridQuarantineProofV2 {
+    pub(crate) transfer_id: String,
+    pub(crate) root_aggregate_id: String,
+    pub(crate) member_root: String,
+    pub(crate) package_hash: String,
+    pub(crate) destination_cell_id: String,
+    pub(crate) assignment_generation: u64,
+    pub(crate) fencing_token: u64,
+    pub(crate) prior_event_sequence: u64,
+    pub(crate) prior_event_hash: String,
+    pub(crate) event_sequence: u64,
+    pub(crate) event_hash: String,
+    pub(crate) event_payload_hash: String,
+    pub(crate) prior_active_world_hash: String,
+    pub(crate) resulting_active_world_hash: String,
+    pub(crate) quarantine_receipt_hash: String,
+    pub(crate) quarantined_at_unix_ms: u64,
+    pub(crate) mutation_witness_hash: String,
+    pub(crate) proof_hash: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -174,10 +237,16 @@ struct DraftGridTransferAbortWitnessV2 {
     prior_event_hash: String,
     cleanup_event_sequence: u64,
     cleanup_event_hash: String,
+    cleanup_event_payload_hash: String,
     base_world_hash: String,
     prior_draft_world_hash: String,
     resulting_draft_world_hash: String,
+    cleanup_simulation_tick: u64,
     aborted_at_unix_ms: u64,
+    removed_lock: Option<DraftAggregateTransferLockV2>,
+    removed_reservation: Option<DraftAggregateTransferReservationV2>,
+    mutation_witness_hash: String,
+    cleanup_proof_hash: String,
     witness_hash: String,
 }
 
@@ -450,7 +519,8 @@ pub(crate) struct DraftGridActivationProofV2 {
     pub(crate) proof_hash: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct DraftGridFinalizationProofV2 {
     pub(crate) transfer_id: String,
     pub(crate) root_aggregate_id: String,
@@ -501,7 +571,8 @@ pub(crate) struct DraftImportedProductionReleaseProofV2 {
     pub(crate) proof_hash: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct DraftGridAbortCleanupProofV2 {
     pub(crate) side: DraftGridTransferAbortSideV2,
     pub(crate) transfer_id: String,
@@ -512,10 +583,17 @@ pub(crate) struct DraftGridAbortCleanupProofV2 {
     pub(crate) fencing_token: u64,
     pub(crate) event_sequence: u64,
     pub(crate) event_hash: String,
+    pub(crate) event_payload_hash: String,
+    pub(crate) prior_event_sequence: u64,
+    pub(crate) prior_event_hash: String,
+    pub(crate) prior_draft_world_hash: String,
     pub(crate) resulting_draft_world_hash: String,
+    pub(crate) trusted_time_unix_ms: u64,
+    pub(crate) mutation_witness_hash: String,
     pub(crate) quarantine_receipt_hash: Option<String>,
     pub(crate) abort_witness_hash: String,
     pub(crate) removed_authority: bool,
+    pub(crate) proof_hash: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -528,6 +606,8 @@ pub(super) struct DraftGridTransferCellStateV2 {
     aggregate_reservations: BTreeMap<String, DraftAggregateTransferReservationV2>,
     pending_imports: BTreeMap<String, DraftPendingGridImportV2>,
     imported_production_eligibilities: BTreeMap<String, DraftImportedProductionEligibilityV2>,
+    committed_prepares: BTreeMap<String, DraftGridPrepareProofV2>,
+    committed_quarantines: BTreeMap<String, DraftGridQuarantineProofV2>,
     committed_exports: BTreeMap<String, DraftGridExportRecordV2>,
     committed_imports: BTreeMap<String, DraftGridImportRecordV2>,
     committed_activations: BTreeMap<String, DraftGridActivationRecordV2>,
@@ -552,6 +632,40 @@ struct DraftActiveWorldHashMaterialV2<'a> {
     source_finalization_tombstones: &'a BTreeMap<String, DraftGridFinalizationTombstoneV2>,
     production_occurrence_history_count: u64,
     production_occurrence_history_head: &'a str,
+}
+
+#[derive(Serialize)]
+struct DraftGridPrepareEventHashMaterialV2<'a> {
+    transfer_id: &'a str,
+    root_aggregate_id: &'a str,
+    member_root: &'a str,
+    package_hash: &'a str,
+    source_cell_id: &'a str,
+    assignment_generation: u64,
+    fencing_token: u64,
+    prior_event_sequence: u64,
+    prior_event_hash: &'a str,
+    event_sequence: u64,
+    event_payload_hash: &'a str,
+    prepared_at_simulation_tick: u64,
+    mutation_witness_hash: &'a str,
+}
+
+#[derive(Serialize)]
+struct DraftGridQuarantineEventHashMaterialV2<'a> {
+    transfer_id: &'a str,
+    root_aggregate_id: &'a str,
+    member_root: &'a str,
+    package_hash: &'a str,
+    destination_cell_id: &'a str,
+    assignment_generation: u64,
+    fencing_token: u64,
+    prior_event_sequence: u64,
+    prior_event_hash: &'a str,
+    event_sequence: u64,
+    quarantine_receipt_hash: &'a str,
+    quarantined_at_unix_ms: u64,
+    mutation_witness_hash: &'a str,
 }
 
 #[derive(Serialize)]
@@ -646,7 +760,8 @@ struct DraftProductionOccurrenceHistoryEntryMaterialV2<'a> {
     mutation_witness_hash: &'a str,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 enum DraftGridDirectoryProofKindV2 {
     SourcePrepare,
     DestinationQuarantine,
@@ -658,18 +773,27 @@ enum DraftGridDirectoryProofKindV2 {
     DestinationAbort,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct DraftGridDirectoryAuthorityV2 {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DraftGridDirectoryAuthorityV2 {
+    directory_revision: u64,
+    directory_document_hash: String,
     binding: DraftGridTransferBindingV2,
     phase: TransferPhase,
     quarantine_receipt_hash: Option<String>,
+    source_prepare_proof: Option<DraftGridPrepareProofV2>,
+    destination_quarantine_proof: Option<DraftGridQuarantineProofV2>,
     source_export_proof_hash: Option<String>,
     source_exported_at_unix_ms: Option<u64>,
     source_export_proof: Option<DraftGridExportProofV2>,
     destination_import_proof: Option<DraftGridImportProofV2>,
     destination_activation_proof: Option<DraftGridActivationProofV2>,
     source_finalization_proof: Option<DraftGridFinalizationProofV2>,
+    source_abort_proof: Option<DraftGridAbortCleanupProofV2>,
+    destination_abort_proof: Option<DraftGridAbortCleanupProofV2>,
     proofs: BTreeSet<DraftGridDirectoryProofKindV2>,
+    source_fencing_history: Vec<(u64, u64)>,
+    destination_fencing_history: Vec<(u64, u64)>,
     live_source_assignment_generation: u64,
     live_source_fencing_token: u64,
     live_destination_assignment_generation: u64,
@@ -826,11 +950,25 @@ impl DraftGridTransferBindingV2 {
 }
 
 impl DraftGridDirectoryAuthorityV2 {
-    fn from_validated_v3(authority: &ValidatedGridTransferAuthorityV3) -> Self {
+    #[cfg(test)]
+    fn test_fencing_history(live_generation: u64, live_fencing_token: u64) -> Vec<(u64, u64)> {
+        let first_fence = live_fencing_token
+            .checked_sub(live_generation.saturating_sub(1))
+            .expect("test fencing token covers every assignment generation");
+        (1..=live_generation)
+            .map(|generation| (generation, first_fence + generation - 1))
+            .collect()
+    }
+
+    pub(crate) fn from_validated_v3(authority: &ValidatedGridTransferAuthorityV3) -> Self {
+        let source_prepare_proof = authority.source_prepare_cell_proof();
+        let destination_quarantine_proof = authority.destination_quarantine_cell_proof();
         let source_export_proof = authority.source_export_cell_proof();
         let destination_import_proof = authority.destination_import_cell_proof();
         let destination_activation_proof = authority.destination_activation_cell_proof();
         let source_finalization_proof = authority.source_finalization_cell_proof();
+        let source_abort_proof = authority.source_abort_cell_proof();
+        let destination_abort_proof = authority.destination_abort_cell_proof();
         let proofs = [
             (
                 authority.source_prepare_proven(),
@@ -869,9 +1007,13 @@ impl DraftGridDirectoryAuthorityV2 {
         .filter_map(|(present, proof)| present.then_some(proof))
         .collect();
         Self {
+            directory_revision: authority.directory_revision(),
+            directory_document_hash: authority.directory_document_hash().to_owned(),
             binding: DraftGridTransferBindingV2::from_validated_authority(authority),
             phase: authority.phase(),
             quarantine_receipt_hash: authority.quarantine_receipt_hash().map(str::to_owned),
+            source_prepare_proof,
+            destination_quarantine_proof,
             source_export_proof_hash: authority
                 .source_export_proof()
                 .and_then(|proof| proof.export_proof_hash())
@@ -883,7 +1025,19 @@ impl DraftGridDirectoryAuthorityV2 {
             destination_import_proof,
             destination_activation_proof,
             source_finalization_proof,
+            source_abort_proof,
+            destination_abort_proof,
             proofs,
+            source_fencing_history: authority
+                .source_fencing_history()
+                .iter()
+                .map(|(&generation, &fence)| (generation, fence))
+                .collect(),
+            destination_fencing_history: authority
+                .destination_fencing_history()
+                .iter()
+                .map(|(&generation, &fence)| (generation, fence))
+                .collect(),
             live_source_assignment_generation: authority.live_source_assignment_generation(),
             live_source_fencing_token: authority.live_source_fencing_token(),
             live_destination_assignment_generation: authority
@@ -893,18 +1047,34 @@ impl DraftGridDirectoryAuthorityV2 {
     }
 
     #[cfg(test)]
-    fn for_package(package: &DraftGridClosurePackageV2, phase: TransferPhase) -> Self {
+    pub(super) fn for_package(package: &DraftGridClosurePackageV2, phase: TransferPhase) -> Self {
         Self {
+            directory_revision: 1,
+            directory_document_hash: blake3::hash(package.package_hash.as_bytes())
+                .to_hex()
+                .to_string(),
             binding: DraftGridTransferBindingV2::from_package(package),
             phase,
             quarantine_receipt_hash: None,
+            source_prepare_proof: None,
+            destination_quarantine_proof: None,
             source_export_proof_hash: None,
             source_exported_at_unix_ms: None,
             source_export_proof: None,
             destination_import_proof: None,
             destination_activation_proof: None,
             source_finalization_proof: None,
+            source_abort_proof: None,
+            destination_abort_proof: None,
             proofs: BTreeSet::new(),
+            source_fencing_history: Self::test_fencing_history(
+                package.source_assignment_generation,
+                package.source_fencing_token,
+            ),
+            destination_fencing_history: Self::test_fencing_history(
+                package.destination_assignment_generation,
+                package.destination_fencing_token,
+            ),
             live_source_assignment_generation: package.source_assignment_generation,
             live_source_fencing_token: package.source_fencing_token,
             live_destination_assignment_generation: package.destination_assignment_generation,
@@ -912,8 +1082,131 @@ impl DraftGridDirectoryAuthorityV2 {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn advance_test_source_authority(&mut self) {
+        self.live_source_assignment_generation += 1;
+        self.live_source_fencing_token += 1;
+        self.source_fencing_history.push((
+            self.live_source_assignment_generation,
+            self.live_source_fencing_token,
+        ));
+        self.advance_test_directory_revision();
+    }
+
+    #[cfg(test)]
+    fn advance_test_destination_authority(&mut self) {
+        self.live_destination_assignment_generation += 1;
+        self.live_destination_fencing_token += 1;
+        self.destination_fencing_history.push((
+            self.live_destination_assignment_generation,
+            self.live_destination_fencing_token,
+        ));
+        self.advance_test_directory_revision();
+    }
+
+    #[cfg(test)]
+    fn advance_test_directory_revision(&mut self) {
+        self.directory_revision += 1;
+        self.directory_document_hash = blake3::hash(
+            format!(
+                "{}:{}:{}:{}:{}",
+                self.directory_revision,
+                self.live_source_assignment_generation,
+                self.live_source_fencing_token,
+                self.live_destination_assignment_generation,
+                self.live_destination_fencing_token
+            )
+            .as_bytes(),
+        )
+        .to_hex()
+        .to_string();
+    }
+
+    #[cfg(test)]
+    fn record_test_source_prepare(
+        &mut self,
+        state: &DraftGridTransferCellStateV2,
+        transfer_id: &str,
+    ) {
+        self.source_prepare_proof = Some(
+            state
+                .committed_prepares
+                .get(transfer_id)
+                .expect("test source prepare proof exists")
+                .clone(),
+        );
+        self.proofs
+            .insert(DraftGridDirectoryProofKindV2::SourcePrepare);
+    }
+
+    #[cfg(test)]
+    fn record_test_destination_quarantine(
+        &mut self,
+        state: &DraftGridTransferCellStateV2,
+        transfer_id: &str,
+    ) {
+        let proof = state
+            .committed_quarantines
+            .get(transfer_id)
+            .expect("test destination quarantine proof exists")
+            .clone();
+        self.quarantine_receipt_hash = Some(proof.quarantine_receipt_hash.clone());
+        self.destination_quarantine_proof = Some(proof);
+        self.proofs
+            .insert(DraftGridDirectoryProofKindV2::DestinationQuarantine);
+    }
+
+    #[cfg(test)]
+    fn record_test_abort(&mut self, proof: &DraftGridAbortCleanupProofV2) {
+        let (slot, kind) = match proof.side {
+            DraftGridTransferAbortSideV2::Source => (
+                &mut self.source_abort_proof,
+                DraftGridDirectoryProofKindV2::SourceAbort,
+            ),
+            DraftGridTransferAbortSideV2::Destination => (
+                &mut self.destination_abort_proof,
+                DraftGridDirectoryProofKindV2::DestinationAbort,
+            ),
+        };
+        *slot = Some(proof.clone());
+        self.proofs.insert(kind);
+    }
+
     fn has_proof(&self, kind: DraftGridDirectoryProofKindV2) -> bool {
         self.proofs.contains(&kind)
+    }
+
+    fn fencing_history_valid(
+        history: &[(u64, u64)],
+        live_generation: u64,
+        live_fencing_token: u64,
+    ) -> bool {
+        if history.len() != usize::try_from(live_generation).unwrap_or(usize::MAX)
+            || history.last().copied() != Some((live_generation, live_fencing_token))
+        {
+            return false;
+        }
+        let mut prior_fence = 0;
+        for (index, &(generation, fence)) in history.iter().enumerate() {
+            if generation != u64::try_from(index).unwrap_or(u64::MAX) + 1 || fence <= prior_fence {
+                return false;
+            }
+            prior_fence = fence;
+        }
+        true
+    }
+
+    fn fencing_token_at(history: &[(u64, u64)], generation: u64) -> Option<u64> {
+        let index = usize::try_from(generation.checked_sub(1)?).ok()?;
+        history
+            .get(index)
+            .filter(|(stored_generation, _)| *stored_generation == generation)
+            .map(|(_, fence)| *fence)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_valid_phase_matrix(&self) -> bool {
+        self.validate_phase_matrix().is_ok()
     }
 
     fn validate_phase_matrix(&self) -> Result<(), DraftGridClosureError> {
@@ -995,6 +1288,8 @@ impl DraftGridDirectoryAuthorityV2 {
                     && has_destination_abort
             }
         } && (has_receipt == has_quarantine)
+            && (has_prepare == self.source_prepare_proof.is_some())
+            && (has_quarantine == self.destination_quarantine_proof.is_some())
             && (!has_quarantine || has_prepare)
             && (has_export == self.source_export_proof_hash.is_some())
             && (has_export == self.source_exported_at_unix_ms.is_some())
@@ -1002,6 +1297,8 @@ impl DraftGridDirectoryAuthorityV2 {
             && (has_import == self.destination_import_proof.is_some())
             && (has_activation == self.destination_activation_proof.is_some())
             && (has_finalization == self.source_finalization_proof.is_some())
+            && (has_source_abort == self.source_abort_proof.is_some())
+            && (has_destination_abort == self.destination_abort_proof.is_some())
             && self.source_export_proof.as_ref().is_none_or(|proof| {
                 self.source_export_proof_hash.as_deref() == Some(proof.proof_hash.as_str())
                     && self.source_exported_at_unix_ms == Some(proof.exported_at_unix_ms)
@@ -1056,14 +1353,34 @@ impl DraftGridDirectoryAuthorityV2 {
         Ok(())
     }
 
-    fn validate_package(
+    pub(super) fn validate_package(
         &self,
         package: &DraftGridClosurePackageV2,
     ) -> Result<(), DraftGridClosureError> {
         self.binding.validate()?;
         self.validate_phase_matrix()?;
         let expected_ledger_vector = DraftGridTransferLedgerVectorV2::from_package(package)?;
-        if self.binding != DraftGridTransferBindingV2::from_package(package)
+        if self.directory_revision == 0
+            || !valid_blake3_hex(&self.directory_document_hash)
+            || !Self::fencing_history_valid(
+                &self.source_fencing_history,
+                self.live_source_assignment_generation,
+                self.live_source_fencing_token,
+            )
+            || !Self::fencing_history_valid(
+                &self.destination_fencing_history,
+                self.live_destination_assignment_generation,
+                self.live_destination_fencing_token,
+            )
+            || Self::fencing_token_at(
+                &self.source_fencing_history,
+                package.source_assignment_generation,
+            ) != Some(package.source_fencing_token)
+            || Self::fencing_token_at(
+                &self.destination_fencing_history,
+                package.destination_assignment_generation,
+            ) != Some(package.destination_fencing_token)
+            || self.binding != DraftGridTransferBindingV2::from_package(package)
             || self.live_source_assignment_generation < self.binding.source_assignment_generation
             || self.live_source_fencing_token < self.binding.source_fencing_token
             || self.live_destination_assignment_generation
@@ -1078,6 +1395,36 @@ impl DraftGridDirectoryAuthorityV2 {
                 .as_ref()
                 .is_some_and(|hash| !valid_blake3_hex(hash))
             || self.source_exported_at_unix_ms == Some(0)
+            || self.source_prepare_proof.as_ref().is_some_and(|proof| {
+                proof.validate().is_err()
+                    || proof.transfer_id != package.transfer_id
+                    || proof.root_aggregate_id != package.root_aggregate_id
+                    || proof.member_root != package.member_root
+                    || proof.package_hash != package.package_hash
+                    || proof.source_cell_id != package.source_cell_id
+                    || Self::fencing_token_at(
+                        &self.source_fencing_history,
+                        proof.assignment_generation,
+                    ) != Some(proof.fencing_token)
+                    || proof.prepared_at_simulation_tick != package.prepared_at_simulation_tick
+            })
+            || self
+                .destination_quarantine_proof
+                .as_ref()
+                .is_some_and(|proof| {
+                    proof.validate().is_err()
+                        || proof.transfer_id != package.transfer_id
+                        || proof.root_aggregate_id != package.root_aggregate_id
+                        || proof.member_root != package.member_root
+                        || proof.package_hash != package.package_hash
+                        || proof.destination_cell_id != package.destination_cell_id
+                        || Self::fencing_token_at(
+                            &self.destination_fencing_history,
+                            proof.assignment_generation,
+                        ) != Some(proof.fencing_token)
+                        || self.quarantine_receipt_hash.as_deref()
+                            != Some(proof.quarantine_receipt_hash.as_str())
+                })
             || self.source_export_proof.as_ref().is_some_and(|proof| {
                 proof.validate().is_err()
                     || proof.transfer_id != package.transfer_id
@@ -1085,8 +1432,10 @@ impl DraftGridDirectoryAuthorityV2 {
                     || proof.member_root != package.member_root
                     || proof.package_hash != package.package_hash
                     || proof.source_cell_id != package.source_cell_id
-                    || proof.assignment_generation < package.source_assignment_generation
-                    || proof.fencing_token < package.source_fencing_token
+                    || Self::fencing_token_at(
+                        &self.source_fencing_history,
+                        proof.assignment_generation,
+                    ) != Some(proof.fencing_token)
                     || self.quarantine_receipt_hash.as_deref()
                         != Some(proof.quarantine_receipt_hash.as_str())
                     || proof.ledger_vector != expected_ledger_vector
@@ -1098,8 +1447,10 @@ impl DraftGridDirectoryAuthorityV2 {
                     || proof.member_root != package.member_root
                     || proof.package_hash != package.package_hash
                     || proof.destination_cell_id != package.destination_cell_id
-                    || proof.assignment_generation < package.destination_assignment_generation
-                    || proof.fencing_token < package.destination_fencing_token
+                    || Self::fencing_token_at(
+                        &self.destination_fencing_history,
+                        proof.assignment_generation,
+                    ) != Some(proof.fencing_token)
                     || self.quarantine_receipt_hash.as_deref()
                         != Some(proof.quarantine_receipt_hash.as_str())
                     || self.source_export_proof_hash.as_deref()
@@ -1117,8 +1468,10 @@ impl DraftGridDirectoryAuthorityV2 {
                         || proof.member_root != package.member_root
                         || proof.package_hash != package.package_hash
                         || proof.destination_cell_id != package.destination_cell_id
-                        || proof.assignment_generation < package.destination_assignment_generation
-                        || proof.fencing_token < package.destination_fencing_token
+                        || Self::fencing_token_at(
+                            &self.destination_fencing_history,
+                            proof.assignment_generation,
+                        ) != Some(proof.fencing_token)
                         || self.quarantine_receipt_hash.as_deref()
                             != Some(proof.quarantine_receipt_hash.as_str())
                         || self.destination_import_proof.as_ref().is_none_or(|import| {
@@ -1138,15 +1491,60 @@ impl DraftGridDirectoryAuthorityV2 {
                         || proof.member_root != package.member_root
                         || proof.package_hash != package.package_hash
                         || proof.source_cell_id != package.source_cell_id
-                        || proof.assignment_generation < package.source_assignment_generation
-                        || proof.fencing_token < package.source_fencing_token
+                        || Self::fencing_token_at(
+                            &self.source_fencing_history,
+                            proof.assignment_generation,
+                        ) != Some(proof.fencing_token)
                 })
+            || self.source_abort_proof.as_ref().is_some_and(|proof| {
+                proof.validate().is_err()
+                    || proof.side != DraftGridTransferAbortSideV2::Source
+                    || proof.transfer_id != package.transfer_id
+                    || proof.member_root != package.member_root
+                    || proof.package_hash != package.package_hash
+                    || proof.cell_id != package.source_cell_id
+                    || Self::fencing_token_at(
+                        &self.source_fencing_history,
+                        proof.assignment_generation,
+                    ) != Some(proof.fencing_token)
+                    || proof
+                        .quarantine_receipt_hash
+                        .as_ref()
+                        .is_some_and(|receipt| {
+                            self.quarantine_receipt_hash.as_ref() != Some(receipt)
+                        })
+            })
+            || self.destination_abort_proof.as_ref().is_some_and(|proof| {
+                proof.validate().is_err()
+                    || proof.side != DraftGridTransferAbortSideV2::Destination
+                    || proof.transfer_id != package.transfer_id
+                    || proof.member_root != package.member_root
+                    || proof.package_hash != package.package_hash
+                    || proof.cell_id != package.destination_cell_id
+                    || Self::fencing_token_at(
+                        &self.destination_fencing_history,
+                        proof.assignment_generation,
+                    ) != Some(proof.fencing_token)
+                    || proof.quarantine_receipt_hash != self.quarantine_receipt_hash
+            })
         {
             return Err(DraftGridClosureError::Invalid(
                 "directory authority does not bind the exact grid package".into(),
             ));
         }
         Ok(())
+    }
+
+    pub(super) fn phase(&self) -> TransferPhase {
+        self.phase
+    }
+
+    pub(super) fn source_fencing_token(&self) -> u64 {
+        self.live_source_fencing_token
+    }
+
+    pub(super) fn destination_fencing_token(&self) -> u64 {
+        self.live_destination_fencing_token
     }
 }
 
@@ -1285,7 +1683,7 @@ impl DraftFrozenClosureIdsV2 {
 }
 
 impl DraftAggregateTransferLockV2 {
-    fn from_package(package: &DraftGridClosurePackageV2) -> Self {
+    fn from_package(package: &DraftGridClosurePackageV2, proof: &DraftGridPrepareProofV2) -> Self {
         Self {
             binding: DraftGridTransferBindingV2::from_package(package),
             frozen: DraftFrozenClosureIdsV2::from_package(package),
@@ -1294,7 +1692,21 @@ impl DraftAggregateTransferLockV2 {
             source_base_world_hash: package.source_world_hash.clone(),
             prepared_at_simulation_tick: package.prepared_at_simulation_tick,
             production_job_origins: package.production_job_origins.clone(),
+            prepare_event_sequence: proof.event_sequence,
+            prepare_event_hash: proof.event_hash.clone(),
+            prepare_event_payload_hash: proof.event_payload_hash.clone(),
+            prepare_mutation_witness_hash: proof.mutation_witness_hash.clone(),
         }
+    }
+
+    fn matches_package(&self, package: &DraftGridClosurePackageV2) -> bool {
+        self.binding == DraftGridTransferBindingV2::from_package(package)
+            && self.frozen == DraftFrozenClosureIdsV2::from_package(package)
+            && self.source_event_sequence == package.source_event_sequence
+            && self.source_event_hash == package.source_event_hash
+            && self.source_base_world_hash == package.source_world_hash
+            && self.prepared_at_simulation_tick == package.prepared_at_simulation_tick
+            && self.production_job_origins == package.production_job_origins
     }
 
     fn validate(&self) -> Result<(), DraftGridClosureError> {
@@ -1304,12 +1716,111 @@ impl DraftAggregateTransferLockV2 {
             || !valid_blake3_hex(&self.source_base_world_hash)
             || (self.source_event_sequence == 0 && !self.source_event_hash.is_empty())
             || (self.source_event_sequence > 0 && !valid_blake3_hex(&self.source_event_hash))
+            || self.source_event_sequence.checked_add(1) != Some(self.prepare_event_sequence)
+            || !valid_blake3_hex(&self.prepare_event_hash)
+            || !valid_blake3_hex(&self.prepare_event_payload_hash)
+            || !valid_blake3_hex(&self.prepare_mutation_witness_hash)
         {
             return Err(DraftGridClosureError::Invalid(
                 "aggregate lock frontier or root binding is invalid".into(),
             ));
         }
         Ok(())
+    }
+}
+
+impl DraftGridPrepareProofV2 {
+    fn new(
+        state: &DraftGridTransferCellStateV2,
+        package: &DraftGridClosurePackageV2,
+        authority: &DraftGridDirectoryAuthorityV2,
+        event: &ValidatedDraftGridEventContextV17,
+    ) -> Result<Self, DraftGridClosureError> {
+        let mut proof = Self {
+            transfer_id: package.transfer_id.clone(),
+            root_aggregate_id: package.root_aggregate_id.clone(),
+            member_root: package.member_root.clone(),
+            package_hash: package.package_hash.clone(),
+            source_cell_id: package.source_cell_id.clone(),
+            assignment_generation: authority.live_source_assignment_generation,
+            fencing_token: authority.live_source_fencing_token,
+            prior_event_sequence: state.base.event_sequence,
+            prior_event_hash: state.base.last_event_hash.clone(),
+            event_sequence: event.event_sequence,
+            event_hash: event.event_hash.clone(),
+            event_payload_hash: event.event_payload_hash.clone(),
+            prior_active_world_hash: state.calculate_active_world_hash()?,
+            resulting_active_world_hash: String::new(),
+            prepared_at_simulation_tick: package.prepared_at_simulation_tick,
+            mutation_witness_hash: String::new(),
+            proof_hash: String::new(),
+        };
+        proof.mutation_witness_hash = proof.calculate_mutation_hash()?;
+        Ok(proof)
+    }
+
+    fn seal_result(
+        &mut self,
+        state: &DraftGridTransferCellStateV2,
+    ) -> Result<(), DraftGridClosureError> {
+        self.resulting_active_world_hash = state.calculate_active_world_hash()?;
+        self.proof_hash = self.calculate_hash()?;
+        self.validate()
+    }
+
+    fn calculate_mutation_hash(&self) -> Result<String, DraftGridClosureError> {
+        let mut material = self.clone();
+        material.event_hash.clear();
+        material.resulting_active_world_hash.clear();
+        material.mutation_witness_hash.clear();
+        material.proof_hash.clear();
+        hash_json(PREPARE_WITNESS_HASH_DOMAIN, &material)
+    }
+
+    fn calculate_hash(&self) -> Result<String, DraftGridClosureError> {
+        let mut material = self.clone();
+        material.proof_hash.clear();
+        hash_json(PREPARE_PROOF_HASH_DOMAIN, &material)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seal_hashes_for_test(&mut self) -> Result<(), String> {
+        self.mutation_witness_hash = self
+            .calculate_mutation_hash()
+            .map_err(|source| source.to_string())?;
+        self.proof_hash = self.calculate_hash().map_err(|source| source.to_string())?;
+        self.validate().map_err(|source| source.to_string())
+    }
+
+    fn validate(&self) -> Result<(), DraftGridClosureError> {
+        if !valid_stable_id(&self.transfer_id)
+            || !valid_stable_id(&self.root_aggregate_id)
+            || !valid_blake3_hex(&self.member_root)
+            || !valid_blake3_hex(&self.package_hash)
+            || !valid_blake3_hex(&self.source_cell_id)
+            || self.assignment_generation == 0
+            || self.fencing_token == 0
+            || (self.prior_event_sequence == 0 && !self.prior_event_hash.is_empty())
+            || (self.prior_event_sequence > 0 && !valid_blake3_hex(&self.prior_event_hash))
+            || self.prior_event_sequence.checked_add(1) != Some(self.event_sequence)
+            || !valid_blake3_hex(&self.event_hash)
+            || !valid_blake3_hex(&self.event_payload_hash)
+            || !valid_blake3_hex(&self.prior_active_world_hash)
+            || !valid_blake3_hex(&self.resulting_active_world_hash)
+            || !valid_blake3_hex(&self.mutation_witness_hash)
+            || self.mutation_witness_hash != self.calculate_mutation_hash()?
+            || !valid_blake3_hex(&self.proof_hash)
+            || self.proof_hash != self.calculate_hash()?
+        {
+            return Err(DraftGridClosureError::Invalid(
+                "grid prepare proof is not canonical event-17 material".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_for_directory(&self) -> Result<(), String> {
+        self.validate().map_err(|source| source.to_string())
     }
 }
 
@@ -1349,6 +1860,7 @@ impl DraftAggregateTransferReservationV2 {
     fn from_receipt(
         package: &DraftGridClosurePackageV2,
         receipt: &DraftGridTransferQuarantineReceiptV2,
+        proof: &DraftGridQuarantineProofV2,
     ) -> Self {
         Self {
             binding: DraftGridTransferBindingV2::from_package(package),
@@ -1358,6 +1870,10 @@ impl DraftAggregateTransferReservationV2 {
             destination_base_world_hash: receipt.destination_base_world_hash.clone(),
             destination_draft_world_hash: receipt.destination_draft_world_hash.clone(),
             quarantined_at_unix_ms: receipt.quarantined_at_unix_ms,
+            quarantine_event_sequence: proof.event_sequence,
+            quarantine_event_hash: proof.event_hash.clone(),
+            quarantine_event_payload_hash: proof.event_payload_hash.clone(),
+            quarantine_mutation_witness_hash: proof.mutation_witness_hash.clone(),
         }
     }
 
@@ -1388,12 +1904,116 @@ impl DraftAggregateTransferReservationV2 {
             || self.quarantined_at_unix_ms == 0
             || !valid_blake3_hex(&self.destination_base_world_hash)
             || !valid_blake3_hex(&self.destination_draft_world_hash)
+            || self.destination_event_sequence.checked_add(1)
+                != Some(self.quarantine_event_sequence)
+            || !valid_blake3_hex(&self.quarantine_event_hash)
+            || !valid_blake3_hex(&self.quarantine_event_payload_hash)
+            || !valid_blake3_hex(&self.quarantine_mutation_witness_hash)
         {
             return Err(DraftGridClosureError::Invalid(
                 "aggregate reservation authority or closure is invalid".into(),
             ));
         }
         self.receipt().validate()
+    }
+}
+
+impl DraftGridQuarantineProofV2 {
+    fn new(
+        state: &DraftGridTransferCellStateV2,
+        package: &DraftGridClosurePackageV2,
+        authority: &DraftGridDirectoryAuthorityV2,
+        event: &ValidatedDraftGridEventContextV17,
+        receipt: &DraftGridTransferQuarantineReceiptV2,
+    ) -> Result<Self, DraftGridClosureError> {
+        let mut proof = Self {
+            transfer_id: package.transfer_id.clone(),
+            root_aggregate_id: package.root_aggregate_id.clone(),
+            member_root: package.member_root.clone(),
+            package_hash: package.package_hash.clone(),
+            destination_cell_id: package.destination_cell_id.clone(),
+            assignment_generation: authority.live_destination_assignment_generation,
+            fencing_token: authority.live_destination_fencing_token,
+            prior_event_sequence: state.base.event_sequence,
+            prior_event_hash: state.base.last_event_hash.clone(),
+            event_sequence: event.event_sequence,
+            event_hash: event.event_hash.clone(),
+            event_payload_hash: event.event_payload_hash.clone(),
+            prior_active_world_hash: state.calculate_active_world_hash()?,
+            resulting_active_world_hash: String::new(),
+            quarantine_receipt_hash: receipt.receipt_hash.clone(),
+            quarantined_at_unix_ms: event.occurred_at_unix_ms,
+            mutation_witness_hash: String::new(),
+            proof_hash: String::new(),
+        };
+        proof.mutation_witness_hash = proof.calculate_mutation_hash()?;
+        Ok(proof)
+    }
+
+    fn seal_result(
+        &mut self,
+        state: &DraftGridTransferCellStateV2,
+    ) -> Result<(), DraftGridClosureError> {
+        self.resulting_active_world_hash = state.calculate_active_world_hash()?;
+        self.proof_hash = self.calculate_hash()?;
+        self.validate()
+    }
+
+    fn calculate_mutation_hash(&self) -> Result<String, DraftGridClosureError> {
+        let mut material = self.clone();
+        material.event_hash.clear();
+        material.resulting_active_world_hash.clear();
+        material.mutation_witness_hash.clear();
+        material.proof_hash.clear();
+        hash_json(QUARANTINE_WITNESS_HASH_DOMAIN, &material)
+    }
+
+    fn calculate_hash(&self) -> Result<String, DraftGridClosureError> {
+        let mut material = self.clone();
+        material.proof_hash.clear();
+        hash_json(QUARANTINE_PROOF_HASH_DOMAIN, &material)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seal_hashes_for_test(&mut self) -> Result<(), String> {
+        self.mutation_witness_hash = self
+            .calculate_mutation_hash()
+            .map_err(|source| source.to_string())?;
+        self.proof_hash = self.calculate_hash().map_err(|source| source.to_string())?;
+        self.validate().map_err(|source| source.to_string())
+    }
+
+    fn validate(&self) -> Result<(), DraftGridClosureError> {
+        if !valid_stable_id(&self.transfer_id)
+            || !valid_stable_id(&self.root_aggregate_id)
+            || !valid_blake3_hex(&self.member_root)
+            || !valid_blake3_hex(&self.package_hash)
+            || !valid_blake3_hex(&self.destination_cell_id)
+            || self.assignment_generation == 0
+            || self.fencing_token == 0
+            || (self.prior_event_sequence == 0 && !self.prior_event_hash.is_empty())
+            || (self.prior_event_sequence > 0 && !valid_blake3_hex(&self.prior_event_hash))
+            || self.prior_event_sequence.checked_add(1) != Some(self.event_sequence)
+            || !valid_blake3_hex(&self.event_hash)
+            || !valid_blake3_hex(&self.event_payload_hash)
+            || !valid_blake3_hex(&self.prior_active_world_hash)
+            || !valid_blake3_hex(&self.resulting_active_world_hash)
+            || !valid_blake3_hex(&self.quarantine_receipt_hash)
+            || self.quarantined_at_unix_ms == 0
+            || !valid_blake3_hex(&self.mutation_witness_hash)
+            || self.mutation_witness_hash != self.calculate_mutation_hash()?
+            || !valid_blake3_hex(&self.proof_hash)
+            || self.proof_hash != self.calculate_hash()?
+        {
+            return Err(DraftGridClosureError::Invalid(
+                "grid quarantine proof is not canonical event-17 material".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_for_directory(&self) -> Result<(), String> {
+        self.validate().map_err(|source| source.to_string())
     }
 }
 
@@ -2769,9 +3389,10 @@ impl DraftGridTransferAbortWitnessV2 {
         resulting_state: &DraftGridTransferCellStateV2,
         package: &DraftGridClosurePackageV2,
         side: DraftGridTransferAbortSideV2,
-        removed_authority: bool,
+        removed_lock: Option<DraftAggregateTransferLockV2>,
+        removed_reservation: Option<DraftAggregateTransferReservationV2>,
         authority: &DraftGridDirectoryAuthorityV2,
-        aborted_at_unix_ms: u64,
+        event: &ValidatedDraftGridEventContextV17,
     ) -> Result<Self, DraftGridClosureError> {
         let (cell_id, assignment_generation, historical_fencing_token, live_fencing_token) =
             match side {
@@ -2788,41 +3409,58 @@ impl DraftGridTransferAbortWitnessV2 {
                     authority.live_destination_fencing_token,
                 ),
             };
+        let quarantine_receipt_hash = removed_reservation
+            .as_ref()
+            .map(|reservation| reservation.receipt_hash.clone())
+            .or_else(|| authority.quarantine_receipt_hash.clone());
         let mut witness = Self {
             schema_version: DRAFT_GRID_TRANSFER_RECEIPT_SCHEMA_VERSION,
             binding: DraftGridTransferBindingV2::from_package(package),
             side,
-            removed_authority,
-            quarantine_receipt_hash: authority.quarantine_receipt_hash.clone(),
+            removed_authority: removed_lock.is_some() || removed_reservation.is_some(),
+            quarantine_receipt_hash,
             cell_id,
             assignment_generation,
             historical_fencing_token,
             live_fencing_token,
             prior_event_sequence: prior_state.base.event_sequence,
             prior_event_hash: prior_state.base.last_event_hash.clone(),
-            cleanup_event_sequence: prior_state.base.event_sequence.checked_add(1).ok_or_else(
-                || {
-                    DraftGridClosureError::Unsupported(
-                        "abort cleanup event sequence exhausted".into(),
-                    )
-                },
-            )?,
-            cleanup_event_hash: String::new(),
+            cleanup_event_sequence: event.event_sequence,
+            cleanup_event_hash: event.event_hash.clone(),
+            cleanup_event_payload_hash: event.event_payload_hash.clone(),
             base_world_hash: prior_state.base.state_hash(),
             prior_draft_world_hash: prior_state.state_hash.clone(),
             resulting_draft_world_hash: resulting_state.calculate_active_world_hash()?,
-            aborted_at_unix_ms,
+            cleanup_simulation_tick: resulting_state.base.simulation_tick,
+            aborted_at_unix_ms: event.occurred_at_unix_ms,
+            removed_lock,
+            removed_reservation,
+            mutation_witness_hash: String::new(),
+            cleanup_proof_hash: String::new(),
             witness_hash: String::new(),
         };
+        witness.mutation_witness_hash = witness.calculate_mutation_hash()?;
         witness.witness_hash = witness.calculate_hash()?;
-        witness.cleanup_event_hash = witness.cleanup_proof().calculate_event_hash()?;
+        let mut cleanup = witness.cleanup_proof();
+        cleanup.proof_hash = cleanup.calculate_hash()?;
+        witness.cleanup_proof_hash = cleanup.proof_hash;
         witness.validate()?;
         Ok(witness)
     }
 
-    fn calculate_hash(&self) -> Result<String, DraftGridClosureError> {
+    fn calculate_mutation_hash(&self) -> Result<String, DraftGridClosureError> {
         let mut material = self.clone();
         material.cleanup_event_hash.clear();
+        material.resulting_draft_world_hash.clear();
+        material.mutation_witness_hash.clear();
+        material.cleanup_proof_hash.clear();
+        material.witness_hash.clear();
+        hash_json(ABORT_WITNESS_HASH_DOMAIN, &material)
+    }
+
+    fn calculate_hash(&self) -> Result<String, DraftGridClosureError> {
+        let mut material = self.clone();
+        material.cleanup_proof_hash.clear();
         material.witness_hash.clear();
         hash_json(ABORT_WITNESS_HASH_DOMAIN, &material)
     }
@@ -2850,16 +3488,42 @@ impl DraftGridTransferAbortWitnessV2 {
             || (self.prior_event_sequence > 0 && !valid_blake3_hex(&self.prior_event_hash))
             || self.prior_event_sequence.checked_add(1) != Some(self.cleanup_event_sequence)
             || !valid_blake3_hex(&self.cleanup_event_hash)
+            || !valid_blake3_hex(&self.cleanup_event_payload_hash)
             || !valid_blake3_hex(&self.base_world_hash)
             || !valid_blake3_hex(&self.prior_draft_world_hash)
             || !valid_blake3_hex(&self.resulting_draft_world_hash)
             || self.aborted_at_unix_ms == 0
+            || !valid_blake3_hex(&self.mutation_witness_hash)
+            || self.mutation_witness_hash != self.calculate_mutation_hash()?
+            || !valid_blake3_hex(&self.cleanup_proof_hash)
             || self
                 .quarantine_receipt_hash
                 .as_ref()
                 .is_some_and(|hash| !valid_blake3_hex(hash))
             || !valid_blake3_hex(&self.witness_hash)
             || self.witness_hash != self.calculate_hash()?
+            || self.removed_authority
+                != (self.removed_lock.is_some() || self.removed_reservation.is_some())
+            || match self.side {
+                DraftGridTransferAbortSideV2::Source => {
+                    self.removed_reservation.is_some()
+                        || self.removed_lock.as_ref().is_some_and(|lock| {
+                            lock.binding != self.binding
+                                || lock.binding.root_aggregate_id != self.binding.root_aggregate_id
+                        })
+                }
+                DraftGridTransferAbortSideV2::Destination => {
+                    self.removed_lock.is_some()
+                        || self
+                            .removed_reservation
+                            .as_ref()
+                            .is_some_and(|reservation| {
+                                reservation.binding != self.binding
+                                    || self.quarantine_receipt_hash.as_deref()
+                                        != Some(reservation.receipt_hash.as_str())
+                            })
+                }
+            }
         {
             return Err(DraftGridClosureError::Invalid(
                 "grid abort witness identity, frontier, or hash is invalid".into(),
@@ -2882,10 +3546,17 @@ impl DraftGridTransferAbortWitnessV2 {
             fencing_token: self.live_fencing_token,
             event_sequence: self.cleanup_event_sequence,
             event_hash: self.cleanup_event_hash.clone(),
+            event_payload_hash: self.cleanup_event_payload_hash.clone(),
+            prior_event_sequence: self.prior_event_sequence,
+            prior_event_hash: self.prior_event_hash.clone(),
+            prior_draft_world_hash: self.prior_draft_world_hash.clone(),
             resulting_draft_world_hash: self.resulting_draft_world_hash.clone(),
+            trusted_time_unix_ms: self.aborted_at_unix_ms,
+            mutation_witness_hash: self.mutation_witness_hash.clone(),
             quarantine_receipt_hash: self.quarantine_receipt_hash.clone(),
             abort_witness_hash: self.witness_hash.clone(),
             removed_authority: self.removed_authority,
+            proof_hash: self.cleanup_proof_hash.clone(),
         }
     }
 
@@ -2896,9 +3567,18 @@ impl DraftGridTransferAbortWitnessV2 {
         side: DraftGridTransferAbortSideV2,
     ) -> Result<(), DraftGridClosureError> {
         self.validate()?;
+        let receipt_matches = match side {
+            DraftGridTransferAbortSideV2::Source => self
+                .quarantine_receipt_hash
+                .as_ref()
+                .is_none_or(|receipt| authority.quarantine_receipt_hash.as_ref() == Some(receipt)),
+            DraftGridTransferAbortSideV2::Destination => {
+                self.quarantine_receipt_hash == authority.quarantine_receipt_hash
+            }
+        };
         if self.binding != DraftGridTransferBindingV2::from_package(package)
             || self.side != side
-            || self.quarantine_receipt_hash != authority.quarantine_receipt_hash
+            || !receipt_matches
         {
             return Err(DraftGridClosureError::Changed(
                 "abort retry changed its package, side, or quarantine authority".into(),
@@ -2909,6 +3589,12 @@ impl DraftGridTransferAbortWitnessV2 {
 }
 
 impl DraftGridAbortCleanupProofV2 {
+    fn calculate_hash(&self) -> Result<String, DraftGridClosureError> {
+        let mut material = self.clone();
+        material.proof_hash.clear();
+        hash_json(ABORT_PROOF_HASH_DOMAIN, &material)
+    }
+
     fn calculate_event_hash(&self) -> Result<String, DraftGridClosureError> {
         let mut material = self.clone();
         material.event_hash.clear();
@@ -2918,9 +3604,11 @@ impl DraftGridAbortCleanupProofV2 {
     #[cfg(test)]
     pub(crate) fn seal_event_hash(&mut self) -> Result<(), String> {
         self.event_hash.clear();
+        self.proof_hash.clear();
         self.event_hash = self
             .calculate_event_hash()
             .map_err(|source| source.to_string())?;
+        self.proof_hash = self.calculate_hash().map_err(|source| source.to_string())?;
         self.validate()
     }
 
@@ -2933,16 +3621,21 @@ impl DraftGridAbortCleanupProofV2 {
             || self.fencing_token == 0
             || self.event_sequence == 0
             || !valid_blake3_hex(&self.event_hash)
-            || self.event_hash
-                != self
-                    .calculate_event_hash()
-                    .map_err(|source| source.to_string())?
+            || !valid_blake3_hex(&self.event_payload_hash)
+            || (self.prior_event_sequence == 0 && !self.prior_event_hash.is_empty())
+            || (self.prior_event_sequence > 0 && !valid_blake3_hex(&self.prior_event_hash))
+            || self.prior_event_sequence.checked_add(1) != Some(self.event_sequence)
+            || !valid_blake3_hex(&self.prior_draft_world_hash)
             || !valid_blake3_hex(&self.resulting_draft_world_hash)
+            || self.trusted_time_unix_ms == 0
+            || !valid_blake3_hex(&self.mutation_witness_hash)
             || self
                 .quarantine_receipt_hash
                 .as_ref()
                 .is_some_and(|hash| !valid_blake3_hex(hash))
             || !valid_blake3_hex(&self.abort_witness_hash)
+            || !valid_blake3_hex(&self.proof_hash)
+            || self.proof_hash != self.calculate_hash().map_err(|source| source.to_string())?
         {
             return Err("grid abort cleanup proof is not canonical fenced material".into());
         }
@@ -2951,6 +3644,18 @@ impl DraftGridAbortCleanupProofV2 {
 }
 
 impl DraftGridTransferCellStateV2 {
+    pub(super) fn base(&self) -> &WorldState {
+        &self.base
+    }
+
+    #[cfg(test)]
+    pub(super) fn advance_test_fence(&mut self) -> Result<(), DraftGridClosureError> {
+        self.base.fencing_token = self.base.fencing_token.checked_add(1).ok_or_else(|| {
+            DraftGridClosureError::Unsupported("test successor fence exhausted".into())
+        })?;
+        self.seal()
+    }
+
     fn new(base: WorldState) -> Result<Self, DraftGridClosureError> {
         Self::new_with_production_origins(base, BTreeMap::new())
     }
@@ -2967,6 +3672,8 @@ impl DraftGridTransferCellStateV2 {
             aggregate_reservations: BTreeMap::new(),
             pending_imports: BTreeMap::new(),
             imported_production_eligibilities: BTreeMap::new(),
+            committed_prepares: BTreeMap::new(),
+            committed_quarantines: BTreeMap::new(),
             committed_exports: BTreeMap::new(),
             committed_imports: BTreeMap::new(),
             committed_activations: BTreeMap::new(),
@@ -2989,11 +3696,16 @@ impl DraftGridTransferCellStateV2 {
     }
 
     fn calculate_active_world_hash(&self) -> Result<String, DraftGridClosureError> {
+        // The fencing token is an operational lease, not gameplay state. A
+        // successor worker must be able to verify the same active-world root
+        // while presenting a newer directory fence.
+        let mut canonical_base = self.base.clone();
+        canonical_base.fencing_token = 0;
         hash_json(
             DRAFT_ACTIVE_WORLD_HASH_DOMAIN,
             &DraftActiveWorldHashMaterialV2 {
                 schema_version: self.schema_version,
-                base: &self.base,
+                base: &canonical_base,
                 production_job_origins: &self.production_job_origins,
                 aggregate_locks: &self.aggregate_locks,
                 aggregate_reservations: &self.aggregate_reservations,
@@ -3073,6 +3785,8 @@ impl DraftGridTransferCellStateV2 {
             || self.aggregate_locks.len() > MAX_DRAFT_TRANSFERS_PER_CELL
             || self.aggregate_reservations.len() > MAX_DRAFT_TRANSFERS_PER_CELL
             || self.pending_imports.len() > MAX_DRAFT_TRANSFERS_PER_CELL
+            || self.committed_prepares.len() > MAX_DRAFT_TRANSFERS_PER_CELL
+            || self.committed_quarantines.len() > MAX_DRAFT_TRANSFERS_PER_CELL
             || self.committed_activations.len() > MAX_DRAFT_TRANSFERS_PER_CELL
             || self.source_finalization_tombstones.len() > MAX_DRAFT_TRANSFERS_PER_CELL
             || self.committed_finalizations.len() > MAX_DRAFT_TRANSFERS_PER_CELL
@@ -3100,11 +3814,90 @@ impl DraftGridTransferCellStateV2 {
 
         let mut transfer_ids = BTreeSet::new();
         let mut frozen_sets = Vec::new();
+        for (transfer_id, proof) in &self.committed_prepares {
+            proof.validate()?;
+            let at_prepare_frontier = self.base.event_sequence == proof.event_sequence;
+            let prior_matches = if at_prepare_frontier {
+                let mut prior = self.clone();
+                prior.committed_prepares.remove(transfer_id);
+                prior.aggregate_locks.remove(&proof.root_aggregate_id);
+                prior.base.event_sequence = proof.prior_event_sequence;
+                prior
+                    .base
+                    .last_event_hash
+                    .clone_from(&proof.prior_event_hash);
+                prior.base.fencing_token = proof.fencing_token;
+                prior.calculate_active_world_hash()? == proof.prior_active_world_hash
+            } else {
+                true
+            };
+            if transfer_id != &proof.transfer_id
+                || proof.source_cell_id != self.base.cell_id
+                || self.base.fencing_token < proof.fencing_token
+                || self.base.event_sequence < proof.event_sequence
+                || (at_prepare_frontier && self.base.last_event_hash != proof.event_hash)
+                || (at_prepare_frontier
+                    && self.calculate_active_world_hash()? != proof.resulting_active_world_hash)
+                || !prior_matches
+            {
+                return Err(DraftGridClosureError::Invalid(
+                    "historical grid prepare proof does not bind one event frontier".into(),
+                ));
+            }
+        }
+        for (transfer_id, proof) in &self.committed_quarantines {
+            proof.validate()?;
+            let reservation = self.aggregate_reservations.get(transfer_id);
+            let at_quarantine_frontier = self.base.event_sequence == proof.event_sequence;
+            let prior_matches = if at_quarantine_frontier {
+                let mut prior = self.clone();
+                prior.committed_quarantines.remove(transfer_id);
+                prior.aggregate_reservations.remove(transfer_id);
+                prior.base.event_sequence = proof.prior_event_sequence;
+                prior
+                    .base
+                    .last_event_hash
+                    .clone_from(&proof.prior_event_hash);
+                let receipt = reservation.map(DraftAggregateTransferReservationV2::receipt);
+                prior.calculate_active_world_hash()? == proof.prior_active_world_hash
+                    && receipt.as_ref().is_some_and(|receipt| {
+                        receipt.receipt_hash == proof.quarantine_receipt_hash
+                            && receipt.destination_base_world_hash == prior.base.state_hash()
+                            && prior.calculate_hash().ok().as_ref()
+                                == Some(&receipt.destination_draft_world_hash)
+                    })
+            } else {
+                true
+            };
+            if transfer_id != &proof.transfer_id
+                || proof.destination_cell_id != self.base.cell_id
+                || self.base.fencing_token < proof.fencing_token
+                || self.base.event_sequence < proof.event_sequence
+                || (at_quarantine_frontier && self.base.last_event_hash != proof.event_hash)
+                || (at_quarantine_frontier
+                    && self.calculate_active_world_hash()? != proof.resulting_active_world_hash)
+                || !prior_matches
+            {
+                return Err(DraftGridClosureError::Invalid(
+                    "historical grid quarantine proof does not bind one event frontier".into(),
+                ));
+            }
+        }
         for (root_id, lock) in &self.aggregate_locks {
             lock.validate()?;
+            let prepare = self.committed_prepares.get(&lock.binding.transfer_id);
             if root_id != &lock.binding.root_aggregate_id
                 || lock.binding.source_cell_id != self.base.cell_id
                 || self.base.fencing_token < lock.binding.source_fencing_token
+                || prepare.is_none_or(|proof| {
+                    proof.root_aggregate_id != lock.binding.root_aggregate_id
+                        || proof.member_root != lock.binding.member_root
+                        || proof.package_hash != lock.binding.package_hash
+                        || proof.event_sequence != lock.prepare_event_sequence
+                        || proof.event_hash != lock.prepare_event_hash
+                        || proof.event_payload_hash != lock.prepare_event_payload_hash
+                        || proof.mutation_witness_hash != lock.prepare_mutation_witness_hash
+                })
                 || !transfer_ids.insert(lock.binding.transfer_id.as_str())
                 || !source_lock_matches(&self.base, lock)
                 || active_v1_transfer_conflicts(&self.base, &lock.binding.transfer_id, &lock.frozen)
@@ -3117,9 +3910,22 @@ impl DraftGridTransferCellStateV2 {
         }
         for (transfer_id, reservation) in &self.aggregate_reservations {
             reservation.validate()?;
+            let quarantine = self.committed_quarantines.get(transfer_id);
             if transfer_id != &reservation.binding.transfer_id
                 || reservation.binding.destination_cell_id != self.base.cell_id
                 || self.base.fencing_token < reservation.binding.destination_fencing_token
+                || quarantine.is_none_or(|proof| {
+                    proof.root_aggregate_id != reservation.binding.root_aggregate_id
+                        || proof.member_root != reservation.binding.member_root
+                        || proof.package_hash != reservation.binding.package_hash
+                        || proof.quarantine_receipt_hash != reservation.receipt_hash
+                        || proof.event_sequence != reservation.quarantine_event_sequence
+                        || proof.event_hash != reservation.quarantine_event_hash
+                        || proof.event_payload_hash != reservation.quarantine_event_payload_hash
+                        || proof.mutation_witness_hash
+                            != reservation.quarantine_mutation_witness_hash
+                        || proof.quarantined_at_unix_ms != reservation.quarantined_at_unix_ms
+                })
                 || !transfer_ids.insert(transfer_id)
                 || !frozen_closure_is_absent(&self.base, &reservation.frozen)
                 || active_v1_transfer_conflicts(
@@ -3685,9 +4491,41 @@ impl DraftGridTransferCellStateV2 {
                 .cleanup_proof()
                 .validate()
                 .map_err(DraftGridClosureError::Invalid)?;
+            let at_abort_frontier = self.base.event_sequence == witness.cleanup_event_sequence
+                && self.base.simulation_tick == witness.cleanup_simulation_tick;
+            let prior_matches = if at_abort_frontier {
+                let mut prior = self.clone();
+                prior.abort_witnesses.remove(transfer_id);
+                if let Some(lock) = &witness.removed_lock {
+                    prior
+                        .aggregate_locks
+                        .insert(lock.binding.root_aggregate_id.clone(), lock.clone());
+                }
+                if let Some(reservation) = &witness.removed_reservation {
+                    prior
+                        .aggregate_reservations
+                        .insert(reservation.binding.transfer_id.clone(), reservation.clone());
+                }
+                prior.base.event_sequence = witness.prior_event_sequence;
+                prior
+                    .base
+                    .last_event_hash
+                    .clone_from(&witness.prior_event_hash);
+                prior.base.fencing_token = witness.live_fencing_token;
+                prior.base.state_hash() == witness.base_world_hash
+                    && prior.calculate_hash()? == witness.prior_draft_world_hash
+            } else {
+                true
+            };
             if transfer_id != &witness.binding.transfer_id
                 || witness.cell_id != self.base.cell_id
                 || self.base.fencing_token < witness.live_fencing_token
+                || self.base.simulation_tick < witness.cleanup_simulation_tick
+                || self.base.event_sequence < witness.cleanup_event_sequence
+                || (at_abort_frontier && self.base.last_event_hash != witness.cleanup_event_hash)
+                || (at_abort_frontier
+                    && self.calculate_active_world_hash()? != witness.resulting_draft_world_hash)
+                || !prior_matches
                 || !transfer_ids.insert(transfer_id)
                 || active_v1_transfer_id_conflicts(&self.base, &witness.binding.transfer_id)
             {
@@ -3815,6 +4653,8 @@ fn draft_transfer_count(state: &DraftGridTransferCellStateV2) -> usize {
         .map(|lock| lock.binding.transfer_id.as_str())
         .chain(state.aggregate_reservations.keys().map(String::as_str))
         .chain(state.pending_imports.keys().map(String::as_str))
+        .chain(state.committed_prepares.keys().map(String::as_str))
+        .chain(state.committed_quarantines.keys().map(String::as_str))
         .chain(state.committed_exports.keys().map(String::as_str))
         .chain(state.committed_imports.keys().map(String::as_str))
         .chain(state.committed_activations.keys().map(String::as_str))
@@ -3955,6 +4795,23 @@ fn locked_closure_matches(world: &WorldState, lock: &DraftAggregateTransferLockV
 }
 
 fn source_lock_matches(world: &WorldState, lock: &DraftAggregateTransferLockV2) -> bool {
+    let at_prepare_frontier = world.event_sequence == lock.prepare_event_sequence;
+    let capture_world_matches = if at_prepare_frontier {
+        let mut capture = world.clone();
+        capture.event_sequence = lock.source_event_sequence;
+        capture.last_event_hash.clone_from(&lock.source_event_hash);
+        lock.source_base_world_hash == capture.state_hash()
+    } else {
+        true
+    };
+    world.event_sequence >= lock.prepare_event_sequence
+        && (!at_prepare_frontier || world.last_event_hash == lock.prepare_event_hash)
+        && capture_world_matches
+        && lock.prepared_at_simulation_tick == world.simulation_tick
+        && locked_closure_matches(world, lock)
+}
+
+fn source_capture_matches(world: &WorldState, lock: &DraftAggregateTransferLockV2) -> bool {
     lock.source_event_sequence == world.event_sequence
         && lock.source_event_hash == world.last_event_hash
         && lock.source_base_world_hash == world.state_hash()
@@ -4118,24 +4975,26 @@ fn insert_grid_transfer_witness(
     Ok(())
 }
 
-fn stage_prepared_grid_lock_v2(
+pub(super) fn stage_prepared_grid_event_v17(
     state: &DraftGridTransferCellStateV2,
     package: &DraftGridClosurePackageV2,
     authority: &DraftGridDirectoryAuthorityV2,
-) -> Result<DraftGridTransferCellStateV2, DraftGridClosureError> {
+    event: &ValidatedDraftGridEventContextV17,
+) -> Result<(DraftGridTransferCellStateV2, DraftGridPrepareProofV2), DraftGridClosureError> {
     state.validate()?;
     package.validate_wire()?;
     authority.validate_package(package)?;
-    if !matches!(
-        authority.phase,
-        TransferPhase::Prepared | TransferPhase::Quarantined
-    ) || (authority.phase == TransferPhase::Quarantined
-        && (!authority.has_proof(DraftGridDirectoryProofKindV2::SourcePrepare)
-            || !authority.has_proof(DraftGridDirectoryProofKindV2::DestinationQuarantine)
-            || authority.quarantine_receipt_hash.is_none()))
+    event.require_payload(&DraftGridEventPayloadV17::GridTransferPrepared {
+        package: package.clone(),
+        authority: authority.clone(),
+    })?;
+    if authority.phase != TransferPhase::Prepared
+        || authority.has_proof(DraftGridDirectoryProofKindV2::SourcePrepare)
+        || authority.has_proof(DraftGridDirectoryProofKindV2::DestinationQuarantine)
+        || authority.quarantine_receipt_hash.is_some()
     {
         return Err(DraftGridClosureError::Invalid(
-            "directory authority is not in a lockable precommit phase".into(),
+            "directory authority is not awaiting the first source prepare event".into(),
         ));
     }
     if state.base.cell_id != package.source_cell_id
@@ -4154,16 +5013,25 @@ fn stage_prepared_grid_lock_v2(
             "source draft cell does not own the package fence and authoritative job origins".into(),
         ));
     }
-    let expected = DraftAggregateTransferLockV2::from_package(package);
     if let Some(existing) = state.aggregate_locks.get(&package.root_aggregate_id) {
-        if existing == &expected {
-            return Ok(state.clone());
-        }
+        let _ = existing;
         return Err(DraftGridClosureError::Changed(
-            "grid root is already locked by different transfer material".into(),
+            "source prepare apply requires its exact predecessor; reconcile committed state separately"
+                .into(),
         ));
     }
-    if !source_lock_matches(&state.base, &expected) {
+    if event.event_sequence != state.base.event_sequence.checked_add(1).unwrap_or(0)
+        || event.previous_event_hash != state.base.last_event_hash
+        || event.authority_fencing_token != state.base.fencing_token
+        || event.authority_fencing_token != authority.live_source_fencing_token
+    {
+        return Err(DraftGridClosureError::Invalid(
+            "grid prepare event-17 context does not follow the live source frontier".into(),
+        ));
+    }
+    let mut proof = DraftGridPrepareProofV2::new(state, package, authority, event)?;
+    let expected = DraftAggregateTransferLockV2::from_package(package, &proof);
+    if !source_capture_matches(&state.base, &expected) {
         return Err(DraftGridClosureError::Changed(
             "source closure changed before the aggregate lock became durable".into(),
         ));
@@ -4173,7 +5041,11 @@ fn stage_prepared_grid_lock_v2(
     }) || state.aggregate_reservations.values().any(|reservation| {
         reservation.binding.transfer_id == package.transfer_id
             || reservation.frozen.overlaps(&expected.frozen)
-    }) || state.committed_exports.contains_key(&package.transfer_id)
+    }) || state.committed_prepares.contains_key(&package.transfer_id)
+        || state
+            .committed_quarantines
+            .contains_key(&package.transfer_id)
+        || state.committed_exports.contains_key(&package.transfer_id)
         || state.abort_witnesses.contains_key(&package.transfer_id)
     {
         return Err(DraftGridClosureError::Changed(
@@ -4183,25 +5055,137 @@ fn stage_prepared_grid_lock_v2(
     let mut next = state.clone();
     next.aggregate_locks
         .insert(package.root_aggregate_id.clone(), expected);
+    next.base.event_sequence = event.event_sequence;
+    next.base.last_event_hash.clone_from(&event.event_hash);
+    proof.seal_result(&next)?;
+    next.committed_prepares
+        .insert(package.transfer_id.clone(), proof.clone());
     next.seal()?;
-    Ok(next)
+    Ok((next, proof))
 }
 
-fn stage_grid_quarantine_v2(
+pub(super) fn reconcile_prepared_grid_v2(
     state: &DraftGridTransferCellStateV2,
-    trusted_now_unix_ms: u64,
     package: &DraftGridClosurePackageV2,
     authority: &DraftGridDirectoryAuthorityV2,
+) -> Result<(DraftGridTransferCellStateV2, DraftGridPrepareProofV2), DraftGridClosureError> {
+    state.validate()?;
+    package.validate_wire()?;
+    authority.validate_package(package)?;
+    if state.base.cell_id != package.source_cell_id
+        || state.base.fencing_token != authority.live_source_fencing_token
+        || !matches!(
+            authority.phase,
+            TransferPhase::Prepared | TransferPhase::Quarantined | TransferPhase::Committed
+        )
+    {
+        return Err(DraftGridClosureError::Invalid(
+            "source prepare reconciliation lacks current source authority".into(),
+        ));
+    }
+    if matches!(
+        authority.phase,
+        TransferPhase::Quarantined | TransferPhase::Committed
+    ) && (!authority.has_proof(DraftGridDirectoryProofKindV2::SourcePrepare)
+        || !authority.has_proof(DraftGridDirectoryProofKindV2::DestinationQuarantine)
+        || authority.quarantine_receipt_hash.is_none())
+    {
+        return Err(DraftGridClosureError::Invalid(
+            "later prepare reconciliation lacks durable precommit directory proofs".into(),
+        ));
+    }
+    let lock = state
+        .aggregate_locks
+        .get(&package.root_aggregate_id)
+        .filter(|lock| lock.matches_package(package))
+        .ok_or_else(|| {
+            DraftGridClosureError::Changed(
+                "source prepare reconciliation cannot find the exact resident lock".into(),
+            )
+        })?;
+    let proof = state
+        .committed_prepares
+        .get(&package.transfer_id)
+        .filter(|proof| {
+            proof.root_aggregate_id == lock.binding.root_aggregate_id
+                && proof.member_root == lock.binding.member_root
+                && proof.package_hash == lock.binding.package_hash
+                && proof.event_sequence == lock.prepare_event_sequence
+                && proof.event_hash == lock.prepare_event_hash
+                && proof.event_payload_hash == lock.prepare_event_payload_hash
+                && proof.mutation_witness_hash == lock.prepare_mutation_witness_hash
+        })
+        .ok_or_else(|| {
+            DraftGridClosureError::Changed(
+                "source prepare reconciliation cannot find the exact canonical proof".into(),
+            )
+        })?;
+    proof.validate()?;
+    if authority
+        .source_prepare_proof
+        .as_ref()
+        .is_some_and(|directory_proof| directory_proof != proof)
+    {
+        return Err(DraftGridClosureError::Changed(
+            "source prepare reconciliation conflicts with the directory's canonical proof".into(),
+        ));
+    }
+    Ok((state.clone(), proof.clone()))
+}
+
+#[cfg(test)]
+fn stage_prepared_grid_lock_v2(
+    state: &DraftGridTransferCellStateV2,
+    package: &DraftGridClosurePackageV2,
+    authority: &DraftGridDirectoryAuthorityV2,
+) -> Result<DraftGridTransferCellStateV2, DraftGridClosureError> {
+    state.validate()?;
+    package.validate_wire()?;
+    authority.validate_package(package)?;
+    if state.base.fencing_token != authority.live_source_fencing_token {
+        return Err(DraftGridClosureError::Invalid(
+            "test prepare caller does not own the live source fence".into(),
+        ));
+    }
+    if state
+        .aggregate_locks
+        .contains_key(&package.root_aggregate_id)
+    {
+        return reconcile_prepared_grid_v2(state, package, authority).map(|(state, _)| state);
+    }
+    let event = DraftCanonicalGridEventV17::new_system(
+        state,
+        format!("prepare-{}", package.transfer_id),
+        1_800_000_000_000,
+        DraftGridEventPayloadV17::GridTransferPrepared {
+            package: package.clone(),
+            authority: authority.clone(),
+        },
+    )?;
+    let context = event.validate_for_state(state)?;
+    stage_prepared_grid_event_v17(state, package, authority, &context).map(|(next, _)| next)
+}
+
+pub(super) fn stage_grid_quarantine_event_v17(
+    state: &DraftGridTransferCellStateV2,
+    package: &DraftGridClosurePackageV2,
+    authority: &DraftGridDirectoryAuthorityV2,
+    event: &ValidatedDraftGridEventContextV17,
 ) -> Result<
     (
         DraftGridTransferCellStateV2,
         DraftGridTransferQuarantineReceiptV2,
+        DraftGridQuarantineProofV2,
     ),
     DraftGridClosureError,
 > {
     state.validate()?;
     package.validate_wire()?;
     authority.validate_package(package)?;
+    event.require_payload(&DraftGridEventPayloadV17::GridTransferQuarantined {
+        package: package.clone(),
+        authority: authority.clone(),
+    })?;
     if state.base.cell_id != package.destination_cell_id
         || state.base.fencing_token != authority.live_destination_fencing_token
     {
@@ -4210,44 +5194,29 @@ fn stage_grid_quarantine_v2(
         ));
     }
     if let Some(existing) = state.aggregate_reservations.get(&package.transfer_id) {
-        let receipt = existing.receipt();
-        if existing.binding != DraftGridTransferBindingV2::from_package(package)
-            || existing.frozen != DraftFrozenClosureIdsV2::from_package(package)
-        {
-            return Err(DraftGridClosureError::Changed(
-                "quarantine retry changed immutable package or closure material".into(),
-            ));
-        }
-        receipt.validate()?;
-        let phase_matches = match authority.phase {
-            TransferPhase::Prepared => {
-                authority.has_proof(DraftGridDirectoryProofKindV2::SourcePrepare)
-                    && !authority.has_proof(DraftGridDirectoryProofKindV2::DestinationQuarantine)
-                    && authority.quarantine_receipt_hash.is_none()
-            }
-            TransferPhase::Quarantined => {
-                authority.has_proof(DraftGridDirectoryProofKindV2::SourcePrepare)
-                    && authority.has_proof(DraftGridDirectoryProofKindV2::DestinationQuarantine)
-                    && authority.quarantine_receipt_hash.as_deref()
-                        == Some(receipt.receipt_hash.as_str())
-            }
-            _ => false,
-        };
-        if !phase_matches {
-            return Err(DraftGridClosureError::Invalid(
-                "quarantine retry lacks the matching durable directory authority".into(),
-            ));
-        }
-        return Ok((state.clone(), receipt));
+        let _ = existing;
+        return Err(DraftGridClosureError::Changed(
+            "destination quarantine apply requires its exact predecessor; reconcile committed state separately"
+                .into(),
+        ));
     }
     if authority.phase != TransferPhase::Prepared
         || !authority.has_proof(DraftGridDirectoryProofKindV2::SourcePrepare)
         || authority.has_proof(DraftGridDirectoryProofKindV2::DestinationQuarantine)
         || authority.quarantine_receipt_hash.is_some()
-        || trusted_now_unix_ms == 0
+        || event.occurred_at_unix_ms == 0
     {
         return Err(DraftGridClosureError::Invalid(
             "directory authority is not awaiting first destination quarantine".into(),
+        ));
+    }
+    if event.event_sequence != state.base.event_sequence.checked_add(1).unwrap_or(0)
+        || event.previous_event_hash != state.base.last_event_hash
+        || event.authority_fencing_token != state.base.fencing_token
+        || event.authority_fencing_token != authority.live_destination_fencing_token
+    {
+        return Err(DraftGridClosureError::Invalid(
+            "grid quarantine event-17 context does not follow the live destination frontier".into(),
         ));
     }
     validate_destination_conflicts_in_validated_world_v21(
@@ -4261,7 +5230,11 @@ fn stage_grid_quarantine_v2(
     }) || state.aggregate_reservations.values().any(|reservation| {
         reservation.binding.transfer_id == package.transfer_id
             || reservation.frozen.overlaps(&frozen)
-    }) || state.committed_exports.contains_key(&package.transfer_id)
+    }) || state.committed_prepares.contains_key(&package.transfer_id)
+        || state
+            .committed_quarantines
+            .contains_key(&package.transfer_id)
+        || state.committed_exports.contains_key(&package.transfer_id)
         || state.abort_witnesses.contains_key(&package.transfer_id)
     {
         return Err(DraftGridClosureError::Changed(
@@ -4282,18 +5255,151 @@ fn stage_grid_quarantine_v2(
         destination_event_sequence: state.base.event_sequence,
         destination_base_world_hash: state.base.state_hash(),
         destination_draft_world_hash: state.state_hash.clone(),
-        quarantined_at_unix_ms: trusted_now_unix_ms,
+        quarantined_at_unix_ms: event.occurred_at_unix_ms,
         receipt_hash: String::new(),
     };
     receipt.receipt_hash = receipt.calculate_hash()?;
     receipt.validate()?;
-    let reservation = DraftAggregateTransferReservationV2::from_receipt(package, &receipt);
+    let mut proof = DraftGridQuarantineProofV2::new(state, package, authority, event, &receipt)?;
+    let reservation = DraftAggregateTransferReservationV2::from_receipt(package, &receipt, &proof);
     reservation.validate()?;
     let mut next = state.clone();
     next.aggregate_reservations
         .insert(package.transfer_id.clone(), reservation);
+    next.base.event_sequence = event.event_sequence;
+    next.base.last_event_hash.clone_from(&event.event_hash);
+    proof.seal_result(&next)?;
+    next.committed_quarantines
+        .insert(package.transfer_id.clone(), proof.clone());
     next.seal()?;
-    Ok((next, receipt))
+    Ok((next, receipt, proof))
+}
+
+pub(super) fn reconcile_quarantined_grid_v2(
+    state: &DraftGridTransferCellStateV2,
+    package: &DraftGridClosurePackageV2,
+    authority: &DraftGridDirectoryAuthorityV2,
+) -> Result<
+    (
+        DraftGridTransferCellStateV2,
+        DraftGridTransferQuarantineReceiptV2,
+        DraftGridQuarantineProofV2,
+    ),
+    DraftGridClosureError,
+> {
+    state.validate()?;
+    package.validate_wire()?;
+    authority.validate_package(package)?;
+    if state.base.cell_id != package.destination_cell_id
+        || state.base.fencing_token != authority.live_destination_fencing_token
+    {
+        return Err(DraftGridClosureError::Invalid(
+            "quarantine reconciliation lacks current destination authority".into(),
+        ));
+    }
+    let reservation = state
+        .aggregate_reservations
+        .get(&package.transfer_id)
+        .filter(|reservation| {
+            reservation.binding == DraftGridTransferBindingV2::from_package(package)
+                && reservation.frozen == DraftFrozenClosureIdsV2::from_package(package)
+        })
+        .ok_or_else(|| {
+            DraftGridClosureError::Changed(
+                "quarantine reconciliation cannot find the exact reservation".into(),
+            )
+        })?;
+    let receipt = reservation.receipt();
+    let proof = state
+        .committed_quarantines
+        .get(&package.transfer_id)
+        .filter(|proof| {
+            proof.quarantine_receipt_hash == receipt.receipt_hash
+                && proof.event_sequence == reservation.quarantine_event_sequence
+                && proof.event_hash == reservation.quarantine_event_hash
+                && proof.event_payload_hash == reservation.quarantine_event_payload_hash
+                && proof.mutation_witness_hash == reservation.quarantine_mutation_witness_hash
+        })
+        .ok_or_else(|| {
+            DraftGridClosureError::Changed(
+                "quarantine reconciliation cannot find the exact canonical proof".into(),
+            )
+        })?;
+    let phase_matches = match authority.phase {
+        TransferPhase::Prepared => {
+            authority.has_proof(DraftGridDirectoryProofKindV2::SourcePrepare)
+                && !authority.has_proof(DraftGridDirectoryProofKindV2::DestinationQuarantine)
+                && authority.quarantine_receipt_hash.is_none()
+        }
+        TransferPhase::Quarantined => {
+            authority.has_proof(DraftGridDirectoryProofKindV2::SourcePrepare)
+                && authority.has_proof(DraftGridDirectoryProofKindV2::DestinationQuarantine)
+                && authority.quarantine_receipt_hash.as_deref()
+                    == Some(receipt.receipt_hash.as_str())
+        }
+        TransferPhase::Aborting => {
+            authority.has_proof(DraftGridDirectoryProofKindV2::SourcePrepare)
+                && (!authority.has_proof(DraftGridDirectoryProofKindV2::DestinationQuarantine)
+                    || (authority.quarantine_receipt_hash.as_deref()
+                        == Some(receipt.receipt_hash.as_str())
+                        && authority.destination_quarantine_proof.as_ref() == Some(proof)))
+        }
+        _ => false,
+    };
+    if !phase_matches {
+        return Err(DraftGridClosureError::Invalid(
+            "quarantine reconciliation lacks matching directory authority".into(),
+        ));
+    }
+    receipt.validate()?;
+    proof.validate()?;
+    if authority
+        .destination_quarantine_proof
+        .as_ref()
+        .is_some_and(|directory_proof| directory_proof != proof)
+    {
+        return Err(DraftGridClosureError::Changed(
+            "quarantine reconciliation conflicts with the directory's canonical proof".into(),
+        ));
+    }
+    Ok((state.clone(), receipt, proof.clone()))
+}
+
+#[cfg(test)]
+fn stage_grid_quarantine_v2(
+    state: &DraftGridTransferCellStateV2,
+    trusted_now_unix_ms: u64,
+    package: &DraftGridClosurePackageV2,
+    authority: &DraftGridDirectoryAuthorityV2,
+) -> Result<
+    (
+        DraftGridTransferCellStateV2,
+        DraftGridTransferQuarantineReceiptV2,
+    ),
+    DraftGridClosureError,
+> {
+    state.validate()?;
+    package.validate_wire()?;
+    authority.validate_package(package)?;
+    if state
+        .aggregate_reservations
+        .contains_key(&package.transfer_id)
+    {
+        return reconcile_quarantined_grid_v2(state, package, authority)
+            .map(|(state, receipt, _)| (state, receipt));
+    }
+    let event = DraftCanonicalGridEventV17::new_system(
+        state,
+        format!("quarantine-{}", package.transfer_id),
+        trusted_now_unix_ms,
+        DraftGridEventPayloadV17::GridTransferQuarantined {
+            package: package.clone(),
+            authority: authority.clone(),
+        },
+    )?;
+    let context = event.validate_for_state(state)?;
+    stage_grid_quarantine_event_v17(state, package, authority, &context)
+        .map(|(next, receipt, _)| (next, receipt))
 }
 
 fn stage_committed_grid_export_v2(
@@ -4360,10 +5466,17 @@ fn stage_committed_grid_export_v2(
             "source export is not at a clean committed boundary".into(),
         ));
     }
-    let expected_lock = DraftAggregateTransferLockV2::from_package(package);
-    if state.aggregate_locks.get(&package.root_aggregate_id) != Some(&expected_lock)
-        || !source_lock_matches(&state.base, &expected_lock)
-    {
+    let expected_lock = state
+        .aggregate_locks
+        .get(&package.root_aggregate_id)
+        .cloned()
+        .filter(|lock| lock.matches_package(package))
+        .ok_or_else(|| {
+            DraftGridClosureError::Changed(
+                "source export no longer matches the exact frozen package closure".into(),
+            )
+        })?;
+    if !source_lock_matches(&state.base, &expected_lock) {
         return Err(DraftGridClosureError::Changed(
             "source export no longer matches the exact frozen package closure".into(),
         ));
@@ -5189,11 +6302,11 @@ fn stage_imported_production_occurrence_v2(
     Ok((next, controls, proof))
 }
 
-fn stage_aborted_grid_cleanup_v2(
+pub(super) fn stage_aborted_grid_cleanup_event_v17(
     state: &DraftGridTransferCellStateV2,
-    trusted_now_unix_ms: u64,
     package: &DraftGridClosurePackageV2,
     authority: &DraftGridDirectoryAuthorityV2,
+    event: &ValidatedDraftGridEventContextV17,
 ) -> Result<(DraftGridTransferCellStateV2, DraftGridAbortCleanupProofV2), DraftGridClosureError> {
     state.validate()?;
     package.validate_wire()?;
@@ -5207,6 +6320,11 @@ fn stage_aborted_grid_cleanup_v2(
             "abort cleanup was presented to an unrelated cell".into(),
         ));
     };
+    event.require_payload(&DraftGridEventPayloadV17::GridTransferAborted {
+        package: package.clone(),
+        authority: authority.clone(),
+        side,
+    })?;
     let live_fencing_token = match side {
         DraftGridTransferAbortSideV2::Source => authority.live_source_fencing_token,
         DraftGridTransferAbortSideV2::Destination => authority.live_destination_fencing_token,
@@ -5217,26 +6335,28 @@ fn stage_aborted_grid_cleanup_v2(
         ));
     }
     if let Some(existing) = state.abort_witnesses.get(&package.transfer_id) {
-        if !matches!(
-            authority.phase,
-            TransferPhase::Aborting | TransferPhase::Aborted
-        ) {
-            return Err(DraftGridClosureError::Invalid(
-                "abort witness retry lacks terminal directory authority".into(),
-            ));
-        }
-        existing.validate_request(package, authority, side)?;
-        let proof = existing.cleanup_proof();
-        proof.validate().map_err(DraftGridClosureError::Invalid)?;
-        return Ok((state.clone(), proof));
+        let _ = existing;
+        return Err(DraftGridClosureError::Changed(
+            "abort cleanup apply requires its exact predecessor; reconcile committed state separately"
+                .into(),
+        ));
     }
-    if authority.phase != TransferPhase::Aborting || trusted_now_unix_ms == 0 {
+    if authority.phase != TransferPhase::Aborting || event.occurred_at_unix_ms == 0 {
         return Err(DraftGridClosureError::Invalid(
             "only an aborting precommit transfer may clean cell authority".into(),
         ));
     }
+    if event.event_sequence != state.base.event_sequence.checked_add(1).unwrap_or(0)
+        || event.previous_event_hash != state.base.last_event_hash
+        || event.authority_fencing_token != state.base.fencing_token
+        || event.authority_fencing_token != live_fencing_token
+    {
+        return Err(DraftGridClosureError::Invalid(
+            "grid abort event-17 context does not follow the live cell frontier".into(),
+        ));
+    }
     let mut next = state.clone();
-    let removed_authority = match side {
+    let (removed_lock, removed_reservation) = match side {
         DraftGridTransferAbortSideV2::Source => {
             if authority.has_proof(DraftGridDirectoryProofKindV2::SourceAbort) {
                 return Err(DraftGridClosureError::Changed(
@@ -5246,24 +6366,21 @@ fn stage_aborted_grid_cleanup_v2(
             if state
                 .aggregate_locks
                 .get(&package.root_aggregate_id)
-                .is_some_and(|existing| {
-                    existing != &DraftAggregateTransferLockV2::from_package(package)
-                })
+                .is_some_and(|existing| !existing.matches_package(package))
             {
                 return Err(DraftGridClosureError::Changed(
                     "source abort does not match the exact aggregate lock".into(),
                 ));
             }
-            let removed = next
-                .aggregate_locks
-                .remove(&package.root_aggregate_id)
-                .is_some();
-            if !removed && authority.has_proof(DraftGridDirectoryProofKindV2::SourcePrepare) {
+            let removed = next.aggregate_locks.remove(&package.root_aggregate_id);
+            if removed.is_none()
+                && authority.has_proof(DraftGridDirectoryProofKindV2::SourcePrepare)
+            {
                 return Err(DraftGridClosureError::Changed(
                     "directory proves a source lock that is absent from cell state".into(),
                 ));
             }
-            removed
+            (removed, None)
         }
         DraftGridTransferAbortSideV2::Destination => {
             if authority.has_proof(DraftGridDirectoryProofKindV2::DestinationAbort) {
@@ -5293,28 +6410,29 @@ fn stage_aborted_grid_cleanup_v2(
                     "destination abort does not match the exact quarantine reservation".into(),
                 ));
             }
-            let removed = next
-                .aggregate_reservations
-                .remove(&package.transfer_id)
-                .is_some();
-            if !removed && authority.has_proof(DraftGridDirectoryProofKindV2::DestinationQuarantine)
+            let removed = next.aggregate_reservations.remove(&package.transfer_id);
+            if removed.is_none()
+                && authority.has_proof(DraftGridDirectoryProofKindV2::DestinationQuarantine)
             {
                 return Err(DraftGridClosureError::Changed(
                     "directory proves a destination reservation that is absent from cell state"
                         .into(),
                 ));
             }
-            removed
+            (None, removed)
         }
     };
+    next.base.event_sequence = event.event_sequence;
+    next.base.last_event_hash.clone_from(&event.event_hash);
     let witness = DraftGridTransferAbortWitnessV2::new(
         state,
         &next,
         package,
         side,
-        removed_authority,
+        removed_lock,
+        removed_reservation,
         authority,
-        trusted_now_unix_ms,
+        event,
     )?;
     next.abort_witnesses
         .insert(package.transfer_id.clone(), witness.clone());
@@ -5322,6 +6440,96 @@ fn stage_aborted_grid_cleanup_v2(
     let proof = witness.cleanup_proof();
     proof.validate().map_err(DraftGridClosureError::Invalid)?;
     Ok((next, proof))
+}
+
+pub(super) fn reconcile_aborted_grid_cleanup_v2(
+    state: &DraftGridTransferCellStateV2,
+    package: &DraftGridClosurePackageV2,
+    authority: &DraftGridDirectoryAuthorityV2,
+) -> Result<(DraftGridTransferCellStateV2, DraftGridAbortCleanupProofV2), DraftGridClosureError> {
+    state.validate()?;
+    package.validate_wire()?;
+    authority.validate_package(package)?;
+    let side = if state.base.cell_id == package.source_cell_id {
+        DraftGridTransferAbortSideV2::Source
+    } else if state.base.cell_id == package.destination_cell_id {
+        DraftGridTransferAbortSideV2::Destination
+    } else {
+        return Err(DraftGridClosureError::Invalid(
+            "abort reconciliation was presented to an unrelated cell".into(),
+        ));
+    };
+    let live_fence = match side {
+        DraftGridTransferAbortSideV2::Source => authority.live_source_fencing_token,
+        DraftGridTransferAbortSideV2::Destination => authority.live_destination_fencing_token,
+    };
+    if state.base.fencing_token != live_fence
+        || !matches!(
+            authority.phase,
+            TransferPhase::Aborting | TransferPhase::Aborted
+        )
+    {
+        return Err(DraftGridClosureError::Invalid(
+            "abort reconciliation lacks current terminal cell authority".into(),
+        ));
+    }
+    let witness = state
+        .abort_witnesses
+        .get(&package.transfer_id)
+        .ok_or_else(|| {
+            DraftGridClosureError::Changed(
+                "abort reconciliation cannot find its canonical cleanup witness".into(),
+            )
+        })?;
+    witness.validate_request(package, authority, side)?;
+    let proof = witness.cleanup_proof();
+    proof.validate().map_err(DraftGridClosureError::Invalid)?;
+    let directory_proof = match side {
+        DraftGridTransferAbortSideV2::Source => authority.source_abort_proof.as_ref(),
+        DraftGridTransferAbortSideV2::Destination => authority.destination_abort_proof.as_ref(),
+    };
+    if directory_proof.is_some_and(|directory_proof| directory_proof != &proof) {
+        return Err(DraftGridClosureError::Changed(
+            "abort reconciliation conflicts with the directory's canonical cleanup proof".into(),
+        ));
+    }
+    Ok((state.clone(), proof))
+}
+
+#[cfg(test)]
+fn stage_aborted_grid_cleanup_v2(
+    state: &DraftGridTransferCellStateV2,
+    trusted_now_unix_ms: u64,
+    package: &DraftGridClosurePackageV2,
+    authority: &DraftGridDirectoryAuthorityV2,
+) -> Result<(DraftGridTransferCellStateV2, DraftGridAbortCleanupProofV2), DraftGridClosureError> {
+    state.validate()?;
+    package.validate_wire()?;
+    authority.validate_package(package)?;
+    if state.abort_witnesses.contains_key(&package.transfer_id) {
+        return reconcile_aborted_grid_cleanup_v2(state, package, authority);
+    }
+    let side = if state.base.cell_id == package.source_cell_id {
+        DraftGridTransferAbortSideV2::Source
+    } else if state.base.cell_id == package.destination_cell_id {
+        DraftGridTransferAbortSideV2::Destination
+    } else {
+        return Err(DraftGridClosureError::Invalid(
+            "abort cleanup was presented to an unrelated cell".into(),
+        ));
+    };
+    let event = DraftCanonicalGridEventV17::new_system(
+        state,
+        format!("abort-{}-{side:?}", package.transfer_id).to_ascii_lowercase(),
+        trusted_now_unix_ms,
+        DraftGridEventPayloadV17::GridTransferAborted {
+            package: package.clone(),
+            authority: authority.clone(),
+            side,
+        },
+    )?;
+    let context = event.validate_for_state(state)?;
+    stage_aborted_grid_cleanup_event_v17(state, package, authority, &context)
 }
 
 fn context_from_package(package: &DraftGridClosurePackageV2) -> DraftGridTransferContextV2 {
@@ -5370,10 +6578,8 @@ mod tests {
         let locked =
             stage_prepared_grid_lock_v2(&source, package, &prepared).expect("source closure locks");
         let mut quarantine_authority = prepared.clone();
-        quarantine_authority
-            .proofs
-            .insert(DraftGridDirectoryProofKindV2::SourcePrepare);
-        let (_, receipt) = stage_grid_quarantine_v2(
+        quarantine_authority.record_test_source_prepare(&locked, &package.transfer_id);
+        let (reserved, _) = stage_grid_quarantine_v2(
             &destination_state(package),
             1_800_000_000_000,
             package,
@@ -5382,10 +6588,7 @@ mod tests {
         .expect("destination quarantine derives receipt");
         let mut committed = quarantine_authority;
         committed.phase = TransferPhase::Committed;
-        committed
-            .proofs
-            .insert(DraftGridDirectoryProofKindV2::DestinationQuarantine);
-        committed.quarantine_receipt_hash = Some(receipt.receipt_hash);
+        committed.record_test_destination_quarantine(&reserved, &package.transfer_id);
         (locked, committed)
     }
 
@@ -5601,17 +6804,12 @@ mod tests {
             .expect("source closure locks");
         let destination = destination_state(&package);
         let mut authority = prepared;
-        authority
-            .proofs
-            .insert(DraftGridDirectoryProofKindV2::SourcePrepare);
-        let (reserved, receipt) =
+        authority.record_test_source_prepare(&locked, &package.transfer_id);
+        let (reserved, _) =
             stage_grid_quarantine_v2(&destination, 1_800_000_000_000, &package, &authority)
                 .expect("destination reservation seals");
         authority.phase = TransferPhase::Committed;
-        authority
-            .proofs
-            .insert(DraftGridDirectoryProofKindV2::DestinationQuarantine);
-        authority.quarantine_receipt_hash = Some(receipt.receipt_hash);
+        authority.record_test_destination_quarantine(&reserved, &package.transfer_id);
         let (exported, export_proof) =
             stage_committed_grid_export_v2(&locked, 1_800_000_010_000, &package, &authority)
                 .expect("source export commits");
@@ -5658,10 +6856,8 @@ mod tests {
             .expect("source closure locks");
         let destination = destination_state(&package);
         let mut quarantine_authority = prepared.clone();
-        quarantine_authority
-            .proofs
-            .insert(DraftGridDirectoryProofKindV2::SourcePrepare);
-        let (reserved, receipt) = stage_grid_quarantine_v2(
+        quarantine_authority.record_test_source_prepare(&locked, &package.transfer_id);
+        let (reserved, _) = stage_grid_quarantine_v2(
             &destination,
             1_800_000_000_000,
             &package,
@@ -5670,10 +6866,7 @@ mod tests {
         .expect("destination reservation seals");
         let mut committed = quarantine_authority;
         committed.phase = TransferPhase::Committed;
-        committed
-            .proofs
-            .insert(DraftGridDirectoryProofKindV2::DestinationQuarantine);
-        committed.quarantine_receipt_hash = Some(receipt.receipt_hash);
+        committed.record_test_destination_quarantine(&reserved, &package.transfer_id);
         let (_, source_export_proof) =
             stage_committed_grid_export_v2(&locked, 1_800_000_010_000, &package, &committed)
                 .expect("source export proof seals");
@@ -6156,8 +7349,7 @@ mod tests {
             .to_hex()
             .to_string();
         successor.seal().expect("successor source state seals");
-        directory_finalized.live_source_assignment_generation += 1;
-        directory_finalized.live_source_fencing_token += 1;
+        directory_finalized.advance_test_source_authority();
         let (successor_retry, successor_proof) = stage_finalized_grid_source_v2(
             &successor,
             activation.activated_at_unix_ms + 30_000,
@@ -6486,8 +7678,7 @@ mod tests {
             .seal()
             .expect("successor fence preserves historical activation");
         let mut successor_authority = finalized;
-        successor_authority.live_destination_assignment_generation += 1;
-        successor_authority.live_destination_fencing_token += 1;
+        successor_authority.advance_test_destination_authority();
         let (successor_retry, successor_proof) = stage_imported_grid_activation_v2(
             &successor_state,
             1_800_000_020_006,
@@ -6890,7 +8081,14 @@ mod tests {
             DraftGridDirectoryAuthorityV2::for_package(&package, TransferPhase::Prepared);
         let locked =
             stage_prepared_grid_lock_v2(&state, &package, &authority).expect("closure locks");
-        assert_eq!(locked.base, source);
+        let mut expected_base = source;
+        expected_base.event_sequence = locked.base.event_sequence;
+        expected_base
+            .last_event_hash
+            .clone_from(&locked.base.last_event_hash);
+        assert_eq!(locked.base, expected_base);
+        assert_eq!(locked.base.event_sequence, state.base.event_sequence + 1);
+        assert_eq!(locked.committed_prepares.len(), 1);
         assert_ne!(locked.state_hash, state.state_hash);
         assert_eq!(locked.aggregate_locks.len(), 1);
         for subject in [
@@ -6964,24 +8162,32 @@ mod tests {
 
     #[test]
     fn quarantine_receipt_and_reservation_are_exact_and_canonical() {
-        let (_, _, package) = package_fixture();
+        let (source, _, package) = package_fixture();
+        let source = DraftGridTransferCellStateV2::new(source).expect("source seals");
         let state = destination_state(&package);
         let mut authority =
             DraftGridDirectoryAuthorityV2::for_package(&package, TransferPhase::Prepared);
-        authority
-            .proofs
-            .insert(DraftGridDirectoryProofKindV2::SourcePrepare);
+        let locked = stage_prepared_grid_lock_v2(&source, &package, &authority)
+            .expect("source prepare proof seals");
+        authority.record_test_source_prepare(&locked, &package.transfer_id);
         let (reserved, receipt) =
             stage_grid_quarantine_v2(&state, 1_800_000_000_000, &package, &authority)
                 .expect("destination quarantines");
         receipt.validate().expect("receipt validates");
-        assert_eq!(reserved.base, state.base);
+        let mut expected_base = state.base.clone();
+        expected_base.event_sequence = reserved.base.event_sequence;
+        expected_base
+            .last_event_hash
+            .clone_from(&reserved.base.last_event_hash);
+        assert_eq!(reserved.base, expected_base);
+        assert_eq!(reserved.base.event_sequence, state.base.event_sequence + 1);
         assert_ne!(reserved.state_hash, state.state_hash);
         assert_eq!(reserved.aggregate_reservations.len(), 1);
+        assert_eq!(reserved.committed_quarantines.len(), 1);
         assert_eq!(receipt.destination_draft_world_hash, state.state_hash);
         assert_eq!(
             receipt.receipt_hash,
-            "58392eb3e5077b8966eb4cae4ec7e822de4acd6a92e90d0b627f136583b2dbd5"
+            "121b1b5809105965f6ef9ae2d914c27c850dd0cccfb071aa47b5edbe661652f2"
         );
 
         let (retry_state, retry_receipt) =
@@ -6992,10 +8198,7 @@ mod tests {
 
         let mut quarantined_authority = authority.clone();
         quarantined_authority.phase = TransferPhase::Quarantined;
-        quarantined_authority
-            .proofs
-            .insert(DraftGridDirectoryProofKindV2::DestinationQuarantine);
-        quarantined_authority.quarantine_receipt_hash = Some(receipt.receipt_hash.clone());
+        quarantined_authority.record_test_destination_quarantine(&reserved, &package.transfer_id);
         let (restart_state, restart_receipt) = stage_grid_quarantine_v2(
             &reserved,
             1_800_000_100_000,
@@ -7024,7 +8227,8 @@ mod tests {
 
     #[test]
     fn successor_destination_fence_can_create_the_first_quarantine() {
-        let (_, _, package) = package_fixture();
+        let (source, _, package) = package_fixture();
+        let source = DraftGridTransferCellStateV2::new(source).expect("source seals");
         let mut destination = destination_state(&package);
         destination.base.fencing_token = destination
             .base
@@ -7034,11 +8238,10 @@ mod tests {
         destination.seal().expect("successor destination seals");
         let mut authority =
             DraftGridDirectoryAuthorityV2::for_package(&package, TransferPhase::Prepared);
-        authority
-            .proofs
-            .insert(DraftGridDirectoryProofKindV2::SourcePrepare);
-        authority.live_destination_assignment_generation += 1;
-        authority.live_destination_fencing_token = destination.base.fencing_token;
+        let locked = stage_prepared_grid_lock_v2(&source, &package, &authority)
+            .expect("source prepare proof seals");
+        authority.record_test_source_prepare(&locked, &package.transfer_id);
+        authority.advance_test_destination_authority();
         let (reserved, receipt) =
             stage_grid_quarantine_v2(&destination, 1_800_000_000_000, &package, &authority)
                 .expect("successor creates the first exact quarantine");
@@ -7063,9 +8266,7 @@ mod tests {
 
         let destination = destination_state(&package);
         let mut quarantine_authority = prepared.clone();
-        quarantine_authority
-            .proofs
-            .insert(DraftGridDirectoryProofKindV2::SourcePrepare);
+        quarantine_authority.record_test_source_prepare(&locked, &package.transfer_id);
         let (reserved, receipt) = stage_grid_quarantine_v2(
             &destination,
             1_800_000_000_000,
@@ -7074,23 +8275,70 @@ mod tests {
         )
         .expect("destination reserves");
 
+        let mut directory_aborted_before_quarantine =
+            DraftGridDirectoryAuthorityV2::for_package(&package, TransferPhase::Aborting);
+        directory_aborted_before_quarantine
+            .record_test_source_prepare(&locked, &package.transfer_id);
+        let (reopened_reservation, late_receipt, late_quarantine_proof) =
+            reconcile_quarantined_grid_v2(
+                &DraftGridTransferCellStateV2::decode_canonical(
+                    &reserved.encode_canonical().expect("reservation encodes"),
+                )
+                .expect("reservation reopens"),
+                &package,
+                &directory_aborted_before_quarantine,
+            )
+            .expect("aborting directory can recover the exact cell-first quarantine proof");
+        assert_eq!(reopened_reservation, reserved);
+        assert_eq!(late_receipt, receipt);
+        assert_eq!(
+            late_quarantine_proof,
+            reserved.committed_quarantines[&package.transfer_id]
+        );
+
         let mut abort_authority =
             DraftGridDirectoryAuthorityV2::for_package(&package, TransferPhase::Aborting);
-        abort_authority
-            .proofs
-            .insert(DraftGridDirectoryProofKindV2::SourcePrepare);
-        abort_authority
-            .proofs
-            .insert(DraftGridDirectoryProofKindV2::DestinationQuarantine);
-        abort_authority.quarantine_receipt_hash = Some(receipt.receipt_hash.clone());
+        abort_authority.record_test_source_prepare(&locked, &package.transfer_id);
+        abort_authority.record_test_destination_quarantine(&reserved, &package.transfer_id);
+        assert_eq!(
+            abort_authority.quarantine_receipt_hash.as_deref(),
+            Some(receipt.receipt_hash.as_str())
+        );
         let (source_clean, source_witness) =
             stage_aborted_grid_cleanup_v2(&locked, 1_800_000_010_000, &package, &abort_authority)
                 .expect("source unlocks");
-        let (destination_clean, destination_witness) =
-            stage_aborted_grid_cleanup_v2(&reserved, 1_800_000_010_001, &package, &abort_authority)
-                .expect("destination unreserves");
-        assert_eq!(source_clean.base, source_state.base);
-        assert_eq!(destination_clean.base, destination.base);
+        let mut source_proven_authority = abort_authority.clone();
+        source_proven_authority.record_test_abort(&source_witness);
+        let (destination_clean, destination_witness) = stage_aborted_grid_cleanup_v2(
+            &reserved,
+            1_800_000_010_001,
+            &package,
+            &source_proven_authority,
+        )
+        .expect("destination unreserves");
+        let mut aborted_authority = source_proven_authority;
+        aborted_authority.record_test_abort(&destination_witness);
+        aborted_authority.phase = TransferPhase::Aborted;
+        let mut expected_source_base = source_state.base.clone();
+        expected_source_base.event_sequence = source_clean.base.event_sequence;
+        expected_source_base
+            .last_event_hash
+            .clone_from(&source_clean.base.last_event_hash);
+        assert_eq!(source_clean.base, expected_source_base);
+        assert_eq!(
+            source_clean.base.event_sequence,
+            source_state.base.event_sequence + 2
+        );
+        let mut expected_destination_base = destination.base.clone();
+        expected_destination_base.event_sequence = destination_clean.base.event_sequence;
+        expected_destination_base
+            .last_event_hash
+            .clone_from(&destination_clean.base.last_event_hash);
+        assert_eq!(destination_clean.base, expected_destination_base);
+        assert_eq!(
+            destination_clean.base.event_sequence,
+            destination.base.event_sequence + 2
+        );
         assert!(source_clean.aggregate_locks.is_empty());
         assert!(destination_clean.aggregate_reservations.is_empty());
         assert!(source_witness.removed_authority);
@@ -7099,7 +8347,7 @@ mod tests {
             &source_clean,
             1_800_000_020_000,
             &package,
-            &abort_authority,
+            &aborted_authority,
         )
         .expect("source cleanup retry succeeds");
         assert_eq!(source_retry, source_clean);
@@ -7108,11 +8356,19 @@ mod tests {
             &destination_clean,
             1_800_000_020_001,
             &package,
-            &abort_authority,
+            &aborted_authority,
         )
         .expect("destination cleanup retry succeeds");
         assert_eq!(destination_retry, destination_clean);
         assert_eq!(destination_retry_witness, destination_witness);
+
+        let mut substituted = aborted_authority;
+        substituted
+            .source_abort_proof
+            .as_mut()
+            .expect("source abort proof is retained")
+            .proof_hash = "ab".repeat(32);
+        assert!(reconcile_aborted_grid_cleanup_v2(&source_clean, &package, &substituted).is_err());
     }
 
     #[test]
@@ -7129,8 +8385,7 @@ mod tests {
         assert!(stage_prepared_grid_lock_v2(&locked, &package, &prepared).is_err());
 
         let mut successor = prepared;
-        successor.live_source_assignment_generation += 1;
-        successor.live_source_fencing_token += 1;
+        successor.advance_test_source_authority();
         let recovered = stage_prepared_grid_lock_v2(&locked, &package, &successor)
             .expect("successor recovers exact lock");
         assert_eq!(recovered, locked);
@@ -7182,7 +8437,7 @@ mod tests {
         assert_eq!(
             exported.base.event_sequence,
             initial_event_sequence
-                .checked_add(1)
+                .checked_add(2)
                 .expect("frontier advances")
         );
         assert_eq!(exported.base.last_event_hash, proof.event_hash);
@@ -7419,6 +8674,33 @@ mod tests {
         assert!(
             stage_grid_quarantine_v2(&destination, 1_800_000_000_000, &package, &wrong_live_fence,)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn directory_fencing_history_rejects_a_resealed_generation_fence_cross_pair() {
+        let (source, _, package) = package_fixture();
+        assert!(package.source_assignment_generation > 1);
+        let source = DraftGridTransferCellStateV2::new(source).expect("source seals");
+        let prepared =
+            DraftGridDirectoryAuthorityV2::for_package(&package, TransferPhase::Prepared);
+        let locked = stage_prepared_grid_lock_v2(&source, &package, &prepared)
+            .expect("source prepare proof seals");
+        let mut proven = prepared;
+        proven.record_test_source_prepare(&locked, &package.transfer_id);
+
+        let mut cross_paired = proven;
+        let proof = cross_paired
+            .source_prepare_proof
+            .as_mut()
+            .expect("source prepare proof is retained");
+        proof.assignment_generation -= 1;
+        proof
+            .seal_hashes_for_test()
+            .expect("cross-paired proof is internally self-consistent");
+        assert!(
+            cross_paired.validate_package(&package).is_err(),
+            "directory provenance rejects a generation paired with another generation's fence"
         );
     }
 

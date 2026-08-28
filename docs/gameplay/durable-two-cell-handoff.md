@@ -2,8 +2,8 @@
 
 **Feature ID:** F-061
 
-**Status:** Accepted implementation contract; implementation and release
-evidence pending
+**Status:** Accepted implementation contract; implementation in progress and
+release evidence pending
 
 **Owner:** Universe-directory, simulation-worker, persistence, protocol,
 replication, native-client, and operations maintainers
@@ -252,6 +252,11 @@ Preparing|Prepared
 
 Both cleanup events are required even when one cell has no lock or reservation;
 the no-op event durably proves absence before the directory unpins either cell.
+If a cell has already durably quarantined the destination package when the
+directory begins aborting, recovery first adopts that exact retained
+quarantine proof without leaving `Aborting`. Destination cleanup must then bind
+the adopted receipt. A source cleanup committed before that late proof was
+discovered remains valid because it removed no destination reservation.
 
 ## Transfer trigger and closure
 
@@ -637,6 +642,16 @@ the full import/activation-linked finalization record outside the active-world
 projection. Restart validation reconstructs the exact predecessor at the
 finalization frontier. Cell-first and directory-first retries are exact, while
 a directory-finalized transfer with no local finalization event fails closed.
+The private event-17 envelope now binds the complete protocol-19 compatibility
+tuple and has distinct typed payloads for prepare, quarantine, export, import,
+activation, finalization, side-specific abort, and production occurrence.
+Prepare, quarantine, and abort already apply through that canonical envelope;
+their retained proofs round-trip through directory v3 with its document
+identity and complete assignment-generation-to-cell-fence histories. Validation
+requires every proof to use an authority pair the directory actually issued,
+and rejects a resealed cross-pair even when its individual numbers are in
+range. Successor workers use separate event-free reconciliation transactions,
+so an already committed event is never invented again during recovery.
 The active event-17 runtime/store adapter, scheduler and durable wake-up path,
 and persistence failpoint crash/replay integration remain to be implemented
 before activation. All drafts are
