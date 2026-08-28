@@ -746,6 +746,35 @@ pub struct Ledger {
     pub built_blocks: u64,
     pub destroyed_blocks: u64,
     pub destroyed_components: u64,
+    #[serde(default)]
+    pub transfer_imported_ore: u64,
+    #[serde(default)]
+    pub transfer_imported_refined: u64,
+    #[serde(default)]
+    pub transfer_imported_components: u64,
+    #[serde(default)]
+    pub transfer_exported_ore: u64,
+    #[serde(default)]
+    pub transfer_exported_refined: u64,
+    #[serde(default)]
+    pub transfer_exported_components: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferWitnessDirection {
+    Import,
+    Export,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TransferConservationWitness {
+    pub transfer_id: String,
+    pub package_hash: String,
+    pub counterparty_cell_id: String,
+    pub direction: TransferWitnessDirection,
+    pub contents: InventoryContents,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -814,6 +843,8 @@ pub struct WorldState {
     pub production_clock: ProductionClock,
     pub death_drops: BTreeMap<String, DeathDrop>,
     pub ledger: Ledger,
+    #[serde(default)]
+    pub transfer_witnesses: BTreeMap<String, TransferConservationWitness>,
     pub processed_operations: BTreeMap<String, ActorOperationHistory>,
 }
 
@@ -1375,6 +1406,47 @@ impl WorldState {
                 );
             }
         }
+
+        let mut imported = InventoryContents::default();
+        let mut exported = InventoryContents::default();
+        for (transfer_id, witness) in &self.transfer_witnesses {
+            if transfer_id != &witness.transfer_id
+                || transfer_id.is_empty()
+                || transfer_id.len() > 128
+                || !transfer_id.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':')
+                })
+                || !valid_blake3_hex(&witness.package_hash)
+                || !valid_blake3_hex(&witness.counterparty_cell_id)
+            {
+                return Err("transfer conservation witness identity is invalid".into());
+            }
+            let totals = match witness.direction {
+                TransferWitnessDirection::Import => &mut imported,
+                TransferWitnessDirection::Export => &mut exported,
+            };
+            totals.ore = totals
+                .ore
+                .checked_add(witness.contents.ore)
+                .ok_or_else(|| "transfer ore witness total overflowed".to_owned())?;
+            totals.refined_material = totals
+                .refined_material
+                .checked_add(witness.contents.refined_material)
+                .ok_or_else(|| "transfer refined witness total overflowed".to_owned())?;
+            totals.components = totals
+                .components
+                .checked_add(witness.contents.components)
+                .ok_or_else(|| "transfer component witness total overflowed".to_owned())?;
+        }
+        if imported.ore != self.ledger.transfer_imported_ore
+            || imported.refined_material != self.ledger.transfer_imported_refined
+            || imported.components != self.ledger.transfer_imported_components
+            || exported.ore != self.ledger.transfer_exported_ore
+            || exported.refined_material != self.ledger.transfer_exported_refined
+            || exported.components != self.ledger.transfer_exported_components
+        {
+            return Err("transfer conservation witnesses do not match the cell ledger".into());
+        }
         Ok(())
     }
 
@@ -1744,6 +1816,7 @@ impl WorldState {
                 genesis_installed_components: 37,
                 ..Ledger::default()
             },
+            transfer_witnesses: BTreeMap::new(),
             processed_operations: BTreeMap::new(),
         }
     }
@@ -1796,6 +1869,7 @@ impl WorldState {
             production_clock: ProductionClock::default(),
             death_drops: BTreeMap::new(),
             ledger: Ledger::default(),
+            transfer_witnesses: BTreeMap::new(),
             processed_operations: BTreeMap::new(),
         };
         state.validate_player_roster()?;
@@ -1841,16 +1915,23 @@ impl WorldState {
             .map(|block| block.component_cost)
             .sum::<u64>();
         let recipes = &content::manifest().recipes;
-        let ore_sources = self.ledger.genesis_ore + self.ledger.mined_ore;
-        let ore_consumed = self.ledger.refine_batches * recipes.refining.ore_input;
+        let ore_sources =
+            self.ledger.genesis_ore + self.ledger.mined_ore + self.ledger.transfer_imported_ore;
+        let ore_consumed = self.ledger.refine_batches * recipes.refining.ore_input
+            + self.ledger.transfer_exported_ore;
         let refined_sources = self.ledger.genesis_refined
-            + self.ledger.refine_batches * recipes.refining.refined_output;
-        let refined_consumed =
-            self.ledger.crafted_components * recipes.component_crafting.refined_input;
+            + self.ledger.refine_batches * recipes.refining.refined_output
+            + self.ledger.transfer_imported_refined;
+        let refined_consumed = self.ledger.crafted_components
+            * recipes.component_crafting.refined_input
+            + self.ledger.transfer_exported_refined;
         let component_sources = self.ledger.genesis_components
             + self.ledger.genesis_installed_components
-            + self.ledger.crafted_components * recipes.component_crafting.component_output;
-        let components_installed_or_destroyed = live_blocks + self.ledger.destroyed_components;
+            + self.ledger.crafted_components * recipes.component_crafting.component_output
+            + self.ledger.transfer_imported_components;
+        let components_installed_or_destroyed = live_blocks
+            + self.ledger.destroyed_components
+            + self.ledger.transfer_exported_components;
 
         ConservationSnapshot {
             ore_sources,
