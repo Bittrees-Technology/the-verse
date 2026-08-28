@@ -661,6 +661,17 @@ impl Runtime {
             )
             .into());
         }
+        if self
+            .state
+            .player_transfer_locks
+            .contains_key(actor_player_id)
+        {
+            return Err(IntentError::rejected(
+                "actor_transfer_locked",
+                "the player is in an authoritative cross-cell handoff",
+            )
+            .into());
+        }
         let operation_id = message.operation_id().ok_or_else(|| {
             IntentError::rejected(
                 "not_a_mutating_intent",
@@ -825,8 +836,9 @@ impl Runtime {
                     || grid.control_linear_input.magnitude() > f64::EPSILON
                     || grid.control_angular_input.magnitude() > f64::EPSILON)
         });
-        let player_physics_active = self.state.player.iter().any(|(_, player)| {
-            matches!(player.life_state, PlayerLifeState::Alive)
+        let player_physics_active = self.state.player.iter().any(|(player_id, player)| {
+            !self.state.player_transfer_locks.contains_key(player_id)
+                && matches!(player.life_state, PlayerLifeState::Alive)
                 && (player.linear_velocity.magnitude() > f64::EPSILON
                     || player.angular_velocity.magnitude() > f64::EPSILON
                     || player.control_linear_input.magnitude() > f64::EPSILON
@@ -866,6 +878,9 @@ impl Runtime {
                 let mut contacts = Vec::new();
                 let mut active_contacts = self.state.active_contact_pairs.clone();
                 let mut scheduled_players = self.state.player.by_id.clone();
+                scheduled_players.retain(|player_id, _| {
+                    !self.state.player_transfer_locks.contains_key(player_id)
+                });
                 for substep_index in 0..step_count {
                     let substep_simulation_tick =
                         self.state.simulation_tick.saturating_add(substep_index);
@@ -1035,7 +1050,14 @@ impl Runtime {
             }
         }
 
-        let player_ids = self.state.player.by_id.keys().cloned().collect::<Vec<_>>();
+        let player_ids = self
+            .state
+            .player
+            .by_id
+            .keys()
+            .filter(|player_id| !self.state.player_transfer_locks.contains_key(*player_id))
+            .cloned()
+            .collect::<Vec<_>>();
         let mut elapsed_seconds_by_player = BTreeMap::new();
         for player_id in &player_ids {
             let player = self
@@ -1056,7 +1078,10 @@ impl Runtime {
             }
         }
         self.life_support_elapsed_millis_by_player
-            .retain(|player_id, _| self.state.player.by_id.contains_key(player_id));
+            .retain(|player_id, _| {
+                self.state.player.by_id.contains_key(player_id)
+                    && !self.state.player_transfer_locks.contains_key(player_id)
+            });
 
         let max_elapsed_seconds = elapsed_seconds_by_player
             .values()
@@ -2359,6 +2384,12 @@ impl WorldState {
                 "the authenticated player is not present in this simulation cell",
             )
         })?;
+        if self.player_transfer_locks.contains_key(actor_player_id) {
+            return Err(IntentError::rejected(
+                "actor_transfer_locked",
+                "the player is in an authoritative cross-cell handoff",
+            ));
+        }
         let operation_id = message.operation_id().ok_or_else(|| {
             IntentError::rejected("not_a_mutating_intent", "message has no operation ID")
         })?;
@@ -3180,6 +3211,38 @@ impl WorldState {
                     "event intent fingerprint does not bind its typed client request",
                 ));
             }
+        }
+        if event
+            .actor_player_id
+            .as_ref()
+            .is_some_and(|player_id| self.player_transfer_locks.contains_key(player_id))
+        {
+            return Err(IntentError::rejected(
+                "replay_actor_transfer_locked",
+                "a transfer-locked player cannot commit gameplay mutations",
+            ));
+        }
+        match &event.payload {
+            EventPayload::SuitOxygenChanged { player_id, .. }
+            | EventPayload::PlayerIncapacitated { player_id, .. }
+                if self.player_transfer_locks.contains_key(player_id) =>
+            {
+                return Err(IntentError::rejected(
+                    "replay_actor_transfer_locked",
+                    "life support cannot mutate a transfer-locked player",
+                ));
+            }
+            EventPayload::PhysicsStepCommitted { players, .. }
+                if players
+                    .iter()
+                    .any(|player| self.player_transfer_locks.contains_key(&player.player_id)) =>
+            {
+                return Err(IntentError::rejected(
+                    "replay_actor_transfer_locked",
+                    "physics cannot mutate a transfer-locked player",
+                ));
+            }
+            _ => {}
         }
         match &event.payload {
             EventPayload::PlayerControlSet { .. }
@@ -4187,7 +4250,10 @@ impl WorldState {
                 let living_player_count = self
                     .player
                     .iter()
-                    .filter(|(_, player)| matches!(player.life_state, PlayerLifeState::Alive))
+                    .filter(|(player_id, player)| {
+                        !self.player_transfer_locks.contains_key(*player_id)
+                            && matches!(player.life_state, PlayerLifeState::Alive)
+                    })
                     .count();
                 if players.len() != living_player_count {
                     return Err(IntentError::rejected(
@@ -4196,6 +4262,8 @@ impl WorldState {
                     ));
                 }
                 let mut scheduled_players = self.player.by_id.clone();
+                scheduled_players
+                    .retain(|player_id, _| !self.player_transfer_locks.contains_key(player_id));
                 for scheduled_player in scheduled_players
                     .values_mut()
                     .filter(|player| matches!(player.life_state, PlayerLifeState::Alive))
@@ -5859,11 +5927,10 @@ fn physics_body_specs(state: &WorldState) -> Vec<BodySpec> {
     planet.friction = physics.friction;
     planet.restitution = physics.restitution;
     bodies.push(planet);
-    for (_, canonical_player) in state
-        .player
-        .iter()
-        .filter(|(_, player)| matches!(player.life_state, PlayerLifeState::Alive))
-    {
+    for (_, canonical_player) in state.player.iter().filter(|(player_id, player)| {
+        !state.player_transfer_locks.contains_key(*player_id)
+            && matches!(player.life_state, PlayerLifeState::Alive)
+    }) {
         let character = &content::manifest().character;
         let radius = character.collision_radius_m;
         let half_height_of_cylinder = (character.standing_height_m - 2.0 * radius) * 0.5;
