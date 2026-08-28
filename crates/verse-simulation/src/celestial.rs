@@ -23,7 +23,6 @@ pub const ADDRESS_SCHEMA_VERSION: u32 = 1;
 pub const SECTOR_EDGE_UM: u64 = 20_000_000_000_000;
 pub const CELL_EDGE_UM: u64 = 20_000_000_000;
 pub const CELLS_PER_SECTOR_AXIS: u32 = 1_000;
-pub const ACTIVE_CELL_ID: &str = "cell-origin";
 pub const GRAVITY_BODY_ID: &str = "khepri-prime";
 pub const VOXEL_BODY_ID: &str = "origin-asteroid";
 const MICROMETRES_PER_METRE: f64 = 1_000_000.0;

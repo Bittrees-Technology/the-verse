@@ -414,7 +414,9 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::{EVENT_SCHEMA_VERSION, WORLD_SCHEMA_VERSION, universe_manifest};
+    use crate::{
+        EVENT_SCHEMA_VERSION, LifecycleMode, Store, WORLD_SCHEMA_VERSION, universe_manifest,
+    };
 
     fn manifest(seed: u64) -> UniverseManifestSnapshot {
         universe_manifest(seed, WORLD_SCHEMA_VERSION, EVENT_SCHEMA_VERSION)
@@ -520,5 +522,61 @@ mod tests {
             LocalCellDirectory::open(directory_root.path(), &manifest, cells),
             Err(CellDirectoryError::Json { .. })
         ));
+    }
+
+    #[test]
+    fn proof_cells_materialize_independent_fenced_lifecycle_roots() {
+        let directory_root = tempdir().expect("temporary directory");
+        let manifest = manifest(705);
+        let [origin, east] = proof_cell_keys().expect("proof keys build");
+        let directory = LocalCellDirectory::open(
+            directory_root.path(),
+            &manifest,
+            [origin.clone(), east.clone()],
+        )
+        .expect("directory opens");
+        let origin_root = directory
+            .cell_store_root(&origin)
+            .expect("origin root derives");
+        let east_root = directory.cell_store_root(&east).expect("east root derives");
+
+        let mut origin_store =
+            Store::open_for_cell(&origin_root, 705, origin.clone()).expect("origin store opens");
+        let mut origin_world = origin_store.load_world().expect("origin world loads");
+        origin_world.fencing_token = origin_store.fencing_token();
+        origin_store
+            .save_snapshot(&origin_world)
+            .expect("origin snapshot persists");
+
+        let mut east_store =
+            Store::open_for_cell(&east_root, 705, east.clone()).expect("east store opens");
+        let mut east_world = east_store.load_world().expect("east world loads");
+        east_world.fencing_token = east_store.fencing_token();
+        east_store
+            .save_snapshot(&east_world)
+            .expect("east snapshot persists");
+
+        assert_ne!(origin_store.cell_id(), east_store.cell_id());
+        assert_eq!(origin_store.cell_key(), &origin);
+        assert_eq!(east_store.cell_key(), &east);
+        assert!(!origin_world.player.by_id.is_empty());
+        assert!(east_world.player.by_id.is_empty());
+        assert!(east_world.grids.is_empty());
+        assert!(east_world.voxels.occupied.is_empty());
+
+        east_store
+            .publish_active(&east_world)
+            .expect("empty destination activates for controlled materialization");
+        east_store
+            .transition_mode(
+                LifecycleMode::Sleeping,
+                LifecycleMode::Draining,
+                &east_world,
+            )
+            .expect("empty destination drains");
+        east_store
+            .release_to_sleeping(&east_world)
+            .expect("empty destination sleeps");
+        assert_eq!(east_store.lifecycle_mode(), LifecycleMode::Sleeping);
     }
 }
