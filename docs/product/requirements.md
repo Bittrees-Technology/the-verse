@@ -14,6 +14,28 @@ Requirement IDs are stable references for issues, pull requests, tests, and rele
 - **PLAT-006 — Direct download:** macOS and Linux distribution shall not require a third-party storefront.
 - **PLAT-007 — Public interfaces:** Versioned APIs and SDKs shall permit approved third-party and Web3 applications.
 
+## Player experience and performance
+
+- **UX-001 — Trustworthy interaction:** Grounded movement, EVA, camera motion,
+  hand-tool targeting, mining, welding, cutting, inventory transfer, and block
+  placement shall meet published responsiveness and correction-quality gates
+  before equivalent construction breadth is added.
+- **UX-002 — Guided first work:** A first-session player shall be able to enter
+  a safe starter worksite and complete a server-verified
+  mine-to-haul-to-refine-to-manufacture-to-build-or-repair loop without relying
+  on an external guide.
+- **UX-003 — Irregular-delivery stability:** Client prediction,
+  interpolation, camera presentation, correction, and reconnect behavior shall
+  remain bounded and visually stable under delayed, uneven, duplicated,
+  reordered, or temporarily interrupted authoritative delivery.
+- **PERF-001 — Published simulation budgets:** Each playable milestone shall
+  publish and test finite budgets for server tick work, client frame time,
+  replication, active grids and blocks, voxel remeshing, production,
+  automation, and recovery catch-up on its supported hardware.
+- **PERF-002 — Graceful overload:** Budget pressure shall reduce detail,
+  update frequency, or active scope through explicit policy while preserving
+  authority, conservation, persistence, and recovery correctness.
+
 ## Identity and agents
 
 - **ID-001 — Passkeys:** User identity shall use WebAuthn passkeys with email-assisted onboarding and recovery.
@@ -35,6 +57,9 @@ Requirement IDs are stable references for issues, pull requests, tests, and rele
 - **WORLD-008 — Partitioned execution:** One logical universe shall be simulated by many dynamically managed cells.
 - **WORLD-009 — Canonical celestial identity:** Every materialized celestial body shall have one immutable ID and normalized hierarchical universe address pinned by a versioned registry hash. Authorized voxel edits or later rule changes shall not silently move or re-identify an existing body.
 - **WORLD-010 — Stable cell routing:** Every simulation cell shall have one canonical normalized key and deterministic ID independent of worker, process, display name, or storage path. Assignment shall use a durable monotonically increasing generation, and stale or conflicting assignments shall fail before cell mutation or state publication.
+- **WORLD-011 — Durable discovery:** Surveys, discoveries, mapped routes,
+  resource depletion, construction, damage, abandonment, and salvage shall
+  produce attributable durable history where disclosure policy permits.
 
 ## Voxels and grids
 
@@ -89,6 +114,18 @@ Requirement IDs are stable references for issues, pull requests, tests, and rele
 - **IND-003 — Formal work:** Players and agents may enter employment, delivery, mining, manufacturing, construction, defense, and service contracts.
 - **IND-004 — Verifiable completion:** Contract completion shall use authoritative events where technically possible.
 - **IND-005 — Company ownership:** Companies may own treasuries, inventories, grids, facilities, blueprints, and market positions.
+- **IND-006 — Useful-work progression:** Capability, reputation, and access
+  progression shall primarily reflect verifiable useful work rather than
+  repetitive activity without economic or social value.
+- **IND-007 — Occupational breadth:** Salvage, hauling, manufacturing,
+  construction, repair, survey, security, and logistics shall be viable
+  player and agent specializations rather than incidental side activities.
+- **IND-008 — Programmable work:** Approved scripts and autonomous workers may
+  operate machinery, logistics, vehicles, and contracts through bounded,
+  observable authority using the same conservation rules as manual play.
+- **IND-009 — Company operations:** Companies shall support scoped roles,
+  permissions, treasuries, payroll, work assignment, asset custody, and
+  auditable governance without granting members unrestricted authority.
 
 ## Markets and tokens
 
@@ -102,6 +139,9 @@ Requirement IDs are stable references for issues, pull requests, tests, and rele
 - **MKT-008 — Ordinary volatility:** Governance shall not pause or alter markets merely because of legitimate price movements, deposits, or sales.
 - **MKT-009 — Permissionless participation:** Any eligible profile may access markets, subject to the Open Metaverse governing framework, published protocol rules, and applicable nonwaivable law.
 - **MKT-010 — Canonical AMM authority:** The Verse DAO shall deploy official AMMs and provide the capital market's initial BIT and commodity liquidity under publicly recorded parameters.
+- **MKT-011 — Regional demand and scarcity:** Production, consumption,
+  depletion, transport cost, risk, and local custody shall create observable
+  regional demand and scarcity signals rather than a globally flattened price.
 
 ## Blockchain
 
@@ -127,6 +167,10 @@ Requirement IDs are stable references for issues, pull requests, tests, and rele
 - **MOD-002 — Private freedom:** Private servers may load unrestricted mods.
 - **MOD-003 — Economic isolation:** Private-server items and resources shall never enter the canonical universe or its markets.
 - **MOD-004 — UGC sales:** Approved blueprints, skins, avatars, clothing, and other content may be sold under declared licenses.
+- **MOD-005 — Shareable engineering artifacts:** Approved blueprints, control
+  scripts, automation packages, and associated test evidence shall be
+  versioned, attributable, portable through declared schemas, and subject to
+  sandbox, budget, permission, and provenance checks.
 
 ## Open source and provenance
 
