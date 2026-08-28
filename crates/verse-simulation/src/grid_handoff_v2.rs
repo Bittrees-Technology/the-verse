@@ -6,6 +6,9 @@
 //! entry point. The active protocol-18/package-v1 path remains EVA-only until
 //! the complete ADR-0024 compatibility tuple activates atomically.
 
+#[allow(dead_code)]
+pub(crate) mod state;
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
@@ -1636,7 +1639,7 @@ mod tests {
         IVec3, IntentReceipt, LocomotionSupportSnapshot, ProductionRecipeKind, Quat, ResourceKind,
     };
 
-    fn crossing_fixture() -> (WorldState, DraftGridTransferContextV2) {
+    pub(super) fn crossing_fixture() -> (WorldState, DraftGridTransferContextV2) {
         let mut source = WorldState::genesis(801);
         source.fencing_token = 11;
         let source_key = celestial::cell_origin_key();
@@ -1721,7 +1724,7 @@ mod tests {
         (source, context)
     }
 
-    fn package_fixture() -> (
+    pub(super) fn package_fixture() -> (
         WorldState,
         DraftGridTransferContextV2,
         DraftGridClosurePackageV2,

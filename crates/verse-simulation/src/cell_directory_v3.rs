@@ -16,6 +16,7 @@ use crate::cell_directory::{
     BundledPlacementPlan, BundledPlacementTransition, CellAssignmentRecord, CellAssignmentState,
     CellDirectoryError, MobileAggregateKind, TransferPhase, stage_bundled_placement_transition,
 };
+use crate::grid_handoff_v2::state::{DraftGridAbortCleanupProofV2, DraftGridTransferAbortSideV2};
 use crate::{celestial, model::valid_blake3_hex};
 
 const DRAFT_CELL_DIRECTORY_V3_SCHEMA_VERSION: u32 = 3;
@@ -65,6 +66,9 @@ struct DirectoryPhaseProofV3 {
     event_hash: String,
     world_hash: String,
     quarantine_receipt_hash: Option<String>,
+    abort_witness_hash: Option<String>,
+    resulting_draft_world_hash: Option<String>,
+    abort_removed_authority: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,6 +106,131 @@ struct CellDirectoryDocumentV3 {
     placements: BTreeMap<String, AggregatePlacementRecord>,
     transfers: BTreeMap<String, CellTransferRecordV3>,
     document_hash: String,
+}
+
+/// Read-only capability produced only after the complete dormant directory-v3
+/// document (including assignments, fencing history, and phase proofs) passes
+/// validation. Grid handoff staging consumes this view instead of reconstructing
+/// directory authority from caller-supplied booleans.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ValidatedGridTransferAuthorityV3 {
+    record: CellTransferRecordV3,
+    source_assignment: CellAssignmentRecord,
+    destination_assignment: CellAssignmentRecord,
+}
+
+impl ValidatedGridTransferAuthorityV3 {
+    pub(super) fn package_schema_version(&self) -> u32 {
+        self.record.bundle.package_schema_version
+    }
+
+    pub(super) fn receipt_schema_version(&self) -> u32 {
+        self.record.bundle.receipt_schema_version
+    }
+
+    pub(super) fn aggregate_kind(&self) -> MobileAggregateKind {
+        self.record.bundle.aggregate_kind
+    }
+
+    pub(super) fn transfer_id(&self) -> &str {
+        &self.record.transfer_id
+    }
+
+    pub(super) fn root_aggregate_id(&self) -> &str {
+        &self.record.root_aggregate_id
+    }
+
+    pub(super) fn package_hash(&self) -> &str {
+        &self.record.bundle.package_hash
+    }
+
+    pub(super) fn closure_root(&self) -> &str {
+        &self.record.bundle.closure_root
+    }
+
+    pub(super) fn conservation_root(&self) -> &str {
+        &self.record.bundle.conservation_root
+    }
+
+    pub(super) fn member_root(&self) -> &str {
+        &self.record.bundle.member_root
+    }
+
+    pub(super) fn source_cell_key(&self) -> &CellKeyV1 {
+        &self.record.source_cell_key
+    }
+
+    pub(super) fn source_cell_id(&self) -> &str {
+        &self.record.source_cell_id
+    }
+
+    pub(super) fn destination_cell_key(&self) -> &CellKeyV1 {
+        &self.record.destination_cell_key
+    }
+
+    pub(super) fn destination_cell_id(&self) -> &str {
+        &self.record.destination_cell_id
+    }
+
+    pub(super) fn source_assignment_generation(&self) -> u64 {
+        self.record.source_assignment_generation
+    }
+
+    pub(super) fn source_fencing_token(&self) -> u64 {
+        self.record.source_fencing_token
+    }
+
+    pub(super) fn destination_assignment_generation(&self) -> u64 {
+        self.record.destination_assignment_generation
+    }
+
+    pub(super) fn destination_fencing_token(&self) -> u64 {
+        self.record.destination_fencing_token
+    }
+
+    pub(super) fn members(&self) -> &[BundledPlacementMember] {
+        &self.record.bundle.members
+    }
+
+    pub(super) fn phase(&self) -> TransferPhase {
+        self.record.phase
+    }
+
+    pub(super) fn quarantine_receipt_hash(&self) -> Option<&str> {
+        self.record.quarantine_receipt_hash.as_deref()
+    }
+
+    pub(super) fn source_prepare_proven(&self) -> bool {
+        self.record.source_prepare_proof.is_some()
+    }
+
+    pub(super) fn destination_quarantine_proven(&self) -> bool {
+        self.record.destination_quarantine_proof.is_some()
+    }
+
+    pub(super) fn source_abort_proven(&self) -> bool {
+        self.record.source_abort_proof.is_some()
+    }
+
+    pub(super) fn destination_abort_proven(&self) -> bool {
+        self.record.destination_abort_proof.is_some()
+    }
+
+    pub(super) fn live_source_assignment_generation(&self) -> u64 {
+        self.source_assignment.assignment_generation
+    }
+
+    pub(super) fn live_source_fencing_token(&self) -> u64 {
+        self.source_assignment.authority_fencing_token
+    }
+
+    pub(super) fn live_destination_assignment_generation(&self) -> u64 {
+        self.destination_assignment.assignment_generation
+    }
+
+    pub(super) fn live_destination_fencing_token(&self) -> u64 {
+        self.destination_assignment.authority_fencing_token
+    }
 }
 
 impl CellTransferRecordV3 {
@@ -229,7 +358,7 @@ impl CellTransferRecordV3 {
             &self.source_cell_id,
             self.source_assignment_generation,
             source,
-            false,
+            true,
         )?;
         self.validate_phase_proof(
             self.destination_abort_proof.as_ref(),
@@ -237,7 +366,7 @@ impl CellTransferRecordV3 {
             &self.destination_cell_id,
             self.destination_assignment_generation,
             destination,
-            false,
+            true,
         )?;
 
         let has_prepare = self.source_prepare_proof.is_some();
@@ -321,6 +450,54 @@ impl CellTransferRecordV3 {
         };
         validate_hash(&proof.event_hash, "phase event")?;
         validate_hash(&proof.world_hash, "phase world")?;
+        if let Some(hash) = &proof.abort_witness_hash {
+            validate_hash(hash, "abort witness")?;
+        }
+        if let Some(hash) = &proof.resulting_draft_world_hash {
+            validate_hash(hash, "resulting draft world")?;
+        }
+        let is_abort = matches!(
+            expected_kind,
+            DirectoryPhaseProofKindV3::SourceAbort | DirectoryPhaseProofKindV3::DestinationAbort
+        );
+        let abort_binding_valid = if is_abort {
+            proof.resulting_draft_world_hash.as_deref() == Some(proof.world_hash.as_str())
+                && proof
+                    .abort_witness_hash
+                    .as_ref()
+                    .zip(proof.abort_removed_authority)
+                    .is_some_and(|(witness_hash, removed_authority)| {
+                        DraftGridAbortCleanupProofV2 {
+                            side: match expected_kind {
+                                DirectoryPhaseProofKindV3::SourceAbort => {
+                                    DraftGridTransferAbortSideV2::Source
+                                }
+                                DirectoryPhaseProofKindV3::DestinationAbort => {
+                                    DraftGridTransferAbortSideV2::Destination
+                                }
+                                _ => unreachable!("abort role was classified"),
+                            },
+                            transfer_id: proof.transfer_id.clone(),
+                            member_root: proof.member_root.clone(),
+                            package_hash: proof.package_hash.clone(),
+                            cell_id: proof.cell_id.clone(),
+                            assignment_generation: proof.assignment_generation,
+                            fencing_token: proof.fencing_token,
+                            event_sequence: proof.event_sequence,
+                            event_hash: proof.event_hash.clone(),
+                            resulting_draft_world_hash: proof.world_hash.clone(),
+                            quarantine_receipt_hash: proof.quarantine_receipt_hash.clone(),
+                            abort_witness_hash: witness_hash.clone(),
+                            removed_authority,
+                        }
+                        .validate()
+                        .is_ok()
+                    })
+        } else {
+            proof.abort_witness_hash.is_none()
+                && proof.resulting_draft_world_hash.is_none()
+                && proof.abort_removed_authority.is_none()
+        };
         if proof.kind != expected_kind
             || proof.transfer_id != self.transfer_id
             || proof.member_root != self.bundle.member_root
@@ -333,6 +510,7 @@ impl CellTransferRecordV3 {
                 .copied()
                 != Some(proof.fencing_token)
             || proof.event_sequence == 0
+            || !abort_binding_valid
             || (binds_receipt && proof.quarantine_receipt_hash != self.quarantine_receipt_hash)
             || (!binds_receipt && proof.quarantine_receipt_hash.is_some())
         {
@@ -346,6 +524,27 @@ impl CellTransferRecordV3 {
 }
 
 impl CellDirectoryDocumentV3 {
+    pub(super) fn validated_grid_transfer_authority(
+        &self,
+        transfer_id: &str,
+    ) -> Result<ValidatedGridTransferAuthorityV3, CellDirectoryError> {
+        self.validate()?;
+        let record = v3_transfer(self, transfer_id)?.clone();
+        Ok(ValidatedGridTransferAuthorityV3 {
+            source_assignment: self
+                .assignments
+                .get(&record.source_cell_id)
+                .expect("validated source assignment exists")
+                .clone(),
+            destination_assignment: self
+                .assignments
+                .get(&record.destination_cell_id)
+                .expect("validated destination assignment exists")
+                .clone(),
+            record,
+        })
+    }
+
     fn calculate_hash(&self) -> Result<String, CellDirectoryError> {
         let mut material = self.clone();
         material.document_hash.clear();
@@ -1002,6 +1201,38 @@ fn stage_v3_request_abort(
 fn stage_v3_abort_cleanup(
     document: &CellDirectoryDocumentV3,
     transfer_id: &str,
+    cleanup: &DraftGridAbortCleanupProofV2,
+) -> Result<CellDirectoryDocumentV3, CellDirectoryError> {
+    cleanup
+        .validate()
+        .map_err(|source| invalid(format!("grid abort cleanup proof is invalid: {source}")))?;
+    let proof = DirectoryPhaseProofV3 {
+        kind: match cleanup.side {
+            DraftGridTransferAbortSideV2::Source => DirectoryPhaseProofKindV3::SourceAbort,
+            DraftGridTransferAbortSideV2::Destination => {
+                DirectoryPhaseProofKindV3::DestinationAbort
+            }
+        },
+        transfer_id: cleanup.transfer_id.clone(),
+        member_root: cleanup.member_root.clone(),
+        package_hash: cleanup.package_hash.clone(),
+        cell_id: cleanup.cell_id.clone(),
+        assignment_generation: cleanup.assignment_generation,
+        fencing_token: cleanup.fencing_token,
+        event_sequence: cleanup.event_sequence,
+        event_hash: cleanup.event_hash.clone(),
+        world_hash: cleanup.resulting_draft_world_hash.clone(),
+        quarantine_receipt_hash: cleanup.quarantine_receipt_hash.clone(),
+        abort_witness_hash: Some(cleanup.abort_witness_hash.clone()),
+        resulting_draft_world_hash: Some(cleanup.resulting_draft_world_hash.clone()),
+        abort_removed_authority: Some(cleanup.removed_authority),
+    };
+    apply_v3_abort_cleanup_proof(document, transfer_id, &proof)
+}
+
+fn apply_v3_abort_cleanup_proof(
+    document: &CellDirectoryDocumentV3,
+    transfer_id: &str,
     proof: &DirectoryPhaseProofV3,
 ) -> Result<CellDirectoryDocumentV3, CellDirectoryError> {
     document.validate()?;
@@ -1412,18 +1643,25 @@ mod tests {
                 transfer.source_cell_id.clone(),
                 transfer.source_assignment_generation,
                 transfer.source_fencing_token,
-                false,
+                true,
                 b"source-abort".as_slice(),
             ),
             DirectoryPhaseProofKindV3::DestinationAbort => (
                 transfer.destination_cell_id.clone(),
                 transfer.destination_assignment_generation,
                 transfer.destination_fencing_token,
-                false,
+                true,
                 b"destination-abort".as_slice(),
             ),
         };
-        DirectoryPhaseProofV3 {
+        let world_hash = blake3::hash(&[label, b"-world"].concat())
+            .to_hex()
+            .to_string();
+        let is_abort = matches!(
+            kind,
+            DirectoryPhaseProofKindV3::SourceAbort | DirectoryPhaseProofKindV3::DestinationAbort
+        );
+        let mut proof = DirectoryPhaseProofV3 {
             kind,
             transfer_id: transfer.transfer_id.clone(),
             member_root: transfer.bundle.member_root.clone(),
@@ -1433,15 +1671,90 @@ mod tests {
             fencing_token,
             event_sequence: 41,
             event_hash: blake3::hash(label).to_hex().to_string(),
-            world_hash: blake3::hash(&[label, b"-world"].concat())
-                .to_hex()
-                .to_string(),
+            world_hash: world_hash.clone(),
             quarantine_receipt_hash: if binds_receipt {
                 transfer.quarantine_receipt_hash.clone()
             } else {
                 None
             },
+            abort_witness_hash: is_abort.then(|| {
+                blake3::hash(&[label, b"-witness"].concat())
+                    .to_hex()
+                    .to_string()
+            }),
+            resulting_draft_world_hash: is_abort.then_some(world_hash),
+            abort_removed_authority: is_abort.then_some(true),
+        };
+        if is_abort {
+            let mut cleanup = DraftGridAbortCleanupProofV2 {
+                side: match kind {
+                    DirectoryPhaseProofKindV3::SourceAbort => DraftGridTransferAbortSideV2::Source,
+                    DirectoryPhaseProofKindV3::DestinationAbort => {
+                        DraftGridTransferAbortSideV2::Destination
+                    }
+                    _ => unreachable!("abort role was classified"),
+                },
+                transfer_id: proof.transfer_id.clone(),
+                member_root: proof.member_root.clone(),
+                package_hash: proof.package_hash.clone(),
+                cell_id: proof.cell_id.clone(),
+                assignment_generation: proof.assignment_generation,
+                fencing_token: proof.fencing_token,
+                event_sequence: proof.event_sequence,
+                event_hash: proof.event_hash.clone(),
+                resulting_draft_world_hash: proof.world_hash.clone(),
+                quarantine_receipt_hash: proof.quarantine_receipt_hash.clone(),
+                abort_witness_hash: proof
+                    .abort_witness_hash
+                    .clone()
+                    .expect("abort witness hash exists"),
+                removed_authority: proof
+                    .abort_removed_authority
+                    .expect("abort removal flag exists"),
+            };
+            cleanup
+                .seal_event_hash()
+                .expect("directory abort proof seals");
+            proof.event_hash = cleanup.event_hash;
         }
+        proof
+    }
+
+    fn abort_cleanup_proof(
+        transfer: &CellTransferRecordV3,
+        side: DraftGridTransferAbortSideV2,
+        removed_authority: bool,
+    ) -> DraftGridAbortCleanupProofV2 {
+        let kind = match side {
+            DraftGridTransferAbortSideV2::Source => DirectoryPhaseProofKindV3::SourceAbort,
+            DraftGridTransferAbortSideV2::Destination => {
+                DirectoryPhaseProofKindV3::DestinationAbort
+            }
+        };
+        let proof = phase_proof(transfer, kind);
+        let mut cleanup = DraftGridAbortCleanupProofV2 {
+            side,
+            transfer_id: proof.transfer_id,
+            member_root: proof.member_root,
+            package_hash: proof.package_hash,
+            cell_id: proof.cell_id,
+            assignment_generation: proof.assignment_generation,
+            fencing_token: proof.fencing_token,
+            event_sequence: proof.event_sequence,
+            event_hash: proof.event_hash,
+            resulting_draft_world_hash: proof
+                .resulting_draft_world_hash
+                .expect("abort proof has resulting world"),
+            quarantine_receipt_hash: proof.quarantine_receipt_hash,
+            abort_witness_hash: proof
+                .abort_witness_hash
+                .expect("abort proof has witness hash"),
+            removed_authority,
+        };
+        cleanup
+            .seal_event_hash()
+            .expect("abort cleanup proof seals");
+        cleanup
     }
 
     fn finalized_document() -> CellDirectoryDocumentV3 {
@@ -1616,6 +1929,52 @@ mod tests {
     }
 
     #[test]
+    fn validated_grid_authority_view_carries_exact_phase_and_live_fences() {
+        let prepared = prepared_document();
+        let view = prepared
+            .validated_grid_transfer_authority("transfer-grid-v3-proof")
+            .expect("validated authority view derives");
+        assert_eq!(view.phase(), TransferPhase::Prepared);
+        assert_eq!(view.live_source_assignment_generation(), 1);
+        assert_eq!(view.live_source_fencing_token(), 5);
+        assert_eq!(view.live_destination_assignment_generation(), 1);
+        assert_eq!(view.live_destination_fencing_token(), 9);
+        assert!(!view.source_prepare_proven());
+        assert!(!view.destination_quarantine_proven());
+
+        let prepare_proof = phase_proof(
+            &prepared.transfers["transfer-grid-v3-proof"],
+            DirectoryPhaseProofKindV3::SourcePrepare,
+        );
+        let source_prepared =
+            stage_v3_source_prepared(&prepared, "transfer-grid-v3-proof", &prepare_proof)
+                .expect("source proof commits");
+        let receipt_hash = blake3::hash(b"authority view receipt").to_hex().to_string();
+        let mut proof_material = source_prepared.transfers["transfer-grid-v3-proof"].clone();
+        proof_material.quarantine_receipt_hash = Some(receipt_hash.clone());
+        let quarantine_proof = phase_proof(
+            &proof_material,
+            DirectoryPhaseProofKindV3::DestinationQuarantine,
+        );
+        let quarantined = stage_v3_quarantine(
+            &source_prepared,
+            "transfer-grid-v3-proof",
+            &receipt_hash,
+            &quarantine_proof,
+        )
+        .expect("quarantine commits");
+        let view = quarantined
+            .validated_grid_transfer_authority("transfer-grid-v3-proof")
+            .expect("quarantined authority view derives");
+        assert_eq!(view.phase(), TransferPhase::Quarantined);
+        assert_eq!(view.quarantine_receipt_hash(), Some(receipt_hash.as_str()));
+        assert!(view.source_prepare_proven());
+        assert!(view.destination_quarantine_proven());
+        assert!(!view.source_abort_proven());
+        assert!(!view.destination_abort_proven());
+    }
+
+    #[test]
     fn dormant_v3_transactions_advance_one_atomic_bundle_and_revision_per_phase() {
         let (initial, requested) = initial_document_and_request();
         let prepared = stage_v3_prepare(&initial, &requested).expect("bundle prepares");
@@ -1712,9 +2071,10 @@ mod tests {
             stage_v3_request_abort(&prepared, "transfer-grid-v3-proof").expect("abort begins");
         assert!(stage_v3_finalize_abort(&aborting, "transfer-grid-v3-proof").is_err());
 
-        let source_proof = phase_proof(
+        let source_proof = abort_cleanup_proof(
             &aborting.transfers["transfer-grid-v3-proof"],
-            DirectoryPhaseProofKindV3::SourceAbort,
+            DraftGridTransferAbortSideV2::Source,
+            false,
         );
         let source_clean =
             stage_v3_abort_cleanup(&aborting, "transfer-grid-v3-proof", &source_proof)
@@ -1724,9 +2084,28 @@ mod tests {
                 .expect("source cleanup retry is exact"),
             source_clean
         );
-        let destination_proof = phase_proof(
+        let mut changed_witness = source_proof.clone();
+        changed_witness.abort_witness_hash = "ab".repeat(32);
+        assert!(
+            stage_v3_abort_cleanup(&source_clean, "transfer-grid-v3-proof", &changed_witness,)
+                .is_err()
+        );
+        let mut changed_world = source_proof.clone();
+        changed_world.resulting_draft_world_hash = "cd".repeat(32);
+        assert!(
+            stage_v3_abort_cleanup(&source_clean, "transfer-grid-v3-proof", &changed_world,)
+                .is_err()
+        );
+        let mut zero_frontier = source_proof.clone();
+        zero_frontier.event_sequence = 0;
+        assert!(
+            stage_v3_abort_cleanup(&source_clean, "transfer-grid-v3-proof", &zero_frontier,)
+                .is_err()
+        );
+        let destination_proof = abort_cleanup_proof(
             &source_clean.transfers["transfer-grid-v3-proof"],
-            DirectoryPhaseProofKindV3::DestinationAbort,
+            DraftGridTransferAbortSideV2::Destination,
+            false,
         );
         let both_clean =
             stage_v3_abort_cleanup(&source_clean, "transfer-grid-v3-proof", &destination_proof)

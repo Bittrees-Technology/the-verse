@@ -542,9 +542,22 @@ supported riders, their inventories and operation histories, and internal
 contacts. Its strict canonical codec, full-collider destination containment,
 checked conservation, global subject-identity checks, external-edge rejection,
 and source/destination transfer-state conflict guards are covered by golden and
-adversarial tests. Both drafts are intentionally unreachable from the
-production directory-v2/package-v1 paths until every version in the table
-above moves in one coordinated activation.
+adversarial tests. A private draft-world-21 envelope now persists the complete
+closure lock, destination identity reservation, content-addressed quarantine
+receipt, and transfer-keyed source or destination abort witness. Its pure
+transactions require a read-only authority view derived from a fully validated
+directory-v3 document, accept successor worker fences without accepting stale
+callers, reconcile quarantine retries after the directory advances, and retain
+cleanup evidence for crash recovery even when a side had no lock or
+reservation. The directory accepts cleanup only through a dedicated proof that
+binds the exact witness hash, source or destination role, live assignment and
+fence, nonzero cleanup frontier, package/member roots, quarantine receipt, and
+resulting draft-world commitment. Committed export and import are deliberately
+absent until each production job carries durable origin-cell provenance and
+every imported queue has an explicit post-import eligibility boundary. All
+drafts are intentionally unreachable from the production
+directory-v2/package-v1 paths until every version in the table above moves in
+one coordinated activation.
 
 The first P1.7 proof archives and resets P1.6 data. A later offline migration
 must derive canonical cell keys, install one placement generation for every

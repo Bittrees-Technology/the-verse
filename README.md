@@ -147,10 +147,18 @@ strict directory-v3 codec and package-v2 closure extractor are implemented.
 The private package draft captures exact grid topology and motion, cargo,
 production FIFO/escrow, owner and supported riders, operation histories, and
 internal contacts; it independently checks containment, conservation,
-identity conflicts, and external edges. Production remains pinned to protocol
-18/directory 2/package 1 until the complete protocol-19 tuple activates
-together. Production active-player load, the production binary codec, general
-multi-cell execution, safe zones, accounts, AMMs, and blockchain settlement remain in the
+identity conflicts, and external edges. A private draft-world-21 envelope now
+freezes every closure subject, reserves every destination identity, issues an
+exact quarantine receipt, survives successor-worker fencing, and persists
+source and destination precommit-abort witnesses, all through a validated
+directory-v3 authority view. Directory abort cleanup now accepts only the
+matching witness hash, side, nonzero cleanup frontier, and resulting
+draft-world commitment. Export and import remain disabled until durable
+production-job origin and destination eligibility are modeled. Production
+remains pinned to protocol 18/directory 2/package 1 until the complete
+protocol-19 tuple activates together. Production active-player load, the
+production binary codec, general multi-cell execution, safe zones, accounts,
+AMMs, and blockchain settlement remain in the
 [delivery roadmap](docs/roadmap/roadmap.md). See [Celestial registry and
 interest-managed visibility](docs/gameplay/celestial-registry-and-interest-management.md),
 [Physical refining and manufacturing](docs/gameplay/physical-industry.md),
