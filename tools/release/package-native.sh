@@ -86,6 +86,11 @@ if [[ "${release_platform}" == "macos-arm64" ]]; then
     --headless \
     --path apps/native-client \
     --export-release "${export_preset}" "${staging_directory}/The Verse.app"
+  client_binary="${staging_directory}/The Verse.app/Contents/MacOS/The Verse"
+  arm64_client_binary="${client_binary}.arm64"
+  lipo -thin arm64 "${client_binary}" -output "${arm64_client_binary}"
+  mv "${arm64_client_binary}" "${client_binary}"
+  chmod 755 "${client_binary}"
   cp target/release/verse-simulation-worker "${staging_directory}/verse-simulation-worker"
   cp tools/release/runtime/launch-macos.command "${staging_directory}/Launch The Verse.command"
   chmod 755 \

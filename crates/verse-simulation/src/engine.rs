@@ -37,9 +37,10 @@ use crate::handoff::{
 use crate::model::PLAYER_INVENTORY_ID;
 use crate::model::{
     Block, CARGO_INVENTORY_CAPACITY_LITERS, ContactPairKey, DeathDrop, Grid, InventoryRecord,
-    Player, PlayerControlFrame, ProcessedOperationRecord, ProductionJob, WORLD_SCHEMA_VERSION,
-    WorldState, inventory_can_add_contents, planet_center, planet_surface_radius_m,
-    production_recipe_quantities, radial_up, valid_blake3_hex,
+    Player, PlayerControlFrame, ProcessedOperationRecord, ProductionJob, STARTER_GRID_ID,
+    STARTER_INDUSTRY_GRID_ID, WORLD_SCHEMA_VERSION, WorldState, inventory_can_add_contents,
+    planet_center, planet_surface_radius_m, production_recipe_quantities, radial_up,
+    valid_blake3_hex,
 };
 use crate::persistence::{
     CellLifecycleStatus, DurableTransferBoundary, PersistenceError, Store, SystemTrustedClock,
@@ -60,6 +61,7 @@ const PLAYER_BODY_ID: &str = "player-body-player-local";
 const PLAYER_COLLIDER_ID: &str = "player-collider-player-local";
 pub(crate) const PLANET_BODY_ID: &str = "planet-body-khepri-prime";
 const PLANET_COLLIDER_ID: &str = "planet-collider-khepri-prime";
+const EARTH_START_PROFILE_MARKER_BLOCK_ID: &str = "block-outpost-floor-x0-z0";
 const MAX_GRID_CONTROL_INPUT: f64 = 1.0;
 const CONTROL_INPUT_EPSILON: f64 = 1.0e-9;
 // Godot's standard Vector3 uses float32 components. Normalizing in float32 and
@@ -915,6 +917,205 @@ impl Runtime {
         self.physics.is_some()
     }
 
+    /// Replaces only the event-zero development fixture with a canonical
+    /// surface outpost. The profile is opt-in so ordinary genesis, established
+    /// universes, and the orbital proof remain unchanged.
+    pub fn configure_earth_start_playtest(&mut self) -> Result<bool, RuntimeError> {
+        if self.halted {
+            return Err(RuntimeError::Halted);
+        }
+        if self.state.event_sequence != 0 {
+            return Err(IntentError::rejected(
+                "earth_start_requires_fresh_world",
+                "the Earthlike surface start can be selected only before the first canonical event",
+            )
+            .into());
+        }
+        if self
+            .state
+            .grids
+            .get(STARTER_INDUSTRY_GRID_ID)
+            .is_some_and(|grid| {
+                grid.blocks
+                    .contains_key(EARTH_START_PROFILE_MARKER_BLOCK_ID)
+            })
+        {
+            return Ok(false);
+        }
+
+        let mut next_state = self.state.clone();
+        let center = planet_center();
+        let surface_radius = planet_surface_radius_m();
+        let player_position = Vec3::new(center.x, center.y + surface_radius + 0.92, center.z + 6.5);
+        let player_address = next_state
+            .address_for_active_position(player_position)
+            .map_err(|message| {
+                IntentError::rejected("earth_start_player_address_invalid", message)
+            })?;
+        {
+            let player = next_state.player.primary_mut();
+            player.address = player_address;
+            player.position = player_position;
+            // Identity looks toward local -Z, placing the open outpost directly
+            // in front of the player at this north-pole tangent patch.
+            player.orientation = Quat::IDENTITY;
+            player.linear_velocity = Vec3::ZERO;
+            player.angular_velocity = Vec3::ZERO;
+            player.surface_contact = false;
+            player.locomotion.kind = LocomotionKind::Airborne;
+            player.locomotion.up = radial_up(player_position);
+            player.locomotion.view_pitch_radians = 0.0;
+            player.locomotion.support = None;
+            player.locomotion.jump_held = false;
+            player.locomotion.jump_buffer_expires_at_simulation_tick = 0;
+            player.locomotion.support_grace_expires_at_simulation_tick = 0;
+            player.locomotion.magnetic_boots_enabled = false;
+            player.locomotion.magnetic_reattach_after_simulation_tick = 0;
+            player.pending_control_frames.clear();
+            player.control_linear_input = Vec3::ZERO;
+            player.control_angular_input = Vec3::ZERO;
+            player.boost = false;
+            player.dampeners = true;
+            player.jump = false;
+            player.control_expires_at_simulation_tick = 0;
+            player.helmet_closed = false;
+            player.jetpack_enabled = false;
+        }
+
+        let skiff_position = Vec3::new(
+            center.x + 9.0,
+            center.y + surface_radius + 0.52,
+            center.z - 1.0,
+        );
+        let skiff_address = next_state
+            .address_for_active_position(skiff_position)
+            .map_err(|message| {
+                IntentError::rejected("earth_start_skiff_address_invalid", message)
+            })?;
+        let skiff = next_state
+            .grids
+            .get_mut(STARTER_GRID_ID)
+            .expect("genesis always contains the starter skiff");
+        skiff.address = skiff_address;
+        skiff.position = skiff_position;
+        skiff.orientation = Quat::IDENTITY;
+        skiff.linear_velocity = Vec3::ZERO;
+        skiff.angular_velocity = Vec3::ZERO;
+        skiff.control_linear_input = Vec3::ZERO;
+        skiff.control_angular_input = Vec3::ZERO;
+        skiff.dampeners = true;
+        skiff.anchored = false;
+
+        let outpost_position = Vec3::new(center.x, center.y + surface_radius + 0.52, center.z);
+        let outpost_address = next_state
+            .address_for_active_position(outpost_position)
+            .map_err(|message| {
+                IntentError::rejected("earth_start_outpost_address_invalid", message)
+            })?;
+        let outpost = next_state
+            .grids
+            .get_mut(STARTER_INDUSTRY_GRID_ID)
+            .expect("genesis always contains the starter industry grid");
+        outpost.address = outpost_address;
+        outpost.position = outpost_position;
+        outpost.orientation = Quat::IDENTITY;
+        outpost.linear_velocity = Vec3::ZERO;
+        outpost.angular_velocity = Vec3::ZERO;
+        outpost.control_linear_input = Vec3::ZERO;
+        outpost.control_angular_input = Vec3::ZERO;
+        outpost.dampeners = true;
+        outpost.anchored = false;
+
+        for (block_id, coordinate) in [
+            ("block-industry-core", IVec3::new(-2, 1, -1)),
+            ("block-industry-power", IVec3::new(-1, 1, -1)),
+            ("block-industry-cargo", IVec3::new(-2, 1, 0)),
+            ("block-conveyor", IVec3::new(-1, 1, 0)),
+            ("block-refinery", IVec3::new(0, 1, 0)),
+            ("block-assembler", IVec3::new(1, 1, 0)),
+        ] {
+            outpost
+                .blocks
+                .get_mut(block_id)
+                .expect("genesis industry block exists")
+                .coordinate = coordinate;
+        }
+
+        let mut added_installed_components = 0_u64;
+        let mut add_structure = |block_id: String, coordinate: IVec3| {
+            let block = Block::new(block_id.clone(), coordinate, BlockKind::Structural);
+            added_installed_components =
+                added_installed_components.saturating_add(block.component_cost);
+            assert!(outpost.blocks.insert(block_id, block).is_none());
+        };
+        for x in -4..=4 {
+            for z in -3..=3 {
+                add_structure(
+                    format!("block-outpost-floor-x{x}-z{z}"),
+                    IVec3::new(x, 0, z),
+                );
+            }
+        }
+        for x in -4..=4 {
+            for y in 1..=2 {
+                add_structure(
+                    format!("block-outpost-back-x{x}-y{y}"),
+                    IVec3::new(x, y, -3),
+                );
+            }
+        }
+        for x in [-4, 4] {
+            for z in -2..=1 {
+                for y in 1..=2 {
+                    add_structure(
+                        format!("block-outpost-side-x{x}-y{y}-z{z}"),
+                        IVec3::new(x, y, z),
+                    );
+                }
+            }
+        }
+        // A low front rail frames the entrance while keeping the player's
+        // first route into the workshop completely open.
+        for x in [-4, -3, 3, 4] {
+            add_structure(
+                format!("block-outpost-front-rail-x{x}"),
+                IVec3::new(x, 1, 2),
+            );
+        }
+        next_state.ledger.genesis_installed_components = next_state
+            .ledger
+            .genesis_installed_components
+            .checked_add(added_installed_components)
+            .ok_or_else(|| {
+                IntentError::rejected(
+                    "earth_start_component_ledger_overflow",
+                    "surface outpost installed components exceed the canonical ledger",
+                )
+            })?;
+
+        next_state
+            .validate_player_roster()
+            .map_err(|message| IntentError::rejected("earth_start_authority_invalid", message))?;
+        if !next_state.conservation().valid {
+            return Err(IntentError::ConservationViolation {
+                event_sequence: next_state.event_sequence,
+            }
+            .into());
+        }
+        let next_physics =
+            if self.store.lifecycle_mode() == crate::persistence::LifecycleMode::Active {
+                let mut physics = Scene::new(physics_scene_config())?;
+                physics.rebuild(&physics_body_specs(&next_state))?;
+                Some(physics)
+            } else {
+                None
+            };
+        self.store.save_snapshot(&next_state)?;
+        self.state = next_state;
+        self.physics = next_physics;
+        Ok(true)
+    }
+
     pub fn next_production_occurrence(&self) -> Option<&ProductionScheduleOccurrence> {
         self.store.next_production_occurrence()
     }
@@ -958,10 +1159,10 @@ impl Runtime {
         player_id.clone_into(&mut player.player_id);
         let roster_offset =
             u32::try_from(next_state.player.by_id.len()).map_or(f64::from(u32::MAX), f64::from);
-        // Keep the loopback co-op fixture inside the starter asteroid's hand-
-        // tool envelope while giving each suit a visibly distinct spawn. The
-        // character collision layer already prevents these nearby capsules
-        // from pushing or becoming locomotion support for one another.
+        // Keep the loopback co-op fixture inside the same local encounter while
+        // giving each suit a visibly distinct spawn. The character collision
+        // layer already prevents these nearby capsules from pushing or becoming
+        // locomotion support for one another.
         player.position.y += 1.5 * roster_offset;
         player.address = next_state
             .address_for_active_position(player.position)
@@ -972,7 +1173,11 @@ impl Runtime {
         player.linear_velocity = Vec3::ZERO;
         player.angular_velocity = Vec3::ZERO;
         player.surface_contact = false;
-        player.locomotion.kind = LocomotionKind::Eva;
+        player.locomotion.kind = if player.jetpack_enabled {
+            LocomotionKind::Eva
+        } else {
+            LocomotionKind::Airborne
+        };
         player.locomotion.up = radial_up(player.position);
         player.locomotion.view_pitch_radians = 0.0;
         player.locomotion.support = None;
@@ -995,8 +1200,6 @@ impl Runtime {
         player.experience = 0;
         player.career = CareerSnapshot::default();
         player.suit_oxygen_milli = 1_000;
-        player.helmet_closed = true;
-        player.jetpack_enabled = true;
         player.life_state = PlayerLifeState::Alive;
         next_state.player.by_id.insert(player_id.to_owned(), player);
         next_state.inventories.insert(
@@ -8005,6 +8208,129 @@ mod tests {
                 .expect("production journal contains an event"),
         )
         .expect("production event parses")
+    }
+
+    #[test]
+    fn earth_start_profile_builds_a_valid_breathable_surface_outpost() {
+        let mut runtime = runtime();
+        let installed_before = runtime.state().ledger.genesis_installed_components;
+
+        assert!(
+            runtime
+                .configure_earth_start_playtest()
+                .expect("fresh surface profile configures")
+        );
+
+        let state = runtime.state();
+        let player = state.player.primary();
+        let environment = state.environment_at(player.position);
+        let outpost = state
+            .grids
+            .get(STARTER_INDUSTRY_GRID_ID)
+            .expect("surface outpost exists");
+        let skiff = state
+            .grids
+            .get(STARTER_GRID_ID)
+            .expect("surface skiff exists");
+        assert!(environment.breathable);
+        assert!(!player.jetpack_enabled);
+        assert!(!player.helmet_closed);
+        assert_eq!(player.locomotion.kind, LocomotionKind::Airborne);
+        assert!(
+            outpost
+                .blocks
+                .contains_key(EARTH_START_PROFILE_MARKER_BLOCK_ID)
+        );
+        assert_eq!(outpost.blocks.len(), 107);
+        assert!(!outpost.anchored);
+        assert!(!skiff.anchored);
+        assert_eq!(
+            state.ledger.genesis_installed_components,
+            installed_before + 101
+        );
+        assert!(state.validate_player_roster().is_ok());
+        assert!(state.conservation().valid);
+        assert!(
+            !runtime
+                .configure_earth_start_playtest()
+                .expect("surface profile is idempotent")
+        );
+    }
+
+    #[test]
+    fn earth_start_profile_persists_before_gameplay() {
+        let directory = tempdir().expect("tempdir");
+        let expected_hash = {
+            let mut runtime = Runtime::open(directory.path(), 42, 5).expect("fresh runtime opens");
+            runtime
+                .configure_earth_start_playtest()
+                .expect("surface profile configures");
+            runtime.state().state_hash()
+        };
+
+        let recovered = Runtime::open(directory.path(), 42, 5).expect("surface profile reopens");
+        assert_eq!(recovered.state().state_hash(), expected_hash);
+        assert!(
+            recovered
+                .state()
+                .grids
+                .get(STARTER_INDUSTRY_GRID_ID)
+                .is_some_and(|grid| grid
+                    .blocks
+                    .contains_key(EARTH_START_PROFILE_MARKER_BLOCK_ID))
+        );
+    }
+
+    #[test]
+    fn earth_start_player_settles_into_server_authoritative_grounded_motion() {
+        let mut runtime = runtime();
+        runtime
+            .configure_earth_start_playtest()
+            .expect("surface profile configures");
+
+        for _ in 0..120 {
+            runtime.advance(16).expect("surface physics advances");
+        }
+
+        let player = runtime.state().player.primary();
+        let character = &content::manifest().character;
+        assert_eq!(player.locomotion.kind, LocomotionKind::Grounded);
+        assert!(
+            player
+                .locomotion
+                .support
+                .as_ref()
+                .is_some_and(|support| support.body_id == PLANET_BODY_ID)
+        );
+        assert!(
+            (player.position - planet_center()).magnitude()
+                >= planet_surface_radius_m() + character.standing_height_m * 0.5 - 0.08
+        );
+        assert!(runtime.state().conservation().valid);
+    }
+
+    #[test]
+    fn earth_start_profile_cannot_rewrite_canonical_history() {
+        let mut runtime = runtime();
+        runtime.state.event_sequence = 1;
+
+        let error = runtime
+            .configure_earth_start_playtest()
+            .expect_err("played universe cannot be rewritten");
+        assert!(
+            error
+                .to_string()
+                .contains("before the first canonical event")
+        );
+        assert!(
+            !runtime
+                .state()
+                .grids
+                .get(STARTER_INDUSTRY_GRID_ID)
+                .expect("orbital industry fixture remains")
+                .blocks
+                .contains_key(EARTH_START_PROFILE_MARKER_BLOCK_ID)
+        );
     }
 
     #[test]

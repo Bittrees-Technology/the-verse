@@ -3,7 +3,8 @@
 set -euo pipefail
 
 package_directory="$(cd "$(dirname "$0")" && pwd)"
-universe_directory="${VERSE_DATA_DIR:-${HOME}/Library/Application Support/The Verse/universe}"
+universe_directory="${VERSE_DATA_DIR:-${HOME}/Library/Application Support/The Verse Earth Playtest/universe}"
+genesis_profile="${VERSE_GENESIS_PROFILE:-earth-start}"
 export VERSE_BROWSER_VERIFIER_ASSET_DIR="${package_directory}/browser-verifier"
 server_pid=""
 
@@ -18,13 +19,14 @@ trap cleanup EXIT INT TERM
 mkdir -p "${universe_directory}"
 "${package_directory}/verse-simulation-worker" \
   --data-directory "${universe_directory}" \
+  --genesis-profile "${genesis_profile}" \
   --bind 127.0.0.1:7777 \
   >"${universe_directory}/server.log" 2>&1 &
 server_pid="$!"
 
 for _ in {1..200}; do
   if curl --fail --silent http://127.0.0.1:7777/healthz >/dev/null; then
-    "${package_directory}/The Verse.app/Contents/MacOS/The Verse" \
+    /usr/bin/arch -arm64 "${package_directory}/The Verse.app/Contents/MacOS/The Verse" \
       -- --server=ws://127.0.0.1:7777/ws
     exit 0
   fi

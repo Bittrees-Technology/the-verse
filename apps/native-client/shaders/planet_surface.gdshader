@@ -2,8 +2,9 @@ shader_type spatial;
 render_mode diffuse_burley, specular_schlick_ggx, cull_back, depth_draw_opaque;
 
 uniform sampler2D planet_albedo : source_color, repeat_enable, filter_linear_mipmap_anisotropic;
+uniform vec3 outpost_direction = vec3(0.0, 1.0, 0.0);
 
-varying vec3 terrain_position;
+varying vec3 planet_direction;
 
 float hash31(vec3 point) {
 	point = fract(point * 0.1031);
@@ -34,23 +35,47 @@ float terrain_noise(vec3 point) {
 }
 
 void vertex() {
-	vec3 radial = normalize(VERTEX);
-	float broad = terrain_noise(radial * 5.2);
-	float ridges = abs(terrain_noise(radial * 19.0) - 0.5) * 2.0;
-	float displacement = (broad - 0.50) * 18.0 + ridges * 3.2;
-	VERTEX += radial * displacement;
-	terrain_position = VERTEX;
+	// The authoritative body is a sphere. Keeping presentation on that same
+	// surface prevents feet, vehicles, and the outpost from disappearing into
+	// decorative terrain that has no matching collider.
+	planet_direction = normalize(VERTEX);
 }
 
 void fragment() {
-	vec3 radial = normalize(terrain_position);
-	float detail = terrain_noise(radial * 34.0);
-	float mineral = terrain_noise(radial * 76.0 + vec3(8.0, 2.0, 11.0));
+	vec3 radial = normalize(planet_direction);
+	float continental = terrain_noise(radial * 3.4 + vec3(2.7, 8.1, 4.3));
+	float regional = terrain_noise(radial * 11.0 + vec3(9.0, 1.5, 6.0));
+	float detail = terrain_noise(radial * 46.0 + vec3(3.0, 7.0, 2.0));
 	vec3 mapped_surface = texture(planet_albedo, UV).rgb;
-	vec3 mineral_tint = mix(vec3(0.78, 0.88, 0.90), vec3(0.72, 0.48, 0.31), mineral);
-	vec3 finished_surface = mapped_surface * mineral_tint * mix(0.92, 1.20, detail);
-	ALBEDO = finished_surface * 1.18;
-	EMISSION = finished_surface * 0.055;
-	ROUGHNESS = mix(0.96, 0.72, mineral);
-	METALLIC = smoothstep(0.90, 0.99, mineral) * 0.10;
+	float texture_value = dot(mapped_surface, vec3(0.30, 0.55, 0.15));
+	float polar_land = smoothstep(0.70, 0.96, abs(radial.y)) * 0.10;
+	float outpost_patch = smoothstep(0.990, 0.9985, dot(radial, normalize(outpost_direction)));
+	float land_field = continental * 0.72 + regional * 0.20 + texture_value * 0.08 + polar_land + outpost_patch * 0.14;
+	float land = smoothstep(0.49, 0.535, land_field);
+	float coast = smoothstep(0.49, 0.57, land_field);
+
+	vec3 deep_ocean = vec3(0.012, 0.085, 0.19);
+	vec3 shelf_ocean = vec3(0.025, 0.30, 0.43);
+	vec3 ocean = mix(deep_ocean, shelf_ocean, smoothstep(0.36, 0.52, land_field));
+	vec3 dry_land = vec3(0.43, 0.34, 0.16);
+	vec3 grassland = vec3(0.12, 0.34, 0.12);
+	vec3 forest = vec3(0.035, 0.19, 0.085);
+	vec3 vegetation = mix(grassland, forest, smoothstep(0.45, 0.78, regional));
+	vec3 ground = mix(dry_land, vegetation, smoothstep(0.34, 0.66, detail));
+	ground = mix(ground, vec3(0.08, 0.30, 0.10), outpost_patch * 0.82);
+	float mountain = smoothstep(0.61, 0.76, land_field + detail * 0.10);
+	mountain *= 1.0 - outpost_patch * 0.92;
+	ground = mix(ground, vec3(0.36, 0.38, 0.36), mountain);
+	float snow = smoothstep(0.76, 0.94, abs(radial.y) + mountain * 0.18);
+	snow *= 1.0 - outpost_patch;
+	ground = mix(ground, vec3(0.88, 0.93, 0.95), snow * mountain);
+	vec3 coast_color = vec3(0.63, 0.58, 0.34);
+	ground = mix(coast_color, ground, coast);
+
+	vec3 finished_surface = mix(ocean, ground, land);
+	ALBEDO = finished_surface * mix(0.90, 1.10, detail);
+	EMISSION = finished_surface * 0.018;
+	ROUGHNESS = mix(0.24, 0.88, land);
+	METALLIC = 0.0;
+	SPECULAR = mix(0.78, 0.30, land);
 }

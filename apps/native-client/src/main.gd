@@ -263,6 +263,8 @@ var message_label: Label
 var connection_label: Label
 var selected_label: Label
 var mission_label: Label
+var operation_title_label: Label
+var contract_title_label: Label
 var level_label: Label
 var telemetry_label: Label
 var interaction_label: Label
@@ -291,6 +293,7 @@ var recovery_button: Button
 var handoff_overlay: Control
 var handoff_title_label: Label
 var handoff_detail_label: Label
+var scene_environment: Environment
 
 var rock_material: Material
 var block_materials: Dictionary = {}
@@ -322,6 +325,7 @@ func _process(delta: float) -> void:
 	_poll_socket()
 	_advance_mutation_transport(delta)
 	_update_player_presentation(delta)
+	_update_environment_presentation(delta)
 	_update_target()
 	_update_tool_action(delta)
 	_update_viewmodel(delta)
@@ -786,19 +790,19 @@ func _add_key_action(action: StringName, keycode: Key) -> void:
 
 func _build_environment() -> void:
 	var world_environment := WorldEnvironment.new()
-	var environment := Environment.new()
-	environment.background_mode = Environment.BG_COLOR
-	environment.background_color = Color(0.006, 0.016, 0.032)
-	environment.ambient_light_source = Environment.AMBIENT_SOURCE_COLOR
-	environment.ambient_light_color = Color(0.20, 0.28, 0.42)
-	environment.ambient_light_energy = 0.38
-	environment.tonemap_mode = Environment.TONE_MAPPER_FILMIC
-	environment.fog_enabled = true
-	environment.fog_light_color = Color(0.055, 0.11, 0.16)
-	environment.fog_light_energy = 0.34
-	environment.fog_density = 0.00004
-	environment.fog_sky_affect = 0.18
-	world_environment.environment = environment
+	scene_environment = Environment.new()
+	scene_environment.background_mode = Environment.BG_COLOR
+	scene_environment.background_color = Color(0.006, 0.016, 0.032)
+	scene_environment.ambient_light_source = Environment.AMBIENT_SOURCE_COLOR
+	scene_environment.ambient_light_color = Color(0.20, 0.28, 0.42)
+	scene_environment.ambient_light_energy = 0.38
+	scene_environment.tonemap_mode = Environment.TONE_MAPPER_FILMIC
+	scene_environment.fog_enabled = true
+	scene_environment.fog_light_color = Color(0.055, 0.11, 0.16)
+	scene_environment.fog_light_energy = 0.34
+	scene_environment.fog_density = 0.00004
+	scene_environment.fog_sky_affect = 0.18
+	world_environment.environment = scene_environment
 	add_child(world_environment)
 
 	var key_light := DirectionalLight3D.new()
@@ -880,6 +884,55 @@ func _build_environment() -> void:
 	_build_orbital_dust()
 	_build_target_highlight()
 	_build_action_feedback()
+
+
+func _update_environment_presentation(delta: float) -> void:
+	if scene_environment == null:
+		return
+	var environment := _local_environment()
+	var density := clampf(float(environment.get("atmosphere_density", 0.0)), 0.0, 1.0)
+	var atmosphere_blend := smoothstep(0.08, 0.55, density)
+	var response := 1.0 - exp(-maxf(delta, 0.0) * 3.5)
+	var space_background := Color(0.006, 0.016, 0.032)
+	var surface_sky := Color(0.12, 0.39, 0.72)
+	var space_ambient := Color(0.20, 0.28, 0.42)
+	var surface_ambient := Color(0.48, 0.63, 0.78)
+	var space_fog := Color(0.055, 0.11, 0.16)
+	var surface_haze := Color(0.23, 0.50, 0.72)
+	var target_background := space_background.lerp(surface_sky, atmosphere_blend)
+	var target_ambient := space_ambient.lerp(surface_ambient, atmosphere_blend)
+	var target_fog := space_fog.lerp(surface_haze, atmosphere_blend)
+	scene_environment.background_color = scene_environment.background_color.lerp(
+		target_background, response
+	)
+	scene_environment.ambient_light_color = scene_environment.ambient_light_color.lerp(
+		target_ambient, response
+	)
+	scene_environment.ambient_light_energy = lerpf(
+		scene_environment.ambient_light_energy,
+		lerpf(0.38, 0.82, atmosphere_blend),
+		response,
+	)
+	scene_environment.fog_light_color = scene_environment.fog_light_color.lerp(
+		target_fog, response
+	)
+	scene_environment.fog_light_energy = lerpf(
+		scene_environment.fog_light_energy,
+		lerpf(0.34, 0.92, atmosphere_blend),
+		response,
+	)
+	scene_environment.fog_density = lerpf(
+		scene_environment.fog_density,
+		lerpf(0.00004, 0.0012, atmosphere_blend),
+		response,
+	)
+	scene_environment.fog_sky_affect = lerpf(
+		scene_environment.fog_sky_affect,
+		lerpf(0.18, 0.88, atmosphere_blend),
+		response,
+	)
+	if stars_root != null:
+		stars_root.visible = atmosphere_blend < 0.55
 
 
 func _material(color: Color, roughness: float, metallic: float) -> StandardMaterial3D:
@@ -974,8 +1027,9 @@ func _rebuild_registered_celestials() -> void:
 		mesh.height = radius * 2.0
 		mesh.radial_segments = 192 if body.get("kind", "") == "planet" else 64
 		mesh.rings = 96 if body.get("kind", "") == "planet" else 32
+		var surface_material: ShaderMaterial = null
 		if descriptor == "khepri-prime-terrestrial-v1":
-			var surface_material := ShaderMaterial.new()
+			surface_material = ShaderMaterial.new()
 			surface_material.shader = PLANET_SHADER
 			surface_material.set_shader_parameter("planet_albedo", PLANET_TEXTURE)
 			mesh.material = surface_material
@@ -994,6 +1048,11 @@ func _rebuild_registered_celestials() -> void:
 			float(orientation.get("y", 0)) / 1_000_000.0,
 			float(orientation.get("z", 0)) / 1_000_000.0
 		)
+		if surface_material != null:
+			var outpost_direction := visual.basis.inverse() * Vector3.UP
+			surface_material.set_shader_parameter(
+				"outpost_direction", outpost_direction.normalized()
+			)
 		planet_root.add_child(visual)
 		celestial_visuals[String(body.get("body_id", ""))] = visual
 		var atmosphere_height := float(body.get("atmosphere_height_um", 0)) / 1_000_000.0
@@ -1281,12 +1340,12 @@ func _build_interface() -> void:
 	accent.size = Vector2(430.0, 2.0)
 	top_bar.add_child(accent)
 
-	var title := Label.new()
-	title.text = "THE VERSE  //  ORBITAL OPERATIONS"
-	title.position = Vector2(24.0, 13.0)
-	title.add_theme_font_size_override("font_size", 19)
-	title.add_theme_color_override("font_color", Color(0.78, 0.91, 0.98))
-	top_bar.add_child(title)
+	operation_title_label = Label.new()
+	operation_title_label.text = "THE VERSE  //  ORBITAL OPERATIONS"
+	operation_title_label.position = Vector2(24.0, 13.0)
+	operation_title_label.add_theme_font_size_override("font_size", 19)
+	operation_title_label.add_theme_color_override("font_color", Color(0.78, 0.91, 0.98))
+	top_bar.add_child(operation_title_label)
 
 	connection_label = Label.new()
 	connection_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
@@ -1328,9 +1387,9 @@ func _build_interface() -> void:
 	var mission_heading := _hud_label("ACTIVE CONTRACT // PRIORITY", Vector2(17.0, 14.0), 11)
 	mission_heading.add_theme_color_override("font_color", Color(1.0, 0.35, 0.12))
 	mission_panel.add_child(mission_heading)
-	var contract_name := _hud_label("WAKE THE KHEPRI RELAY", Vector2(17.0, 39.0), 18)
-	contract_name.add_theme_color_override("font_color", Color(0.90, 0.94, 0.96))
-	mission_panel.add_child(contract_name)
+	contract_title_label = _hud_label("WAKE THE KHEPRI RELAY", Vector2(17.0, 39.0), 18)
+	contract_title_label.add_theme_color_override("font_color", Color(0.90, 0.94, 0.96))
+	mission_panel.add_child(contract_title_label)
 	mission_label = _hud_label("Awaiting authoritative career record…", Vector2(17.0, 76.0), 14)
 	mission_label.size = Vector2(350.0, 145.0)
 	mission_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
@@ -6567,6 +6626,23 @@ func _owned_death_drop_recorded(player: Dictionary) -> bool:
 
 
 func _update_interface() -> void:
+	var environment := _local_environment()
+	var surface_operations := (
+		bool(environment.get("breathable", false))
+		and float(environment.get("altitude_m", INF)) < 25.0
+	)
+	if operation_title_label != null:
+		operation_title_label.text = (
+			"THE VERSE  //  KHEPRI SURFACE OPERATIONS"
+			if surface_operations
+			else "THE VERSE  //  ORBITAL OPERATIONS"
+		)
+	if contract_title_label != null:
+		contract_title_label.text = (
+			"KHEPRI OUTPOST COMMISSIONING"
+			if surface_operations
+			else "WAKE THE KHEPRI RELAY"
+		)
 	var link_text := "○ RELAY OFFLINE // F5 TO RETRY"
 	if connected:
 		match replication_state:
@@ -6644,7 +6720,6 @@ func _update_interface() -> void:
 		if life_support_state != "normal"
 		else Color(0.64, 0.90, 0.94)
 	)
-	var environment := _local_environment()
 	var gravity_g := float(environment.get("gravity_m_s2", 0.0)) / 9.80665
 	var atmosphere_percent := roundi(float(environment.get("atmosphere_density", 0.0)) * 100.0)
 	status_label.text = (

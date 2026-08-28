@@ -9,8 +9,9 @@ approve the unsigned development build in System Settings.
 
 Linux: run "./the-verse" from a terminal. The initial target is x86_64 Ubuntu.
 
-The launcher starts a server bound only to 127.0.0.1:7777, stores the universe
-in the platform user-data directory, then connects the native client. The local
+The launcher starts a server bound only to 127.0.0.1:7777, creates a fresh
+Earthlike surface playtest in its own platform user-data directory, then
+connects the native client. Existing orbital saves are not changed. The local
 browser command center is available at http://127.0.0.1:7777 while playing.
 Both clients independently verify each authorized interest view before applying
 it or acknowledging it; verifier failure closes the stream without a fallback.
