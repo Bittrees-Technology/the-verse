@@ -1077,6 +1077,32 @@ impl WorldState {
         &self,
         production_job_frontier_is_valid: impl Fn(&ProductionJob) -> bool,
     ) -> Result<(), String> {
+        self.validate_player_roster_with_identity_and_job_frontier(
+            WorldIdentityExpectation::ActiveProtocol18,
+            production_job_frontier_is_valid,
+        )
+    }
+
+    /// Validates a schema-20 gameplay body only in its dormant schema-21
+    /// envelope context. The opaque manifest capability prevents a caller from
+    /// supplying a raw hash or a manifest-4/world-21 hybrid.
+    #[allow(dead_code)]
+    pub(crate) fn validate_world_v21_gameplay_body_with_job_frontier(
+        &self,
+        manifest: &crate::manifest_v5::ValidatedUniverseManifestV5,
+        production_job_frontier_is_valid: impl Fn(&ProductionJob) -> bool,
+    ) -> Result<(), String> {
+        self.validate_player_roster_with_identity_and_job_frontier(
+            WorldIdentityExpectation::DormantProtocol19(manifest),
+            production_job_frontier_is_valid,
+        )
+    }
+
+    fn validate_player_roster_with_identity_and_job_frontier(
+        &self,
+        identity: WorldIdentityExpectation<'_>,
+        production_job_frontier_is_valid: impl Fn(&ProductionJob) -> bool,
+    ) -> Result<(), String> {
         if self.schema_version != WORLD_SCHEMA_VERSION {
             return Err(format!(
                 "world schema {} does not match required schema {WORLD_SCHEMA_VERSION}",
@@ -1096,12 +1122,29 @@ impl WorldState {
         }
         let registry = celestial::registry_snapshot(self.world_seed)
             .map_err(|source| format!("world celestial registry is invalid: {source}"))?;
-        let universe_manifest = celestial::universe_manifest(
-            self.world_seed,
-            WORLD_SCHEMA_VERSION,
-            crate::event::EVENT_SCHEMA_VERSION,
-        )
-        .map_err(|source| format!("world universe manifest is invalid: {source}"))?;
+        let expected_manifest_hash = match identity {
+            WorldIdentityExpectation::ActiveProtocol18 => {
+                celestial::universe_manifest(
+                    self.world_seed,
+                    WORLD_SCHEMA_VERSION,
+                    crate::event::EVENT_SCHEMA_VERSION,
+                )
+                .map_err(|source| format!("world universe manifest is invalid: {source}"))?
+                .manifest_hash
+            }
+            WorldIdentityExpectation::DormantProtocol19(manifest) => {
+                if manifest.world_seed() != self.world_seed
+                    || manifest.universe_id() != self.universe_id
+                    || manifest.document().celestial_registry_hash != registry.registry_hash
+                {
+                    return Err(
+                        "world-21 gameplay body does not match its validated manifest-5 identity"
+                            .into(),
+                    );
+                }
+                manifest.manifest_hash().to_owned()
+            }
+        };
         let cell_key = celestial::cell_key_from_address(&self.cell_address)
             .map_err(|source| format!("world cell key is invalid: {source}"))?;
         let expected_cell_id = celestial::cell_id(&cell_key)
@@ -1125,7 +1168,7 @@ impl WorldState {
                 && self.voxels.ferrite_ore.is_empty()
         };
         if self.universe_id != registry.universe_id
-            || self.universe_manifest_hash != universe_manifest.manifest_hash
+            || self.universe_manifest_hash != expected_manifest_hash
             || self.celestial_registry_hash != registry.registry_hash
             || self.cell_id != expected_cell_id
             || !body_binding_valid
@@ -2368,6 +2411,13 @@ impl WorldState {
             breathable: atmosphere_density >= 0.35 && oxygen_fraction >= 0.18,
         }
     }
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+enum WorldIdentityExpectation<'a> {
+    ActiveProtocol18,
+    DormantProtocol19(&'a crate::manifest_v5::ValidatedUniverseManifestV5),
 }
 
 fn local_body_center(origin: &UniverseAddress, body_center: &UniverseAddress) -> Vec3 {

@@ -546,6 +546,15 @@ substitution. This does not activate the tuple: the world-21 envelope's nested
 gameplay body must still be migrated from its manifest-4 validation path before
 directory-v3 or the world-21 Store may accept the capability.
 
+The core world validator now keeps those contexts disjoint. An active
+protocol-18 world still requires schema 20 and its exact manifest-4 identity. A
+schema-20 gameplay body nested inside the dormant schema-21 envelope instead
+requires the non-serializable validated manifest-5 capability; manifest-4 bytes
+cannot cross that gate, manifest-5 bodies fail the active validator, and a
+capability for another seed or universe cannot authorize the body. Manifest 5
+lives at the neutral simulation layer so neither the core world model nor the
+future Store depends back on the handoff subsystem.
+
 Implementation is staged behind that boundary. The private directory-v3 draft
 already validates ordered grid-and-rider membership, closure and conservation
 roots, package and receipt schemas, historical cell fences, phase-specific
