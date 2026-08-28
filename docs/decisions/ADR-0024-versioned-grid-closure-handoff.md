@@ -118,6 +118,35 @@ material. Destination observers receive one complete current public grid and
 public riders. Actor-private state remains visible only to its authorized
 player.
 
+### Dormant world-21 Store initialization
+
+Protocol-19 cell state uses the isolated `protocol-19-world-v21` namespace;
+the active protocol-18 Store never reads it. Initialization holds one exclusive
+writer lock and persists a canonical identity, manifest-5 document, world-21
+snapshot, empty event-17 journal, and a sealed initialization head. The head is
+the commit marker and is written last. It binds the complete protocol tuple,
+identity, manifest, migration anchor, snapshot, and zero-length event frontier.
+The caller must supply an already durable per-cell root. The namespace
+directory is committed by synchronizing that root, and each authority
+replacement is synchronized before the head is installed.
+
+Recovery requires an externally routed cell key and verifies its canonical
+cell ID against both identity and snapshot. Moving a complete, otherwise valid
+cell namespace onto another cell's route fails closed. A missing head grants no
+authority; while holding the writer lock, initialization may remove only the
+known precommit authority files and their temporary files, synchronize that
+cleanup, and retry. An I/O or metadata error while checking the head is not
+absence and fails closed without cleanup. Once a head exists, initialization
+never overwrites it and ordinary recovery must validate every bounded
+canonical file. The recovery-only slice refuses all event-17 records and
+remains test-only until a validated migration-target install capability and
+durable append protocol exist.
+
+Rollback removes the entire unactivated protocol-19 namespace or restores it
+as one matching compatibility set. Copying individual identity, manifest,
+snapshot, journal, or head files between cells or protocol versions is not a
+supported rollback.
+
 ## Compatibility and migration
 
 Upgrade is refused while either proof cell contains a nonterminal protocol-18
