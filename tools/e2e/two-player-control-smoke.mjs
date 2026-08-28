@@ -19,6 +19,9 @@ const CHARACTER_EYE_OFFSET = 1.62 - 1.8 / 2;
 const CHARACTER_MAXIMUM_ANGULAR_SPEED = 2.5;
 const TOOL_RANGE = 9.0;
 const TARGET_ALIGNMENT_RADIANS = 0.006;
+const RECOVERY_WINDOW_MILLIS = 10_000;
+const MAX_RECOVERIES_PER_WINDOW = 4;
+const RECOVERY_WINDOW_GUARD_MILLIS = 50;
 let targetingOperationSequence = 0;
 
 class ProtocolClient {
@@ -31,6 +34,7 @@ class ProtocolClient {
     this.committedOperationSequence = 0;
     this.lastProjectedOperationSequence = 0;
     this.operationSequenceById = new Map();
+    this.snapshotRequestTimes = [];
     this.lastFatal = undefined;
     this.interestStream = new Protocol16InterestStream({
       expectedPlayerId: playerId,
@@ -128,6 +132,23 @@ class ProtocolClient {
 
   operationSequenceFor(operationId) {
     return this.operationSequenceById.get(operationId);
+  }
+
+  async requestSnapshot() {
+    for (;;) {
+      const now = Date.now();
+      this.snapshotRequestTimes = this.snapshotRequestTimes.filter(
+        (requestedAt) => now - requestedAt < RECOVERY_WINDOW_MILLIS,
+      );
+      if (this.snapshotRequestTimes.length < MAX_RECOVERIES_PER_WINDOW) break;
+      const delay =
+        RECOVERY_WINDOW_MILLIS -
+        (now - this.snapshotRequestTimes[0]) +
+        RECOVERY_WINDOW_GUARD_MILLIS;
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+    this.snapshotRequestTimes.push(Date.now());
+    this.send({ type: "request_snapshot" });
   }
 
   async connect() {
@@ -687,8 +708,7 @@ async function waitForCommonVoxelRemoval(
   // Two observer sessions may therefore hold different valid chunk revisions
   // at the same canonical event frontier. Rebase each view and require both
   // independently to expose the committed removal.
-  local.send({ type: "request_snapshot" });
-  remote.send({ type: "request_snapshot" });
+  await Promise.all([local.requestSnapshot(), remote.requestSnapshot()]);
   const predicate = (message) =>
     message.type === "interest_state" &&
     message.projection.event_sequence >= minimumEventSequence &&
@@ -840,8 +860,7 @@ async function requestCommonSnapshot(
   minimumSequence,
   description,
 ) {
-  local.send({ type: "request_snapshot" });
-  remote.send({ type: "request_snapshot" });
+  await Promise.all([local.requestSnapshot(), remote.requestSnapshot()]);
   return waitForCommonSnapshot(
     local,
     remote,
