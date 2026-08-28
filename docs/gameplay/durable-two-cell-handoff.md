@@ -579,9 +579,24 @@ includes installed components, advances a draft cell-event frontier, and seals
 acyclic mutation, event, resulting-world, and final proof hashes. It rejects
 partial state, ledger or witness tampering, proof substitution, overflow, and
 later-phase retries without the exact directory-retained final proof hash.
-Destination materialization/import, destination activation, source
-finalization, the explicit transfer-paused production outcome, and crash/replay
-integration remain to be implemented before activation. All drafts are
+World 21 now also has strict dormant state models for the destination side. A
+pending import lock and its per-machine production eligibility records are
+part of the active-world commitment, while the completed import record remains
+historical and therefore cannot self-commit its resulting active-world hash.
+The pending record nests the exact validated quarantine reservation and typed
+source-export proof, matches their package, member, receipt, ledger and time
+evidence, and binds destination fence, event, lifecycle, conservation,
+eligibility root, and mutation witness. The typed import proof then adds the
+resulting world and a separate final proof hash. Canonical decode rejects
+unknown fields, substituted source evidence, non-monotonic import time, changed
+event material, and tampered historical records. This is persistence authority,
+not a materialization claim. Until distinct authenticated activation and
+eligibility-release witnesses exist, restart validation requires every
+committed import to retain its exact pending lock and complete machine-hold
+set; advancing an unrelated event cannot erase either authority. Destination
+materialization/import, destination activation, source finalization, the
+explicit transfer-paused production outcome, and crash/replay integration
+remain to be implemented before activation. All drafts are
 intentionally unreachable from the production directory-v2/package-v1 paths
 until every version in the table above moves in one coordinated activation.
 

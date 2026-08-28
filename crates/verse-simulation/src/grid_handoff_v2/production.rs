@@ -321,6 +321,31 @@ impl DraftImportedProductionEligibilityV2 {
         &self.eligibility_hash
     }
 
+    pub(super) fn validate_persisted_import_boundary(
+        &self,
+        transfer_id: &str,
+        package_hash: &str,
+        boundary: &ValidatedDraftGridImportBoundaryV2,
+    ) -> Result<(), DraftGridClosureError> {
+        self.validate()?;
+        if self.transfer_id != transfer_id
+            || self.package_hash != package_hash
+            || self.destination_assignment_generation
+                != boundary.destination_assignment_generation()
+            || self.destination_fencing_token != boundary.destination_fencing_token()
+            || self.import_event_sequence != boundary.import_event_sequence()
+            || self.import_event_hash != boundary.import_event_hash()
+            || self.trusted_import_unix_ms != boundary.trusted_import_unix_ms()
+            || self.destination_production_lifecycle_generation
+                != boundary.destination_production_lifecycle_generation()
+        {
+            return Err(DraftGridClosureError::Invalid(
+                "persisted import eligibility changed its sealed import boundary".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn validate_for_import(
         &self,
         package: &DraftGridClosurePackageV2,
@@ -431,6 +456,21 @@ impl DraftImportedProductionEligibilityV2 {
     ) -> Self {
         let mut record = self.clone();
         record.ordered_job_ids = ordered_job_ids;
+        record.eligibility_hash.clear();
+        record.eligibility_hash = record.calculate_hash().expect("test record reseals");
+        record
+    }
+
+    #[cfg(test)]
+    pub(super) fn resealed_with_trusted_import_unix_ms_for_test(
+        &self,
+        trusted_import_unix_ms: u64,
+    ) -> Self {
+        let mut record = self.clone();
+        record.trusted_import_unix_ms = trusted_import_unix_ms;
+        record.eligible_at_unix_ms = trusted_import_unix_ms
+            .checked_add(PRODUCTION_IMPORT_REARM_MILLIS)
+            .expect("test trusted import time remains in range");
         record.eligibility_hash.clear();
         record.eligibility_hash = record.calculate_hash().expect("test record reseals");
         record

@@ -178,9 +178,20 @@ the exact mutation witness, conservation vector, and trusted export time so a
 restart can reconstruct and validate that typed proof instead of trusting an
 opaque hash. Directory v3 now requires
 that durable source-export proof before import and a destination-activation
-proof before source finalization. Destination materialization, activation,
-source finalization, scheduler wiring, and the crash matrix remain disabled
-until their atomic transactions are implemented. Production remains
+proof before source finalization. The draft-world envelope now also reserves
+three destination-import persistence families: a live pending-activation lock,
+live per-machine production holds, and a historical import record excluded
+from the active-world hash. The typed import proof binds the nested validated
+source-export proof, original quarantine evidence, monotonic trusted times,
+destination event and fence, exact ledger vector, production lifecycle/root,
+resulting active world, and separate acyclic mutation and final proof hashes.
+These records and their strict codec validation are dormant models only.
+restart validation retains the complete pending lock and machine-hold set until
+future authenticated activation and eligibility-release witnesses replace
+them. An unrelated later cell event cannot silently discard either authority.
+Destination materialization, activation, source finalization, scheduler wiring,
+and the crash matrix remain disabled until their atomic transactions are
+implemented. Production remains
 pinned to protocol 18/directory 2/package 1 until the complete protocol-19
 tuple activates together. Production active-player load, the
 production binary codec, general multi-cell execution, safe zones, accounts,
