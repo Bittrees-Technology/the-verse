@@ -57,6 +57,14 @@ pub fn valid_blake3_hex(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
+fn valid_transfer_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+}
+
 pub fn radial_up(position: Vec3) -> Vec3 {
     let radial = position - planet_center();
     let magnitude = radial.magnitude();
@@ -777,6 +785,34 @@ pub struct TransferConservationWitness {
     pub contents: InventoryContents,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlayerTransferLock {
+    pub transfer_id: String,
+    pub package_hash: String,
+    pub destination_cell_id: String,
+    pub prior_placement_generation: u64,
+    pub resulting_placement_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlayerTransferReservation {
+    pub transfer_id: String,
+    pub package_hash: String,
+    pub receipt_hash: String,
+    pub source_cell_id: String,
+    pub destination_cell_id: String,
+    pub player_id: String,
+    pub inventory_id: String,
+    pub destination_assignment_generation: u64,
+    pub destination_fencing_token: u64,
+    pub destination_event_sequence: u64,
+    pub destination_world_hash: String,
+    pub prior_placement_generation: u64,
+    pub resulting_placement_generation: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ContactPairKey {
     pub body_a: String,
@@ -845,6 +881,10 @@ pub struct WorldState {
     pub ledger: Ledger,
     #[serde(default)]
     pub transfer_witnesses: BTreeMap<String, TransferConservationWitness>,
+    #[serde(default)]
+    pub player_transfer_locks: BTreeMap<String, PlayerTransferLock>,
+    #[serde(default)]
+    pub player_transfer_reservations: BTreeMap<String, PlayerTransferReservation>,
     pub processed_operations: BTreeMap<String, ActorOperationHistory>,
 }
 
@@ -1407,6 +1447,50 @@ impl WorldState {
             }
         }
 
+        let mut locked_transfer_ids = BTreeSet::new();
+        for (player_id, lock) in &self.player_transfer_locks {
+            if !valid_player_id(player_id)
+                || self.player.get(player_id).is_none()
+                || !valid_transfer_id(&lock.transfer_id)
+                || !valid_blake3_hex(&lock.package_hash)
+                || !valid_blake3_hex(&lock.destination_cell_id)
+                || lock.prior_placement_generation == 0
+                || lock.prior_placement_generation.checked_add(1)
+                    != Some(lock.resulting_placement_generation)
+                || !locked_transfer_ids.insert(lock.transfer_id.as_str())
+                || self.transfer_witnesses.contains_key(&lock.transfer_id)
+            {
+                return Err("player transfer locks must bind one present player and canonical package generation".into());
+            }
+        }
+
+        let mut reserved_player_ids = BTreeSet::new();
+        let mut reserved_inventory_ids = BTreeSet::new();
+        for (transfer_id, reservation) in &self.player_transfer_reservations {
+            if transfer_id != &reservation.transfer_id
+                || !valid_transfer_id(transfer_id)
+                || !valid_blake3_hex(&reservation.package_hash)
+                || !valid_blake3_hex(&reservation.receipt_hash)
+                || !valid_blake3_hex(&reservation.source_cell_id)
+                || !valid_blake3_hex(&reservation.destination_cell_id)
+                || !valid_player_id(&reservation.player_id)
+                || !valid_transfer_id(&reservation.inventory_id)
+                || reservation.destination_assignment_generation == 0
+                || reservation.destination_fencing_token == 0
+                || !valid_blake3_hex(&reservation.destination_world_hash)
+                || reservation.prior_placement_generation == 0
+                || reservation.prior_placement_generation.checked_add(1)
+                    != Some(reservation.resulting_placement_generation)
+                || self.player.get(&reservation.player_id).is_some()
+                || self.inventories.contains_key(&reservation.inventory_id)
+                || !reserved_player_ids.insert(reservation.player_id.as_str())
+                || !reserved_inventory_ids.insert(reservation.inventory_id.as_str())
+                || self.transfer_witnesses.contains_key(transfer_id)
+            {
+                return Err("player transfer reservations must bind unique absent subject IDs and canonical quarantine material".into());
+            }
+        }
+
         let mut imported = InventoryContents::default();
         let mut exported = InventoryContents::default();
         for (transfer_id, witness) in &self.transfer_witnesses {
@@ -1817,6 +1901,8 @@ impl WorldState {
                 ..Ledger::default()
             },
             transfer_witnesses: BTreeMap::new(),
+            player_transfer_locks: BTreeMap::new(),
+            player_transfer_reservations: BTreeMap::new(),
             processed_operations: BTreeMap::new(),
         }
     }
@@ -1870,6 +1956,8 @@ impl WorldState {
             death_drops: BTreeMap::new(),
             ledger: Ledger::default(),
             transfer_witnesses: BTreeMap::new(),
+            player_transfer_locks: BTreeMap::new(),
+            player_transfer_reservations: BTreeMap::new(),
             processed_operations: BTreeMap::new(),
         };
         state.validate_player_roster()?;

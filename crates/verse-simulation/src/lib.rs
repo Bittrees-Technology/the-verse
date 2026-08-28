@@ -36,12 +36,13 @@ pub use handoff::{
     HandoffArtifactError, HandoffError, LocalHandoffArtifactStore, MAX_TRANSFER_ARTIFACT_BYTES,
     PlayerTransferConservation, PlayerTransferContext, PlayerTransferPackage,
     PlayerTransferQuarantineReceipt, TRANSFER_PACKAGE_SCHEMA_VERSION, prepare_eva_player_transfer,
-    quarantine_eva_player_transfer, stage_committed_eva_export, stage_committed_eva_import,
+    quarantine_eva_player_transfer, stage_aborted_eva_unlock, stage_committed_eva_export,
+    stage_committed_eva_import, stage_eva_player_quarantine, stage_prepared_eva_lock,
 };
 pub use model::{
-    ActorOperationHistory, Block, Grid, InventoryRecord, Ledger, Player, ProductionClock,
-    TransferConservationWitness, TransferWitnessDirection, VoxelField, WORLD_SCHEMA_VERSION,
-    WorldState,
+    ActorOperationHistory, Block, Grid, InventoryRecord, Ledger, Player, PlayerTransferLock,
+    PlayerTransferReservation, ProductionClock, TransferConservationWitness,
+    TransferWitnessDirection, VoxelField, WORLD_SCHEMA_VERSION, WorldState,
 };
 pub use persistence::{CellLifecycleStatus, LifecycleMode, PersistenceError, Store, TrustedClock};
 pub use projection::{
