@@ -8,11 +8,11 @@ use std::sync::OnceLock;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use verse_protocol::{
-    CELESTIAL_REGISTRY_SCHEMA_VERSION, CelestialBodyKind, CelestialBodySnapshot,
-    CelestialRegistrySnapshot, CelestialScaleClass, CellCoordinate, I64Vec3,
-    LIFECYCLE_CONTROL_SCHEMA_VERSION, PRODUCTION_SCHEDULE_OCCURRENCE_SCHEMA_VERSION,
-    SectorCoordinate, UNIVERSE_MANIFEST_SCHEMA_VERSION, UniverseAddress, UniverseManifestSnapshot,
-    Vec3,
+    CELESTIAL_REGISTRY_SCHEMA_VERSION, CELL_KEY_SCHEMA_VERSION, CelestialBodyKind,
+    CelestialBodySnapshot, CelestialRegistrySnapshot, CelestialScaleClass, CellCoordinate,
+    CellKeyV1, I64Vec3, LIFECYCLE_CONTROL_SCHEMA_VERSION,
+    PRODUCTION_SCHEDULE_OCCURRENCE_SCHEMA_VERSION, SectorCoordinate,
+    UNIVERSE_MANIFEST_SCHEMA_VERSION, UniverseAddress, UniverseManifestSnapshot, Vec3,
 };
 
 use crate::content;
@@ -193,6 +193,88 @@ pub fn cell_origin_address() -> UniverseAddress {
         },
         local_um: I64Vec3::ZERO,
     }
+}
+
+pub fn cell_origin_key() -> CellKeyV1 {
+    cell_key_from_address(&cell_origin_address())
+        .expect("embedded origin address is a canonical cell key")
+}
+
+pub fn cell_key_from_address(address: &UniverseAddress) -> Result<CellKeyV1, CelestialError> {
+    validate_universe_address(address, &address.universe_id)?;
+    Ok(CellKeyV1 {
+        schema_version: CELL_KEY_SCHEMA_VERSION,
+        universe_id: address.universe_id.clone(),
+        sector: address.sector.clone(),
+        cell: address.cell,
+    })
+}
+
+pub fn cell_address_from_key(key: &CellKeyV1) -> Result<UniverseAddress, CelestialError> {
+    validate_cell_key(key)?;
+    Ok(cell_address_from_parts(key))
+}
+
+pub fn validate_cell_key(key: &CellKeyV1) -> Result<(), CelestialError> {
+    if key.schema_version != CELL_KEY_SCHEMA_VERSION {
+        return Err(CelestialError::InvalidAddress(format!(
+            "cell-key schema {} does not match required schema {CELL_KEY_SCHEMA_VERSION}",
+            key.schema_version
+        )));
+    }
+    validate_universe_address(&cell_address_from_parts(key), &key.universe_id)
+}
+
+fn cell_address_from_parts(key: &CellKeyV1) -> UniverseAddress {
+    UniverseAddress {
+        universe_id: key.universe_id.clone(),
+        sector: key.sector.clone(),
+        cell: key.cell,
+        local_um: I64Vec3::ZERO,
+    }
+}
+
+pub fn neighbor_cell_key(key: &CellKeyV1, delta: [i32; 3]) -> Result<CellKeyV1, CelestialError> {
+    validate_cell_key(key)?;
+    let sectors = [&key.sector.x, &key.sector.y, &key.sector.z];
+    let cells = [key.cell.x, key.cell.y, key.cell.z];
+    let mut normalized_sectors = [0_i128; 3];
+    let mut normalized_cells = [0_u32; 3];
+    for axis in 0..3 {
+        let sector = sectors[axis]
+            .parse::<i128>()
+            .map_err(|_| CelestialError::AddressOverflow)?;
+        let requested_cell = i128::from(cells[axis])
+            .checked_add(i128::from(delta[axis]))
+            .ok_or(CelestialError::AddressOverflow)?;
+        let (sector, cell, local_um) = normalize_axis(sector, requested_cell, 0)?;
+        debug_assert_eq!(local_um, 0);
+        normalized_sectors[axis] = sector;
+        normalized_cells[axis] = cell;
+    }
+    Ok(CellKeyV1 {
+        schema_version: CELL_KEY_SCHEMA_VERSION,
+        universe_id: key.universe_id.clone(),
+        sector: SectorCoordinate {
+            x: normalized_sectors[0].to_string(),
+            y: normalized_sectors[1].to_string(),
+            z: normalized_sectors[2].to_string(),
+        },
+        cell: CellCoordinate {
+            x: normalized_cells[0],
+            y: normalized_cells[1],
+            z: normalized_cells[2],
+        },
+    })
+}
+
+pub fn cell_id(key: &CellKeyV1) -> Result<String, CelestialError> {
+    validate_cell_key(key)?;
+    let bytes = canonical_json_bytes(key)?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"the-verse/cell-key/v1\0");
+    hasher.update(&bytes);
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 pub fn validate_universe_address(
@@ -1006,6 +1088,66 @@ mod tests {
             Ok((-1, 999, 9_999_999_999))
         );
         assert!(normalize_axis(i128::MAX, 999, i128::from(CELL_EDGE_UM)).is_err());
+    }
+
+    #[test]
+    fn cell_keys_have_stable_identity_and_neighbor_carries() {
+        let origin = cell_origin_key();
+        assert_eq!(origin.schema_version, CELL_KEY_SCHEMA_VERSION);
+        assert_eq!(origin.sector.x, "0");
+        assert_eq!(origin.cell.x, 500);
+        assert_eq!(
+            cell_address_from_key(&origin).expect("origin key becomes an address"),
+            cell_origin_address()
+        );
+
+        let east = neighbor_cell_key(&origin, [1, 0, 0]).expect("east neighbor derives");
+        assert_eq!(east.sector.x, "0");
+        assert_eq!(east.cell.x, 501);
+        assert_ne!(cell_id(&origin), cell_id(&east));
+
+        let mut low = origin.clone();
+        low.sector.x = "0".into();
+        low.cell.x = 0;
+        let west = neighbor_cell_key(&low, [-1, 0, 0]).expect("west neighbor carries");
+        assert_eq!(west.sector.x, "-1");
+        assert_eq!(west.cell.x, 999);
+
+        let mut high = origin.clone();
+        high.sector.y = "-2".into();
+        high.cell.y = 999;
+        let north = neighbor_cell_key(&high, [0, 1, 0]).expect("north neighbor carries");
+        assert_eq!(north.sector.y, "-1");
+        assert_eq!(north.cell.y, 0);
+    }
+
+    #[test]
+    fn cell_key_identity_has_cross_platform_golden_hashes() {
+        let origin = cell_origin_key();
+        let east = neighbor_cell_key(&origin, [1, 0, 0]).expect("east neighbor derives");
+        assert_eq!(
+            cell_id(&origin).expect("origin cell hashes"),
+            "5110e8ef07316dc5fc8cd48210915d3e879779c67dc3e11a9da0402656c76d17"
+        );
+        assert_eq!(
+            cell_id(&east).expect("east cell hashes"),
+            "e24242afc42c71a9629093e0c82b1779e306e92c52804ebc105ef373fa5a8f4d"
+        );
+    }
+
+    #[test]
+    fn cell_keys_reject_noncanonical_or_wrong_schema_material() {
+        let mut key = cell_origin_key();
+        key.sector.x = "-0".into();
+        assert!(validate_cell_key(&key).is_err());
+
+        let mut key = cell_origin_key();
+        key.cell.z = CELLS_PER_SECTOR_AXIS;
+        assert!(validate_cell_key(&key).is_err());
+
+        let mut key = cell_origin_key();
+        key.schema_version += 1;
+        assert!(validate_cell_key(&key).is_err());
     }
 
     #[test]

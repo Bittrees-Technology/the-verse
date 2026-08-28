@@ -3,6 +3,7 @@
 //! Server-authoritative simulation kernel for The Verse P0 playable proof.
 
 mod celestial;
+mod cell_directory;
 mod content;
 mod engine;
 mod event;
@@ -11,7 +12,14 @@ mod persistence;
 mod projection;
 mod targeting;
 
-pub use celestial::{CelestialError, registry_snapshot, universe_manifest};
+pub use celestial::{
+    CelestialError, cell_address_from_key, cell_id, cell_key_from_address, cell_origin_key,
+    neighbor_cell_key, registry_snapshot, universe_manifest, validate_cell_key,
+};
+pub use cell_directory::{
+    CELL_DIRECTORY_SCHEMA_VERSION, CellAssignmentRecord, CellAssignmentState, CellDirectoryError,
+    LocalCellDirectory, proof_cell_keys,
+};
 pub use content::ContentManifest;
 pub use engine::{
     AdvanceImpact, AdvanceOutcome, IntentError, ProductionDispatchOutcome, Runtime, RuntimeError,

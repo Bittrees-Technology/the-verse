@@ -19,6 +19,7 @@ pub const INTEREST_SCHEMA_VERSION: u32 = 1;
 pub const INTENT_FINGERPRINT_SCHEMA_VERSION: u32 = 1;
 pub const LIFECYCLE_CONTROL_SCHEMA_VERSION: u32 = 1;
 pub const PRODUCTION_SCHEDULE_OCCURRENCE_SCHEMA_VERSION: u32 = 1;
+pub const CELL_KEY_SCHEMA_VERSION: u32 = 1;
 
 /// An exact bounded local coordinate in integer micrometres.
 #[derive(
@@ -68,6 +69,18 @@ pub struct UniverseAddress {
     pub sector: SectorCoordinate,
     pub cell: CellCoordinate,
     pub local_um: I64Vec3,
+}
+
+/// Stable execution-cell identity without a cell-local position. Routing,
+/// assignment, and persistence use this canonical key rather than a worker
+/// name, display alias, or filesystem path.
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CellKeyV1 {
+    pub schema_version: u32,
+    pub universe_id: String,
+    pub sector: SectorCoordinate,
+    pub cell: CellCoordinate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
