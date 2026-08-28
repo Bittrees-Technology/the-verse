@@ -13,8 +13,8 @@ use verse_protocol::CellKeyV1;
 
 use crate::cell_directory::{
     AggregatePlacementRecord, AggregatePlacementState, BundledPlacementMember,
-    BundledPlacementPlan, CellAssignmentRecord, CellAssignmentState, CellDirectoryError,
-    MobileAggregateKind, TransferPhase,
+    BundledPlacementPlan, BundledPlacementTransition, CellAssignmentRecord, CellAssignmentState,
+    CellDirectoryError, MobileAggregateKind, TransferPhase, stage_bundled_placement_transition,
 };
 use crate::{celestial, model::valid_blake3_hex};
 
@@ -105,6 +105,20 @@ struct CellDirectoryDocumentV3 {
 }
 
 impl CellTransferRecordV3 {
+    fn immutable_material_matches(&self, other: &Self) -> bool {
+        self.transfer_id == other.transfer_id
+            && self.root_aggregate_id == other.root_aggregate_id
+            && self.source_cell_key == other.source_cell_key
+            && self.source_cell_id == other.source_cell_id
+            && self.destination_cell_key == other.destination_cell_key
+            && self.destination_cell_id == other.destination_cell_id
+            && self.source_assignment_generation == other.source_assignment_generation
+            && self.source_fencing_token == other.source_fencing_token
+            && self.destination_assignment_generation == other.destination_assignment_generation
+            && self.destination_fencing_token == other.destination_fencing_token
+            && self.bundle == other.bundle
+    }
+
     fn bundled_plan(&self) -> Result<BundledPlacementPlan, CellDirectoryError> {
         let plan = BundledPlacementPlan {
             root_aggregate_id: self.root_aggregate_id.clone(),
@@ -620,6 +634,30 @@ impl CellDirectoryDocumentV3 {
         }
 
         for (aggregate_id, placement) in &self.placements {
+            if placement.placement_generation > 1 {
+                let mut origins = advance_index
+                    .keys()
+                    .filter(|(candidate_id, generation, _)| {
+                        candidate_id == aggregate_id && *generation == 1
+                    });
+                let (_, _, origin_cell_id) = origins.next().ok_or_else(|| {
+                    invalid(format!(
+                        "v3 placement {aggregate_id} has no durable generation-one origin"
+                    ))
+                })?;
+                if origins.next().is_some() {
+                    return Err(invalid(format!(
+                        "v3 placement {aggregate_id} has ambiguous generation-one history"
+                    )));
+                }
+                Self::validate_later_member_history(
+                    aggregate_id,
+                    1,
+                    origin_cell_id,
+                    placement,
+                    &advance_index,
+                )?;
+            }
             if let Some(transfer_id) = &placement.active_transfer_id {
                 let transfer = self.transfers.get(transfer_id).ok_or_else(|| {
                     invalid(format!(
@@ -670,6 +708,413 @@ impl CellDirectoryDocumentV3 {
             )));
         }
         Ok(())
+    }
+}
+
+fn stage_v3_prepare(
+    document: &CellDirectoryDocumentV3,
+    requested: &CellTransferRecordV3,
+) -> Result<CellDirectoryDocumentV3, CellDirectoryError> {
+    document.validate()?;
+    if requested.phase != TransferPhase::Prepared
+        || requested.quarantine_receipt_hash.is_some()
+        || requested.source_prepare_proof.is_some()
+        || requested.destination_quarantine_proof.is_some()
+        || requested.import_proof.is_some()
+        || requested.finalization_proof.is_some()
+        || requested.source_abort_proof.is_some()
+        || requested.destination_abort_proof.is_some()
+    {
+        return Err(conflict(
+            &requested.transfer_id,
+            "v3 prepare request contains post-prepare evidence",
+        ));
+    }
+    let plan = requested.validate_identity(&requested.transfer_id)?;
+    let source = document
+        .assignments
+        .get(&requested.source_cell_id)
+        .ok_or_else(|| invalid("v3 prepare source assignment is unknown"))?;
+    let destination = document
+        .assignments
+        .get(&requested.destination_cell_id)
+        .ok_or_else(|| invalid("v3 prepare destination assignment is unknown"))?;
+    requested.validate_phase_proofs(source, destination)?;
+    if let Some(existing) = document.transfers.get(&requested.transfer_id) {
+        if existing.immutable_material_matches(requested) {
+            return Ok(document.clone());
+        }
+        return Err(conflict(
+            &requested.transfer_id,
+            "v3 transfer ID is already bound to different immutable material",
+        ));
+    }
+    if source.cell_key != requested.source_cell_key
+        || destination.cell_key != requested.destination_cell_key
+        || source.state != CellAssignmentState::Assigned
+        || destination.state != CellAssignmentState::Assigned
+        || source.assignment_generation != requested.source_assignment_generation
+        || source.authority_fencing_token != requested.source_fencing_token
+        || destination.assignment_generation != requested.destination_assignment_generation
+        || destination.authority_fencing_token != requested.destination_fencing_token
+        || !are_face_neighbors(&requested.source_cell_key, &requested.destination_cell_key)
+    {
+        return Err(conflict(
+            &requested.transfer_id,
+            "v3 prepare route does not match current cell authority",
+        ));
+    }
+
+    let placements = stage_bundled_placement_transition(
+        &document.placements,
+        &plan,
+        &requested.transfer_id,
+        &requested.bundle.member_root,
+        BundledPlacementTransition::Prepare,
+    )?;
+    let mut next = document.clone();
+    next.placements = placements;
+    next.transfers
+        .insert(requested.transfer_id.clone(), requested.clone());
+    finish_v3_transaction(document, next)
+}
+
+fn stage_v3_source_prepared(
+    document: &CellDirectoryDocumentV3,
+    transfer_id: &str,
+    proof: &DirectoryPhaseProofV3,
+) -> Result<CellDirectoryDocumentV3, CellDirectoryError> {
+    document.validate()?;
+    let current = v3_transfer(document, transfer_id)?.clone();
+    if let Some(existing) = &current.source_prepare_proof {
+        if existing == proof {
+            return Ok(document.clone());
+        }
+        return Err(conflict(
+            transfer_id,
+            "v3 source-prepare retry changed its durable proof",
+        ));
+    }
+    if current.phase != TransferPhase::Prepared {
+        return Err(conflict(
+            transfer_id,
+            "v3 source-prepare proof arrived after prepare phase",
+        ));
+    }
+    let mut next = document.clone();
+    next.transfers
+        .get_mut(transfer_id)
+        .expect("validated v3 transfer exists")
+        .source_prepare_proof = Some(proof.clone());
+    finish_v3_transaction(document, next)
+}
+
+fn stage_v3_quarantine(
+    document: &CellDirectoryDocumentV3,
+    transfer_id: &str,
+    receipt_hash: &str,
+    proof: &DirectoryPhaseProofV3,
+) -> Result<CellDirectoryDocumentV3, CellDirectoryError> {
+    document.validate()?;
+    validate_hash(receipt_hash, "quarantine receipt")?;
+    let current = v3_transfer(document, transfer_id)?.clone();
+    if current.quarantine_receipt_hash.is_some() || current.destination_quarantine_proof.is_some() {
+        if current.quarantine_receipt_hash.as_deref() == Some(receipt_hash)
+            && current.destination_quarantine_proof.as_ref() == Some(proof)
+        {
+            return Ok(document.clone());
+        }
+        return Err(conflict(
+            transfer_id,
+            "v3 quarantine retry changed its receipt or durable proof",
+        ));
+    }
+    if current.phase != TransferPhase::Prepared || current.source_prepare_proof.is_none() {
+        return Err(conflict(
+            transfer_id,
+            "v3 transfer is not awaiting its first quarantine proof",
+        ));
+    }
+    let mut next = document.clone();
+    let transfer = next
+        .transfers
+        .get_mut(transfer_id)
+        .expect("validated v3 transfer exists");
+    transfer.quarantine_receipt_hash = Some(receipt_hash.to_owned());
+    transfer.destination_quarantine_proof = Some(proof.clone());
+    transfer.phase = TransferPhase::Quarantined;
+    finish_v3_transaction(document, next)
+}
+
+fn stage_v3_commit(
+    document: &CellDirectoryDocumentV3,
+    transfer_id: &str,
+    expected_member_root: &str,
+) -> Result<CellDirectoryDocumentV3, CellDirectoryError> {
+    document.validate()?;
+    validate_hash(expected_member_root, "member root")?;
+    let current = v3_transfer(document, transfer_id)?.clone();
+    if current.bundle.member_root != expected_member_root {
+        return Err(conflict(
+            transfer_id,
+            "v3 commit member root changed after prepare",
+        ));
+    }
+    if matches!(
+        current.phase,
+        TransferPhase::Committed | TransferPhase::Imported | TransferPhase::Finalized
+    ) {
+        return Ok(document.clone());
+    }
+    if current.phase != TransferPhase::Quarantined
+        || current.source_prepare_proof.is_none()
+        || current.destination_quarantine_proof.is_none()
+    {
+        return Err(conflict(
+            transfer_id,
+            "v3 transfer is not quarantined with complete durable evidence",
+        ));
+    }
+    let plan = current.bundled_plan()?;
+    let placements = stage_bundled_placement_transition(
+        &document.placements,
+        &plan,
+        transfer_id,
+        &current.bundle.member_root,
+        BundledPlacementTransition::Commit,
+    )?;
+    let mut next = document.clone();
+    next.placements = placements;
+    next.transfers
+        .get_mut(transfer_id)
+        .expect("validated v3 transfer exists")
+        .phase = TransferPhase::Committed;
+    finish_v3_transaction(document, next)
+}
+
+fn stage_v3_import(
+    document: &CellDirectoryDocumentV3,
+    transfer_id: &str,
+    proof: &DirectoryPhaseProofV3,
+) -> Result<CellDirectoryDocumentV3, CellDirectoryError> {
+    document.validate()?;
+    let current = v3_transfer(document, transfer_id)?.clone();
+    if let Some(existing) = &current.import_proof {
+        if existing == proof
+            && matches!(
+                current.phase,
+                TransferPhase::Imported | TransferPhase::Finalized
+            )
+        {
+            return Ok(document.clone());
+        }
+        return Err(conflict(
+            transfer_id,
+            "v3 import retry changed its durable proof",
+        ));
+    }
+    if current.phase != TransferPhase::Committed {
+        return Err(conflict(
+            transfer_id,
+            "v3 transfer is not committed for import",
+        ));
+    }
+    let plan = current.bundled_plan()?;
+    let placements = stage_bundled_placement_transition(
+        &document.placements,
+        &plan,
+        transfer_id,
+        &current.bundle.member_root,
+        BundledPlacementTransition::Import,
+    )?;
+    let mut next = document.clone();
+    next.placements = placements;
+    let transfer = next
+        .transfers
+        .get_mut(transfer_id)
+        .expect("validated v3 transfer exists");
+    transfer.import_proof = Some(proof.clone());
+    transfer.phase = TransferPhase::Imported;
+    finish_v3_transaction(document, next)
+}
+
+fn stage_v3_finalize(
+    document: &CellDirectoryDocumentV3,
+    transfer_id: &str,
+    proof: &DirectoryPhaseProofV3,
+) -> Result<CellDirectoryDocumentV3, CellDirectoryError> {
+    document.validate()?;
+    let current = v3_transfer(document, transfer_id)?.clone();
+    if let Some(existing) = &current.finalization_proof {
+        if existing == proof && current.phase == TransferPhase::Finalized {
+            return Ok(document.clone());
+        }
+        return Err(conflict(
+            transfer_id,
+            "v3 finalization retry changed its durable proof",
+        ));
+    }
+    if current.phase != TransferPhase::Imported || current.import_proof.is_none() {
+        return Err(conflict(
+            transfer_id,
+            "v3 transfer is not imported for finalization",
+        ));
+    }
+    let mut next = document.clone();
+    let transfer = next
+        .transfers
+        .get_mut(transfer_id)
+        .expect("validated v3 transfer exists");
+    transfer.finalization_proof = Some(proof.clone());
+    transfer.phase = TransferPhase::Finalized;
+    finish_v3_transaction(document, next)
+}
+
+fn stage_v3_request_abort(
+    document: &CellDirectoryDocumentV3,
+    transfer_id: &str,
+) -> Result<CellDirectoryDocumentV3, CellDirectoryError> {
+    document.validate()?;
+    let current = v3_transfer(document, transfer_id)?;
+    if matches!(
+        current.phase,
+        TransferPhase::Aborting | TransferPhase::Aborted
+    ) {
+        return Ok(document.clone());
+    }
+    if !matches!(
+        current.phase,
+        TransferPhase::Prepared | TransferPhase::Quarantined
+    ) {
+        return Err(conflict(
+            transfer_id,
+            "v3 committed transfer cannot abort to its source",
+        ));
+    }
+    let mut next = document.clone();
+    next.transfers
+        .get_mut(transfer_id)
+        .expect("validated v3 transfer exists")
+        .phase = TransferPhase::Aborting;
+    finish_v3_transaction(document, next)
+}
+
+fn stage_v3_abort_cleanup(
+    document: &CellDirectoryDocumentV3,
+    transfer_id: &str,
+    proof: &DirectoryPhaseProofV3,
+) -> Result<CellDirectoryDocumentV3, CellDirectoryError> {
+    document.validate()?;
+    let current = v3_transfer(document, transfer_id)?.clone();
+    let existing = match proof.kind {
+        DirectoryPhaseProofKindV3::SourceAbort => current.source_abort_proof.as_ref(),
+        DirectoryPhaseProofKindV3::DestinationAbort => current.destination_abort_proof.as_ref(),
+        _ => {
+            return Err(conflict(
+                transfer_id,
+                "v3 abort cleanup proof has a non-abort role",
+            ));
+        }
+    };
+    if let Some(existing) = existing {
+        if existing == proof
+            && matches!(
+                current.phase,
+                TransferPhase::Aborting | TransferPhase::Aborted
+            )
+        {
+            return Ok(document.clone());
+        }
+        return Err(conflict(
+            transfer_id,
+            "v3 abort cleanup retry changed its durable proof",
+        ));
+    }
+    if current.phase != TransferPhase::Aborting {
+        return Err(conflict(
+            transfer_id,
+            "v3 abort cleanup requires an aborting transfer",
+        ));
+    }
+    let mut next = document.clone();
+    let transfer = next
+        .transfers
+        .get_mut(transfer_id)
+        .expect("validated v3 transfer exists");
+    match proof.kind {
+        DirectoryPhaseProofKindV3::SourceAbort => {
+            transfer.source_abort_proof = Some(proof.clone());
+        }
+        DirectoryPhaseProofKindV3::DestinationAbort => {
+            transfer.destination_abort_proof = Some(proof.clone());
+        }
+        _ => unreachable!("abort proof role was validated"),
+    }
+    finish_v3_transaction(document, next)
+}
+
+fn stage_v3_finalize_abort(
+    document: &CellDirectoryDocumentV3,
+    transfer_id: &str,
+) -> Result<CellDirectoryDocumentV3, CellDirectoryError> {
+    document.validate()?;
+    let current = v3_transfer(document, transfer_id)?.clone();
+    if current.phase == TransferPhase::Aborted {
+        return Ok(document.clone());
+    }
+    if current.phase != TransferPhase::Aborting
+        || current.source_abort_proof.is_none()
+        || current.destination_abort_proof.is_none()
+    {
+        return Err(conflict(
+            transfer_id,
+            "v3 abort cannot finalize before both durable cell cleanups",
+        ));
+    }
+    let plan = current.bundled_plan()?;
+    let placements = stage_bundled_placement_transition(
+        &document.placements,
+        &plan,
+        transfer_id,
+        &current.bundle.member_root,
+        BundledPlacementTransition::Abort,
+    )?;
+    let mut next = document.clone();
+    next.placements = placements;
+    next.transfers
+        .get_mut(transfer_id)
+        .expect("validated v3 transfer exists")
+        .phase = TransferPhase::Aborted;
+    finish_v3_transaction(document, next)
+}
+
+fn finish_v3_transaction(
+    prior: &CellDirectoryDocumentV3,
+    mut next: CellDirectoryDocumentV3,
+) -> Result<CellDirectoryDocumentV3, CellDirectoryError> {
+    next.directory_revision = prior
+        .directory_revision
+        .checked_add(1)
+        .ok_or(CellDirectoryError::DirectoryRevisionExhausted)?;
+    next.document_hash.clear();
+    next.seal()?;
+    Ok(next)
+}
+
+fn v3_transfer<'a>(
+    document: &'a CellDirectoryDocumentV3,
+    transfer_id: &str,
+) -> Result<&'a CellTransferRecordV3, CellDirectoryError> {
+    document
+        .transfers
+        .get(transfer_id)
+        .ok_or_else(|| CellDirectoryError::UnknownTransfer(transfer_id.to_owned()))
+}
+
+fn conflict(transfer_id: &str, reason: impl Into<String>) -> CellDirectoryError {
+    CellDirectoryError::TransferConflict {
+        transfer_id: transfer_id.to_owned(),
+        reason: reason.into(),
     }
 }
 
@@ -916,6 +1361,20 @@ mod tests {
         document
     }
 
+    fn initial_document_and_request() -> (CellDirectoryDocumentV3, CellTransferRecordV3) {
+        let prepared = prepared_document();
+        let requested = prepared.transfers["transfer-grid-v3-proof"].clone();
+        let mut initial = prepared;
+        initial.directory_revision -= 1;
+        initial.transfers.clear();
+        for placement in initial.placements.values_mut() {
+            placement.state = AggregatePlacementState::Resident;
+            placement.active_transfer_id = None;
+        }
+        initial.seal().expect("initial v3 document seals");
+        (initial, requested)
+    }
+
     fn phase_proof(
         transfer: &CellTransferRecordV3,
         kind: DirectoryPhaseProofKindV3,
@@ -1154,6 +1613,174 @@ mod tests {
             transfer.bundle.member_root,
             transfer.bundled_plan().unwrap().member_root
         );
+    }
+
+    #[test]
+    fn dormant_v3_transactions_advance_one_atomic_bundle_and_revision_per_phase() {
+        let (initial, requested) = initial_document_and_request();
+        let prepared = stage_v3_prepare(&initial, &requested).expect("bundle prepares");
+        assert_eq!(prepared, prepared_document());
+        assert_eq!(
+            stage_v3_prepare(&prepared, &requested).expect("prepare retry is exact"),
+            prepared
+        );
+
+        let prepare_proof = phase_proof(
+            &prepared.transfers["transfer-grid-v3-proof"],
+            DirectoryPhaseProofKindV3::SourcePrepare,
+        );
+        let source_prepared =
+            stage_v3_source_prepared(&prepared, "transfer-grid-v3-proof", &prepare_proof)
+                .expect("source proof commits");
+
+        let receipt_hash = blake3::hash(b"transaction receipt").to_hex().to_string();
+        let mut quarantine_material = source_prepared.transfers["transfer-grid-v3-proof"].clone();
+        quarantine_material.quarantine_receipt_hash = Some(receipt_hash.clone());
+        let quarantine_proof = phase_proof(
+            &quarantine_material,
+            DirectoryPhaseProofKindV3::DestinationQuarantine,
+        );
+        let quarantined = stage_v3_quarantine(
+            &source_prepared,
+            "transfer-grid-v3-proof",
+            &receipt_hash,
+            &quarantine_proof,
+        )
+        .expect("quarantine commits");
+
+        let committed = stage_v3_commit(
+            &quarantined,
+            "transfer-grid-v3-proof",
+            &requested.bundle.member_root,
+        )
+        .expect("bundle placement commits");
+        assert_eq!(
+            stage_v3_commit(
+                &committed,
+                "transfer-grid-v3-proof",
+                &requested.bundle.member_root,
+            )
+            .expect("commit retry is exact"),
+            committed
+        );
+        for member in &requested.bundle.members {
+            let placement = &committed.placements[&member.aggregate_id];
+            assert_eq!(placement.state, AggregatePlacementState::InTransit);
+            assert_eq!(placement.cell_id, requested.destination_cell_id);
+            assert_eq!(
+                placement.placement_generation,
+                member.resulting_placement_generation
+            );
+        }
+
+        let import_proof = phase_proof(
+            &committed.transfers["transfer-grid-v3-proof"],
+            DirectoryPhaseProofKindV3::DestinationImport,
+        );
+        let imported = stage_v3_import(&committed, "transfer-grid-v3-proof", &import_proof)
+            .expect("bundle import commits");
+        assert_eq!(
+            stage_v3_import(&imported, "transfer-grid-v3-proof", &import_proof)
+                .expect("import retry is exact"),
+            imported
+        );
+        for member in &requested.bundle.members {
+            let placement = &imported.placements[&member.aggregate_id];
+            assert_eq!(placement.state, AggregatePlacementState::Resident);
+            assert!(placement.active_transfer_id.is_none());
+        }
+
+        let finalization_proof = phase_proof(
+            &imported.transfers["transfer-grid-v3-proof"],
+            DirectoryPhaseProofKindV3::SourceFinalization,
+        );
+        let finalized = stage_v3_finalize(&imported, "transfer-grid-v3-proof", &finalization_proof)
+            .expect("bundle finalizes");
+        assert_eq!(finalized.directory_revision, initial.directory_revision + 6);
+        assert_eq!(
+            decode_v3(&encode_v3(&finalized).expect("finalized document encodes"))
+                .expect("finalized document reopens"),
+            finalized
+        );
+    }
+
+    #[test]
+    fn dormant_v3_transactions_abort_every_member_only_after_both_cleanups() {
+        let (initial, requested) = initial_document_and_request();
+        let prepared = stage_v3_prepare(&initial, &requested).expect("bundle prepares");
+        let aborting =
+            stage_v3_request_abort(&prepared, "transfer-grid-v3-proof").expect("abort begins");
+        assert!(stage_v3_finalize_abort(&aborting, "transfer-grid-v3-proof").is_err());
+
+        let source_proof = phase_proof(
+            &aborting.transfers["transfer-grid-v3-proof"],
+            DirectoryPhaseProofKindV3::SourceAbort,
+        );
+        let source_clean =
+            stage_v3_abort_cleanup(&aborting, "transfer-grid-v3-proof", &source_proof)
+                .expect("source cleanup commits");
+        assert_eq!(
+            stage_v3_abort_cleanup(&source_clean, "transfer-grid-v3-proof", &source_proof)
+                .expect("source cleanup retry is exact"),
+            source_clean
+        );
+        let destination_proof = phase_proof(
+            &source_clean.transfers["transfer-grid-v3-proof"],
+            DirectoryPhaseProofKindV3::DestinationAbort,
+        );
+        let both_clean =
+            stage_v3_abort_cleanup(&source_clean, "transfer-grid-v3-proof", &destination_proof)
+                .expect("destination cleanup commits");
+        let aborted = stage_v3_finalize_abort(&both_clean, "transfer-grid-v3-proof")
+            .expect("abort finalizes");
+        for member in &requested.bundle.members {
+            assert_eq!(
+                aborted.placements[&member.aggregate_id],
+                initial.placements[&member.aggregate_id]
+            );
+        }
+        assert_eq!(
+            stage_v3_finalize_abort(&aborted, "transfer-grid-v3-proof")
+                .expect("abort retry is exact"),
+            aborted
+        );
+    }
+
+    #[test]
+    fn dormant_v3_transaction_conflicts_leave_the_prior_document_unchanged() {
+        let (initial, mut requested) = initial_document_and_request();
+        for member in &mut requested.bundle.members {
+            member.prior_placement_generation = 2;
+            member.resulting_placement_generation = 3;
+        }
+        let substituted = BundledPlacementPlan::new(
+            requested.root_aggregate_id.clone(),
+            requested.source_cell_key.clone(),
+            requested.destination_cell_key.clone(),
+            requested.bundle.members.clone(),
+        )
+        .expect("substituted plan is syntactically valid");
+        requested.bundle.member_root = substituted.member_root;
+        assert!(stage_v3_prepare(&initial, &requested).is_err());
+        initial.validate().expect("prior document remains valid");
+
+        let (_, requested) = initial_document_and_request();
+        let prepared = stage_v3_prepare(&initial, &requested).expect("bundle prepares");
+        assert!(
+            stage_v3_import(
+                &prepared,
+                "transfer-grid-v3-proof",
+                &phase_proof(
+                    &prepared.transfers["transfer-grid-v3-proof"],
+                    DirectoryPhaseProofKindV3::DestinationImport,
+                ),
+            )
+            .is_err()
+        );
+        assert!(stage_v3_commit(&prepared, "transfer-grid-v3-proof", &"0".repeat(64),).is_err());
+        prepared
+            .validate()
+            .expect("failed transitions leave prepared document valid");
     }
 
     #[test]
