@@ -10,6 +10,7 @@ use serde::Serialize;
 use verse_protocol::{
     CELESTIAL_REGISTRY_SCHEMA_VERSION, CelestialBodyKind, CelestialBodySnapshot,
     CelestialRegistrySnapshot, CelestialScaleClass, EnvironmentSnapshot,
+    LIFECYCLE_CONTROL_SCHEMA_VERSION, PRODUCTION_SCHEDULE_OCCURRENCE_SCHEMA_VERSION,
     UNIVERSE_MANIFEST_SCHEMA_VERSION, UniverseAddress, UniverseManifestSnapshot,
 };
 
@@ -18,7 +19,7 @@ use crate::error::{ErrorCode, Result, VerifyError};
 
 const ADDRESS_SCHEMA_VERSION: u32 = 1;
 const REGISTRY_DOMAIN: &[u8] = b"the-verse/celestial-registry/v1\0";
-const MANIFEST_DOMAIN: &[u8] = b"the-verse/universe-manifest/v2\0";
+const MANIFEST_DOMAIN: &[u8] = b"the-verse/universe-manifest/v3\0";
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct AddressDimensions {
@@ -153,6 +154,9 @@ pub(crate) fn validate_documents(
         && manifest.address_schema_version == ADDRESS_SCHEMA_VERSION
         && manifest.world_schema_version == expected_world_schema
         && manifest.event_schema_version == expected_event_schema
+        && manifest.lifecycle_control_schema_version == LIFECYCLE_CONTROL_SCHEMA_VERSION
+        && manifest.production_schedule_occurrence_schema_version
+            == PRODUCTION_SCHEDULE_OCCURRENCE_SCHEMA_VERSION
         && manifest.content_schema_version == expected_content_schema
         && manifest.content_manifest_version == expected_content_manifest
         && manifest.celestial_registry_schema_version == registry.schema_version
@@ -182,6 +186,10 @@ pub(crate) fn validate_documents(
     validate_identifier(
         &manifest.content_manifest_version,
         "manifest content_manifest_version",
+    )?;
+    validate_hash(
+        &manifest.lifecycle_policy_hash,
+        "manifest lifecycle_policy_hash",
     )?;
 
     let mut bodies = BTreeMap::new();
@@ -779,6 +787,9 @@ struct ManifestHashMaterial<'a> {
     content_hash: &'a str,
     world_schema_version: u32,
     event_schema_version: u32,
+    lifecycle_control_schema_version: u32,
+    production_schedule_occurrence_schema_version: u32,
+    lifecycle_policy_hash: &'a str,
 }
 
 pub(crate) fn manifest_hash(manifest: &UniverseManifestSnapshot) -> Result<String> {
@@ -801,6 +812,10 @@ pub(crate) fn manifest_hash(manifest: &UniverseManifestSnapshot) -> Result<Strin
             content_hash: &manifest.content_hash,
             world_schema_version: manifest.world_schema_version,
             event_schema_version: manifest.event_schema_version,
+            lifecycle_control_schema_version: manifest.lifecycle_control_schema_version,
+            production_schedule_occurrence_schema_version: manifest
+                .production_schedule_occurrence_schema_version,
+            lifecycle_policy_hash: &manifest.lifecycle_policy_hash,
         },
     )
 }
@@ -895,7 +910,7 @@ mod tests {
         };
         registry.registry_hash = registry_hash(&registry).expect("registry hashes");
         let mut manifest = UniverseManifestSnapshot {
-            schema_version: 2,
+            schema_version: UNIVERSE_MANIFEST_SCHEMA_VERSION,
             manifest_hash: String::new(),
             universe_id: "universe-test".into(),
             world_seed: "seed".into(),
@@ -912,6 +927,10 @@ mod tests {
             content_hash: CONTENT_HASH.into(),
             world_schema_version: 11,
             event_schema_version: 12,
+            lifecycle_control_schema_version: LIFECYCLE_CONTROL_SCHEMA_VERSION,
+            production_schedule_occurrence_schema_version:
+                PRODUCTION_SCHEDULE_OCCURRENCE_SCHEMA_VERSION,
+            lifecycle_policy_hash: CONTENT_HASH.into(),
         };
         manifest.manifest_hash = manifest_hash(&manifest).expect("manifest hashes");
         (registry, manifest)

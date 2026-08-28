@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
+use std::sync::Arc;
 
 use serde::Serialize;
 use thiserror::Error;
@@ -32,10 +33,16 @@ use crate::model::{
     WorldState, inventory_can_add_contents, planet_center, planet_surface_radius_m,
     production_recipe_quantities, radial_up, valid_blake3_hex,
 };
-use crate::persistence::{PersistenceError, Store};
+use crate::persistence::{
+    CellLifecycleStatus, PersistenceError, Store, SystemTrustedClock, TrustedClock,
+};
 #[cfg(test)]
 use crate::targeting::{TOOL_SURFACE_RANGE_M, ToolHit};
 use crate::targeting::{ToolTarget, closest_tool_hit};
+
+pub const MAX_BACKGROUND_QUEUE_BEARING_MACHINES: usize = 256;
+pub const MAX_PRODUCTION_CATCH_UP_QUANTA: usize = 60;
+pub const MAX_PRODUCTION_CATCH_UP_MILLIS: u128 = 250;
 
 #[cfg(test)]
 const PLAYER_BODY_ID: &str = "player-body-player-local";
@@ -200,6 +207,10 @@ pub enum RuntimeError {
     Physics(#[from] PhysicsError),
     #[error("authoritative writes are halted after a persistence failure")]
     Halted,
+    #[error("cell lifecycle mode {mode:?} does not permit this operation")]
+    LifecycleUnavailable {
+        mode: crate::persistence::LifecycleMode,
+    },
     #[error("canonical world invariant failed: {0}")]
     CanonicalInvariant(String),
 }
@@ -233,6 +244,12 @@ pub struct AdvanceOutcome {
     pub impact: AdvanceImpact,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProductionDispatchOutcome {
+    pub committed_quanta: usize,
+    pub backlog_remaining: bool,
+}
+
 impl AdvanceOutcome {
     #[must_use]
     pub const fn changed(self) -> bool {
@@ -251,7 +268,6 @@ pub struct Runtime {
     snapshot_every: u64,
     events_since_snapshot: u64,
     life_support_elapsed_millis_by_player: BTreeMap<String, u32>,
-    production_elapsed_millis: u32,
     physics_step_phase: u64,
     physics: Scene,
     halted: bool,
@@ -267,7 +283,21 @@ impl Runtime {
         requested_seed: u64,
         snapshot_every: u64,
     ) -> Result<Self, RuntimeError> {
-        let mut store = Store::open(data_directory, requested_seed)?;
+        Self::open_with_clock(
+            data_directory,
+            requested_seed,
+            snapshot_every,
+            Arc::new(SystemTrustedClock),
+        )
+    }
+
+    pub fn open_with_clock(
+        data_directory: impl AsRef<Path>,
+        requested_seed: u64,
+        snapshot_every: u64,
+        clock: Arc<dyn TrustedClock>,
+    ) -> Result<Self, RuntimeError> {
+        let mut store = Store::open_with_clock(data_directory, requested_seed, clock)?;
         let mut state = store.load_world()?;
         state.fencing_token = store.fencing_token();
 
@@ -286,7 +316,6 @@ impl Runtime {
             snapshot_every: snapshot_every.max(1),
             events_since_snapshot: 0,
             life_support_elapsed_millis_by_player,
-            production_elapsed_millis: 0,
             physics_step_phase,
             physics,
             halted: false,
@@ -298,11 +327,20 @@ impl Runtime {
         if runtime.state.event_sequence == 0 {
             runtime.store.save_snapshot(&runtime.state)?;
         }
+        runtime.store.publish_active(&runtime.state)?;
         Ok(runtime)
     }
 
     pub const fn state(&self) -> &WorldState {
         &self.state
+    }
+
+    pub fn next_production_occurrence(&self) -> Option<&ProductionScheduleOccurrence> {
+        self.store.next_production_occurrence()
+    }
+
+    pub fn lifecycle_status(&self) -> CellLifecycleStatus {
+        self.store.lifecycle_status()
     }
 
     /// Adds a deterministic loopback-development actor before the first
@@ -501,6 +539,11 @@ impl Runtime {
         if self.halted {
             return Err(RuntimeError::Halted);
         }
+        if self.store.lifecycle_mode() != crate::persistence::LifecycleMode::Active {
+            return Err(RuntimeError::LifecycleUnavailable {
+                mode: self.store.lifecycle_mode(),
+            });
+        }
         if let Err(message) = self.state.validate_player_roster() {
             self.halted = true;
             return Err(RuntimeError::CanonicalInvariant(message));
@@ -542,11 +585,25 @@ impl Runtime {
             return Ok(receipt);
         }
 
-        let event = self
+        let mut event = self
             .state
             .prepare_client_event_as(actor_player_id, message)?;
+        let occurred_at_unix_ms = match self.store.accepted_trusted_time() {
+            Ok(now) => now,
+            Err(source) => {
+                self.halted = true;
+                return Err(source.into());
+            }
+        };
+        event.retime_and_rehash(occurred_at_unix_ms);
+        let prior_production_runnable = self.state.background_production_is_runnable()?;
         let mut next_state = self.state.clone();
         next_state.apply_event(&event)?;
+        let resulting_next_occurrence = self.resulting_next_production_occurrence(
+            prior_production_runnable,
+            &next_state,
+            &event,
+        )?;
         if let EventPayload::VoxelMined { coordinate, .. } = &event.payload {
             let chunk = voxel_collision_chunk_coordinate(*coordinate);
             let body_id = voxel_collision_chunk_body_id(chunk);
@@ -565,7 +622,10 @@ impl Runtime {
                 self.physics_full_rebuilds += 1;
             }
         }
-        if let Err(source) = self.store.append_event(&event) {
+        if let Err(source) =
+            self.store
+                .commit_world_event(&event, &next_state, resulting_next_occurrence)
+        {
             self.halted = true;
             return Err(source.into());
         }
@@ -635,6 +695,11 @@ impl Runtime {
     ) -> Result<AdvanceOutcome, RuntimeError> {
         if self.halted {
             return Err(RuntimeError::Halted);
+        }
+        if self.store.lifecycle_mode() != crate::persistence::LifecycleMode::Active {
+            return Err(RuntimeError::LifecycleUnavailable {
+                mode: self.store.lifecycle_mode(),
+            });
         }
         if let Err(source) = self.store.renew_lease() {
             self.halted = true;
@@ -903,27 +968,22 @@ impl Runtime {
             }
         }
 
-        self.production_elapsed_millis = self
-            .production_elapsed_millis
-            .saturating_add(u32::from(delta_millis));
-        let production_seconds = self.production_elapsed_millis / 1_000;
-        self.production_elapsed_millis %= 1_000;
-        for _ in 0..production_seconds {
-            let occurrence = self.state.next_active_production_occurrence()?;
-            let payload = self.state.production_quantum_payload(occurrence)?;
-            let EventPayload::ProductionQuantumCommitted { outcomes, .. } = &payload else {
-                unreachable!("production planner returns a production quantum");
-            };
-            if outcomes.iter().any(ProductionMachineOutcome::changes_state) {
-                self.commit_production_quantum(payload)?;
-                outcome.record(AdvanceImpact::Structural);
-            }
+        if self.advance_due_production()?.committed_quanta > 0 {
+            outcome.record(AdvanceImpact::Structural);
         }
         Ok(outcome)
     }
 
     fn commit_system_event(&mut self, payload: EventPayload) -> Result<(), RuntimeError> {
-        let event = self.state.prepare_system_event(payload);
+        let mut event = self.state.prepare_system_event(payload);
+        let occurred_at_unix_ms = match self.store.accepted_trusted_time() {
+            Ok(now) => now,
+            Err(source) => {
+                self.halted = true;
+                return Err(source.into());
+            }
+        };
+        event.retime_and_rehash(occurred_at_unix_ms);
         self.commit_prepared_system_event(&event)
     }
 
@@ -933,8 +993,14 @@ impl Runtime {
     }
 
     fn commit_prepared_system_event(&mut self, event: &CanonicalEvent) -> Result<(), RuntimeError> {
+        let prior_production_runnable = self.state.background_production_is_runnable()?;
         let mut next_state = self.state.clone();
         next_state.apply_event(event)?;
+        let resulting_next_occurrence = self.resulting_next_production_occurrence(
+            prior_production_runnable,
+            &next_state,
+            event,
+        )?;
         if event_changes_physics_scene(&event.payload) {
             self.physics.rebuild(&physics_body_specs(&next_state))?;
             #[cfg(test)]
@@ -942,13 +1008,79 @@ impl Runtime {
                 self.physics_full_rebuilds += 1;
             }
         }
-        if let Err(source) = self.store.append_event(event) {
+        if let Err(source) =
+            self.store
+                .commit_world_event(event, &next_state, resulting_next_occurrence)
+        {
             self.halted = true;
             return Err(source.into());
         }
         self.state = next_state;
+        if matches!(
+            &event.payload,
+            EventPayload::ProductionQuantumCommitted { .. }
+        ) && let Err(source) = self.store.acknowledge_production_sequence(&self.state)
+        {
+            self.halted = true;
+            return Err(source.into());
+        }
         self.after_event()?;
         Ok(())
+    }
+
+    fn resulting_next_production_occurrence(
+        &self,
+        prior_runnable: bool,
+        resulting_state: &WorldState,
+        event: &CanonicalEvent,
+    ) -> Result<Option<ProductionScheduleOccurrence>, RuntimeError> {
+        let resulting_runnable = resulting_state.background_production_is_runnable()?;
+        if !resulting_runnable {
+            return Ok(None);
+        }
+        if let EventPayload::ProductionQuantumCommitted { occurrence, .. } = &event.payload {
+            let scheduled_for_unix_ms = occurrence
+                .scheduled_for_unix_ms
+                .checked_add(1_000)
+                .ok_or_else(|| {
+                    IntentError::rejected(
+                        "production_clock_exhausted",
+                        "production scheduled time is exhausted",
+                    )
+                })?;
+            return resulting_state
+                .next_production_occurrence_at(scheduled_for_unix_ms)
+                .map(Some)
+                .map_err(Into::into);
+        }
+        if prior_runnable {
+            return self
+                .store
+                .next_production_occurrence()
+                .cloned()
+                .map(Some)
+                .ok_or_else(|| {
+                    IntentError::rejected(
+                        "production_schedule_missing",
+                        "runnable production has no durable next occurrence",
+                    )
+                    .into()
+                });
+        }
+        let scheduled_for_unix_ms =
+            event
+                .occurred_at_unix_ms
+                .checked_add(1_000)
+                .ok_or_else(|| {
+                    IntentError::rejected(
+                        "production_clock_exhausted",
+                        "production scheduled time is exhausted",
+                    )
+                })?;
+        resulting_state
+            .next_production_occurrence_at(scheduled_for_unix_ms)
+            .map(Some)
+            .map_err(Into::into)
     }
 
     pub fn persist_snapshot(&mut self) -> Result<(), RuntimeError> {
@@ -984,11 +1116,121 @@ impl Runtime {
         if self.halted {
             return Err(RuntimeError::Halted);
         }
+        if !matches!(
+            self.store.lifecycle_mode(),
+            crate::persistence::LifecycleMode::Active
+                | crate::persistence::LifecycleMode::Background
+                | crate::persistence::LifecycleMode::Activating
+        ) {
+            return Err(RuntimeError::LifecycleUnavailable {
+                mode: self.store.lifecycle_mode(),
+            });
+        }
         if self.state.production_occurrence_is_committed(&occurrence) {
+            if let Err(source) = self.store.acknowledge_production_sequence(&self.state) {
+                self.halted = true;
+                return Err(source.into());
+            }
             return Ok(false);
         }
         let payload = self.state.production_quantum_payload(occurrence)?;
         self.commit_production_quantum(payload)?;
+        Ok(true)
+    }
+
+    pub fn advance_due_production(&mut self) -> Result<ProductionDispatchOutcome, RuntimeError> {
+        if self.halted {
+            return Err(RuntimeError::Halted);
+        }
+        let now_unix_ms = match self.store.accepted_trusted_time() {
+            Ok(now) => now,
+            Err(source) => {
+                self.halted = true;
+                return Err(source.into());
+            }
+        };
+        let started_at = std::time::Instant::now();
+        let mut committed_quanta = 0;
+        while committed_quanta < MAX_PRODUCTION_CATCH_UP_QUANTA {
+            let Some(occurrence) = self.store.next_production_occurrence().cloned() else {
+                break;
+            };
+            if occurrence.scheduled_for_unix_ms > now_unix_ms {
+                break;
+            }
+            if self.advance_background_production_occurrence(occurrence)? {
+                committed_quanta += 1;
+            }
+            if started_at.elapsed().as_millis() >= MAX_PRODUCTION_CATCH_UP_MILLIS {
+                break;
+            }
+        }
+        let backlog_remaining = self
+            .store
+            .next_production_occurrence()
+            .is_some_and(|occurrence| occurrence.scheduled_for_unix_ms <= now_unix_ms);
+        Ok(ProductionDispatchOutcome {
+            committed_quanta,
+            backlog_remaining,
+        })
+    }
+
+    pub fn drain_to_background_or_sleeping(
+        &mut self,
+    ) -> Result<crate::persistence::LifecycleMode, RuntimeError> {
+        if self.halted {
+            return Err(RuntimeError::Halted);
+        }
+        if self.store.lifecycle_mode() != crate::persistence::LifecycleMode::Active {
+            return Err(RuntimeError::LifecycleUnavailable {
+                mode: self.store.lifecycle_mode(),
+            });
+        }
+        let production_runnable = self.state.background_production_is_runnable()?;
+        let desired_mode = if production_runnable {
+            crate::persistence::LifecycleMode::Background
+        } else {
+            crate::persistence::LifecycleMode::Sleeping
+        };
+        self.store.transition_mode(
+            desired_mode,
+            crate::persistence::LifecycleMode::Draining,
+            &self.state,
+        )?;
+        self.persist_snapshot()?;
+        if production_runnable {
+            self.store.transition_mode(
+                crate::persistence::LifecycleMode::Background,
+                crate::persistence::LifecycleMode::Background,
+                &self.state,
+            )?;
+            Ok(crate::persistence::LifecycleMode::Background)
+        } else {
+            self.store.release_to_sleeping(&self.state)?;
+            Ok(crate::persistence::LifecycleMode::Sleeping)
+        }
+    }
+
+    pub fn activation_step(&mut self) -> Result<bool, RuntimeError> {
+        if self.halted {
+            return Err(RuntimeError::Halted);
+        }
+        match self.store.lifecycle_mode() {
+            crate::persistence::LifecycleMode::Active => return Ok(true),
+            crate::persistence::LifecycleMode::Background => self.store.transition_mode(
+                crate::persistence::LifecycleMode::Active,
+                crate::persistence::LifecycleMode::Activating,
+                &self.state,
+            )?,
+            crate::persistence::LifecycleMode::Activating => {}
+            mode => return Err(RuntimeError::LifecycleUnavailable { mode }),
+        }
+        let dispatch = self.advance_due_production()?;
+        if dispatch.backlog_remaining {
+            return Ok(false);
+        }
+        self.persist_snapshot()?;
+        self.store.publish_active(&self.state)?;
         Ok(true)
     }
 
@@ -1015,6 +1257,41 @@ impl WorldState {
             && occurrence.scheduled_for_unix_ms == self.production_clock.last_scheduled_for_unix_ms
             && occurrence.universe_manifest_hash == self.universe_manifest_hash
             && occurrence.celestial_registry_hash == self.celestial_registry_hash
+    }
+
+    pub fn background_production_is_runnable(&self) -> Result<bool, IntentError> {
+        if self.production_queues.len() > MAX_BACKGROUND_QUEUE_BEARING_MACHINES {
+            return Err(IntentError::rejected(
+                "background_machine_budget_exceeded",
+                format!(
+                    "background production supports at most {MAX_BACKGROUND_QUEUE_BEARING_MACHINES} queue-bearing machines"
+                ),
+            ));
+        }
+        let mut scheduled = self
+            .production_queues
+            .keys()
+            .map(|machine_block_id| {
+                self.block_grid(machine_block_id)
+                    .map(|(grid, _)| (grid.grid_id.as_str(), machine_block_id.as_str()))
+                    .ok_or_else(|| {
+                        IntentError::rejected(
+                            "production_machine_missing",
+                            "a queued production machine is missing from canonical state",
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        scheduled.sort_unstable();
+        for (_, machine_block_id) in scheduled {
+            if self
+                .production_machine_outcome_after_one_second(machine_block_id)?
+                .changes_state()
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn next_active_production_occurrence(
@@ -1068,6 +1345,15 @@ impl WorldState {
             universe_manifest_hash: self.universe_manifest_hash.clone(),
             celestial_registry_hash: self.celestial_registry_hash.clone(),
         })
+    }
+
+    pub(crate) fn next_production_occurrence_at(
+        &self,
+        scheduled_for_unix_ms: u64,
+    ) -> Result<ProductionScheduleOccurrence, IntentError> {
+        let mut occurrence = self.next_active_production_occurrence()?;
+        occurrence.scheduled_for_unix_ms = scheduled_for_unix_ms;
+        Ok(occurrence)
     }
 
     fn production_quantum_payload(
@@ -6647,6 +6933,7 @@ fn add_contents(
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use proptest::prelude::*;
     use tempfile::tempdir;
@@ -6659,6 +6946,25 @@ mod tests {
         STARTER_INDUSTRY_CARGO_INVENTORY_ID, STARTER_INDUSTRY_GRID_ID, VoxelField,
     };
     use crate::persistence::AppendFailpoint;
+
+    #[derive(Debug)]
+    struct ManualTrustedClock(AtomicU64);
+
+    impl ManualTrustedClock {
+        const fn new(now_unix_ms: u64) -> Self {
+            Self(AtomicU64::new(now_unix_ms))
+        }
+
+        fn set(&self, now_unix_ms: u64) {
+            self.0.store(now_unix_ms, Ordering::SeqCst);
+        }
+    }
+
+    impl TrustedClock for ManualTrustedClock {
+        fn now_unix_ms(&self) -> Result<u64, PersistenceError> {
+            Ok(self.0.load(Ordering::SeqCst))
+        }
+    }
 
     fn runtime() -> Runtime {
         Runtime::open(tempdir().expect("tempdir").keep(), 42, 5).expect("runtime opens")
@@ -6732,8 +7038,21 @@ mod tests {
     }
 
     fn advance_whole_seconds(runtime: &mut Runtime, seconds: usize) {
-        for _ in 0..seconds * 4 {
-            runtime.advance(250).expect("authoritative second advances");
+        for _ in 0..seconds {
+            let scheduled_for_unix_ms = runtime
+                .state()
+                .production_clock
+                .last_scheduled_for_unix_ms
+                .checked_add(1_000)
+                .expect("fixture production clock remains available")
+                .max(1_000);
+            let occurrence = runtime
+                .state()
+                .next_production_occurrence_at(scheduled_for_unix_ms)
+                .expect("fixture occurrence is canonical");
+            runtime
+                .advance_background_production_occurrence(occurrence)
+                .expect("authoritative second advances");
         }
     }
 
@@ -6955,6 +7274,216 @@ mod tests {
             }
             assert!(recovered.state().conservation().valid);
         }
+    }
+
+    #[test]
+    fn durable_schedule_preserves_the_remaining_subsecond_across_restart() {
+        let directory = tempdir().expect("tempdir");
+        let clock = Arc::new(ManualTrustedClock::new(1_000_000));
+        {
+            let mut runtime = Runtime::open_with_clock(directory.path(), 601, 100, clock.clone())
+                .expect("runtime opens");
+            seed_industry_cargo(
+                &mut runtime,
+                InventoryContents {
+                    ore: 2,
+                    ..InventoryContents::default()
+                },
+            );
+            runtime
+                .execute_next_for_fixture(&production_intent(
+                    "durable-partial-second",
+                    "block-refinery",
+                    ProductionRecipeKind::Refining,
+                    1,
+                ))
+                .expect("job queues");
+            assert_eq!(
+                runtime
+                    .next_production_occurrence()
+                    .expect("occurrence arms")
+                    .scheduled_for_unix_ms,
+                1_001_000
+            );
+        }
+
+        clock.set(1_000_750);
+        let mut recovered = Runtime::open_with_clock(directory.path(), 601, 100, clock.clone())
+            .expect("runtime recovers at 750 ms");
+        assert_eq!(
+            recovered
+                .advance_due_production()
+                .expect("early dispatch is inert")
+                .committed_quanta,
+            0
+        );
+        clock.set(1_000_999);
+        assert_eq!(
+            recovered
+                .advance_due_production()
+                .expect("999 ms dispatch is inert")
+                .committed_quanta,
+            0
+        );
+        clock.set(1_001_000);
+        assert_eq!(
+            recovered
+                .advance_due_production()
+                .expect("exact due dispatch commits")
+                .committed_quanta,
+            1
+        );
+        assert_eq!(
+            recovered.state().production_queues["block-refinery"][0].progress_ticks,
+            60
+        );
+    }
+
+    #[test]
+    fn forward_jump_respects_catch_up_budgets_and_retains_exact_continuation() {
+        let directory = tempdir().expect("tempdir");
+        let clock = Arc::new(ManualTrustedClock::new(2_000_000));
+        {
+            let mut runtime = Runtime::open_with_clock(directory.path(), 602, 100, clock.clone())
+                .expect("runtime opens");
+            seed_industry_cargo(
+                &mut runtime,
+                InventoryContents {
+                    ore: 200,
+                    ..InventoryContents::default()
+                },
+            );
+            runtime
+                .execute_next_for_fixture(&production_intent(
+                    "bounded-forward-jump",
+                    "block-refinery",
+                    ProductionRecipeKind::Refining,
+                    100,
+                ))
+                .expect("long job queues");
+        }
+
+        clock.set(2_100_000);
+        let mut recovered = Runtime::open_with_clock(directory.path(), 602, 100, clock.clone())
+            .expect("replacement runtime opens after forward jump");
+        let first = recovered
+            .advance_due_production()
+            .expect("first catch-up dispatch succeeds");
+        assert!((1..=MAX_PRODUCTION_CATCH_UP_QUANTA).contains(&first.committed_quanta));
+        assert!(first.backlog_remaining);
+        let mut committed = first.committed_quanta;
+        let mut backlog_remaining = first.backlog_remaining;
+        let mut dispatches = 1;
+        while backlog_remaining {
+            let continuation = recovered
+                .advance_due_production()
+                .expect("continuation dispatch succeeds");
+            assert!((1..=MAX_PRODUCTION_CATCH_UP_QUANTA).contains(&continuation.committed_quanta));
+            committed += continuation.committed_quanta;
+            backlog_remaining = continuation.backlog_remaining;
+            dispatches += 1;
+            assert!(dispatches <= 100, "bounded continuation must make progress");
+        }
+        assert_eq!(committed, 100);
+        assert_eq!(
+            recovered
+                .state()
+                .production_clock
+                .last_committed_quantum_sequence,
+            100
+        );
+        assert_eq!(
+            recovered.state().production_queues["block-refinery"][0].progress_ticks,
+            6_000
+        );
+    }
+
+    #[test]
+    fn drain_releases_an_idle_cell_and_a_successor_reactivates_with_a_new_fence() {
+        let directory = tempdir().expect("tempdir");
+        let first_fence;
+        {
+            let mut runtime = Runtime::open(directory.path(), 603, 100).expect("runtime opens");
+            first_fence = runtime.lifecycle_status().fencing_token;
+            assert_eq!(
+                runtime
+                    .drain_to_background_or_sleeping()
+                    .expect("idle drain succeeds"),
+                crate::persistence::LifecycleMode::Sleeping
+            );
+            let sleeping = runtime.lifecycle_status();
+            assert_eq!(
+                sleeping.observed_mode,
+                crate::persistence::LifecycleMode::Sleeping
+            );
+            assert!(sleeping.expires_at_unix_ms.is_none());
+            assert!(matches!(
+                runtime.advance(16),
+                Err(RuntimeError::LifecycleUnavailable {
+                    mode: crate::persistence::LifecycleMode::Sleeping
+                })
+            ));
+        }
+
+        let successor = Runtime::open(directory.path(), 603, 100).expect("successor activates");
+        assert_eq!(
+            successor.lifecycle_status().observed_mode,
+            crate::persistence::LifecycleMode::Active
+        );
+        assert!(successor.lifecycle_status().fencing_token > first_fence);
+    }
+
+    #[test]
+    fn background_mode_runs_only_due_production_then_reactivates() {
+        let directory = tempdir().expect("tempdir");
+        let clock = Arc::new(ManualTrustedClock::new(3_000_000));
+        let mut runtime = Runtime::open_with_clock(directory.path(), 604, 100, clock.clone())
+            .expect("runtime opens");
+        seed_industry_cargo(
+            &mut runtime,
+            InventoryContents {
+                ore: 2,
+                ..InventoryContents::default()
+            },
+        );
+        runtime
+            .execute_next_for_fixture(&production_intent(
+                "background-drain",
+                "block-refinery",
+                ProductionRecipeKind::Refining,
+                1,
+            ))
+            .expect("job queues");
+        let simulation_tick = runtime.state().simulation_tick;
+        let player_oxygen = runtime.state().player.suit_oxygen_milli;
+        assert_eq!(
+            runtime
+                .drain_to_background_or_sleeping()
+                .expect("runnable drain succeeds"),
+            crate::persistence::LifecycleMode::Background
+        );
+        assert!(matches!(
+            runtime.advance(250),
+            Err(RuntimeError::LifecycleUnavailable {
+                mode: crate::persistence::LifecycleMode::Background
+            })
+        ));
+
+        clock.set(3_001_000);
+        assert_eq!(
+            runtime
+                .advance_due_production()
+                .expect("background production advances")
+                .committed_quanta,
+            1
+        );
+        assert_eq!(runtime.state().simulation_tick, simulation_tick);
+        assert_eq!(runtime.state().player.suit_oxygen_milli, player_oxygen);
+        assert!(runtime.activation_step().expect("activation completes"));
+        assert_eq!(
+            runtime.lifecycle_status().observed_mode,
+            crate::persistence::LifecycleMode::Active
+        );
     }
 
     #[test]
@@ -8594,9 +9123,7 @@ mod tests {
                     },
                 )
                 .expect("secondary actor queues its connected refinery");
-            for _ in 0..8 {
-                runtime.advance(250).expect("refinery advances");
-            }
+            advance_whole_seconds(&mut runtime, 2);
             runtime
                 .execute_next_as_for_fixture(
                     "player-remote",
@@ -8611,9 +9138,7 @@ mod tests {
                     },
                 )
                 .expect("secondary actor queues its connected assembler");
-            for _ in 0..8 {
-                runtime.advance(250).expect("assembler advances");
-            }
+            advance_whole_seconds(&mut runtime, 2);
             runtime
                 .execute_next_as_for_fixture(
                     "player-remote",

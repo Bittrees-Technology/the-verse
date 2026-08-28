@@ -1,6 +1,6 @@
 [package]
 name = "verse-interest-verifier"
-description = "Portable protocol-16 interest-view verifier for The Verse"
+description = "Portable protocol-17 interest-view verifier for The Verse"
 license = "Apache-2.0"
 version.workspace = true
 edition.workspace = true

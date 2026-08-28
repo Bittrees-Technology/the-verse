@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Clean-room verifier for protocol-16 interest baselines and deltas.
+//! Clean-room verifier for protocol-17 interest baselines and deltas.
 //!
 //! The verifier consumes original UTF-8 JSON bytes. All connection and view
 //! transitions are staged and require an opaque one-use token to commit.
@@ -1984,6 +1984,10 @@ mod tests {
             content_hash: CONTENT_HASH.into(),
             world_schema_version: WORLD_SCHEMA,
             event_schema_version: EVENT_SCHEMA,
+            lifecycle_control_schema_version: verse_protocol::LIFECYCLE_CONTROL_SCHEMA_VERSION,
+            production_schedule_occurrence_schema_version:
+                verse_protocol::PRODUCTION_SCHEDULE_OCCURRENCE_SCHEMA_VERSION,
+            lifecycle_policy_hash: CONTENT_HASH.into(),
         };
         manifest.manifest_hash =
             registry::manifest_hash(&manifest).expect("manifest fixture hashes");
@@ -2226,7 +2230,7 @@ mod tests {
     #[test]
     fn rejects_duplicate_and_unknown_fields_before_transition() {
         let mut verifier = InterestVerifier::new(config()).expect("config is valid");
-        let raw = br#"{"type":"welcome","protocol_version":16,"protocol_version":16,"projection_schema_version":3,"world_schema_version":11,"event_schema_version":12,"content_schema_version":13,"content_manifest_version":"content-v1","celestial_registry_schema_version":1,"universe_manifest_schema_version":2,"interest_schema_version":1,"server_name":"test","session_role":{"kind":"spectator"}}"#;
+        let raw = br#"{"type":"welcome","protocol_version":17,"protocol_version":17,"projection_schema_version":3,"world_schema_version":11,"event_schema_version":12,"content_schema_version":13,"content_manifest_version":"content-v1","celestial_registry_schema_version":1,"universe_manifest_schema_version":3,"interest_schema_version":1,"server_name":"test","session_role":{"kind":"spectator"}}"#;
         assert_eq!(
             verifier
                 .stage(raw)
@@ -2816,7 +2820,7 @@ mod tests {
             Some(concat!(
                 "{\"type\":\"acknowledge_interest\",\"session_epoch\":\"session-1\",",
                 "\"interest_epoch\":41,\"baseline_id\":\"baseline-1\",\"delta_sequence\":0,",
-                "\"view_hash\":\"dba65a263bb44f56c7615d695baaa1194566c1043fb8b6b1a56af00ede03f87b\"}"
+                "\"view_hash\":\"8e576c2b228cffc05b97e8baeff3f30a577469cc5c3b3cc12210c5c078c163ec\"}"
             ))
         );
 
@@ -3104,7 +3108,7 @@ mod tests {
     fn empty_spectator_view_hash_is_frozen() {
         assert_eq!(
             view_state(0).view_hash,
-            "dba65a263bb44f56c7615d695baaa1194566c1043fb8b6b1a56af00ede03f87b"
+            "8e576c2b228cffc05b97e8baeff3f30a577469cc5c3b3cc12210c5c078c163ec"
         );
     }
 }
