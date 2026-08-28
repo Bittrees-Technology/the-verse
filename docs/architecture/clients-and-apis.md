@@ -213,14 +213,20 @@ The P1.7 compatibility tuple is also indivisible:
 | Universe manifest | `4` |
 | Interest schema | `2` |
 | Operation fingerprint | `2` |
-| Lifecycle control | `1` |
+| Lifecycle control | `2` |
 | Production occurrence | `1` |
-| Cell directory | `1` |
+| Cell directory | `2` |
 | Transfer/package | `1` |
 
 Upgrade and rollback drain incompatible sessions. Protocol `18` state is never
 reinterpreted as a P1.6 stream, and handoff begins only after both cell workers,
 the directory, gateway, verifier, and client agree on the complete tuple.
+
+Atomic ordinary-grid closure handoff introduces protocol `19`, projection `5`,
+world `21`, event `17`, universe manifest `5`, interest `3`, directory `3`, and
+transfer package `2`. The complete boundary is recorded in ADR-0024; v1
+transfer artifacts remain independent-EVA artifacts and fail closed under the
+grid runtime.
 
 ## Permission examples
 

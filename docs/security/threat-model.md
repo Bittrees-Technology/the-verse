@@ -220,6 +220,16 @@ secrecy, fog of war, or zero-knowledge state.
   limits. These implementation budgets do not become permanent product size
   caps.
 
+The ordinary-grid closure extension is a separate compatibility boundary:
+protocol `19`, projection `5`, world `21`, event `17`, universe manifest `5`,
+interest `3`, cell directory `3`, and transfer/package `2`. Protocol-18
+package-v1 material remains EVA-only. Grid closure additionally treats every
+block, cargo record, production queue and escrow, internal contact, supported
+rider, rider inventory, and operation frontier as one locked subject set. A
+partial, externally connected, stale, conflicting, or oversized closure fails
+before prepare, and all member placements advance in one directory
+compare-and-swap.
+
 ## Security gates
 
 Before public alpha:

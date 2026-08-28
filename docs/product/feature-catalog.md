@@ -112,13 +112,16 @@ does not complete F-013 or WORLD-008: multi-cell assignment, handoff,
 distributed control-plane availability, and background physics remain separate
 milestones.
 
-F-061 is specification-ready as the bounded P1.7 correctness slice. Its
+F-061 has an implemented independent-EVA checkpoint under protocol `18`. Its
 [accepted gameplay contract](../gameplay/durable-two-cell-handoff.md) and
 [ADR-0023](../decisions/ADR-0023-durable-two-cell-handoff.md) define two
 adjacent proof cells, stable cell keys, durable assignment generations, a
 separate aggregate placement fence, content-addressed prepare/quarantine,
 directory compare-and-swap commit, exact transfer conservation, and a
-same-session verified destination baseline. P1.7 does not complete arbitrary
+same-session verified destination baseline. The promised ordinary-grid closure
+remains an implementation gate under the versioned boundary in
+[ADR-0024](../decisions/ADR-0024-versioned-grid-closure-handoff.md). P1.7 does
+not complete arbitrary
 multi-cell placement, cross-cell physics, multi-host availability, static
 megastructure partitioning, or the public-scale concurrency envelope.
 

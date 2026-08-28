@@ -104,7 +104,7 @@ P0.10 retains durable input-only controls and one atomic Jolt-backed
 character/grid physics step. A 1.8 m dynamic capsule owns radial upright
 alignment, tangent walk/sprint, buffered jump, slope handling, bounded steps,
 ground snap, magnetic attachment, and moving-support velocity inheritance. The
-active P1.5 transport uses protocol 16: gameplay mutations retain actor-local
+active two-cell transport uses protocol 18: gameplay mutations retain actor-local
 idempotency while connections receive a registry-bound interest baseline
 followed by acknowledged sparse deltas, bounded recovery baselines, and exact
 enter/replace/remove semantics. Actor-private projections hide inventory,
@@ -138,9 +138,13 @@ convergence without accepted shortcuts. [Hosted CI run
 33128613104](https://github.com/Bittrees-Technology/the-verse/actions/runs/33128613104)
 passes the complete Linux replay, Linux container probe, independent browser
 and native verifier suites, and Linux/Apple Silicon packages for implementation
-revision `71e955c`. Production active-player load, the production binary codec,
-and sleeping-cell production remain pending. Drop recovery/expiry, global cell
-execution, safe zones, accounts, AMMs, and blockchain settlement remain in the
+revision `71e955c`. The later P1.6 checkpoint adds fenced sleeping-cell
+production, and the current P1.7 checkpoint adds a durable two-cell directory,
+same-session independent-EVA handoff, verified destination routing, and exact
+restart recovery. Ordinary grid closure handoff is the next compatibility
+boundary; it is specified but not yet implemented. Production active-player
+load, the production binary codec, general multi-cell execution, safe zones,
+accounts, AMMs, and blockchain settlement remain in the
 [delivery roadmap](docs/roadmap/roadmap.md). See [Celestial registry and
 interest-managed visibility](docs/gameplay/celestial-registry-and-interest-management.md),
 [Physical refining and manufacturing](docs/gameplay/physical-industry.md),
