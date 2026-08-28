@@ -17,8 +17,9 @@ pub use celestial::{
     neighbor_cell_key, registry_snapshot, universe_manifest, validate_cell_key,
 };
 pub use cell_directory::{
-    CELL_DIRECTORY_SCHEMA_VERSION, CellAssignmentRecord, CellAssignmentState, CellDirectoryError,
-    LocalCellDirectory, proof_cell_keys,
+    AggregatePlacementRecord, AggregatePlacementState, CELL_DIRECTORY_SCHEMA_VERSION,
+    CellAssignmentRecord, CellAssignmentState, CellDirectoryError, CellTransferRecord,
+    LocalCellDirectory, MobileAggregateKind, TransferPhase, proof_cell_keys,
 };
 pub use content::ContentManifest;
 pub use engine::{
