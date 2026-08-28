@@ -554,7 +554,10 @@ binds the exact witness hash, source or destination role, live assignment and
 fence, nonzero cleanup frontier, package/member roots, quarantine receipt, and
 resulting draft-world commitment. Directory v3 now also persists a typed
 source-export proof before allowing destination import and requires a distinct
-destination-activation proof before source finalization. The package draft now
+destination-activation proof before source finalization. The persisted export
+evidence includes the mutation witness, exact ledger vector, resulting world,
+final proof hash, and trusted export time; directory decode reconstructs the
+typed cell proof and rejects substituted roots or missing evidence. The package draft now
 requires every production job to carry its exact
 canonical creation material: universe, creator cell, event sequence, entity
 kind, and ordinal. This makes the source-local queue frontier unambiguous after

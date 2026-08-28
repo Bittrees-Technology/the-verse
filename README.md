@@ -173,7 +173,10 @@ mutation. Its checked conservation witness includes carried and escrowed
 resources plus installed block components, advances one draft event frontier,
 and produces separate acyclic mutation, event, resulting-world, and final proof
 commitments. Exact retries survive later directory phases only when the
-directory retains the matching final proof hash. Directory v3 now requires
+directory retains the matching final proof hash. The directory also persists
+the exact mutation witness, conservation vector, and trusted export time so a
+restart can reconstruct and validate that typed proof instead of trusting an
+opaque hash. Directory v3 now requires
 that durable source-export proof before import and a destination-activation
 proof before source finalization. Destination materialization, activation,
 source finalization, scheduler wiring, and the crash matrix remain disabled

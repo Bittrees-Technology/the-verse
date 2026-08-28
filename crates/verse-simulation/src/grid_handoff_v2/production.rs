@@ -10,16 +10,20 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    DraftGridClosureError, DraftGridClosurePackageV2, ProductionJob, hash_json, valid_blake3_hex,
-    valid_stable_id,
+    DraftGridClosureError, DraftGridClosurePackageV2, ProductionJob, WorldState, hash_json,
+    valid_blake3_hex, valid_stable_id,
 };
 use crate::event::{PRODUCTION_SCHEDULE_OCCURRENCE_SCHEMA_VERSION, ProductionScheduleOccurrence};
 use crate::identity::{SUBJECT_ID_SCHEMA_VERSION, canonical_subject_id};
+
+use super::state::ValidatedDraftGridImportBoundaryV2;
 
 const PRODUCTION_JOB_ENTITY_KIND: &str = "production-job";
 const DRAFT_IMPORTED_PRODUCTION_ELIGIBILITY_SCHEMA_VERSION: u32 = 2;
 const IMPORTED_PRODUCTION_ELIGIBILITY_HASH_DOMAIN: &[u8] =
     b"the-verse/imported-production-eligibility/v2\0";
+const IMPORTED_PRODUCTION_ELIGIBILITY_MAP_ROOT_DOMAIN: &[u8] =
+    b"the-verse/imported-production-eligibility-map/v2\0";
 const PRODUCTION_IMPORT_REARM_MILLIS: u64 = 1_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -238,7 +242,7 @@ impl DraftImportedProductionEligibilityV2 {
         hash_json(IMPORTED_PRODUCTION_ELIGIBILITY_HASH_DOMAIN, &material)
     }
 
-    fn validate(&self) -> Result<(), DraftGridClosureError> {
+    pub(super) fn validate(&self) -> Result<(), DraftGridClosureError> {
         let unique_job_ids = self.ordered_job_ids.iter().collect::<BTreeSet<_>>();
         if self.schema_version != DRAFT_IMPORTED_PRODUCTION_ELIGIBILITY_SCHEMA_VERSION
             || !valid_stable_id(&self.transfer_id)
@@ -273,6 +277,48 @@ impl DraftImportedProductionEligibilityV2 {
             ));
         }
         Ok(())
+    }
+
+    pub(super) fn validate_persisted_in_world(
+        &self,
+        world: &WorldState,
+        current_queue: &VecDeque<ProductionJob>,
+    ) -> Result<(), DraftGridClosureError> {
+        self.validate()?;
+        if self.universe_id != world.universe_id
+            || self.universe_manifest_hash != world.universe_manifest_hash
+            || self.celestial_registry_hash != world.celestial_registry_hash
+            || self.destination_cell_id != world.cell_id
+            || self.destination_production_lifecycle_generation
+                != world.production_clock.lifecycle_generation
+            || self
+                .ordered_job_ids
+                .iter()
+                .map(String::as_str)
+                .ne(current_queue.iter().map(|job| job.job_id.as_str()))
+        {
+            return Err(DraftGridClosureError::Invalid(
+                "persisted import eligibility no longer binds its destination world and queue"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn transfer_id(&self) -> &str {
+        &self.transfer_id
+    }
+
+    pub(super) fn package_hash(&self) -> &str {
+        &self.package_hash
+    }
+
+    pub(super) fn machine_block_id(&self) -> &str {
+        &self.machine_block_id
+    }
+
+    pub(super) fn eligibility_hash(&self) -> &str {
+        &self.eligibility_hash
     }
 
     fn validate_for_import(
@@ -392,9 +438,26 @@ impl DraftImportedProductionEligibilityV2 {
 }
 
 impl DraftProductionImportAuthorityV2 {
-    /// Test-only material constructor. Production code receives no raw
-    /// constructor until the committed import transaction can derive every
-    /// field from validated directory, cell-event, and trusted-clock evidence.
+    /// Builds the private production capability after the destination import
+    /// transaction has derived every field from validated directory, cell
+    /// event, live-fence, lifecycle, and trusted-clock evidence.
+    pub(super) fn from_committed_import(
+        package: &DraftGridClosurePackageV2,
+        boundary: &ValidatedDraftGridImportBoundaryV2,
+    ) -> Result<Self, DraftGridClosureError> {
+        let authority = Self {
+            destination_assignment_generation: boundary.destination_assignment_generation(),
+            destination_fencing_token: boundary.destination_fencing_token(),
+            import_event_sequence: boundary.import_event_sequence(),
+            import_event_hash: boundary.import_event_hash().to_owned(),
+            trusted_import_unix_ms: boundary.trusted_import_unix_ms(),
+            destination_production_lifecycle_generation: boundary
+                .destination_production_lifecycle_generation(),
+        };
+        authority.validate_for_package(package)?;
+        Ok(authority)
+    }
+
     #[cfg(test)]
     pub(super) fn new(
         package: &DraftGridClosurePackageV2,
@@ -472,6 +535,20 @@ pub(super) fn validate_imported_production_eligibilities(
         ));
     }
     Ok(())
+}
+
+pub(super) fn imported_production_eligibility_map_root(
+    records: &BTreeMap<String, DraftImportedProductionEligibilityV2>,
+) -> Result<String, DraftGridClosureError> {
+    for (machine_id, record) in records {
+        record.validate()?;
+        if machine_id != record.machine_block_id() {
+            return Err(DraftGridClosureError::Invalid(
+                "import eligibility map key does not match its machine identity".into(),
+            ));
+        }
+    }
+    hash_json(IMPORTED_PRODUCTION_ELIGIBILITY_MAP_ROOT_DOMAIN, records)
 }
 
 #[cfg(test)]
