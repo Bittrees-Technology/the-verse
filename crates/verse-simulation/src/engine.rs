@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -250,6 +250,14 @@ pub struct ProductionDispatchOutcome {
     pub backlog_remaining: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct RuntimeOpenConfig {
+    data_directory: PathBuf,
+    requested_seed: u64,
+    snapshot_every: u64,
+    clock: Arc<dyn TrustedClock>,
+}
+
 impl AdvanceOutcome {
     #[must_use]
     pub const fn changed(self) -> bool {
@@ -269,7 +277,7 @@ pub struct Runtime {
     events_since_snapshot: u64,
     life_support_elapsed_millis_by_player: BTreeMap<String, u32>,
     physics_step_phase: u64,
-    physics: Scene,
+    physics: Option<Scene>,
     halted: bool,
     #[cfg(test)]
     physics_full_rebuilds: u64,
@@ -291,7 +299,61 @@ impl Runtime {
         )
     }
 
+    pub fn open_hosted(
+        data_directory: impl AsRef<Path>,
+        requested_seed: u64,
+        snapshot_every: u64,
+    ) -> Result<Self, RuntimeError> {
+        Self::open_hosted_with_clock(
+            data_directory,
+            requested_seed,
+            snapshot_every,
+            Arc::new(SystemTrustedClock),
+        )
+    }
+
+    pub fn open_hosted_with_clock(
+        data_directory: impl AsRef<Path>,
+        requested_seed: u64,
+        snapshot_every: u64,
+        clock: Arc<dyn TrustedClock>,
+    ) -> Result<Self, RuntimeError> {
+        let mut runtime = Self::open_for_activation_with_clock(
+            data_directory,
+            requested_seed,
+            snapshot_every,
+            clock,
+        )?;
+        runtime.store.restore_recovered_host_mode(&runtime.state)?;
+        Ok(runtime)
+    }
+
     pub fn open_with_clock(
+        data_directory: impl AsRef<Path>,
+        requested_seed: u64,
+        snapshot_every: u64,
+        clock: Arc<dyn TrustedClock>,
+    ) -> Result<Self, RuntimeError> {
+        let mut runtime = Self::open_for_activation_with_clock(
+            data_directory,
+            requested_seed,
+            snapshot_every,
+            clock,
+        )?;
+        while !runtime.activation_step()? {}
+        Ok(runtime)
+    }
+
+    pub fn open_for_activation(config: &RuntimeOpenConfig) -> Result<Self, RuntimeError> {
+        Self::open_for_activation_with_clock(
+            &config.data_directory,
+            config.requested_seed,
+            config.snapshot_every,
+            Arc::clone(&config.clock),
+        )
+    }
+
+    fn open_for_activation_with_clock(
         data_directory: impl AsRef<Path>,
         requested_seed: u64,
         snapshot_every: u64,
@@ -301,8 +363,6 @@ impl Runtime {
         let mut state = store.load_world()?;
         state.fencing_token = store.fencing_token();
 
-        let mut physics = Scene::new(physics_scene_config())?;
-        physics.rebuild(&physics_body_specs(&state))?;
         let physics_step_phase = state.physics_step_phase;
         let life_support_elapsed_millis_by_player = state
             .player
@@ -317,7 +377,7 @@ impl Runtime {
             events_since_snapshot: 0,
             life_support_elapsed_millis_by_player,
             physics_step_phase,
-            physics,
+            physics: None,
             halted: false,
             #[cfg(test)]
             physics_full_rebuilds: 0,
@@ -327,12 +387,56 @@ impl Runtime {
         if runtime.state.event_sequence == 0 {
             runtime.store.save_snapshot(&runtime.state)?;
         }
-        runtime.store.publish_active(&runtime.state)?;
         Ok(runtime)
+    }
+
+    fn initialize_physics(&mut self) -> Result<(), RuntimeError> {
+        if self.physics.is_some() {
+            return Ok(());
+        }
+        let mut physics = Scene::new(physics_scene_config())?;
+        physics.rebuild(&physics_body_specs(&self.state))?;
+        self.physics = Some(physics);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn physics(&self) -> &Scene {
+        self.physics
+            .as_ref()
+            .expect("active test runtime has an initialized physics scene")
+    }
+
+    #[cfg(test)]
+    fn physics_mut(&mut self) -> &mut Scene {
+        self.physics
+            .as_mut()
+            .expect("active test runtime has an initialized physics scene")
+    }
+
+    #[cfg(test)]
+    fn rebuild_physics_for_test(&mut self) {
+        let body_specs = physics_body_specs(&self.state);
+        self.physics_mut()
+            .rebuild(&body_specs)
+            .expect("test fixture must produce a valid physics scene");
+    }
+
+    pub fn open_config(&self) -> RuntimeOpenConfig {
+        RuntimeOpenConfig {
+            data_directory: self.store.root_path().to_path_buf(),
+            requested_seed: self.state.world_seed,
+            snapshot_every: self.snapshot_every,
+            clock: self.store.clock(),
+        }
     }
 
     pub const fn state(&self) -> &WorldState {
         &self.state
+    }
+
+    pub const fn physics_scene_is_initialized(&self) -> bool {
+        self.physics.is_some()
     }
 
     pub fn next_production_occurrence(&self) -> Option<&ProductionScheduleOccurrence> {
@@ -439,8 +543,14 @@ impl Runtime {
             }
             .into());
         }
-        let mut next_physics = Scene::new(physics_scene_config())?;
-        next_physics.rebuild(&physics_body_specs(&next_state))?;
+        let next_physics =
+            if self.store.lifecycle_mode() == crate::persistence::LifecycleMode::Active {
+                let mut physics = Scene::new(physics_scene_config())?;
+                physics.rebuild(&physics_body_specs(&next_state))?;
+                Some(physics)
+            } else {
+                None
+            };
         self.store.save_snapshot(&next_state)?;
         self.state = next_state;
         self.physics = next_physics;
@@ -463,9 +573,7 @@ impl Runtime {
         self.state.player.linear_velocity = Vec3::ZERO;
         self.state.player.angular_velocity = Vec3::ZERO;
         self.state.player.surface_contact = false;
-        self.physics
-            .rebuild(&physics_body_specs(&self.state))
-            .expect("test relocation must produce a valid physics scene");
+        self.rebuild_physics_for_test();
     }
 
     #[cfg(test)]
@@ -506,9 +614,7 @@ impl Runtime {
         self.state.player.locomotion.kind = LocomotionKind::Airborne;
         self.state.player.locomotion.up = Vec3::new(0.0, 1.0, 0.0);
         self.state.player.locomotion.view_pitch_radians = 0.0;
-        self.physics
-            .rebuild(&physics_body_specs(&self.state))
-            .expect("test aim must produce a valid physics scene");
+        self.rebuild_physics_for_test();
     }
 
     pub const fn is_halted(&self) -> bool {
@@ -604,10 +710,17 @@ impl Runtime {
             &next_state,
             &event,
         )?;
+        let lifecycle_mode = self.store.lifecycle_mode();
+        let physics = self
+            .physics
+            .as_mut()
+            .ok_or(RuntimeError::LifecycleUnavailable {
+                mode: lifecycle_mode,
+            })?;
         if let EventPayload::VoxelMined { coordinate, .. } = &event.payload {
             let chunk = voxel_collision_chunk_coordinate(*coordinate);
             let body_id = voxel_collision_chunk_body_id(chunk);
-            self.physics.replace_body(
+            physics.replace_body(
                 &body_id,
                 voxel_collision_chunk_body_spec(&next_state, chunk),
             )?;
@@ -616,7 +729,7 @@ impl Runtime {
                 self.physics_chunk_replacements += 1;
             }
         } else if event_changes_physics_scene(&event.payload) {
-            self.physics.rebuild(&physics_body_specs(&next_state))?;
+            physics.rebuild(&physics_body_specs(&next_state))?;
             #[cfg(test)]
             {
                 self.physics_full_rebuilds += 1;
@@ -735,7 +848,14 @@ impl Runtime {
             let step_count = (self.physics_step_phase / 1_000_000_000).min(15);
             if step_count > 0 {
                 self.physics_step_phase -= step_count * 1_000_000_000;
-                let mut body_states = match self.physics.body_states() {
+                let lifecycle_mode = self.store.lifecycle_mode();
+                let physics = self
+                    .physics
+                    .as_mut()
+                    .ok_or(RuntimeError::LifecycleUnavailable {
+                        mode: lifecycle_mode,
+                    })?;
+                let mut body_states = match physics.body_states() {
                     Ok(bodies) => bodies,
                     Err(source) => {
                         self.halted = true;
@@ -757,14 +877,14 @@ impl Runtime {
                         );
                         adjust_grounded_capsule_for_substep(
                             &self.state,
-                            &mut self.physics,
+                            physics,
                             scheduled_player,
                             &mut body_states,
                             substep_simulation_tick,
                         )?;
                         let jump = classify_player_locomotion_for_substep(
                             &self.state,
-                            &self.physics,
+                            &*physics,
                             scheduled_player,
                             &body_states,
                             substep_simulation_tick,
@@ -784,7 +904,7 @@ impl Runtime {
                             index == 0,
                         ));
                     }
-                    let step = match self.physics.step(&controls) {
+                    let step = match physics.step(&controls) {
                         Ok(step) => step,
                         Err(source) => {
                             self.halted = true;
@@ -896,7 +1016,14 @@ impl Runtime {
                     self.halted = true;
                     return Err(source);
                 }
-                if let Err(source) = self.physics.rebuild(&physics_body_specs(&self.state)) {
+                let lifecycle_mode = self.store.lifecycle_mode();
+                let physics = self
+                    .physics
+                    .as_mut()
+                    .ok_or(RuntimeError::LifecycleUnavailable {
+                        mode: lifecycle_mode,
+                    })?;
+                if let Err(source) = physics.rebuild(&physics_body_specs(&self.state)) {
                     self.halted = true;
                     return Err(source.into());
                 }
@@ -1002,7 +1129,13 @@ impl Runtime {
             event,
         )?;
         if event_changes_physics_scene(&event.payload) {
-            self.physics.rebuild(&physics_body_specs(&next_state))?;
+            let lifecycle_mode = self.store.lifecycle_mode();
+            self.physics
+                .as_mut()
+                .ok_or(RuntimeError::LifecycleUnavailable {
+                    mode: lifecycle_mode,
+                })?
+                .rebuild(&physics_body_specs(&next_state))?;
             #[cfg(test)]
             {
                 self.physics_full_rebuilds += 1;
@@ -1067,16 +1200,27 @@ impl Runtime {
                     .into()
                 });
         }
+        let scheduled_from_trusted_boundary = event
+            .occurred_at_unix_ms
+            .checked_add(1_000)
+            .ok_or_else(|| {
+                IntentError::rejected(
+                    "production_clock_exhausted",
+                    "production scheduled time is exhausted",
+                )
+            })?;
+        let scheduled_after_committed_cursor = resulting_state
+            .production_clock
+            .last_scheduled_for_unix_ms
+            .checked_add(1_000)
+            .ok_or_else(|| {
+                IntentError::rejected(
+                    "production_clock_exhausted",
+                    "production scheduled time is exhausted",
+                )
+            })?;
         let scheduled_for_unix_ms =
-            event
-                .occurred_at_unix_ms
-                .checked_add(1_000)
-                .ok_or_else(|| {
-                    IntentError::rejected(
-                        "production_clock_exhausted",
-                        "production scheduled time is exhausted",
-                    )
-                })?;
+            scheduled_from_trusted_boundary.max(scheduled_after_committed_cursor);
         resulting_state
             .next_production_occurrence_at(scheduled_for_unix_ms)
             .map(Some)
@@ -1133,6 +1277,13 @@ impl Runtime {
             }
             return Ok(false);
         }
+        if self.store.next_production_occurrence() != Some(&occurrence) {
+            return Err(IntentError::rejected(
+                "production_occurrence_delivery_conflict",
+                "scheduler delivery does not match the durable next production occurrence",
+            )
+            .into());
+        }
         let payload = self.state.production_quantum_payload(occurrence)?;
         self.commit_production_quantum(payload)?;
         Ok(true)
@@ -1149,13 +1300,20 @@ impl Runtime {
                 return Err(source.into());
             }
         };
+        self.advance_due_production_through(now_unix_ms)
+    }
+
+    fn advance_due_production_through(
+        &mut self,
+        cutoff_unix_ms: u64,
+    ) -> Result<ProductionDispatchOutcome, RuntimeError> {
         let started_at = std::time::Instant::now();
         let mut committed_quanta = 0;
         while committed_quanta < MAX_PRODUCTION_CATCH_UP_QUANTA {
             let Some(occurrence) = self.store.next_production_occurrence().cloned() else {
                 break;
             };
-            if occurrence.scheduled_for_unix_ms > now_unix_ms {
+            if occurrence.scheduled_for_unix_ms > cutoff_unix_ms {
                 break;
             }
             if self.advance_background_production_occurrence(occurrence)? {
@@ -1168,11 +1326,38 @@ impl Runtime {
         let backlog_remaining = self
             .store
             .next_production_occurrence()
-            .is_some_and(|occurrence| occurrence.scheduled_for_unix_ms <= now_unix_ms);
+            .is_some_and(|occurrence| occurrence.scheduled_for_unix_ms <= cutoff_unix_ms);
         Ok(ProductionDispatchOutcome {
             committed_quanta,
             backlog_remaining,
         })
+    }
+
+    pub fn production_wait_millis(&mut self) -> Result<Option<u64>, RuntimeError> {
+        if self.halted {
+            return Err(RuntimeError::Halted);
+        }
+        let now_unix_ms = self.store.accepted_trusted_time()?;
+        Ok(self
+            .store
+            .next_production_occurrence()
+            .map(|occurrence| occurrence.scheduled_for_unix_ms.saturating_sub(now_unix_ms)))
+    }
+
+    pub fn background_dispatch_step(
+        &mut self,
+    ) -> Result<crate::persistence::LifecycleMode, RuntimeError> {
+        if self.store.lifecycle_mode() != crate::persistence::LifecycleMode::Background {
+            return Err(RuntimeError::LifecycleUnavailable {
+                mode: self.store.lifecycle_mode(),
+            });
+        }
+        self.advance_due_production()?;
+        if self.store.next_production_occurrence().is_none() {
+            self.store.release_to_sleeping(&self.state)?;
+            return Ok(crate::persistence::LifecycleMode::Sleeping);
+        }
+        Ok(crate::persistence::LifecycleMode::Background)
     }
 
     pub fn drain_to_background_or_sleeping(
@@ -1204,9 +1389,11 @@ impl Runtime {
                 crate::persistence::LifecycleMode::Background,
                 &self.state,
             )?;
+            self.physics = None;
             Ok(crate::persistence::LifecycleMode::Background)
         } else {
             self.store.release_to_sleeping(&self.state)?;
+            self.physics = None;
             Ok(crate::persistence::LifecycleMode::Sleeping)
         }
     }
@@ -1225,11 +1412,17 @@ impl Runtime {
             crate::persistence::LifecycleMode::Activating => {}
             mode => return Err(RuntimeError::LifecycleUnavailable { mode }),
         }
-        let dispatch = self.advance_due_production()?;
+        let cutoff_unix_ms = self.store.activation_cutoff_unix_ms().ok_or_else(|| {
+            RuntimeError::Persistence(PersistenceError::InvalidLifecycleControl(
+                "activating lifecycle has no durable wake cut-off".into(),
+            ))
+        })?;
+        let dispatch = self.advance_due_production_through(cutoff_unix_ms)?;
         if dispatch.backlog_remaining {
             return Ok(false);
         }
         self.persist_snapshot()?;
+        self.initialize_physics()?;
         self.store.publish_active(&self.state)?;
         Ok(true)
     }
@@ -1414,7 +1607,7 @@ impl WorldState {
             self.production_clock
                 .last_scheduled_for_unix_ms
                 .checked_add(1_000)
-                .is_some_and(|expected| occurrence.scheduled_for_unix_ms == expected)
+                .is_some_and(|earliest| occurrence.scheduled_for_unix_ms >= earliest)
         };
         if occurrence.schema_version != PRODUCTION_SCHEDULE_OCCURRENCE_SCHEMA_VERSION
             || occurrence.universe_id != self.universe_id
@@ -7039,20 +7232,41 @@ mod tests {
 
     fn advance_whole_seconds(runtime: &mut Runtime, seconds: usize) {
         for _ in 0..seconds {
-            let scheduled_for_unix_ms = runtime
-                .state()
-                .production_clock
-                .last_scheduled_for_unix_ms
-                .checked_add(1_000)
-                .expect("fixture production clock remains available")
-                .max(1_000);
+            if runtime.next_production_occurrence().is_none() {
+                if !runtime
+                    .state()
+                    .background_production_is_runnable()
+                    .expect("fixture production state is valid")
+                {
+                    continue;
+                }
+                let scheduled_for_unix_ms = runtime
+                    .state()
+                    .production_clock
+                    .last_scheduled_for_unix_ms
+                    .checked_add(1_000)
+                    .expect("fixture production clock has capacity");
+                let occurrence = runtime
+                    .state()
+                    .next_production_occurrence_at(scheduled_for_unix_ms)
+                    .expect("fixture occurrence follows canonical production state");
+                runtime
+                    .store
+                    .install_next_production_occurrence_for_test(occurrence)
+                    .expect("fixture occurrence persists");
+            }
             let occurrence = runtime
-                .state()
-                .next_production_occurrence_at(scheduled_for_unix_ms)
-                .expect("fixture occurrence is canonical");
-            runtime
-                .advance_background_production_occurrence(occurrence)
-                .expect("authoritative second advances");
+                .next_production_occurrence()
+                .cloned()
+                .expect("fixture occurrence is durably scheduled");
+            if let Err(source) =
+                runtime.advance_background_production_occurrence(occurrence.clone())
+            {
+                panic!(
+                    "authoritative second advances: {source}; occurrence={occurrence:?}; clock={:?}",
+                    runtime.state().production_clock
+                );
+            }
         }
     }
 
@@ -7103,9 +7317,9 @@ mod tests {
         let mut runtime = two_machine_production_runtime(directory.path());
         let before_sequence = runtime.state().event_sequence;
         let occurrence = runtime
-            .state()
-            .next_active_production_occurrence()
-            .expect("next occurrence exists");
+            .next_production_occurrence()
+            .cloned()
+            .expect("next occurrence is durably scheduled");
 
         assert!(
             runtime
@@ -7162,9 +7376,9 @@ mod tests {
         let mut runtime = two_machine_production_runtime(directory.path());
         let prior = runtime.state().clone();
         let occurrence = runtime
-            .state()
-            .next_active_production_occurrence()
-            .expect("next occurrence exists");
+            .next_production_occurrence()
+            .cloned()
+            .expect("next occurrence is durably scheduled");
         runtime
             .advance_background_production_occurrence(occurrence)
             .expect("whole-cell quantum commits");
@@ -7188,9 +7402,9 @@ mod tests {
         let directory = tempdir().expect("tempdir");
         let mut runtime = two_machine_production_runtime(directory.path());
         let occurrence = runtime
-            .state()
-            .next_active_production_occurrence()
-            .expect("next occurrence exists");
+            .next_production_occurrence()
+            .cloned()
+            .expect("next occurrence is durably scheduled");
         let prior_sequence = runtime.state().event_sequence;
         let prior_tick = runtime.state().simulation_tick;
         let prior_phase = runtime.state().physics_step_phase;
@@ -7225,9 +7439,9 @@ mod tests {
             let directory = tempdir().expect("tempdir");
             let mut runtime = two_machine_production_runtime(directory.path());
             let occurrence = runtime
-                .state()
-                .next_active_production_occurrence()
-                .expect("next occurrence exists");
+                .next_production_occurrence()
+                .cloned()
+                .expect("next occurrence is durably scheduled");
             let prior_hash = runtime.state().state_hash();
             let prior_sequence = runtime.state().event_sequence;
             runtime.store.set_append_failpoint(failpoint);
@@ -7343,6 +7557,7 @@ mod tests {
     fn forward_jump_respects_catch_up_budgets_and_retains_exact_continuation() {
         let directory = tempdir().expect("tempdir");
         let clock = Arc::new(ManualTrustedClock::new(2_000_000));
+        let open_config;
         {
             let mut runtime = Runtime::open_with_clock(directory.path(), 602, 100, clock.clone())
                 .expect("runtime opens");
@@ -7361,10 +7576,11 @@ mod tests {
                     100,
                 ))
                 .expect("long job queues");
+            open_config = runtime.open_config();
         }
 
         clock.set(2_100_000);
-        let mut recovered = Runtime::open_with_clock(directory.path(), 602, 100, clock.clone())
+        let mut recovered = Runtime::open_for_activation(&open_config)
             .expect("replacement runtime opens after forward jump");
         let first = recovered
             .advance_due_production()
@@ -7417,6 +7633,7 @@ mod tests {
                 crate::persistence::LifecycleMode::Sleeping
             );
             assert!(sleeping.expires_at_unix_ms.is_none());
+            assert!(!runtime.physics_scene_is_initialized());
             assert!(matches!(
                 runtime.advance(16),
                 Err(RuntimeError::LifecycleUnavailable {
@@ -7430,6 +7647,7 @@ mod tests {
             successor.lifecycle_status().observed_mode,
             crate::persistence::LifecycleMode::Active
         );
+        assert!(successor.physics_scene_is_initialized());
         assert!(successor.lifecycle_status().fencing_token > first_fence);
     }
 
@@ -7462,6 +7680,7 @@ mod tests {
                 .expect("runnable drain succeeds"),
             crate::persistence::LifecycleMode::Background
         );
+        assert!(!runtime.physics_scene_is_initialized());
         assert!(matches!(
             runtime.advance(250),
             Err(RuntimeError::LifecycleUnavailable {
@@ -7483,6 +7702,387 @@ mod tests {
         assert_eq!(
             runtime.lifecycle_status().observed_mode,
             crate::persistence::LifecycleMode::Active
+        );
+        assert!(runtime.physics_scene_is_initialized());
+    }
+
+    #[test]
+    fn idle_production_rearms_from_the_new_trusted_boundary_without_cursor_conflict() {
+        let directory = tempdir().expect("tempdir");
+        let clock = Arc::new(ManualTrustedClock::new(3_500_000));
+        let mut runtime = Runtime::open_with_clock(directory.path(), 608, 100, clock.clone())
+            .expect("runtime opens");
+        seed_industry_cargo(
+            &mut runtime,
+            InventoryContents {
+                ore: 2,
+                ..InventoryContents::default()
+            },
+        );
+        runtime
+            .execute_next_for_fixture(&production_intent(
+                "idle-rearm-refining",
+                "block-refinery",
+                ProductionRecipeKind::Refining,
+                1,
+            ))
+            .expect("refining queues");
+        for due in [3_501_000, 3_502_000] {
+            clock.set(due);
+            assert_eq!(
+                runtime
+                    .advance_due_production()
+                    .expect("refining quantum commits")
+                    .committed_quanta,
+                1
+            );
+        }
+        assert!(runtime.next_production_occurrence().is_none());
+        assert_eq!(
+            runtime
+                .state()
+                .production_clock
+                .last_committed_quantum_sequence,
+            2
+        );
+
+        clock.set(3_502_125);
+        runtime
+            .execute_next_for_fixture(&production_intent(
+                "idle-rearm-assembly",
+                "block-assembler",
+                ProductionRecipeKind::Component,
+                1,
+            ))
+            .expect("assembly queues after the idle gap");
+        let rearmed = runtime
+            .next_production_occurrence()
+            .cloned()
+            .expect("new runnable boundary rearms production");
+        assert_eq!(rearmed.production_quantum_sequence, 3);
+        assert_eq!(rearmed.scheduled_for_unix_ms, 3_503_125);
+
+        let before_conflict = runtime.state().state_hash();
+        let mut conflicting = rearmed.clone();
+        conflicting.scheduled_for_unix_ms += 1;
+        assert!(matches!(
+            runtime.advance_background_production_occurrence(conflicting),
+            Err(RuntimeError::Intent(IntentError::Rejected { ref code, .. }))
+                if code == "production_occurrence_delivery_conflict"
+        ));
+        assert_eq!(runtime.state().state_hash(), before_conflict);
+
+        clock.set(rearmed.scheduled_for_unix_ms);
+        assert_eq!(
+            runtime
+                .advance_due_production()
+                .expect("rearmed occurrence commits")
+                .committed_quanta,
+            1
+        );
+        assert_eq!(
+            runtime
+                .state()
+                .production_clock
+                .last_committed_quantum_sequence,
+            3
+        );
+        assert!(runtime.state().conservation().valid);
+    }
+
+    #[test]
+    fn activation_catches_up_only_through_its_durable_wake_cutoff() {
+        let directory = tempdir().expect("tempdir");
+        let clock = Arc::new(ManualTrustedClock::new(4_000_000));
+        let mut runtime = Runtime::open_with_clock(directory.path(), 605, 100, clock.clone())
+            .expect("runtime opens");
+        seed_industry_cargo(
+            &mut runtime,
+            InventoryContents {
+                ore: 200,
+                ..InventoryContents::default()
+            },
+        );
+        runtime
+            .execute_next_for_fixture(&production_intent(
+                "activation-cutoff",
+                "block-refinery",
+                ProductionRecipeKind::Refining,
+                100,
+            ))
+            .expect("long job queues");
+        assert_eq!(
+            runtime
+                .drain_to_background_or_sleeping()
+                .expect("runnable cell drains"),
+            crate::persistence::LifecycleMode::Background
+        );
+        let open_config = runtime.open_config();
+        drop(runtime);
+
+        clock.set(4_070_000);
+        let mut runtime = Runtime::open_for_activation(&open_config)
+            .expect("replacement acquires the background cell for activation");
+        assert!(!runtime.activation_step().expect("bounded catch-up yields"));
+        assert_eq!(
+            runtime.lifecycle_status().observed_mode,
+            crate::persistence::LifecycleMode::Activating
+        );
+        assert!(!runtime.physics_scene_is_initialized());
+        assert!(
+            (1..=u64::try_from(MAX_PRODUCTION_CATCH_UP_QUANTA).expect("catch-up budget fits u64"))
+                .contains(
+                    &runtime
+                        .state()
+                        .production_clock
+                        .last_committed_quantum_sequence
+                )
+        );
+        let first_activation_frontier = runtime
+            .state()
+            .production_clock
+            .last_committed_quantum_sequence;
+        drop(runtime);
+
+        clock.set(4_075_000);
+        let mut runtime =
+            Runtime::open_hosted_with_clock(directory.path(), 605, 100, clock.clone())
+                .expect("activation crash recovery preserves the original cut-off");
+        assert_eq!(
+            runtime
+                .state()
+                .production_clock
+                .last_committed_quantum_sequence,
+            first_activation_frontier
+        );
+        let mut activated = false;
+        for _ in 0..100 {
+            activated = runtime
+                .activation_step()
+                .expect("cut-off catch-up continues");
+            if activated {
+                break;
+            }
+        }
+        assert!(
+            activated,
+            "bounded activation eventually reaches its cut-off"
+        );
+        assert_eq!(
+            runtime
+                .state()
+                .production_clock
+                .last_committed_quantum_sequence,
+            70
+        );
+        assert_eq!(
+            runtime
+                .next_production_occurrence()
+                .expect("post-cutoff work remains scheduled")
+                .scheduled_for_unix_ms,
+            4_071_000
+        );
+        assert!(runtime.physics_scene_is_initialized());
+    }
+
+    #[test]
+    fn hosted_restart_restores_sleeping_without_physics_or_writer_ownership() {
+        let directory = tempdir().expect("tempdir");
+        let clock = Arc::new(ManualTrustedClock::new(5_000_000));
+        let mut runtime = Runtime::open_with_clock(directory.path(), 606, 100, clock.clone())
+            .expect("runtime opens");
+        assert_eq!(
+            runtime
+                .drain_to_background_or_sleeping()
+                .expect("idle cell sleeps"),
+            crate::persistence::LifecycleMode::Sleeping
+        );
+        drop(runtime);
+
+        let sleeping_host =
+            Runtime::open_hosted_with_clock(directory.path(), 606, 100, clock.clone())
+                .expect("host recovers the durable sleeping mode");
+        assert_eq!(
+            sleeping_host.lifecycle_status().observed_mode,
+            crate::persistence::LifecycleMode::Sleeping
+        );
+        assert!(!sleeping_host.physics_scene_is_initialized());
+
+        let wake_config = sleeping_host.open_config();
+        let waking = Runtime::open_for_activation(&wake_config)
+            .expect("sleeping host retains no exclusive writer ownership");
+        assert_eq!(
+            waking.lifecycle_status().observed_mode,
+            crate::persistence::LifecycleMode::Activating
+        );
+        assert!(!waking.physics_scene_is_initialized());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cross_process_hard_kill_replays_exactly_one_background_output() {
+        const CHILD_FLAG: &str = "VERSE_P16_CROSS_PROCESS_CHILD";
+        const ROOT_ENV: &str = "VERSE_P16_CROSS_PROCESS_ROOT";
+        const READY_ENV: &str = "VERSE_P16_CROSS_PROCESS_READY";
+        const SEED: u64 = 607;
+        const START_UNIX_MS: u64 = 6_000_000;
+
+        if std::env::var_os(CHILD_FLAG).is_some() {
+            let root = std::path::PathBuf::from(
+                std::env::var_os(ROOT_ENV).expect("child receives the universe root"),
+            );
+            let ready = std::path::PathBuf::from(
+                std::env::var_os(READY_ENV).expect("child receives the readiness marker"),
+            );
+            let clock = Arc::new(ManualTrustedClock::new(START_UNIX_MS));
+            let mut runtime = Runtime::open_with_clock(&root, SEED, 100, clock.clone())
+                .expect("child runtime opens");
+            seed_industry_cargo(
+                &mut runtime,
+                InventoryContents {
+                    ore: 2,
+                    ..InventoryContents::default()
+                },
+            );
+            runtime
+                .execute_next_for_fixture(&production_intent(
+                    "cross-process-background",
+                    "block-refinery",
+                    ProductionRecipeKind::Refining,
+                    1,
+                ))
+                .expect("child queues refining");
+            let job = runtime
+                .state
+                .production_queues
+                .get_mut("block-refinery")
+                .and_then(|queue| queue.front_mut())
+                .expect("child refining job exists");
+            job.progress_ticks = job
+                .duration_ticks
+                .checked_sub(u64::from(content::manifest().physics.fixed_step_hz))
+                .expect("fixture duration exceeds one quantum");
+            runtime
+                .persist_snapshot()
+                .expect("near-complete child job persists");
+            assert_eq!(
+                runtime
+                    .drain_to_background_or_sleeping()
+                    .expect("child drains to background"),
+                crate::persistence::LifecycleMode::Background
+            );
+            clock.set(START_UNIX_MS + 1_000);
+            assert_eq!(
+                runtime
+                    .advance_due_production()
+                    .expect("child commits one due quantum")
+                    .committed_quanta,
+                1
+            );
+            assert_eq!(
+                runtime.state.inventories[STARTER_INDUSTRY_CARGO_INVENTORY_ID]
+                    .contents
+                    .refined_material,
+                1
+            );
+            fs::write(&ready, b"journal-synced").expect("child publishes readiness marker");
+            loop {
+                std::thread::park();
+            }
+        }
+
+        let directory = tempdir().expect("tempdir");
+        let ready = directory.path().join("background-event-synced");
+        let current_executable =
+            std::env::current_exe().expect("test executable path remains available");
+        let mut child = std::process::Command::new(current_executable)
+            .arg("--exact")
+            .arg("engine::tests::cross_process_hard_kill_replays_exactly_one_background_output")
+            .arg("--nocapture")
+            .env(CHILD_FLAG, "1")
+            .env(ROOT_ENV, directory.path())
+            .env(READY_ENV, &ready)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("cross-process fixture starts");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !ready.exists() {
+            if let Some(status) = child.try_wait().expect("child status remains readable") {
+                panic!("cross-process fixture exited before the hard-kill boundary: {status}");
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cross-process fixture did not reach the hard-kill boundary"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let stop_status = std::process::Command::new("kill")
+            .arg("-STOP")
+            .arg(child.id().to_string())
+            .status()
+            .expect("the local host provides POSIX process signalling");
+        assert!(stop_status.success());
+        let blocked_clock = Arc::new(ManualTrustedClock::new(START_UNIX_MS + 20_000));
+        assert!(matches!(
+            Runtime::open_hosted_with_clock(directory.path(), SEED, 100, blocked_clock,),
+            Err(RuntimeError::Persistence(
+                PersistenceError::WriterAlreadyActive(_)
+            ))
+        ));
+        child
+            .kill()
+            .expect("hard-kill terminates the writer process");
+        let status = child.wait().expect("hard-killed child is reaped");
+        assert!(!status.success());
+
+        let clock = Arc::new(ManualTrustedClock::new(START_UNIX_MS + 1_000));
+        let mut recovered =
+            Runtime::open_hosted_with_clock(directory.path(), SEED, 100, clock.clone())
+                .expect("successor replays the synced event without a graceful snapshot");
+        assert_eq!(
+            recovered.lifecycle_status().observed_mode,
+            crate::persistence::LifecycleMode::Background
+        );
+        assert!(!recovered.physics_scene_is_initialized());
+        assert_eq!(
+            recovered
+                .state()
+                .production_clock
+                .last_committed_quantum_sequence,
+            1
+        );
+        assert_eq!(
+            recovered.state().inventories[STARTER_INDUSTRY_CARGO_INVENTORY_ID]
+                .contents
+                .refined_material,
+            1
+        );
+        assert!(recovered.state().conservation().valid);
+        assert_eq!(
+            recovered
+                .background_dispatch_step()
+                .expect("reconciled background cell releases"),
+            crate::persistence::LifecycleMode::Sleeping
+        );
+
+        let wake_config = recovered.open_config();
+        drop(recovered);
+        let mut active = Runtime::open_for_activation(&wake_config)
+            .expect("successor reacquires the sleeping cell");
+        assert!(active.activation_step().expect("successor activates"));
+        assert_eq!(
+            active.state().inventories[STARTER_INDUSTRY_CARGO_INVENTORY_ID]
+                .contents
+                .refined_material,
+            1
+        );
+        assert_eq!(
+            active
+                .state()
+                .production_clock
+                .last_committed_quantum_sequence,
+            1
         );
     }
 
@@ -8557,10 +9157,7 @@ mod tests {
         player.angular_velocity = primary.angular_velocity;
         player.surface_contact = primary.surface_contact;
         player.locomotion = primary.locomotion;
-        runtime
-            .physics
-            .rebuild(&physics_body_specs(&runtime.state))
-            .expect("actor-specific tool pose rebuilds the physics scene");
+        runtime.rebuild_physics_for_test();
     }
 
     fn normalized(value: Vec3) -> Vec3 {
@@ -8644,10 +9241,7 @@ mod tests {
         }
         *runtime.state.player.primary_mut() =
             aimed.expect("build fixture has one visible face-connected existing block");
-        runtime
-            .physics
-            .rebuild(&physics_body_specs(&runtime.state))
-            .expect("test setup rebuilds aimed player near the grid");
+        runtime.rebuild_physics_for_test();
     }
 
     fn exposed_voxel_face(voxels: &VoxelField, coordinate: IVec3) -> Option<IVec3> {
@@ -8711,10 +9305,7 @@ mod tests {
             .get_mut(player_id)
             .expect("aimed fixture actor exists") =
             aimed.expect("mining fixture voxel has a visible exposed face");
-        runtime
-            .physics
-            .rebuild(&physics_body_specs(&runtime.state))
-            .expect("test setup rebuilds aimed player near the voxel");
+        runtime.rebuild_physics_for_test();
     }
 
     fn aim_player_at_block(runtime: &mut Runtime, grid_id: &str, block_id: &str) {
@@ -8757,10 +9348,7 @@ mod tests {
         }
         *runtime.state.player.primary_mut() =
             aimed.expect("hand-tool fixture block has one visible exposed face");
-        runtime
-            .physics
-            .rebuild(&physics_body_specs(&runtime.state))
-            .expect("test setup rebuilds aimed player near the block");
+        runtime.rebuild_physics_for_test();
     }
 
     fn aim_player_at_block_preserving_locomotion(
@@ -8781,10 +9369,7 @@ mod tests {
         runtime.state.player.linear_velocity = prior.linear_velocity;
         runtime.state.player.angular_velocity = prior.angular_velocity;
         runtime.state.player.surface_contact = prior.surface_contact;
-        runtime
-            .physics
-            .rebuild(&physics_body_specs(&runtime.state))
-            .expect("tool fixture restores the physical player pose");
+        runtime.rebuild_physics_for_test();
     }
 
     fn add_remote_player(runtime: &mut Runtime) {
@@ -8797,10 +9382,7 @@ mod tests {
             .get_mut("player-remote")
             .expect("remote development player exists")
             .linear_velocity = Vec3::new(0.25, 0.0, 0.0);
-        runtime
-            .physics
-            .rebuild(&physics_body_specs(&runtime.state))
-            .expect("two-player physics scene builds");
+        runtime.rebuild_physics_for_test();
     }
 
     #[test]
@@ -9662,10 +10244,7 @@ mod tests {
             .sum();
         runtime.state.ledger.destroyed_components = 0;
         assert!(runtime.state.conservation().valid);
-        runtime
-            .physics
-            .rebuild(&physics_body_specs(&runtime.state))
-            .expect("fixture physics rebuilds");
+        runtime.rebuild_physics_for_test();
         runtime
             .persist_snapshot()
             .expect("fixture snapshot persists");
@@ -10454,7 +11033,7 @@ mod tests {
         let target = reachable_voxel(&mut runtime);
         let body_id = voxel_collision_chunk_body_id(voxel_collision_chunk_coordinate(target));
         let collider_id = voxel_collision_collider_id(target);
-        assert!(runtime.physics.contains_collider(&body_id, &collider_id));
+        assert!(runtime.physics().contains_collider(&body_id, &collider_id));
         let intent = ClientMessage::MineVoxel {
             operation_sequence: 0,
             operation_id: "mine-once".into(),
@@ -10465,7 +11044,7 @@ mod tests {
             .expect("first mine accepted");
         assert_eq!(runtime.physics_chunk_replacements, 1);
         assert_eq!(runtime.physics_full_rebuilds, 0);
-        assert!(!runtime.physics.contains_collider(&body_id, &collider_id));
+        assert!(!runtime.physics().contains_collider(&body_id, &collider_id));
         let hash_after_first = runtime.state().state_hash();
         let second = runtime
             .execute_next_for_fixture(&intent)
@@ -10668,7 +11247,7 @@ mod tests {
             |runtime: &mut Runtime, operation_id: &str, coordinate: IVec3, expected_code: &str| {
                 let before_hash = runtime.state().state_hash();
                 let before_sequence = runtime.state().event_sequence;
-                let before_fingerprint = runtime.physics.body_collider_fingerprint();
+                let before_fingerprint = runtime.physics().body_collider_fingerprint();
                 let before_journal = fs::read(directory.path().join("events.ndjson"))
                     .expect("journal reads before rejection");
                 let result = runtime.execute_next_as_for_fixture(
@@ -10687,7 +11266,7 @@ mod tests {
                 assert_eq!(runtime.state().state_hash(), before_hash);
                 assert_eq!(runtime.state().event_sequence, before_sequence);
                 assert_eq!(
-                    runtime.physics.body_collider_fingerprint(),
+                    runtime.physics().body_collider_fingerprint(),
                     before_fingerprint
                 );
                 assert_eq!(
@@ -10731,10 +11310,7 @@ mod tests {
             death_id: "remote-test-death".into(),
             cause: PlayerDeathCause::OxygenDepleted,
         };
-        runtime
-            .physics
-            .rebuild(&physics_body_specs(&runtime.state))
-            .expect("incapacitated fixture physics builds");
+        runtime.rebuild_physics_for_test();
         runtime
             .persist_snapshot()
             .expect("incapacitated mining baseline persists");
@@ -11098,7 +11674,7 @@ mod tests {
         runtime.persist_snapshot().expect("player pose persists");
         assert!(runtime.state().grids["anchored-grid"].anchor_touches(&runtime.state().voxels));
         let before_hash = runtime.state().state_hash();
-        let before_fingerprint = runtime.physics.body_collider_fingerprint();
+        let before_fingerprint = runtime.physics().body_collider_fingerprint();
         let before_journal =
             fs::read(directory.path().join("events.ndjson")).expect("journal reads");
 
@@ -11114,7 +11690,7 @@ mod tests {
         ));
         assert_eq!(runtime.state().state_hash(), before_hash);
         assert_eq!(
-            runtime.physics.body_collider_fingerprint(),
+            runtime.physics().body_collider_fingerprint(),
             before_fingerprint
         );
         assert_eq!(runtime.physics_chunk_replacements, 0);
@@ -11698,10 +12274,7 @@ mod tests {
         let mut runtime = runtime();
         runtime.state.player.linear_velocity = Vec3::new(20.0, 0.0, 0.0);
         runtime.state.player.angular_velocity = Vec3::new(0.0, 0.0, 3.0);
-        runtime
-            .physics
-            .rebuild(&physics_body_specs(&runtime.state))
-            .expect("high-inertia player fixture rebuilds");
+        runtime.rebuild_physics_for_test();
         runtime
             .execute_next_for_fixture(&ClientMessage::SetPlayerControl {
                 operation_sequence: 0,
@@ -11952,10 +12525,7 @@ mod tests {
             player.suit_oxygen_milli = 1_000;
             player.linear_velocity = Vec3::ZERO;
         }
-        runtime
-            .physics
-            .rebuild(&physics_body_specs(&runtime.state))
-            .expect("two-player vacuum fixture builds");
+        runtime.rebuild_physics_for_test();
         runtime.persist_snapshot().expect("fixture persists");
 
         for _ in 0..3 {
@@ -13861,10 +14431,7 @@ mod tests {
         set_test_player_position(&mut runtime.state.player, start);
         runtime.state.player.linear_velocity = Vec3::new(0.0, -24.0, 0.0);
         runtime.state.player.jetpack_enabled = false;
-        runtime
-            .physics
-            .rebuild(&physics_body_specs(&runtime.state))
-            .expect("test setup rebuilds the rotated grid scene");
+        runtime.rebuild_physics_for_test();
 
         let mut contacted = false;
         for _ in 0..30 {
@@ -13899,10 +14466,7 @@ mod tests {
         set_test_player_position(&mut runtime.state.player, start);
         runtime.state.player.linear_velocity = Vec3::new(0.0, -24.0, 0.0);
         runtime.state.player.jetpack_enabled = false;
-        runtime
-            .physics
-            .rebuild(&physics_body_specs(&runtime.state))
-            .expect("planet landing fixture rebuilds");
+        runtime.rebuild_physics_for_test();
 
         let mut contacted = false;
         for _ in 0..60 {
@@ -14140,25 +14704,30 @@ mod tests {
             local_anchor: Vec3::new(0.0, planet_surface_radius_m(), 0.0),
             local_normal: Vec3::new(0.0, 1.0, 0.0),
         });
-        runtime
-            .physics
-            .rebuild(&physics_body_specs(&runtime.state))
-            .expect("snap fixture rebuilds");
-        let mut body_states = runtime.physics.body_states().expect("body states extract");
+        runtime.rebuild_physics_for_test();
+        let mut body_states = runtime
+            .physics_mut()
+            .body_states()
+            .expect("body states extract");
         let before = body_states
             .iter()
             .find(|body| body.body_id == PLAYER_BODY_ID)
             .expect("player body exists")
             .clone();
 
-        adjust_grounded_capsule_for_substep(
-            &runtime.state,
-            &mut runtime.physics,
-            &runtime.state.player,
-            &mut body_states,
-            runtime.state.simulation_tick,
-        )
-        .expect("ground snap applies");
+        {
+            let Runtime { state, physics, .. } = &mut runtime;
+            adjust_grounded_capsule_for_substep(
+                &*state,
+                physics
+                    .as_mut()
+                    .expect("active test runtime has an initialized physics scene"),
+                &state.player,
+                &mut body_states,
+                state.simulation_tick,
+            )
+            .expect("ground snap applies");
+        }
         let after = body_states
             .iter()
             .find(|body| body.body_id == PLAYER_BODY_ID)
@@ -14196,10 +14765,7 @@ mod tests {
             false,
             runtime.state.simulation_tick,
         );
-        runtime
-            .physics
-            .rebuild(&physics_body_specs(&runtime.state))
-            .expect("radial upright fixture rebuilds");
+        runtime.rebuild_physics_for_test();
 
         let desired_up = Vec3::new(1.0, 0.0, 0.0);
         let initial_up = runtime
@@ -14272,10 +14838,7 @@ mod tests {
                 false,
                 runtime.state.simulation_tick,
             );
-            runtime
-                .physics
-                .rebuild(&physics_body_specs(&runtime.state))
-                .expect("planet-axis fixture rebuilds");
+            runtime.rebuild_physics_for_test();
             runtime.advance(17).expect("planet-axis support classifies");
 
             assert_eq!(
@@ -14316,10 +14879,7 @@ mod tests {
             false,
             runtime.state.simulation_tick,
         );
-        runtime
-            .physics
-            .rebuild(&physics_body_specs(&runtime.state))
-            .expect("pole-neighborhood fixture rebuilds");
+        runtime.rebuild_physics_for_test();
         runtime.advance(17).expect("pole support classifies");
         let initial_position = runtime.state.player.position;
         let mut previous_orientation = runtime.state.player.orientation;
@@ -14384,10 +14944,7 @@ mod tests {
             false,
             runtime.state.simulation_tick,
         );
-        runtime
-            .physics
-            .rebuild(&physics_body_specs(&runtime.state))
-            .expect("grounded walking fixture rebuilds");
+        runtime.rebuild_physics_for_test();
         runtime.advance(17).expect("support is classified");
         assert_eq!(
             runtime.state().player.locomotion.kind,
@@ -14472,10 +15029,7 @@ mod tests {
             false,
             runtime.state.simulation_tick,
         );
-        runtime
-            .physics
-            .rebuild(&physics_body_specs(&runtime.state))
-            .expect("jump fixture rebuilds");
+        runtime.rebuild_physics_for_test();
         runtime.advance(17).expect("support is classified");
 
         runtime
@@ -14541,10 +15095,7 @@ mod tests {
             true,
             runtime.state.simulation_tick,
         );
-        runtime
-            .physics
-            .rebuild(&physics_body_specs(&runtime.state))
-            .expect("moving support fixture rebuilds");
+        runtime.rebuild_physics_for_test();
 
         runtime.advance(17).expect("magnetic support is classified");
         assert_eq!(
@@ -14599,10 +15150,7 @@ mod tests {
             true,
             runtime.state.simulation_tick,
         );
-        runtime
-            .physics
-            .rebuild(&physics_body_specs(&runtime.state))
-            .expect("rotating support fixture rebuilds");
+        runtime.rebuild_physics_for_test();
 
         runtime.advance(17).expect("rotating support classifies");
         assert_eq!(
@@ -14654,10 +15202,7 @@ mod tests {
             true,
             runtime.state.simulation_tick,
         );
-        runtime
-            .physics
-            .rebuild(&physics_body_specs(&runtime.state))
-            .expect("magnetic destruction fixture rebuilds");
+        runtime.rebuild_physics_for_test();
         runtime.advance(17).expect("magnetic support classifies");
         let support = runtime
             .state
@@ -14747,10 +15292,7 @@ mod tests {
             true,
             runtime.state.simulation_tick,
         );
-        runtime
-            .physics
-            .rebuild(&physics_body_specs(&runtime.state))
-            .expect("split-support fixture rebuilds");
+        runtime.rebuild_physics_for_test();
         runtime.advance(17).expect("split support classifies");
         let initial_support = runtime
             .state
@@ -14830,10 +15372,7 @@ mod tests {
         set_test_player_position(&mut runtime.state.player, start);
         runtime.state.player.linear_velocity = Vec3::new(0.0, -12.0, 0.0);
         runtime.state.player.jetpack_enabled = false;
-        runtime
-            .physics
-            .rebuild(&physics_body_specs(&runtime.state))
-            .expect("near-surface landing fixture rebuilds");
+        runtime.rebuild_physics_for_test();
 
         runtime
             .advance(17)
@@ -14865,10 +15404,7 @@ mod tests {
         set_test_player_position(&mut runtime.state.player, collision_start);
         runtime.state.player.linear_velocity = Vec3::new(0.0, -24.0, 0.0);
         runtime.state.player.jetpack_enabled = false;
-        runtime
-            .physics
-            .rebuild(&physics_body_specs(&runtime.state))
-            .expect("voxel collision fixture rebuilds");
+        runtime.rebuild_physics_for_test();
 
         let mut contacted = false;
         for _ in 0..30 {
@@ -14898,10 +15434,7 @@ mod tests {
         runtime.state.player.linear_velocity = Vec3::new(4.0, 0.0, 0.0);
         runtime.state.player.surface_contact = false;
         runtime.state.active_contact_pairs.clear();
-        runtime
-            .physics
-            .rebuild(&physics_body_specs(&runtime.state))
-            .expect("nearby clear voxel fixture rebuilds");
+        runtime.rebuild_physics_for_test();
         runtime.advance(100).expect("nearby clear motion commits");
         assert!(runtime.state().player.position.x > clear_start.x + 0.2);
     }
@@ -14922,10 +15455,7 @@ mod tests {
         );
         runtime.state.player.linear_velocity = Vec3::new(0.0, -24.0, 0.0);
         runtime.state.player.jetpack_enabled = false;
-        runtime
-            .physics
-            .rebuild(&physics_body_specs(&runtime.state))
-            .expect("axis-aligned grid fixture rebuilds");
+        runtime.rebuild_physics_for_test();
 
         let mut contacted = false;
         for _ in 0..30 {
@@ -14946,10 +15476,7 @@ mod tests {
         runtime.state.player.linear_velocity = Vec3::new(4.0, 0.0, 0.0);
         runtime.state.player.surface_contact = false;
         runtime.state.active_contact_pairs.clear();
-        runtime
-            .physics
-            .rebuild(&physics_body_specs(&runtime.state))
-            .expect("nearby clear grid fixture rebuilds");
+        runtime.rebuild_physics_for_test();
         runtime
             .advance(100)
             .expect("nearby clear grid motion commits");
@@ -15119,7 +15646,7 @@ mod tests {
                 voxel_collision_chunk_body_id(voxel_collision_chunk_coordinate(before_target));
             let collider_id = voxel_collision_collider_id(before_target);
             prior_hash = runtime.state().state_hash();
-            prior_fingerprint = runtime.physics.body_collider_fingerprint();
+            prior_fingerprint = runtime.physics().body_collider_fingerprint();
             assert_eq!(
                 prior_fingerprint,
                 expected_physics_fingerprint(runtime.state())
@@ -15140,14 +15667,14 @@ mod tests {
             assert!(runtime.is_halted());
             assert_eq!(runtime.state().state_hash(), prior_hash);
             assert!(runtime.state().voxels.occupied.contains(&before_target));
-            assert!(!runtime.physics.contains_collider(&body_id, &collider_id));
+            assert!(!runtime.physics().contains_collider(&body_id, &collider_id));
         }
         let recovered = Runtime::open(before_directory.path(), 109, 100)
             .expect("before-write mining failure recovers");
         assert_eq!(recovered.state().state_hash(), prior_hash);
         assert!(recovered.state().voxels.occupied.contains(&before_target));
         assert_eq!(
-            recovered.physics.body_collider_fingerprint(),
+            recovered.physics().body_collider_fingerprint(),
             prior_fingerprint
         );
 
@@ -15181,7 +15708,7 @@ mod tests {
             assert!(runtime.is_halted());
             assert_eq!(runtime.state().state_hash(), prior_state.state_hash());
             assert!(runtime.state().voxels.occupied.contains(&after_target));
-            assert!(!runtime.physics.contains_collider(&body_id, &collider_id));
+            assert!(!runtime.physics().contains_collider(&body_id, &collider_id));
 
             let journal = fs::read_to_string(after_directory.path().join("events.ndjson"))
                 .expect("synced mining journal reads");
@@ -15203,7 +15730,7 @@ mod tests {
         );
         assert!(!recovered.state().voxels.occupied.contains(&after_target));
         assert_eq!(
-            recovered.physics.body_collider_fingerprint(),
+            recovered.physics().body_collider_fingerprint(),
             expected_physics_fingerprint(&expected_durable_state)
         );
         assert!(recovered.state().conservation().valid);
@@ -15686,10 +16213,7 @@ mod tests {
                 },
             );
             assert!(runtime.state().conservation().valid);
-            runtime
-                .physics
-                .rebuild(&physics_body_specs(&runtime.state))
-                .expect("cargo-bearing anchor fixture physics rebuilds");
+            runtime.rebuild_physics_for_test();
             runtime
                 .persist_snapshot()
                 .expect("cargo-bearing anchor fixture snapshot persists");

@@ -199,6 +199,7 @@ CellLifecycleRecord
   acquired_at_unix_ms?
   renewed_at_unix_ms?
   expires_at_unix_ms?
+  activation_cutoff_unix_ms?
   last_world_event_sequence
   last_world_event_hash
   last_world_state_hash
@@ -260,12 +261,16 @@ Its stable key is:
 (universe_id, cell_id, lifecycle_generation, production_quantum_sequence)
 ```
 
-Sequences are positive and contiguous within a generation. Scheduled time
-advances by exactly 1,000 milliseconds per occurrence. Dispatch time and
-lateness are diagnostic only. Backward trusted time does not reverse a cursor
-or make an occurrence due; a rollback beyond the configured tolerance halts
-scheduling for operator recovery. A forward jump creates a sequential backlog.
-It never grants one oversized elapsed duration or skips intermediate quanta.
+Sequences are positive and contiguous within a generation. While production
+remains continuously runnable, scheduled time advances by exactly 1,000
+milliseconds per occurrence. After an idle or paused interval cancels the
+cursor, the next occurrence is re-armed exactly 1,000 milliseconds after the
+new trusted runnable boundary and can therefore have a larger gap from the
+last committed occurrence. Dispatch time and lateness are diagnostic only.
+Backward trusted time does not reverse a cursor or make an occurrence due; a
+rollback beyond the configured tolerance halts scheduling for operator
+recovery. A forward jump creates a sequential backlog. It never grants one
+oversized elapsed duration or skips intermediate quanta.
 
 `lifecycle_generation` names the production-clock generation, not an ordinary
 mode transition, worker process, or lease acquisition. It remains stable across

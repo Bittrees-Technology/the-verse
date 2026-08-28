@@ -15,6 +15,7 @@ pub use celestial::{CelestialError, registry_snapshot, universe_manifest};
 pub use content::ContentManifest;
 pub use engine::{
     AdvanceImpact, AdvanceOutcome, IntentError, ProductionDispatchOutcome, Runtime, RuntimeError,
+    RuntimeOpenConfig,
 };
 pub use event::{
     CanonicalEvent, EVENT_SCHEMA_VERSION, EventPayload,
