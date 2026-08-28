@@ -38,12 +38,19 @@ The simulation derives experience from accepted events:
 | Mine voxel | `ore yield × 5` |
 | Refine batch | `12` |
 | Fabricate component | `18` |
-| Transfer inventory | `2` |
-| Build block | `25` |
-| Engage anchor | `40` |
-| Damage block | `3` |
+| Transfer inventory | `0` |
+| Place a component-backed frame | `5` |
+| Complete that frame for the first time | `20` |
+| First eligible anchor engagement | `40` |
+| Intermediate weld or ordinary repair | `0` |
+| Damage block | `0` |
 
-Movement, release of an anchor, grid-motion settings, and simulation ticks award no experience. Level 2 begins at 100 total experience; each later threshold adds another `level × 100`. The current implementation caps the derived level at 100.
+Movement, inventory shuffling, intermediate welds, ordinary repair, damage,
+release or repeated engagement of an anchor, grid-motion settings, and
+simulation ticks award no experience. A placed and completed frame awards 25
+total exactly once. Level 2 begins at 100 total experience; each later
+threshold adds another `level × 100`. The current implementation caps the
+derived level at 100.
 
 ## Presentation rules
 

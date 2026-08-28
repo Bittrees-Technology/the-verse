@@ -74,7 +74,9 @@ Exit gate:
 
 Build:
 
-- Multiple users in a cell.
+- Server-issued session authority bound to one durable player identity.
+- Multiple users in a cell with independent input, inventory, life, and recovery state.
+- Deterministic shared-player physics and replication budgets.
 - Interest management.
 - Fixed celestial registry.
 - Dynamic cell scheduling.

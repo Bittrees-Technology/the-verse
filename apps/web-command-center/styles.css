@@ -78,12 +78,23 @@ main {
 }
 
 .notice {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
   margin-bottom: 18px;
   padding: 10px 14px;
   border-left: 3px solid var(--orange);
   background: rgba(130, 66, 22, 0.12);
   color: #d6bca9;
   font-size: 0.8rem;
+}
+
+.notice strong {
+  flex: 0 0 auto;
+  color: var(--green);
+  font-size: 0.68rem;
+  letter-spacing: 0.1em;
 }
 
 .metrics {
@@ -165,12 +176,48 @@ button:disabled { cursor: not-allowed; opacity: 0.4; }
 }
 
 #activity li { margin-bottom: 8px; padding-left: 3px; }
-.legend { display: flex; gap: 18px; padding-top: 11px; color: var(--muted); font-size: 0.7rem; }
+.legend { display: flex; gap: 18px; align-items: center; padding-top: 11px; color: var(--muted); font-size: 0.7rem; }
+.legend strong { margin-left: auto; color: var(--green); letter-spacing: 0.08em; }
 .legend i { display: inline-block; width: 9px; height: 9px; margin-right: 5px; border-radius: 50%; }
 .rock { background: #667684; }
 .ore { background: var(--orange); }
 .grid { background: var(--cyan); }
 .player { background: var(--green); }
+
+.player-roster {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin: 12px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.player-roster li {
+  display: grid;
+  grid-template-columns: 9px auto;
+  align-items: center;
+  gap: 1px 7px;
+  min-width: 190px;
+  padding: 8px 10px;
+  border: 1px solid #1d384d;
+  background: rgba(5, 13, 21, 0.72);
+  color: var(--text);
+  font-size: 0.75rem;
+}
+
+.player-roster i {
+  grid-row: 1 / 3;
+  width: 9px;
+  height: 9px;
+  transform: rotate(45deg);
+}
+
+.player-roster small {
+  color: var(--muted);
+  font-size: 0.58rem;
+  letter-spacing: 0.08em;
+}
 
 @media (max-width: 980px) {
   .metrics { grid-template-columns: 1fr 1fr; }
@@ -181,4 +228,7 @@ button:disabled { cursor: not-allowed; opacity: 0.4; }
 @media (max-width: 620px) {
   header, main { padding-right: 15px; padding-left: 15px; }
   .metrics, aside { grid-template-columns: 1fr; }
+  .notice { align-items: flex-start; flex-direction: column; gap: 8px; }
+  .legend { align-items: flex-start; flex-wrap: wrap; }
+  .legend strong { width: 100%; margin-left: 0; }
 }

@@ -1,6 +1,6 @@
 {
-  "schema_version": 8,
-  "manifest_version": "p0.10.0",
+  "schema_version": 9,
+  "manifest_version": "p1.1.0",
   "license": "AGPL-3.0-or-later",
   "physics": {
     "fixed_step_hz": 60,
@@ -62,6 +62,17 @@
       "y": 4.5,
       "z": 10.0
     }
+  },
+  "experience_rewards": {
+    "mined_ore_unit": 5,
+    "refining_batch": 12,
+    "crafted_component": 18,
+    "frame_placed": 5,
+    "construction_completed": 20,
+    "weld_progress_or_repair": 0,
+    "inventory_transfer": 0,
+    "first_anchor_engagement": 40,
+    "block_damage": 0
   },
   "voxel_materials": [
     {

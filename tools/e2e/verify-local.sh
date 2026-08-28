@@ -21,9 +21,10 @@ cargo build --locked -p verse-simulation-worker
 
 start_server() {
   local mode="${1:-live}"
+  local data_directory="${2:-${verse_test_dir}}"
   local server_command=(
     target/debug/verse-simulation-worker
-    --data-directory "${verse_test_dir}"
+    --data-directory "${data_directory}"
     --bind "127.0.0.1:${verse_port}"
     --snapshot-every 5
   )
@@ -47,6 +48,58 @@ stop_server() {
   wait "${verse_server_pid}"
   verse_server_pid=""
 }
+
+# Exercise concurrent actor binding, actor-owned mining, and actor-scoped
+# control against an isolated universe so its movement cannot perturb the
+# longer progression scenario.
+start_server live "${verse_test_dir}/two-player-control"
+if ! node tools/e2e/two-player-control-smoke.mjs "ws://127.0.0.1:${verse_port}/ws"; then
+  sed -n '1,240p' "${verse_test_dir}/server.log" >&2
+  exit 1
+fi
+stop_server
+
+# Reopen paused once to establish the exact durable state after the live
+# physics loop has stopped, then reopen it again to prove recovery.
+start_server paused "${verse_test_dir}/two-player-control"
+two_player_before="$(
+  curl --fail --silent "http://127.0.0.1:${verse_port}/api/v1/status"
+)"
+two_player_hash="$(jq -r '.world_hash' <<<"${two_player_before}")"
+two_player_sequence="$(jq -r '.event_sequence' <<<"${two_player_before}")"
+two_player_fence="$(jq -r '.fencing_token' <<<"${two_player_before}")"
+echo "VERSE_TWO_PLAYER_RECOVERY_BEFORE sequence=${two_player_sequence} fence=${two_player_fence} hash=${two_player_hash}"
+stop_server
+
+start_server paused "${verse_test_dir}/two-player-control"
+two_player_after="$(
+  curl --fail --silent "http://127.0.0.1:${verse_port}/api/v1/status"
+)"
+two_player_after_hash="$(jq -r '.world_hash' <<<"${two_player_after}")"
+two_player_after_sequence="$(jq -r '.event_sequence' <<<"${two_player_after}")"
+two_player_after_fence="$(jq -r '.fencing_token' <<<"${two_player_after}")"
+echo "VERSE_TWO_PLAYER_RECOVERY_AFTER sequence=${two_player_after_sequence} fence=${two_player_after_fence} hash=${two_player_after_hash}"
+if [[ "${two_player_after_hash}" != "${two_player_hash}" ]]; then
+  echo "Two-player recovery hash mismatch" >&2
+  exit 1
+fi
+if [[ "${two_player_after_sequence}" != "${two_player_sequence}" ]]; then
+  echo "Two-player recovery event-sequence mismatch" >&2
+  exit 1
+fi
+if [[ "${two_player_after_fence}" -le "${two_player_fence}" ]]; then
+  echo "Two-player recovery fencing token did not advance" >&2
+  exit 1
+fi
+if ! node tools/e2e/two-player-control-smoke.mjs \
+  "ws://127.0.0.1:${verse_port}/ws" \
+  --verify-recovery \
+  "${two_player_hash}" \
+  "${two_player_sequence}"; then
+  sed -n '1,240p' "${verse_test_dir}/server.log" >&2
+  exit 1
+fi
+stop_server
 
 start_server
 if ! node tools/e2e/protocol-smoke.mjs "ws://127.0.0.1:${verse_port}/ws"; then
@@ -96,22 +149,25 @@ if [[ -z "${godot_bin}" ]] && [[ -x "artifacts/toolchains/godot-4.7.2/Godot.app/
   godot_bin="artifacts/toolchains/godot-4.7.2/Godot.app/Contents/MacOS/Godot"
 fi
 if [[ -n "${godot_bin}" ]]; then
-  echo "VERSE_GODOT_SMOKE_START bin=${godot_bin}"
-  set +e
-  "${godot_bin}" \
-    --verbose \
-    --headless \
-    --path apps/native-client \
-    -- \
-    "--server=ws://127.0.0.1:${verse_port}/ws" \
-    --smoke-test
-  godot_status="$?"
-  set -e
-  if [[ "${godot_status}" -ne 0 ]]; then
-    echo "Godot native smoke failed with status ${godot_status}" >&2
-    sed -n '1,240p' "${verse_test_dir}/server.log" >&2
-    exit "${godot_status}"
-  fi
+  for player_id in player-local player-remote; do
+    echo "VERSE_GODOT_SMOKE_START bin=${godot_bin} player=${player_id}"
+    set +e
+    "${godot_bin}" \
+      --verbose \
+      --headless \
+      --path apps/native-client \
+      -- \
+      "--server=ws://127.0.0.1:${verse_port}/ws" \
+      "--player-id=${player_id}" \
+      --smoke-test
+    godot_status="$?"
+    set -e
+    if [[ "${godot_status}" -ne 0 ]]; then
+      echo "Godot native smoke failed for ${player_id} with status ${godot_status}" >&2
+      sed -n '1,240p' "${verse_test_dir}/server.log" >&2
+      exit "${godot_status}"
+    fi
+  done
 else
   echo "Godot smoke skipped: set GODOT_BIN to a Godot 4.7.2 executable"
 fi

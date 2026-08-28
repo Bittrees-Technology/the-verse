@@ -17,5 +17,9 @@ ADRs capture durable choices and their consequences.
 | [0011](ADR-0011-dirty-voxel-collision-chunks.md) | Atomic dirty-chunk replacement for derived voxel collision | Accepted |
 | [0012](ADR-0012-oxygen-incapacitation-and-proof-respawn.md) | Canonical oxygen incapacitation, inventory drop, and proof respawn | Accepted |
 | [0013](ADR-0013-input-only-authoritative-character-motion.md) | Atomic input-only EVA, landing/contact, and rotation physics | Accepted |
+| [0014](ADR-0014-authoritative-grounded-and-magnetic-locomotion.md) | Grounded and magnetic locomotion from canonical support | Accepted |
+| [0015](ADR-0015-session-bound-multiplayer-cell.md) | Session-bound actors and deterministic multi-player cell state | Proposed |
+| [0016](ADR-0016-session-private-state-projection.md) | Public world plus session-private player state projections | Accepted |
+| [0017](ADR-0017-bounded-conflict-safe-idempotency.md) | Bounded conflict-safe actor operation sequences | Accepted |
 
 Status values: Proposed, Accepted, Superseded, Rejected.

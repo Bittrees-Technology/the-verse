@@ -23,7 +23,7 @@ Priorities:
 | F-009 | Inventory ledger and conservation tests | P0 | Event schema |
 | F-010 | Damage, block removal, and split grids | P0 | Physics |
 | F-011 | Durable snapshot and event recovery | P0 | Persistence |
-| F-012 | Multiple players in one cell | P1 | F-002 |
+| F-012 | Multiple players in one cell | P1 | F-002, SIM-011, SIM-012 |
 | F-013 | Dynamic cell assignment and handoff | P1 | Universe directory |
 | F-014 | Fixed celestial registry | P1 | Coordinate schema |
 | F-015 | Procedural frontier generation | P1 | Generation rules |

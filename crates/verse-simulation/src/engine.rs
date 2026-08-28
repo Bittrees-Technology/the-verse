@@ -3,16 +3,18 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 
+use serde::Serialize;
 use thiserror::Error;
 use verse_physics::{
-    BodyControl, BodySpec, BoxColliderSpec, CapsuleCast, CapsuleColliderSpec, MotionQuality,
-    PhysicsError, Pose as PhysicsPose, Quat as PhysicsQuat, Scene, SceneConfig, SphereColliderSpec,
-    Vec3 as PhysicsVec3,
+    BodyCollisionClass, BodyControl, BodySpec, BoxColliderSpec, CapsuleCast, CapsuleColliderSpec,
+    MotionQuality, PhysicsError, Pose as PhysicsPose, Quat as PhysicsQuat, Scene, SceneConfig,
+    SphereColliderSpec, Vec3 as PhysicsVec3,
 };
 use verse_protocol::{
-    BlockKind, ClientMessage, IVec3, IntentReceipt, InventoryContents, InventoryDomain,
-    LocomotionKind, LocomotionSupportSnapshot, MotionSnapshot, PlayerDeathCause, PlayerLifeState,
-    PlayerLocomotionSnapshot, Quat, ResourceKind, Vec3, WorldSnapshot,
+    BlockKind, CareerSnapshot, ClientMessage, INTENT_FINGERPRINT_SCHEMA_VERSION, IVec3,
+    IntentReceipt, InventoryContents, InventoryDomain, LocomotionKind, LocomotionSupportSnapshot,
+    MotionSnapshot, PROTOCOL_VERSION, PlayerDeathCause, PlayerLifeState, PlayerLocomotionSnapshot,
+    Quat, ResourceKind, Vec3, WorldSnapshot,
 };
 
 use crate::content;
@@ -20,21 +22,30 @@ use crate::event::{
     CanonicalEvent, EVENT_SCHEMA_NAME, EVENT_SCHEMA_VERSION, EventPayload, PhysicsBodyOutcome,
     PhysicsContactOutcome, PhysicsContactPhase, PlayerPhysicsOutcome,
 };
+#[cfg(test)]
+use crate::model::PLAYER_INVENTORY_ID;
 use crate::model::{
     Block, CARGO_INVENTORY_CAPACITY_LITERS, ContactPairKey, DeathDrop, Grid, InventoryRecord,
-    PLANET_CENTER, PLANET_SURFACE_RADIUS_M, PLAYER_INVENTORY_ID, Player, PlayerControlFrame,
-    WorldState, radial_up,
+    PLANET_CENTER, PLANET_SURFACE_RADIUS_M, Player, PlayerControlFrame, ProcessedOperationRecord,
+    WORLD_SCHEMA_VERSION, WorldState, radial_up, valid_blake3_hex,
 };
 use crate::persistence::{PersistenceError, Store};
+#[cfg(test)]
+use crate::targeting::{TOOL_SURFACE_RANGE_M, ToolHit};
+use crate::targeting::{ToolTarget, closest_tool_hit};
 
+#[cfg(test)]
 const PLAYER_BODY_ID: &str = "player-body-player-local";
+#[cfg(test)]
 const PLAYER_COLLIDER_ID: &str = "player-collider-player-local";
 const PLANET_BODY_ID: &str = "planet-body-khepri-prime";
 const PLANET_COLLIDER_ID: &str = "planet-collider-khepri-prime";
-const MINING_RANGE: f64 = 8.5;
-const HAND_TOOL_RANGE: f64 = 9.0;
 const MAX_GRID_CONTROL_INPUT: f64 = 1.0;
 const CONTROL_INPUT_EPSILON: f64 = 1.0e-9;
+// Godot's standard Vector3 uses float32 components. Normalizing in float32 and
+// reconstructing those components as JSON float64 can put the calculated
+// magnitude a few ULPs above one even though the source vector was valid.
+const CONTROL_INPUT_SOURCE_PRECISION_EPSILON: f64 = 8.0 * f32::EPSILON as f64;
 const MAX_GRID_BLOCKS_P0: usize = 2_048;
 const MAX_PENDING_PLAYER_CONTROL_FRAMES: usize = 64;
 const PLAYER_POSITION_CORRECTION_BUDGET_M_PER_STEP: f64 = 0.55;
@@ -47,6 +58,86 @@ const PHYSICS_CONTACT_POINT_SLOP_M: f64 = 0.001;
 const PLAYER_PLANET_PENETRATION_LIMIT_M: f64 = 0.28;
 const PLAYER_BOX_PENETRATION_LIMIT_M: f64 = 0.85;
 const CHARACTER_INERTIA_MULTIPLIER: f64 = 12.0;
+
+#[derive(Serialize)]
+struct IntentFingerprintMaterial<'a> {
+    domain: &'static str,
+    protocol_version: u32,
+    fingerprint_schema_version: u32,
+    world_schema_version: u32,
+    event_schema_version: u32,
+    universe_id: &'a str,
+    cell_id: &'a str,
+    actor_player_id: &'a str,
+    message: &'a serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
+struct OperationEventMetadata {
+    operation_id: String,
+    operation_sequence: u64,
+    intent_fingerprint: String,
+}
+
+fn player_body_id(player_id: &str) -> String {
+    format!("player-body-{player_id}")
+}
+
+fn player_collider_id(player_id: &str) -> String {
+    format!("player-collider-{player_id}")
+}
+
+fn client_message_floats_are_finite(message: &ClientMessage) -> bool {
+    let finite = |value: Vec3| value.x.is_finite() && value.y.is_finite() && value.z.is_finite();
+    match message {
+        ClientMessage::SetPlayerControl {
+            linear_input,
+            angular_input,
+            ..
+        }
+        | ClientMessage::SetGridControl {
+            linear_input,
+            angular_input,
+            ..
+        } => finite(*linear_input) && finite(*angular_input),
+        ClientMessage::Hello { .. }
+        | ClientMessage::RequestSnapshot
+        | ClientMessage::SetSuitMode { .. }
+        | ClientMessage::RespawnPlayer { .. }
+        | ClientMessage::MineVoxel { .. }
+        | ClientMessage::RefineOre { .. }
+        | ClientMessage::CraftComponent { .. }
+        | ClientMessage::TransferInventory { .. }
+        | ClientMessage::BuildBlock { .. }
+        | ClientMessage::WeldBlock { .. }
+        | ClientMessage::ToggleGridAnchor { .. }
+        | ClientMessage::DamageBlock { .. } => true,
+    }
+}
+
+fn normalize_json_signed_zero(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Number(number)
+            if number
+                .as_f64()
+                .is_some_and(|value| value == 0.0 && value.is_sign_negative()) =>
+        {
+            *number =
+                serde_json::Number::from_f64(0.0).expect("finite canonical zero is a JSON number");
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                normalize_json_signed_zero(value);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for value in map.values_mut() {
+                normalize_json_signed_zero(value);
+            }
+        }
+        _ => {}
+    }
+}
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum IntentError {
@@ -104,6 +195,8 @@ pub enum RuntimeError {
     Physics(#[from] PhysicsError),
     #[error("authoritative writes are halted after a persistence failure")]
     Halted,
+    #[error("canonical world invariant failed: {0}")]
+    CanonicalInvariant(String),
 }
 
 #[derive(Debug)]
@@ -112,7 +205,7 @@ pub struct Runtime {
     state: WorldState,
     snapshot_every: u64,
     events_since_snapshot: u64,
-    life_support_elapsed_millis: u32,
+    life_support_elapsed_millis_by_player: BTreeMap<String, u32>,
     physics_step_phase: u64,
     physics: Scene,
     halted: bool,
@@ -135,12 +228,18 @@ impl Runtime {
         let mut physics = Scene::new(physics_scene_config())?;
         physics.rebuild(&physics_body_specs(&state))?;
         let physics_step_phase = state.physics_step_phase;
+        let life_support_elapsed_millis_by_player = state
+            .player
+            .by_id
+            .keys()
+            .map(|player_id| (player_id.clone(), 0))
+            .collect();
         let mut runtime = Self {
             store,
             state,
             snapshot_every: snapshot_every.max(1),
             events_since_snapshot: 0,
-            life_support_elapsed_millis: 0,
+            life_support_elapsed_millis_by_player,
             physics_step_phase,
             physics,
             halted: false,
@@ -159,6 +258,107 @@ impl Runtime {
         &self.state
     }
 
+    /// Adds a deterministic loopback-development actor before the first
+    /// canonical event. This is a server-authorized fixture, never a gameplay
+    /// hello side effect, and cannot rewrite an active universe history.
+    pub fn admit_development_player(&mut self, player_id: &str) -> Result<bool, RuntimeError> {
+        if self.halted {
+            return Err(RuntimeError::Halted);
+        }
+        if let Err(message) = self.state.validate_player_roster() {
+            self.halted = true;
+            return Err(RuntimeError::CanonicalInvariant(message));
+        }
+        if self.state.player.by_id.contains_key(player_id) {
+            return Ok(false);
+        }
+        if self.state.event_sequence != 0 {
+            return Err(IntentError::rejected(
+                "development_admission_requires_fresh_world",
+                "development players can be pre-admitted only before the first canonical event",
+            )
+            .into());
+        }
+
+        let mut next_state = self.state.clone();
+        let inventory_id = format!("inventory-{player_id}");
+        if next_state.inventories.contains_key(&inventory_id) {
+            return Err(IntentError::rejected(
+                "development_admission_inventory_conflict",
+                "development player inventory identity already exists",
+            )
+            .into());
+        }
+        let mut player = next_state.player.primary().clone();
+        player_id.clone_into(&mut player.player_id);
+        let roster_offset =
+            u32::try_from(next_state.player.by_id.len()).map_or(f64::from(u32::MAX), f64::from);
+        // Keep the loopback co-op fixture inside the starter asteroid's hand-
+        // tool envelope while giving each suit a visibly distinct spawn. The
+        // character collision layer already prevents these nearby capsules
+        // from pushing or becoming locomotion support for one another.
+        player.position.y += 1.5 * roster_offset;
+        player.orientation = Quat::IDENTITY;
+        player.linear_velocity = Vec3::ZERO;
+        player.angular_velocity = Vec3::ZERO;
+        player.surface_contact = false;
+        player.locomotion.kind = LocomotionKind::Eva;
+        player.locomotion.up = radial_up(player.position);
+        player.locomotion.view_pitch_radians = 0.0;
+        player.locomotion.support = None;
+        player.locomotion.jump_held = false;
+        player.locomotion.jump_buffer_expires_at_simulation_tick = 0;
+        player.locomotion.support_grace_expires_at_simulation_tick = 0;
+        player.locomotion.magnetic_boots_enabled = false;
+        player.locomotion.magnetic_reattach_after_simulation_tick = 0;
+        player.movement_epoch = 1;
+        player.last_received_input_sequence = 0;
+        player.last_processed_input_sequence = 0;
+        player.pending_control_frames.clear();
+        player.control_linear_input = Vec3::ZERO;
+        player.control_angular_input = Vec3::ZERO;
+        player.boost = false;
+        player.dampeners = true;
+        player.jump = false;
+        player.control_expires_at_simulation_tick = 0;
+        player.inventory_id.clone_from(&inventory_id);
+        player.experience = 0;
+        player.career = CareerSnapshot::default();
+        player.suit_oxygen_milli = 1_000;
+        player.helmet_closed = true;
+        player.jetpack_enabled = true;
+        player.life_state = PlayerLifeState::Alive;
+        next_state.player.by_id.insert(player_id.to_owned(), player);
+        next_state.inventories.insert(
+            inventory_id.clone(),
+            InventoryRecord {
+                inventory_id,
+                domain: InventoryDomain::Player {
+                    player_id: player_id.to_owned(),
+                },
+                contents: InventoryContents::default(),
+                capacity_liters: crate::model::PLAYER_INVENTORY_CAPACITY_LITERS,
+            },
+        );
+        next_state
+            .validate_player_roster()
+            .map_err(|message| IntentError::rejected("development_admission_invalid", message))?;
+        if !next_state.conservation().valid {
+            return Err(IntentError::ConservationViolation {
+                event_sequence: next_state.event_sequence,
+            }
+            .into());
+        }
+        let mut next_physics = Scene::new(physics_scene_config())?;
+        next_physics.rebuild(&physics_body_specs(&next_state))?;
+        self.store.save_snapshot(&next_state)?;
+        self.state = next_state;
+        self.physics = next_physics;
+        self.life_support_elapsed_millis_by_player
+            .insert(player_id.to_owned(), 0);
+        Ok(true)
+    }
+
     #[cfg(test)]
     pub(crate) fn relocate_player_for_test(&mut self, position: Vec3) {
         self.state.player.position = position;
@@ -169,6 +369,41 @@ impl Runtime {
         self.physics
             .rebuild(&physics_body_specs(&self.state))
             .expect("test relocation must produce a valid physics scene");
+    }
+
+    #[cfg(test)]
+    pub(crate) fn aim_player_for_test(&mut self, target: Vec3, outward_face: Vec3) {
+        let face = outward_face * outward_face.magnitude().recip();
+        let eye = target + face * 4.0;
+        let forward = (target - eye) * (target - eye).magnitude().recip();
+        let dot = -forward.z;
+        let orientation = if dot < -1.0 + 1.0e-9 {
+            Quat::new(0.0, 1.0, 0.0, 0.0)
+        } else {
+            let x = forward.y;
+            let y = -forward.x;
+            let w = 1.0 + dot;
+            let inverse_length = x.mul_add(x, y.mul_add(y, w * w)).sqrt().recip();
+            Quat::new(
+                (x * inverse_length) as f32,
+                (y * inverse_length) as f32,
+                0.0,
+                (w * inverse_length) as f32,
+            )
+        };
+        let eye_offset = content::manifest().character.eye_height_m
+            - content::manifest().character.standing_height_m * 0.5;
+        self.state.player.position = eye - Vec3::new(0.0, eye_offset, 0.0);
+        self.state.player.orientation = orientation;
+        self.state.player.linear_velocity = Vec3::ZERO;
+        self.state.player.angular_velocity = Vec3::ZERO;
+        self.state.player.surface_contact = false;
+        self.state.player.locomotion.kind = LocomotionKind::Airborne;
+        self.state.player.locomotion.up = Vec3::new(0.0, 1.0, 0.0);
+        self.state.player.locomotion.view_pitch_radians = 0.0;
+        self.physics
+            .rebuild(&physics_body_specs(&self.state))
+            .expect("test aim must produce a valid physics scene");
     }
 
     pub const fn is_halted(&self) -> bool {
@@ -184,8 +419,31 @@ impl Runtime {
     }
 
     pub fn execute(&mut self, message: &ClientMessage) -> Result<IntentReceipt, RuntimeError> {
+        let actor_player_id = self.state.player.player_id.clone();
+        self.execute_as(&actor_player_id, message)
+    }
+
+    /// Execute one client intent for the player identity already authenticated
+    /// by the connection boundary. The actor is deliberately separate from the
+    /// client payload so changing JSON fields cannot select another player.
+    pub fn execute_as(
+        &mut self,
+        actor_player_id: &str,
+        message: &ClientMessage,
+    ) -> Result<IntentReceipt, RuntimeError> {
         if self.halted {
             return Err(RuntimeError::Halted);
+        }
+        if let Err(message) = self.state.validate_player_roster() {
+            self.halted = true;
+            return Err(RuntimeError::CanonicalInvariant(message));
+        }
+        if !self.state.player.by_id.contains_key(actor_player_id) {
+            return Err(IntentError::rejected(
+                "actor_not_present",
+                "the authenticated player is not present in this simulation cell",
+            )
+            .into());
         }
         let operation_id = message.operation_id().ok_or_else(|| {
             IntentError::rejected(
@@ -193,12 +451,33 @@ impl Runtime {
                 "hello and snapshot requests are handled by the network service",
             )
         })?;
-
-        if let Some(receipt) = self.state.processed_operations.get(operation_id) {
-            return Ok(receipt.clone());
+        if operation_id.trim().is_empty() || operation_id.len() > 128 {
+            return Err(IntentError::rejected(
+                "invalid_operation_id",
+                "operation ID must contain between 1 and 128 characters",
+            )
+            .into());
+        }
+        let operation_sequence = message.operation_sequence().ok_or_else(|| {
+            IntentError::rejected(
+                "not_a_mutating_intent",
+                "hello and snapshot requests have no operation sequence",
+            )
+        })?;
+        let intent_fingerprint = self
+            .state
+            .client_intent_fingerprint(actor_player_id, message)?;
+        if let Some(receipt) = self.state.validate_operation_attempt(
+            actor_player_id,
+            operation_sequence,
+            &intent_fingerprint,
+        )? {
+            return Ok(receipt);
         }
 
-        let event = self.state.prepare_client_event(message)?;
+        let event = self
+            .state
+            .prepare_client_event_as(actor_player_id, message)?;
         let mut next_state = self.state.clone();
         next_state.apply_event(&event)?;
         if let EventPayload::VoxelMined { coordinate, .. } = &event.payload {
@@ -227,9 +506,8 @@ impl Runtime {
         self.after_event()?;
 
         self.state
-            .processed_operations
-            .get(operation_id)
-            .cloned()
+            .processed_operation_record(actor_player_id, operation_sequence)
+            .map(|record| record.receipt.clone())
             .ok_or_else(|| {
                 IntentError::rejected(
                     "receipt_missing",
@@ -237,6 +515,46 @@ impl Runtime {
                 )
                 .into()
             })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn execute_next_for_fixture(
+        &mut self,
+        message: &ClientMessage,
+    ) -> Result<IntentReceipt, RuntimeError> {
+        let actor_player_id = self.state.player.player_id.clone();
+        self.execute_next_as_for_fixture(&actor_player_id, message)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn execute_next_as_for_fixture(
+        &mut self,
+        actor_player_id: &str,
+        message: &ClientMessage,
+    ) -> Result<IntentReceipt, RuntimeError> {
+        let mut sequenced = message.clone();
+        if sequenced.operation_sequence() == Some(0) {
+            let retained_sequence = sequenced.operation_id().and_then(|operation_id| {
+                self.state
+                    .processed_operations
+                    .get(actor_player_id)
+                    .and_then(|history| {
+                        history
+                            .retained
+                            .values()
+                            .find(|record| record.operation_id == operation_id)
+                    })
+                    .map(|record| record.receipt.operation_sequence)
+            });
+            let sequence = retained_sequence.unwrap_or_else(|| {
+                self.state
+                    .last_operation_sequence(actor_player_id)
+                    .checked_add(1)
+                    .expect("fixture operation sequence remains available")
+            });
+            assert!(sequenced.set_operation_sequence(sequence));
+        }
+        self.execute_as(actor_player_id, &sequenced)
     }
 
     pub fn advance(&mut self, delta_millis: u16) -> Result<bool, RuntimeError> {
@@ -250,17 +568,18 @@ impl Runtime {
                     || grid.control_linear_input.magnitude() > f64::EPSILON
                     || grid.control_angular_input.magnitude() > f64::EPSILON)
         });
-        let player_physics_active = matches!(self.state.player.life_state, PlayerLifeState::Alive)
-            && (self.state.player.linear_velocity.magnitude() > f64::EPSILON
-                || self.state.player.angular_velocity.magnitude() > f64::EPSILON
-                || self.state.player.control_linear_input.magnitude() > f64::EPSILON
-                || self.state.player.control_angular_input.magnitude() > f64::EPSILON
-                || !self.state.player.pending_control_frames.is_empty()
-                || self.state.player.boost
-                || self.state.simulation_tick
-                    < self.state.player.control_expires_at_simulation_tick
-                || !self.state.player.dampeners
-                || !self.state.player.jetpack_enabled);
+        let player_physics_active = self.state.player.iter().any(|(_, player)| {
+            matches!(player.life_state, PlayerLifeState::Alive)
+                && (player.linear_velocity.magnitude() > f64::EPSILON
+                    || player.angular_velocity.magnitude() > f64::EPSILON
+                    || player.control_linear_input.magnitude() > f64::EPSILON
+                    || player.control_angular_input.magnitude() > f64::EPSILON
+                    || !player.pending_control_frames.is_empty()
+                    || player.boost
+                    || self.state.simulation_tick < player.control_expires_at_simulation_tick
+                    || !player.dampeners
+                    || !player.jetpack_enabled)
+        });
         let physics_active = moving_grid || player_physics_active;
         let delta_millis = delta_millis.clamp(1, 250);
         let mut changed = false;
@@ -282,35 +601,45 @@ impl Runtime {
                 let mut output = None;
                 let mut contacts = Vec::new();
                 let mut active_contacts = self.state.active_contact_pairs.clone();
-                let mut scheduled_player = self.state.player.clone();
+                let mut scheduled_players = self.state.player.by_id.clone();
                 for substep_index in 0..step_count {
                     let substep_simulation_tick =
                         self.state.simulation_tick.saturating_add(substep_index);
-                    advance_player_control_for_substep(
-                        &mut scheduled_player,
-                        substep_simulation_tick,
-                    );
-                    adjust_grounded_capsule_for_substep(
-                        &self.state,
-                        &mut self.physics,
-                        &scheduled_player,
-                        &mut body_states,
-                        substep_simulation_tick,
-                    )?;
-                    let player_jump = classify_player_locomotion_for_substep(
-                        &self.state,
-                        &self.physics,
-                        &mut scheduled_player,
-                        &body_states,
-                        substep_simulation_tick,
-                    )?;
-                    let controls = physics_controls(
-                        &self.state,
-                        &scheduled_player,
-                        &body_states,
-                        substep_simulation_tick,
-                        player_jump,
-                    );
+                    let mut player_jumps = BTreeMap::new();
+                    for (player_id, scheduled_player) in &mut scheduled_players {
+                        advance_player_control_for_substep(
+                            scheduled_player,
+                            substep_simulation_tick,
+                        );
+                        adjust_grounded_capsule_for_substep(
+                            &self.state,
+                            &mut self.physics,
+                            scheduled_player,
+                            &mut body_states,
+                            substep_simulation_tick,
+                        )?;
+                        let jump = classify_player_locomotion_for_substep(
+                            &self.state,
+                            &self.physics,
+                            scheduled_player,
+                            &body_states,
+                            substep_simulation_tick,
+                        )?;
+                        player_jumps.insert(player_id.clone(), jump);
+                    }
+                    let mut controls = Vec::new();
+                    for (index, (player_id, scheduled_player)) in
+                        scheduled_players.iter().enumerate()
+                    {
+                        controls.extend(physics_controls(
+                            &self.state,
+                            scheduled_player,
+                            &body_states,
+                            substep_simulation_tick,
+                            player_jumps.get(player_id).copied().flatten(),
+                            index == 0,
+                        ));
+                    }
                     let step = match self.physics.step(&controls) {
                         Ok(step) => step,
                         Err(source) => {
@@ -318,22 +647,25 @@ impl Runtime {
                             return Err(source.into());
                         }
                     };
-                    if let (Some(prior), Some(result)) = (
-                        body_states
-                            .iter()
-                            .find(|body| body.body_id == PLAYER_BODY_ID),
-                        step.bodies
-                            .iter()
-                            .find(|body| body.body_id == PLAYER_BODY_ID),
-                    ) && let Err(source) = ensure_player_fixed_step_envelope(
-                        from_physics_vec3(prior.pose.position),
-                        from_physics_quat(prior.pose.rotation),
-                        from_physics_vec3(result.pose.position),
-                        from_physics_quat(result.pose.rotation),
-                        &physics_scene_config(),
-                    ) {
-                        self.halted = true;
-                        return Err(source.into());
+                    for scheduled_player in scheduled_players.values() {
+                        let player_body_id = player_body_id(&scheduled_player.player_id);
+                        if let (Some(prior), Some(result)) = (
+                            body_states
+                                .iter()
+                                .find(|body| body.body_id == player_body_id),
+                            step.bodies
+                                .iter()
+                                .find(|body| body.body_id == player_body_id),
+                        ) && let Err(source) = ensure_player_fixed_step_envelope(
+                            from_physics_vec3(prior.pose.position),
+                            from_physics_quat(prior.pose.rotation),
+                            from_physics_vec3(result.pose.position),
+                            from_physics_quat(result.pose.rotation),
+                            &physics_scene_config(),
+                        ) {
+                            self.halted = true;
+                            return Err(source.into());
+                        }
                     }
                     for grid in self.state.grids.values().filter(|grid| !grid.anchored) {
                         if let (Some(prior), Some(result)) = (
@@ -384,18 +716,29 @@ impl Runtime {
                         .filter(|body| self.state.grids.contains_key(&body.body_id))
                         .map(physics_body_outcome)
                         .collect(),
-                    player: output
-                        .bodies
-                        .iter()
-                        .find(|body| body.body_id == PLAYER_BODY_ID)
-                        .map(|body| {
-                            player_physics_outcome(
-                                &scheduled_player,
-                                body,
-                                active_contacts.iter().any(contact_key_involves_player),
-                                self.state.simulation_tick.saturating_add(step_count),
-                            )
-                        }),
+                    players: scheduled_players
+                        .values()
+                        .filter_map(|scheduled_player| {
+                            let player_body_id = player_body_id(&scheduled_player.player_id);
+                            output
+                                .bodies
+                                .iter()
+                                .find(|body| body.body_id == player_body_id)
+                                .map(|body| {
+                                    player_physics_outcome(
+                                        scheduled_player,
+                                        body,
+                                        active_contacts.iter().any(|contact| {
+                                            contact_key_involves_player_id(
+                                                contact,
+                                                &scheduled_player.player_id,
+                                            )
+                                        }),
+                                        self.state.simulation_tick.saturating_add(step_count),
+                                    )
+                                })
+                        })
+                        .collect(),
                     contacts,
                     active_contacts_after: active_contacts.into_iter().collect(),
                 };
@@ -415,27 +758,63 @@ impl Runtime {
             }
         }
 
-        let player_life_support_active =
-            matches!(self.state.player.life_state, PlayerLifeState::Alive);
-        if player_life_support_active {
-            self.life_support_elapsed_millis = self
-                .life_support_elapsed_millis
-                .saturating_add(u32::from(delta_millis));
-        } else if !matches!(self.state.player.life_state, PlayerLifeState::Alive) {
-            self.life_support_elapsed_millis = 0;
+        let player_ids = self.state.player.by_id.keys().cloned().collect::<Vec<_>>();
+        let mut elapsed_seconds_by_player = BTreeMap::new();
+        for player_id in &player_ids {
+            let player = self
+                .state
+                .player
+                .get(player_id)
+                .expect("roster identity collected from canonical state");
+            let elapsed_millis = self
+                .life_support_elapsed_millis_by_player
+                .entry(player_id.clone())
+                .or_default();
+            if matches!(player.life_state, PlayerLifeState::Alive) {
+                *elapsed_millis = elapsed_millis.saturating_add(u32::from(delta_millis));
+                elapsed_seconds_by_player.insert(player_id.clone(), *elapsed_millis / 1_000);
+                *elapsed_millis %= 1_000;
+            } else {
+                *elapsed_millis = 0;
+            }
         }
-        if player_life_support_active && self.life_support_elapsed_millis >= 1_000 {
-            let elapsed_seconds = self.life_support_elapsed_millis / 1_000;
-            self.life_support_elapsed_millis %= 1_000;
-            for _ in 0..elapsed_seconds {
-                let Some(payload) = self.state.life_support_payload_after_one_second()? else {
+        self.life_support_elapsed_millis_by_player
+            .retain(|player_id, _| self.state.player.by_id.contains_key(player_id));
+
+        let max_elapsed_seconds = elapsed_seconds_by_player
+            .values()
+            .copied()
+            .max()
+            .unwrap_or_default();
+        // Each elapsed life-support second is a deterministic round. Players
+        // within the round are scheduled in canonical roster order so two
+        // simultaneous transitions always produce the same event chain.
+        for second_index in 0..max_elapsed_seconds {
+            for player_id in &player_ids {
+                if elapsed_seconds_by_player
+                    .get(player_id)
+                    .copied()
+                    .unwrap_or_default()
+                    <= second_index
+                    || !matches!(
+                        self.state
+                            .player
+                            .get(player_id)
+                            .expect("scheduled player remains in canonical roster")
+                            .life_state,
+                        PlayerLifeState::Alive
+                    )
+                {
+                    continue;
+                }
+                let Some(payload) = self
+                    .state
+                    .life_support_payload_after_one_second_for(player_id)?
+                else {
                     continue;
                 };
                 self.commit_system_event(payload)?;
                 changed = true;
-                if !matches!(self.state.player.life_state, PlayerLifeState::Alive) {
-                    break;
-                }
             }
         }
         Ok(changed)
@@ -483,20 +862,24 @@ impl Runtime {
 }
 
 impl WorldState {
-    fn next_suit_oxygen_after_one_second(&self) -> Result<u16, IntentError> {
-        if !matches!(self.player.life_state, PlayerLifeState::Alive)
-            || self.player.suit_oxygen_milli == 0
-        {
+    fn next_suit_oxygen_after_one_second_for(&self, player_id: &str) -> Result<u16, IntentError> {
+        let player = self.player.get(player_id).ok_or_else(|| {
+            IntentError::rejected(
+                "lifecycle_player_missing",
+                "life support target is not present in the canonical roster",
+            )
+        })?;
+        if !matches!(player.life_state, PlayerLifeState::Alive) || player.suit_oxygen_milli == 0 {
             return Err(IntentError::rejected(
                 "player_not_alive",
                 "only an alive player with remaining oxygen has a life-support transition",
             ));
         }
-        let environment = self.environment_at(self.player.position);
+        let environment = self.environment_at(player.position);
         let survival = &content::manifest().survival;
-        let per_second_delta = if !self.player.helmet_closed && environment.breathable {
+        let per_second_delta = if !player.helmet_closed && environment.breathable {
             survival.open_breathable_delta_milli_per_second
-        } else if !self.player.helmet_closed {
+        } else if !player.helmet_closed {
             survival.open_vacuum_delta_milli_per_second
         } else if environment.breathable {
             survival.sealed_breathable_delta_milli_per_second
@@ -504,48 +887,70 @@ impl WorldState {
             survival.sealed_vacuum_delta_milli_per_second
         };
         Ok(u16::try_from(
-            (i32::from(self.player.suit_oxygen_milli) + i32::from(per_second_delta))
+            (i32::from(player.suit_oxygen_milli) + i32::from(per_second_delta))
                 .clamp(0, i32::from(survival.suit_oxygen_capacity_milli)),
         )
         .expect("clamped suit oxygen always fits u16"))
     }
 
-    fn life_support_payload_after_one_second(&self) -> Result<Option<EventPayload>, IntentError> {
-        let previous_oxygen_milli = self.player.suit_oxygen_milli;
-        let new_oxygen_milli = self.next_suit_oxygen_after_one_second()?;
+    fn life_support_payload_after_one_second_for(
+        &self,
+        player_id: &str,
+    ) -> Result<Option<EventPayload>, IntentError> {
+        let player = self.player.get(player_id).ok_or_else(|| {
+            IntentError::rejected(
+                "lifecycle_player_missing",
+                "life support target is not present in the canonical roster",
+            )
+        })?;
+        let previous_oxygen_milli = player.suit_oxygen_milli;
+        let new_oxygen_milli = self.next_suit_oxygen_after_one_second_for(player_id)?;
         if new_oxygen_milli == previous_oxygen_milli {
             return Ok(None);
         }
         if new_oxygen_milli == 0 {
-            return self.oxygen_incapacitation_payload().map(Some);
+            return self.oxygen_incapacitation_payload_for(player_id).map(Some);
         }
         Ok(Some(EventPayload::SuitOxygenChanged {
+            player_id: player_id.to_owned(),
             previous_oxygen_milli,
             new_oxygen_milli,
         }))
     }
 
+    #[cfg(test)]
     fn oxygen_incapacitation_payload(&self) -> Result<EventPayload, IntentError> {
-        if !matches!(self.player.life_state, PlayerLifeState::Alive)
-            || self.player.suit_oxygen_milli == 0
-        {
+        self.oxygen_incapacitation_payload_for(&self.player.player_id)
+    }
+
+    fn oxygen_incapacitation_payload_for(
+        &self,
+        player_id: &str,
+    ) -> Result<EventPayload, IntentError> {
+        let player = self.player.get(player_id).ok_or_else(|| {
+            IntentError::rejected(
+                "lifecycle_player_missing",
+                "life support target is not present in the canonical roster",
+            )
+        })?;
+        if !matches!(player.life_state, PlayerLifeState::Alive) || player.suit_oxygen_milli == 0 {
             return Err(IntentError::rejected(
                 "player_not_alive",
                 "only an alive player with remaining oxygen can become incapacitated",
             ));
         }
-        if self.next_suit_oxygen_after_one_second()? != 0 {
+        if self.next_suit_oxygen_after_one_second_for(player_id)? != 0 {
             return Err(IntentError::rejected(
                 "oxygen_not_depleted",
                 "the authoritative one-second life-support transition does not reach zero",
             ));
         }
         let event_sequence = self.event_sequence + 1;
-        let death_id = format!("death-{}-{event_sequence}", self.player.player_id);
-        let inventory = self.inventory(&self.player.inventory_id)?;
+        let death_id = format!("death-{}-{event_sequence}", player.player_id);
+        let inventory = self.inventory(&player.inventory_id)?;
         if inventory.domain
             != (InventoryDomain::Player {
-                player_id: self.player.player_id.clone(),
+                player_id: player.player_id.clone(),
             })
         {
             return Err(IntentError::rejected(
@@ -555,7 +960,7 @@ impl WorldState {
         }
         let has_carried_inventory = inventory.contents != InventoryContents::default();
         let (dropped_inventory, death_drop) = if has_carried_inventory {
-            let drop_id = format!("drop-{}-{event_sequence}", self.player.player_id);
+            let drop_id = format!("drop-{}-{event_sequence}", player.player_id);
             let inventory_id = format!("inventory-{drop_id}");
             if self.death_drops.contains_key(&drop_id)
                 || self.inventories.contains_key(&inventory_id)
@@ -570,6 +975,7 @@ impl WorldState {
                     inventory_id: inventory_id.clone(),
                     domain: InventoryDomain::Dropped {
                         reason: "player_oxygen_depleted".into(),
+                        owner_player_id: player.player_id.clone(),
                     },
                     contents: inventory.contents.clone(),
                     capacity_liters: inventory.capacity_liters,
@@ -578,8 +984,8 @@ impl WorldState {
                     drop_id,
                     death_id: death_id.clone(),
                     inventory_id,
-                    owner_player_id: self.player.player_id.clone(),
-                    position: self.player.position,
+                    owner_player_id: player.player_id.clone(),
+                    position: player.position,
                     created_event_sequence: event_sequence,
                     cause: PlayerDeathCause::OxygenDepleted,
                 }),
@@ -588,24 +994,36 @@ impl WorldState {
             (None, None)
         };
         Ok(EventPayload::PlayerIncapacitated {
+            player_id: player.player_id.clone(),
             death_id,
             cause: PlayerDeathCause::OxygenDepleted,
-            position: self.player.position,
-            previous_oxygen_milli: self.player.suit_oxygen_milli,
+            position: player.position,
+            previous_oxygen_milli: player.suit_oxygen_milli,
             dropped_inventory,
             death_drop,
         })
     }
 
+    #[cfg(test)]
     fn player_respawn_payload(&self) -> Result<EventPayload, IntentError> {
-        let PlayerLifeState::Incapacitated { death_id, .. } = &self.player.life_state else {
+        self.player_respawn_payload_for(&self.player.player_id)
+    }
+
+    fn player_respawn_payload_for(&self, player_id: &str) -> Result<EventPayload, IntentError> {
+        let player = self.player.get(player_id).ok_or_else(|| {
+            IntentError::rejected(
+                "lifecycle_player_missing",
+                "respawn target is not present in the canonical roster",
+            )
+        })?;
+        let PlayerLifeState::Incapacitated { death_id, .. } = &player.life_state else {
             return Err(IntentError::rejected(
                 "player_already_alive",
                 "the player is already alive",
             ));
         };
         let survival = &content::manifest().survival;
-        if self.inventory(&self.player.inventory_id)?.contents != InventoryContents::default() {
+        if self.inventory(&player.inventory_id)?.contents != InventoryContents::default() {
             return Err(IntentError::rejected(
                 "respawn_inventory_not_empty",
                 "recovery requires the carried inventory to remain in its death drop",
@@ -646,12 +1064,296 @@ impl WorldState {
             && !self.player_movement_hits_grid(position, position, orientation)
     }
 
+    pub fn client_intent_fingerprint(
+        &self,
+        actor_player_id: &str,
+        message: &ClientMessage,
+    ) -> Result<String, IntentError> {
+        if message.operation_sequence().is_none() || message.operation_id().is_none() {
+            return Err(IntentError::rejected(
+                "not_a_mutating_intent",
+                "only mutating client messages have intent fingerprints",
+            ));
+        }
+        if !client_message_floats_are_finite(message) {
+            return Err(IntentError::rejected(
+                "invalid_vector",
+                "client intent floating-point fields must be finite",
+            ));
+        }
+        let mut canonical_message = serde_json::to_value(message).map_err(|_| {
+            IntentError::rejected(
+                "intent_fingerprint_invalid",
+                "client intent cannot be represented by the canonical fingerprint schema",
+            )
+        })?;
+        normalize_json_signed_zero(&mut canonical_message);
+        let material = IntentFingerprintMaterial {
+            domain: "the-verse-client-intent-v1",
+            protocol_version: PROTOCOL_VERSION,
+            fingerprint_schema_version: INTENT_FINGERPRINT_SCHEMA_VERSION,
+            world_schema_version: WORLD_SCHEMA_VERSION,
+            event_schema_version: EVENT_SCHEMA_VERSION,
+            universe_id: &self.universe_id,
+            cell_id: &self.cell_id,
+            actor_player_id,
+            message: &canonical_message,
+        };
+        let bytes = serde_json::to_vec(&material).map_err(|_| {
+            IntentError::rejected(
+                "intent_fingerprint_invalid",
+                "client intent cannot be represented by the canonical fingerprint schema",
+            )
+        })?;
+        Ok(blake3::hash(&bytes).to_hex().to_string())
+    }
+
+    fn validate_operation_attempt(
+        &self,
+        actor_player_id: &str,
+        operation_sequence: u64,
+        intent_fingerprint: &str,
+    ) -> Result<Option<IntentReceipt>, IntentError> {
+        if operation_sequence == 0 {
+            return Err(IntentError::rejected(
+                "operation_sequence_invalid",
+                "operation sequence must be positive",
+            ));
+        }
+        let Some(history) = self.processed_operations.get(actor_player_id) else {
+            if operation_sequence == 1 {
+                return Ok(None);
+            }
+            return Err(IntentError::rejected(
+                "operation_sequence_gap",
+                "operation sequence must begin at one for this actor",
+            ));
+        };
+        if operation_sequence <= history.compacted_through {
+            return Err(IntentError::rejected(
+                "operation_already_committed",
+                "operation committed but its historical receipt has been compacted",
+            ));
+        }
+        if let Some(record) = history.retained.get(&operation_sequence) {
+            if record.intent_fingerprint == intent_fingerprint {
+                return Ok(Some(record.receipt.clone()));
+            }
+            return Err(IntentError::rejected(
+                "operation_conflict",
+                "operation sequence is already bound to a different client intent",
+            ));
+        }
+        if operation_sequence <= history.committed_through {
+            return Err(IntentError::rejected(
+                "operation_history_invalid",
+                "canonical operation history is missing a committed retained record",
+            ));
+        }
+        let expected = history.committed_through.checked_add(1).ok_or_else(|| {
+            IntentError::rejected(
+                "operation_sequence_exhausted",
+                "the actor operation sequence has reached its maximum value",
+            )
+        })?;
+        if operation_sequence != expected {
+            return Err(IntentError::rejected(
+                "operation_sequence_gap",
+                format!("operation sequence must be the next committed value {expected}"),
+            ));
+        }
+        Ok(None)
+    }
+
+    fn client_message_for_human_event(
+        event: &CanonicalEvent,
+    ) -> Result<ClientMessage, IntentError> {
+        let operation_sequence = event
+            .operation_sequence
+            .expect("validated human event has an operation sequence");
+        let operation_id = event
+            .operation_id
+            .as_ref()
+            .expect("validated human event has an operation ID")
+            .clone();
+        let message = match &event.payload {
+            EventPayload::PlayerControlSet {
+                movement_epoch,
+                input_sequence,
+                linear_input,
+                angular_input,
+                boost,
+                dampeners,
+                jump,
+                ..
+            } => ClientMessage::SetPlayerControl {
+                operation_sequence,
+                operation_id,
+                movement_epoch: *movement_epoch,
+                input_sequence: *input_sequence,
+                linear_input: *linear_input,
+                angular_input: *angular_input,
+                boost: *boost,
+                dampeners: *dampeners,
+                jump: *jump,
+            },
+            EventPayload::SuitModeChanged {
+                helmet_closed,
+                jetpack_enabled,
+                magnetic_boots_enabled,
+            } => ClientMessage::SetSuitMode {
+                operation_sequence,
+                operation_id,
+                helmet_closed: *helmet_closed,
+                jetpack_enabled: *jetpack_enabled,
+                magnetic_boots_enabled: *magnetic_boots_enabled,
+            },
+            EventPayload::PlayerRespawned { .. } => ClientMessage::RespawnPlayer {
+                operation_sequence,
+                operation_id,
+            },
+            EventPayload::VoxelMined { coordinate, .. } => ClientMessage::MineVoxel {
+                operation_sequence,
+                operation_id,
+                coordinate: *coordinate,
+            },
+            EventPayload::OreRefined {
+                inventory_id,
+                batches,
+            } => ClientMessage::RefineOre {
+                operation_sequence,
+                operation_id,
+                inventory_id: inventory_id.clone(),
+                batches: *batches,
+            },
+            EventPayload::ComponentCrafted {
+                inventory_id,
+                quantity,
+            } => ClientMessage::CraftComponent {
+                operation_sequence,
+                operation_id,
+                inventory_id: inventory_id.clone(),
+                quantity: *quantity,
+            },
+            EventPayload::InventoryTransferred {
+                source_inventory_id,
+                destination_inventory_id,
+                resource,
+                quantity,
+            } => ClientMessage::TransferInventory {
+                operation_sequence,
+                operation_id,
+                source_inventory_id: source_inventory_id.clone(),
+                destination_inventory_id: destination_inventory_id.clone(),
+                resource: *resource,
+                quantity: *quantity,
+            },
+            EventPayload::BlockBuilt { grid_id, block, .. } => ClientMessage::BuildBlock {
+                operation_sequence,
+                operation_id,
+                grid_id: grid_id.clone(),
+                coordinate: block.coordinate,
+                kind: block.kind,
+                orientation: block.orientation,
+            },
+            EventPayload::BlockWelded {
+                grid_id, block_id, ..
+            } => ClientMessage::WeldBlock {
+                operation_sequence,
+                operation_id,
+                grid_id: grid_id.clone(),
+                block_id: block_id.clone(),
+            },
+            EventPayload::GridControlSet {
+                grid_id,
+                linear_input,
+                angular_input,
+                dampeners,
+            } => ClientMessage::SetGridControl {
+                operation_sequence,
+                operation_id,
+                grid_id: grid_id.clone(),
+                linear_input: *linear_input,
+                angular_input: *angular_input,
+                dampeners: *dampeners,
+            },
+            EventPayload::GridAnchorSet { grid_id, .. } => ClientMessage::ToggleGridAnchor {
+                operation_sequence,
+                operation_id,
+                grid_id: grid_id.clone(),
+            },
+            EventPayload::BlockDamaged {
+                grid_id, block_id, ..
+            } => ClientMessage::DamageBlock {
+                operation_sequence,
+                operation_id,
+                grid_id: grid_id.clone(),
+                block_id: block_id.clone(),
+            },
+            EventPayload::SuitOxygenChanged { .. } | EventPayload::PlayerIncapacitated { .. } => {
+                return Err(IntentError::rejected(
+                    "replay_lifecycle_envelope_invalid",
+                    "automatic life-support payload cannot use a human client envelope",
+                ));
+            }
+            EventPayload::PhysicsStepCommitted { .. } => {
+                return Err(IntentError::rejected(
+                    "replay_physics_envelope_invalid",
+                    "physics payload cannot use a human client envelope",
+                ));
+            }
+        };
+        Ok(message)
+    }
+
     pub fn prepare_client_event(
         &self,
         message: &ClientMessage,
     ) -> Result<CanonicalEvent, IntentError> {
+        self.prepare_client_event_as(&self.player.player_id, message)
+    }
+
+    #[cfg(test)]
+    fn prepare_next_client_event_for_fixture(
+        &self,
+        message: &ClientMessage,
+    ) -> Result<CanonicalEvent, IntentError> {
+        self.prepare_next_client_event_as_for_fixture(&self.player.player_id, message)
+    }
+
+    #[cfg(test)]
+    fn prepare_next_client_event_as_for_fixture(
+        &self,
+        actor_player_id: &str,
+        message: &ClientMessage,
+    ) -> Result<CanonicalEvent, IntentError> {
+        let mut sequenced = message.clone();
+        if sequenced.operation_sequence() == Some(0) {
+            let sequence = self
+                .last_operation_sequence(actor_player_id)
+                .checked_add(1)
+                .expect("fixture operation sequence remains available");
+            assert!(sequenced.set_operation_sequence(sequence));
+        }
+        self.prepare_client_event_as(actor_player_id, &sequenced)
+    }
+
+    pub fn prepare_client_event_as(
+        &self,
+        actor_player_id: &str,
+        message: &ClientMessage,
+    ) -> Result<CanonicalEvent, IntentError> {
+        let actor = self.player.get(actor_player_id).ok_or_else(|| {
+            IntentError::rejected(
+                "actor_not_present",
+                "the authenticated player is not present in this simulation cell",
+            )
+        })?;
         let operation_id = message.operation_id().ok_or_else(|| {
             IntentError::rejected("not_a_mutating_intent", "message has no operation ID")
+        })?;
+        let operation_sequence = message.operation_sequence().ok_or_else(|| {
+            IntentError::rejected("not_a_mutating_intent", "message has no operation sequence")
         })?;
         if operation_id.trim().is_empty() || operation_id.len() > 128 {
             return Err(IntentError::rejected(
@@ -659,7 +1361,17 @@ impl WorldState {
                 "operation ID must contain between 1 and 128 characters",
             ));
         }
-        if !matches!(self.player.life_state, PlayerLifeState::Alive)
+        let intent_fingerprint = self.client_intent_fingerprint(actor_player_id, message)?;
+        if self
+            .validate_operation_attempt(actor_player_id, operation_sequence, &intent_fingerprint)?
+            .is_some()
+        {
+            return Err(IntentError::rejected(
+                "operation_already_committed",
+                "the retained operation has already committed; execute through the runtime to recover its receipt",
+            ));
+        }
+        if !matches!(actor.life_state, PlayerLifeState::Alive)
             && !matches!(message, ClientMessage::RespawnPlayer { .. })
         {
             return Err(IntentError::rejected(
@@ -681,13 +1393,13 @@ impl WorldState {
             } => {
                 ensure_bounded_control(*linear_input, "character linear control")?;
                 ensure_bounded_control(*angular_input, "character angular control")?;
-                if *movement_epoch != self.player.movement_epoch {
+                if *movement_epoch != actor.movement_epoch {
                     return Err(IntentError::rejected(
                         "movement_epoch_stale",
                         "character control does not match the current movement epoch",
                     ));
                 }
-                if *input_sequence <= self.player.last_received_input_sequence {
+                if *input_sequence <= actor.last_received_input_sequence {
                     return Err(IntentError::rejected(
                         "movement_input_out_of_order",
                         "character control sequence must advance monotonically",
@@ -697,7 +1409,7 @@ impl WorldState {
                     usize::try_from(content::manifest().character.control_lease_ticks)
                         .unwrap_or(usize::MAX)
                         .min(MAX_PENDING_PLAYER_CONTROL_FRAMES);
-                if self.player.pending_control_frames.len() >= lease_queue_limit {
+                if actor.pending_control_frames.len() >= lease_queue_limit {
                     return Err(IntentError::rejected(
                         "movement_input_backpressure",
                         "character control queue is full; wait for an authoritative physics acknowledgement",
@@ -722,9 +1434,9 @@ impl WorldState {
                 magnetic_boots_enabled,
                 ..
             } => {
-                if self.player.helmet_closed == *helmet_closed
-                    && self.player.jetpack_enabled == *jetpack_enabled
-                    && self.player.locomotion.magnetic_boots_enabled == *magnetic_boots_enabled
+                if actor.helmet_closed == *helmet_closed
+                    && actor.jetpack_enabled == *jetpack_enabled
+                    && actor.locomotion.magnetic_boots_enabled == *magnetic_boots_enabled
                 {
                     return Err(IntentError::rejected(
                         "suit_mode_no_change",
@@ -737,27 +1449,22 @@ impl WorldState {
                     magnetic_boots_enabled: *magnetic_boots_enabled,
                 }
             }
-            ClientMessage::RespawnPlayer { .. } => self.player_respawn_payload()?,
+            ClientMessage::RespawnPlayer { .. } => {
+                self.player_respawn_payload_for(actor_player_id)?
+            }
             ClientMessage::MineVoxel { coordinate, .. } => {
                 let material = self.voxels.material(*coordinate).ok_or_else(|| {
                     IntentError::rejected("voxel_missing", "target voxel is already empty")
                 })?;
-                let voxel_position = Vec3::new(
-                    f64::from(coordinate.x),
-                    f64::from(coordinate.y),
-                    f64::from(coordinate.z),
-                );
-                if self.player.position.squared_distance(voxel_position)
-                    > MINING_RANGE * MINING_RANGE
-                {
-                    return Err(IntentError::rejected(
-                        "voxel_out_of_range",
-                        "target voxel is beyond the mining tool range",
-                    ));
-                }
+                self.ensure_voxel_tool_target(
+                    actor,
+                    *coordinate,
+                    "voxel_not_targeted",
+                    "the requested voxel is not the authenticated actor's closest visible tool target",
+                )?;
                 let ore_yield = content::voxel(material).ore_yield;
                 if !self
-                    .inventory(&self.player.inventory_id)?
+                    .inventory(&actor.inventory_id)?
                     .can_add(ResourceKind::Ore, ore_yield)
                 {
                     return Err(IntentError::rejected(
@@ -779,7 +1486,7 @@ impl WorldState {
                     coordinate: *coordinate,
                     material,
                     ore_yield,
-                    inventory_id: self.player.inventory_id.clone(),
+                    inventory_id: actor.inventory_id.clone(),
                 }
             }
             ClientMessage::RefineOre {
@@ -798,12 +1505,33 @@ impl WorldState {
                     .ok_or_else(|| {
                         IntentError::rejected("quantity_overflow", "refining quantity is too large")
                     })?;
+                self.ensure_actor_owns_inventory(actor_player_id, inventory_id)?;
                 self.ensure_inventory_functional(inventory_id)?;
                 let inventory = self.inventory(inventory_id)?;
                 if inventory.contents.ore < ore_required {
                     return Err(IntentError::rejected(
                         "insufficient_ore",
                         format!("refining requires {ore_required} ore"),
+                    ));
+                }
+                let refined_output = batches
+                    .checked_mul(content::manifest().recipes.refining.refined_output)
+                    .ok_or_else(|| {
+                        IntentError::rejected("quantity_overflow", "refining output is too large")
+                    })?;
+                let mut projected = inventory.clone();
+                projected.contents.ore -= ore_required;
+                projected.contents.refined_material = projected
+                    .contents
+                    .refined_material
+                    .checked_add(refined_output)
+                    .ok_or_else(|| {
+                        IntentError::rejected("quantity_overflow", "refined inventory overflowed")
+                    })?;
+                if projected.used_liters() > projected.capacity_liters {
+                    return Err(IntentError::rejected(
+                        "inventory_capacity_exceeded",
+                        "the inventory has no volume for the refined output",
                     ));
                 }
                 EventPayload::OreRefined {
@@ -822,6 +1550,7 @@ impl WorldState {
                         "crafting requires at least one component",
                     ));
                 }
+                self.ensure_actor_owns_inventory(actor_player_id, inventory_id)?;
                 self.ensure_inventory_functional(inventory_id)?;
                 let inventory = self.inventory(inventory_id)?;
                 let refined_required = quantity
@@ -835,21 +1564,26 @@ impl WorldState {
                         format!("crafting requires {refined_required} refined material"),
                     ));
                 }
-                let refined_output = quantity.saturating_mul(
-                    content::manifest()
-                        .recipes
-                        .component_crafting
-                        .component_output,
-                );
-                let used_after = inventory
-                    .used_liters()
-                    .saturating_sub(refined_required.saturating_mul(
-                        crate::model::resource_unit_volume_liters(ResourceKind::RefinedMaterial),
-                    ))
-                    .saturating_add(refined_output.saturating_mul(
-                        crate::model::resource_unit_volume_liters(ResourceKind::Component),
-                    ));
-                if used_after > inventory.capacity_liters {
+                let component_output = quantity
+                    .checked_mul(
+                        content::manifest()
+                            .recipes
+                            .component_crafting
+                            .component_output,
+                    )
+                    .ok_or_else(|| {
+                        IntentError::rejected("quantity_overflow", "crafting output is too large")
+                    })?;
+                let mut projected = inventory.clone();
+                projected.contents.refined_material -= refined_required;
+                projected.contents.components = projected
+                    .contents
+                    .components
+                    .checked_add(component_output)
+                    .ok_or_else(|| {
+                        IntentError::rejected("quantity_overflow", "component inventory overflowed")
+                    })?;
+                if projected.used_liters() > projected.capacity_liters {
                     return Err(IntentError::rejected(
                         "inventory_capacity_exceeded",
                         "the inventory has no volume for the fabricated component",
@@ -879,6 +1613,8 @@ impl WorldState {
                         "transfer quantity must be positive",
                     ));
                 }
+                self.ensure_actor_owns_inventory(actor_player_id, source_inventory_id)?;
+                self.ensure_actor_owns_inventory(actor_player_id, destination_inventory_id)?;
                 self.ensure_inventory_functional(source_inventory_id)?;
                 self.ensure_inventory_functional(destination_inventory_id)?;
                 let source = self.inventory(source_inventory_id)?;
@@ -912,6 +1648,7 @@ impl WorldState {
                 orientation,
                 ..
             } => {
+                self.ensure_actor_owns_grid(actor_player_id, grid_id)?;
                 let grid = self.grid(grid_id)?;
                 if *orientation > 3 {
                     return Err(IntentError::rejected(
@@ -942,14 +1679,20 @@ impl WorldState {
                         "new blocks must share a face with the target grid",
                     ));
                 }
-                self.ensure_hand_tool_range(grid, *coordinate, "block_out_of_range")?;
+                self.ensure_build_tool_target(
+                    actor,
+                    grid_id,
+                    *coordinate,
+                    "build_face_not_targeted",
+                    "the requested frame is not on the exact visible face targeted by the authenticated actor",
+                )?;
                 if self.player_intersects_grid_coordinate(grid, *coordinate) {
                     return Err(IntentError::rejected(
                         "block_intersects_player",
                         "a block frame cannot be created around the living player collider",
                     ));
                 }
-                let player_inventory = self.inventory(PLAYER_INVENTORY_ID)?;
+                let player_inventory = self.inventory(&actor.inventory_id)?;
                 let component_cost = content::block(*kind).component_cost;
                 if player_inventory.contents.components < component_cost {
                     return Err(IntentError::rejected(
@@ -968,17 +1711,25 @@ impl WorldState {
                 }
                 EventPayload::BlockBuilt {
                     grid_id: grid_id.clone(),
+                    component_inventory_id: actor.inventory_id.clone(),
                     block,
                 }
             }
             ClientMessage::WeldBlock {
                 grid_id, block_id, ..
             } => {
+                self.ensure_actor_owns_grid(actor_player_id, grid_id)?;
                 let grid = self.grid(grid_id)?;
                 let block = grid.blocks.get(block_id).ok_or_else(|| {
                     IntentError::rejected("block_missing", "weld target does not exist")
                 })?;
-                self.ensure_hand_tool_range(grid, block.coordinate, "block_out_of_range")?;
+                self.ensure_block_tool_target(
+                    actor,
+                    grid_id,
+                    block_id,
+                    "block_not_targeted",
+                    "the requested weld block is not the authenticated actor's closest visible tool target",
+                )?;
                 let max_health = block.max_health();
                 if block.health >= max_health {
                     return Err(IntentError::rejected(
@@ -1009,6 +1760,7 @@ impl WorldState {
             } => {
                 ensure_finite(*linear_input, "grid linear control")?;
                 ensure_finite(*angular_input, "grid angular control")?;
+                self.ensure_actor_owns_grid(actor_player_id, grid_id)?;
                 let grid = self.grid(grid_id)?;
                 if grid.anchored {
                     return Err(IntentError::rejected(
@@ -1038,6 +1790,7 @@ impl WorldState {
                 }
             }
             ClientMessage::ToggleGridAnchor { grid_id, .. } => {
+                self.ensure_actor_owns_grid(actor_player_id, grid_id)?;
                 let grid = self.grid(grid_id)?;
                 let anchored = !grid.anchored;
                 if anchored {
@@ -1057,19 +1810,26 @@ impl WorldState {
                 EventPayload::GridAnchorSet {
                     grid_id: grid_id.clone(),
                     anchored,
+                    reward_credited: anchored && grid.anchor_reward_eligible,
                 }
             }
             ClientMessage::DamageBlock {
                 grid_id, block_id, ..
             } => {
                 let grid = self.grid(grid_id)?;
-                let block = grid.blocks.get(block_id).ok_or_else(|| {
+                let _block = grid.blocks.get(block_id).ok_or_else(|| {
                     IntentError::rejected(
                         "block_missing",
                         "target block does not exist on the grid",
                     )
                 })?;
-                self.ensure_hand_tool_range(grid, block.coordinate, "block_out_of_range")?;
+                self.ensure_block_tool_target(
+                    actor,
+                    grid_id,
+                    block_id,
+                    "block_not_targeted",
+                    "the requested damage block is not the authenticated actor's closest visible tool target",
+                )?;
                 EventPayload::BlockDamaged {
                     grid_id: grid_id.clone(),
                     block_id: block_id.clone(),
@@ -1085,36 +1845,92 @@ impl WorldState {
         };
 
         Ok(self.new_event(
-            "player-local",
+            Some(actor_player_id),
             "human",
-            Some(operation_id.to_owned()),
+            Some(OperationEventMetadata {
+                operation_id: operation_id.to_owned(),
+                operation_sequence,
+                intent_fingerprint,
+            }),
             payload,
         ))
     }
 
     pub fn prepare_system_event(&self, payload: EventPayload) -> CanonicalEvent {
-        self.new_event("simulation-worker", "system", None, payload)
+        self.new_event(None, "system", None, payload)
     }
 
     fn new_event(
         &self,
-        actor_profile_id: &str,
+        actor_player_id: Option<&str>,
         actor_type: &str,
-        operation_id: Option<String>,
+        operation: Option<OperationEventMetadata>,
         payload: EventPayload,
     ) -> CanonicalEvent {
+        let (operation_id, operation_sequence, intent_fingerprint) =
+            operation.map_or((None, None, None), |operation| {
+                (
+                    Some(operation.operation_id),
+                    Some(operation.operation_sequence),
+                    Some(operation.intent_fingerprint),
+                )
+            });
         CanonicalEvent::new(
             self.event_sequence + 1,
             self.content_manifest_version.clone(),
             self.universe_id.clone(),
             self.cell_id.clone(),
             self.fencing_token,
-            actor_profile_id,
+            actor_player_id.map(str::to_owned),
             actor_type,
             operation_id,
+            operation_sequence,
+            intent_fingerprint,
             self.last_event_hash.clone(),
             payload,
         )
+    }
+
+    #[cfg(test)]
+    fn new_test_human_event(
+        &self,
+        actor_player_id: &str,
+        operation_id: impl Into<String>,
+        payload: EventPayload,
+    ) -> CanonicalEvent {
+        let operation_sequence = self
+            .last_operation_sequence(actor_player_id)
+            .checked_add(1)
+            .expect("test operation sequence remains available");
+        self.new_test_human_event_at(actor_player_id, operation_sequence, operation_id, payload)
+    }
+
+    #[cfg(test)]
+    fn new_test_human_event_at(
+        &self,
+        actor_player_id: &str,
+        operation_sequence: u64,
+        operation_id: impl Into<String>,
+        payload: EventPayload,
+    ) -> CanonicalEvent {
+        let mut event = self.new_event(
+            Some(actor_player_id),
+            "human",
+            Some(OperationEventMetadata {
+                operation_id: operation_id.into(),
+                operation_sequence,
+                intent_fingerprint: "0".repeat(64),
+            }),
+            payload,
+        );
+        let message = Self::client_message_for_human_event(&event)
+            .expect("test human payload reconstructs a typed client message");
+        event.intent_fingerprint = Some(
+            self.client_intent_fingerprint(actor_player_id, &message)
+                .expect("test human intent fingerprints"),
+        );
+        event.event_hash = event.calculate_hash();
+        event
     }
 
     pub fn apply_event(&mut self, event: &CanonicalEvent) -> Result<(), IntentError> {
@@ -1143,18 +1959,85 @@ impl WorldState {
         if event.content_manifest_version != self.content_manifest_version {
             return Err(IntentError::ContentManifestMismatch);
         }
-        if let Some(operation_id) = &event.operation_id
-            && self.processed_operations.contains_key(operation_id)
-        {
-            return Err(IntentError::rejected(
-                "replay_operation_duplicate",
-                "event operation ID was already committed",
-            ));
+        match event.actor_type.as_str() {
+            "human"
+                if event
+                    .actor_player_id
+                    .as_deref()
+                    .is_none_or(|player_id| !self.player.by_id.contains_key(player_id))
+                    || event.operation_id.as_deref().is_none_or(|operation_id| {
+                        operation_id.trim().is_empty() || operation_id.len() > 128
+                    })
+                    || event
+                        .operation_sequence
+                        .is_none_or(|sequence| sequence == 0)
+                    || event
+                        .intent_fingerprint
+                        .as_deref()
+                        .is_none_or(|fingerprint| !valid_blake3_hex(fingerprint)) =>
+            {
+                return Err(IntentError::rejected(
+                    "replay_actor_envelope_invalid",
+                    "human events require one present canonical player actor, operation ID, positive operation sequence, and typed intent fingerprint",
+                ));
+            }
+            "system"
+                if event.actor_player_id.is_some()
+                    || event.operation_id.is_some()
+                    || event.operation_sequence.is_some()
+                    || event.intent_fingerprint.is_some() =>
+            {
+                return Err(IntentError::rejected(
+                    "replay_actor_envelope_invalid",
+                    "system events cannot carry any client operation metadata",
+                ));
+            }
+            "human" | "system" => {}
+            _ => {
+                return Err(IntentError::rejected(
+                    "replay_actor_envelope_invalid",
+                    "event actor type must be human or system",
+                ));
+            }
+        }
+        if event.actor_type == "human" {
+            let actor_player_id = event
+                .actor_player_id
+                .as_deref()
+                .expect("validated human event has an actor");
+            let operation_sequence = event
+                .operation_sequence
+                .expect("validated human event has an operation sequence");
+            let intent_fingerprint = event
+                .intent_fingerprint
+                .as_deref()
+                .expect("validated human event has an intent fingerprint");
+            if self
+                .validate_operation_attempt(
+                    actor_player_id,
+                    operation_sequence,
+                    intent_fingerprint,
+                )?
+                .is_some()
+            {
+                return Err(IntentError::rejected(
+                    "replay_operation_duplicate",
+                    "event operation sequence was already committed",
+                ));
+            }
+            let reconstructed = Self::client_message_for_human_event(event)?;
+            let expected_fingerprint =
+                self.client_intent_fingerprint(actor_player_id, &reconstructed)?;
+            if expected_fingerprint != intent_fingerprint {
+                return Err(IntentError::rejected(
+                    "replay_intent_fingerprint_mismatch",
+                    "event intent fingerprint does not bind its typed client request",
+                ));
+            }
         }
         match &event.payload {
             EventPayload::PlayerControlSet { .. }
-                if event.actor_profile_id != self.player.player_id
-                    || event.actor_type != "human"
+                if event.actor_type != "human"
                     || event.operation_id.as_deref().is_none_or(str::is_empty) =>
             {
                 return Err(IntentError::rejected(
@@ -1162,8 +2045,35 @@ impl WorldState {
                     "character control requires the authoritative player actor and an operation ID",
                 ));
             }
+            EventPayload::VoxelMined { .. }
+                if event.actor_type != "human"
+                    || event.actor_player_id.is_none()
+                    || event.operation_id.as_deref().is_none_or(str::is_empty) =>
+            {
+                return Err(IntentError::rejected(
+                    "replay_mining_envelope_invalid",
+                    "voxel mining requires the authoritative player actor and an operation ID",
+                ));
+            }
+            EventPayload::OreRefined { .. }
+            | EventPayload::ComponentCrafted { .. }
+            | EventPayload::InventoryTransferred { .. }
+            | EventPayload::BlockBuilt { .. }
+            | EventPayload::BlockWelded { .. }
+            | EventPayload::GridControlSet { .. }
+            | EventPayload::GridAnchorSet { .. }
+            | EventPayload::BlockDamaged { .. }
+                if event.actor_type != "human"
+                    || event.actor_player_id.is_none()
+                    || event.operation_id.as_deref().is_none_or(str::is_empty) =>
+            {
+                return Err(IntentError::rejected(
+                    "replay_hand_tool_envelope_invalid",
+                    "industry, construction, grid control, anchoring, and hand-tool damage require an authenticated player actor and operation ID",
+                ));
+            }
             EventPayload::PhysicsStepCommitted { .. }
-                if event.actor_profile_id != "simulation-worker"
+                if event.actor_player_id.is_some()
                     || event.actor_type != "system"
                     || event.operation_id.is_some() =>
             {
@@ -1172,8 +2082,20 @@ impl WorldState {
                     "physics outcomes require the system actor and no operation ID",
                 ));
             }
-            EventPayload::SuitOxygenChanged { .. } | EventPayload::PlayerIncapacitated { .. }
-                if event.actor_profile_id != "simulation-worker"
+            EventPayload::SuitModeChanged { .. }
+                if event.actor_player_id.is_none()
+                    || event.actor_type != "human"
+                    || event.operation_id.as_deref().is_none_or(str::is_empty) =>
+            {
+                return Err(IntentError::rejected(
+                    "replay_lifecycle_envelope_invalid",
+                    "suit mode requires the authenticated player actor and an operation ID",
+                ));
+            }
+            EventPayload::SuitOxygenChanged { player_id, .. }
+            | EventPayload::PlayerIncapacitated { player_id, .. }
+                if !self.player.by_id.contains_key(player_id)
+                    || event.actor_player_id.is_some()
                     || event.actor_type != "system"
                     || event.operation_id.is_some() =>
             {
@@ -1183,7 +2105,7 @@ impl WorldState {
                 ));
             }
             EventPayload::PlayerRespawned { .. }
-                if event.actor_profile_id != "player-local"
+                if event.actor_player_id.is_none()
                     || event.actor_type != "human"
                     || event.operation_id.as_deref().is_none_or(str::is_empty) =>
             {
@@ -1194,11 +2116,15 @@ impl WorldState {
             }
             _ => {}
         }
-        if !matches!(self.player.life_state, PlayerLifeState::Alive)
+        if let Some(actor_player_id) = event.actor_player_id.as_deref()
             && !matches!(
-                &event.payload,
-                EventPayload::PlayerRespawned { .. } | EventPayload::PhysicsStepCommitted { .. }
+                self.player
+                    .get(actor_player_id)
+                    .expect("validated human actor is present")
+                    .life_state,
+                PlayerLifeState::Alive
             )
+            && !matches!(&event.payload, EventPayload::PlayerRespawned { .. })
         {
             return Err(IntentError::rejected(
                 "replay_player_incapacitated",
@@ -1217,10 +2143,18 @@ impl WorldState {
                 jump,
                 expires_at_simulation_tick,
             } => {
+                let actor_player_id = event
+                    .actor_player_id
+                    .as_deref()
+                    .expect("validated player control has a human actor");
+                let actor = self
+                    .player
+                    .get_mut(actor_player_id)
+                    .expect("validated player control actor is present");
                 ensure_bounded_control(*linear_input, "replayed character linear control")?;
                 ensure_bounded_control(*angular_input, "replayed character angular control")?;
-                if *movement_epoch != self.player.movement_epoch
-                    || *input_sequence <= self.player.last_received_input_sequence
+                if *movement_epoch != actor.movement_epoch
+                    || *input_sequence <= actor.last_received_input_sequence
                     || *expires_at_simulation_tick
                         != self
                             .simulation_tick
@@ -1235,54 +2169,65 @@ impl WorldState {
                     usize::try_from(content::manifest().character.control_lease_ticks)
                         .unwrap_or(usize::MAX)
                         .min(MAX_PENDING_PLAYER_CONTROL_FRAMES);
-                if self.player.pending_control_frames.len() >= lease_queue_limit {
+                if actor.pending_control_frames.len() >= lease_queue_limit {
                     return Err(IntentError::rejected(
                         "replay_player_control_backpressure_invalid",
                         "character control event exceeds the canonical pending-frame bound",
                     ));
                 }
-                self.player
-                    .pending_control_frames
-                    .push_back(PlayerControlFrame {
-                        input_sequence: *input_sequence,
-                        linear_input: *linear_input,
-                        angular_input: *angular_input,
-                        boost: *boost,
-                        dampeners: *dampeners,
-                        jump: *jump,
-                        expires_at_simulation_tick: *expires_at_simulation_tick,
-                    });
-                self.player.last_received_input_sequence = *input_sequence;
+                actor.pending_control_frames.push_back(PlayerControlFrame {
+                    input_sequence: *input_sequence,
+                    linear_input: *linear_input,
+                    angular_input: *angular_input,
+                    boost: *boost,
+                    dampeners: *dampeners,
+                    jump: *jump,
+                    expires_at_simulation_tick: *expires_at_simulation_tick,
+                });
+                actor.last_received_input_sequence = *input_sequence;
             }
             EventPayload::SuitModeChanged {
                 helmet_closed,
                 jetpack_enabled,
                 magnetic_boots_enabled,
             } => {
-                self.player.helmet_closed = *helmet_closed;
-                self.player.jetpack_enabled = *jetpack_enabled;
-                self.player.locomotion.magnetic_boots_enabled = *magnetic_boots_enabled;
+                let actor_player_id = event
+                    .actor_player_id
+                    .as_deref()
+                    .expect("validated suit mode has a human actor");
+                let player = self
+                    .player
+                    .get_mut(actor_player_id)
+                    .expect("validated suit-mode actor is present");
+                player.helmet_closed = *helmet_closed;
+                player.jetpack_enabled = *jetpack_enabled;
+                player.locomotion.magnetic_boots_enabled = *magnetic_boots_enabled;
                 if *jetpack_enabled {
-                    self.player.locomotion.kind = LocomotionKind::Eva;
-                    self.player.locomotion.support = None;
-                } else if matches!(self.player.locomotion.kind, LocomotionKind::Eva) {
-                    self.player.locomotion.kind = LocomotionKind::Airborne;
+                    player.locomotion.kind = LocomotionKind::Eva;
+                    player.locomotion.support = None;
+                } else if matches!(player.locomotion.kind, LocomotionKind::Eva) {
+                    player.locomotion.kind = LocomotionKind::Airborne;
                 }
             }
             EventPayload::SuitOxygenChanged {
-                new_oxygen_milli, ..
+                player_id,
+                new_oxygen_milli,
+                ..
             } => {
-                let expected = self.life_support_payload_after_one_second()?;
+                let expected = self.life_support_payload_after_one_second_for(player_id)?;
                 if expected.as_ref() != Some(&event.payload) {
                     return Err(IntentError::rejected(
                         "replay_suit_oxygen_invalid",
                         "life-support event is not the exact authoritative one-second outcome",
                     ));
                 }
-                self.player.suit_oxygen_milli = *new_oxygen_milli;
+                self.player
+                    .get_mut(player_id)
+                    .expect("validated lifecycle target is present")
+                    .suit_oxygen_milli = *new_oxygen_milli;
             }
-            EventPayload::PlayerIncapacitated { .. } => {
-                let expected = self.oxygen_incapacitation_payload()?;
+            EventPayload::PlayerIncapacitated { player_id, .. } => {
+                let expected = self.oxygen_incapacitation_payload_for(player_id)?;
                 if expected != event.payload {
                     return Err(IntentError::rejected(
                         "replay_player_incapacitation_invalid",
@@ -1290,6 +2235,7 @@ impl WorldState {
                     ));
                 }
                 let EventPayload::PlayerIncapacitated {
+                    player_id,
                     death_id,
                     cause,
                     dropped_inventory,
@@ -1299,39 +2245,43 @@ impl WorldState {
                 else {
                     unreachable!("incapacitation preparation returns incapacitation payload");
                 };
-                self.inventory_mut(&self.player.inventory_id.clone())?
-                    .contents = InventoryContents::default();
+                let inventory_id = self
+                    .player
+                    .get(&player_id)
+                    .expect("validated incapacitation target is present")
+                    .inventory_id
+                    .clone();
+                self.inventory_mut(&inventory_id)?.contents = InventoryContents::default();
                 if let (Some(inventory), Some(drop)) = (dropped_inventory, death_drop) {
                     self.inventories
                         .insert(inventory.inventory_id.clone(), inventory);
                     self.death_drops.insert(drop.drop_id.clone(), drop);
                 }
-                self.player.suit_oxygen_milli = 0;
-                self.player.jetpack_enabled = false;
-                self.player.linear_velocity = Vec3::ZERO;
-                self.player.angular_velocity = Vec3::ZERO;
-                self.player.surface_contact = false;
-                self.player.locomotion = reset_locomotion(
-                    self.player.position,
+                let player = self
+                    .player
+                    .get_mut(&player_id)
+                    .expect("validated incapacitation target is present");
+                player.suit_oxygen_milli = 0;
+                player.jetpack_enabled = false;
+                player.linear_velocity = Vec3::ZERO;
+                player.angular_velocity = Vec3::ZERO;
+                player.surface_contact = false;
+                player.locomotion = reset_locomotion(
+                    player.position,
                     LocomotionKind::Airborne,
                     false,
                     self.simulation_tick,
                 );
-                self.player.control_linear_input = Vec3::ZERO;
-                self.player.control_angular_input = Vec3::ZERO;
-                self.player.boost = false;
-                self.player.dampeners = true;
-                self.player.jump = false;
-                self.player.control_expires_at_simulation_tick = self.simulation_tick;
-                self.player.pending_control_frames.clear();
-                self.player.life_state = PlayerLifeState::Incapacitated { death_id, cause };
+                player.control_linear_input = Vec3::ZERO;
+                player.control_angular_input = Vec3::ZERO;
+                player.boost = false;
+                player.dampeners = true;
+                player.jump = false;
+                player.control_expires_at_simulation_tick = self.simulation_tick;
+                player.pending_control_frames.clear();
+                player.life_state = PlayerLifeState::Incapacitated { death_id, cause };
                 self.active_contact_pairs
-                    .retain(|pair| !contact_key_involves_player(pair));
-                for grid in self.grids.values_mut() {
-                    grid.control_linear_input = Vec3::ZERO;
-                    grid.control_angular_input = Vec3::ZERO;
-                    grid.dampeners = true;
-                }
+                    .retain(|pair| !contact_key_involves_player_id(pair, &player_id));
             }
             EventPayload::PlayerRespawned {
                 position,
@@ -1341,19 +2291,27 @@ impl WorldState {
                 magnetic_boots_enabled,
                 ..
             } => {
-                let expected = self.player_respawn_payload()?;
+                let actor_player_id = event
+                    .actor_player_id
+                    .as_deref()
+                    .expect("validated respawn has a human actor");
+                let expected = self.player_respawn_payload_for(actor_player_id)?;
                 if expected != event.payload {
                     return Err(IntentError::rejected(
                         "replay_player_respawn_invalid",
                         "respawn does not match the server-selected recovery outcome",
                     ));
                 }
-                self.player.position = *position;
-                self.player.orientation = Quat::IDENTITY;
-                self.player.linear_velocity = Vec3::ZERO;
-                self.player.angular_velocity = Vec3::ZERO;
-                self.player.surface_contact = false;
-                self.player.locomotion = reset_locomotion(
+                let player = self
+                    .player
+                    .get_mut(actor_player_id)
+                    .expect("validated respawn actor is present");
+                player.position = *position;
+                player.orientation = Quat::IDENTITY;
+                player.linear_velocity = Vec3::ZERO;
+                player.angular_velocity = Vec3::ZERO;
+                player.surface_contact = false;
+                player.locomotion = reset_locomotion(
                     *position,
                     if *jetpack_enabled {
                         LocomotionKind::Eva
@@ -1363,22 +2321,22 @@ impl WorldState {
                     *magnetic_boots_enabled,
                     self.simulation_tick,
                 );
-                self.player.movement_epoch = self.player.movement_epoch.saturating_add(1);
-                self.player.last_received_input_sequence = 0;
-                self.player.last_processed_input_sequence = 0;
-                self.player.pending_control_frames.clear();
-                self.player.control_linear_input = Vec3::ZERO;
-                self.player.control_angular_input = Vec3::ZERO;
-                self.player.boost = false;
-                self.player.dampeners = true;
-                self.player.jump = false;
-                self.player.control_expires_at_simulation_tick = self.simulation_tick;
-                self.player.suit_oxygen_milli = *suit_oxygen_milli;
-                self.player.helmet_closed = *helmet_closed;
-                self.player.jetpack_enabled = *jetpack_enabled;
-                self.player.life_state = PlayerLifeState::Alive;
+                player.movement_epoch = player.movement_epoch.saturating_add(1);
+                player.last_received_input_sequence = 0;
+                player.last_processed_input_sequence = 0;
+                player.pending_control_frames.clear();
+                player.control_linear_input = Vec3::ZERO;
+                player.control_angular_input = Vec3::ZERO;
+                player.boost = false;
+                player.dampeners = true;
+                player.jump = false;
+                player.control_expires_at_simulation_tick = self.simulation_tick;
+                player.suit_oxygen_milli = *suit_oxygen_milli;
+                player.helmet_closed = *helmet_closed;
+                player.jetpack_enabled = *jetpack_enabled;
+                player.life_state = PlayerLifeState::Alive;
                 self.active_contact_pairs
-                    .retain(|pair| !contact_key_involves_player(pair));
+                    .retain(|pair| !contact_key_involves_player_id(pair, actor_player_id));
             }
             EventPayload::VoxelMined {
                 coordinate,
@@ -1386,17 +2344,67 @@ impl WorldState {
                 ore_yield,
                 inventory_id,
             } => {
-                let removed = self.voxels.remove(*coordinate).ok_or_else(|| {
+                let actor_player_id = event
+                    .actor_player_id
+                    .as_deref()
+                    .expect("validated mining event has a human actor");
+                let actor = self
+                    .player
+                    .get(actor_player_id)
+                    .expect("validated mining actor is present");
+                if inventory_id != &actor.inventory_id {
+                    return Err(IntentError::rejected(
+                        "replay_mining_actor_inventory_invalid",
+                        "mined ore must be credited to the authenticated actor's carried inventory",
+                    ));
+                }
+                let canonical_material = self.voxels.material(*coordinate).ok_or_else(|| {
                     IntentError::rejected("replay_voxel_missing", "event target voxel is missing")
                 })?;
-                if removed != *material {
+                if canonical_material != *material {
                     return Err(IntentError::rejected(
                         "replay_material_mismatch",
                         "event material does not match voxel material",
                     ));
                 }
-                self.inventory_mut(inventory_id)?.contents.ore += ore_yield;
-                self.ledger.mined_ore += ore_yield;
+                self.ensure_voxel_tool_target(
+                    actor,
+                    *coordinate,
+                    "replay_mining_target_invalid",
+                    "mining event does not match the authenticated actor's closest visible tool target",
+                )?;
+                let canonical_ore_yield = content::voxel(canonical_material).ore_yield;
+                if *ore_yield != canonical_ore_yield {
+                    return Err(IntentError::rejected(
+                        "replay_mining_yield_invalid",
+                        "mining event yield does not match the canonical voxel material",
+                    ));
+                }
+                if !self
+                    .inventory(inventory_id)?
+                    .can_add(ResourceKind::Ore, canonical_ore_yield)
+                {
+                    return Err(IntentError::rejected(
+                        "replay_mining_inventory_capacity_invalid",
+                        "mining event exceeds the authenticated actor's carried inventory capacity",
+                    ));
+                }
+                if self.grids.values().any(|grid| {
+                    grid.anchored
+                        && grid.anchor_touches(&self.voxels)
+                        && !grid.anchor_touches_after_removal(&self.voxels, Some(*coordinate))
+                }) {
+                    return Err(IntentError::rejected(
+                        "replay_mining_anchor_support_invalid",
+                        "mining event would remove the final voxel support from an anchored grid",
+                    ));
+                }
+
+                self.voxels
+                    .remove(*coordinate)
+                    .expect("validated mining target remains present");
+                self.inventory_mut(inventory_id)?.contents.ore += canonical_ore_yield;
+                self.ledger.mined_ore += canonical_ore_yield;
                 let body_id =
                     voxel_collision_chunk_body_id(voxel_collision_chunk_coordinate(*coordinate));
                 let collider_id = voxel_collision_collider_id(*coordinate);
@@ -1409,6 +2417,10 @@ impl WorldState {
                 inventory_id,
                 batches,
             } => {
+                let actor_player_id = event
+                    .actor_player_id
+                    .as_deref()
+                    .expect("validated refining event has a human actor");
                 let recipe = &content::manifest().recipes.refining;
                 if *batches == 0 {
                     return Err(IntentError::rejected(
@@ -1422,22 +2434,60 @@ impl WorldState {
                         "refining event quantity overflowed",
                     )
                 })?;
+                let refined_output =
+                    batches.checked_mul(recipe.refined_output).ok_or_else(|| {
+                        IntentError::rejected(
+                            "replay_refining_quantity_invalid",
+                            "refining event output overflowed",
+                        )
+                    })?;
+                self.ensure_actor_owns_inventory(actor_player_id, inventory_id)?;
                 self.ensure_inventory_functional(inventory_id)?;
-                if self.inventory(inventory_id)?.contents.ore < ore_required {
+                let mut projected = self.inventory(inventory_id)?.clone();
+                if projected.contents.ore < ore_required {
                     return Err(IntentError::rejected(
                         "replay_refining_inventory_invalid",
                         "refining event exceeds the authoritative ore inventory",
                     ));
                 }
-                let inventory = self.inventory_mut(inventory_id)?;
-                inventory.contents.ore -= ore_required;
-                inventory.contents.refined_material += batches * recipe.refined_output;
-                self.ledger.refine_batches += batches;
+                projected.contents.ore -= ore_required;
+                projected.contents.refined_material = projected
+                    .contents
+                    .refined_material
+                    .checked_add(refined_output)
+                    .ok_or_else(|| {
+                        IntentError::rejected(
+                            "replay_refining_inventory_invalid",
+                            "refining event overflows the authoritative inventory",
+                        )
+                    })?;
+                if projected.used_liters() > projected.capacity_liters {
+                    return Err(IntentError::rejected(
+                        "replay_refining_inventory_invalid",
+                        "refining event exceeds authoritative inventory capacity",
+                    ));
+                }
+                let next_batches = self
+                    .ledger
+                    .refine_batches
+                    .checked_add(*batches)
+                    .ok_or_else(|| {
+                        IntentError::rejected(
+                            "replay_refining_ledger_invalid",
+                            "refining event overflows the canonical ledger",
+                        )
+                    })?;
+                self.inventory_mut(inventory_id)?.contents = projected.contents;
+                self.ledger.refine_batches = next_batches;
             }
             EventPayload::ComponentCrafted {
                 inventory_id,
                 quantity,
             } => {
+                let actor_player_id = event
+                    .actor_player_id
+                    .as_deref()
+                    .expect("validated crafting event has a human actor");
                 let recipe = &content::manifest().recipes.component_crafting;
                 if *quantity == 0 {
                     return Err(IntentError::rejected(
@@ -1452,17 +2502,53 @@ impl WorldState {
                             "crafting event quantity overflowed",
                         )
                     })?;
+                let component_output =
+                    quantity
+                        .checked_mul(recipe.component_output)
+                        .ok_or_else(|| {
+                            IntentError::rejected(
+                                "replay_crafting_quantity_invalid",
+                                "crafting event output overflowed",
+                            )
+                        })?;
+                self.ensure_actor_owns_inventory(actor_player_id, inventory_id)?;
                 self.ensure_inventory_functional(inventory_id)?;
-                if self.inventory(inventory_id)?.contents.refined_material < refined_required {
+                let mut projected = self.inventory(inventory_id)?.clone();
+                if projected.contents.refined_material < refined_required {
                     return Err(IntentError::rejected(
                         "replay_crafting_inventory_invalid",
                         "crafting event exceeds the authoritative refined inventory",
                     ));
                 }
-                let inventory = self.inventory_mut(inventory_id)?;
-                inventory.contents.refined_material -= refined_required;
-                inventory.contents.components += quantity * recipe.component_output;
-                self.ledger.crafted_components += quantity;
+                projected.contents.refined_material -= refined_required;
+                projected.contents.components = projected
+                    .contents
+                    .components
+                    .checked_add(component_output)
+                    .ok_or_else(|| {
+                        IntentError::rejected(
+                            "replay_crafting_inventory_invalid",
+                            "crafting event overflows the authoritative inventory",
+                        )
+                    })?;
+                if projected.used_liters() > projected.capacity_liters {
+                    return Err(IntentError::rejected(
+                        "replay_crafting_inventory_invalid",
+                        "crafting event exceeds authoritative inventory capacity",
+                    ));
+                }
+                let next_crafted = self
+                    .ledger
+                    .crafted_components
+                    .checked_add(*quantity)
+                    .ok_or_else(|| {
+                        IntentError::rejected(
+                            "replay_crafting_ledger_invalid",
+                            "crafting event overflows the canonical ledger",
+                        )
+                    })?;
+                self.inventory_mut(inventory_id)?.contents = projected.contents;
+                self.ledger.crafted_components = next_crafted;
             }
             EventPayload::InventoryTransferred {
                 source_inventory_id,
@@ -1470,12 +2556,18 @@ impl WorldState {
                 resource,
                 quantity,
             } => {
+                let actor_player_id = event
+                    .actor_player_id
+                    .as_deref()
+                    .expect("validated transfer event has a human actor");
                 if source_inventory_id == destination_inventory_id || *quantity == 0 {
                     return Err(IntentError::rejected(
                         "replay_inventory_transfer_invalid",
                         "inventory transfer must use distinct inventories and a positive quantity",
                     ));
                 }
+                self.ensure_actor_owns_inventory(actor_player_id, source_inventory_id)?;
+                self.ensure_actor_owns_inventory(actor_player_id, destination_inventory_id)?;
                 self.ensure_inventory_functional(source_inventory_id)?;
                 self.ensure_inventory_functional(destination_inventory_id)?;
                 if self
@@ -1492,18 +2584,32 @@ impl WorldState {
                         "inventory transfer exceeds authoritative contents or capacity",
                     ));
                 }
-                mutate_resource(
-                    &mut self.inventory_mut(source_inventory_id)?.contents,
-                    *resource,
-                    |amount| *amount -= quantity,
-                );
-                mutate_resource(
-                    &mut self.inventory_mut(destination_inventory_id)?.contents,
-                    *resource,
-                    |amount| *amount += quantity,
-                );
+                let mut source_contents = self.inventory(source_inventory_id)?.contents.clone();
+                let mut destination_contents =
+                    self.inventory(destination_inventory_id)?.contents.clone();
+                mutate_resource(&mut source_contents, *resource, |amount| {
+                    *amount -= quantity;
+                });
+                let destination_amount = destination_contents
+                    .amount(*resource)
+                    .checked_add(*quantity)
+                    .ok_or_else(|| {
+                        IntentError::rejected(
+                            "replay_inventory_transfer_invalid",
+                            "inventory transfer overflows the destination quantity",
+                        )
+                    })?;
+                mutate_resource(&mut destination_contents, *resource, |amount| {
+                    *amount = destination_amount;
+                });
+                self.inventory_mut(source_inventory_id)?.contents = source_contents;
+                self.inventory_mut(destination_inventory_id)?.contents = destination_contents;
             }
-            EventPayload::BlockBuilt { grid_id, block } => {
+            EventPayload::BlockBuilt {
+                grid_id,
+                component_inventory_id,
+                block,
+            } => {
                 let definition = content::block(block.kind);
                 let expected_block_id = format!("block-{}", event.event_sequence);
                 let expected_inventory_id = (block.kind == BlockKind::Cargo)
@@ -1535,6 +2641,22 @@ impl WorldState {
                     ));
                 }
                 let grid = self.grid(grid_id)?;
+                let actor_player_id = event
+                    .actor_player_id
+                    .as_deref()
+                    .expect("validated construction event has a human actor");
+                let actor = self
+                    .player
+                    .get(actor_player_id)
+                    .expect("validated construction actor is present");
+                self.ensure_actor_owns_grid(actor_player_id, grid_id)?;
+                if component_inventory_id != &actor.inventory_id {
+                    return Err(IntentError::rejected(
+                        "replay_construction_inventory_invalid",
+                        "construction must debit the authenticated actor's carried inventory",
+                    ));
+                }
+                self.ensure_actor_owns_inventory(actor_player_id, component_inventory_id)?;
                 if grid.blocks.len() >= MAX_GRID_BLOCKS_P0
                     || grid.block_at(block.coordinate).is_some()
                     || (!grid.blocks.is_empty()
@@ -1547,10 +2669,12 @@ impl WorldState {
                         "placed frame exceeds the grid budget or is not at a free face-connected coordinate",
                     ));
                 }
-                self.ensure_hand_tool_range(
-                    grid,
+                self.ensure_build_tool_target(
+                    actor,
+                    grid_id,
                     block.coordinate,
-                    "replay_construction_out_of_range",
+                    "replay_construction_target_invalid",
+                    "construction event is not on the exact closest visible face targeted by its authenticated actor",
                 )?;
                 if self.player_intersects_grid_coordinate(grid, block.coordinate) {
                     return Err(IntentError::rejected(
@@ -1558,14 +2682,17 @@ impl WorldState {
                         "placed frame intersects the authoritative player collider",
                     ));
                 }
-                if self.inventory(PLAYER_INVENTORY_ID)?.contents.components < block.component_cost {
+                if self.inventory(component_inventory_id)?.contents.components
+                    < block.component_cost
+                {
                     return Err(IntentError::rejected(
                         "replay_construction_components_invalid",
                         "placed frame exceeds the authoritative component inventory",
                     ));
                 }
-                self.inventory_mut(PLAYER_INVENTORY_ID)?.contents.components -=
-                    block.component_cost;
+                self.inventory_mut(component_inventory_id)?
+                    .contents
+                    .components -= block.component_cost;
                 if let Some(inventory_id) = &block.inventory_id {
                     self.inventories.insert(
                         inventory_id.clone(),
@@ -1592,6 +2719,26 @@ impl WorldState {
                 max_health,
                 completed_construction,
             } => {
+                let actor_player_id = event
+                    .actor_player_id
+                    .as_deref()
+                    .expect("validated weld event has a human actor");
+                let actor = self
+                    .player
+                    .get(actor_player_id)
+                    .expect("validated weld actor is present");
+                self.ensure_actor_owns_grid(actor_player_id, grid_id)?;
+                let grid = self.grid(grid_id)?;
+                let _targeted_block = grid.blocks.get(block_id).ok_or_else(|| {
+                    IntentError::rejected("replay_block_missing", "weld target is missing")
+                })?;
+                self.ensure_block_tool_target(
+                    actor,
+                    grid_id,
+                    block_id,
+                    "replay_weld_target_invalid",
+                    "weld event does not match the authenticated actor's closest visible tool target",
+                )?;
                 let block = self
                     .grid_mut(grid_id)?
                     .blocks
@@ -1637,15 +2784,56 @@ impl WorldState {
                 angular_input,
                 dampeners,
             } => {
+                let actor_player_id = event
+                    .actor_player_id
+                    .as_deref()
+                    .expect("validated grid control event has a human actor");
+                self.ensure_actor_owns_grid(actor_player_id, grid_id)?;
+                ensure_finite(*linear_input, "replayed grid linear control")?;
+                ensure_finite(*angular_input, "replayed grid angular control")?;
+                let grid = self.grid(grid_id)?;
+                if grid.anchored
+                    || !grid.power().online
+                    || linear_input.magnitude() > MAX_GRID_CONTROL_INPUT + CONTROL_INPUT_EPSILON
+                    || angular_input.magnitude() > MAX_GRID_CONTROL_INPUT + CONTROL_INPUT_EPSILON
+                {
+                    return Err(IntentError::rejected(
+                        "replay_grid_control_invalid",
+                        "grid control requires an owned, powered, released grid and normalized finite inputs",
+                    ));
+                }
                 let grid = self.grid_mut(grid_id)?;
                 grid.control_linear_input = *linear_input;
                 grid.control_angular_input = *angular_input;
                 grid.dampeners = *dampeners;
             }
-            EventPayload::GridAnchorSet { grid_id, anchored } => {
+            EventPayload::GridAnchorSet {
+                grid_id,
+                anchored,
+                reward_credited,
+            } => {
+                let actor_player_id = event
+                    .actor_player_id
+                    .as_deref()
+                    .expect("validated anchor event has a human actor");
+                self.ensure_actor_owns_grid(actor_player_id, grid_id)?;
+                let grid = self.grid(grid_id)?;
+                let expected_reward = *anchored && grid.anchor_reward_eligible;
+                if *anchored == grid.anchored
+                    || (*anchored && (!grid.power().online || !grid.anchor_touches(&self.voxels)))
+                    || *reward_credited != expected_reward
+                {
+                    return Err(IntentError::rejected(
+                        "replay_grid_anchor_invalid",
+                        "anchor event must be an authorized toggle with canonical power, contact, and reward state",
+                    ));
+                }
                 let grid = self.grid_mut(grid_id)?;
                 grid.anchored = *anchored;
                 if *anchored {
+                    if *reward_credited {
+                        grid.anchor_reward_eligible = false;
+                    }
                     grid.linear_velocity = Vec3::ZERO;
                     grid.angular_velocity = Vec3::ZERO;
                     grid.control_linear_input = Vec3::ZERO;
@@ -1656,13 +2844,40 @@ impl WorldState {
                 grid_id,
                 block_id,
                 damage,
-            } => self.apply_damage(grid_id, block_id, *damage, event.event_sequence)?,
+            } => {
+                let actor_player_id = event
+                    .actor_player_id
+                    .as_deref()
+                    .expect("validated damage event has a human actor");
+                let actor = self
+                    .player
+                    .get(actor_player_id)
+                    .expect("validated damage actor is present");
+                if *damage != 35 {
+                    return Err(IntentError::rejected(
+                        "replay_damage_amount_invalid",
+                        "hand-tool damage must match the canonical amount",
+                    ));
+                }
+                let grid = self.grid(grid_id)?;
+                let _block = grid.blocks.get(block_id).ok_or_else(|| {
+                    IntentError::rejected("replay_block_missing", "damage target is missing")
+                })?;
+                self.ensure_block_tool_target(
+                    actor,
+                    grid_id,
+                    block_id,
+                    "replay_damage_target_invalid",
+                    "damage event does not match the authenticated actor's closest visible tool target",
+                )?;
+                self.apply_damage(grid_id, block_id, *damage, event.event_sequence)?;
+            }
             EventPayload::PhysicsStepCommitted {
                 fixed_step_hz,
                 step_count,
                 remaining_step_phase,
                 bodies,
-                player,
+                players,
                 contacts,
                 active_contacts_after,
             } => {
@@ -1684,29 +2899,52 @@ impl WorldState {
                     ));
                 }
                 let physics_limits = physics_scene_config();
-                let player_alive = matches!(self.player.life_state, PlayerLifeState::Alive);
-                if player.is_some() != player_alive {
+                let living_player_count = self
+                    .player
+                    .iter()
+                    .filter(|(_, player)| matches!(player.life_state, PlayerLifeState::Alive))
+                    .count();
+                if players.len() != living_player_count {
                     return Err(IntentError::rejected(
                         "replay_player_physics_presence_invalid",
-                        "physics outcome must contain the player exactly while alive",
+                        "physics outcome must contain every living player exactly once",
                     ));
                 }
-                let mut scheduled_player = self.player.clone();
-                if player_alive {
+                let mut scheduled_players = self.player.by_id.clone();
+                for scheduled_player in scheduled_players
+                    .values_mut()
+                    .filter(|player| matches!(player.life_state, PlayerLifeState::Alive))
+                {
                     for substep_index in 0..u64::from(*step_count) {
                         advance_player_control_for_substep(
-                            &mut scheduled_player,
+                            scheduled_player,
                             self.simulation_tick.saturating_add(substep_index),
                         );
                     }
                 }
-                if let Some(player) = player {
-                    if player.player_id != self.player.player_id {
+                let mut seen_players = BTreeSet::new();
+                for player in players {
+                    if !seen_players.insert(player.player_id.as_str()) {
                         return Err(IntentError::rejected(
-                            "replay_player_physics_identity_invalid",
-                            "physics outcome identifies the wrong player",
+                            "replay_player_physics_duplicate",
+                            "physics outcome contains a duplicate player",
                         ));
                     }
+                    let Some(prior_player) = self.player.get(&player.player_id) else {
+                        return Err(IntentError::rejected(
+                            "replay_player_physics_identity_invalid",
+                            "physics outcome identifies a player outside this cell",
+                        ));
+                    };
+                    if !matches!(prior_player.life_state, PlayerLifeState::Alive) {
+                        return Err(IntentError::rejected(
+                            "replay_player_physics_presence_invalid",
+                            "physics outcome cannot contain an incapacitated player",
+                        ));
+                    }
+                    let scheduled_player = scheduled_players
+                        .get(&player.player_id)
+                        .expect("validated player is present in the scheduled roster");
                     ensure_finite(player.position, "replayed player position")?;
                     ensure_finite(player.linear_velocity, "replayed player velocity")?;
                     ensure_finite(player.angular_velocity, "replayed player angular velocity")?;
@@ -1739,7 +2977,7 @@ impl WorldState {
                         ));
                     }
                     ensure_player_motion_continuity(
-                        &self.player,
+                        prior_player,
                         player,
                         *step_count,
                         &physics_limits,
@@ -1748,7 +2986,7 @@ impl WorldState {
                         self.simulation_tick.saturating_add(u64::from(*step_count));
                     validate_player_locomotion_outcome(
                         self,
-                        &scheduled_player,
+                        scheduled_player,
                         player,
                         resulting_tick,
                     )?;
@@ -1777,6 +3015,21 @@ impl WorldState {
                             "player physics control and lease outcome is not canonical",
                         ));
                     }
+                }
+                let canonical_player_ids = self
+                    .player
+                    .iter()
+                    .filter(|(_, player)| matches!(player.life_state, PlayerLifeState::Alive))
+                    .map(|(player_id, _)| player_id.as_str());
+                if !players
+                    .iter()
+                    .map(|player| player.player_id.as_str())
+                    .eq(canonical_player_ids)
+                {
+                    return Err(IntentError::rejected(
+                        "replay_player_physics_order_invalid",
+                        "physics player outcomes must use canonical player-ID order",
+                    ));
                 }
                 let mut seen = BTreeSet::new();
                 for body in bodies {
@@ -1851,6 +3104,15 @@ impl WorldState {
                         )?;
                     }
                 }
+                if bodies
+                    .windows(2)
+                    .any(|pair| pair[0].grid_id.as_str() >= pair[1].grid_id.as_str())
+                {
+                    return Err(IntentError::rejected(
+                        "replay_physics_body_order_invalid",
+                        "physics grid outcomes must use canonical grid-ID order",
+                    ));
+                }
                 let mut contacts_by_substep = vec![Vec::new(); usize::from(*step_count)];
                 for contact in contacts {
                     if contact.substep_index >= *step_count {
@@ -1903,12 +3165,26 @@ impl WorldState {
                             "physics contact reduced translational mass does not match canonical content",
                         ));
                     }
-                    if contact_key_involves_player(&key) {
-                        let player = player
-                            .as_ref()
+                    let left_player = player_for_body_id(self, &key.body_a);
+                    let right_player = player_for_body_id(self, &key.body_b);
+                    if left_player.is_some() && right_player.is_some() {
+                        return Err(IntentError::rejected(
+                            "replay_character_contact_forbidden",
+                            "character collision layers do not produce character-to-character contacts",
+                        ));
+                    }
+                    if let Some(contact_player_id) = player_id_for_contact(self, &key) {
+                        let player = players
+                            .iter()
+                            .find(|player| player.player_id == contact_player_id)
                             .expect("validated living player outcome exists for a player contact");
+                        let prior_player = self
+                            .player
+                            .get(contact_player_id)
+                            .expect("contact player is present in the canonical roster");
                         if !self.player_contact_is_spatially_plausible(
                             contact,
+                            prior_player,
                             player,
                             bodies,
                             *step_count,
@@ -1921,6 +3197,26 @@ impl WorldState {
                         }
                     }
                     contacts_by_substep[usize::from(contact.substep_index)].push((key, contact));
+                }
+                if contacts.windows(2).any(|pair| {
+                    (
+                        pair[0].substep_index,
+                        pair[0].body_a_id.as_str(),
+                        pair[0].collider_a_id.as_str(),
+                        pair[0].body_b_id.as_str(),
+                        pair[0].collider_b_id.as_str(),
+                    ) >= (
+                        pair[1].substep_index,
+                        pair[1].body_a_id.as_str(),
+                        pair[1].collider_a_id.as_str(),
+                        pair[1].body_b_id.as_str(),
+                        pair[1].collider_b_id.as_str(),
+                    )
+                }) {
+                    return Err(IntentError::rejected(
+                        "replay_physics_contact_order_invalid",
+                        "physics contacts must use canonical substep and collider-pair order",
+                    ));
                 }
                 let mut active = self.active_contact_pairs.clone();
                 for substep in contacts_by_substep {
@@ -1954,8 +3250,10 @@ impl WorldState {
                         "physics active-contact outcome does not match the final substep",
                     ));
                 }
-                if let Some(player) = player {
-                    let expected_surface_contact = active.iter().any(contact_key_involves_player)
+                for player in players {
+                    let expected_surface_contact = active
+                        .iter()
+                        .any(|contact| contact_key_involves_player_id(contact, &player.player_id))
                         || player.locomotion.support.is_some();
                     if player.surface_contact != expected_surface_contact {
                         return Err(IntentError::rejected(
@@ -1974,22 +3272,30 @@ impl WorldState {
                     grid.linear_velocity = body.linear_velocity;
                     grid.angular_velocity = body.angular_velocity;
                 }
-                if let Some(player) = player {
-                    self.player.position = player.position;
-                    self.player.orientation = player.orientation;
-                    self.player.linear_velocity = player.linear_velocity;
-                    self.player.angular_velocity = player.angular_velocity;
-                    self.player.surface_contact = player.surface_contact;
-                    self.player.locomotion = player.locomotion.clone();
-                    self.player.last_processed_input_sequence =
+                for player in players {
+                    let scheduled_player = scheduled_players
+                        .remove(&player.player_id)
+                        .expect("validated physics outcome has scheduled state");
+                    let canonical_player = self
+                        .player
+                        .get_mut(&player.player_id)
+                        .expect("validated physics outcome has canonical state");
+                    canonical_player.position = player.position;
+                    canonical_player.orientation = player.orientation;
+                    canonical_player.linear_velocity = player.linear_velocity;
+                    canonical_player.angular_velocity = player.angular_velocity;
+                    canonical_player.surface_contact = player.surface_contact;
+                    canonical_player.locomotion = player.locomotion.clone();
+                    canonical_player.last_processed_input_sequence =
                         scheduled_player.last_processed_input_sequence;
-                    self.player.pending_control_frames = scheduled_player.pending_control_frames;
-                    self.player.control_linear_input = player.control_linear_input;
-                    self.player.control_angular_input = player.control_angular_input;
-                    self.player.boost = player.boost;
-                    self.player.dampeners = player.dampeners;
-                    self.player.jump = player.jump;
-                    self.player.control_expires_at_simulation_tick =
+                    canonical_player.pending_control_frames =
+                        scheduled_player.pending_control_frames;
+                    canonical_player.control_linear_input = player.control_linear_input;
+                    canonical_player.control_angular_input = player.control_angular_input;
+                    canonical_player.boost = player.boost;
+                    canonical_player.dampeners = player.dampeners;
+                    canonical_player.jump = player.jump;
+                    canonical_player.control_expires_at_simulation_tick =
                         player.control_expires_at_simulation_tick;
                 }
                 self.active_contact_pairs = active;
@@ -1998,24 +3304,76 @@ impl WorldState {
             }
         }
 
-        self.player.experience = self
-            .player
-            .experience
-            .saturating_add(event.payload.experience_reward());
+        let experience_reward = event.payload.experience_reward();
+        if experience_reward > 0 {
+            let actor_player_id = event
+                .actor_player_id
+                .as_deref()
+                .expect("reward-bearing events have a validated human actor");
+            let actor = self
+                .player
+                .get_mut(actor_player_id)
+                .expect("validated reward actor is present");
+            actor.experience = actor.experience.saturating_add(experience_reward);
+        }
         match &event.payload {
-            EventPayload::VoxelMined { .. } => self.player.career.voxels_mined += 1,
+            EventPayload::VoxelMined { .. } => {
+                let actor_player_id = event
+                    .actor_player_id
+                    .as_deref()
+                    .expect("validated mining event has a human actor");
+                self.player
+                    .get_mut(actor_player_id)
+                    .expect("validated mining actor is present")
+                    .career
+                    .voxels_mined += 1;
+            }
             EventPayload::OreRefined { batches, .. } => {
-                self.player.career.refining_batches += batches;
+                let actor_player_id = event
+                    .actor_player_id
+                    .as_deref()
+                    .expect("validated refining event has a human actor");
+                self.player
+                    .get_mut(actor_player_id)
+                    .expect("validated refining actor is present")
+                    .career
+                    .refining_batches += batches;
             }
             EventPayload::ComponentCrafted { quantity, .. } => {
-                self.player.career.components_crafted += quantity;
+                let actor_player_id = event
+                    .actor_player_id
+                    .as_deref()
+                    .expect("validated crafting event has a human actor");
+                self.player
+                    .get_mut(actor_player_id)
+                    .expect("validated crafting actor is present")
+                    .career
+                    .components_crafted += quantity;
             }
             EventPayload::BlockWelded {
                 completed_construction: true,
                 ..
-            } => self.player.career.blocks_built += 1,
+            } => {
+                let actor_player_id = event
+                    .actor_player_id
+                    .as_deref()
+                    .expect("validated weld event has a human actor");
+                self.player
+                    .get_mut(actor_player_id)
+                    .expect("validated weld actor is present")
+                    .career
+                    .blocks_built += 1;
+            }
             EventPayload::GridAnchorSet { anchored: true, .. } => {
-                self.player.career.anchors_engaged += 1;
+                let actor_player_id = event
+                    .actor_player_id
+                    .as_deref()
+                    .expect("validated anchor event has a human actor");
+                self.player
+                    .get_mut(actor_player_id)
+                    .expect("validated anchor actor is present")
+                    .career
+                    .anchors_engaged += 1;
             }
             EventPayload::PlayerControlSet { .. }
             | EventPayload::SuitModeChanged { .. }
@@ -2035,17 +3393,35 @@ impl WorldState {
 
         self.event_sequence = event.event_sequence;
         self.last_event_hash.clone_from(&event.event_hash);
-        if let Some(operation_id) = &event.operation_id {
+        if let (
+            Some(actor_player_id),
+            Some(operation_id),
+            Some(operation_sequence),
+            Some(intent_fingerprint),
+        ) = (
+            &event.actor_player_id,
+            &event.operation_id,
+            event.operation_sequence,
+            &event.intent_fingerprint,
+        ) {
             let (code, message) = event.payload.receipt();
-            self.processed_operations.insert(
-                operation_id.clone(),
-                IntentReceipt {
+            self.record_processed_operation(
+                actor_player_id,
+                ProcessedOperationRecord {
                     operation_id: operation_id.clone(),
-                    event_sequence: event.event_sequence,
-                    code: code.into(),
-                    message,
+                    intent_fingerprint: intent_fingerprint.clone(),
+                    receipt: IntentReceipt {
+                        operation_sequence,
+                        operation_id: operation_id.clone(),
+                        event_sequence: event.event_sequence,
+                        code: code.into(),
+                        message,
+                    },
                 },
-            );
+            )
+            .map_err(|message| {
+                IntentError::rejected("replay_operation_history_invalid", message)
+            })?;
         }
 
         if !self.conservation().valid {
@@ -2063,6 +3439,7 @@ impl WorldState {
         damage: u16,
         event_sequence: u64,
     ) -> Result<(), IntentError> {
+        let grid_owner_player_id = self.grid(grid_id)?.owner_player_id.clone();
         let removed = {
             let grid = self.grid_mut(grid_id)?;
             let block = grid.blocks.get_mut(block_id).ok_or_else(|| {
@@ -2086,6 +3463,7 @@ impl WorldState {
         {
             inventory.domain = InventoryDomain::Dropped {
                 reason: "cargo_block_destroyed".into(),
+                owner_player_id: grid_owner_player_id,
             };
         }
         self.split_disconnected_grid(grid_id, event_sequence)?;
@@ -2097,10 +3475,11 @@ impl WorldState {
         grid_id: &str,
         event_sequence: u64,
     ) -> Result<(), IntentError> {
-        let original = self.grids.remove(grid_id).ok_or_else(|| {
+        let original = self.grids.get(grid_id).cloned().ok_or_else(|| {
             IntentError::rejected("replay_grid_missing", "grid split target is missing")
         })?;
         if original.blocks.is_empty() {
+            self.grids.remove(grid_id);
             return Ok(());
         }
 
@@ -2138,12 +3517,33 @@ impl WorldState {
             })
             .unwrap_or(0);
 
+        let split_grid_ids = components
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                if index == primary_index {
+                    original.grid_id.clone()
+                } else {
+                    format!("{}-split-{event_sequence}-{index}", original.grid_id)
+                }
+            })
+            .collect::<Vec<_>>();
+        if split_grid_ids
+            .iter()
+            .enumerate()
+            .any(|(index, split_id)| index != primary_index && self.grids.contains_key(split_id))
+        {
+            return Err(IntentError::rejected(
+                "replay_grid_split_identity_duplicate",
+                "deterministic grid split identity is already in use",
+            ));
+        }
+
+        let did_split = components.len() > 1;
+        self.grids.remove(grid_id);
+
         for (index, component) in components.into_iter().enumerate() {
-            let new_grid_id = if index == primary_index {
-                original.grid_id.clone()
-            } else {
-                format!("{}-split-{event_sequence}-{index}", original.grid_id)
-            };
+            let new_grid_id = split_grid_ids[index].clone();
             let blocks = component
                 .iter()
                 .map(|coordinate| {
@@ -2153,13 +3553,23 @@ impl WorldState {
                 .collect();
             let mut grid = Grid {
                 grid_id: new_grid_id.clone(),
+                owner_player_id: original.owner_player_id.clone(),
+                anchor_reward_eligible: original.anchor_reward_eligible && index == primary_index,
                 position: original.position,
                 orientation: original.orientation,
                 linear_velocity: original.linear_velocity,
                 angular_velocity: original.angular_velocity,
-                control_linear_input: original.control_linear_input,
-                control_angular_input: original.control_angular_input,
-                dampeners: original.dampeners,
+                control_linear_input: if did_split {
+                    Vec3::ZERO
+                } else {
+                    original.control_linear_input
+                },
+                control_angular_input: if did_split {
+                    Vec3::ZERO
+                } else {
+                    original.control_angular_input
+                },
+                dampeners: original.dampeners || did_split,
                 anchored: original.anchored,
                 blocks,
             };
@@ -2170,9 +3580,9 @@ impl WorldState {
     }
 
     fn physics_collider_exists(&self, body_id: &str, collider_id: &str) -> bool {
-        if body_id == PLAYER_BODY_ID {
-            return matches!(self.player.life_state, PlayerLifeState::Alive)
-                && collider_id == PLAYER_COLLIDER_ID;
+        if let Some(player) = player_for_body_id(self, body_id) {
+            return matches!(player.life_state, PlayerLifeState::Alive)
+                && collider_id == player_collider_id(&player.player_id);
         }
         if body_id == PLANET_BODY_ID {
             return collider_id == PLANET_COLLIDER_ID;
@@ -2227,6 +3637,53 @@ impl WorldState {
         }
     }
 
+    /// Resolve inventory authority from canonical ownership rather than from
+    /// client-selected IDs. Carried inventory belongs to its linked player;
+    /// cargo inherits the owner of the one grid containing its live block.
+    /// Dropped inventory deliberately has no generic-use authority.
+    fn ensure_actor_owns_inventory(
+        &self,
+        actor_player_id: &str,
+        inventory_id: &str,
+    ) -> Result<(), IntentError> {
+        let inventory = self.inventory(inventory_id)?;
+        if matches!(inventory.domain, InventoryDomain::Dropped { .. }) {
+            return Err(IntentError::rejected(
+                "dropped_inventory_sealed",
+                "dropped inventory requires an explicit recovery or salvage action",
+            ));
+        }
+        let owner_player_id = self
+            .inventory_owner_player_id(inventory_id)
+            .map_err(|message| IntentError::rejected("inventory_authority_invalid", message))?;
+        if owner_player_id != actor_player_id {
+            return Err(IntentError::rejected(
+                "inventory_access_denied",
+                "the authenticated player cannot access the selected inventory",
+            ));
+        }
+        match &inventory.domain {
+            InventoryDomain::Player { player_id } => {
+                let actor = self.player.get(actor_player_id).ok_or_else(|| {
+                    IntentError::rejected(
+                        "actor_not_present",
+                        "the authenticated inventory actor is not present",
+                    )
+                })?;
+                if player_id == actor_player_id && actor.inventory_id == inventory_id {
+                    Ok(())
+                } else {
+                    Err(IntentError::rejected(
+                        "inventory_access_denied",
+                        "the authenticated player cannot access the selected carried inventory",
+                    ))
+                }
+            }
+            InventoryDomain::Cargo { .. } => Ok(()),
+            InventoryDomain::Dropped { .. } => unreachable!("dropped inventories reject above"),
+        }
+    }
+
     fn inventory_mut(&mut self, inventory_id: &str) -> Result<&mut InventoryRecord, IntentError> {
         self.inventories.get_mut(inventory_id).ok_or_else(|| {
             IntentError::rejected(
@@ -2242,27 +3699,107 @@ impl WorldState {
         })
     }
 
+    fn ensure_actor_owns_grid(
+        &self,
+        actor_player_id: &str,
+        grid_id: &str,
+    ) -> Result<(), IntentError> {
+        if self.grid(grid_id)?.owner_player_id == actor_player_id {
+            Ok(())
+        } else {
+            Err(IntentError::rejected(
+                "grid_access_denied",
+                "the authenticated player cannot perform this action on the selected grid",
+            ))
+        }
+    }
+
     fn grid_mut(&mut self, grid_id: &str) -> Result<&mut Grid, IntentError> {
         self.grids.get_mut(grid_id).ok_or_else(|| {
             IntentError::rejected("grid_missing", format!("grid {grid_id} does not exist"))
         })
     }
 
-    fn ensure_hand_tool_range(
+    fn ensure_voxel_tool_target(
         &self,
-        grid: &Grid,
-        coordinate: verse_protocol::IVec3,
+        actor: &Player,
+        coordinate: IVec3,
         code: &str,
+        message: &str,
     ) -> Result<(), IntentError> {
-        let world = grid.world_coordinate(coordinate);
-        let position = Vec3::new(f64::from(world.x), f64::from(world.y), f64::from(world.z));
-        if self.player.position.squared_distance(position) > HAND_TOOL_RANGE * HAND_TOOL_RANGE {
-            return Err(IntentError::rejected(
-                code,
-                "the targeted block coordinate is beyond the hand-tool range",
-            ));
+        let hit = closest_tool_hit(actor, &self.voxels, &self.grids);
+        if matches!(
+            hit,
+            Some(ref hit)
+                if hit.local_face.is_some()
+                    && hit.target == ToolTarget::Voxel { coordinate }
+        ) {
+            Ok(())
+        } else {
+            Err(IntentError::rejected(code, message))
         }
-        Ok(())
+    }
+
+    fn ensure_block_tool_target(
+        &self,
+        actor: &Player,
+        grid_id: &str,
+        block_id: &str,
+        code: &str,
+        message: &str,
+    ) -> Result<(), IntentError> {
+        let hit = closest_tool_hit(actor, &self.voxels, &self.grids);
+        if matches!(
+            hit,
+            Some(ref hit)
+                if hit.local_face.is_some()
+                    && matches!(
+                        &hit.target,
+                        ToolTarget::Block {
+                            grid_id: targeted_grid_id,
+                            block_id: targeted_block_id,
+                            ..
+                        } if targeted_grid_id == grid_id && targeted_block_id == block_id
+                    )
+        ) {
+            Ok(())
+        } else {
+            Err(IntentError::rejected(code, message))
+        }
+    }
+
+    fn ensure_build_tool_target(
+        &self,
+        actor: &Player,
+        grid_id: &str,
+        coordinate: IVec3,
+        code: &str,
+        message: &str,
+    ) -> Result<(), IntentError> {
+        let Some(hit) = closest_tool_hit(actor, &self.voxels, &self.grids) else {
+            return Err(IntentError::rejected(code, message));
+        };
+        let Some(face) = hit.local_face else {
+            return Err(IntentError::rejected(code, message));
+        };
+        let ToolTarget::Block {
+            grid_id: targeted_grid_id,
+            coordinate: targeted_coordinate,
+            ..
+        } = hit.target
+        else {
+            return Err(IntentError::rejected(code, message));
+        };
+        let expected = IVec3::new(
+            targeted_coordinate.x.saturating_add(face.x),
+            targeted_coordinate.y.saturating_add(face.y),
+            targeted_coordinate.z.saturating_add(face.z),
+        );
+        if targeted_grid_id == grid_id && expected == coordinate {
+            Ok(())
+        } else {
+            Err(IntentError::rejected(code, message))
+        }
     }
 
     fn player_intersects_voxel(&self, position: Vec3, orientation: Quat) -> bool {
@@ -2316,11 +3853,16 @@ impl WorldState {
     }
 
     fn player_intersects_grid_coordinate(&self, grid: &Grid, coordinate: IVec3) -> bool {
-        let relative = self.player.position - grid.position;
-        let local_player = grid.orientation.conjugate().rotate(relative);
-        let world_axis = self.player.orientation.rotate(Vec3::new(0.0, 1.0, 0.0));
-        let local_axis = grid.orientation.conjugate().rotate(world_axis);
-        capsule_axis_intersects_unit_cube(local_player, local_axis, coordinate)
+        self.player.iter().any(|(_, player)| {
+            if !matches!(player.life_state, PlayerLifeState::Alive) {
+                return false;
+            }
+            let relative = player.position - grid.position;
+            let local_player = grid.orientation.conjugate().rotate(relative);
+            let world_axis = player.orientation.rotate(Vec3::new(0.0, 1.0, 0.0));
+            let local_axis = grid.orientation.conjugate().rotate(world_axis);
+            capsule_axis_intersects_unit_cube(local_player, local_axis, coordinate)
+        })
     }
 
     fn player_movement_hits_grid(&self, start: Vec3, end: Vec3, orientation: Quat) -> bool {
@@ -2332,6 +3874,7 @@ impl WorldState {
     fn player_contact_is_spatially_plausible(
         &self,
         contact: &PhysicsContactOutcome,
+        prior_player: &Player,
         player: &PlayerPhysicsOutcome,
         bodies: &[PhysicsBodyOutcome],
         step_count: u8,
@@ -2349,8 +3892,8 @@ impl WorldState {
         let capsule_half_height = character_capsule_half_height();
         if point_capsule_axis_distance(
             contact.point,
-            self.player.position,
-            self.player.orientation,
+            prior_player.position,
+            prior_player.orientation,
             capsule_half_height,
         ) > completed_steps * per_step_reach + radius + surface_slack
         {
@@ -2367,14 +3910,15 @@ impl WorldState {
             return false;
         }
 
-        let (other_body, other_collider) = if contact.body_a_id == PLAYER_BODY_ID {
+        let player_body_id = player_body_id(&prior_player.player_id);
+        let (other_body, other_collider) = if contact.body_a_id == player_body_id {
             (&contact.body_b_id, &contact.collider_b_id)
-        } else if contact.body_b_id == PLAYER_BODY_ID {
+        } else if contact.body_b_id == player_body_id {
             (&contact.body_a_id, &contact.collider_a_id)
         } else {
             return false;
         };
-        if other_body == PLAYER_BODY_ID {
+        if player_for_body_id(self, other_body).is_some() {
             return false;
         }
         if other_body == PLANET_BODY_ID {
@@ -2557,7 +4101,7 @@ fn validate_player_locomotion_outcome(
     if let Some(support) = &locomotion.support {
         ensure_finite(support.local_anchor, "replayed support anchor")?;
         ensure_finite(support.local_normal, "replayed support normal")?;
-        if support.body_id == PLAYER_BODY_ID
+        if player_for_body_id(state, &support.body_id).is_some()
             || !state.physics_collider_exists(&support.body_id, &support.collider_id)
             || (support.local_normal.magnitude() - 1.0).abs() > 1.0e-5
             || support.local_anchor.magnitude() > 1.0e7
@@ -2965,32 +4509,37 @@ fn physics_body_specs(state: &WorldState) -> Vec<BodySpec> {
     planet.friction = physics.friction;
     planet.restitution = physics.restitution;
     bodies.push(planet);
-    if matches!(state.player.life_state, PlayerLifeState::Alive) {
+    for (_, canonical_player) in state
+        .player
+        .iter()
+        .filter(|(_, player)| matches!(player.life_state, PlayerLifeState::Alive))
+    {
         let character = &content::manifest().character;
         let radius = character.collision_radius_m;
         let half_height_of_cylinder = (character.standing_height_m - 2.0 * radius) * 0.5;
         let volume = std::f64::consts::PI * radius.powi(2) * (2.0 * half_height_of_cylinder)
             + 4.0 / 3.0 * std::f64::consts::PI * radius.powi(3);
         let mut player = BodySpec::dynamic(
-            PLAYER_BODY_ID,
+            player_body_id(&canonical_player.player_id),
             PhysicsPose::new(
-                to_physics_vec3(state.player.position),
-                to_physics_quat(state.player.orientation),
+                to_physics_vec3(canonical_player.position),
+                to_physics_quat(canonical_player.orientation),
             ),
             Vec::new(),
         );
         player.capsule_colliders.push(CapsuleColliderSpec {
-            collider_id: PLAYER_COLLIDER_ID.into(),
+            collider_id: player_collider_id(&canonical_player.player_id),
             local_pose: PhysicsPose::IDENTITY,
             radius: radius as f32,
             half_height_of_cylinder: half_height_of_cylinder as f32,
             density_kg_per_m3: (character.mass_kg / volume) as f32,
         });
-        player.linear_velocity = to_physics_vec3(state.player.linear_velocity);
-        player.angular_velocity = to_physics_vec3(state.player.angular_velocity);
+        player.linear_velocity = to_physics_vec3(canonical_player.linear_velocity);
+        player.angular_velocity = to_physics_vec3(canonical_player.angular_velocity);
         player.friction = physics.friction;
         player.restitution = physics.restitution;
         player.allow_sleeping = false;
+        player.collision_class = BodyCollisionClass::Character;
         player.inertia_multiplier = CHARACTER_INERTIA_MULTIPLIER as f32;
         player.motion_quality = MotionQuality::LinearCast;
         bodies.push(player);
@@ -3118,9 +4667,10 @@ fn classify_player_locomotion_for_substep(
     if !matches!(player.life_state, PlayerLifeState::Alive) {
         return Ok(None);
     }
+    let player_body_id = player_body_id(&player.player_id);
     let Some(body) = body_states
         .iter()
-        .find(|body| body.body_id == PLAYER_BODY_ID)
+        .find(|body| body.body_id == player_body_id)
     else {
         return Ok(None);
     };
@@ -3167,7 +4717,8 @@ fn classify_player_locomotion_for_substep(
         radius: character.collision_radius_m as f32,
         half_height_of_cylinder: character_capsule_half_height() as f32,
         displacement: to_physics_vec3(probe_up * -probe_distance),
-        ignore_body_id: Some(PLAYER_BODY_ID.into()),
+        collision_class: BodyCollisionClass::Character,
+        ignore_body_id: Some(player_body_id),
     })?;
     let prior_had_support = player.locomotion.support.is_some();
     let mut accepted_support = None;
@@ -3279,9 +4830,10 @@ fn adjust_grounded_capsule_for_substep(
     {
         return Ok(());
     }
+    let player_body_id = player_body_id(&player.player_id);
     let Some(body_index) = body_states
         .iter()
-        .position(|body| body.body_id == PLAYER_BODY_ID)
+        .position(|body| body.body_id == player_body_id)
     else {
         return Ok(());
     };
@@ -3316,11 +4868,15 @@ fn adjust_grounded_capsule_for_substep(
                 * local_walk_input.magnitude().min(1.0)
                 * selected_speed
                 * f64::from(content::manifest().physics.fixed_delta_seconds);
-            if let Some(step_translation) =
-                grounded_step_translation(physics_scene, body_pose, up, forward_displacement)?
-            {
+            if let Some(step_translation) = grounded_step_translation(
+                physics_scene,
+                &player_body_id,
+                body_pose,
+                up,
+                forward_displacement,
+            )? {
                 physics_scene
-                    .translate_dynamic_body(PLAYER_BODY_ID, to_physics_vec3(step_translation))?;
+                    .translate_dynamic_body(&player_body_id, to_physics_vec3(step_translation))?;
                 body_states[body_index].pose.position =
                     body_states[body_index].pose.position + to_physics_vec3(step_translation);
             }
@@ -3334,7 +4890,8 @@ fn adjust_grounded_capsule_for_substep(
         radius: character.collision_radius_m as f32,
         half_height_of_cylinder: character_capsule_half_height() as f32,
         displacement: to_physics_vec3(snap_displacement),
-        ignore_body_id: Some(PLAYER_BODY_ID.into()),
+        collision_class: BodyCollisionClass::Character,
+        ignore_body_id: Some(player_body_id.clone()),
     })? {
         let surface_normal = normalized_or(from_physics_vec3(hit.surface_normal), up);
         let same_support = player.locomotion.support.as_ref().is_some_and(|support| {
@@ -3363,7 +4920,7 @@ fn adjust_grounded_capsule_for_substep(
             if snap_distance > f64::EPSILON {
                 let translation = up * -snap_distance;
                 physics_scene
-                    .translate_dynamic_body(PLAYER_BODY_ID, to_physics_vec3(translation))?;
+                    .translate_dynamic_body(&player_body_id, to_physics_vec3(translation))?;
                 body_states[body_index].pose.position =
                     body_states[body_index].pose.position + to_physics_vec3(translation);
             }
@@ -3374,6 +4931,7 @@ fn adjust_grounded_capsule_for_substep(
 
 fn grounded_step_translation(
     physics_scene: &Scene,
+    player_body_id: &str,
     body_pose: PhysicsPose,
     up: Vec3,
     forward_displacement: Vec3,
@@ -3385,7 +4943,8 @@ fn grounded_step_translation(
         radius: character.collision_radius_m as f32,
         half_height_of_cylinder: character_capsule_half_height() as f32,
         displacement: to_physics_vec3(displacement),
-        ignore_body_id: Some(PLAYER_BODY_ID.into()),
+        collision_class: BodyCollisionClass::Character,
+        ignore_body_id: Some(player_body_id.into()),
     };
     let obstruction_pose = PhysicsPose::new(
         body_pose.position + to_physics_vec3(up * STEP_SKIN_M),
@@ -3565,55 +5124,62 @@ fn physics_controls(
     body_states: &[verse_physics::BodyState],
     simulation_tick: u64,
     player_jump: Option<PlayerJumpLaunch>,
+    include_grid_controls: bool,
 ) -> Vec<BodyControl> {
     let physics = &content::manifest().physics;
-    let mut controls = state
-        .grids
-        .values()
-        .filter(|grid| !grid.anchored)
-        .map(|grid| {
-            let body_state = body_states.iter().find(|body| body.body_id == grid.grid_id);
-            let linear_velocity = body_state.map_or(grid.linear_velocity, |body| {
-                from_physics_vec3(body.linear_velocity)
-            });
-            let angular_velocity = body_state.map_or(grid.angular_velocity, |body| {
-                from_physics_vec3(body.angular_velocity)
-            });
-            let online = grid.power().online;
-            let user_force = if online {
-                grid.orientation.rotate(grid.control_linear_input) * physics.control_force_newtons
-            } else {
-                Vec3::ZERO
-            };
-            let user_torque = if online {
-                grid.orientation.rotate(grid.control_angular_input)
-                    * physics.control_torque_newton_meters
-            } else {
-                Vec3::ZERO
-            };
-            let dampener_force = if online && grid.dampeners {
-                linear_velocity * -physics.linear_dampener_newtons_per_mps
-            } else {
-                Vec3::ZERO
-            };
-            let dampener_torque = if online && grid.dampeners {
-                angular_velocity * -physics.angular_dampener_newton_meters_per_radian
-            } else {
-                Vec3::ZERO
-            };
-            BodyControl {
-                body_id: grid.grid_id.clone(),
-                force_newtons: to_physics_vec3(user_force + dampener_force),
-                torque_newton_meters: to_physics_vec3(user_torque + dampener_torque),
-            }
-        })
-        .collect::<Vec<_>>();
+    let mut controls = if include_grid_controls {
+        state
+            .grids
+            .values()
+            .filter(|grid| !grid.anchored)
+            .map(|grid| {
+                let body_state = body_states.iter().find(|body| body.body_id == grid.grid_id);
+                let linear_velocity = body_state.map_or(grid.linear_velocity, |body| {
+                    from_physics_vec3(body.linear_velocity)
+                });
+                let angular_velocity = body_state.map_or(grid.angular_velocity, |body| {
+                    from_physics_vec3(body.angular_velocity)
+                });
+                let online = grid.power().online;
+                let user_force = if online {
+                    grid.orientation.rotate(grid.control_linear_input)
+                        * physics.control_force_newtons
+                } else {
+                    Vec3::ZERO
+                };
+                let user_torque = if online {
+                    grid.orientation.rotate(grid.control_angular_input)
+                        * physics.control_torque_newton_meters
+                } else {
+                    Vec3::ZERO
+                };
+                let dampener_force = if online && grid.dampeners {
+                    linear_velocity * -physics.linear_dampener_newtons_per_mps
+                } else {
+                    Vec3::ZERO
+                };
+                let dampener_torque = if online && grid.dampeners {
+                    angular_velocity * -physics.angular_dampener_newton_meters_per_radian
+                } else {
+                    Vec3::ZERO
+                };
+                BodyControl {
+                    body_id: grid.grid_id.clone(),
+                    force_newtons: to_physics_vec3(user_force + dampener_force),
+                    torque_newton_meters: to_physics_vec3(user_torque + dampener_torque),
+                }
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
 
     if matches!(player.life_state, PlayerLifeState::Alive) {
         let character = &content::manifest().character;
+        let player_body_id = player_body_id(&player.player_id);
         let body_state = body_states
             .iter()
-            .find(|body| body.body_id == PLAYER_BODY_ID);
+            .find(|body| body.body_id == player_body_id);
         let position = body_state.map_or(player.position, |body| {
             from_physics_vec3(body.pose.position)
         });
@@ -3799,7 +5365,7 @@ fn physics_controls(
             local_angular_acceleration.z * capsule_perpendicular_inertia,
         ) * CHARACTER_INERTIA_MULTIPLIER;
         controls.push(BodyControl {
-            body_id: PLAYER_BODY_ID.into(),
+            body_id: player_body_id,
             force_newtons: to_physics_vec3(acceleration * character.mass_kg),
             torque_newton_meters: to_physics_vec3(orientation.rotate(local_torque)),
         });
@@ -3893,8 +5459,30 @@ fn contact_pair_key(contact: &verse_physics::ContactRecord) -> ContactPairKey {
     }
 }
 
+#[cfg(test)]
 fn contact_key_involves_player(contact: &ContactPairKey) -> bool {
     contact.body_a == PLAYER_BODY_ID || contact.body_b == PLAYER_BODY_ID
+}
+
+fn contact_key_involves_player_id(contact: &ContactPairKey, player_id: &str) -> bool {
+    let body_id = player_body_id(player_id);
+    contact.body_a == body_id || contact.body_b == body_id
+}
+
+fn player_for_body_id<'a>(state: &'a WorldState, body_id: &str) -> Option<&'a Player> {
+    state
+        .player
+        .iter()
+        .find_map(|(player_id, player)| (player_body_id(player_id) == body_id).then_some(player))
+}
+
+fn player_id_for_contact<'a>(state: &'a WorldState, contact: &ContactPairKey) -> Option<&'a str> {
+    let left = player_for_body_id(state, &contact.body_a).map(|player| player.player_id.as_str());
+    let right = player_for_body_id(state, &contact.body_b).map(|player| player.player_id.as_str());
+    match (left, right) {
+        (Some(player_id), None) | (None, Some(player_id)) => Some(player_id),
+        _ => None,
+    }
 }
 
 fn reduced_translational_contact_mass_grams(
@@ -3903,7 +5491,9 @@ fn reduced_translational_contact_mass_grams(
     right_body: &str,
 ) -> u64 {
     fn mass(state: &WorldState, body_id: &str) -> Option<u64> {
-        if body_id == PLAYER_BODY_ID && matches!(state.player.life_state, PlayerLifeState::Alive) {
+        if player_for_body_id(state, body_id)
+            .is_some_and(|player| matches!(player.life_state, PlayerLifeState::Alive))
+        {
             #[allow(clippy::cast_sign_loss)]
             return Some((content::manifest().character.mass_kg * 1_000.0).round() as u64);
         }
@@ -4092,7 +5682,7 @@ fn ensure_finite(value: Vec3, label: &str) -> Result<(), IntentError> {
 
 fn ensure_bounded_control(value: Vec3, label: &str) -> Result<(), IntentError> {
     ensure_finite(value, label)?;
-    if value.magnitude() > MAX_GRID_CONTROL_INPUT + CONTROL_INPUT_EPSILON {
+    if value.magnitude() > MAX_GRID_CONTROL_INPUT + CONTROL_INPUT_SOURCE_PRECISION_EPSILON {
         Err(IntentError::rejected(
             "control_input_out_of_range",
             format!("{label} magnitude must not exceed one"),
@@ -4123,72 +5713,1328 @@ mod tests {
     use verse_protocol::IVec3;
 
     use super::*;
-    use crate::model::{STARTER_GRID_ID, VoxelField};
+    use crate::model::{
+        ActorOperationHistory, PROCESSED_OPERATION_RETENTION_LIMIT, STARTER_GRID_ID, VoxelField,
+    };
     use crate::persistence::AppendFailpoint;
 
     fn runtime() -> Runtime {
         Runtime::open(tempdir().expect("tempdir").keep(), 42, 5).expect("runtime opens")
     }
 
+    #[test]
+    fn authenticated_actor_is_separate_from_the_client_intent() {
+        let mut runtime = runtime();
+        let before_hash = runtime.state().state_hash();
+        let before_sequence = runtime.state().event_sequence;
+        let intent = ClientMessage::SetPlayerControl {
+            operation_sequence: 0,
+            operation_id: "actor-isolation-1".into(),
+            movement_epoch: runtime.state().player.movement_epoch,
+            input_sequence: 1,
+            linear_input: Vec3::new(0.0, 0.0, -1.0),
+            angular_input: Vec3::ZERO,
+            boost: false,
+            dampeners: true,
+            jump: false,
+        };
+
+        let rejected = runtime
+            .execute_next_as_for_fixture("another-player", &intent)
+            .expect_err("an unbound actor cannot control the canonical player");
+        assert!(matches!(
+            rejected,
+            RuntimeError::Intent(IntentError::Rejected { ref code, .. })
+                if code == "actor_not_present"
+        ));
+        assert_eq!(runtime.state().event_sequence, before_sequence);
+        assert_eq!(runtime.state().state_hash(), before_hash);
+
+        let receipt = runtime
+            .execute_next_as_for_fixture("player-local", &intent)
+            .expect("the bound actor can submit its own control");
+        assert_eq!(runtime.state().event_sequence, before_sequence + 1);
+        assert_eq!(runtime.state().player.last_received_input_sequence, 1);
+        assert_eq!(receipt.event_sequence, before_sequence + 1);
+        assert_eq!(
+            runtime
+                .state()
+                .processed_operation("player-local", "actor-isolation-1")
+                .expect("actor-scoped receipt exists"),
+            &receipt
+        );
+    }
+
+    fn sequenced_suit_message(
+        operation_sequence: u64,
+        operation_id: impl Into<String>,
+        helmet_closed: bool,
+    ) -> ClientMessage {
+        ClientMessage::SetSuitMode {
+            operation_sequence,
+            operation_id: operation_id.into(),
+            helmet_closed,
+            jetpack_enabled: true,
+            magnetic_boots_enabled: false,
+        }
+    }
+
+    fn rejected_code(error: RuntimeError) -> String {
+        match error {
+            RuntimeError::Intent(IntentError::Rejected { code, .. }) => code,
+            other => panic!("expected an intent rejection, received {other}"),
+        }
+    }
+
+    #[test]
+    fn operation_sequences_detect_conflicts_gaps_and_reuse_rejected_frontier() {
+        let mut runtime = runtime();
+        let first = sequenced_suit_message(1, "sequence-one", false);
+        let first_receipt = runtime.execute(&first).expect("sequence one commits");
+        let committed_hash = runtime.state().state_hash();
+        assert_eq!(first_receipt.operation_sequence, 1);
+
+        assert_eq!(
+            runtime
+                .execute(&first)
+                .expect("an exact retry is idempotent"),
+            first_receipt
+        );
+        assert_eq!(runtime.state().state_hash(), committed_hash);
+
+        assert_eq!(
+            rejected_code(
+                runtime
+                    .execute(&sequenced_suit_message(1, "changed-id", false))
+                    .expect_err("a changed diagnostic ID changes the typed intent")
+            ),
+            "operation_conflict"
+        );
+        assert_eq!(
+            rejected_code(
+                runtime
+                    .execute(&sequenced_suit_message(1, "sequence-one", true))
+                    .expect_err("a changed payload conflicts at the committed sequence")
+            ),
+            "operation_conflict"
+        );
+        assert_eq!(runtime.state().state_hash(), committed_hash);
+
+        assert_eq!(
+            rejected_code(
+                runtime
+                    .execute(&sequenced_suit_message(0, "zero", true))
+                    .expect_err("zero is never a client operation sequence")
+            ),
+            "operation_sequence_invalid"
+        );
+        assert_eq!(
+            rejected_code(
+                runtime
+                    .execute(&sequenced_suit_message(3, "gap", true))
+                    .expect_err("a client cannot skip sequence two")
+            ),
+            "operation_sequence_gap"
+        );
+
+        let rejected_second = sequenced_suit_message(2, "rejected-two", false);
+        assert_eq!(
+            rejected_code(
+                runtime
+                    .execute(&rejected_second)
+                    .expect_err("an unchanged suit mode is rejected")
+            ),
+            "suit_mode_no_change"
+        );
+        assert_eq!(runtime.state().last_operation_sequence("player-local"), 1);
+        assert_eq!(runtime.state().state_hash(), committed_hash);
+
+        let corrected = sequenced_suit_message(2, "corrected-two", true);
+        let corrected_receipt = runtime
+            .execute(&corrected)
+            .expect("the rejected frontier can be reused with corrected intent");
+        assert_eq!(corrected_receipt.operation_sequence, 2);
+        assert_eq!(runtime.state().last_operation_sequence("player-local"), 2);
+    }
+
+    #[test]
+    fn operation_fingerprints_are_actor_scoped_and_canonicalize_signed_zero() {
+        let mut runtime = runtime();
+        runtime
+            .admit_development_player("player-remote")
+            .expect("second actor is pre-admitted");
+
+        let shared = sequenced_suit_message(1, "shared-diagnostic", false);
+        let local = runtime
+            .execute(&shared)
+            .expect("local sequence one commits");
+        let remote = runtime
+            .execute_as("player-remote", &shared)
+            .expect("remote has an independent sequence one");
+        assert_eq!(local.operation_sequence, 1);
+        assert_eq!(remote.operation_sequence, 1);
+        assert_ne!(local.event_sequence, remote.event_sequence);
+        assert_eq!(runtime.state().last_operation_sequence("player-local"), 1);
+        assert_eq!(runtime.state().last_operation_sequence("player-remote"), 1);
+
+        let positive_zero = ClientMessage::SetPlayerControl {
+            operation_sequence: 2,
+            operation_id: "zero-control".into(),
+            movement_epoch: 1,
+            input_sequence: 1,
+            linear_input: Vec3::new(0.0, 0.0, 0.0),
+            angular_input: Vec3::new(0.0, 0.0, 0.0),
+            boost: false,
+            dampeners: true,
+            jump: false,
+        };
+        let negative_zero = ClientMessage::SetPlayerControl {
+            operation_sequence: 2,
+            operation_id: "zero-control".into(),
+            movement_epoch: 1,
+            input_sequence: 1,
+            linear_input: Vec3::new(-0.0, 0.0, -0.0),
+            angular_input: Vec3::new(0.0, -0.0, 0.0),
+            boost: false,
+            dampeners: true,
+            jump: false,
+        };
+        assert_eq!(
+            runtime
+                .state()
+                .client_intent_fingerprint("player-local", &positive_zero)
+                .expect("positive zero fingerprints"),
+            runtime
+                .state()
+                .client_intent_fingerprint("player-local", &negative_zero)
+                .expect("negative zero fingerprints canonically")
+        );
+
+        let non_finite = ClientMessage::SetPlayerControl {
+            operation_sequence: 2,
+            operation_id: "zero-control".into(),
+            movement_epoch: 1,
+            input_sequence: 1,
+            linear_input: Vec3::new(f64::NAN, 0.0, 0.0),
+            angular_input: Vec3::ZERO,
+            boost: false,
+            dampeners: true,
+            jump: false,
+        };
+        assert_eq!(
+            runtime
+                .state()
+                .client_intent_fingerprint("player-local", &non_finite)
+                .expect_err("non-finite intent data is not fingerprintable")
+                .code(),
+            "invalid_vector"
+        );
+    }
+
+    #[test]
+    fn operation_compaction_and_exact_retry_survive_restart() {
+        let directory = tempdir().expect("tempdir");
+        let expected_hash;
+        let expected_compaction_hash: String;
+        let final_message = sequenced_suit_message(129, "bounded-129", false);
+        let final_receipt;
+        {
+            let mut runtime =
+                Runtime::open(directory.path(), 143, 1).expect("runtime opens for compaction");
+            let mut last_receipt = None;
+            for operation_sequence in 1..=129 {
+                let message = sequenced_suit_message(
+                    operation_sequence,
+                    format!("bounded-{operation_sequence}"),
+                    operation_sequence % 2 == 0,
+                );
+                last_receipt = Some(runtime.execute(&message).expect("operation commits"));
+            }
+            final_receipt = last_receipt.expect("the bounded campaign is nonempty");
+            let history = &runtime.state().processed_operations["player-local"];
+            assert_eq!(history.committed_through, 129);
+            assert_eq!(history.compacted_through, 1);
+            assert_eq!(history.retained.len(), PROCESSED_OPERATION_RETENTION_LIMIT);
+            assert_eq!(
+                history.retained.first_key_value().map(|(key, _)| *key),
+                Some(2)
+            );
+            assert!(valid_blake3_hex(&history.compacted_history_hash));
+            expected_compaction_hash = history.compacted_history_hash.clone();
+            expected_hash = runtime.state().state_hash();
+        }
+
+        let mut recovered =
+            Runtime::open(directory.path(), 143, 1).expect("compacted runtime recovers");
+        assert_eq!(recovered.state().state_hash(), expected_hash);
+        let history = &recovered.state().processed_operations["player-local"];
+        assert_eq!(history.compacted_history_hash, expected_compaction_hash);
+        assert_eq!(history.committed_through, 129);
+        assert_eq!(history.compacted_through, 1);
+
+        assert_eq!(
+            rejected_code(
+                recovered
+                    .execute(&sequenced_suit_message(1, "bounded-1", false))
+                    .expect_err("a compacted retry cannot reconstruct its exact receipt")
+            ),
+            "operation_already_committed"
+        );
+        assert_eq!(
+            recovered
+                .execute(&final_message)
+                .expect("a retained exact retry returns its durable receipt"),
+            final_receipt
+        );
+        assert_eq!(recovered.state().state_hash(), expected_hash);
+    }
+
+    #[test]
+    fn operation_frontier_recovers_across_append_failpoints() {
+        for (failpoint, durable) in [
+            (AppendFailpoint::BeforeWrite, false),
+            (AppendFailpoint::AfterSync, true),
+        ] {
+            let directory = tempdir().expect("tempdir");
+            let message = sequenced_suit_message(1, format!("failpoint-{durable}"), false);
+            {
+                let mut runtime = Runtime::open(directory.path(), 149, 100).expect("runtime opens");
+                runtime.store.set_append_failpoint(failpoint);
+                assert!(matches!(
+                    runtime.execute(&message),
+                    Err(RuntimeError::Persistence(
+                        PersistenceError::InjectedFailure(_)
+                    ))
+                ));
+                assert!(runtime.is_halted());
+                assert_eq!(runtime.state().last_operation_sequence("player-local"), 0);
+            }
+
+            let mut recovered =
+                Runtime::open(directory.path(), 149, 100).expect("runtime recovers");
+            assert_eq!(
+                recovered.state().last_operation_sequence("player-local"),
+                u64::from(durable)
+            );
+            let receipt = recovered
+                .execute(&message)
+                .expect("the same operation is accepted or retried exactly");
+            assert_eq!(receipt.operation_sequence, 1);
+            assert_eq!(recovered.state().last_operation_sequence("player-local"), 1);
+            assert_eq!(recovered.state().event_sequence, 1);
+        }
+    }
+
+    #[test]
+    fn malformed_operation_history_halts_before_intent_processing() {
+        let mut runtime = runtime();
+        runtime.state.processed_operations.insert(
+            "player-local".into(),
+            ActorOperationHistory {
+                committed_through: 2,
+                compacted_through: 0,
+                compacted_history_hash: String::new(),
+                retained: BTreeMap::new(),
+            },
+        );
+        assert!(matches!(
+            runtime.execute(&sequenced_suit_message(3, "must-not-run", false)),
+            Err(RuntimeError::CanonicalInvariant(_))
+        ));
+        assert!(runtime.is_halted());
+        assert_eq!(runtime.state().event_sequence, 0);
+    }
+
+    #[test]
+    fn replay_rejects_trim_empty_operation_id_before_any_state_mutation() {
+        let state = WorldState::genesis(151);
+        let mut event = state
+            .prepare_client_event(&sequenced_suit_message(1, "canonical-id", false))
+            .expect("canonical suit event prepares");
+        let whitespace_message = sequenced_suit_message(1, " \t ", false);
+        event.operation_id = Some(" \t ".into());
+        event.intent_fingerprint = Some(
+            state
+                .client_intent_fingerprint("player-local", &whitespace_message)
+                .expect("typed whitespace operation ID fingerprints"),
+        );
+        event.event_hash = event.calculate_hash();
+
+        let mut candidate = state.clone();
+        let before = candidate.clone();
+        let before_bytes = serde_json::to_vec(&candidate).expect("canonical state serializes");
+        let error = candidate
+            .apply_event(&event)
+            .expect_err("trim-empty replay operation ID rejects");
+        assert_eq!(error.code(), "replay_actor_envelope_invalid");
+        assert_eq!(candidate, before);
+        assert_eq!(
+            serde_json::to_vec(&candidate).expect("rejected state serializes"),
+            before_bytes
+        );
+    }
+
     fn move_player_near_grid(runtime: &mut Runtime) {
-        runtime.state.player.position = Vec3::new(10.0, 1.0, 3.0);
-        runtime.state.player.linear_velocity = Vec3::ZERO;
+        aim_player_for_build(runtime, STARTER_GRID_ID, IVec3::new(0, 1, 0));
+    }
+
+    fn copy_primary_tool_pose_to(runtime: &mut Runtime, player_id: &str) {
+        let primary = runtime.state.player.primary().clone();
+        let player = runtime
+            .state
+            .player
+            .get_mut(player_id)
+            .expect("tool-pose target player exists");
+        player.position = primary.position;
+        player.orientation = primary.orientation;
+        player.linear_velocity = primary.linear_velocity;
+        player.angular_velocity = primary.angular_velocity;
+        player.surface_contact = primary.surface_contact;
+        player.locomotion = primary.locomotion;
         runtime
             .physics
             .rebuild(&physics_body_specs(&runtime.state))
-            .expect("test setup rebuilds player near the grid");
+            .expect("actor-specific tool pose rebuilds the physics scene");
     }
 
-    fn stationary_player_outcome(
-        state: &WorldState,
-        step_count: u8,
-    ) -> Option<PlayerPhysicsOutcome> {
-        matches!(state.player.life_state, PlayerLifeState::Alive).then(|| {
-            let resulting_tick = state.simulation_tick + u64::from(step_count);
-            let lease_active = resulting_tick < state.player.control_expires_at_simulation_tick;
-            PlayerPhysicsOutcome {
-                player_id: state.player.player_id.clone(),
-                position: state.player.position,
-                orientation: state.player.orientation,
-                linear_velocity: state.player.linear_velocity,
-                angular_velocity: state.player.angular_velocity,
-                locomotion: state.player.locomotion.clone(),
-                surface_contact: false,
-                control_linear_input: if lease_active {
-                    state.player.control_linear_input
-                } else {
-                    Vec3::ZERO
-                },
-                control_angular_input: if lease_active {
-                    state.player.control_angular_input
-                } else {
-                    Vec3::ZERO
-                },
-                boost: state.player.boost && lease_active,
-                jump: state.player.jump && lease_active,
-                dampeners: state.player.dampeners || !lease_active,
-                control_expires_at_simulation_tick: state.player.control_expires_at_simulation_tick,
+    fn normalized(value: Vec3) -> Vec3 {
+        value * value.magnitude().recip()
+    }
+
+    fn orientation_from_forward(forward: Vec3) -> Quat {
+        let forward = normalized(forward);
+        // Shortest rotation from Godot's local forward (-Z) to the target.
+        let dot = -forward.z;
+        if dot < -1.0 + 1.0e-9 {
+            return Quat::new(0.0, 1.0, 0.0, 0.0);
+        }
+        let x = forward.y;
+        let y = -forward.x;
+        let w = 1.0 + dot;
+        let inverse_length = x.mul_add(x, y.mul_add(y, w * w)).sqrt().recip();
+        Quat::new(
+            (x * inverse_length) as f32,
+            (y * inverse_length) as f32,
+            0.0,
+            (w * inverse_length) as f32,
+        )
+    }
+
+    fn aim_player_from_face(player: &mut Player, target: Vec3, outward_face: Vec3) {
+        let eye_offset = content::manifest().character.eye_height_m
+            - content::manifest().character.standing_height_m * 0.5;
+        let eye = target + normalized(outward_face) * 4.0;
+        player.position = eye - Vec3::new(0.0, eye_offset, 0.0);
+        player.orientation = orientation_from_forward(target - eye);
+        player.linear_velocity = Vec3::ZERO;
+        player.angular_velocity = Vec3::ZERO;
+        player.locomotion.kind = LocomotionKind::Airborne;
+        player.locomotion.up = Vec3::new(0.0, 1.0, 0.0);
+        player.locomotion.view_pitch_radians = 0.0;
+    }
+
+    fn aim_player_for_build(runtime: &mut Runtime, grid_id: &str, coordinate: IVec3) {
+        let grid = runtime.state.grids[grid_id].clone();
+        let mut aimed = None;
+        for existing in coordinate
+            .neighbors()
+            .into_iter()
+            .filter(|neighbor| grid.block_at(*neighbor).is_some())
+        {
+            let local_face = IVec3::new(
+                coordinate.x - existing.x,
+                coordinate.y - existing.y,
+                coordinate.z - existing.z,
+            );
+            let world_face = grid.orientation.rotate(Vec3::new(
+                f64::from(local_face.x),
+                f64::from(local_face.y),
+                f64::from(local_face.z),
+            ));
+            let mut candidate = runtime.state.player.primary().clone();
+            aim_player_from_face(&mut candidate, grid.world_position(existing), world_face);
+            let hit = closest_tool_hit(&candidate, &runtime.state.voxels, &runtime.state.grids);
+            if matches!(
+                hit,
+                Some(ToolHit {
+                    target: ToolTarget::Block {
+                        ref grid_id,
+                        coordinate: targeted,
+                        ..
+                    },
+                    local_face: Some(face),
+                    ..
+                }) if grid_id == &grid.grid_id
+                    && targeted == existing
+                    && IVec3::new(
+                        targeted.x + face.x,
+                        targeted.y + face.y,
+                        targeted.z + face.z,
+                    ) == coordinate
+            ) {
+                aimed = Some(candidate);
+                break;
             }
-        })
+        }
+        *runtime.state.player.primary_mut() =
+            aimed.expect("build fixture has one visible face-connected existing block");
+        runtime
+            .physics
+            .rebuild(&physics_body_specs(&runtime.state))
+            .expect("test setup rebuilds aimed player near the grid");
     }
 
-    fn reachable_voxel(runtime: &Runtime) -> IVec3 {
+    fn exposed_voxel_face(voxels: &VoxelField, coordinate: IVec3) -> Option<IVec3> {
+        coordinate
+            .neighbors()
+            .into_iter()
+            .find(|neighbor| !voxels.occupied.contains(neighbor))
+            .map(|neighbor| {
+                IVec3::new(
+                    neighbor.x - coordinate.x,
+                    neighbor.y - coordinate.y,
+                    neighbor.z - coordinate.z,
+                )
+            })
+    }
+
+    fn aim_player_at_voxel(runtime: &mut Runtime, player_id: &str, coordinate: IVec3) {
+        let target = Vec3::new(
+            f64::from(coordinate.x),
+            f64::from(coordinate.y),
+            f64::from(coordinate.z),
+        );
+        let baseline = runtime
+            .state
+            .player
+            .get(player_id)
+            .expect("aimed fixture actor exists")
+            .clone();
+        let mut aimed = None;
+        for neighbor in coordinate
+            .neighbors()
+            .into_iter()
+            .filter(|neighbor| !runtime.state.voxels.occupied.contains(neighbor))
+        {
+            let face = IVec3::new(
+                neighbor.x - coordinate.x,
+                neighbor.y - coordinate.y,
+                neighbor.z - coordinate.z,
+            );
+            let mut candidate = baseline.clone();
+            aim_player_from_face(
+                &mut candidate,
+                target,
+                Vec3::new(f64::from(face.x), f64::from(face.y), f64::from(face.z)),
+            );
+            if matches!(
+                closest_tool_hit(&candidate, &runtime.state.voxels, &runtime.state.grids),
+                Some(ToolHit {
+                    target: ToolTarget::Voxel { coordinate: targeted },
+                    local_face: Some(_),
+                    ..
+                }) if targeted == coordinate
+            ) {
+                aimed = Some(candidate);
+                break;
+            }
+        }
+        *runtime
+            .state
+            .player
+            .get_mut(player_id)
+            .expect("aimed fixture actor exists") =
+            aimed.expect("mining fixture voxel has a visible exposed face");
         runtime
+            .physics
+            .rebuild(&physics_body_specs(&runtime.state))
+            .expect("test setup rebuilds aimed player near the voxel");
+    }
+
+    fn aim_player_at_block(runtime: &mut Runtime, grid_id: &str, block_id: &str) {
+        let grid = runtime.state.grids[grid_id].clone();
+        let block = grid.blocks[block_id].clone();
+        let baseline = runtime.state.player.primary().clone();
+        let mut aimed = None;
+        for neighbor in block
+            .coordinate
+            .neighbors()
+            .into_iter()
+            .filter(|neighbor| grid.block_at(*neighbor).is_none())
+        {
+            let face = Vec3::new(
+                f64::from(neighbor.x - block.coordinate.x),
+                f64::from(neighbor.y - block.coordinate.y),
+                f64::from(neighbor.z - block.coordinate.z),
+            );
+            let mut candidate = baseline.clone();
+            aim_player_from_face(
+                &mut candidate,
+                grid.world_position(block.coordinate),
+                grid.orientation.rotate(face),
+            );
+            if matches!(
+                closest_tool_hit(&candidate, &runtime.state.voxels, &runtime.state.grids),
+                Some(ToolHit {
+                    target: ToolTarget::Block {
+                        ref grid_id,
+                        ref block_id,
+                        ..
+                    },
+                    local_face: Some(_),
+                    ..
+                }) if grid_id == &grid.grid_id && block_id == &block.block_id
+            ) {
+                aimed = Some(candidate);
+                break;
+            }
+        }
+        *runtime.state.player.primary_mut() =
+            aimed.expect("hand-tool fixture block has one visible exposed face");
+        runtime
+            .physics
+            .rebuild(&physics_body_specs(&runtime.state))
+            .expect("test setup rebuilds aimed player near the block");
+    }
+
+    fn aim_player_at_block_preserving_locomotion(
+        runtime: &mut Runtime,
+        grid_id: &str,
+        block_id: &str,
+    ) {
+        let preserved_locomotion = runtime.state.player.locomotion.clone();
+        aim_player_at_block(runtime, grid_id, block_id);
+        runtime.state.player.locomotion = preserved_locomotion;
+        runtime.state.player.locomotion.view_pitch_radians = 0.0;
+    }
+
+    fn restore_player_pose_after_tool_fixture(runtime: &mut Runtime, prior: &Player) {
+        runtime.state.player.position = prior.position;
+        runtime.state.player.orientation = prior.orientation;
+        runtime.state.player.linear_velocity = prior.linear_velocity;
+        runtime.state.player.angular_velocity = prior.angular_velocity;
+        runtime.state.player.surface_contact = prior.surface_contact;
+        runtime
+            .physics
+            .rebuild(&physics_body_specs(&runtime.state))
+            .expect("tool fixture restores the physical player pose");
+    }
+
+    fn add_remote_player(runtime: &mut Runtime) {
+        runtime
+            .admit_development_player("player-remote")
+            .expect("remote development player admits");
+        runtime
+            .state
+            .player
+            .get_mut("player-remote")
+            .expect("remote development player exists")
+            .linear_velocity = Vec3::new(0.25, 0.0, 0.0);
+        runtime
+            .physics
+            .rebuild(&physics_body_specs(&runtime.state))
+            .expect("two-player physics scene builds");
+    }
+
+    #[test]
+    fn operation_ids_and_control_frontiers_are_scoped_per_player() {
+        let directory = tempdir().expect("tempdir");
+        let mut runtime = Runtime::open(directory.path(), 68, 1_000).expect("runtime opens");
+        add_remote_player(&mut runtime);
+        runtime
+            .persist_snapshot()
+            .expect("two-player baseline persists");
+        let control = |player: &Player, linear_input: Vec3| ClientMessage::SetPlayerControl {
+            operation_sequence: 0,
+            operation_id: "shared-operation-id".into(),
+            movement_epoch: player.movement_epoch,
+            input_sequence: 1,
+            linear_input,
+            angular_input: Vec3::ZERO,
+            boost: false,
+            dampeners: true,
+            jump: false,
+        };
+        let local_intent = control(
+            runtime
+                .state
+                .player
+                .get("player-local")
+                .expect("local exists"),
+            Vec3::new(1.0, 0.0, 0.0),
+        );
+        let remote_intent = control(
+            runtime
+                .state
+                .player
+                .get("player-remote")
+                .expect("remote exists"),
+            Vec3::new(-1.0, 0.0, 0.0),
+        );
+
+        let local_receipt = runtime
+            .execute_next_as_for_fixture("player-local", &local_intent)
+            .expect("local control commits");
+        let remote_receipt = runtime
+            .execute_next_as_for_fixture("player-remote", &remote_intent)
+            .expect("remote control with the same operation ID commits independently");
+        assert_ne!(local_receipt.event_sequence, remote_receipt.event_sequence);
+        assert_eq!(
+            runtime
+                .state
+                .player
+                .get("player-local")
+                .unwrap()
+                .last_received_input_sequence,
+            1
+        );
+        assert_eq!(
+            runtime
+                .state
+                .player
+                .get("player-remote")
+                .unwrap()
+                .last_received_input_sequence,
+            1
+        );
+        assert_eq!(
+            runtime
+                .state
+                .processed_operation("player-local", "shared-operation-id"),
+            Some(&local_receipt)
+        );
+        assert_eq!(
+            runtime
+                .state
+                .processed_operation("player-remote", "shared-operation-id"),
+            Some(&remote_receipt)
+        );
+        let accepted_hash = runtime.state().state_hash();
+        let accepted_sequence = runtime.state().event_sequence;
+        assert_eq!(
+            runtime
+                .execute_next_as_for_fixture("player-local", &local_intent)
+                .expect("local retry is idempotent"),
+            local_receipt
+        );
+        assert_eq!(
+            runtime
+                .execute_next_as_for_fixture("player-remote", &remote_intent)
+                .expect("remote retry is idempotent"),
+            remote_receipt
+        );
+        assert_eq!(runtime.state().state_hash(), accepted_hash);
+        assert_eq!(runtime.state().event_sequence, accepted_sequence);
+
+        let primary_mode_before = (
+            runtime.state().player.helmet_closed,
+            runtime.state().player.jetpack_enabled,
+            runtime.state().player.locomotion.magnetic_boots_enabled,
+        );
+        let remote_suit_receipt = runtime
+            .execute_next_as_for_fixture(
+                "player-remote",
+                &ClientMessage::SetSuitMode {
+                    operation_sequence: 0,
+                    operation_id: "remote-suit-disabled".into(),
+                    helmet_closed: false,
+                    jetpack_enabled: true,
+                    magnetic_boots_enabled: false,
+                },
+            )
+            .expect("secondary suit mode targets its authenticated actor");
+        assert_eq!(
+            (
+                runtime.state().player.helmet_closed,
+                runtime.state().player.jetpack_enabled,
+                runtime.state().player.locomotion.magnetic_boots_enabled,
+            ),
+            primary_mode_before
+        );
+        let remote = runtime.state().player.get("player-remote").unwrap();
+        assert!(!remote.helmet_closed);
+        assert!(remote.jetpack_enabled);
+        assert!(!remote.locomotion.magnetic_boots_enabled);
+        let lifecycle_hash = runtime.state().state_hash();
+        let lifecycle_sequence = runtime.state().event_sequence;
+        assert_eq!(
+            runtime
+                .execute_next_as_for_fixture(
+                    "player-remote",
+                    &ClientMessage::SetSuitMode {
+                        operation_sequence: 0,
+                        operation_id: "remote-suit-disabled".into(),
+                        helmet_closed: false,
+                        jetpack_enabled: true,
+                        magnetic_boots_enabled: false,
+                    },
+                )
+                .expect("secondary suit retry is actor-scoped and idempotent"),
+            remote_suit_receipt
+        );
+        assert_eq!(runtime.state().state_hash(), lifecycle_hash);
+        assert_eq!(runtime.state().event_sequence, lifecycle_sequence);
+
+        drop(runtime);
+        let recovered = Runtime::open(directory.path(), 68, 1_000).expect("runtime recovers");
+        assert_eq!(recovered.state().state_hash(), lifecycle_hash);
+        assert_eq!(
+            recovered
+                .state()
+                .processed_operation("player-remote", "shared-operation-id"),
+            Some(&remote_receipt)
+        );
+    }
+
+    #[test]
+    fn actor_owned_industry_and_engineering_are_isolated_and_recover_exactly() {
+        let directory = tempdir().expect("tempdir");
+        let expected_hash;
+        {
+            let mut runtime =
+                Runtime::open(directory.path(), 169, 5).expect("authority runtime opens");
+            runtime
+                .admit_development_player("player-remote")
+                .expect("secondary actor admits");
+            runtime
+                .state
+                .grids
+                .get_mut(STARTER_GRID_ID)
+                .expect("starter grid exists")
+                .owner_player_id = "player-remote".into();
+            runtime
+                .state
+                .inventories
+                .get_mut(PLAYER_INVENTORY_ID)
+                .expect("primary inventory exists")
+                .contents
+                .components -= 4;
+            runtime
+                .state
+                .inventories
+                .get_mut("inventory-player-remote")
+                .expect("secondary inventory exists")
+                .contents = InventoryContents {
+                ore: 2,
+                refined_material: 1,
+                components: 4,
+            };
+            runtime.state.ledger.genesis_ore += 2;
+            runtime.state.ledger.genesis_refined += 1;
+            assert!(runtime.state().conservation().valid);
+            runtime
+                .persist_snapshot()
+                .expect("owned-grid authority fixture persists");
+
+            let denied = [
+                (
+                    ClientMessage::RefineOre {
+                        operation_sequence: 0,
+                        operation_id: "remote-refine-primary".into(),
+                        inventory_id: PLAYER_INVENTORY_ID.into(),
+                        batches: 1,
+                    },
+                    "inventory_access_denied",
+                ),
+                (
+                    ClientMessage::CraftComponent {
+                        operation_sequence: 0,
+                        operation_id: "remote-craft-primary".into(),
+                        inventory_id: PLAYER_INVENTORY_ID.into(),
+                        quantity: 1,
+                    },
+                    "inventory_access_denied",
+                ),
+                (
+                    ClientMessage::TransferInventory {
+                        operation_sequence: 0,
+                        operation_id: "remote-transfer-from-primary".into(),
+                        source_inventory_id: PLAYER_INVENTORY_ID.into(),
+                        destination_inventory_id: "inventory-player-remote".into(),
+                        resource: ResourceKind::Component,
+                        quantity: 1,
+                    },
+                    "inventory_access_denied",
+                ),
+                (
+                    ClientMessage::TransferInventory {
+                        operation_sequence: 0,
+                        operation_id: "remote-transfer-to-primary".into(),
+                        source_inventory_id: "inventory-player-remote".into(),
+                        destination_inventory_id: PLAYER_INVENTORY_ID.into(),
+                        resource: ResourceKind::Component,
+                        quantity: 1,
+                    },
+                    "inventory_access_denied",
+                ),
+            ];
+            for (message, expected_code) in denied {
+                let before = runtime.state().state_hash();
+                let error = runtime
+                    .execute_next_as_for_fixture("player-remote", &message)
+                    .expect_err("cross-owner inventory intent rejects");
+                assert!(matches!(
+                    error,
+                    RuntimeError::Intent(IntentError::Rejected { ref code, .. })
+                        if code == expected_code
+                ));
+                assert_eq!(runtime.state().state_hash(), before);
+            }
+
+            let foreign_grid_intents = [
+                ClientMessage::BuildBlock {
+                    operation_sequence: 0,
+                    operation_id: "primary-build-foreign".into(),
+                    grid_id: STARTER_GRID_ID.into(),
+                    coordinate: IVec3::new(0, 1, 0),
+                    kind: BlockKind::Structural,
+                    orientation: 0,
+                },
+                ClientMessage::WeldBlock {
+                    operation_sequence: 0,
+                    operation_id: "primary-weld-foreign".into(),
+                    grid_id: STARTER_GRID_ID.into(),
+                    block_id: "block-core".into(),
+                },
+                ClientMessage::SetGridControl {
+                    operation_sequence: 0,
+                    operation_id: "primary-control-foreign".into(),
+                    grid_id: STARTER_GRID_ID.into(),
+                    linear_input: Vec3::new(0.25, 0.0, 0.0),
+                    angular_input: Vec3::ZERO,
+                    dampeners: true,
+                },
+                ClientMessage::ToggleGridAnchor {
+                    operation_sequence: 0,
+                    operation_id: "primary-anchor-foreign".into(),
+                    grid_id: STARTER_GRID_ID.into(),
+                },
+            ];
+            for message in foreign_grid_intents {
+                let before = runtime.state().state_hash();
+                let error = runtime
+                    .execute_next_as_for_fixture("player-local", &message)
+                    .expect_err("foreign constructive grid intent rejects");
+                assert!(matches!(
+                    error,
+                    RuntimeError::Intent(IntentError::Rejected { ref code, .. })
+                        if code == "grid_access_denied"
+                ));
+                assert_eq!(runtime.state().state_hash(), before);
+            }
+
+            runtime
+                .execute_next_as_for_fixture(
+                    "player-remote",
+                    &ClientMessage::RefineOre {
+                        operation_sequence: 0,
+                        operation_id: "remote-refine-owned".into(),
+                        inventory_id: "inventory-player-remote".into(),
+                        batches: 1,
+                    },
+                )
+                .expect("secondary actor refines its carried ore");
+            runtime
+                .execute_next_as_for_fixture(
+                    "player-remote",
+                    &ClientMessage::CraftComponent {
+                        operation_sequence: 0,
+                        operation_id: "remote-craft-owned".into(),
+                        inventory_id: "inventory-player-remote".into(),
+                        quantity: 1,
+                    },
+                )
+                .expect("secondary actor crafts in its carried inventory");
+            runtime
+                .execute_next_as_for_fixture(
+                    "player-remote",
+                    &ClientMessage::TransferInventory {
+                        operation_sequence: 0,
+                        operation_id: "remote-transfer-to-owned-cargo".into(),
+                        source_inventory_id: "inventory-player-remote".into(),
+                        destination_inventory_id: "inventory-cargo-starter".into(),
+                        resource: ResourceKind::Component,
+                        quantity: 1,
+                    },
+                )
+                .expect("secondary actor deposits into its completed cargo");
+            runtime
+                .execute_next_as_for_fixture(
+                    "player-remote",
+                    &ClientMessage::TransferInventory {
+                        operation_sequence: 0,
+                        operation_id: "remote-transfer-from-owned-cargo".into(),
+                        source_inventory_id: "inventory-cargo-starter".into(),
+                        destination_inventory_id: "inventory-player-remote".into(),
+                        resource: ResourceKind::Component,
+                        quantity: 1,
+                    },
+                )
+                .expect("secondary actor withdraws from its completed cargo");
+            runtime
+                .execute_next_as_for_fixture(
+                    "player-remote",
+                    &ClientMessage::SetGridControl {
+                        operation_sequence: 0,
+                        operation_id: "remote-control-owned-grid".into(),
+                        grid_id: STARTER_GRID_ID.into(),
+                        linear_input: Vec3::new(0.25, 0.0, 0.0),
+                        angular_input: Vec3::ZERO,
+                        dampeners: true,
+                    },
+                )
+                .expect("secondary owner controls its powered released grid");
+
+            aim_player_for_build(&mut runtime, STARTER_GRID_ID, IVec3::new(0, 1, 0));
+            copy_primary_tool_pose_to(&mut runtime, "player-remote");
+            runtime
+                .execute_next_as_for_fixture(
+                    "player-remote",
+                    &ClientMessage::BuildBlock {
+                        operation_sequence: 0,
+                        operation_id: "remote-build-owned-grid".into(),
+                        grid_id: STARTER_GRID_ID.into(),
+                        coordinate: IVec3::new(0, 1, 0),
+                        kind: BlockKind::Structural,
+                        orientation: 0,
+                    },
+                )
+                .expect("secondary owner places a frame using its carried components");
+            let frame_id = runtime.state().grids[STARTER_GRID_ID]
+                .block_at(IVec3::new(0, 1, 0))
+                .expect("secondary frame exists")
+                .block_id
+                .clone();
+            for stage in 0..3 {
+                aim_player_at_block(&mut runtime, STARTER_GRID_ID, &frame_id);
+                copy_primary_tool_pose_to(&mut runtime, "player-remote");
+                runtime
+                    .execute_next_as_for_fixture(
+                        "player-remote",
+                        &ClientMessage::WeldBlock {
+                            operation_sequence: 0,
+                            operation_id: format!("remote-weld-owned-grid-{stage}"),
+                            grid_id: STARTER_GRID_ID.into(),
+                            block_id: frame_id.clone(),
+                        },
+                    )
+                    .expect("secondary owner welds its frame");
+            }
+
+            let local_experience_before = runtime.state().player.primary().experience;
+            aim_player_at_block(&mut runtime, STARTER_GRID_ID, "block-deck-e");
+            runtime
+                .execute_next_as_for_fixture(
+                    "player-local",
+                    &ClientMessage::DamageBlock {
+                        operation_sequence: 0,
+                        operation_id: "primary-damage-foreign-grid".into(),
+                        grid_id: STARTER_GRID_ID.into(),
+                        block_id: "block-deck-e".into(),
+                    },
+                )
+                .expect("non-owner PvP damage remains legal in the unsecured cell");
+
+            let primary = runtime.state().player.primary();
+            let remote = runtime
+                .state()
+                .player
+                .get("player-remote")
+                .expect("secondary actor remains present");
+            assert_eq!(primary.experience, local_experience_before);
+            assert_eq!(primary.career, CareerSnapshot::default());
+            assert_eq!(remote.experience, 55);
+            assert_eq!(remote.career.refining_batches, 1);
+            assert_eq!(remote.career.components_crafted, 1);
+            assert_eq!(remote.career.blocks_built, 1);
+            assert_eq!(
+                runtime.state().grids[STARTER_GRID_ID].owner_player_id,
+                "player-remote"
+            );
+            assert!(runtime.state().conservation().valid);
+            runtime
+                .persist_snapshot()
+                .expect("actor-owned progression snapshot persists");
+            expected_hash = runtime.state().state_hash();
+        }
+
+        let recovered =
+            Runtime::open(directory.path(), 169, 5).expect("actor-owned progression recovers");
+        assert_eq!(recovered.state().state_hash(), expected_hash);
+        assert_eq!(
+            recovered.state().grids[STARTER_GRID_ID].owner_player_id,
+            "player-remote"
+        );
+    }
+
+    fn stationary_player_outcomes(state: &WorldState, step_count: u8) -> Vec<PlayerPhysicsOutcome> {
+        state
+            .player
+            .iter()
+            .filter(|(_, player)| matches!(player.life_state, PlayerLifeState::Alive))
+            .map(|(_, player)| {
+                let resulting_tick = state.simulation_tick + u64::from(step_count);
+                let lease_active = resulting_tick < player.control_expires_at_simulation_tick;
+                PlayerPhysicsOutcome {
+                    player_id: player.player_id.clone(),
+                    position: player.position,
+                    orientation: player.orientation,
+                    linear_velocity: player.linear_velocity,
+                    angular_velocity: player.angular_velocity,
+                    locomotion: player.locomotion.clone(),
+                    surface_contact: false,
+                    control_linear_input: if lease_active {
+                        player.control_linear_input
+                    } else {
+                        Vec3::ZERO
+                    },
+                    control_angular_input: if lease_active {
+                        player.control_angular_input
+                    } else {
+                        Vec3::ZERO
+                    },
+                    boost: player.boost && lease_active,
+                    jump: player.jump && lease_active,
+                    dampeners: player.dampeners || !lease_active,
+                    control_expires_at_simulation_tick: player.control_expires_at_simulation_tick,
+                }
+            })
+            .collect()
+    }
+
+    fn reachable_voxel(runtime: &mut Runtime) -> IVec3 {
+        let coordinate = runtime
             .state()
             .voxels
             .occupied
             .iter()
             .copied()
-            .find(|coordinate| {
-                let position = Vec3::new(
-                    f64::from(coordinate.x),
-                    f64::from(coordinate.y),
-                    f64::from(coordinate.z),
-                );
-                runtime.state().player.position.squared_distance(position)
-                    <= MINING_RANGE * MINING_RANGE
+            .find(|coordinate| exposed_voxel_face(&runtime.state.voxels, *coordinate).is_some())
+            .expect("exposed voxel exists");
+        aim_player_at_voxel(runtime, "player-local", coordinate);
+        coordinate
+    }
+
+    #[test]
+    fn hand_tool_prepare_rejects_nonvisible_targets_and_wrong_build_face_without_mutation() {
+        let mut runtime = runtime();
+        move_player_near_grid(&mut runtime);
+        let assert_rejected_unchanged =
+            |runtime: &mut Runtime, message: ClientMessage, expected_code: &str| {
+                let before_hash = runtime.state().state_hash();
+                let before_sequence = runtime.state().event_sequence;
+                let result = runtime.execute_next_for_fixture(&message);
+                assert!(matches!(
+                    result,
+                    Err(RuntimeError::Intent(IntentError::Rejected { ref code, .. }))
+                        if code == expected_code
+                ));
+                assert_eq!(runtime.state().state_hash(), before_hash);
+                assert_eq!(runtime.state().event_sequence, before_sequence);
+            };
+
+        assert_rejected_unchanged(
+            &mut runtime,
+            ClientMessage::DamageBlock {
+                operation_sequence: 0,
+                operation_id: "occluded-damage-prepare".into(),
+                grid_id: STARTER_GRID_ID.into(),
+                block_id: "block-deck-e".into(),
+            },
+            "block_not_targeted",
+        );
+        assert_rejected_unchanged(
+            &mut runtime,
+            ClientMessage::BuildBlock {
+                operation_sequence: 0,
+                operation_id: "wrong-build-face-prepare".into(),
+                grid_id: STARTER_GRID_ID.into(),
+                coordinate: IVec3::new(0, -1, 0),
+                kind: BlockKind::Structural,
+                orientation: 0,
+            },
+            "build_face_not_targeted",
+        );
+
+        let visible = reachable_voxel(&mut runtime);
+        let different = runtime
+            .state()
+            .voxels
+            .occupied
+            .iter()
+            .copied()
+            .find(|coordinate| *coordinate != visible)
+            .expect("asteroid has another voxel");
+        assert_rejected_unchanged(
+            &mut runtime,
+            ClientMessage::MineVoxel {
+                operation_sequence: 0,
+                operation_id: "occluded-mining-prepare".into(),
+                coordinate: different,
+            },
+            "voxel_not_targeted",
+        );
+    }
+
+    #[test]
+    fn mining_prepare_accepts_exactly_nine_meter_surface_range_and_rejects_beyond_it() {
+        let mut state = runtime().state().clone();
+        state.voxels = VoxelField {
+            occupied: BTreeSet::from([IVec3::ZERO]),
+            ferrite_ore: BTreeSet::new(),
+        };
+        state.grids.clear();
+        let eye_offset = content::manifest().character.eye_height_m
+            - content::manifest().character.standing_height_m * 0.5;
+        state.player.position = Vec3::new(0.0, -eye_offset, 9.5);
+        state.player.orientation = Quat::IDENTITY;
+        state.player.locomotion.kind = LocomotionKind::Airborne;
+        state.player.locomotion.up = Vec3::new(0.0, 1.0, 0.0);
+        state.player.locomotion.view_pitch_radians = 0.0;
+        state
+            .prepare_next_client_event_for_fixture(&ClientMessage::MineVoxel {
+                operation_sequence: 0,
+                operation_id: "exact-nine-meter-surface".into(),
+                coordinate: IVec3::ZERO,
             })
-            .expect("reachable voxel exists")
+            .expect("a surface exactly nine meters from the eye is targetable");
+
+        state.player.position.z += 1.0e-8;
+        let before_hash = state.state_hash();
+        let error = state
+            .prepare_next_client_event_for_fixture(&ClientMessage::MineVoxel {
+                operation_sequence: 0,
+                operation_id: "beyond-nine-meter-surface".into(),
+                coordinate: IVec3::ZERO,
+            })
+            .expect_err("a surface beyond the inclusive range rejects");
+        assert_eq!(error.code(), "voxel_not_targeted");
+        assert_eq!(state.state_hash(), before_hash);
+    }
+
+    #[test]
+    fn hand_tool_replay_rejects_target_and_actor_substitution_before_mutation() {
+        let mut runtime = runtime();
+        runtime
+            .admit_development_player("player-remote")
+            .expect("secondary fixture actor admits");
+        move_player_near_grid(&mut runtime);
+        aim_player_at_block(&mut runtime, STARTER_GRID_ID, "block-core");
+        let state = runtime.state().clone();
+
+        let damage = state
+            .prepare_next_client_event_for_fixture(&ClientMessage::DamageBlock {
+                operation_sequence: 0,
+                operation_id: "canonical-targeted-damage".into(),
+                grid_id: STARTER_GRID_ID.into(),
+                block_id: "block-core".into(),
+            })
+            .expect("visible damage event prepares");
+        let reject = |event: &CanonicalEvent, expected_code: &str, state: &WorldState| {
+            let mut candidate = state.clone();
+            let before_hash = candidate.state_hash();
+            let error = candidate
+                .apply_event(event)
+                .expect_err("forged tool replay rejects");
+            assert_eq!(error.code(), expected_code);
+            assert_eq!(candidate.state_hash(), before_hash);
+        };
+
+        let mut wrong_damage_target = damage.clone();
+        let EventPayload::BlockDamaged { block_id, .. } = &mut wrong_damage_target.payload else {
+            unreachable!();
+        };
+        *block_id = "block-deck-e".into();
+        wrong_damage_target.event_hash = wrong_damage_target.calculate_hash();
+        reject(
+            &wrong_damage_target,
+            "replay_intent_fingerprint_mismatch",
+            &state,
+        );
+
+        let mut wrong_damage_amount = damage.clone();
+        let EventPayload::BlockDamaged {
+            damage: forged_damage,
+            ..
+        } = &mut wrong_damage_amount.payload
+        else {
+            unreachable!();
+        };
+        *forged_damage = 0;
+        wrong_damage_amount.event_hash = wrong_damage_amount.calculate_hash();
+        reject(&wrong_damage_amount, "replay_damage_amount_invalid", &state);
+
+        let mut wrong_damage_actor = damage;
+        wrong_damage_actor.actor_player_id = Some("player-remote".into());
+        wrong_damage_actor.event_hash = wrong_damage_actor.calculate_hash();
+        reject(
+            &wrong_damage_actor,
+            "replay_intent_fingerprint_mismatch",
+            &state,
+        );
+
+        let mut build_runtime = runtime;
+        move_player_near_grid(&mut build_runtime);
+        let build_state = build_runtime.state().clone();
+        let build = build_state
+            .prepare_next_client_event_for_fixture(&ClientMessage::BuildBlock {
+                operation_sequence: 0,
+                operation_id: "canonical-targeted-build".into(),
+                grid_id: STARTER_GRID_ID.into(),
+                coordinate: IVec3::new(0, 1, 0),
+                kind: BlockKind::Structural,
+                orientation: 0,
+            })
+            .expect("visible construction event prepares");
+        let mut wrong_build_face = build.clone();
+        let EventPayload::BlockBuilt { block, .. } = &mut wrong_build_face.payload else {
+            unreachable!();
+        };
+        block.coordinate = IVec3::new(0, -1, 0);
+        wrong_build_face.event_hash = wrong_build_face.calculate_hash();
+        reject(
+            &wrong_build_face,
+            "replay_intent_fingerprint_mismatch",
+            &build_state,
+        );
+
+        let mut wrong_build_actor = build.clone();
+        wrong_build_actor.actor_player_id = Some("player-remote".into());
+        wrong_build_actor.event_hash = wrong_build_actor.calculate_hash();
+        reject(
+            &wrong_build_actor,
+            "replay_intent_fingerprint_mismatch",
+            &build_state,
+        );
+
+        let mut post_build_state = build_state;
+        post_build_state
+            .apply_event(&build)
+            .expect("canonical visible frame replays");
+        let frame_id = post_build_state.grids[STARTER_GRID_ID]
+            .block_at(IVec3::new(0, 1, 0))
+            .expect("frame exists")
+            .block_id
+            .clone();
+        let weld = post_build_state
+            .prepare_next_client_event_for_fixture(&ClientMessage::WeldBlock {
+                operation_sequence: 0,
+                operation_id: "canonical-targeted-weld".into(),
+                grid_id: STARTER_GRID_ID.into(),
+                block_id: frame_id,
+            })
+            .expect("visible weld event prepares");
+        let mut wrong_weld_target = weld;
+        let EventPayload::BlockWelded { block_id, .. } = &mut wrong_weld_target.payload else {
+            unreachable!();
+        };
+        *block_id = "block-core".into();
+        wrong_weld_target.event_hash = wrong_weld_target.calculate_hash();
+        reject(
+            &wrong_weld_target,
+            "replay_intent_fingerprint_mismatch",
+            &post_build_state,
+        );
     }
 
     fn expected_physics_fingerprint(state: &WorldState) -> Vec<(String, Vec<String>)> {
@@ -4227,8 +7073,10 @@ mod tests {
             if block.is_complete() {
                 break;
             }
+            aim_player_at_block(runtime, STARTER_GRID_ID, &block.block_id);
             runtime
-                .execute(&ClientMessage::WeldBlock {
+                .execute_next_for_fixture(&ClientMessage::WeldBlock {
+                    operation_sequence: 0,
                     operation_id: format!("{prefix}-{}", block.health),
                     grid_id: STARTER_GRID_ID.into(),
                     block_id: block.block_id,
@@ -4245,6 +7093,8 @@ mod tests {
     ) -> Grid {
         Grid {
             grid_id: grid_id.into(),
+            owner_player_id: "player-local".into(),
+            anchor_reward_eligible: true,
             position,
             orientation: Quat::IDENTITY,
             linear_velocity,
@@ -4274,10 +7124,34 @@ mod tests {
         runtime.state.simulation_tick = 0;
         runtime.state.physics_step_phase = 0;
         runtime.physics_step_phase = 0;
-        runtime
+        let cargo_links = runtime
             .state
-            .inventories
-            .retain(|inventory_id, _| inventory_id == PLAYER_INVENTORY_ID);
+            .grids
+            .values()
+            .flat_map(|grid| grid.blocks.values())
+            .filter_map(|block| {
+                block
+                    .inventory_id
+                    .as_ref()
+                    .map(|inventory_id| (inventory_id.clone(), block.block_id.clone()))
+            })
+            .collect::<BTreeMap<_, _>>();
+        runtime.state.inventories.retain(|inventory_id, inventory| {
+            matches!(inventory.domain, InventoryDomain::Player { .. })
+                || cargo_links.contains_key(inventory_id)
+        });
+        for (inventory_id, block_id) in cargo_links {
+            runtime
+                .state
+                .inventories
+                .entry(inventory_id.clone())
+                .or_insert_with(|| InventoryRecord {
+                    inventory_id,
+                    domain: InventoryDomain::Cargo { block_id },
+                    contents: InventoryContents::default(),
+                    capacity_liters: CARGO_INVENTORY_CAPACITY_LITERS,
+                });
+        }
         runtime.state.ledger.genesis_installed_components = runtime
             .state
             .grids
@@ -4301,6 +7175,7 @@ mod tests {
         let runtime = runtime();
         let mut state = runtime.state().clone();
         let mut event = state.prepare_system_event(EventPayload::SuitOxygenChanged {
+            player_id: "player-local".into(),
             previous_oxygen_milli: 1_000,
             new_oxygen_milli: 995,
         });
@@ -4344,7 +7219,7 @@ mod tests {
             step_count: 1,
             remaining_step_phase: 0,
             bodies,
-            player: stationary_player_outcome(state, 1),
+            players: stationary_player_outcomes(state, 1),
             contacts: vec![PhysicsContactOutcome {
                 substep_index: 0,
                 body_a_id: STARTER_GRID_ID.into(),
@@ -4426,7 +7301,7 @@ mod tests {
             step_count: 1,
             remaining_step_phase: 0,
             bodies,
-            player: stationary_player_outcome(&state, 1),
+            players: stationary_player_outcomes(&state, 1),
             contacts: Vec::new(),
             active_contacts_after: Vec::new(),
         };
@@ -4493,7 +7368,7 @@ mod tests {
             step_count: 1,
             remaining_step_phase: 0,
             bodies,
-            player: stationary_player_outcome(state, 1),
+            players: stationary_player_outcomes(state, 1),
             contacts: Vec::new(),
             active_contacts_after: Vec::new(),
         };
@@ -4509,81 +7384,63 @@ mod tests {
         };
 
         let mut missing = canonical.clone();
-        let EventPayload::PhysicsStepCommitted { player, .. } = &mut missing else {
+        let EventPayload::PhysicsStepCommitted { players, .. } = &mut missing else {
             unreachable!();
         };
-        *player = None;
+        players.clear();
         reject(missing, "replay_player_physics_presence_invalid");
 
         let mut wrong_id = canonical.clone();
-        let EventPayload::PhysicsStepCommitted {
-            player: Some(player),
-            ..
-        } = &mut wrong_id
-        else {
+        let EventPayload::PhysicsStepCommitted { players, .. } = &mut wrong_id else {
             unreachable!();
         };
+        let player = &mut players[0];
         player.player_id.push_str("-forged");
         reject(wrong_id, "replay_player_physics_identity_invalid");
 
         let mut non_finite = canonical.clone();
-        let EventPayload::PhysicsStepCommitted {
-            player: Some(player),
-            ..
-        } = &mut non_finite
-        else {
+        let EventPayload::PhysicsStepCommitted { players, .. } = &mut non_finite else {
             unreachable!();
         };
+        let player = &mut players[0];
         player.position.x = f64::NAN;
         reject(non_finite, "invalid_vector");
 
         let mut zero_rotation = canonical.clone();
-        let EventPayload::PhysicsStepCommitted {
-            player: Some(player),
-            ..
-        } = &mut zero_rotation
-        else {
+        let EventPayload::PhysicsStepCommitted { players, .. } = &mut zero_rotation else {
             unreachable!();
         };
+        let player = &mut players[0];
         player.orientation = Quat::new(0.0, 0.0, 0.0, 0.0);
         reject(zero_rotation, "replay_player_physics_rotation_invalid");
 
         let mut over_speed = canonical.clone();
-        let EventPayload::PhysicsStepCommitted {
-            player: Some(player),
-            ..
-        } = &mut over_speed
-        else {
+        let EventPayload::PhysicsStepCommitted { players, .. } = &mut over_speed else {
             unreachable!();
         };
+        let player = &mut players[0];
         player.linear_velocity = Vec3::new(32.001, 0.0, 0.0);
         reject(over_speed, "replay_player_physics_velocity_invalid");
 
         let mut teleported = canonical.clone();
-        let EventPayload::PhysicsStepCommitted {
-            player: Some(player),
-            ..
-        } = &mut teleported
-        else {
+        let EventPayload::PhysicsStepCommitted { players, .. } = &mut teleported else {
             unreachable!();
         };
+        let player = &mut players[0];
         player.position.x += 10.0;
         reject(teleported, "replay_player_physics_translation_invalid");
 
         let mut spun = canonical.clone();
-        let EventPayload::PhysicsStepCommitted {
-            player: Some(player),
-            ..
-        } = &mut spun
-        else {
+        let EventPayload::PhysicsStepCommitted { players, .. } = &mut spun else {
             unreachable!();
         };
+        let player = &mut players[0];
         player.orientation = Quat::new(0.0, 0.0, 1.0, 0.0);
         reject(spun, "replay_player_physics_rotation_continuity_invalid");
 
         let mut impossible_contact = canonical.clone();
         let EventPayload::PhysicsStepCommitted {
-            player: Some(player),
+            players,
             contacts,
             active_contacts_after,
             ..
@@ -4591,6 +7448,7 @@ mod tests {
         else {
             unreachable!();
         };
+        let player = &mut players[0];
         let key = ContactPairKey {
             body_a: PLANET_BODY_ID.into(),
             collider_a: PLANET_COLLIDER_ID.into(),
@@ -4627,7 +7485,7 @@ mod tests {
         let voxel_collider = voxel_collision_collider_id(voxel);
         let mut wrong_voxel_geometry = canonical.clone();
         let EventPayload::PhysicsStepCommitted {
-            player: Some(player),
+            players,
             contacts,
             active_contacts_after,
             ..
@@ -4635,6 +7493,7 @@ mod tests {
         else {
             unreachable!();
         };
+        let player = &mut players[0];
         let key = ContactPairKey {
             body_a: PLAYER_BODY_ID.into(),
             collider_a: PLAYER_COLLIDER_ID.into(),
@@ -4668,7 +7527,7 @@ mod tests {
 
         let mut wrong_grid_geometry = canonical.clone();
         let EventPayload::PhysicsStepCommitted {
-            player: Some(player),
+            players,
             contacts,
             active_contacts_after,
             ..
@@ -4676,6 +7535,7 @@ mod tests {
         else {
             unreachable!();
         };
+        let player = &mut players[0];
         let key = ContactPairKey {
             body_a: STARTER_GRID_ID.into(),
             collider_a: "block-core".into(),
@@ -4708,48 +7568,157 @@ mod tests {
         );
 
         let mut wrong_control = canonical.clone();
-        let EventPayload::PhysicsStepCommitted {
-            player: Some(player),
-            ..
-        } = &mut wrong_control
-        else {
+        let EventPayload::PhysicsStepCommitted { players, .. } = &mut wrong_control else {
             unreachable!();
         };
+        let player = &mut players[0];
         player.boost = true;
         reject(wrong_control, "replay_player_physics_control_invalid");
 
         let mut wrong_locomotion = canonical.clone();
-        let EventPayload::PhysicsStepCommitted {
-            player: Some(player),
-            ..
-        } = &mut wrong_locomotion
-        else {
+        let EventPayload::PhysicsStepCommitted { players, .. } = &mut wrong_locomotion else {
             unreachable!();
         };
+        let player = &mut players[0];
         player.locomotion.kind = LocomotionKind::Grounded;
         reject(wrong_locomotion, "replay_player_locomotion_invalid");
 
         let mut wrong_jump = canonical.clone();
-        let EventPayload::PhysicsStepCommitted {
-            player: Some(player),
-            ..
-        } = &mut wrong_jump
-        else {
+        let EventPayload::PhysicsStepCommitted { players, .. } = &mut wrong_jump else {
             unreachable!();
         };
+        let player = &mut players[0];
         player.jump = true;
         reject(wrong_jump, "replay_player_physics_control_invalid");
 
         let mut wrong_contact = canonical;
-        let EventPayload::PhysicsStepCommitted {
-            player: Some(player),
-            ..
-        } = &mut wrong_contact
-        else {
+        let EventPayload::PhysicsStepCommitted { players, .. } = &mut wrong_contact else {
             unreachable!();
         };
+        let player = &mut players[0];
         player.surface_contact = true;
         reject(wrong_contact, "replay_player_surface_contact_invalid");
+    }
+
+    #[test]
+    fn replay_rejects_character_to_character_contacts_before_mutation() {
+        let runtime = runtime();
+        let mut state = runtime.state().clone();
+        let mut second_player = state.player.primary().clone();
+        second_player.player_id = "player-remote".into();
+        second_player.inventory_id = "inventory-player-remote".into();
+        second_player.position.x += 4.0;
+        state
+            .player
+            .by_id
+            .insert(second_player.player_id.clone(), second_player);
+        let before_hash = state.state_hash();
+        let local_body = player_body_id("player-local");
+        let local_collider = player_collider_id("player-local");
+        let remote_body = player_body_id("player-remote");
+        let remote_collider = player_collider_id("player-remote");
+        let contact_key = ContactPairKey {
+            body_a: local_body.clone(),
+            collider_a: local_collider.clone(),
+            body_b: remote_body.clone(),
+            collider_b: remote_collider.clone(),
+        };
+        let event = state.prepare_system_event(EventPayload::PhysicsStepCommitted {
+            fixed_step_hz: content::manifest().physics.fixed_step_hz,
+            step_count: 1,
+            remaining_step_phase: 0,
+            bodies: state
+                .grids
+                .values()
+                .map(|grid| PhysicsBodyOutcome {
+                    grid_id: grid.grid_id.clone(),
+                    position: grid.position,
+                    orientation: grid.orientation,
+                    linear_velocity: grid.linear_velocity,
+                    angular_velocity: grid.angular_velocity,
+                })
+                .collect(),
+            players: stationary_player_outcomes(&state, 1),
+            contacts: vec![PhysicsContactOutcome {
+                substep_index: 0,
+                body_a_id: local_body.clone(),
+                collider_a_id: local_collider,
+                body_b_id: remote_body.clone(),
+                collider_b_id: remote_collider,
+                point: state.player.position,
+                normal: Vec3::new(1.0, 0.0, 0.0),
+                penetration_m: 0.0,
+                closing_speed_mm_per_second: 0,
+                estimated_normal_impulse_millinewton_seconds: 0,
+                reduced_translational_mass_grams: reduced_translational_contact_mass_grams(
+                    &state,
+                    &local_body,
+                    &remote_body,
+                ),
+                phase: PhysicsContactPhase::Began,
+            }],
+            active_contacts_after: vec![contact_key],
+        });
+        let mut replay = state.clone();
+
+        let error = replay
+            .apply_event(&event)
+            .expect_err("character-to-character contacts must not enter canonical replay");
+
+        assert_eq!(error.code(), "replay_character_contact_forbidden");
+        assert_eq!(replay.state_hash(), before_hash);
+    }
+
+    #[test]
+    fn two_player_physics_commits_in_order_and_recovers_exactly() {
+        let directory = tempdir().expect("tempdir");
+        let mut runtime = Runtime::open(directory.path(), 67, 1_000).expect("runtime opens");
+        add_remote_player(&mut runtime);
+        runtime
+            .persist_snapshot()
+            .expect("two-player baseline persists");
+        let prior_state = runtime.state.clone();
+
+        assert!(runtime.advance(17).expect("shared physics step commits"));
+        assert!(!runtime.is_halted());
+        let committed_hash = runtime.state().state_hash();
+        let journal = fs::read_to_string(directory.path().join("events.ndjson"))
+            .expect("shared physics journal reads");
+        let event: CanonicalEvent = serde_json::from_str(
+            journal
+                .lines()
+                .last()
+                .expect("shared physics event is durable"),
+        )
+        .expect("shared physics event decodes");
+        let EventPayload::PhysicsStepCommitted { players, .. } = &event.payload else {
+            panic!("shared step must commit a physics outcome");
+        };
+        assert_eq!(
+            players
+                .iter()
+                .map(|player| player.player_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["player-local", "player-remote"]
+        );
+
+        let mut reversed = event.clone();
+        let EventPayload::PhysicsStepCommitted { players, .. } = &mut reversed.payload else {
+            unreachable!();
+        };
+        players.reverse();
+        reversed.event_hash = reversed.calculate_hash();
+        let mut replay = prior_state.clone();
+        let error = replay
+            .apply_event(&reversed)
+            .expect_err("noncanonical player outcome order rejects");
+        assert_eq!(error.code(), "replay_player_physics_order_invalid");
+        assert_eq!(replay.state_hash(), prior_state.state_hash());
+
+        drop(runtime);
+        let recovered = Runtime::open(directory.path(), 67, 1_000).expect("runtime recovers");
+        assert_eq!(recovered.state().state_hash(), committed_hash);
+        assert_eq!(recovered.snapshot().players.len(), 2);
     }
 
     #[test]
@@ -4779,7 +7748,7 @@ mod tests {
             step_count: 1,
             remaining_step_phase: 0,
             bodies,
-            player: stationary_player_outcome(state, 1),
+            players: stationary_player_outcomes(state, 1),
             contacts: Vec::new(),
             active_contacts_after: Vec::new(),
         });
@@ -4793,18 +7762,24 @@ mod tests {
 
     #[test]
     fn replay_rejects_a_full_integrity_no_op_weld_without_awarding_experience() {
-        let runtime = runtime();
+        let mut runtime = runtime();
+        move_player_near_grid(&mut runtime);
+        aim_player_at_block(&mut runtime, STARTER_GRID_ID, "block-core");
         let mut state = runtime.state().clone();
         let before_hash = state.state_hash();
         let max_health = state.grids[STARTER_GRID_ID].blocks["block-core"].max_health();
-        let event = state.prepare_system_event(EventPayload::BlockWelded {
-            grid_id: STARTER_GRID_ID.into(),
-            block_id: "block-core".into(),
-            previous_health: max_health,
-            new_health: max_health,
-            max_health,
-            completed_construction: false,
-        });
+        let event = state.new_test_human_event(
+            "player-local",
+            "replayed-full-weld",
+            EventPayload::BlockWelded {
+                grid_id: STARTER_GRID_ID.into(),
+                block_id: "block-core".into(),
+                previous_health: max_health,
+                new_health: max_health,
+                max_health,
+                completed_construction: false,
+            },
+        );
 
         let error = state
             .apply_event(&event)
@@ -4820,7 +7795,8 @@ mod tests {
         move_player_near_grid(&mut runtime);
         let state = runtime.state().clone();
         let canonical = state
-            .prepare_client_event(&ClientMessage::BuildBlock {
+            .prepare_next_client_event_for_fixture(&ClientMessage::BuildBlock {
+                operation_sequence: 0,
                 operation_id: "canonical-replay-frame".into(),
                 grid_id: STARTER_GRID_ID.into(),
                 coordinate: IVec3::new(0, 1, 0),
@@ -4876,25 +7852,380 @@ mod tests {
     #[test]
     fn mining_retry_is_idempotent() {
         let mut runtime = runtime();
-        let target = reachable_voxel(&runtime);
+        let target = reachable_voxel(&mut runtime);
         let body_id = voxel_collision_chunk_body_id(voxel_collision_chunk_coordinate(target));
         let collider_id = voxel_collision_collider_id(target);
         assert!(runtime.physics.contains_collider(&body_id, &collider_id));
         let intent = ClientMessage::MineVoxel {
+            operation_sequence: 0,
             operation_id: "mine-once".into(),
             coordinate: target,
         };
-        let first = runtime.execute(&intent).expect("first mine accepted");
+        let first = runtime
+            .execute_next_for_fixture(&intent)
+            .expect("first mine accepted");
         assert_eq!(runtime.physics_chunk_replacements, 1);
         assert_eq!(runtime.physics_full_rebuilds, 0);
         assert!(!runtime.physics.contains_collider(&body_id, &collider_id));
         let hash_after_first = runtime.state().state_hash();
-        let second = runtime.execute(&intent).expect("retry accepted");
+        let second = runtime
+            .execute_next_for_fixture(&intent)
+            .expect("retry accepted");
         assert_eq!(first, second);
         assert_eq!(hash_after_first, runtime.state().state_hash());
         assert_eq!(runtime.physics_chunk_replacements, 1);
         assert_eq!(runtime.physics_full_rebuilds, 0);
         assert!(runtime.state().conservation().valid);
+    }
+
+    #[test]
+    fn authenticated_secondary_mining_credits_only_its_actor_and_recovers_exactly() {
+        let directory = tempdir().expect("tempdir");
+        let mut runtime = Runtime::open(directory.path(), 141, 1_000).expect("runtime opens");
+        runtime
+            .admit_development_player("player-remote")
+            .expect("remote development player admits");
+        let primary_position = runtime
+            .state()
+            .player
+            .get("player-local")
+            .expect("primary player exists")
+            .position;
+        let target = runtime
+            .state()
+            .voxels
+            .occupied
+            .iter()
+            .copied()
+            .find(|coordinate| {
+                let position = Vec3::new(
+                    f64::from(coordinate.x),
+                    f64::from(coordinate.y),
+                    f64::from(coordinate.z),
+                );
+                primary_position.squared_distance(position)
+                    > TOOL_SURFACE_RANGE_M * TOOL_SURFACE_RANGE_M
+                    && exposed_voxel_face(&runtime.state.voxels, *coordinate).is_some()
+            })
+            .expect("asteroid has a voxel outside primary mining range");
+        aim_player_at_voxel(&mut runtime, "player-remote", target);
+        runtime
+            .persist_snapshot()
+            .expect("remote mining baseline persists");
+
+        let material = runtime
+            .state()
+            .voxels
+            .material(target)
+            .expect("target voxel exists");
+        let ore_yield = content::voxel(material).ore_yield;
+        let primary_before = runtime
+            .state()
+            .player
+            .get("player-local")
+            .expect("primary player exists")
+            .clone();
+        let primary_inventory_before = runtime.state().inventories[&primary_before.inventory_id]
+            .contents
+            .clone();
+        let remote_before = runtime
+            .state()
+            .player
+            .get("player-remote")
+            .expect("remote player exists")
+            .clone();
+        let intent = ClientMessage::MineVoxel {
+            operation_sequence: 0,
+            operation_id: "shared-mining-operation".into(),
+            coordinate: target,
+        };
+
+        let receipt = runtime
+            .execute_next_as_for_fixture("player-remote", &intent)
+            .expect("authenticated remote actor mines reachable voxel");
+        assert_eq!(receipt.code, "voxel_mined");
+        assert_eq!(runtime.state().voxels.material(target), None);
+        assert_eq!(
+            runtime.state().inventories[&remote_before.inventory_id]
+                .contents
+                .ore,
+            ore_yield
+        );
+        let remote_after = runtime
+            .state()
+            .player
+            .get("player-remote")
+            .expect("remote player remains present")
+            .clone();
+        assert_eq!(
+            remote_after.experience,
+            remote_before.experience + ore_yield * 5
+        );
+        assert_eq!(
+            remote_after.career.voxels_mined,
+            remote_before.career.voxels_mined + 1
+        );
+        assert_eq!(
+            runtime
+                .state()
+                .player
+                .get("player-local")
+                .expect("primary player remains present"),
+            &primary_before
+        );
+        assert_eq!(
+            runtime.state().inventories[&primary_before.inventory_id].contents,
+            primary_inventory_before
+        );
+        assert_eq!(
+            runtime
+                .state()
+                .processed_operation("player-remote", "shared-mining-operation"),
+            Some(&receipt)
+        );
+        assert!(
+            runtime
+                .state()
+                .processed_operation("player-local", "shared-mining-operation")
+                .is_none()
+        );
+        let journal = fs::read_to_string(directory.path().join("events.ndjson"))
+            .expect("mining journal reads");
+        let event: CanonicalEvent = serde_json::from_str(
+            journal
+                .lines()
+                .last()
+                .expect("mining event is durably journaled"),
+        )
+        .expect("mining event parses");
+        assert_eq!(event.actor_player_id.as_deref(), Some("player-remote"));
+        assert!(matches!(
+            event.payload,
+            EventPayload::VoxelMined { ref inventory_id, .. }
+                if inventory_id == &remote_before.inventory_id
+        ));
+        let accepted_hash = runtime.state().state_hash();
+        assert_eq!(
+            runtime
+                .execute_next_as_for_fixture("player-remote", &intent)
+                .expect("remote mining retry is idempotent"),
+            receipt
+        );
+        assert_eq!(runtime.state().state_hash(), accepted_hash);
+        assert!(runtime.state().conservation().valid);
+
+        drop(runtime);
+        let recovered = Runtime::open(directory.path(), 141, 1_000).expect("runtime recovers");
+        assert_eq!(recovered.state().state_hash(), accepted_hash);
+        assert_eq!(
+            recovered
+                .state()
+                .player
+                .get("player-remote")
+                .expect("remote actor recovers"),
+            &remote_after
+        );
+        assert_eq!(
+            recovered
+                .state()
+                .player
+                .get("player-local")
+                .expect("primary actor recovers"),
+            &primary_before
+        );
+    }
+
+    #[test]
+    fn secondary_mining_rejections_are_exactly_non_mutating() {
+        let directory = tempdir().expect("tempdir");
+        let mut runtime = Runtime::open(directory.path(), 142, 1_000).expect("runtime opens");
+        runtime
+            .admit_development_player("player-remote")
+            .expect("remote development player admits");
+        let out_of_range_target = runtime
+            .state()
+            .voxels
+            .occupied
+            .iter()
+            .copied()
+            .max_by(|left, right| {
+                let remote_position = runtime
+                    .state()
+                    .player
+                    .get("player-remote")
+                    .expect("remote exists")
+                    .position;
+                let distance = |coordinate: &IVec3| {
+                    remote_position.squared_distance(Vec3::new(
+                        f64::from(coordinate.x),
+                        f64::from(coordinate.y),
+                        f64::from(coordinate.z),
+                    ))
+                };
+                distance(left).total_cmp(&distance(right))
+            })
+            .expect("asteroid has voxels");
+        let assert_unchanged =
+            |runtime: &mut Runtime, operation_id: &str, coordinate: IVec3, expected_code: &str| {
+                let before_hash = runtime.state().state_hash();
+                let before_sequence = runtime.state().event_sequence;
+                let before_fingerprint = runtime.physics.body_collider_fingerprint();
+                let before_journal = fs::read(directory.path().join("events.ndjson"))
+                    .expect("journal reads before rejection");
+                let result = runtime.execute_next_as_for_fixture(
+                    "player-remote",
+                    &ClientMessage::MineVoxel {
+                        operation_sequence: 0,
+                        operation_id: operation_id.into(),
+                        coordinate,
+                    },
+                );
+                assert!(matches!(
+                    result,
+                    Err(RuntimeError::Intent(IntentError::Rejected { ref code, .. }))
+                        if code == expected_code
+                ));
+                assert_eq!(runtime.state().state_hash(), before_hash);
+                assert_eq!(runtime.state().event_sequence, before_sequence);
+                assert_eq!(
+                    runtime.physics.body_collider_fingerprint(),
+                    before_fingerprint
+                );
+                assert_eq!(
+                    fs::read(directory.path().join("events.ndjson"))
+                        .expect("journal reads after rejection"),
+                    before_journal
+                );
+                assert!(
+                    runtime
+                        .state()
+                        .processed_operation("player-remote", operation_id)
+                        .is_none()
+                );
+            };
+        assert_unchanged(
+            &mut runtime,
+            "remote-mine-out-of-range",
+            out_of_range_target,
+            "voxel_not_targeted",
+        );
+
+        let reachable_target = *runtime
+            .state()
+            .voxels
+            .occupied
+            .iter()
+            .next()
+            .expect("asteroid has a reachable fixture voxel");
+        let reachable_position = Vec3::new(
+            f64::from(reachable_target.x),
+            f64::from(reachable_target.y),
+            f64::from(reachable_target.z),
+        );
+        let remote = runtime
+            .state
+            .player
+            .get_mut("player-remote")
+            .expect("remote player exists");
+        remote.position = reachable_position + Vec3::new(0.0, 3.0, 0.0);
+        remote.life_state = PlayerLifeState::Incapacitated {
+            death_id: "remote-test-death".into(),
+            cause: PlayerDeathCause::OxygenDepleted,
+        };
+        runtime
+            .physics
+            .rebuild(&physics_body_specs(&runtime.state))
+            .expect("incapacitated fixture physics builds");
+        runtime
+            .persist_snapshot()
+            .expect("incapacitated mining baseline persists");
+        assert_unchanged(
+            &mut runtime,
+            "remote-mine-incapacitated",
+            reachable_target,
+            "player_incapacitated",
+        );
+    }
+
+    #[test]
+    fn replay_rejects_cross_actor_mining_inventory_spoof_without_mutation() {
+        let mut runtime = runtime();
+        runtime
+            .admit_development_player("player-remote")
+            .expect("remote development player admits");
+        let primary_position = runtime.state().player.primary().position;
+        let target = runtime
+            .state()
+            .voxels
+            .occupied
+            .iter()
+            .copied()
+            .find(|coordinate| {
+                primary_position.squared_distance(Vec3::new(
+                    f64::from(coordinate.x),
+                    f64::from(coordinate.y),
+                    f64::from(coordinate.z),
+                )) > TOOL_SURFACE_RANGE_M * TOOL_SURFACE_RANGE_M
+                    && exposed_voxel_face(&runtime.state.voxels, *coordinate).is_some()
+            })
+            .expect("asteroid has a fixture voxel outside primary mining range");
+        aim_player_at_voxel(&mut runtime, "player-remote", target);
+        let canonical_event = runtime
+            .state()
+            .prepare_next_client_event_as_for_fixture(
+                "player-remote",
+                &ClientMessage::MineVoxel {
+                    operation_sequence: 0,
+                    operation_id: "forged-mining-owner".into(),
+                    coordinate: target,
+                },
+            )
+            .expect("canonical remote mining event prepares");
+        let primary_inventory_id = runtime.state().player.primary().inventory_id.clone();
+        let assert_replay_rejected_without_mutation =
+            |event: &CanonicalEvent, expected_code: &str| {
+                let mut candidate = runtime.state().clone();
+                let before_hash = candidate.state_hash();
+                let result = candidate.apply_event(event);
+                assert!(matches!(
+                    result,
+                    Err(IntentError::Rejected { ref code, .. }) if code == expected_code
+                ));
+                assert_eq!(candidate.state_hash(), before_hash);
+                assert!(candidate.voxels.material(target).is_some());
+                assert_eq!(candidate.inventories[&primary_inventory_id].contents.ore, 0);
+                assert_eq!(
+                    candidate.inventories["inventory-player-remote"]
+                        .contents
+                        .ore,
+                    0
+                );
+            };
+
+        let mut event = canonical_event.clone();
+        let EventPayload::VoxelMined { inventory_id, .. } = &mut event.payload else {
+            unreachable!("mining intent prepares a mining event")
+        };
+        inventory_id.clone_from(&primary_inventory_id);
+        event.event_hash = event.calculate_hash();
+        assert_replay_rejected_without_mutation(&event, "replay_mining_actor_inventory_invalid");
+
+        let mut event = canonical_event.clone();
+        event.actor_player_id = Some("player-local".into());
+        let EventPayload::VoxelMined { inventory_id, .. } = &mut event.payload else {
+            unreachable!("mining intent prepares a mining event")
+        };
+        inventory_id.clone_from(&primary_inventory_id);
+        event.event_hash = event.calculate_hash();
+        assert_replay_rejected_without_mutation(&event, "replay_intent_fingerprint_mismatch");
+
+        let mut event = canonical_event;
+        let EventPayload::VoxelMined { ore_yield, .. } = &mut event.payload else {
+            unreachable!("mining intent prepares a mining event")
+        };
+        *ore_yield = ore_yield.saturating_add(1);
+        event.event_hash = event.calculate_hash();
+        assert_replay_rejected_without_mutation(&event, "replay_mining_yield_invalid");
     }
 
     #[test]
@@ -4966,9 +8297,10 @@ mod tests {
             .copied()
             .find(|coordinate| {
                 let chunk = voxel_collision_chunk_coordinate(*coordinate);
-                state.voxels.occupied.iter().any(|other| {
-                    *other != *coordinate && voxel_collision_chunk_coordinate(*other) == chunk
-                })
+                exposed_voxel_face(&state.voxels, *coordinate).is_some()
+                    && state.voxels.occupied.iter().any(|other| {
+                        *other != *coordinate && voxel_collision_chunk_coordinate(*other) == chunk
+                    })
             })
             .expect("target has a surviving chunk neighbor");
         let survivor = state
@@ -4982,10 +8314,16 @@ mod tests {
                         == voxel_collision_chunk_coordinate(target)
             })
             .expect("surviving collider exists");
-        state.player.position = Vec3::new(
+        let target_position = Vec3::new(
             f64::from(target.x),
             f64::from(target.y),
             f64::from(target.z),
+        );
+        let face = exposed_voxel_face(&state.voxels, target).unwrap();
+        aim_player_from_face(
+            state.player.primary_mut(),
+            target_position,
+            Vec3::new(f64::from(face.x), f64::from(face.y), f64::from(face.z)),
         );
         let body_id = voxel_collision_chunk_body_id(voxel_collision_chunk_coordinate(target));
         let collider_id = voxel_collision_collider_id(target);
@@ -5013,7 +8351,8 @@ mod tests {
             survivor_pair.clone(),
         ]);
         let event = state
-            .prepare_client_event(&ClientMessage::MineVoxel {
+            .prepare_next_client_event_for_fixture(&ClientMessage::MineVoxel {
+                operation_sequence: 0,
                 operation_id: "prune-mined-contact".into(),
                 coordinate: target,
             })
@@ -5052,7 +8391,8 @@ mod tests {
         runtime.relocate_player_for_test(Vec3::new(0.0, 3.0, 0.0));
         runtime.persist_snapshot().expect("player pose persists");
         runtime
-            .execute(&ClientMessage::SetGridControl {
+            .execute_next_for_fixture(&ClientMessage::SetGridControl {
+                operation_sequence: 0,
                 operation_id: "settle-on-two-voxels".into(),
                 grid_id: "resting-grid".into(),
                 linear_input: Vec3::new(0.0, -0.2, 0.0),
@@ -5083,8 +8423,11 @@ mod tests {
             .cloned()
             .expect("surviving pair is active");
 
+        aim_player_at_voxel(&mut runtime, "player-local", target);
+
         runtime
-            .execute(&ClientMessage::MineVoxel {
+            .execute_next_for_fixture(&ClientMessage::MineVoxel {
+                operation_sequence: 0,
                 operation_id: "mine-one-contact-leaf".into(),
                 coordinate: target,
             })
@@ -5152,7 +8495,7 @@ mod tests {
                 ferrite_ore: BTreeSet::new(),
             },
         );
-        runtime.state.player.position = Vec3::new(0.0, 0.0, 3.0);
+        aim_player_at_voxel(&mut runtime, "player-local", target);
         runtime.persist_snapshot().expect("player pose persists");
         assert!(runtime.state().grids["anchored-grid"].anchor_touches(&runtime.state().voxels));
         let before_hash = runtime.state().state_hash();
@@ -5160,7 +8503,8 @@ mod tests {
         let before_journal =
             fs::read(directory.path().join("events.ndjson")).expect("journal reads");
 
-        let result = runtime.execute(&ClientMessage::MineVoxel {
+        let result = runtime.execute_next_for_fixture(&ClientMessage::MineVoxel {
+            operation_sequence: 0,
             operation_id: "mine-final-anchor-support".into(),
             coordinate: target,
         });
@@ -5177,10 +8521,10 @@ mod tests {
         assert_eq!(runtime.physics_chunk_replacements, 0);
         assert_eq!(runtime.physics_full_rebuilds, 0);
         assert!(
-            !runtime
+            runtime
                 .state()
-                .processed_operations
-                .contains_key("mine-final-anchor-support")
+                .processed_operation("player-local", "mine-final-anchor-support")
+                .is_none()
         );
         assert_eq!(
             fs::read(directory.path().join("events.ndjson")).expect("journal rereads"),
@@ -5199,14 +8543,19 @@ mod tests {
             .cloned()
             .expect("cargo inventory");
         let intent = ClientMessage::TransferInventory {
+            operation_sequence: 0,
             operation_id: "transfer-components".into(),
             source_inventory_id: PLAYER_INVENTORY_ID.into(),
             destination_inventory_id: cargo_id.clone(),
             resource: ResourceKind::Component,
             quantity: 4,
         };
-        runtime.execute(&intent).expect("transfer accepted");
-        runtime.execute(&intent).expect("retry returns receipt");
+        runtime
+            .execute_next_for_fixture(&intent)
+            .expect("transfer accepted");
+        runtime
+            .execute_next_for_fixture(&intent)
+            .expect("retry returns receipt");
         assert_eq!(
             runtime.state().inventories[PLAYER_INVENTORY_ID]
                 .contents
@@ -5232,7 +8581,8 @@ mod tests {
                 .cloned()
                 .expect("cargo inventory");
             runtime
-                .execute(&ClientMessage::TransferInventory {
+                .execute_next_for_fixture(&ClientMessage::TransferInventory {
+                    operation_sequence: 0,
                     operation_id: format!("property-transfer-{quantity}"),
                     source_inventory_id: PLAYER_INVENTORY_ID.into(),
                     destination_inventory_id: cargo_id.clone(),
@@ -5258,7 +8608,8 @@ mod tests {
     #[test]
     fn character_control_rejects_wrong_epoch_out_of_order_and_unbounded_input() {
         let mut runtime = runtime();
-        let result = runtime.execute(&ClientMessage::SetPlayerControl {
+        let result = runtime.execute_next_for_fixture(&ClientMessage::SetPlayerControl {
+            operation_sequence: 0,
             operation_id: "wrong-epoch".into(),
             movement_epoch: 0,
             input_sequence: 1,
@@ -5287,7 +8638,8 @@ mod tests {
                 Vec3::new(0.0, f64::INFINITY, 0.0),
             ),
         ] {
-            let result = runtime.execute(&ClientMessage::SetPlayerControl {
+            let result = runtime.execute_next_for_fixture(&ClientMessage::SetPlayerControl {
+                operation_sequence: 0,
                 operation_id: operation_id.into(),
                 movement_epoch: 1,
                 input_sequence: 1,
@@ -5305,7 +8657,8 @@ mod tests {
             assert_eq!(runtime.state().event_sequence, 0);
         }
 
-        let result = runtime.execute(&ClientMessage::SetPlayerControl {
+        let result = runtime.execute_next_for_fixture(&ClientMessage::SetPlayerControl {
+            operation_sequence: 0,
             operation_id: "unbounded-control".into(),
             movement_epoch: 1,
             input_sequence: 1,
@@ -5323,6 +8676,7 @@ mod tests {
         assert_eq!(runtime.state().event_sequence, 0);
 
         let accepted_control = ClientMessage::SetPlayerControl {
+            operation_sequence: 0,
             operation_id: "control-1".into(),
             movement_epoch: 1,
             input_sequence: 1,
@@ -5333,14 +8687,15 @@ mod tests {
             dampeners: false,
         };
         let first_receipt = runtime
-            .execute(&accepted_control)
+            .execute_next_for_fixture(&accepted_control)
             .expect("bounded in-order control is accepted");
         let retry_receipt = runtime
-            .execute(&accepted_control)
+            .execute_next_for_fixture(&accepted_control)
             .expect("same operation retry returns its durable receipt");
         assert_eq!(retry_receipt, first_receipt);
         assert_eq!(runtime.state().event_sequence, 1);
-        let result = runtime.execute(&ClientMessage::SetPlayerControl {
+        let result = runtime.execute_next_for_fixture(&ClientMessage::SetPlayerControl {
+            operation_sequence: 0,
             operation_id: "control-reordered".into(),
             movement_epoch: 1,
             input_sequence: 1,
@@ -5363,13 +8718,62 @@ mod tests {
         assert!(runtime.state().conservation().valid);
     }
 
+    proptest! {
+        #[test]
+        fn godot_float32_mouse_and_roll_vectors_survive_json_reconstruction(
+            mouse_x in -32_768_i32..=32_767,
+            mouse_y in -32_768_i32..=32_767,
+            roll in -1_i8..=1,
+        ) {
+            // This mirrors Godot's standard float32 Vector3 limit_length(1.0)
+            // before serde reconstructs the JSON components as float64.
+            let mut x = -(mouse_y as f32) * 0.12_f32;
+            let mut y = -(mouse_x as f32) * 0.12_f32;
+            let mut z = f32::from(roll);
+            let magnitude = (x * x + y * y + z * z).sqrt();
+            if magnitude > 1.0 {
+                let scale = 1.0_f32 / magnitude;
+                x *= scale;
+                y *= scale;
+                z *= scale;
+            }
+            let reconstructed = Vec3::new(f64::from(x), f64::from(y), f64::from(z));
+
+            prop_assert!(
+                ensure_bounded_control(reconstructed, "Godot reconstructed control").is_ok(),
+                "float32-valid source magnitude {} was rejected",
+                reconstructed.magnitude(),
+            );
+            prop_assert!(
+                reconstructed.magnitude()
+                    <= MAX_GRID_CONTROL_INPUT + CONTROL_INPUT_SOURCE_PRECISION_EPSILON
+            );
+        }
+    }
+
+    #[test]
+    fn control_precision_tolerance_does_not_admit_materially_unbounded_input() {
+        let source_precision_boundary = Vec3::new(
+            MAX_GRID_CONTROL_INPUT + CONTROL_INPUT_SOURCE_PRECISION_EPSILON,
+            0.0,
+            0.0,
+        );
+        assert!(ensure_bounded_control(source_precision_boundary, "boundary control").is_ok());
+        assert!(matches!(
+            ensure_bounded_control(Vec3::new(1.000_01, 0.0, 0.0), "materially unbounded"),
+            Err(IntentError::Rejected { ref code, .. })
+                if code == "control_input_out_of_range"
+        ));
+    }
+
     #[test]
     fn one_frame_press_and_release_are_consumed_on_successive_fixed_steps() {
         let mut runtime = runtime();
         let initial_orientation = runtime.state().player.orientation;
         for (input_sequence, angular_input) in [(1, Vec3::new(0.0, 0.0, 1.0)), (2, Vec3::ZERO)] {
             runtime
-                .execute(&ClientMessage::SetPlayerControl {
+                .execute_next_for_fixture(&ClientMessage::SetPlayerControl {
+                    operation_sequence: 0,
                     operation_id: format!("tap-{input_sequence}"),
                     movement_epoch: 1,
                     input_sequence,
@@ -5416,7 +8820,8 @@ mod tests {
                     [(1, Vec3::new(0.0, 0.0, 1.0)), (2, Vec3::ZERO)]
                 {
                     runtime
-                        .execute(&ClientMessage::SetPlayerControl {
+                        .execute_next_for_fixture(&ClientMessage::SetPlayerControl {
+                            operation_sequence: 0,
                             operation_id: format!("restart-tap-{snapshot_every}-{input_sequence}"),
                             movement_epoch: 1,
                             input_sequence,
@@ -5455,7 +8860,8 @@ mod tests {
                 let mut runtime = Runtime::open(directory.path(), 133, 100).expect("runtime opens");
                 runtime.store.set_append_failpoint(failpoint);
                 assert!(matches!(
-                    runtime.execute(&ClientMessage::SetPlayerControl {
+                    runtime.execute_next_for_fixture(&ClientMessage::SetPlayerControl {
+                        operation_sequence: 0,
                         operation_id: format!("queued-failpoint-{durable}"),
                         movement_epoch: 1,
                         input_sequence: 1,
@@ -5497,7 +8903,8 @@ mod tests {
         for offset in 0..queue_limit {
             let input_sequence = u64::try_from(offset + 1).expect("queue bound fits u64");
             runtime
-                .execute(&ClientMessage::SetPlayerControl {
+                .execute_next_for_fixture(&ClientMessage::SetPlayerControl {
+                    operation_sequence: 0,
                     operation_id: format!("queued-{input_sequence}"),
                     movement_epoch: 1,
                     input_sequence,
@@ -5511,7 +8918,8 @@ mod tests {
         }
         let before = runtime.state().state_hash();
         let rejected_sequence = u64::try_from(queue_limit + 1).expect("queue bound fits u64");
-        let result = runtime.execute(&ClientMessage::SetPlayerControl {
+        let result = runtime.execute_next_for_fixture(&ClientMessage::SetPlayerControl {
+            operation_sequence: 0,
             operation_id: "queue-overflow".into(),
             movement_epoch: 1,
             input_sequence: rejected_sequence,
@@ -5537,7 +8945,8 @@ mod tests {
     fn expired_queued_control_is_acked_without_reviving_stale_motion() {
         let mut runtime = runtime();
         runtime
-            .execute(&ClientMessage::SetPlayerControl {
+            .execute_next_for_fixture(&ClientMessage::SetPlayerControl {
+                operation_sequence: 0,
                 operation_id: "expired-front".into(),
                 movement_epoch: 1,
                 input_sequence: 1,
@@ -5564,7 +8973,8 @@ mod tests {
         {
             let mut runtime = Runtime::open(directory.path(), 131, 1).expect("runtime opens");
             runtime
-                .execute(&ClientMessage::SetPlayerControl {
+                .execute_next_for_fixture(&ClientMessage::SetPlayerControl {
+                    operation_sequence: 0,
                     operation_id: "disconnect-held-control".into(),
                     movement_epoch: 1,
                     input_sequence: 1,
@@ -5602,7 +9012,8 @@ mod tests {
     fn authoritative_character_control_drives_eva_rotation_and_expires_safely() {
         let mut runtime = runtime();
         runtime
-            .execute(&ClientMessage::SetPlayerControl {
+            .execute_next_for_fixture(&ClientMessage::SetPlayerControl {
+                operation_sequence: 0,
                 operation_id: "eva-control-1-1".into(),
                 movement_epoch: 1,
                 input_sequence: 1,
@@ -5649,7 +9060,8 @@ mod tests {
                 let mut runtime = runtime();
                 for input_sequence in 1_u64..=24 {
                     runtime
-                        .execute(&ClientMessage::SetPlayerControl {
+                        .execute_next_for_fixture(&ClientMessage::SetPlayerControl {
+                            operation_sequence: 0,
                             operation_id: format!("held-{dampeners}-{boost}-{input_sequence}"),
                             movement_epoch: runtime.state().player.movement_epoch,
                             input_sequence,
@@ -5692,7 +9104,8 @@ mod tests {
             .rebuild(&physics_body_specs(&runtime.state))
             .expect("high-inertia player fixture rebuilds");
         runtime
-            .execute(&ClientMessage::SetPlayerControl {
+            .execute_next_for_fixture(&ClientMessage::SetPlayerControl {
+                operation_sequence: 0,
                 operation_id: "coast-after-boost".into(),
                 movement_epoch: 1,
                 input_sequence: 1,
@@ -5708,7 +9121,8 @@ mod tests {
         assert!(runtime.state().player.angular_velocity.z > 2.9);
 
         runtime
-            .execute(&ClientMessage::SetPlayerControl {
+            .execute_next_for_fixture(&ClientMessage::SetPlayerControl {
+                operation_sequence: 0,
                 operation_id: "normal-thrust-above-normal-cap".into(),
                 movement_epoch: 1,
                 input_sequence: 2,
@@ -5732,7 +9146,8 @@ mod tests {
     fn quantized_eva_motion_matches_the_cross_platform_golden_fixture() {
         let mut runtime = runtime();
         runtime
-            .execute(&ClientMessage::SetPlayerControl {
+            .execute_next_for_fixture(&ClientMessage::SetPlayerControl {
+                operation_sequence: 0,
                 operation_id: "cross-platform-motion-golden".into(),
                 movement_epoch: 1,
                 input_sequence: 1,
@@ -5790,7 +9205,7 @@ mod tests {
             state.player.jetpack_enabled = true;
             state.player.dampeners = false;
             state.player.control_expires_at_simulation_tick = 1;
-            let controls = physics_controls(&state, &state.player, &[], 0, None);
+            let controls = physics_controls(&state, &state.player, &[], 0, None, true);
             let player = controls
                 .iter()
                 .find(|control| control.body_id == PLAYER_BODY_ID)
@@ -5812,7 +9227,8 @@ mod tests {
         ));
         runtime.state.player.suit_oxygen_milli = 900;
         runtime
-            .execute(&ClientMessage::SetSuitMode {
+            .execute_next_for_fixture(&ClientMessage::SetSuitMode {
+                operation_sequence: 0,
                 operation_id: "open-helmet".into(),
                 helmet_closed: false,
                 jetpack_enabled: true,
@@ -5853,6 +9269,7 @@ mod tests {
         let (_, impossible) = apply(
             state.clone(),
             EventPayload::SuitOxygenChanged {
+                player_id: "player-local".into(),
                 previous_oxygen_milli: 1_000,
                 new_oxygen_milli: 1,
             },
@@ -5864,6 +9281,7 @@ mod tests {
         let (exact_vacuum, accepted) = apply(
             state,
             EventPayload::SuitOxygenChanged {
+                player_id: "player-local".into(),
                 previous_oxygen_milli: 1_000,
                 new_oxygen_milli: 960,
             },
@@ -5878,6 +9296,7 @@ mod tests {
         let (_, impossible) = apply(
             state.clone(),
             EventPayload::SuitOxygenChanged {
+                player_id: "player-local".into(),
                 previous_oxygen_milli: 900,
                 new_oxygen_milli: 860,
             },
@@ -5889,6 +9308,7 @@ mod tests {
         let (exact_breathable, accepted) = apply(
             state,
             EventPayload::SuitOxygenChanged {
+                player_id: "player-local".into(),
                 previous_oxygen_milli: 900,
                 new_oxygen_milli: 925,
             },
@@ -5918,6 +9338,421 @@ mod tests {
             dead.player.life_state,
             PlayerLifeState::Incapacitated { .. }
         ));
+    }
+
+    #[test]
+    fn life_support_schedules_every_player_in_canonical_order_and_recovers_exactly() {
+        let directory = tempdir().expect("tempdir");
+        let mut runtime = Runtime::open(directory.path(), 143, 1_000).expect("runtime opens");
+        runtime
+            .admit_development_player("player-remote")
+            .expect("secondary player admits");
+        for player in runtime.state.player.by_id.values_mut() {
+            player.position = Vec3::new(100.0, 100.0, 100.0);
+            player.helmet_closed = true;
+            player.suit_oxygen_milli = 1_000;
+            player.linear_velocity = Vec3::ZERO;
+        }
+        runtime
+            .physics
+            .rebuild(&physics_body_specs(&runtime.state))
+            .expect("two-player vacuum fixture builds");
+        runtime.persist_snapshot().expect("fixture persists");
+
+        for _ in 0..3 {
+            assert!(
+                !runtime
+                    .advance(250)
+                    .expect("partial life-support second advances")
+            );
+        }
+        assert!(
+            runtime
+                .advance(250)
+                .expect("one life-support second advances")
+        );
+        assert_eq!(
+            runtime
+                .state()
+                .player
+                .get("player-local")
+                .unwrap()
+                .suit_oxygen_milli,
+            995
+        );
+        assert_eq!(
+            runtime
+                .state()
+                .player
+                .get("player-remote")
+                .unwrap()
+                .suit_oxygen_milli,
+            995
+        );
+        let journal =
+            fs::read_to_string(directory.path().join("events.ndjson")).expect("journal reads");
+        let lifecycle_targets = journal
+            .lines()
+            .map(|line| serde_json::from_str::<CanonicalEvent>(line).expect("event parses"))
+            .filter_map(|event| match event.payload {
+                EventPayload::SuitOxygenChanged { player_id, .. } => Some(player_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            lifecycle_targets,
+            vec!["player-local".to_owned(), "player-remote".to_owned()]
+        );
+        let expected_hash = runtime.state().state_hash();
+        let expected_sequence = runtime.state().event_sequence;
+
+        drop(runtime);
+        let recovered = Runtime::open(directory.path(), 143, 1_000).expect("runtime recovers");
+        assert_eq!(recovered.state().state_hash(), expected_hash);
+        assert_eq!(recovered.state().event_sequence, expected_sequence);
+    }
+
+    #[test]
+    fn secondary_oxygen_death_isolates_inventory_player_grid_and_contact_state() {
+        let directory = tempdir().expect("tempdir");
+        let mut runtime = Runtime::open(directory.path(), 144, 1_000).expect("runtime opens");
+        runtime
+            .admit_development_player("player-remote")
+            .expect("secondary player admits");
+        let remote_inventory_id = runtime
+            .state
+            .player
+            .get("player-remote")
+            .unwrap()
+            .inventory_id
+            .clone();
+        runtime
+            .state
+            .inventories
+            .get_mut(PLAYER_INVENTORY_ID)
+            .unwrap()
+            .contents
+            .components -= 3;
+        runtime
+            .state
+            .inventories
+            .get_mut(&remote_inventory_id)
+            .unwrap()
+            .contents
+            .components = 3;
+        let remote = runtime.state.player.get_mut("player-remote").unwrap();
+        remote.suit_oxygen_milli = 5;
+        remote.linear_velocity = Vec3::new(3.0, 2.0, 1.0);
+        remote.angular_velocity = Vec3::new(0.5, 0.25, 0.125);
+        remote.control_linear_input = Vec3::new(1.0, 0.0, 0.0);
+        remote.control_angular_input = Vec3::new(0.0, 1.0, 0.0);
+        remote.boost = true;
+        remote.dampeners = false;
+        let local_contact = ContactPairKey {
+            body_a: player_body_id("player-local"),
+            collider_a: player_collider_id("player-local"),
+            body_b: STARTER_GRID_ID.into(),
+            collider_b: "block-core".into(),
+        };
+        let remote_contact = ContactPairKey {
+            body_a: player_body_id("player-remote"),
+            collider_a: player_collider_id("player-remote"),
+            body_b: STARTER_GRID_ID.into(),
+            collider_b: "block-power".into(),
+        };
+        runtime.state.active_contact_pairs =
+            BTreeSet::from([local_contact.clone(), remote_contact]);
+        let grid = runtime.state.grids.get_mut(STARTER_GRID_ID).unwrap();
+        grid.control_linear_input = Vec3::new(0.25, 0.5, 0.75);
+        grid.control_angular_input = Vec3::new(0.1, 0.2, 0.3);
+        grid.dampeners = false;
+        let primary_before = runtime.state.player.primary().clone();
+        let grid_before = runtime.state.grids[STARTER_GRID_ID].clone();
+        runtime.persist_snapshot().expect("fixture persists");
+        runtime
+            .life_support_elapsed_millis_by_player
+            .insert("player-remote".into(), 999);
+
+        assert!(runtime.advance(1).expect("secondary death commits"));
+        assert_eq!(runtime.state().player.primary(), &primary_before);
+        assert_eq!(runtime.state().grids[STARTER_GRID_ID], grid_before);
+        assert_eq!(
+            runtime.state().active_contact_pairs,
+            BTreeSet::from([local_contact])
+        );
+        let remote = runtime.state().player.get("player-remote").unwrap();
+        assert!(matches!(
+            remote.life_state,
+            PlayerLifeState::Incapacitated { .. }
+        ));
+        assert_eq!(remote.suit_oxygen_milli, 0);
+        assert_eq!(remote.linear_velocity, Vec3::ZERO);
+        assert_eq!(remote.angular_velocity, Vec3::ZERO);
+        assert_eq!(
+            runtime.state().inventories[&remote_inventory_id].contents,
+            InventoryContents::default()
+        );
+        let death_drop = runtime
+            .state()
+            .death_drops
+            .values()
+            .next()
+            .expect("secondary carried inventory drops");
+        assert_eq!(death_drop.owner_player_id, "player-remote");
+        assert_eq!(
+            runtime.state().inventories[&death_drop.inventory_id]
+                .contents
+                .components,
+            3
+        );
+        assert!(runtime.state().conservation().valid);
+        let expected_hash = runtime.state().state_hash();
+
+        drop(runtime);
+        let recovered = Runtime::open(directory.path(), 144, 1_000).expect("runtime recovers");
+        assert_eq!(recovered.state().state_hash(), expected_hash);
+    }
+
+    #[test]
+    fn simultaneous_player_deaths_are_unique_ordered_and_recover_exactly() {
+        let directory = tempdir().expect("tempdir");
+        let mut runtime = Runtime::open(directory.path(), 145, 1_000).expect("runtime opens");
+        runtime
+            .admit_development_player("player-remote")
+            .expect("secondary player admits");
+        for (player_id, player) in &mut runtime.state.player.by_id {
+            player.suit_oxygen_milli = 5;
+            runtime
+                .life_support_elapsed_millis_by_player
+                .insert(player_id.clone(), 999);
+        }
+        runtime.persist_snapshot().expect("fixture persists");
+
+        assert!(runtime.advance(1).expect("simultaneous deaths commit"));
+        let local = runtime.state().player.get("player-local").unwrap();
+        let remote = runtime.state().player.get("player-remote").unwrap();
+        let PlayerLifeState::Incapacitated {
+            death_id: local_death,
+            ..
+        } = &local.life_state
+        else {
+            panic!("local player must be incapacitated");
+        };
+        let PlayerLifeState::Incapacitated {
+            death_id: remote_death,
+            ..
+        } = &remote.life_state
+        else {
+            panic!("remote player must be incapacitated");
+        };
+        assert_ne!(local_death, remote_death);
+        assert_eq!(local_death, "death-player-local-1");
+        assert_eq!(remote_death, "death-player-remote-2");
+        let journal =
+            fs::read_to_string(directory.path().join("events.ndjson")).expect("journal reads");
+        let targets = journal
+            .lines()
+            .map(|line| serde_json::from_str::<CanonicalEvent>(line).expect("event parses"))
+            .filter_map(|event| match event.payload {
+                EventPayload::PlayerIncapacitated { player_id, .. } => Some(player_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(targets, vec!["player-local", "player-remote"]);
+        let expected_hash = runtime.state().state_hash();
+
+        drop(runtime);
+        let recovered = Runtime::open(directory.path(), 145, 1_000).expect("runtime recovers");
+        assert_eq!(recovered.state().state_hash(), expected_hash);
+    }
+
+    #[test]
+    fn secondary_respawn_is_actor_scoped_idempotent_and_exactly_recoverable() {
+        let directory = tempdir().expect("tempdir");
+        let mut runtime = Runtime::open(directory.path(), 146, 1_000).expect("runtime opens");
+        runtime
+            .admit_development_player("player-remote")
+            .expect("secondary player admits");
+        runtime
+            .state
+            .player
+            .get_mut("player-remote")
+            .unwrap()
+            .suit_oxygen_milli = 5;
+        runtime.persist_snapshot().expect("fixture persists");
+        runtime
+            .life_support_elapsed_millis_by_player
+            .insert("player-remote".into(), 999);
+        runtime.advance(1).expect("secondary death commits");
+        let primary_before = runtime.state().player.primary().clone();
+        let respawn = ClientMessage::RespawnPlayer {
+            operation_sequence: 0,
+            operation_id: "remote-respawn".into(),
+        };
+
+        let first = runtime
+            .execute_next_as_for_fixture("player-remote", &respawn)
+            .expect("secondary recovery commits");
+        let expected_hash = runtime.state().state_hash();
+        let expected_sequence = runtime.state().event_sequence;
+        assert_eq!(runtime.state().player.primary(), &primary_before);
+        let remote = runtime.state().player.get("player-remote").unwrap();
+        assert_eq!(remote.life_state, PlayerLifeState::Alive);
+        assert_eq!(remote.movement_epoch, 2);
+        assert_eq!(
+            runtime
+                .execute_next_as_for_fixture("player-remote", &respawn)
+                .expect("secondary recovery retry is idempotent"),
+            first
+        );
+        assert_eq!(runtime.state().state_hash(), expected_hash);
+        assert_eq!(runtime.state().event_sequence, expected_sequence);
+        assert!(
+            runtime
+                .state()
+                .processed_operation("player-local", "remote-respawn")
+                .is_none()
+        );
+        assert_eq!(
+            runtime
+                .state()
+                .processed_operation("player-remote", "remote-respawn"),
+            Some(&first)
+        );
+
+        drop(runtime);
+        let recovered = Runtime::open(directory.path(), 146, 1_000).expect("runtime recovers");
+        assert_eq!(recovered.state().state_hash(), expected_hash);
+    }
+
+    #[test]
+    fn replay_rejects_malformed_lifecycle_targets_without_mutation() {
+        let mut runtime = runtime();
+        runtime
+            .admit_development_player("player-remote")
+            .expect("secondary player admits");
+        let base = runtime.state().clone();
+        let reject = |state: &WorldState, event: CanonicalEvent, expected_code: &str| {
+            let mut candidate = state.clone();
+            let before = candidate.state_hash();
+            assert!(matches!(
+                candidate.apply_event(&event),
+                Err(IntentError::Rejected { ref code, .. }) if code == expected_code
+            ));
+            assert_eq!(candidate.state_hash(), before);
+        };
+
+        reject(
+            &base,
+            base.prepare_system_event(EventPayload::SuitOxygenChanged {
+                player_id: "player-ghost".into(),
+                previous_oxygen_milli: 1_000,
+                new_oxygen_milli: 995,
+            }),
+            "replay_lifecycle_envelope_invalid",
+        );
+        reject(
+            &base,
+            base.new_event(
+                None,
+                "system",
+                None,
+                EventPayload::SuitModeChanged {
+                    helmet_closed: false,
+                    jetpack_enabled: true,
+                    magnetic_boots_enabled: false,
+                },
+            ),
+            "replay_lifecycle_envelope_invalid",
+        );
+        let mut dead = base.clone();
+        dead.player
+            .get_mut("player-remote")
+            .unwrap()
+            .suit_oxygen_milli = 5;
+        let death = dead
+            .oxygen_incapacitation_payload_for("player-remote")
+            .expect("secondary death prepares");
+        let death_event = dead.prepare_system_event(death);
+        dead.apply_event(&death_event)
+            .expect("secondary death applies");
+        let remote_respawn = dead
+            .player_respawn_payload_for("player-remote")
+            .expect("secondary respawn prepares");
+        reject(
+            &dead,
+            dead.new_test_human_event(
+                "player-local",
+                "forged-cross-player-respawn",
+                remote_respawn,
+            ),
+            "player_already_alive",
+        );
+    }
+
+    #[test]
+    fn secondary_death_commit_failpoints_recover_prior_or_durable_actor_state() {
+        for (failpoint, durable) in [
+            (AppendFailpoint::BeforeWrite, false),
+            (AppendFailpoint::AfterSync, true),
+        ] {
+            let directory = tempdir().expect("tempdir");
+            let before_state;
+            {
+                let mut runtime =
+                    Runtime::open(directory.path(), 147, 1_000).expect("runtime opens");
+                runtime
+                    .admit_development_player("player-remote")
+                    .expect("secondary player admits");
+                runtime
+                    .state
+                    .player
+                    .get_mut("player-remote")
+                    .unwrap()
+                    .suit_oxygen_milli = 5;
+                runtime.persist_snapshot().expect("fixture persists");
+                before_state = runtime.state().clone();
+                runtime
+                    .life_support_elapsed_millis_by_player
+                    .insert("player-remote".into(), 999);
+                runtime.store.set_append_failpoint(failpoint);
+                assert!(matches!(
+                    runtime.advance(1),
+                    Err(RuntimeError::Persistence(
+                        PersistenceError::InjectedFailure(_)
+                    ))
+                ));
+                assert!(runtime.is_halted());
+            }
+
+            let recovered = Runtime::open(directory.path(), 147, 1_000).expect("runtime recovers");
+            let expected_hash = if durable {
+                let journal = fs::read_to_string(directory.path().join("events.ndjson"))
+                    .expect("durable journal reads");
+                let event = serde_json::from_str::<CanonicalEvent>(
+                    journal.lines().next().expect("durable death event exists"),
+                )
+                .expect("durable death event parses");
+                let mut expected = before_state.clone();
+                expected.apply_event(&event).expect("durable death replays");
+                expected.state_hash()
+            } else {
+                before_state.state_hash()
+            };
+            assert_eq!(recovered.state().state_hash(), expected_hash);
+            assert_eq!(
+                matches!(
+                    recovered
+                        .state()
+                        .player
+                        .get("player-remote")
+                        .unwrap()
+                        .life_state,
+                    PlayerLifeState::Incapacitated { .. }
+                ),
+                durable
+            );
+        }
     }
 
     #[test]
@@ -5988,6 +9823,7 @@ mod tests {
 
         let blocked_messages = [
             ClientMessage::SetPlayerControl {
+                operation_sequence: 0,
                 operation_id: "dead-control".into(),
                 movement_epoch: runtime.state().player.movement_epoch,
                 input_sequence: 1,
@@ -5998,26 +9834,31 @@ mod tests {
                 dampeners: true,
             },
             ClientMessage::SetSuitMode {
+                operation_sequence: 0,
                 operation_id: "dead-suit".into(),
                 helmet_closed: false,
                 jetpack_enabled: false,
                 magnetic_boots_enabled: false,
             },
             ClientMessage::MineVoxel {
+                operation_sequence: 0,
                 operation_id: "dead-mine".into(),
                 coordinate: IVec3::ZERO,
             },
             ClientMessage::RefineOre {
+                operation_sequence: 0,
                 operation_id: "dead-refine".into(),
                 inventory_id: PLAYER_INVENTORY_ID.into(),
                 batches: 1,
             },
             ClientMessage::CraftComponent {
+                operation_sequence: 0,
                 operation_id: "dead-craft".into(),
                 inventory_id: PLAYER_INVENTORY_ID.into(),
                 quantity: 1,
             },
             ClientMessage::TransferInventory {
+                operation_sequence: 0,
                 operation_id: "dead-transfer".into(),
                 source_inventory_id: drop_inventory_id.clone(),
                 destination_inventory_id: PLAYER_INVENTORY_ID.into(),
@@ -6025,6 +9866,7 @@ mod tests {
                 quantity: 1,
             },
             ClientMessage::BuildBlock {
+                operation_sequence: 0,
                 operation_id: "dead-build".into(),
                 grid_id: STARTER_GRID_ID.into(),
                 coordinate: IVec3::new(0, 1, 0),
@@ -6032,11 +9874,13 @@ mod tests {
                 orientation: 0,
             },
             ClientMessage::WeldBlock {
+                operation_sequence: 0,
                 operation_id: "dead-weld".into(),
                 grid_id: STARTER_GRID_ID.into(),
                 block_id: "block-core".into(),
             },
             ClientMessage::SetGridControl {
+                operation_sequence: 0,
                 operation_id: "dead-control".into(),
                 grid_id: STARTER_GRID_ID.into(),
                 linear_input: Vec3::new(1.0, 0.0, 0.0),
@@ -6044,10 +9888,12 @@ mod tests {
                 dampeners: false,
             },
             ClientMessage::ToggleGridAnchor {
+                operation_sequence: 0,
                 operation_id: "dead-anchor".into(),
                 grid_id: STARTER_GRID_ID.into(),
             },
             ClientMessage::DamageBlock {
+                operation_sequence: 0,
                 operation_id: "dead-damage".into(),
                 grid_id: STARTER_GRID_ID.into(),
                 block_id: "block-core".into(),
@@ -6056,7 +9902,7 @@ mod tests {
         let dead_hash = runtime.state().state_hash();
         for message in blocked_messages {
             assert!(matches!(
-                runtime.execute(&message),
+                runtime.execute_next_for_fixture(&message),
                 Err(RuntimeError::Intent(IntentError::Rejected { ref code, .. }))
                     if code == "player_incapacitated"
             ));
@@ -6064,11 +9910,16 @@ mod tests {
         }
 
         let respawn = ClientMessage::RespawnPlayer {
+            operation_sequence: 0,
             operation_id: "recover-once".into(),
         };
-        let first = runtime.execute(&respawn).expect("recovery accepted");
+        let first = runtime
+            .execute_next_for_fixture(&respawn)
+            .expect("recovery accepted");
         let recovered_hash = runtime.state().state_hash();
-        let second = runtime.execute(&respawn).expect("recovery retry accepted");
+        let second = runtime
+            .execute_next_for_fixture(&respawn)
+            .expect("recovery retry accepted");
         assert_eq!(first, second);
         assert_eq!(runtime.state().state_hash(), recovered_hash);
         assert_eq!(runtime.state().event_sequence, death_sequence + 1);
@@ -6099,16 +9950,19 @@ mod tests {
 
         let sealed_intents = [
             ClientMessage::RefineOre {
+                operation_sequence: 0,
                 operation_id: "drop-refine".into(),
                 inventory_id: drop_inventory_id.clone(),
                 batches: 1,
             },
             ClientMessage::CraftComponent {
+                operation_sequence: 0,
                 operation_id: "drop-craft".into(),
                 inventory_id: drop_inventory_id.clone(),
                 quantity: 1,
             },
             ClientMessage::TransferInventory {
+                operation_sequence: 0,
                 operation_id: "drop-transfer-source".into(),
                 source_inventory_id: drop_inventory_id.clone(),
                 destination_inventory_id: PLAYER_INVENTORY_ID.into(),
@@ -6116,6 +9970,7 @@ mod tests {
                 quantity: 1,
             },
             ClientMessage::TransferInventory {
+                operation_sequence: 0,
                 operation_id: "drop-transfer-destination".into(),
                 source_inventory_id: PLAYER_INVENTORY_ID.into(),
                 destination_inventory_id: drop_inventory_id.clone(),
@@ -6125,7 +9980,7 @@ mod tests {
         ];
         for intent in sealed_intents {
             assert!(matches!(
-                runtime.execute(&intent),
+                runtime.execute_next_for_fixture(&intent),
                 Err(RuntimeError::Intent(IntentError::Rejected { ref code, .. }))
                     if code == "dropped_inventory_sealed"
             ));
@@ -6154,10 +10009,9 @@ mod tests {
             },
         ];
         for (index, payload) in replay_payloads.into_iter().enumerate() {
-            let event = runtime.state().new_event(
+            let event = runtime.state().new_test_human_event(
                 "player-local",
-                "human",
-                Some(format!("forged-drop-operation-{index}")),
+                format!("forged-drop-operation-{index}"),
                 payload,
             );
             let mut candidate = runtime.state().clone();
@@ -6174,7 +10028,8 @@ mod tests {
     fn empty_inventory_oxygen_death_does_not_create_an_empty_drop() {
         let mut runtime = runtime();
         runtime
-            .execute(&ClientMessage::TransferInventory {
+            .execute_next_for_fixture(&ClientMessage::TransferInventory {
+                operation_sequence: 0,
                 operation_id: "stow-before-death".into(),
                 source_inventory_id: PLAYER_INVENTORY_ID.into(),
                 destination_inventory_id: "inventory-cargo-starter".into(),
@@ -6214,7 +10069,9 @@ mod tests {
             body_b: STARTER_GRID_ID.into(),
             collider_b: "block-core".into(),
         });
-        runtime.life_support_elapsed_millis = 999;
+        runtime
+            .life_support_elapsed_millis_by_player
+            .insert("player-local".into(), 999);
 
         runtime
             .advance(1)
@@ -6389,9 +10246,9 @@ mod tests {
         let event = state.prepare_system_event(canonical);
         state.apply_event(&event).expect("canonical death applies");
         let grid = &state.grids[STARTER_GRID_ID];
-        assert_eq!(grid.control_linear_input, Vec3::ZERO);
-        assert_eq!(grid.control_angular_input, Vec3::ZERO);
-        assert!(grid.dampeners);
+        assert_eq!(grid.control_linear_input, Vec3::new(1.0, 0.0, 0.0));
+        assert_eq!(grid.control_angular_input, Vec3::new(0.0, 1.0, 0.0));
+        assert!(!grid.dampeners);
         assert!(state.player.pending_control_frames.is_empty());
         assert!(state.conservation().valid);
     }
@@ -6411,7 +10268,9 @@ mod tests {
                     .persist_snapshot()
                     .expect("low-oxygen state persists");
                 before_state = runtime.state().clone();
-                runtime.life_support_elapsed_millis = 999;
+                runtime
+                    .life_support_elapsed_millis_by_player
+                    .insert("player-local".into(), 999);
                 runtime.store.set_append_failpoint(failpoint);
                 assert!(matches!(
                     runtime.advance(1),
@@ -6472,7 +10331,8 @@ mod tests {
                 runtime.persist_snapshot().expect("dead state persists");
                 runtime.store.set_append_failpoint(failpoint);
                 assert!(matches!(
-                    runtime.execute(&ClientMessage::RespawnPlayer {
+                    runtime.execute_next_for_fixture(&ClientMessage::RespawnPlayer {
+                        operation_sequence: 0,
                         operation_id: "recover-after-failure".into(),
                     }),
                     Err(RuntimeError::Persistence(
@@ -6524,12 +10384,7 @@ mod tests {
         dead.apply_event(&death_event).expect("death applies");
         let canonical = dead.player_respawn_payload().expect("respawn prepares");
         let reject = |payload: EventPayload| {
-            let event = dead.new_event(
-                "player-local",
-                "human",
-                Some("tampered-respawn".into()),
-                payload,
-            );
+            let event = dead.new_test_human_event("player-local", "tampered-respawn", payload);
             let mut candidate = dead.clone();
             let before = candidate.state_hash();
             assert!(matches!(
@@ -6600,12 +10455,7 @@ mod tests {
         assert!((position.z - primary.z).abs() <= f64::EPSILON);
         assert!(position.y > primary.y);
 
-        let event = state.new_event(
-            "player-local",
-            "human",
-            Some("blocked-primary-recovery".into()),
-            payload,
-        );
+        let event = state.new_test_human_event("player-local", "blocked-primary-recovery", payload);
         state.apply_event(&event).expect("fallback respawn applies");
         assert_eq!(state.player.position, position);
         assert_eq!(state.player.life_state, PlayerLifeState::Alive);
@@ -6682,9 +10532,13 @@ mod tests {
             .oxygen_incapacitation_payload()
             .expect("death prepares");
         let forged_death = state.new_event(
-            "player-local",
+            Some("player-local"),
             "human",
-            Some("forged-death".into()),
+            Some(OperationEventMetadata {
+                operation_id: "forged-death".into(),
+                operation_sequence: 1,
+                intent_fingerprint: "0".repeat(64),
+            }),
             death.clone(),
         );
         assert!(matches!(
@@ -6706,15 +10560,14 @@ mod tests {
         ));
 
         let operation_id = "canonical-recovery";
-        let respawn_event =
-            state.new_event("player-local", "human", Some(operation_id.into()), respawn);
+        let respawn_event = state.new_test_human_event("player-local", operation_id, respawn);
         state
             .apply_event(&respawn_event)
             .expect("human respawn with operation applies");
-        let duplicate = state.new_event(
+        let duplicate = state.new_test_human_event_at(
             "player-local",
-            "human",
-            Some(operation_id.into()),
+            1,
+            operation_id,
             EventPayload::PlayerControlSet {
                 movement_epoch: state.player.movement_epoch,
                 input_sequence: 1,
@@ -6729,8 +10582,51 @@ mod tests {
         );
         assert!(matches!(
             state.apply_event(&duplicate),
-            Err(IntentError::Rejected { ref code, .. }) if code == "replay_operation_duplicate"
+            Err(IntentError::Rejected { ref code, .. }) if code == "operation_conflict"
         ));
+    }
+
+    #[test]
+    fn industry_and_grid_replay_require_authenticated_human_envelopes() {
+        let state = WorldState::genesis(171);
+        let payloads = [
+            EventPayload::OreRefined {
+                inventory_id: PLAYER_INVENTORY_ID.into(),
+                batches: 1,
+            },
+            EventPayload::ComponentCrafted {
+                inventory_id: PLAYER_INVENTORY_ID.into(),
+                quantity: 1,
+            },
+            EventPayload::InventoryTransferred {
+                source_inventory_id: PLAYER_INVENTORY_ID.into(),
+                destination_inventory_id: "inventory-cargo-starter".into(),
+                resource: ResourceKind::Component,
+                quantity: 1,
+            },
+            EventPayload::GridControlSet {
+                grid_id: STARTER_GRID_ID.into(),
+                linear_input: Vec3::ZERO,
+                angular_input: Vec3::ZERO,
+                dampeners: true,
+            },
+            EventPayload::GridAnchorSet {
+                grid_id: STARTER_GRID_ID.into(),
+                anchored: true,
+                reward_credited: true,
+            },
+        ];
+
+        for payload in payloads {
+            let event = state.prepare_system_event(payload);
+            let mut candidate = state.clone();
+            let before = candidate.state_hash();
+            let error = candidate
+                .apply_event(&event)
+                .expect_err("client work with a system envelope rejects");
+            assert_eq!(error.code(), "replay_hand_tool_envelope_invalid");
+            assert_eq!(candidate.state_hash(), before);
+        }
     }
 
     #[test]
@@ -6749,7 +10645,8 @@ mod tests {
                     }
                     if respawned {
                         runtime
-                            .execute(&ClientMessage::RespawnPlayer {
+                            .execute_next_for_fixture(&ClientMessage::RespawnPlayer {
+                                operation_sequence: 0,
                                 operation_id: "matrix-recovery".into(),
                             })
                             .expect("respawn commits");
@@ -6791,7 +10688,8 @@ mod tests {
             .get_mut(&cargo_id)
             .expect("cargo")
             .capacity_liters = 21;
-        let result = runtime.execute(&ClientMessage::TransferInventory {
+        let result = runtime.execute_next_for_fixture(&ClientMessage::TransferInventory {
+            operation_sequence: 0,
             operation_id: "overfill-cargo".into(),
             source_inventory_id: PLAYER_INVENTORY_ID.into(),
             destination_inventory_id: cargo_id,
@@ -6817,14 +10715,19 @@ mod tests {
         let mut runtime = runtime();
         move_player_near_grid(&mut runtime);
         let intent = ClientMessage::BuildBlock {
+            operation_sequence: 0,
             operation_id: "idempotent-build".into(),
             grid_id: STARTER_GRID_ID.into(),
             coordinate: IVec3::new(0, 1, 0),
             kind: BlockKind::Structural,
             orientation: 2,
         };
-        let first = runtime.execute(&intent).expect("build accepted");
-        let second = runtime.execute(&intent).expect("retry accepted");
+        let first = runtime
+            .execute_next_for_fixture(&intent)
+            .expect("build accepted");
+        let second = runtime
+            .execute_next_for_fixture(&intent)
+            .expect("retry accepted");
         assert_eq!(first, second);
         assert_eq!(
             runtime.state().inventories[PLAYER_INVENTORY_ID]
@@ -6848,7 +10751,8 @@ mod tests {
         let mut runtime = runtime();
         move_player_near_grid(&mut runtime);
         runtime
-            .execute(&ClientMessage::BuildBlock {
+            .execute_next_for_fixture(&ClientMessage::BuildBlock {
+                operation_sequence: 0,
                 operation_id: "place-frame".into(),
                 grid_id: STARTER_GRID_ID.into(),
                 coordinate: IVec3::new(0, 1, 0),
@@ -6862,32 +10766,41 @@ mod tests {
             .block_id
             .clone();
         let first_weld = ClientMessage::WeldBlock {
+            operation_sequence: 0,
             operation_id: "weld-once".into(),
             grid_id: STARTER_GRID_ID.into(),
             block_id: block_id.clone(),
         };
-        let first_receipt = runtime.execute(&first_weld).expect("first weld accepted");
-        let retry_receipt = runtime.execute(&first_weld).expect("weld retry accepted");
+        let first_receipt = runtime
+            .execute_next_for_fixture(&first_weld)
+            .expect("first weld accepted");
+        let retry_receipt = runtime
+            .execute_next_for_fixture(&first_weld)
+            .expect("weld retry accepted");
         assert_eq!(first_receipt, retry_receipt);
         assert_eq!(
             runtime.state().grids[STARTER_GRID_ID].blocks[&block_id].health,
             50
         );
         runtime
-            .execute(&ClientMessage::WeldBlock {
+            .execute_next_for_fixture(&ClientMessage::WeldBlock {
+                operation_sequence: 0,
                 operation_id: "weld-middle".into(),
                 grid_id: STARTER_GRID_ID.into(),
                 block_id: block_id.clone(),
             })
             .expect("middle weld accepted");
         let final_weld = ClientMessage::WeldBlock {
+            operation_sequence: 0,
             operation_id: "weld-final".into(),
             grid_id: STARTER_GRID_ID.into(),
             block_id: block_id.clone(),
         };
-        let final_receipt = runtime.execute(&final_weld).expect("final weld accepted");
+        let final_receipt = runtime
+            .execute_next_for_fixture(&final_weld)
+            .expect("final weld accepted");
         let final_retry = runtime
-            .execute(&final_weld)
+            .execute_next_for_fixture(&final_weld)
             .expect("final weld retry accepted");
         assert_eq!(final_receipt, final_retry);
         assert!(
@@ -6897,9 +10810,10 @@ mod tests {
                 .construction_complete
         );
         assert_eq!(runtime.state().player.career.blocks_built, 1);
-        assert_eq!(runtime.state().player.experience, 37);
+        assert_eq!(runtime.state().player.experience, 25);
         let sequence = runtime.state().event_sequence;
-        let completed = runtime.execute(&ClientMessage::WeldBlock {
+        let completed = runtime.execute_next_for_fixture(&ClientMessage::WeldBlock {
+            operation_sequence: 0,
             operation_id: "over-weld".into(),
             grid_id: STARTER_GRID_ID.into(),
             block_id,
@@ -6918,7 +10832,8 @@ mod tests {
         let mut runtime = runtime();
         move_player_near_grid(&mut runtime);
         runtime
-            .execute(&ClientMessage::BuildBlock {
+            .execute_next_for_fixture(&ClientMessage::BuildBlock {
+                operation_sequence: 0,
                 operation_id: "place-cargo-frame".into(),
                 grid_id: STARTER_GRID_ID.into(),
                 coordinate: IVec3::new(0, 1, 0),
@@ -6934,7 +10849,8 @@ mod tests {
             .inventory_id
             .clone()
             .expect("cargo identity exists");
-        let sealed = runtime.execute(&ClientMessage::TransferInventory {
+        let sealed = runtime.execute_next_for_fixture(&ClientMessage::TransferInventory {
+            operation_sequence: 0,
             operation_id: "transfer-into-sealed-cargo".into(),
             source_inventory_id: PLAYER_INVENTORY_ID.into(),
             destination_inventory_id: cargo_inventory_id.clone(),
@@ -6955,7 +10871,8 @@ mod tests {
 
         weld_to_completion(&mut runtime, IVec3::new(0, 1, 0), "complete-cargo");
         runtime
-            .execute(&ClientMessage::TransferInventory {
+            .execute_next_for_fixture(&ClientMessage::TransferInventory {
+                operation_sequence: 0,
                 operation_id: "transfer-into-complete-cargo".into(),
                 source_inventory_id: PLAYER_INVENTORY_ID.into(),
                 destination_inventory_id: cargo_inventory_id.clone(),
@@ -6964,7 +10881,8 @@ mod tests {
             })
             .expect("completed cargo accepts inventory");
         runtime
-            .execute(&ClientMessage::TransferInventory {
+            .execute_next_for_fixture(&ClientMessage::TransferInventory {
+                operation_sequence: 0,
                 operation_id: "transfer-out-of-complete-cargo".into(),
                 source_inventory_id: cargo_inventory_id.clone(),
                 destination_inventory_id: PLAYER_INVENTORY_ID.into(),
@@ -6993,8 +10911,11 @@ mod tests {
             assert!(original.construction_complete);
             assert_eq!(runtime.state().player.career.blocks_built, 0);
 
+            aim_player_at_block(&mut runtime, STARTER_GRID_ID, &block_id);
+
             runtime
-                .execute(&ClientMessage::DamageBlock {
+                .execute_next_for_fixture(&ClientMessage::DamageBlock {
+                    operation_sequence: 0,
                     operation_id: "damage-completed-armor".into(),
                     grid_id: STARTER_GRID_ID.into(),
                     block_id: block_id.clone(),
@@ -7012,14 +10933,16 @@ mod tests {
                 .expect("damaged block appears in the snapshot");
             assert!(damaged_snapshot.construction_complete);
             assert_eq!(runtime.state().player.career.blocks_built, 0);
-            assert_eq!(runtime.state().player.experience, 3);
+            assert_eq!(runtime.state().player.experience, 0);
 
             let mut weld_index = 0_u32;
             while runtime.state().grids[STARTER_GRID_ID].blocks[&block_id].health
                 < original.max_health()
             {
+                aim_player_at_block(&mut runtime, STARTER_GRID_ID, &block_id);
                 runtime
-                    .execute(&ClientMessage::WeldBlock {
+                    .execute_next_for_fixture(&ClientMessage::WeldBlock {
+                        operation_sequence: 0,
                         operation_id: format!("repair-completed-armor-{weld_index}"),
                         grid_id: STARTER_GRID_ID.into(),
                         block_id: block_id.clone(),
@@ -7031,7 +10954,7 @@ mod tests {
             assert_eq!(repaired.health, repaired.max_health());
             assert!(repaired.construction_complete);
             assert_eq!(runtime.state().player.career.blocks_built, 0);
-            assert_eq!(runtime.state().player.experience, 15);
+            assert_eq!(runtime.state().player.experience, 0);
             assert!(runtime.state().conservation().valid);
             runtime.persist_snapshot().expect("snapshot persists");
             expected_hash = runtime.state().state_hash();
@@ -7048,7 +10971,8 @@ mod tests {
     #[test]
     fn construction_rejects_remote_and_invalid_frames() {
         let mut runtime = runtime();
-        let remote = runtime.execute(&ClientMessage::BuildBlock {
+        let remote = runtime.execute_next_for_fixture(&ClientMessage::BuildBlock {
+            operation_sequence: 0,
             operation_id: "remote-frame".into(),
             grid_id: STARTER_GRID_ID.into(),
             coordinate: IVec3::new(0, 1, 0),
@@ -7058,13 +10982,14 @@ mod tests {
         assert!(matches!(
             remote,
             Err(RuntimeError::Intent(IntentError::Rejected { ref code, .. }))
-                if code == "block_out_of_range"
+                if code == "build_face_not_targeted"
         ));
         move_player_near_grid(&mut runtime);
         let candidate = IVec3::new(0, 1, 0);
         runtime.state.player.position =
             runtime.state().grids[STARTER_GRID_ID].world_position(candidate);
-        let overlap = runtime.execute(&ClientMessage::BuildBlock {
+        let overlap = runtime.execute_next_for_fixture(&ClientMessage::BuildBlock {
+            operation_sequence: 0,
             operation_id: "overlapping-frame".into(),
             grid_id: STARTER_GRID_ID.into(),
             coordinate: candidate,
@@ -7076,7 +11001,8 @@ mod tests {
             Err(RuntimeError::Intent(IntentError::Rejected { ref code, .. }))
                 if code == "block_intersects_player"
         ));
-        let invalid = runtime.execute(&ClientMessage::BuildBlock {
+        let invalid = runtime.execute_next_for_fixture(&ClientMessage::BuildBlock {
+            operation_sequence: 0,
             operation_id: "invalid-orientation".into(),
             grid_id: STARTER_GRID_ID.into(),
             coordinate: IVec3::new(0, 1, 0),
@@ -7094,11 +11020,13 @@ mod tests {
 
     #[test]
     fn construction_replay_rejects_a_frame_around_the_player_before_mutation() {
-        let mut state = runtime().state().clone();
-        state.player.position = Vec3::new(10.0, 1.0, 3.0);
+        let mut runtime = runtime();
+        move_player_near_grid(&mut runtime);
+        let mut state = runtime.state().clone();
         let coordinate = IVec3::new(0, 1, 0);
         let canonical = state
-            .prepare_client_event(&ClientMessage::BuildBlock {
+            .prepare_next_client_event_for_fixture(&ClientMessage::BuildBlock {
+                operation_sequence: 0,
                 operation_id: "prepared-clear-frame".into(),
                 grid_id: STARTER_GRID_ID.into(),
                 coordinate,
@@ -7118,17 +11046,20 @@ mod tests {
     #[test]
     fn unfinished_anchor_cannot_lock_the_grid() {
         let mut runtime = runtime();
-        move_player_near_grid(&mut runtime);
+        let anchor_coordinate = IVec3::new(-2, 1, -1);
+        aim_player_for_build(&mut runtime, STARTER_GRID_ID, anchor_coordinate);
         runtime
-            .execute(&ClientMessage::BuildBlock {
+            .execute_next_for_fixture(&ClientMessage::BuildBlock {
+                operation_sequence: 0,
                 operation_id: "place-anchor-frame".into(),
                 grid_id: STARTER_GRID_ID.into(),
-                coordinate: IVec3::new(-2, 0, 0),
+                coordinate: anchor_coordinate,
                 kind: BlockKind::Anchor,
                 orientation: 3,
             })
             .expect("anchor frame placement accepted");
-        let unfinished = runtime.execute(&ClientMessage::ToggleGridAnchor {
+        let unfinished = runtime.execute_next_for_fixture(&ClientMessage::ToggleGridAnchor {
+            operation_sequence: 0,
             operation_id: "engage-unfinished-anchor".into(),
             grid_id: STARTER_GRID_ID.into(),
         });
@@ -7137,14 +11068,63 @@ mod tests {
             Err(RuntimeError::Intent(IntentError::Rejected { ref code, .. }))
                 if code == "anchor_not_touching_voxel"
         ));
-        weld_to_completion(&mut runtime, IVec3::new(-2, 0, 0), "weld-anchor");
+        weld_to_completion(&mut runtime, anchor_coordinate, "weld-anchor");
+        let experience_before_anchor = runtime.state().player.experience;
+        let mut forged_anchor = runtime
+            .state()
+            .prepare_next_client_event_for_fixture(&ClientMessage::ToggleGridAnchor {
+                operation_sequence: 0,
+                operation_id: "forged-anchor-reward".into(),
+                grid_id: STARTER_GRID_ID.into(),
+            })
+            .expect("canonical rewarded anchor event prepares");
+        let EventPayload::GridAnchorSet {
+            reward_credited, ..
+        } = &mut forged_anchor.payload
+        else {
+            unreachable!();
+        };
+        *reward_credited = false;
+        forged_anchor.event_hash = forged_anchor.calculate_hash();
+        let mut forged_candidate = runtime.state().clone();
+        let forged_before = forged_candidate.state_hash();
+        let forged_error = forged_candidate
+            .apply_event(&forged_anchor)
+            .expect_err("forged one-time anchor reward decision rejects");
+        assert_eq!(forged_error.code(), "replay_grid_anchor_invalid");
+        assert_eq!(forged_candidate.state_hash(), forged_before);
         runtime
-            .execute(&ClientMessage::ToggleGridAnchor {
+            .execute_next_for_fixture(&ClientMessage::ToggleGridAnchor {
+                operation_sequence: 0,
                 operation_id: "engage-complete-anchor".into(),
                 grid_id: STARTER_GRID_ID.into(),
             })
             .expect("complete anchor engages");
         assert!(runtime.state().grids[STARTER_GRID_ID].anchored);
+        assert!(!runtime.state().grids[STARTER_GRID_ID].anchor_reward_eligible);
+        assert_eq!(
+            runtime.state().player.experience,
+            experience_before_anchor + 40
+        );
+        runtime
+            .execute_next_for_fixture(&ClientMessage::ToggleGridAnchor {
+                operation_sequence: 0,
+                operation_id: "release-complete-anchor".into(),
+                grid_id: STARTER_GRID_ID.into(),
+            })
+            .expect("complete anchor releases");
+        runtime
+            .execute_next_for_fixture(&ClientMessage::ToggleGridAnchor {
+                operation_sequence: 0,
+                operation_id: "reengage-complete-anchor".into(),
+                grid_id: STARTER_GRID_ID.into(),
+            })
+            .expect("complete anchor reengages without another reward");
+        assert_eq!(
+            runtime.state().player.experience,
+            experience_before_anchor + 40
+        );
+        assert_eq!(runtime.state().player.career.anchors_engaged, 2);
         assert!(runtime.state().conservation().valid);
     }
 
@@ -7154,7 +11134,8 @@ mod tests {
         move_player_near_grid(&mut runtime);
         let baseline = runtime.state().grids[STARTER_GRID_ID].power().produced;
         runtime
-            .execute(&ClientMessage::BuildBlock {
+            .execute_next_for_fixture(&ClientMessage::BuildBlock {
+                operation_sequence: 0,
                 operation_id: "place-power-frame".into(),
                 grid_id: STARTER_GRID_ID.into(),
                 coordinate: IVec3::new(0, 1, 0),
@@ -7190,7 +11171,8 @@ mod tests {
         )
         .expect("replacement lease writes");
 
-        let result = runtime.execute(&ClientMessage::SetPlayerControl {
+        let result = runtime.execute_next_for_fixture(&ClientMessage::SetPlayerControl {
+            operation_sequence: 0,
             operation_id: "stale-writer-control".into(),
             movement_epoch: 1,
             input_sequence: 1,
@@ -7209,7 +11191,8 @@ mod tests {
         assert_eq!(runtime.state().event_sequence, 0);
         assert_eq!(runtime.state().player.position, Vec3::new(12.0, 4.5, 10.0));
         assert!(matches!(
-            runtime.execute(&ClientMessage::SetPlayerControl {
+            runtime.execute_next_for_fixture(&ClientMessage::SetPlayerControl {
+                operation_sequence: 0,
                 operation_id: "halted-control".into(),
                 movement_epoch: 1,
                 input_sequence: 2,
@@ -7455,6 +11438,7 @@ mod tests {
 
         let translation = grounded_step_translation(
             &scene,
+            PLAYER_BODY_ID,
             PhysicsPose::new(PhysicsVec3::new(0.0, 0.9, 0.0), PhysicsQuat::IDENTITY),
             Vec3::new(0.0, 1.0, 0.0),
             Vec3::new(0.125, 0.0, 0.0),
@@ -7486,6 +11470,7 @@ mod tests {
         assert!(
             grounded_step_translation(
                 &scene,
+                PLAYER_BODY_ID,
                 PhysicsPose::new(PhysicsVec3::new(0.0, 0.9, 0.0), PhysicsQuat::IDENTITY),
                 Vec3::new(0.0, 1.0, 0.0),
                 Vec3::new(0.125, 0.0, 0.0),
@@ -7703,7 +11688,8 @@ mod tests {
 
         for sequence in 1..=12 {
             runtime
-                .execute(&ClientMessage::SetPlayerControl {
+                .execute_next_for_fixture(&ClientMessage::SetPlayerControl {
+                    operation_sequence: 0,
                     operation_id: format!("pole-walk-{sequence}"),
                     movement_epoch: runtime.state.player.movement_epoch,
                     input_sequence: sequence,
@@ -7771,7 +11757,8 @@ mod tests {
 
         let initial_x = runtime.state().player.position.x;
         runtime
-            .execute(&ClientMessage::SetPlayerControl {
+            .execute_next_for_fixture(&ClientMessage::SetPlayerControl {
+                operation_sequence: 0,
                 operation_id: "ground-walk".into(),
                 movement_epoch: 1,
                 input_sequence: 1,
@@ -7789,7 +11776,8 @@ mod tests {
         assert!(walk_speed <= content::manifest().character.walk_speed_m_s + 0.1);
 
         runtime
-            .execute(&ClientMessage::SetPlayerControl {
+            .execute_next_for_fixture(&ClientMessage::SetPlayerControl {
+                operation_sequence: 0,
                 operation_id: "ground-sprint".into(),
                 movement_epoch: 1,
                 input_sequence: 2,
@@ -7806,7 +11794,8 @@ mod tests {
         assert!(sprint_speed <= content::manifest().character.sprint_speed_m_s + 0.1);
 
         runtime
-            .execute(&ClientMessage::SetPlayerControl {
+            .execute_next_for_fixture(&ClientMessage::SetPlayerControl {
+                operation_sequence: 0,
                 operation_id: "ground-brake".into(),
                 movement_epoch: 1,
                 input_sequence: 3,
@@ -7850,7 +11839,8 @@ mod tests {
         runtime.advance(17).expect("support is classified");
 
         runtime
-            .execute(&ClientMessage::SetPlayerControl {
+            .execute_next_for_fixture(&ClientMessage::SetPlayerControl {
+                operation_sequence: 0,
                 operation_id: "ground-jump-press".into(),
                 movement_epoch: 1,
                 input_sequence: 1,
@@ -7871,7 +11861,8 @@ mod tests {
         let first_launch_speed = runtime.state().player.linear_velocity.y;
 
         runtime
-            .execute(&ClientMessage::SetPlayerControl {
+            .execute_next_for_fixture(&ClientMessage::SetPlayerControl {
+                operation_sequence: 0,
                 operation_id: "ground-jump-held".into(),
                 movement_epoch: 1,
                 input_sequence: 2,
@@ -8043,14 +12034,22 @@ mod tests {
         let hit_count = runtime.state.grids[STARTER_GRID_ID].blocks[&support.collider_id]
             .health
             .div_ceil(35);
+        let supported_player = runtime.state.player.primary().clone();
         for index in 0..hit_count {
+            aim_player_at_block_preserving_locomotion(
+                &mut runtime,
+                STARTER_GRID_ID,
+                &support.collider_id,
+            );
             runtime
-                .execute(&ClientMessage::DamageBlock {
+                .execute_next_for_fixture(&ClientMessage::DamageBlock {
+                    operation_sequence: 0,
                     operation_id: format!("destroy-magnetic-support-{index}"),
                     grid_id: STARTER_GRID_ID.into(),
                     block_id: support.collider_id.clone(),
                 })
                 .expect("support damage commits");
+            restore_player_pose_after_tool_fixture(&mut runtime, &supported_player);
         }
         assert!(!runtime.state.grids.values().any(|grid| {
             grid.blocks
@@ -8126,14 +12125,18 @@ mod tests {
         let position_before_split = runtime.state.player.position;
 
         let bridge_health = runtime.state.grids["split-grid"].blocks["split-bridge"].health;
+        let supported_player = runtime.state.player.primary().clone();
         for index in 0..bridge_health.div_ceil(35) {
+            aim_player_at_block_preserving_locomotion(&mut runtime, "split-grid", "split-bridge");
             runtime
-                .execute(&ClientMessage::DamageBlock {
+                .execute_next_for_fixture(&ClientMessage::DamageBlock {
+                    operation_sequence: 0,
                     operation_id: format!("split-support-bridge-{index}"),
                     grid_id: "split-grid".into(),
                     block_id: "split-bridge".into(),
                 })
                 .expect("bridge damage commits");
+            restore_player_pose_after_tool_fixture(&mut runtime, &supported_player);
         }
         let split_grid_id = runtime
             .state
@@ -8270,7 +12273,6 @@ mod tests {
             .grids
             .get_mut(STARTER_GRID_ID)
             .expect("starter grid exists");
-        grid.anchored = true;
         let block_position = grid.world_position(IVec3::ZERO);
         runtime.state.player.position = block_position + Vec3::new(0.0, 0.5 + radius + 2.0, 0.0);
         runtime.state.player.linear_velocity = Vec3::new(0.0, -24.0, 0.0);
@@ -8361,7 +12363,8 @@ mod tests {
             let mut runtime = Runtime::open(before_directory.path(), 79, 100)
                 .expect("runtime starts for pre-write failure");
             runtime
-                .execute(&ClientMessage::SetGridControl {
+                .execute_next_for_fixture(&ClientMessage::SetGridControl {
+                    operation_sequence: 0,
                     operation_id: "pre-write-control".into(),
                     grid_id: STARTER_GRID_ID.into(),
                     linear_input: Vec3::new(0.0, 0.0, -1.0),
@@ -8399,7 +12402,8 @@ mod tests {
             let mut runtime = Runtime::open(after_directory.path(), 83, 100)
                 .expect("runtime starts for post-sync failure");
             runtime
-                .execute(&ClientMessage::SetGridControl {
+                .execute_next_for_fixture(&ClientMessage::SetGridControl {
+                    operation_sequence: 0,
                     operation_id: "post-sync-control".into(),
                     grid_id: STARTER_GRID_ID.into(),
                     linear_input: Vec3::new(0.0, 0.0, -1.0),
@@ -8462,7 +12466,10 @@ mod tests {
         {
             let mut runtime =
                 Runtime::open(before_directory.path(), 109, 100).expect("runtime opens");
-            before_target = reachable_voxel(&runtime);
+            before_target = reachable_voxel(&mut runtime);
+            runtime
+                .persist_snapshot()
+                .expect("aimed mining baseline persists");
             let body_id =
                 voxel_collision_chunk_body_id(voxel_collision_chunk_coordinate(before_target));
             let collider_id = voxel_collision_collider_id(before_target);
@@ -8476,7 +12483,8 @@ mod tests {
                 .store
                 .set_append_failpoint(AppendFailpoint::BeforeWrite);
             assert!(matches!(
-                runtime.execute(&ClientMessage::MineVoxel {
+                runtime.execute_next_for_fixture(&ClientMessage::MineVoxel {
+                    operation_sequence: 0,
                     operation_id: "mine-before-write".into(),
                     coordinate: before_target,
                 }),
@@ -8504,7 +12512,10 @@ mod tests {
         {
             let mut runtime =
                 Runtime::open(after_directory.path(), 113, 100).expect("runtime opens");
-            after_target = reachable_voxel(&runtime);
+            after_target = reachable_voxel(&mut runtime);
+            runtime
+                .persist_snapshot()
+                .expect("aimed mining baseline persists");
             let body_id =
                 voxel_collision_chunk_body_id(voxel_collision_chunk_coordinate(after_target));
             let collider_id = voxel_collision_collider_id(after_target);
@@ -8513,7 +12524,8 @@ mod tests {
                 .store
                 .set_append_failpoint(AppendFailpoint::AfterSync);
             assert!(matches!(
-                runtime.execute(&ClientMessage::MineVoxel {
+                runtime.execute_next_for_fixture(&ClientMessage::MineVoxel {
+                    operation_sequence: 0,
                     operation_id: "mine-after-sync".into(),
                     coordinate: after_target,
                 }),
@@ -8557,31 +12569,49 @@ mod tests {
         let mut runtime = runtime();
         move_player_near_grid(&mut runtime);
         let build = ClientMessage::BuildBlock {
+            operation_sequence: 0,
             operation_id: "build-bridge".into(),
             grid_id: STARTER_GRID_ID.into(),
             coordinate: IVec3::new(0, 1, 0),
             kind: BlockKind::DamageTest,
             orientation: 0,
         };
-        runtime.execute(&build).expect("bridge block built");
+        runtime
+            .execute_next_for_fixture(&build)
+            .expect("bridge block built");
         let build_top = ClientMessage::BuildBlock {
+            operation_sequence: 0,
             operation_id: "build-top".into(),
             grid_id: STARTER_GRID_ID.into(),
             coordinate: IVec3::new(0, 2, 0),
             kind: BlockKind::Structural,
             orientation: 0,
         };
-        runtime.execute(&build_top).expect("top block built");
+        runtime
+            .execute_next_for_fixture(&build_top)
+            .expect("top block built");
         weld_to_completion(&mut runtime, IVec3::new(0, 1, 0), "weld-bridge");
         weld_to_completion(&mut runtime, IVec3::new(0, 2, 0), "weld-top");
+        runtime
+            .execute_next_for_fixture(&ClientMessage::SetGridControl {
+                operation_sequence: 0,
+                operation_id: "control-before-split".into(),
+                grid_id: STARTER_GRID_ID.into(),
+                linear_input: Vec3::new(0.25, 0.0, 0.0),
+                angular_input: Vec3::new(0.0, 0.1, 0.0),
+                dampeners: false,
+            })
+            .expect("owned grid control engages before structural split");
         let bridge_id = runtime.state().grids[STARTER_GRID_ID]
             .block_at(IVec3::new(0, 1, 0))
             .expect("bridge block")
             .block_id
             .clone();
         for index in 0..2 {
+            aim_player_at_block(&mut runtime, STARTER_GRID_ID, &bridge_id);
             runtime
-                .execute(&ClientMessage::DamageBlock {
+                .execute_next_for_fixture(&ClientMessage::DamageBlock {
+                    operation_sequence: 0,
                     operation_id: format!("damage-{index}"),
                     grid_id: STARTER_GRID_ID.into(),
                     block_id: bridge_id.clone(),
@@ -8599,6 +12629,21 @@ mod tests {
             block_ids.iter().collect::<BTreeSet<_>>().len()
         );
         assert_eq!(runtime.state().grids.len(), 2);
+        assert!(runtime.state().grids.values().all(|grid| {
+            grid.owner_player_id == "player-local"
+                && grid.control_linear_input == Vec3::ZERO
+                && grid.control_angular_input == Vec3::ZERO
+                && grid.dampeners
+        }));
+        assert_eq!(
+            runtime
+                .state()
+                .grids
+                .values()
+                .filter(|grid| grid.anchor_reward_eligible)
+                .count(),
+            1
+        );
         assert!(runtime.state().conservation().valid);
     }
 
@@ -8606,7 +12651,8 @@ mod tests {
     fn authoritative_grid_controls_cannot_drive_through_asteroid_voxels() {
         let mut runtime = runtime();
         runtime
-            .execute(&ClientMessage::SetGridControl {
+            .execute_next_for_fixture(&ClientMessage::SetGridControl {
+                operation_sequence: 0,
                 operation_id: "drive-into-asteroid".into(),
                 grid_id: STARTER_GRID_ID.into(),
                 linear_input: Vec3::new(-1.0, 0.0, 0.0),
@@ -8627,6 +12673,64 @@ mod tests {
         );
         assert!(grid.linear_velocity.x > -0.25);
         assert!(runtime.state().simulation_tick >= 24);
+    }
+
+    #[test]
+    fn grid_control_replay_revalidates_bounds_power_and_anchor_state() {
+        let state = WorldState::genesis(172);
+        let valid = state
+            .prepare_next_client_event_for_fixture(&ClientMessage::SetGridControl {
+                operation_sequence: 0,
+                operation_id: "canonical-grid-control".into(),
+                grid_id: STARTER_GRID_ID.into(),
+                linear_input: Vec3::new(0.25, 0.0, 0.0),
+                angular_input: Vec3::ZERO,
+                dampeners: true,
+            })
+            .expect("canonical grid control prepares");
+
+        let mut oversized = valid.clone();
+        let EventPayload::GridControlSet { linear_input, .. } = &mut oversized.payload else {
+            unreachable!();
+        };
+        *linear_input = Vec3::new(1.25, 0.0, 0.0);
+        oversized.event_hash = oversized.calculate_hash();
+
+        let mut anchored_state = state.clone();
+        anchored_state
+            .grids
+            .get_mut(STARTER_GRID_ID)
+            .expect("starter grid exists")
+            .anchored = true;
+        let mut unpowered_state = state.clone();
+        for block in unpowered_state
+            .grids
+            .get_mut(STARTER_GRID_ID)
+            .expect("starter grid exists")
+            .blocks
+            .values_mut()
+        {
+            if matches!(block.kind, BlockKind::PowerSource | BlockKind::Battery) {
+                block.construction_complete = false;
+            }
+        }
+
+        for (mut candidate, event, expected_code) in [
+            (
+                state.clone(),
+                oversized,
+                "replay_intent_fingerprint_mismatch",
+            ),
+            (anchored_state, valid.clone(), "replay_grid_control_invalid"),
+            (unpowered_state, valid, "replay_grid_control_invalid"),
+        ] {
+            let before = candidate.state_hash();
+            let error = candidate
+                .apply_event(&event)
+                .expect_err("forged grid control replay rejects");
+            assert_eq!(error.code(), expected_code);
+            assert_eq!(candidate.state_hash(), before);
+        }
     }
 
     #[test]
@@ -8724,7 +12828,8 @@ mod tests {
     fn runtime_cargo_mass_reduces_acceleration_under_the_same_force() {
         fn accelerate(runtime: &mut Runtime, operation_prefix: &str) -> f64 {
             runtime
-                .execute(&ClientMessage::SetGridControl {
+                .execute_next_for_fixture(&ClientMessage::SetGridControl {
+                    operation_sequence: 0,
                     operation_id: format!("{operation_prefix}-control"),
                     grid_id: STARTER_GRID_ID.into(),
                     linear_input: Vec3::new(1.0, 0.0, 0.0),
@@ -8755,7 +12860,8 @@ mod tests {
             .cloned()
             .expect("starter cargo exists");
         heavy
-            .execute(&ClientMessage::TransferInventory {
+            .execute_next_for_fixture(&ClientMessage::TransferInventory {
+                operation_sequence: 0,
                 operation_id: "load-physical-cargo".into(),
                 source_inventory_id: PLAYER_INVENTORY_ID.into(),
                 destination_inventory_id: cargo_id.clone(),
@@ -8819,7 +12925,8 @@ mod tests {
         assert!(runtime.state().grids["floor-grid"].anchor_touches(&runtime.state().voxels));
         assert!(runtime.state().grids["floor-grid"].power().online);
         runtime
-            .execute(&ClientMessage::SetGridControl {
+            .execute_next_for_fixture(&ClientMessage::SetGridControl {
+                operation_sequence: 0,
                 operation_id: "press-grid-onto-floor".into(),
                 grid_id: "resting-grid".into(),
                 linear_input: Vec3::new(0.0, -0.2, 0.0),
@@ -8961,7 +13068,8 @@ mod tests {
             );
             let before_rejected_control = runtime.state().state_hash();
             assert!(matches!(
-                runtime.execute(&ClientMessage::SetGridControl {
+                runtime.execute_next_for_fixture(&ClientMessage::SetGridControl {
+                    operation_sequence: 0,
                     operation_id: "reject-anchored-control".into(),
                     grid_id: "anchored-grid".into(),
                     linear_input: Vec3::new(1.0, 0.0, 0.0),
@@ -8996,7 +13104,8 @@ mod tests {
                 .state()
                 .grid_mass_grams(&runtime.state().grids["anchored-grid"]);
             runtime
-                .execute(&ClientMessage::ToggleGridAnchor {
+                .execute_next_for_fixture(&ClientMessage::ToggleGridAnchor {
+                    operation_sequence: 0,
                     operation_id: "release-final-anchor".into(),
                     grid_id: "anchored-grid".into(),
                 })
@@ -9020,7 +13129,8 @@ mod tests {
             assert!(runtime.state().conservation().valid);
 
             runtime
-                .execute(&ClientMessage::SetGridControl {
+                .execute_next_for_fixture(&ClientMessage::SetGridControl {
+                    operation_sequence: 0,
                     operation_id: "move-released-anchor".into(),
                     grid_id: "anchored-grid".into(),
                     linear_input: Vec3::new(1.0, 0.0, 0.0),
@@ -9056,7 +13166,8 @@ mod tests {
         let directory = tempfile::tempdir().expect("tempdir");
         let mut runtime = Runtime::open(directory.path(), 42, 1).expect("runtime opens");
         runtime
-            .execute(&ClientMessage::SetGridControl {
+            .execute_next_for_fixture(&ClientMessage::SetGridControl {
+                operation_sequence: 0,
                 operation_id: "contact-lifecycle-thrust".into(),
                 grid_id: STARTER_GRID_ID.into(),
                 linear_input: Vec3::new(-1.0, 0.0, 0.0),
@@ -9137,7 +13248,8 @@ mod tests {
         let directory = tempfile::tempdir().expect("tempdir");
         let mut runtime = Runtime::open(directory.path(), 7, 1_000).expect("runtime opens");
         runtime
-            .execute(&ClientMessage::SetGridControl {
+            .execute_next_for_fixture(&ClientMessage::SetGridControl {
+                operation_sequence: 0,
                 operation_id: "recovery-thrust".into(),
                 grid_id: STARTER_GRID_ID.into(),
                 linear_input: Vec3::new(0.0, 0.0, 0.5),
@@ -9172,7 +13284,8 @@ mod tests {
         let directory = tempfile::tempdir().expect("tempdir");
         let mut runtime = Runtime::open(directory.path(), 7, 1).expect("runtime opens");
         runtime
-            .execute(&ClientMessage::SetGridControl {
+            .execute_next_for_fixture(&ClientMessage::SetGridControl {
+                operation_sequence: 0,
                 operation_id: "timing-thrust".into(),
                 grid_id: STARTER_GRID_ID.into(),
                 linear_input: Vec3::new(0.0, 0.0, 0.25),

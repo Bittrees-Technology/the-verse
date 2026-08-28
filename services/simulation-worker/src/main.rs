@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 use tokio::net::TcpListener;
 use tracing::{error, info};
@@ -34,6 +34,16 @@ struct Arguments {
     #[arg(long, env = "VERSE_TICK_MS", default_value_t = 16)]
     tick_millis: u16,
 
+    /// Comma-separated loopback-only development actors pre-admitted before
+    /// the first event. Gameplay hello messages can bind but never create one.
+    #[arg(
+        long,
+        env = "VERSE_DEVELOPMENT_PLAYERS",
+        value_delimiter = ',',
+        default_value = "player-remote"
+    )]
+    development_players: Vec<String>,
+
     /// Open the authoritative state for recovery inspection without advancing time.
     #[arg(long, env = "VERSE_PAUSE_SIMULATION", default_value_t = false)]
     pause_simulation: bool,
@@ -51,7 +61,12 @@ async fn main() -> Result<()> {
         .init();
 
     let arguments = Arguments::parse();
-    let runtime = Runtime::open(
+    if !arguments.bind.ip().is_loopback() {
+        bail!(
+            "protocol 11 local-development player authentication is restricted to a loopback bind; use 127.0.0.1 or wait for the configured session authority"
+        );
+    }
+    let mut runtime = Runtime::open(
         &arguments.data_directory,
         arguments.world_seed,
         arguments.snapshot_every,
@@ -62,6 +77,11 @@ async fn main() -> Result<()> {
             arguments.data_directory.display()
         )
     })?;
+    for player_id in &arguments.development_players {
+        runtime
+            .admit_development_player(player_id)
+            .with_context(|| format!("failed to pre-admit development player {player_id}"))?;
+    }
     let state = AppState::new(runtime);
     let tick_task = if arguments.pause_simulation {
         None
@@ -139,6 +159,7 @@ mod tests {
     fn authoritative_tick_defaults_to_at_most_one_sixty_hz_frame() {
         let arguments = Arguments::parse_from(["verse-simulation-worker"]);
         assert_eq!(arguments.tick_millis, 16);
+        assert_eq!(arguments.development_players, ["player-remote"]);
         assert!(f64::from(arguments.tick_millis) <= 1_000.0 / 60.0);
     }
 }

@@ -11,15 +11,23 @@ const PLANET_SHADER: Shader = preload("res://shaders/planet_surface.gdshader")
 const ATMOSPHERE_SHADER: Shader = preload("res://shaders/planet_atmosphere.gdshader")
 const CLOUD_SHADER: Shader = preload("res://shaders/planet_clouds.gdshader")
 const BLOCK_DAMAGE_SHADER: Shader = preload("res://shaders/block_damage.gdshader")
-const PROTOCOL_VERSION := 10
+const PROTOCOL_VERSION := 14
+const PROJECTION_SCHEMA_VERSION := 1
 const DEFAULT_SERVER := "ws://127.0.0.1:7777/ws"
-const PLAYER_INVENTORY := "inventory-player-local"
+const DEFAULT_PLAYER_ID := "player-local"
 const STARTER_GRID := "grid-starter"
 # Clean-room prediction mirrors the protocol-fenced p0.10.0 character content.
 # The server remains authoritative for elapsed time, contacts, and final motion.
 const CHARACTER_FIXED_DELTA := 1.0 / 60.0
 const CONTROL_SEND_INTERVAL := 0.10
+# Leave enough headroom for Godot's float32 Vector3 components to survive
+# JSON's float64 reconstruction without crossing the authoritative unit sphere.
+const CONTROL_INPUT_SAFE_LIMIT := 0.999999
 const PREDICTION_HISTORY_LIMIT := 180
+const MUTATION_QUEUE_LIMIT := 32
+const MUTATION_RETRY_INTERVAL := 1.5
+const MUTATION_RETRY_LIMIT := 3
+const JSON_SAFE_INTEGER_MAX := 9007199254740991
 const POSITION_SNAP_DISTANCE := 2.0
 const ORIENTATION_SNAP_ANGLE := PI / 3.0
 const CHARACTER_COLLISION_RADIUS := 0.34
@@ -46,6 +54,9 @@ const PHYSICS_MAXIMUM_LINEAR_SPEED := 32.0
 const PHYSICS_MAXIMUM_ANGULAR_SPEED := 8.0
 const MOUSE_ANGULAR_INPUT_PER_PIXEL := 0.12
 const TARGET_RANGE := 9.0
+const TOOL_HIT_EPSILON := 0.000000001
+const TOOL_DIRECTION_EPSILON := 0.000000000001
+const TOOL_DDA_MAX_STEPS := 512
 const MINE_DURATION := 0.72
 const WELD_DURATION := 0.52
 const DAMAGE_DURATION := 0.46
@@ -73,9 +84,24 @@ const DENSITY_NEIGHBORS: Array[Vector3i] = [
 
 var socket := WebSocketPeer.new()
 var server_url := DEFAULT_SERVER
+var requested_player_id := DEFAULT_PLAYER_ID
+var bound_player_id := ""
 var connected := false
 var handshake_sent := false
 var operation_counter := 0
+var committed_operation_sequence := 0
+var committed_operation_actor_id := ""
+var operation_frontier_observed := false
+var observed_operation_frontier := -1
+var operation_frontier_ready := false
+var mutation_queue: Array[Dictionary] = []
+var mutation_queue_actor_id := ""
+var in_flight_mutation: Dictionary = {}
+var in_flight_mutation_text := ""
+var in_flight_mutation_actor_id := ""
+var mutation_retry_elapsed := 0.0
+var mutation_retry_count := 0
+var mutation_resync_required := false
 var authoritative_player_ready := false
 var awaiting_reconnect_baseline := true
 var control_send_elapsed := 0.0
@@ -104,19 +130,26 @@ var prediction_history: Array[Dictionary] = []
 var pending_controls: Array[Dictionary] = []
 var prediction_history_invalid := false
 var mouse_delta_accumulator := Vector2.ZERO
+var roll_left_held := false
+var roll_right_held := false
+var pending_roll_transitions: Array[float] = []
 var presentation_position_offset := Vector3.ZERO
 var presentation_orientation_offset := Quaternion.IDENTITY
 var require_neutral_baseline := true
 var last_player_id := ""
 var last_player_life_state := ""
 var snapshot: Dictionary = {}
+var actor_private_snapshot: Dictionary = {}
+var session_role_kind := ""
 var voxel_lookup: Dictionary = {}
 var voxel_coordinate_lookup: Dictionary = {}
 var voxel_chunk_nodes: Dictionary = {}
 var grid_lookup: Dictionary = {}
 var grid_node_lookup: Dictionary = {}
+var remote_player_nodes: Dictionary = {}
 var rendered_voxel_count := -1
 var selected_block_kind := "structural"
+var target_hit: Dictionary = {}
 var target_voxel: Variant = null
 var target_block: Dictionary = {}
 var recent_message := "Starting local universe connection…"
@@ -140,11 +173,17 @@ var build_rotation_quarters := 0
 var last_level := 1
 var pending_mine_position: Variant = null
 var inventory_open := false
-var grid_control_active := false
+var active_grid_control_id := ""
+var selected_cargo_inventory_id := ""
+var last_targeted_owned_grid_id := ""
 var inventory_item_labels: Dictionary = {}
 var inventory_capacity_labels: Dictionary = {}
 var inventory_capacity_bars: Dictionary = {}
 var inventory_rows: Dictionary = {}
+var inventory_title_labels: Dictionary = {}
+var inventory_subtitle_labels: Dictionary = {}
+var inventory_selectors: Dictionary = {}
+var inventory_transfer_buttons: Array[Button] = []
 var inventory_selected_resource := "component"
 var inventory_selected_side := "suit"
 var inventory_filters := {"suit": "all", "cargo": "all"}
@@ -153,6 +192,7 @@ var inventory_search_queries := {"suit": "", "cargo": ""}
 var camera: Camera3D
 var asteroid_root: Node3D
 var grids_root: Node3D
+var players_root: Node3D
 var stars_root: Node3D
 var planet_root: Node3D
 var target_highlight: MeshInstance3D
@@ -210,6 +250,7 @@ func _process(delta: float) -> void:
 	if planet_cloud_layer != null:
 		planet_cloud_layer.rotation.y += delta * 0.0025
 	_poll_socket()
+	_advance_mutation_transport(delta)
 	_update_player_presentation(delta)
 	_update_target()
 	_update_tool_action(delta)
@@ -218,18 +259,27 @@ func _process(delta: float) -> void:
 
 
 func _physics_process(delta: float) -> void:
-	if not connected or not authoritative_player_ready:
+	if (
+		not connected
+		or not authoritative_player_ready
+		or not operation_frontier_ready
+		or mutation_resync_required
+	):
 		return
 	if _local_player_incapacitated():
 		return
 	control_send_elapsed += delta
-	var control := _sample_player_control()
+	var control := _neutral_player_control()
+	var sampled_roll_transition := false
 	if require_neutral_baseline:
-		control = _neutral_player_control()
 		if _send_player_control(control, true):
 			require_neutral_baseline = false
-	elif _should_send_player_control(control):
-		_send_player_control(control, false)
+	else:
+		sampled_roll_transition = not pending_roll_transitions.is_empty()
+		control = _sample_player_control()
+		if _should_send_player_control(control) and _send_player_control(control, false):
+			if sampled_roll_transition and not pending_roll_transitions.is_empty():
+				pending_roll_transitions.pop_front()
 	_predict_player_step(control, CHARACTER_FIXED_DELTA, true)
 
 
@@ -253,7 +303,7 @@ func _input(event: InputEvent) -> void:
 	# Inventory text entry owns keyboard input. A held grid-control key still gets
 	# its release so opening the terminal cannot leave thrust latched.
 	if inventory_open and event is InputEventKey:
-		if event.keycode == KEY_M and not event.pressed and grid_control_active:
+		if event.keycode == KEY_M and not event.pressed and not active_grid_control_id.is_empty():
 			_stop_target_grid()
 		var focus_owner := get_viewport().gui_get_focus_owner()
 		var text_entry_focused := focus_owner is LineEdit or focus_owner is TextEdit
@@ -261,10 +311,18 @@ func _input(event: InputEvent) -> void:
 			_set_inventory_open(false)
 		return
 
+	if (
+		event is InputEventKey
+		and not event.echo
+		and event.keycode in [KEY_Q, KEY_E]
+		and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED
+	):
+		_capture_roll_key_transition(event)
+
 	if event is InputEventKey and event.keycode == KEY_M and not event.echo:
 		if event.pressed and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
 			_move_target_grid()
-		elif grid_control_active:
+		elif not active_grid_control_id.is_empty():
 			_stop_target_grid()
 		return
 
@@ -279,6 +337,7 @@ func _input(event: InputEvent) -> void:
 						if Input.mouse_mode == Input.MOUSE_MODE_CAPTURED
 						else Input.MOUSE_MODE_CAPTURED
 					)
+					_clear_transient_character_input()
 			KEY_I:
 				_set_inventory_open(not inventory_open)
 			KEY_J:
@@ -324,7 +383,7 @@ func _input(event: InputEvent) -> void:
 			KEY_V:
 				_transfer_to_or_from_cargo(event.shift_pressed)
 			KEY_P:
-				_send({"type": "request_snapshot"})
+				_send_transport({"type": "request_snapshot"})
 			KEY_Z:
 				desired_dampeners = not desired_dampeners
 				_set_message(
@@ -357,6 +416,8 @@ func _player_life_state(player: Dictionary) -> String:
 	var life_state: Variant = player.get("life_state", {})
 	if life_state is Dictionary:
 		return String(life_state.get("kind", "alive"))
+	if life_state is String:
+		return String(life_state)
 	return "alive"
 
 
@@ -365,8 +426,128 @@ func _player_is_incapacitated(player: Dictionary) -> bool:
 
 
 func _local_player_incapacitated() -> bool:
-	var player: Dictionary = snapshot.get("player", {})
+	var player := _local_player()
 	return not _player_controls_enabled(player)
+
+
+func _controlled_player_id() -> String:
+	return bound_player_id if not bound_player_id.is_empty() else requested_player_id
+
+
+func _player_from_roster(players: Array, player_id: String) -> Dictionary:
+	for candidate in players:
+		if candidate is Dictionary and String(candidate.get("player_id", "")) == player_id:
+			return candidate
+	return {}
+
+
+func _local_player() -> Dictionary:
+	var player: Variant = actor_private_snapshot.get("player", {})
+	if not player is Dictionary:
+		return {}
+	if String(player.get("player_id", "")) != bound_player_id:
+		return {}
+	return player
+
+
+func _local_inventory_id() -> String:
+	return String(_local_player().get("inventory_id", ""))
+
+
+func _local_environment() -> Dictionary:
+	var player_environment: Variant = _local_player().get("environment", {})
+	if player_environment is Dictionary and not player_environment.is_empty():
+		return player_environment
+	return snapshot.get("environment", {})
+
+
+func _private_inventory_ready() -> bool:
+	return not _local_inventory_id().is_empty()
+
+
+func _clear_actor_private_state() -> void:
+	actor_private_snapshot = {}
+	operation_frontier_ready = false
+	selected_cargo_inventory_id = ""
+	last_targeted_owned_grid_id = ""
+	for button in inventory_transfer_buttons:
+		if is_instance_valid(button):
+			button.disabled = true
+	var selector: OptionButton = inventory_selectors.get("cargo", null)
+	if selector != null and is_instance_valid(selector):
+		selector.clear()
+		selector.add_item("NO AUTHORIZED CARGO LINK")
+		selector.set_item_metadata(0, "")
+		selector.disabled = true
+
+
+func _protocol_nonnegative_integer(value: Variant) -> int:
+	var value_type := typeof(value)
+	if value_type == TYPE_INT:
+		var integer_value := int(value)
+		if integer_value >= 0 and integer_value <= JSON_SAFE_INTEGER_MAX:
+			return integer_value
+		return -1
+	if value_type != TYPE_FLOAT:
+		return -1
+	var float_value := float(value)
+	if (
+		not is_finite(float_value)
+		or float_value < 0.0
+		or float_value > float(JSON_SAFE_INTEGER_MAX)
+		or floor(float_value) != float_value
+	):
+		return -1
+	return int(float_value)
+
+
+func _actor_private_matches(candidate: Variant, event_sequence: int) -> bool:
+	if not candidate is Dictionary or candidate.is_empty() or bound_player_id.is_empty():
+		return false
+	var player: Variant = candidate.get("player", {})
+	if not player is Dictionary or String(player.get("player_id", "")) != bound_player_id:
+		return false
+	var carried_inventory_id := String(player.get("inventory_id", ""))
+	var carried_matches := 0
+	for inventory_value in candidate.get("inventories", []):
+		if not inventory_value is Dictionary:
+			continue
+		var domain: Dictionary = inventory_value.get("domain", {})
+		if (
+			String(inventory_value.get("inventory_id", "")) == carried_inventory_id
+			and String(domain.get("kind", "")) == "player"
+			and String(domain.get("player_id", "")) == bound_player_id
+		):
+			carried_matches += 1
+	if carried_inventory_id.is_empty() or carried_matches != 1:
+		return false
+	if (
+		not candidate.has("committed_operation_sequence")
+		or _protocol_nonnegative_integer(
+			candidate.get("committed_operation_sequence", null)
+		) < 0
+	):
+		return false
+	# Protocol 14 nests the overlay in the outer projected snapshot, making the
+	# outer sequence authoritative. Honor a future explicit sequence only when
+	# it agrees, so malformed extensions still fail closed.
+	return (
+		not candidate.has("event_sequence")
+		or _protocol_nonnegative_integer(candidate.get("event_sequence", null))
+		== event_sequence
+	)
+
+
+func _install_actor_private(candidate: Variant, event_sequence: int) -> bool:
+	_clear_actor_private_state()
+	if not _actor_private_matches(candidate, event_sequence):
+		return false
+	actor_private_snapshot = (candidate as Dictionary).duplicate(true)
+	return _reconcile_operation_frontier(
+		_protocol_nonnegative_integer(
+			actor_private_snapshot.get("committed_operation_sequence", null)
+		)
+	)
 
 
 func _life_support_display_state(player: Dictionary) -> String:
@@ -380,13 +561,15 @@ func _life_support_display_state(player: Dictionary) -> String:
 
 
 func _player_controls_enabled(player: Dictionary) -> bool:
-	return not _player_is_incapacitated(player)
+	return not player.is_empty() and not _player_is_incapacitated(player)
 
 
 func _parse_command_line() -> void:
 	for argument in OS.get_cmdline_user_args():
 		if argument.begins_with("--server="):
 			server_url = argument.trim_prefix("--server=")
+		elif argument.begins_with("--player-id="):
+			requested_player_id = argument.trim_prefix("--player-id=")
 		elif argument == "--smoke-test":
 			smoke_test = true
 
@@ -465,6 +648,9 @@ func _build_environment() -> void:
 	grids_root = Node3D.new()
 	grids_root.name = "AuthoritativeGrids"
 	add_child(grids_root)
+	players_root = Node3D.new()
+	players_root.name = "AuthoritativeRemotePlayers"
+	add_child(players_root)
 	stars_root = Node3D.new()
 	stars_root.name = "Starfield"
 	add_child(stars_root)
@@ -1179,15 +1365,20 @@ func _inventory_column(
 	var title_label := _hud_label(title, Vector2(16.0, 12.0), 16)
 	title_label.add_theme_color_override("font_color", Color(0.80, 0.89, 0.91))
 	panel.add_child(title_label)
+	inventory_title_labels[side] = title_label
 	var subtitle_label := _hud_label(subtitle, Vector2(16.0, 36.0), 10)
 	subtitle_label.add_theme_color_override("font_color", Color(0.38, 0.67, 0.74))
 	panel.add_child(subtitle_label)
+	inventory_subtitle_labels[side] = subtitle_label
 
 	var selector := OptionButton.new()
 	selector.position = Vector2(16.0, 60.0)
 	selector.size = Vector2(438.0, 32.0)
 	selector.add_item("%s  /  %s" % [title, subtitle])
+	if side == "cargo":
+		selector.item_selected.connect(_cargo_inventory_selected)
 	panel.add_child(selector)
+	inventory_selectors[side] = selector
 	var search := LineEdit.new()
 	search.placeholder_text = "Search inventory"
 	search.position = Vector2(16.0, 99.0)
@@ -1309,10 +1500,22 @@ func _add_transfer_controls(parent: Control) -> void:
 		button.size = Vector2(44.0, 34.0)
 		button.pressed.connect(_transfer_selected_inventory.bind(bool(data[2]), bool(data[3])))
 		parent.add_child(button)
+		inventory_transfer_buttons.append(button)
 
 
 func _transfer_selected_inventory(reverse: bool, all: bool) -> void:
 	_transfer_inventory_resource(inventory_selected_resource, reverse, all)
+
+
+func _cargo_inventory_selected(index: int) -> void:
+	var selector: OptionButton = inventory_selectors.get("cargo", null)
+	if selector == null or index < 0 or index >= selector.item_count:
+		return
+	var inventory_id := String(selector.get_item_metadata(index))
+	for candidate in _owned_cargo_candidates():
+		if String(candidate.get("inventory_id", "")) == inventory_id:
+			selected_cargo_inventory_id = inventory_id
+			return
 
 
 func _select_inventory_resource(side: String, resource: String) -> void:
@@ -1438,10 +1641,14 @@ func _poll_socket() -> void:
 		connected = true
 		if not handshake_sent:
 			handshake_sent = true
-			_send({
+			_send_transport({
 				"type": "hello",
 				"protocol_version": PROTOCOL_VERSION,
-				"client_name": "godot-native-p0.10",
+				"client_name": "godot-native-p1.3",
+				"authentication": {
+					"kind": "local_development",
+					"player_id": requested_player_id,
+				},
 			})
 		while socket.get_available_packet_count() > 0:
 			var text := socket.get_packet().get_string_from_utf8()
@@ -1470,33 +1677,57 @@ func _poll_socket() -> void:
 func _handle_server_message(message: Dictionary) -> void:
 	match message.get("type", ""):
 		"welcome":
-			_set_message("Connected to %s" % message.get("server_name", "The Verse"))
+			var session_role: Dictionary = message.get("session_role", {})
+			session_role_kind = String(session_role.get("kind", ""))
+			_clear_actor_private_state()
+			if session_role_kind == "player":
+				bound_player_id = String(session_role.get("player_id", requested_player_id))
+			else:
+				bound_player_id = ""
+			if not _mutation_actor_matches_session():
+				_clear_mutation_pipeline()
+				mutation_resync_required = true
+				_set_message("PENDING COMMANDS DISCARDED // SESSION ACTOR CHANGED", true)
+			if (
+				not committed_operation_actor_id.is_empty()
+				and committed_operation_actor_id != bound_player_id
+			):
+				committed_operation_sequence = 0
+				committed_operation_actor_id = ""
+				operation_frontier_observed = false
+				observed_operation_frontier = -1
+			_set_message(
+				"Connected to %s // %s"
+				% [message.get("server_name", "The Verse"), _controlled_player_id()]
+			)
 		"snapshot":
 			_apply_snapshot(message.get("snapshot", {}))
 		"motion_state":
 			_apply_motion_state(message.get("motion", {}))
 		"intent_accepted":
 			var receipt: Dictionary = message.get("receipt", {})
-			if receipt.get("code", "") != "player_control_set":
-				_set_message(receipt.get("message", "Intent accepted"))
-			if receipt.get("operation_id", "") == recovery_operation:
-				_set_message("Recovery authorized // awaiting authoritative snapshot")
-			if smoke_test and receipt.get("operation_id", "") == smoke_operation:
-				smoke_receipt_received = true
-				_check_smoke_control_ack(snapshot.get("player", {}))
+			if _handle_intent_accepted(receipt):
+				if receipt.get("code", "") != "player_control_set":
+					_set_message(receipt.get("message", "Intent accepted"))
+				if receipt.get("operation_id", "") == recovery_operation:
+					_set_message("Recovery authorized // awaiting authoritative snapshot")
+				if smoke_test and receipt.get("operation_id", "") == smoke_operation:
+					smoke_receipt_received = true
+					_check_smoke_control_ack(_local_player())
 		"intent_rejected":
 			pending_mine_position = null
-			var rejected_operation := String(message.get("operation_id", ""))
-			if message.get("operation_id", "") == recovery_operation:
-				recovery_operation = ""
-			if rejected_operation.begins_with("player-control-"):
-				_begin_player_resync()
-				_send({"type": "request_snapshot"})
-			_set_message(
-				"%s — %s" % [message.get("code", "rejected"), message.get("message", "")],
-				true
-			)
+			if _handle_intent_rejected(message):
+				if message.get("operation_id", "") == recovery_operation:
+					recovery_operation = ""
+				_set_message(
+					"%s — %s"
+					% [message.get("code", "rejected"), message.get("message", "")],
+					true
+				)
 		"fatal":
+			mutation_resync_required = true
+			operation_frontier_ready = false
+			authoritative_player_ready = false
 			_set_message(
 				"FATAL %s — %s" % [message.get("code", ""), message.get("message", "")],
 				true
@@ -1511,14 +1742,11 @@ func _apply_snapshot(authoritative: Dictionary) -> void:
 		event_sequence, last_authoritative_event_sequence
 	):
 		return
-	_capture_prediction_gravity(authoritative)
-	snapshot = authoritative
-	var player: Dictionary = snapshot.get("player", {})
-	var level := int(player.get("level", 1))
-	if level > last_level:
-		_set_message("CLEARANCE ADVANCED // SALVAGER LEVEL %d" % level)
-		tool_kick = 1.0
-	last_level = level
+	var private_candidate: Variant = authoritative.get("actor_private", {})
+	snapshot = authoritative.duplicate(true)
+	snapshot.erase("actor_private")
+	var players: Array = snapshot.get("players", [])
+	_sync_remote_players(players)
 
 	var voxels: Array = snapshot.get("voxels", [])
 	if voxels.size() != rendered_voxel_count:
@@ -1530,6 +1758,38 @@ func _apply_snapshot(authoritative: Dictionary) -> void:
 				_emit_mining_fragments(Vector3(mined_coordinate))
 				pending_mine_position = null
 	_rebuild_grids(snapshot.get("grids", []))
+	if smoke_test:
+		print("VERSE_SMOKE_STRUCTURAL_READY event=%d" % event_sequence)
+
+	var public_player := _player_from_roster(players, bound_player_id)
+	var projection_valid := (
+		int(snapshot.get("projection_schema_version", 0)) == PROJECTION_SCHEMA_VERSION
+		and not public_player.is_empty()
+		and _install_actor_private(private_candidate, event_sequence)
+	)
+	if not projection_valid:
+		if smoke_test:
+			printerr(
+				"VERSE_SMOKE_PRIVATE_PROJECTION_INVALID actor=%s event=%d"
+				% [bound_player_id, event_sequence]
+			)
+		_clear_actor_private_state()
+		authoritative_player_ready = false
+		last_authoritative_event_sequence = event_sequence
+		last_authoritative_simulation_tick = int(snapshot.get("simulation_tick", 0))
+		_set_message(
+			"PRIVATE INVENTORY LINK UNAVAILABLE // RESYNC REQUIRED",
+			true
+		)
+		return
+
+	var player := _local_player()
+	_capture_prediction_gravity({"player": player, "environment": _local_environment()})
+	var level := int(player.get("level", 1))
+	if level > last_level:
+		_set_message("CLEARANCE ADVANCED // SALVAGER LEVEL %d" % level)
+		tool_kick = 1.0
+	last_level = level
 	_apply_authoritative_player(
 		player,
 		int(snapshot.get("simulation_tick", 0)),
@@ -1537,11 +1797,14 @@ func _apply_snapshot(authoritative: Dictionary) -> void:
 		String(snapshot.get("world_hash", "")),
 		"snapshot"
 	)
+	_dispatch_next_mutation()
 	if smoke_test and not smoke_visual_ready:
+		print("VERSE_SMOKE_VISUAL_ASSERTIONS_START event=%d" % event_sequence)
 		if not _run_visual_smoke_assertions():
 			get_tree().quit(1)
 			return
 		smoke_visual_ready = true
+		print("VERSE_SMOKE_VISUAL_ASSERTIONS_COMPLETE event=%d" % event_sequence)
 
 
 func _full_snapshot_event_is_current(incoming_sequence: int, current_sequence: int) -> bool:
@@ -1585,15 +1848,55 @@ func _apply_motion_state(motion: Dictionary) -> void:
 	var event_sequence := int(motion.get("event_sequence", -1))
 	if event_sequence <= last_authoritative_event_sequence:
 		return
-	var player_motion: Dictionary = motion.get("player", {})
-	var merged_player: Dictionary = snapshot.get("player", {}).duplicate(true)
-	for key in player_motion:
-		merged_player[key] = player_motion[key]
-	snapshot["player"] = merged_player
+	if int(motion.get("projection_schema_version", 0)) != PROJECTION_SCHEMA_VERSION:
+		_invalidate_private_motion(event_sequence, int(motion.get("simulation_tick", 0)))
+		return
+	var has_private_motion := motion.has("actor_private")
+	var private_motion: Variant = motion.get("actor_private", {})
+	if has_private_motion and (
+		not private_motion is Dictionary
+		or String(private_motion.get("player_id", "")) != bound_player_id
+	):
+		_invalidate_private_motion(event_sequence, int(motion.get("simulation_tick", 0)))
+		return
+	var existing_players: Array = snapshot.get("players", []).duplicate(true)
+	var motion_players: Array = motion.get("players", [])
+	for player_motion in motion_players:
+		if not player_motion is Dictionary:
+			continue
+		var player_id := String(player_motion.get("player_id", ""))
+		var found := false
+		for index in existing_players.size():
+			if String(existing_players[index].get("player_id", "")) != player_id:
+				continue
+			var merged: Dictionary = existing_players[index].duplicate(true)
+			for key in player_motion:
+				merged[key] = player_motion[key]
+			existing_players[index] = merged
+			found = true
+			break
+		if not found:
+			existing_players.append(player_motion.duplicate(true))
+	snapshot["players"] = existing_players
 	snapshot["event_sequence"] = event_sequence
 	snapshot["simulation_tick"] = int(motion.get("simulation_tick", 0))
 	snapshot["world_hash"] = String(motion.get("world_hash", ""))
 	_update_grid_motion(motion.get("grids", []))
+	_sync_remote_players(existing_players)
+
+	var merged_player := _local_player().duplicate(true)
+	if merged_player.is_empty():
+		last_authoritative_event_sequence = event_sequence
+		last_authoritative_simulation_tick = int(motion.get("simulation_tick", 0))
+		return
+	if has_private_motion:
+		for key in private_motion:
+			merged_player[key] = private_motion[key]
+	else:
+		var public_motion := _player_from_roster(motion_players, bound_player_id)
+		merged_player = _merge_public_motion_into_private(merged_player, public_motion)
+	actor_private_snapshot["player"] = merged_player
+	_capture_prediction_gravity({"player": merged_player, "environment": _local_environment()})
 	_apply_authoritative_player(
 		merged_player,
 		int(motion.get("simulation_tick", 0)),
@@ -1601,6 +1904,32 @@ func _apply_motion_state(motion: Dictionary) -> void:
 		String(motion.get("world_hash", "")),
 		"motion_state"
 	)
+
+
+func _invalidate_private_motion(event_sequence: int, simulation_tick: int) -> void:
+	_clear_actor_private_state()
+	authoritative_player_ready = false
+	last_authoritative_event_sequence = event_sequence
+	last_authoritative_simulation_tick = simulation_tick
+	_set_message("PRIVATE MOTION LINK INVALID // REQUESTING RESYNC", true)
+	if socket.get_ready_state() == WebSocketPeer.STATE_OPEN:
+		_send_transport({"type": "request_snapshot"})
+
+
+func _merge_public_motion_into_private(
+	private_player: Dictionary, public_motion: Dictionary
+) -> Dictionary:
+	var merged := private_player.duplicate(true)
+	for key in [
+		"position", "orientation", "linear_velocity", "angular_velocity", "surface_contact",
+	]:
+		if public_motion.has(key):
+			merged[key] = public_motion[key]
+	if public_motion.has("locomotion_kind"):
+		var locomotion: Dictionary = merged.get("locomotion", {}).duplicate(true)
+		locomotion["kind"] = public_motion["locomotion_kind"]
+		merged["locomotion"] = locomotion
+	return merged
 
 
 func _update_grid_motion(grids: Array) -> void:
@@ -1618,6 +1947,116 @@ func _update_grid_motion(grids: Array) -> void:
 			grid_node.quaternion = _grid_quaternion(grid)
 
 
+func _sync_remote_players(players: Array) -> void:
+	if players_root == null:
+		return
+	var visible_ids: Dictionary = {}
+	for player in players:
+		if not player is Dictionary:
+			continue
+		var player_id := String(player.get("player_id", ""))
+		if player_id.is_empty() or player_id == _controlled_player_id():
+			continue
+		visible_ids[player_id] = true
+		var node: Node3D = remote_player_nodes.get(player_id, null)
+		if node == null:
+			node = _build_remote_player_visual(player_id)
+			remote_player_nodes[player_id] = node
+			players_root.add_child(node)
+		node.position = _vec3(player.get("position", {}))
+		node.quaternion = _quat(player.get("orientation", {}))
+		node.visible = true
+	for player_id in remote_player_nodes.keys().duplicate():
+		if visible_ids.has(player_id):
+			continue
+		var stale: Node3D = remote_player_nodes[player_id]
+		remote_player_nodes.erase(player_id)
+		stale.queue_free()
+
+
+func _remote_player_visuals_match(players: Array) -> bool:
+	var expected: Dictionary = {}
+	for player in players:
+		if not player is Dictionary:
+			continue
+		var player_id := String(player.get("player_id", ""))
+		if player_id.is_empty() or player_id == _controlled_player_id():
+			continue
+		expected[player_id] = player
+	if remote_player_nodes.size() != expected.size():
+		return false
+	for player_id in expected:
+		var node: Node3D = remote_player_nodes.get(player_id, null)
+		if node == null or not is_instance_valid(node) or node.get_parent() != players_root:
+			return false
+		var player: Dictionary = expected[player_id]
+		if node.position.distance_to(_vec3(player.get("position", {}))) > 0.001:
+			return false
+		if node.get_node_or_null("PilotLabel") == null:
+			return false
+	return true
+
+
+func _build_remote_player_visual(player_id: String) -> Node3D:
+	var root := Node3D.new()
+	root.name = "RemotePilot_%s" % player_id
+	var suit_material := _armored_material(Color(0.58, 0.66, 0.70), 0.68, 0.54)
+	var joint_material := _material(Color(0.055, 0.075, 0.09), 0.52, 0.66)
+	var visor_material := _glass_material()
+
+	var torso := _box_visual(Vector3(0.58, 0.68, 0.32), suit_material)
+	torso.position = Vector3(0.0, 0.08, 0.0)
+	root.add_child(torso)
+	var chest := _box_visual(Vector3(0.38, 0.20, 0.06), detail_materials["cyan"])
+	chest.position = Vector3(0.0, 0.18, -0.19)
+	root.add_child(chest)
+	var pelvis := _box_visual(Vector3(0.48, 0.22, 0.30), joint_material)
+	pelvis.position = Vector3(0.0, -0.34, 0.0)
+	root.add_child(pelvis)
+	var backpack := _box_visual(Vector3(0.44, 0.54, 0.20), detail_materials["steel"])
+	backpack.position = Vector3(0.0, 0.10, 0.25)
+	root.add_child(backpack)
+
+	var helmet := MeshInstance3D.new()
+	var helmet_mesh := SphereMesh.new()
+	helmet_mesh.radius = 0.25
+	helmet_mesh.height = 0.48
+	helmet_mesh.radial_segments = 24
+	helmet_mesh.rings = 12
+	helmet_mesh.material = suit_material
+	helmet.mesh = helmet_mesh
+	helmet.position = Vector3(0.0, 0.61, 0.0)
+	root.add_child(helmet)
+	var visor := _box_visual(Vector3(0.34, 0.17, 0.035), visor_material)
+	visor.position = Vector3(0.0, 0.63, -0.225)
+	root.add_child(visor)
+
+	for side in [-1.0, 1.0]:
+		var arm := _cylinder_visual(0.105, 0.62, suit_material)
+		arm.position = Vector3(side * 0.39, -0.02, 0.0)
+		root.add_child(arm)
+		var glove := _box_visual(Vector3(0.20, 0.18, 0.19), joint_material)
+		glove.position = Vector3(side * 0.39, -0.39, -0.01)
+		root.add_child(glove)
+		var leg := _cylinder_visual(0.13, 0.66, suit_material)
+		leg.position = Vector3(side * 0.17, -0.69, 0.0)
+		root.add_child(leg)
+		var boot := _box_visual(Vector3(0.25, 0.20, 0.37), joint_material)
+		boot.position = Vector3(side * 0.17, -1.05, -0.07)
+		root.add_child(boot)
+
+	var label := Label3D.new()
+	label.name = "PilotLabel"
+	label.text = player_id
+	label.position = Vector3(0.0, 1.06, 0.0)
+	label.font_size = 28
+	label.outline_size = 8
+	label.modulate = Color(0.48, 0.88, 1.0)
+	label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+	root.add_child(label)
+	return root
+
+
 func _apply_authoritative_player(
 	player: Dictionary,
 	simulation_tick: int,
@@ -1625,7 +2064,11 @@ func _apply_authoritative_player(
 	_world_hash: String,
 	source: String
 ) -> void:
-	if player.is_empty() or event_sequence <= last_authoritative_event_sequence:
+	if (
+		player.is_empty()
+		or event_sequence < last_authoritative_event_sequence
+		or (event_sequence == last_authoritative_event_sequence and source != "snapshot")
+	):
 		return
 	var incoming_player_id := String(player.get("player_id", ""))
 	var incoming_life_state := _player_life_state(player)
@@ -1684,7 +2127,7 @@ func _apply_authoritative_player(
 		desired_magnetic_boots = bool(incoming_locomotion.get("magnetic_boots_enabled", false))
 		last_sent_control = {}
 		control_send_elapsed = CONTROL_SEND_INTERVAL
-		mouse_delta_accumulator = Vector2.ZERO
+		_clear_transient_character_input()
 		require_neutral_baseline = incoming_life_state == "alive"
 	elif history_reset:
 		# The missing local timeline cannot be replayed safely. Preserve sequence
@@ -1698,7 +2141,7 @@ func _apply_authoritative_player(
 		desired_magnetic_boots = bool(incoming_locomotion.get("magnetic_boots_enabled", false))
 		last_sent_control = {}
 		control_send_elapsed = CONTROL_SEND_INTERVAL
-		mouse_delta_accumulator = Vector2.ZERO
+		_clear_transient_character_input()
 		require_neutral_baseline = incoming_life_state == "alive"
 	else:
 		prediction_history.clear()
@@ -1818,6 +2261,10 @@ func _correction_requires_snap(
 
 func _begin_player_resync() -> void:
 	authoritative_player_ready = false
+	bound_player_id = ""
+	session_role_kind = ""
+	_clear_actor_private_state()
+	active_grid_control_id = ""
 	awaiting_reconnect_baseline = true
 	prediction_history.clear()
 	pending_controls.clear()
@@ -1826,11 +2273,24 @@ func _begin_player_resync() -> void:
 	prediction_gravity_fallback = Vector3.ZERO
 	last_sent_control = {}
 	control_send_elapsed = 0.0
-	mouse_delta_accumulator = Vector2.ZERO
+	_clear_transient_character_input()
 	presentation_position_offset = Vector3.ZERO
 	presentation_orientation_offset = Quaternion.IDENTITY
 	require_neutral_baseline = true
 	last_authoritative_event_sequence = -1
+	_sync_remote_players([])
+
+
+func _reset_control_prediction_after_rejection() -> void:
+	authoritative_player_ready = false
+	awaiting_reconnect_baseline = true
+	prediction_history.clear()
+	pending_controls.clear()
+	prediction_history_invalid = false
+	last_sent_control = {}
+	control_send_elapsed = 0.0
+	_clear_transient_character_input()
+	require_neutral_baseline = true
 
 
 func _rebuild_voxels(voxels: Array) -> void:
@@ -2310,9 +2770,9 @@ func _stable_unit_seed(text: String) -> float:
 
 func _sample_player_control() -> Dictionary:
 	if Input.mouse_mode != Input.MOUSE_MODE_CAPTURED or inventory_open:
-		mouse_delta_accumulator = Vector2.ZERO
+		_clear_transient_character_input()
 		return _neutral_player_control()
-	var player: Dictionary = snapshot.get("player", {})
+	var player := _local_player()
 	var jetpack_enabled := bool(player.get("jetpack_enabled", true))
 	var vertical_input := (
 		Input.get_action_strength("move_up") - Input.get_action_strength("move_down")
@@ -2323,17 +2783,16 @@ func _sample_player_control() -> Dictionary:
 		Input.get_action_strength("move_right") - Input.get_action_strength("move_left"),
 		vertical_input,
 		Input.get_action_strength("move_backward") - Input.get_action_strength("move_forward")
-	).limit_length(1.0)
+	).limit_length(CONTROL_INPUT_SAFE_LIMIT)
 	var roll_input := (
 		Input.get_action_strength("roll_right") - Input.get_action_strength("roll_left")
 	)
+	var roll_angular_input := -roll_input
+	if not pending_roll_transitions.is_empty():
+		roll_angular_input = pending_roll_transitions.front()
 	var mouse_delta := mouse_delta_accumulator
 	mouse_delta_accumulator = Vector2.ZERO
-	var angular_input := Vector3(
-		-mouse_delta.y * MOUSE_ANGULAR_INPUT_PER_PIXEL,
-		-mouse_delta.x * MOUSE_ANGULAR_INPUT_PER_PIXEL,
-		-roll_input
-	).limit_length(1.0)
+	var angular_input := _bounded_angular_input(mouse_delta, roll_angular_input)
 	return {
 		"linear_input": linear_input,
 		"angular_input": angular_input,
@@ -2341,6 +2800,14 @@ func _sample_player_control() -> Dictionary:
 		"jump": not jetpack_enabled and Input.is_action_pressed("move_up"),
 		"dampeners": desired_dampeners,
 	}
+
+
+func _bounded_angular_input(mouse_delta: Vector2, roll_angular_input: float) -> Vector3:
+	return Vector3(
+		-mouse_delta.y * MOUSE_ANGULAR_INPUT_PER_PIXEL,
+		-mouse_delta.x * MOUSE_ANGULAR_INPUT_PER_PIXEL,
+		roll_angular_input
+	).limit_length(CONTROL_INPUT_SAFE_LIMIT)
 
 
 func _neutral_player_control() -> Dictionary:
@@ -2377,7 +2844,20 @@ func _control_send_due(control: Dictionary, previous: Dictionary, elapsed: float
 	return (
 		previous.is_empty()
 		or not _controls_equal(control, previous)
-		or elapsed >= CONTROL_SEND_INTERVAL
+		or (
+			_control_requires_lease_refresh(control)
+			and elapsed >= CONTROL_SEND_INTERVAL
+		)
+	)
+
+
+func _control_requires_lease_refresh(control: Dictionary) -> bool:
+	return (
+		(control.get("linear_input", Vector3.ZERO) as Vector3).length_squared() > 0.00000001
+		or (control.get("angular_input", Vector3.ZERO) as Vector3).length_squared() > 0.00000001
+		or bool(control.get("boost", false))
+		or bool(control.get("jump", false))
+		or not bool(control.get("dampeners", true))
 	)
 
 
@@ -2390,8 +2870,12 @@ func _send_player_control(control: Dictionary, force: bool) -> bool:
 	):
 		return false
 	var bounded_control := {
-		"linear_input": (control.get("linear_input", Vector3.ZERO) as Vector3).limit_length(1.0),
-		"angular_input": (control.get("angular_input", Vector3.ZERO) as Vector3).limit_length(1.0),
+		"linear_input": (control.get("linear_input", Vector3.ZERO) as Vector3).limit_length(
+			CONTROL_INPUT_SAFE_LIMIT
+		),
+		"angular_input": (control.get("angular_input", Vector3.ZERO) as Vector3).limit_length(
+			CONTROL_INPUT_SAFE_LIMIT
+		),
 		"boost": bool(control.get("boost", false)),
 		"jump": bool(control.get("jump", false)),
 		"dampeners": bool(control.get("dampeners", true)),
@@ -2399,7 +2883,7 @@ func _send_player_control(control: Dictionary, force: bool) -> bool:
 	var sequence := next_input_sequence
 	var operation_id := "player-control-%d-%d" % [movement_epoch, sequence]
 	var message := _player_control_message(operation_id, movement_epoch, sequence, bounded_control)
-	if not _send(message):
+	if not _queue_mutation(message):
 		return false
 	next_input_sequence += 1
 	current_prediction_input_sequence = sequence
@@ -2410,6 +2894,31 @@ func _send_player_control(control: Dictionary, force: bool) -> bool:
 		smoke_operation = operation_id
 		smoke_input_sequence = sequence
 	return true
+
+
+func _capture_roll_key_transition(event: InputEventKey) -> void:
+	var changed := false
+	if event.keycode == KEY_Q and roll_left_held != event.pressed:
+		roll_left_held = event.pressed
+		changed = true
+	elif event.keycode == KEY_E and roll_right_held != event.pressed:
+		roll_right_held = event.pressed
+		changed = true
+	if not changed:
+		return
+	var roll_input := float(int(roll_right_held) - int(roll_left_held))
+	var angular_roll := -roll_input * CONTROL_INPUT_SAFE_LIMIT
+	if pending_roll_transitions.is_empty() or not is_equal_approx(
+		pending_roll_transitions.back(), angular_roll
+	):
+		pending_roll_transitions.append(angular_roll)
+
+
+func _clear_transient_character_input() -> void:
+	mouse_delta_accumulator = Vector2.ZERO
+	roll_left_held = false
+	roll_right_held = false
+	pending_roll_transitions.clear()
 
 
 func _record_pending_control(epoch: int, sequence: int, control: Dictionary) -> void:
@@ -2450,7 +2959,7 @@ func _player_control_message(
 
 
 func _predict_player_step(control: Dictionary, delta: float, record_history: bool) -> void:
-	var player: Dictionary = snapshot.get("player", {})
+	var player := _local_player()
 	var locomotion: Dictionary = player.get("locomotion", {})
 	var prediction_control := control.duplicate(true)
 	var jump_held := bool(control.get("jump", false))
@@ -2643,7 +3152,7 @@ func _prediction_support_velocity(locomotion: Dictionary) -> Vector3:
 
 
 func _prediction_gravity(position: Vector3) -> Vector3:
-	var environment: Dictionary = snapshot.get("environment", {})
+	var environment := _local_environment()
 	var fallback := prediction_gravity_fallback
 	if fallback.length_squared() <= 0.0:
 		fallback = _vec3(environment.get("gravity", {}))
@@ -2693,7 +3202,7 @@ func _sweep_player_position(start: Vector3, finish: Vector3) -> Dictionary:
 
 
 func _player_position_is_clear(position: Vector3) -> bool:
-	var environment: Dictionary = snapshot.get("environment", {})
+	var environment := _local_environment()
 	var capsule_up := _camera_up()
 	var surface_radius := float(environment.get("surface_radius_m", 0.0))
 	if surface_radius > 0.0:
@@ -2749,7 +3258,7 @@ func _update_player_presentation(delta: float) -> void:
 	presentation_orientation_offset = _shortest_slerp(
 		presentation_orientation_offset, Quaternion.IDENTITY, blend
 	)
-	var locomotion: Dictionary = snapshot.get("player", {}).get("locomotion", {})
+	var locomotion: Dictionary = _local_player().get("locomotion", {})
 	var view_orientation := _player_view_orientation(predicted_orientation, locomotion)
 	camera.position = predicted_position + presentation_position_offset + _camera_eye_offset()
 	camera.quaternion = (presentation_orientation_offset * view_orientation).normalized()
@@ -2760,7 +3269,7 @@ func _update_player_presentation(delta: float) -> void:
 
 
 func _camera_up() -> Vector3:
-	var player: Dictionary = snapshot.get("player", {})
+	var player := _local_player()
 	var locomotion: Dictionary = player.get("locomotion", {})
 	var kind := String(locomotion.get("kind", "eva"))
 	if kind in ["grounded", "magnetic", "airborne"]:
@@ -2790,23 +3299,38 @@ func _shortest_slerp(first: Quaternion, second: Quaternion, weight: float) -> Qu
 
 func _update_target() -> void:
 	if _local_player_incapacitated():
+		target_hit = {}
 		target_voxel = null
 		target_block = {}
 		target_highlight.visible = false
 		build_preview.visible = false
 		return
-	target_voxel = _raymarch_voxel()
-	target_block = _ray_target_block()
+	var origin := camera.global_position
+	var direction := -camera.global_transform.basis.z.normalized()
+	target_hit = _closest_tool_hit(origin, direction, TARGET_RANGE)
+	_set_tool_targets_from_hit(target_hit)
 	build_preview.visible = false
-	if target_voxel != null:
+	if target_hit.is_empty() or not bool(target_hit.get("has_face", false)):
+		target_highlight.visible = false
+	elif target_voxel != null:
 		target_highlight.visible = true
-		target_highlight.global_position = Vector3(target_voxel)
+		target_highlight.global_transform = Transform3D(
+			Basis.IDENTITY, Vector3(target_voxel)
+		)
 	elif not target_block.is_empty():
 		target_highlight.visible = true
-		target_highlight.global_position = target_block.get("world_position", Vector3.ZERO)
+		target_highlight.global_transform = Transform3D(
+			_grid_basis(target_block["grid"]),
+			target_block.get("world_position", Vector3.ZERO)
+		)
 	else:
 		target_highlight.visible = false
-	if build_mode and not target_block.is_empty() and not _block_needs_weld(target_block["block"]):
+	if (
+		build_mode
+		and not target_block.is_empty()
+		and _target_grid_owned_by_local()
+		and not _block_needs_weld(target_block["block"])
+	):
 		var grid: Dictionary = target_block["grid"]
 		var grid_position := _vec3(grid.get("position", {}))
 		var grid_basis := _grid_basis(grid)
@@ -2906,6 +3430,9 @@ func _run_visual_smoke_assertions() -> bool:
 	var expected_seed := _stable_unit_seed("smoke-damaged")
 	var life_support_valid := _run_life_support_smoke_assertions()
 	var motion_prediction_valid := _run_motion_prediction_smoke_assertions()
+	var remote_roster_valid := _remote_player_visuals_match(
+		snapshot.get("players", [])
+	)
 	var valid: bool = (
 		frame_visual.get_meta("verse_visual_state", "") == "frame"
 		and frame_visual.get_node_or_null("DamageOverlay") == null
@@ -2953,6 +3480,7 @@ func _run_visual_smoke_assertions() -> bool:
 		) < 0.00001
 		and life_support_valid
 		and motion_prediction_valid
+		and remote_roster_valid
 	)
 	frame_visual.free()
 	damaged_visual.free()
@@ -2961,7 +3489,7 @@ func _run_visual_smoke_assertions() -> bool:
 		printerr("VERSE_VISUAL_STATE_FAILED")
 		return false
 	print(
-		"VERSE_VISUAL_STATE_OK frame=frame damaged=armor_damaged repaired=armor_complete inventory_focus=owned reconnect=global reconciliation=bounded"
+		"VERSE_VISUAL_STATE_OK frame=frame damaged=armor_damaged repaired=armor_complete inventory_focus=owned reconnect=global reconciliation=bounded remote_roster=visible"
 	)
 	print("VERSE_EVA_GRAVITY_OK drift=gravity dampeners=compensating")
 	return true
@@ -3233,7 +3761,10 @@ func _run_motion_prediction_smoke_assertions() -> bool:
 		and not _controls_equal(dampened_control, roll_control)
 		and _control_send_due(dampened_control, thrust_control, 0.0)
 		and not _control_send_due(dampened_control, dampened_control, 0.05)
-		and _control_send_due(dampened_control, dampened_control, CONTROL_SEND_INTERVAL)
+		and not _control_send_due(
+			dampened_control, dampened_control, CONTROL_SEND_INTERVAL
+		)
+		and _control_send_due(roll_control, roll_control, CONTROL_SEND_INTERVAL)
 		and absf(shortest_orientation.dot(rolled_orientation)) > 0.999
 	)
 	if not valid:
@@ -3278,7 +3809,7 @@ func _run_life_support_smoke_assertions() -> bool:
 		and recovery_button.text.contains("[ENTER]")
 		and incapacitated_detail_label.text.contains("OXYGEN RESERVE DEPLETED")
 	)
-	var authoritative_player: Dictionary = snapshot.get("player", {})
+	var authoritative_player := _local_player()
 	_update_life_support_interface(authoritative_player)
 
 	var valid := (
@@ -3314,51 +3845,327 @@ func _check_smoke_control_ack(player: Dictionary) -> void:
 	get_tree().quit(0)
 
 
-func _raymarch_voxel() -> Variant:
-	var origin := camera.global_position
-	var direction := -camera.global_transform.basis.z.normalized()
-	var last_coordinate := Vector3i(999999, 999999, 999999)
-	for index in 80:
-		var sample := origin + direction * (float(index) * TARGET_RANGE / 80.0)
-		var coordinate := Vector3i(
-			roundi(sample.x),
-			roundi(sample.y),
-			roundi(sample.z)
-		)
-		if coordinate == last_coordinate:
-			continue
-		last_coordinate = coordinate
-		if voxel_lookup.has(_coord_key(coordinate)):
-			return coordinate
-	return null
-
-
-func _ray_target_block() -> Dictionary:
-	var origin := camera.global_position
-	var direction := -camera.global_transform.basis.z.normalized()
-	var best: Dictionary = {}
-	var best_t := TARGET_RANGE + 1.0
-	for grid_id in grid_lookup:
-		var grid: Dictionary = grid_lookup[grid_id]
+func _closest_tool_hit(
+	origin: Vector3, direction: Vector3, maximum_distance := TARGET_RANGE
+) -> Dictionary:
+	if direction.length() <= TOOL_DIRECTION_EPSILON or maximum_distance < 0.0:
+		return {}
+	var ray_direction := direction.normalized()
+	var best := _raymarch_voxel_hit(origin, ray_direction, maximum_distance)
+	var grid_ids: Array = grid_lookup.keys()
+	grid_ids.sort()
+	for grid_id_value in grid_ids:
+		var grid_id := String(grid_id_value)
+		var grid: Dictionary = grid_lookup[grid_id_value]
 		var grid_position := _vec3(grid.get("position", {}))
 		var grid_basis := _grid_basis(grid)
-		for block in grid.get("blocks", []):
-			var local := _coord_vector(block.get("coordinate", {}))
-			var world := grid_position + grid_basis * local
-			var to_block := world - origin
-			var t := to_block.dot(direction)
-			if t <= 0.0 or t > TARGET_RANGE or t >= best_t:
+		var inverse_basis := grid_basis.inverse()
+		var local_origin := inverse_basis * (origin - grid_position)
+		var local_direction := inverse_basis * ray_direction
+		var blocks: Array = grid.get("blocks", []).duplicate()
+		blocks.sort_custom(func(first: Dictionary, second: Dictionary) -> bool:
+			return String(first.get("block_id", "")) < String(second.get("block_id", ""))
+		)
+		for block in blocks:
+			var local_center := _coord_vector(block.get("coordinate", {}))
+			var intersection := _ray_unit_box_hit(
+				local_origin, local_direction, local_center, maximum_distance
+			)
+			if intersection.is_empty():
 				continue
-			var perpendicular := (to_block - direction * t).length()
-			if perpendicular <= 0.68:
-				best_t = t
-				best = {
-					"grid_id": grid_id,
-					"grid": grid,
-					"block": block,
-					"world_position": world,
-				}
+			var local_normal: Vector3 = intersection.get("normal", Vector3.ZERO)
+			var distance := float(intersection.get("distance", 0.0))
+			var candidate := {
+				"kind": "block",
+				"distance": distance,
+				"has_face": not local_normal.is_zero_approx(),
+				"hit_position": origin + ray_direction * distance,
+				"local_normal": local_normal,
+				"world_normal": (grid_basis * local_normal).normalized()
+				if not local_normal.is_zero_approx()
+				else Vector3.ZERO,
+				"grid_id": grid_id,
+				"grid": grid,
+				"block": block,
+				"world_position": grid_position + grid_basis * local_center,
+			}
+			if _tool_hit_is_better(candidate, best):
+				best = candidate
 	return best
+
+
+func _raymarch_voxel_hit(
+	origin: Vector3, direction: Vector3, maximum_distance: float
+) -> Dictionary:
+	var touching := _origin_touching_voxel_hit(origin)
+	if not touching.is_empty():
+		return touching
+	var coordinate := _voxel_cell_at(origin)
+	var step := Vector3i(
+		_ray_axis_step(direction.x),
+		_ray_axis_step(direction.y),
+		_ray_axis_step(direction.z)
+	)
+	var next_crossing := Vector3(
+		_first_voxel_boundary_distance(origin.x, direction.x, coordinate.x, step.x),
+		_first_voxel_boundary_distance(origin.y, direction.y, coordinate.y, step.y),
+		_first_voxel_boundary_distance(origin.z, direction.z, coordinate.z, step.z)
+	)
+	var crossing_delta := Vector3(
+		_ray_crossing_delta(direction.x),
+		_ray_crossing_delta(direction.y),
+		_ray_crossing_delta(direction.z)
+	)
+	var best: Dictionary = {}
+	for _index in TOOL_DDA_MAX_STEPS:
+		for touched_coordinate in _parallel_boundary_voxel_cells(coordinate, origin, step):
+			if voxel_lookup.has(_coord_key(touched_coordinate)):
+				var intersection := _ray_unit_box_hit(
+					origin, direction, Vector3(touched_coordinate), maximum_distance
+				)
+				if not intersection.is_empty():
+					var normal: Vector3 = intersection.get("normal", Vector3.ZERO)
+					var distance := float(intersection.get("distance", 0.0))
+					var candidate := {
+						"kind": "voxel",
+						"distance": distance,
+						"has_face": not normal.is_zero_approx(),
+						"hit_position": origin + direction * distance,
+						"local_normal": normal,
+						"world_normal": normal,
+						"coordinate": touched_coordinate,
+					}
+					if _tool_hit_is_better(candidate, best):
+						best = candidate
+
+		var axis := _first_crossing_axis(next_crossing)
+		var next_distance := _vector_axis(next_crossing, axis)
+		if next_distance > maximum_distance + TOOL_HIT_EPSILON:
+			break
+		if (
+			not best.is_empty()
+			and next_distance > float(best.get("distance", 0.0)) + TOOL_HIT_EPSILON
+		):
+			break
+		coordinate = _step_coordinate_axis(coordinate, step, axis)
+		next_crossing = _advance_vector_axis(next_crossing, crossing_delta, axis)
+	return best
+
+
+func _origin_touching_voxel_hit(origin: Vector3) -> Dictionary:
+	var x_coordinates := _voxel_axis_origin_cells(origin.x)
+	var y_coordinates := _voxel_axis_origin_cells(origin.y)
+	var z_coordinates := _voxel_axis_origin_cells(origin.z)
+	var candidates: Array[Vector3i] = []
+	for x in x_coordinates:
+		for y in y_coordinates:
+			for z in z_coordinates:
+				var coordinate := Vector3i(int(x), int(y), int(z))
+				if voxel_lookup.has(_coord_key(coordinate)):
+					candidates.append(coordinate)
+	if candidates.is_empty():
+		return {}
+	candidates.sort_custom(func(first: Vector3i, second: Vector3i) -> bool:
+		return _voxel_coordinate_less(first, second)
+	)
+	var coordinate: Vector3i = candidates.front()
+	return {
+		"kind": "voxel",
+		"distance": 0.0,
+		"has_face": false,
+		"hit_position": origin,
+		"local_normal": Vector3.ZERO,
+		"world_normal": Vector3.ZERO,
+		"coordinate": coordinate,
+	}
+
+
+func _ray_unit_box_hit(
+	origin: Vector3, direction: Vector3, center: Vector3, maximum_distance: float
+) -> Dictionary:
+	var relative_origin := origin - center
+	var near_distance := -INF
+	var far_distance := INF
+	var entry_normal := Vector3.ZERO
+	for axis in 3:
+		var axis_origin := _vector_axis(relative_origin, axis)
+		var axis_direction := _vector_axis(direction, axis)
+		if absf(axis_direction) <= TOOL_DIRECTION_EPSILON:
+			if axis_origin < -0.5 or axis_origin > 0.5:
+				return {}
+			continue
+		var first := (-0.5 - axis_origin) / axis_direction
+		var second := (0.5 - axis_origin) / axis_direction
+		var axis_near := minf(first, second)
+		var axis_far := maxf(first, second)
+		var axis_normal := _axis_vector(axis) * (-1.0 if axis_direction > 0.0 else 1.0)
+		if axis_near > near_distance + TOOL_HIT_EPSILON:
+			near_distance = axis_near
+			entry_normal = axis_normal
+		far_distance = minf(far_distance, axis_far)
+		if near_distance > far_distance + TOOL_HIT_EPSILON:
+			return {}
+
+	if far_distance < -TOOL_HIT_EPSILON:
+		return {}
+	var distance := maxf(near_distance, 0.0)
+	if distance > maximum_distance + TOOL_HIT_EPSILON:
+		return {}
+	return {
+		"distance": distance,
+		"normal": entry_normal if distance > TOOL_HIT_EPSILON else Vector3.ZERO,
+	}
+
+
+func _tool_hit_is_better(candidate: Dictionary, current: Dictionary) -> bool:
+	if current.is_empty():
+		return true
+	var candidate_distance := float(candidate.get("distance", INF))
+	var current_distance := float(current.get("distance", INF))
+	if candidate_distance < current_distance - TOOL_HIT_EPSILON:
+		return true
+	if candidate_distance > current_distance + TOOL_HIT_EPSILON:
+		return false
+	var candidate_kind := String(candidate.get("kind", ""))
+	var current_kind := String(current.get("kind", ""))
+	if candidate_kind != current_kind:
+		return candidate_kind == "block"
+	if candidate_kind == "block":
+		var candidate_grid := String(candidate.get("grid_id", ""))
+		var current_grid := String(current.get("grid_id", ""))
+		if candidate_grid != current_grid:
+			return candidate_grid < current_grid
+		return (
+			String(candidate.get("block", {}).get("block_id", ""))
+			< String(current.get("block", {}).get("block_id", ""))
+		)
+	return _voxel_coordinate_less(
+		candidate.get("coordinate", Vector3i.ZERO),
+		current.get("coordinate", Vector3i.ZERO)
+	)
+
+
+func _set_tool_targets_from_hit(hit: Dictionary) -> void:
+	target_voxel = null
+	target_block = {}
+	if hit.is_empty() or not bool(hit.get("has_face", false)):
+		return
+	if String(hit.get("kind", "")) == "voxel":
+		target_voxel = hit.get("coordinate", null)
+	elif String(hit.get("kind", "")) == "block":
+		target_block = hit
+
+
+func _voxel_cell_at(point: Vector3) -> Vector3i:
+	return Vector3i(
+		floori(point.x + 0.5), floori(point.y + 0.5), floori(point.z + 0.5)
+	)
+
+
+func _voxel_axis_origin_cells(value: float) -> Array[int]:
+	var primary := floori(value + 0.5)
+	var coordinates: Array[int] = [primary]
+	if absf(value - (float(primary) - 0.5)) <= TOOL_DIRECTION_EPSILON:
+		coordinates.append(primary - 1)
+	coordinates.sort()
+	return coordinates
+
+
+func _parallel_boundary_voxel_cells(
+	coordinate: Vector3i, origin: Vector3, step: Vector3i
+) -> Array[Vector3i]:
+	var x_coordinates := _parallel_boundary_axis_cells(coordinate.x, origin.x, step.x)
+	var y_coordinates := _parallel_boundary_axis_cells(coordinate.y, origin.y, step.y)
+	var z_coordinates := _parallel_boundary_axis_cells(coordinate.z, origin.z, step.z)
+	var coordinates: Array[Vector3i] = []
+	for x in x_coordinates:
+		for y in y_coordinates:
+			for z in z_coordinates:
+				coordinates.append(Vector3i(int(x), int(y), int(z)))
+	coordinates.sort_custom(func(first: Vector3i, second: Vector3i) -> bool:
+		return _voxel_coordinate_less(first, second)
+	)
+	return coordinates
+
+
+func _parallel_boundary_axis_cells(
+	coordinate: int, origin: float, step: int
+) -> Array[int]:
+	if (
+		step == 0
+		and absf((origin + 0.5) - roundf(origin + 0.5)) <= TOOL_DIRECTION_EPSILON
+	):
+		return [coordinate - 1, coordinate]
+	return [coordinate]
+
+
+func _ray_axis_step(value: float) -> int:
+	if value > TOOL_DIRECTION_EPSILON:
+		return 1
+	if value < -TOOL_DIRECTION_EPSILON:
+		return -1
+	return 0
+
+
+func _first_voxel_boundary_distance(
+	origin: float, direction: float, coordinate: int, step: int
+) -> float:
+	if step == 0:
+		return INF
+	var boundary := float(coordinate) + (0.5 if step > 0 else -0.5)
+	return (boundary - origin) / direction
+
+
+func _ray_crossing_delta(direction: float) -> float:
+	return INF if absf(direction) <= TOOL_DIRECTION_EPSILON else absf(1.0 / direction)
+
+
+func _first_crossing_axis(crossing: Vector3) -> int:
+	if crossing.x <= crossing.y and crossing.x <= crossing.z:
+		return 0
+	if crossing.y <= crossing.z:
+		return 1
+	return 2
+
+
+func _vector_axis(value: Vector3, axis: int) -> float:
+	if axis == 0:
+		return value.x
+	if axis == 1:
+		return value.y
+	return value.z
+
+
+func _axis_vector(axis: int) -> Vector3:
+	if axis == 0:
+		return Vector3.RIGHT
+	if axis == 1:
+		return Vector3.UP
+	return Vector3.BACK
+
+
+func _step_coordinate_axis(coordinate: Vector3i, step: Vector3i, axis: int) -> Vector3i:
+	if axis == 0:
+		return coordinate + Vector3i(step.x, 0, 0)
+	if axis == 1:
+		return coordinate + Vector3i(0, step.y, 0)
+	return coordinate + Vector3i(0, 0, step.z)
+
+
+func _advance_vector_axis(value: Vector3, delta: Vector3, axis: int) -> Vector3:
+	if axis == 0:
+		return Vector3(value.x + delta.x, value.y, value.z)
+	if axis == 1:
+		return Vector3(value.x, value.y + delta.y, value.z)
+	return Vector3(value.x, value.y, value.z + delta.z)
+
+
+func _voxel_coordinate_less(first: Vector3i, second: Vector3i) -> bool:
+	if first.x != second.x:
+		return first.x < second.x
+	if first.y != second.y:
+		return first.y < second.y
+	return first.z < second.z
 
 
 func _update_tool_action(delta: float) -> void:
@@ -3378,7 +4185,12 @@ func _update_tool_action(delta: float) -> void:
 		action_key = "damage:%s" % target_block["block"].get("block_id", "")
 		duration = DAMAGE_DURATION
 		action_name = "CUTTING ARMOR"
-	elif holding_primary and build_mode and not target_block.is_empty():
+	elif (
+		holding_primary
+		and build_mode
+		and not target_block.is_empty()
+		and _target_grid_owned_by_local()
+	):
 		var construction_target: Dictionary = target_block["block"]
 		if _block_needs_weld(construction_target):
 			action_key = "weld:%s" % construction_target.get("block_id", "")
@@ -3476,14 +4288,10 @@ func _update_action_feedback() -> void:
 
 
 func _active_action_position() -> Vector3:
-	if action_target_key.begins_with("mine:") and target_voxel != null:
-		return Vector3(target_voxel)
-	if action_target_key.begins_with("weld:") and not target_block.is_empty():
-		return target_block.get("world_position", camera.global_position - camera.basis.z * 2.0)
-	if action_target_key.begins_with("build:"):
-		return build_preview.global_position
-	if not target_block.is_empty():
-		return target_block.get("world_position", camera.global_position - camera.basis.z * 2.0)
+	if not target_hit.is_empty():
+		return target_hit.get(
+			"hit_position", camera.global_position - camera.global_transform.basis.z * 2.0
+		)
 	return camera.global_position - camera.basis.z * 2.0
 
 
@@ -3492,7 +4300,7 @@ func _mine_target_voxel() -> void:
 		_set_message("Aim at an asteroid voxel within mining range", true)
 		return
 	pending_mine_position = target_voxel
-	_send({
+	_queue_mutation({
 		"type": "mine_voxel",
 		"operation_id": _operation_id("mine"),
 		"coordinate": _protocol_ivec3(target_voxel),
@@ -3504,7 +4312,7 @@ func _damage_target_block() -> void:
 		_set_message("Aim at a grid block to apply test damage", true)
 		return
 	var block: Dictionary = target_block["block"]
-	_send({
+	_queue_mutation({
 		"type": "damage_block",
 		"operation_id": _operation_id("damage"),
 		"grid_id": target_block["grid_id"],
@@ -3516,8 +4324,11 @@ func _build_selected_block() -> void:
 	if target_block.is_empty():
 		_set_message("Aim at a grid block before building", true)
 		return
+	if not _target_grid_owned_by_local():
+		_report_foreign_grid_access(target_block.get("grid", {}))
+		return
 	var coordinate := _build_coordinate()
-	_send({
+	_queue_mutation({
 		"type": "build_block",
 		"operation_id": _operation_id("build"),
 		"grid_id": target_block["grid_id"],
@@ -3531,11 +4342,14 @@ func _weld_target_block() -> void:
 	if target_block.is_empty():
 		_set_message("Aim at an unfinished frame or damaged block", true)
 		return
+	if not _target_grid_owned_by_local():
+		_report_foreign_grid_access(target_block.get("grid", {}))
+		return
 	var block: Dictionary = target_block["block"]
 	if not _block_needs_weld(block):
 		_set_message("Target block is already at full integrity", true)
 		return
-	_send({
+	_queue_mutation({
 		"type": "weld_block",
 		"operation_id": _operation_id("weld"),
 		"grid_id": target_block["grid_id"],
@@ -3546,27 +4360,22 @@ func _weld_target_block() -> void:
 func _build_coordinate() -> Vector3i:
 	if target_block.is_empty():
 		return Vector3i.ZERO
-	var grid: Dictionary = target_block["grid"]
 	var block: Dictionary = target_block["block"]
 	var current := _coord_i(block.get("coordinate", {}))
-	var offset: Vector3i
-	if selected_block_kind == "anchor":
-		var grid_position := _vec3(grid.get("position", {}))
-		var basis := _grid_basis(grid)
-		var toward_asteroid := basis.inverse() * (-grid_position)
-		offset = _dominant_axis(toward_asteroid)
-	else:
-		var basis := _grid_basis(grid)
-		var toward_camera: Vector3 = basis.inverse() * (
-			camera.global_position - target_block.get("world_position", Vector3.ZERO)
-		)
-		offset = _dominant_axis(toward_camera)
+	var local_normal: Vector3 = target_block.get("local_normal", Vector3.ZERO)
+	if local_normal.is_zero_approx():
+		return current
+	var offset := Vector3i(
+		roundi(local_normal.x), roundi(local_normal.y), roundi(local_normal.z)
+	)
 	return current + offset
 
 
 func _toggle_anchor() -> void:
-	var grid_id := _target_or_starter_grid()
-	_send({
+	var grid_id := _owned_grid_for_command()
+	if grid_id.is_empty():
+		return
+	_queue_mutation({
 		"type": "toggle_grid_anchor",
 		"operation_id": _operation_id("anchor"),
 		"grid_id": grid_id,
@@ -3574,61 +4383,83 @@ func _toggle_anchor() -> void:
 
 
 func _move_target_grid() -> void:
-	var grid_id := _target_or_starter_grid()
+	var grid_id := _owned_grid_for_command()
+	if grid_id.is_empty():
+		return
 	var direction := -camera.global_transform.basis.z.normalized()
 	var grid: Dictionary = grid_lookup.get(grid_id, {})
 	var local_direction := (_grid_basis(grid).inverse() * direction).limit_length(0.999)
-	grid_control_active = true
-	_send({
+	if _queue_mutation({
 		"type": "set_grid_control",
 		"operation_id": _operation_id("grid-control"),
 		"grid_id": grid_id,
 		"linear_input": _protocol_vec3(local_direction),
 		"angular_input": _protocol_vec3(Vector3(0.0, 0.24, 0.0)),
 		"dampeners": true,
-	})
+	}):
+		active_grid_control_id = grid_id
 
 
 func _stop_target_grid() -> void:
-	grid_control_active = false
-	_send({
+	var grid_id := _take_active_grid_control_id()
+	if grid_id.is_empty():
+		return
+	_queue_mutation({
 		"type": "set_grid_control",
 		"operation_id": _operation_id("grid-stop"),
-		"grid_id": _target_or_starter_grid(),
+		"grid_id": grid_id,
 		"linear_input": _protocol_vec3(Vector3.ZERO),
 		"angular_input": _protocol_vec3(Vector3.ZERO),
 		"dampeners": true,
 	})
 
 
+func _take_active_grid_control_id() -> String:
+	var grid_id := active_grid_control_id
+	active_grid_control_id = ""
+	return grid_id
+
+
 func _refine_ore() -> void:
-	_send({
+	var inventory_id := _local_inventory_id()
+	if inventory_id.is_empty():
+		_set_message("No authoritative suit inventory is available", true)
+		return
+	_queue_mutation({
 		"type": "refine_ore",
 		"operation_id": _operation_id("refine"),
-		"inventory_id": PLAYER_INVENTORY,
+		"inventory_id": inventory_id,
 		"batches": 1,
 	})
 
 
 func _craft_component() -> void:
-	_send({
+	var inventory_id := _local_inventory_id()
+	if inventory_id.is_empty():
+		_set_message("No authoritative suit inventory is available", true)
+		return
+	_queue_mutation({
 		"type": "craft_component",
 		"operation_id": _operation_id("craft"),
-		"inventory_id": PLAYER_INVENTORY,
+		"inventory_id": inventory_id,
 		"quantity": 1,
 	})
 
 
 func _transfer_to_or_from_cargo(reverse: bool) -> void:
-	var cargo_id := _first_cargo_inventory()
+	var cargo_id := _selected_owned_cargo_inventory()
 	if cargo_id.is_empty():
-		_set_message("No live cargo inventory is available", true)
+		_set_message("NO AUTHORIZED CARGO LINK", true)
 		return
-	_send({
+	var suit_id := _local_inventory_id()
+	if suit_id.is_empty():
+		_set_message("No authoritative suit inventory is available", true)
+		return
+	_queue_mutation({
 		"type": "transfer_inventory",
 		"operation_id": _operation_id("transfer"),
-		"source_inventory_id": cargo_id if reverse else PLAYER_INVENTORY,
-		"destination_inventory_id": PLAYER_INVENTORY if reverse else cargo_id,
+		"source_inventory_id": cargo_id if reverse else suit_id,
+		"destination_inventory_id": suit_id if reverse else cargo_id,
 		"resource": "ore",
 		"quantity": 1,
 	})
@@ -3641,7 +4472,7 @@ func _set_inventory_open(open: bool) -> void:
 	inventory_overlay.visible = open
 	build_mode = false if open else build_mode
 	action_charge = 0.0
-	mouse_delta_accumulator = Vector2.ZERO
+	_clear_transient_character_input()
 	Input.mouse_mode = Input.MOUSE_MODE_VISIBLE if open else Input.MOUSE_MODE_CAPTURED
 	_set_message(
 		"Engineering inventory terminal online" if open else "Engineering terminal closed"
@@ -3654,13 +4485,13 @@ func _enter_incapacitated_state() -> void:
 	prediction_history.clear()
 	pending_controls.clear()
 	last_sent_control = {}
-	mouse_delta_accumulator = Vector2.ZERO
+	_clear_transient_character_input()
 	require_neutral_baseline = false
 	action_charge = 0.0
 	action_target_key = ""
 	action_cooldown = 0.0
 	build_mode = false
-	grid_control_active = false
+	active_grid_control_id = ""
 	recovery_operation = ""
 	if inventory_open:
 		inventory_open = false
@@ -3680,7 +4511,7 @@ func _request_recovery() -> void:
 		_set_message("Recovery unavailable while disconnected — press F5", true)
 		return
 	recovery_operation = _operation_id("respawn")
-	if not _send({
+	if not _queue_mutation({
 		"type": "respawn_player",
 		"operation_id": recovery_operation,
 	}):
@@ -3690,8 +4521,8 @@ func _request_recovery() -> void:
 
 
 func _toggle_jetpack() -> void:
-	var player: Dictionary = snapshot.get("player", {})
-	_send({
+	var player := _local_player()
+	_queue_mutation({
 		"type": "set_suit_mode",
 		"operation_id": _operation_id("suit"),
 		"helmet_closed": bool(player.get("helmet_closed", true)),
@@ -3701,9 +4532,9 @@ func _toggle_jetpack() -> void:
 
 
 func _toggle_magnetic_boots() -> void:
-	var player: Dictionary = snapshot.get("player", {})
+	var player := _local_player()
 	desired_magnetic_boots = not desired_magnetic_boots
-	_send({
+	_queue_mutation({
 		"type": "set_suit_mode",
 		"operation_id": _operation_id("suit"),
 		"helmet_closed": bool(player.get("helmet_closed", true)),
@@ -3714,8 +4545,8 @@ func _toggle_magnetic_boots() -> void:
 
 
 func _toggle_helmet() -> void:
-	var player: Dictionary = snapshot.get("player", {})
-	_send({
+	var player := _local_player()
+	_queue_mutation({
 		"type": "set_suit_mode",
 		"operation_id": _operation_id("suit"),
 		"helmet_closed": not bool(player.get("helmet_closed", true)),
@@ -3725,19 +4556,23 @@ func _toggle_helmet() -> void:
 
 
 func _transfer_inventory_resource(resource: String, reverse: bool, all: bool) -> void:
-	var cargo_id := _first_cargo_inventory()
+	var cargo_id := _selected_owned_cargo_inventory()
 	if cargo_id.is_empty():
-		_set_message("No live cargo inventory is available", true)
+		_set_message("NO AUTHORIZED CARGO LINK", true)
 		return
-	var source_id := cargo_id if reverse else PLAYER_INVENTORY
-	var destination_id := PLAYER_INVENTORY if reverse else cargo_id
+	var suit_id := _local_inventory_id()
+	if suit_id.is_empty():
+		_set_message("No authoritative suit inventory is available", true)
+		return
+	var source_id := cargo_id if reverse else suit_id
+	var destination_id := suit_id if reverse else cargo_id
 	var quantity := 1
 	if all:
 		quantity = _resource_amount(_inventory(source_id).get("contents", {}), resource)
 	if quantity <= 0:
 		_set_message("The selected source stack is empty", true)
 		return
-	_send({
+	_queue_mutation({
 		"type": "transfer_inventory",
 		"operation_id": _operation_id("terminal-transfer"),
 		"source_inventory_id": source_id,
@@ -3758,29 +4593,467 @@ func _resource_amount(contents: Dictionary, resource: String) -> int:
 	return 0
 
 
-func _first_cargo_inventory() -> String:
-	for inventory in snapshot.get("inventories", []):
-		var domain: Dictionary = inventory.get("domain", {})
-		if domain.get("kind", "") == "cargo":
-			return inventory.get("inventory_id", "")
+func _selected_owned_cargo_inventory() -> String:
+	_refresh_owned_cargo_selection()
+	return selected_cargo_inventory_id
+
+
+func _refresh_owned_cargo_selection() -> Array[Dictionary]:
+	var candidates := _owned_cargo_candidates()
+	if candidates.is_empty():
+		selected_cargo_inventory_id = ""
+		last_targeted_owned_grid_id = _targeted_owned_grid_id()
+		return candidates
+
+	var candidate_ids: Array[String] = []
+	for candidate in candidates:
+		candidate_ids.append(String(candidate.get("inventory_id", "")))
+	var targeted_grid_id := _targeted_owned_grid_id()
+	if targeted_grid_id != last_targeted_owned_grid_id and not targeted_grid_id.is_empty():
+		for candidate in candidates:
+			if String(candidate.get("grid_id", "")) == targeted_grid_id:
+				selected_cargo_inventory_id = String(candidate.get("inventory_id", ""))
+				break
+	last_targeted_owned_grid_id = targeted_grid_id
+	if not selected_cargo_inventory_id in candidate_ids:
+		selected_cargo_inventory_id = String(candidates.front().get("inventory_id", ""))
+	return candidates
+
+
+func _owned_cargo_candidates() -> Array[Dictionary]:
+	var candidates: Array[Dictionary] = []
+	for inventory_value in actor_private_snapshot.get("inventories", []):
+		if not inventory_value is Dictionary:
+			continue
+		var inventory: Dictionary = inventory_value
+		if String(inventory.get("domain", {}).get("kind", "")) != "cargo":
+			continue
+		var binding := _cargo_inventory_binding(inventory)
+		if binding.is_empty():
+			continue
+		var grid: Dictionary = binding["grid"]
+		var block: Dictionary = binding["block"]
+		if (
+			not _grid_owned_by_local(grid)
+			or not bool(block.get("construction_complete", false))
+			or int(block.get("health", 0)) <= 0
+		):
+			continue
+		candidates.append({
+			"inventory_id": String(inventory.get("inventory_id", "")),
+			"grid_id": String(binding.get("grid_id", "")),
+			"block_id": String(block.get("block_id", "")),
+		})
+	candidates.sort_custom(func(first: Dictionary, second: Dictionary) -> bool:
+		var first_grid := String(first.get("grid_id", ""))
+		var second_grid := String(second.get("grid_id", ""))
+		if first_grid != second_grid:
+			return first_grid < second_grid
+		var first_block := String(first.get("block_id", ""))
+		var second_block := String(second.get("block_id", ""))
+		if first_block != second_block:
+			return first_block < second_block
+		return String(first.get("inventory_id", "")) < String(second.get("inventory_id", ""))
+	)
+	return candidates
+
+
+func _cargo_inventory_binding(inventory: Dictionary) -> Dictionary:
+	var inventory_id := String(inventory.get("inventory_id", ""))
+	var domain: Dictionary = inventory.get("domain", {})
+	var block_id := String(domain.get("block_id", ""))
+	if inventory_id.is_empty() or block_id.is_empty():
+		return {}
+	var matches: Array[Dictionary] = []
+	for grid_id in _all_grid_ids():
+		var grid := _grid_record(grid_id)
+		for block_value in grid.get("blocks", []):
+			if not block_value is Dictionary:
+				continue
+			var block: Dictionary = block_value
+			if (
+				String(block.get("block_id", "")) == block_id
+				and String(block.get("kind", "")) == "cargo"
+			):
+				matches.append({"grid_id": grid_id, "grid": grid, "block": block})
+	return matches.front() if matches.size() == 1 else {}
+
+
+func _all_grid_ids() -> Array[String]:
+	var ids: Dictionary = {}
+	for grid_value in snapshot.get("grids", []):
+		if grid_value is Dictionary:
+			var grid_id := String(grid_value.get("grid_id", ""))
+			if not grid_id.is_empty():
+				ids[grid_id] = true
+	for grid_id in grid_lookup:
+		ids[String(grid_id)] = true
+	var ordered: Array[String] = []
+	for grid_id in ids:
+		ordered.append(String(grid_id))
+	ordered.sort()
+	return ordered
+
+
+func _grid_record(grid_id: String) -> Dictionary:
+	if grid_lookup.has(grid_id):
+		return grid_lookup[grid_id]
+	for grid_value in snapshot.get("grids", []):
+		if grid_value is Dictionary and String(grid_value.get("grid_id", "")) == grid_id:
+			return grid_value
+	return {}
+
+
+func _grid_owned_by_local(grid: Dictionary) -> bool:
+	var owner_player_id := String(grid.get("owner_player_id", ""))
+	return not owner_player_id.is_empty() and owner_player_id == _controlled_player_id()
+
+
+func _target_grid_owned_by_local() -> bool:
+	return not target_block.is_empty() and _grid_owned_by_local(target_block.get("grid", {}))
+
+
+func _targeted_owned_grid_id() -> String:
+	return String(target_block.get("grid_id", "")) if _target_grid_owned_by_local() else ""
+
+
+func _owned_grid_ids() -> Array[String]:
+	var owned: Array[String] = []
+	for grid_id in _all_grid_ids():
+		if _grid_owned_by_local(_grid_record(grid_id)):
+			owned.append(grid_id)
+	return owned
+
+
+func _owned_grid_for_command(report_error := true) -> String:
+	if not target_block.is_empty():
+		if _target_grid_owned_by_local():
+			return String(target_block.get("grid_id", ""))
+		if report_error:
+			_report_foreign_grid_access(target_block.get("grid", {}))
+		return ""
+	var owned := _owned_grid_ids()
+	if not owned.is_empty():
+		return owned.front()
+	if report_error:
+		_set_message("No owned grid is available for engineering control", true)
 	return ""
 
 
-func _target_or_starter_grid() -> String:
-	if not target_block.is_empty():
-		return target_block.get("grid_id", STARTER_GRID)
-	if grid_lookup.has(STARTER_GRID):
-		return STARTER_GRID
-	if not grid_lookup.is_empty():
-		return grid_lookup.keys()[0]
-	return STARTER_GRID
+func _report_foreign_grid_access(grid: Dictionary) -> void:
+	var owner := String(grid.get("owner_player_id", "UNREGISTERED"))
+	if owner.is_empty():
+		owner = "UNREGISTERED"
+	_set_message("ACCESS LOCKED // PROPERTY OF %s" % owner, true)
 
 
-func _send(message: Dictionary) -> bool:
+func _mutation_actor_matches_session() -> bool:
+	if mutation_queue_actor_id.is_empty() and in_flight_mutation_actor_id.is_empty():
+		return true
+	if session_role_kind != "player" or bound_player_id.is_empty():
+		return false
+	return (
+		(mutation_queue_actor_id.is_empty() or mutation_queue_actor_id == bound_player_id)
+		and (
+			in_flight_mutation_actor_id.is_empty()
+			or in_flight_mutation_actor_id == bound_player_id
+		)
+	)
+
+
+func _clear_mutation_pipeline() -> void:
+	mutation_queue.clear()
+	mutation_queue_actor_id = ""
+	in_flight_mutation = {}
+	in_flight_mutation_text = ""
+	in_flight_mutation_actor_id = ""
+	mutation_retry_elapsed = 0.0
+	mutation_retry_count = 0
+
+
+func _refresh_mutation_actor_binding() -> void:
+	if mutation_queue.is_empty() and in_flight_mutation.is_empty():
+		mutation_queue_actor_id = ""
+		in_flight_mutation_actor_id = ""
+
+
+func _queue_mutation(message: Dictionary) -> bool:
+	if (
+		not connected
+		or not authoritative_player_ready
+		or not operation_frontier_ready
+		or mutation_resync_required
+		or session_role_kind != "player"
+		or bound_player_id.is_empty()
+	):
+		_set_message("AUTHORITATIVE COMMAND FRONTIER UNAVAILABLE // RESYNC REQUIRED", true)
+		return false
+	if message.has("operation_sequence"):
+		_set_message("CLIENT COMMAND REJECTED // SEQUENCE IS SERVER-RECONCILED", true)
+		return false
+	if mutation_queue_actor_id.is_empty():
+		mutation_queue_actor_id = bound_player_id
+	if mutation_queue_actor_id != bound_player_id:
+		_set_message("CLIENT COMMAND REJECTED // SESSION ACTOR CHANGED", true)
+		return false
+
+	var queued := message.duplicate(true)
+	if String(queued.get("type", "")) == "set_player_control" and _coalesce_queued_control(queued):
+		return true
+	if mutation_queue.size() >= MUTATION_QUEUE_LIMIT:
+		_set_message("COMMAND BUFFER FULL // WAITING FOR AUTHORITY", true)
+		return false
+	mutation_queue.append(queued)
+	_dispatch_next_mutation()
+	return true
+
+
+func _coalesce_queued_control(message: Dictionary) -> bool:
+	if mutation_queue.is_empty():
+		return false
+	var queued: Dictionary = mutation_queue.back()
+	if String(queued.get("type", "")) != "set_player_control":
+		return false
+	var superseded_input_sequence := int(queued.get("input_sequence", 0))
+	mutation_queue[mutation_queue.size() - 1] = message.duplicate(true)
+	var retained_controls: Array[Dictionary] = []
+	for pending in pending_controls:
+		if int(pending.get("input_sequence", 0)) != superseded_input_sequence:
+			retained_controls.append(pending)
+	pending_controls = retained_controls
+	prediction_history_invalid = true
+	return true
+
+
+func _dispatch_next_mutation() -> bool:
+	if (
+		not in_flight_mutation.is_empty()
+		or mutation_queue.is_empty()
+		or not connected
+		or not authoritative_player_ready
+		or not operation_frontier_ready
+		or mutation_resync_required
+		or not _mutation_actor_matches_session()
+	):
+		return false
+	if committed_operation_sequence >= JSON_SAFE_INTEGER_MAX:
+		mutation_resync_required = true
+		_set_message("COMMAND SEQUENCE EXCEEDS SAFE CLIENT RANGE // AUTHORITY HALTED", true)
+		return false
+
+	var message: Dictionary = mutation_queue.pop_front()
+	message["operation_sequence"] = committed_operation_sequence + 1
+	in_flight_mutation = message.duplicate(true)
+	in_flight_mutation_text = JSON.stringify(in_flight_mutation)
+	in_flight_mutation_actor_id = bound_player_id
+	mutation_retry_elapsed = 0.0
+	mutation_retry_count = 0
+	if not _send_text_transport(in_flight_mutation_text):
+		operation_frontier_ready = false
+		return false
+	return true
+
+
+func _advance_mutation_transport(delta: float) -> void:
+	if (
+		in_flight_mutation.is_empty()
+		or not connected
+		or not authoritative_player_ready
+		or not operation_frontier_ready
+		or mutation_resync_required
+	):
+		return
+	mutation_retry_elapsed += delta
+	if mutation_retry_elapsed < MUTATION_RETRY_INTERVAL:
+		return
+	if mutation_retry_count >= MUTATION_RETRY_LIMIT:
+		_request_operation_resync("COMMAND RECEIPT TIMEOUT")
+		return
+	mutation_retry_elapsed = 0.0
+	mutation_retry_count += 1
+	if not _send_text_transport(in_flight_mutation_text):
+		operation_frontier_ready = false
+
+
+func _request_operation_resync(reason: String) -> void:
+	mutation_resync_required = true
+	operation_frontier_ready = false
+	authoritative_player_ready = false
+	_set_message("%s // REQUESTING AUTHORITATIVE FRONTIER" % reason, true)
+	if socket.get_ready_state() == WebSocketPeer.STATE_OPEN:
+		_send_transport({"type": "request_snapshot"})
+
+
+func _reconcile_operation_frontier(frontier: int) -> bool:
+	if frontier < 0 or not _mutation_actor_matches_session():
+		mutation_resync_required = true
+		return false
+	var observed_floor := committed_operation_sequence
+	if operation_frontier_observed:
+		observed_floor = maxi(observed_floor, observed_operation_frontier)
+	if (
+		operation_frontier_observed
+		and committed_operation_actor_id == bound_player_id
+		and frontier < observed_floor
+	):
+		mutation_resync_required = true
+		return false
+	if (
+		operation_frontier_observed
+		and not committed_operation_actor_id.is_empty()
+		and committed_operation_actor_id != bound_player_id
+	):
+		mutation_resync_required = true
+		return false
+	var resuming_after_resync := mutation_resync_required or not operation_frontier_ready
+	committed_operation_actor_id = bound_player_id
+	if in_flight_mutation.is_empty():
+		committed_operation_sequence = frontier
+		operation_frontier_observed = true
+		observed_operation_frontier = frontier
+		operation_frontier_ready = true
+		mutation_resync_required = false
+		_refresh_mutation_actor_binding()
+		return true
+
+	var pending_sequence := int(in_flight_mutation.get("operation_sequence", 0))
+	if pending_sequence <= 0 or frontier < pending_sequence - 1:
+		mutation_resync_required = true
+		return false
+	if frontier == pending_sequence - 1:
+		committed_operation_sequence = frontier
+		operation_frontier_observed = true
+		observed_operation_frontier = frontier
+		operation_frontier_ready = true
+		mutation_resync_required = false
+		mutation_retry_elapsed = MUTATION_RETRY_INTERVAL
+		if resuming_after_resync:
+			mutation_retry_count = 0
+		return true
+	if frontier == pending_sequence:
+		# A frontier alone cannot prove that this exact payload won a race with
+		# another session using the same actor. Retain and retry the byte-identical
+		# command so authority returns either its original receipt or a conflict.
+		operation_frontier_observed = true
+		observed_operation_frontier = frontier
+		operation_frontier_ready = true
+		mutation_resync_required = false
+		mutation_retry_elapsed = MUTATION_RETRY_INTERVAL
+		if resuming_after_resync:
+			mutation_retry_count = 0
+		return true
+
+	# Another writer advanced this actor while the local command outcome was
+	# unknown. The pending command is committed, but later queued commands were
+	# authored against an obsolete frontier and must never be guessed forward.
+	committed_operation_sequence = frontier
+	operation_frontier_observed = true
+	observed_operation_frontier = frontier
+	_clear_mutation_pipeline()
+	operation_frontier_ready = true
+	mutation_resync_required = false
+	_set_message("COMMAND QUEUE DISCARDED // ACTOR FRONTIER ADVANCED ELSEWHERE", true)
+	return true
+
+
+func _handle_intent_accepted(receipt: Dictionary) -> bool:
+	var sequence := _protocol_nonnegative_integer(
+		receipt.get("operation_sequence", null)
+	)
+	if sequence < 0:
+		_request_operation_resync("MALFORMED COMMAND RECEIPT")
+		return false
+	if sequence <= committed_operation_sequence:
+		return false
+	if in_flight_mutation.is_empty():
+		_request_operation_resync("UNEXPECTED COMMAND RECEIPT")
+		return false
+	if (
+		sequence != int(in_flight_mutation.get("operation_sequence", 0))
+		or String(receipt.get("operation_id", ""))
+		!= String(in_flight_mutation.get("operation_id", ""))
+		or sequence != committed_operation_sequence + 1
+	):
+		_request_operation_resync("COMMAND RECEIPT CONFLICT")
+		return false
+	committed_operation_sequence = sequence
+	committed_operation_actor_id = bound_player_id
+	operation_frontier_observed = true
+	observed_operation_frontier = maxi(observed_operation_frontier, sequence)
+	in_flight_mutation = {}
+	in_flight_mutation_text = ""
+	in_flight_mutation_actor_id = ""
+	mutation_retry_elapsed = 0.0
+	mutation_retry_count = 0
+	operation_frontier_ready = true
+	mutation_resync_required = false
+	_refresh_mutation_actor_binding()
+	_dispatch_next_mutation()
+	return true
+
+
+func _handle_intent_rejected(message: Dictionary) -> bool:
+	var sequence := _protocol_nonnegative_integer(
+		message.get("operation_sequence", null)
+	)
+	if sequence < 0:
+		_request_operation_resync("UNBOUND COMMAND REJECTION")
+		return false
+	if sequence <= committed_operation_sequence:
+		return false
+	if in_flight_mutation.is_empty():
+		_request_operation_resync("UNEXPECTED COMMAND REJECTION")
+		return false
+	var response_operation_id := String(message.get("operation_id", ""))
+	if (
+		sequence != int(in_flight_mutation.get("operation_sequence", 0))
+		or response_operation_id.is_empty()
+		or response_operation_id != String(in_flight_mutation.get("operation_id", ""))
+	):
+		_request_operation_resync("COMMAND REJECTION CONFLICT")
+		return false
+	var code := String(message.get("code", ""))
+	if code in [
+		"operation_conflict",
+		"operation_sequence_gap",
+		"operation_already_committed",
+		"operation_history_invalid",
+		"operation_sequence_invalid",
+		"operation_sequence_exhausted",
+	]:
+		_request_operation_resync("AUTHORITATIVE %s" % code.to_upper())
+		return false
+
+	# Gameplay validation did not consume the frontier. Drop only the rejected
+	# command so the next queued command reuses this exact sequence.
+	var rejected_player_control := (
+		String(in_flight_mutation.get("type", "")) == "set_player_control"
+	)
+	in_flight_mutation = {}
+	in_flight_mutation_text = ""
+	in_flight_mutation_actor_id = ""
+	mutation_retry_elapsed = 0.0
+	mutation_retry_count = 0
+	_refresh_mutation_actor_binding()
+	if rejected_player_control:
+		# Do not send anything authored from the stale prediction baseline. The
+		# complete snapshot will reconcile the reusable operation frontier first.
+		_reset_control_prediction_after_rejection()
+		_request_operation_resync("PLAYER CONTROL REJECTED")
+		return true
+	_dispatch_next_mutation()
+	return true
+
+
+func _send_transport(message: Dictionary) -> bool:
+	return _send_text_transport(JSON.stringify(message))
+
+
+func _send_text_transport(encoded_message: String) -> bool:
 	if socket.get_ready_state() != WebSocketPeer.STATE_OPEN:
 		_set_message("No authoritative server connection — press F5", true)
 		return false
-	var error := socket.send_text(JSON.stringify(message))
+	var error := socket.send_text(encoded_message)
 	if error != OK:
 		_set_message("Network send failed: %s" % error_string(error), true)
 		return false
@@ -3798,7 +5071,7 @@ func _update_life_support_interface(player: Dictionary) -> void:
 	incapacitated_overlay.visible = display_state == "incapacitated"
 	if display_state == "critical":
 		var oxygen_percent := int(player.get("suit_oxygen_milli", 0)) / 10
-		var environment: Dictionary = snapshot.get("environment", {})
+		var environment := _local_environment()
 		var helmet_closed := bool(player.get("helmet_closed", true))
 		var breathable := bool(environment.get("breathable", false))
 		var remedy := "SEEK BREATHABLE ATMOSPHERE"
@@ -3836,7 +5109,7 @@ func _owned_death_drop_recorded(player: Dictionary) -> bool:
 	var player_id := String(player.get("player_id", ""))
 	var life_state: Dictionary = player.get("life_state", {})
 	var death_id := String(life_state.get("death_id", ""))
-	for drop in snapshot.get("death_drops", []):
+	for drop in actor_private_snapshot.get("death_drops", []):
 		if (
 			drop is Dictionary
 			and String(drop.get("owner_player_id", "")) == player_id
@@ -3856,7 +5129,7 @@ func _update_interface() -> void:
 		"font_color",
 		Color(0.35, 0.95, 0.62) if connected else Color(1.0, 0.38, 0.25)
 	)
-	var player: Dictionary = snapshot.get("player", {})
+	var player := _local_player()
 	_update_life_support_interface(player)
 	var level := int(player.get("level", 1))
 	var experience := int(player.get("experience", 0))
@@ -3890,7 +5163,7 @@ func _update_interface() -> void:
 		if life_support_state != "normal"
 		else Color(0.64, 0.90, 0.94)
 	)
-	var environment: Dictionary = snapshot.get("environment", {})
+	var environment := _local_environment()
 	var gravity_g := float(environment.get("gravity_m_s2", 0.0)) / 9.80665
 	var atmosphere_percent := roundi(float(environment.get("atmosphere_density", 0.0)) * 100.0)
 	status_label.text = (
@@ -3902,26 +5175,32 @@ func _update_interface() -> void:
 			atmosphere_percent,
 			"BREATHABLE" if environment.get("breathable", false) else "VACUUM",
 			int(snapshot.get("event_sequence", 0)),
-			"CONSERVED" if snapshot.get("conservation", {}).get("valid", false) else "FAULT",
+			"CONSERVED" if snapshot.get("conservation_valid", false) else "FAULT",
 			String(snapshot.get("world_hash", "—")).left(8),
 		]
 	)
-	var player_inventory := _inventory(PLAYER_INVENTORY)
+	var player_inventory := _inventory(_local_inventory_id())
 	var contents: Dictionary = player_inventory.get("contents", {})
-	var conserved: Dictionary = snapshot.get("conservation", {})
-	inventory_label.text = (
-		"CARGO HARNESS  //  %d / %d L\nORE  %03d     ALLOY  %03d     PARTS  %03d\n[I] OPEN LOGISTICS TERMINAL"
-	) % [
-		int(player_inventory.get("used_liters", 0)),
-		int(player_inventory.get("capacity_liters", 0)),
-		int(contents.get("ore", 0)),
-		int(contents.get("refined_material", 0)),
-		int(contents.get("components", 0)),
-	]
+	var conservation_valid := bool(snapshot.get("conservation_valid", false))
+	if _private_inventory_ready():
+		inventory_label.text = (
+			"CARGO HARNESS  //  %d / %d L\nORE  %03d     ALLOY  %03d     PARTS  %03d\n[I] OPEN LOGISTICS TERMINAL"
+		) % [
+			int(player_inventory.get("used_liters", 0)),
+			int(player_inventory.get("capacity_liters", 0)),
+			int(contents.get("ore", 0)),
+			int(contents.get("refined_material", 0)),
+			int(contents.get("components", 0)),
+		]
+	else:
+		inventory_label.text = (
+			"PRIVATE INVENTORY LINK UNAVAILABLE\n"
+			+ "REFINE / CRAFT / TRANSFER DISABLED\n[F5] REQUEST AUTHORITATIVE RESYNC"
+		)
 	inventory_label.add_theme_color_override(
 		"font_color",
 		Color(0.95, 0.71, 0.27)
-		if conserved.get("valid", false)
+		if conservation_valid
 		else Color(1.0, 0.18, 0.18)
 	)
 	_update_inventory_terminal()
@@ -3959,7 +5238,17 @@ func _update_interface() -> void:
 		var health := int(block.get("health", 0))
 		var max_health := maxi(int(block.get("max_health", health)), 1)
 		var integrity := health * 100 / max_health
-		if build_mode:
+		if not _target_grid_owned_by_local():
+			var owner := String(target_block.get("grid", {}).get(
+				"owner_player_id", "UNREGISTERED"
+			))
+			if owner.is_empty():
+				owner = "UNREGISTERED"
+			target_label.text = (
+				"%s // INTEGRITY %d%%\nACCESS LOCKED // PROPERTY OF %s\nHOLD RMB  //  CUT AND SALVAGE"
+				% [String(block.get("kind", "block")).to_upper(), integrity, owner]
+			)
+		elif build_mode:
 			if health < max_health:
 				if bool(block.get("construction_complete", false)):
 					target_label.text = "%s DAMAGED // INTEGRITY %d%%\nHOLD LMB  //  REPAIR" % [
@@ -3986,8 +5275,10 @@ func _update_interface() -> void:
 			if build_mode
 			else "EVA NAVIGATION // AIM AT ROCK OR MACHINERY"
 		)
-	if grid_control_active:
-		mode_label.text = "GRID CONTROL ACTIVE // RELEASE M OR PRESS X TO DAMPEN"
+	if not active_grid_control_id.is_empty():
+		mode_label.text = "GRID CONTROL ACTIVE // %s // RELEASE M OR PRESS X TO DAMPEN" % active_grid_control_id
+	elif build_mode and not target_block.is_empty() and not _target_grid_owned_by_local():
+		mode_label.text = "CONSTRUCTION ACCESS LOCKED // TARGET AN OWNED GRID"
 	elif action_charge <= 0.0:
 		mode_label.text = (
 			"CONSTRUCTION HOLOGRAM // %s // ROT %03d°" % [
@@ -4006,8 +5297,10 @@ func _update_interface() -> void:
 
 
 func _update_inventory_terminal() -> void:
-	var suit_inventory := _inventory(PLAYER_INVENTORY)
-	var cargo_inventory := _inventory(_first_cargo_inventory())
+	var cargo_candidates := _refresh_owned_cargo_selection()
+	_update_cargo_inventory_selector(cargo_candidates)
+	var suit_inventory := _inventory(_local_inventory_id())
+	var cargo_inventory := _inventory(selected_cargo_inventory_id)
 	for side_data in [["suit", suit_inventory], ["cargo", cargo_inventory]]:
 		var side := String(side_data[0])
 		var inventory: Dictionary = side_data[1]
@@ -4031,15 +5324,62 @@ func _update_inventory_terminal() -> void:
 			if mass_data.size() == 2:
 				var mass_label: Label = mass_data[0]
 				mass_label.text = "%.1f kg" % (float(quantity) * float(mass_data[1]))
-		var capacity := maxi(int(inventory.get("capacity_liters", 0)), 1)
+		var reported_capacity := int(inventory.get("capacity_liters", 0))
+		var capacity := maxi(reported_capacity, 1)
 		var used := int(inventory.get("used_liters", 0))
 		var mass_kg := float(inventory.get("mass_grams", 0)) / 1000.0
 		var capacity_label: Label = inventory_capacity_labels.get(side, null)
 		if capacity_label != null:
-			capacity_label.text = "%d / %d L  //  %.1f kg" % [used, capacity, mass_kg]
+			capacity_label.text = "%d / %d L  //  %.1f kg" % [
+				used, reported_capacity, mass_kg
+			]
 		var capacity_bar: ProgressBar = inventory_capacity_bars.get(side, null)
 		if capacity_bar != null:
 			capacity_bar.value = clampf(float(used) / float(capacity), 0.0, 1.0)
+
+
+func _update_cargo_inventory_selector(candidates: Array[Dictionary]) -> void:
+	var selector: OptionButton = inventory_selectors.get("cargo", null)
+	var title_label: Label = inventory_title_labels.get("cargo", null)
+	var subtitle_label: Label = inventory_subtitle_labels.get("cargo", null)
+	var available := not selected_cargo_inventory_id.is_empty()
+	for button in inventory_transfer_buttons:
+		button.disabled = not available
+	if selector == null:
+		return
+	selector.clear()
+	if not available:
+		selector.add_item("NO AUTHORIZED CARGO LINK")
+		selector.set_item_metadata(0, "")
+		selector.disabled = true
+		if title_label != null:
+			title_label.text = "NO AUTHORIZED CARGO LINK"
+		if subtitle_label != null:
+			subtitle_label.text = "OWNED COMPLETED CARGO REQUIRED"
+		return
+
+	selector.disabled = false
+	var selected_index := 0
+	var selected_candidate: Dictionary = {}
+	for index in candidates.size():
+		var candidate: Dictionary = candidates[index]
+		var grid_id := String(candidate.get("grid_id", ""))
+		var block_id := String(candidate.get("block_id", ""))
+		var inventory_id := String(candidate.get("inventory_id", ""))
+		selector.add_item("%s  /  %s" % [grid_id, block_id])
+		selector.set_item_metadata(index, inventory_id)
+		if inventory_id == selected_cargo_inventory_id:
+			selected_index = index
+			selected_candidate = candidate
+	selector.select(selected_index)
+	if selected_candidate.is_empty() and not candidates.is_empty():
+		selected_candidate = candidates[selected_index]
+	if title_label != null:
+		title_label.text = String(selected_candidate.get("grid_id", "OWNED GRID")).to_upper()
+	if subtitle_label != null:
+		subtitle_label.text = "AUTHORIZED CARGO // %s" % String(
+			selected_candidate.get("block_id", "")
+		)
 
 
 func _mission_text(career: Dictionary) -> String:
@@ -4091,7 +5431,7 @@ func _mission_text(career: Dictionary) -> String:
 
 
 func _inventory(inventory_id: String) -> Dictionary:
-	for inventory in snapshot.get("inventories", []):
+	for inventory in actor_private_snapshot.get("inventories", []):
 		if inventory.get("inventory_id", "") == inventory_id:
 			return inventory
 	return {}

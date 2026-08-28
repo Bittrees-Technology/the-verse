@@ -4,6 +4,7 @@ set -euo pipefail
 
 verse_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 godot_binary="${verse_root}/artifacts/toolchains/godot-4.7.2/Godot.app/Contents/MacOS/Godot"
+player_id="${VERSE_PLAYER_ID:-player-local}"
 server_pid=""
 
 cleanup() {
@@ -38,4 +39,9 @@ for _ in {1..100}; do
 done
 
 echo "The Verse server is live at http://127.0.0.1:7777"
-"${godot_binary}" --path apps/native-client -- --server=ws://127.0.0.1:7777/ws
+echo "Launching authoritative pilot ${player_id}"
+"${godot_binary}" \
+  --path apps/native-client \
+  -- \
+  --server=ws://127.0.0.1:7777/ws \
+  "--player-id=${player_id}"
