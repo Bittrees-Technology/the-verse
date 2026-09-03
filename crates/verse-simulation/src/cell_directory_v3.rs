@@ -6,7 +6,7 @@
 //! this codec private preserves the protocol-18/directory-v2 compatibility
 //! boundary while the complete grid-closure tuple is implemented and tested.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
@@ -47,6 +47,12 @@ const DRAFT_DIRECTORY_HISTORY_HEAD_FILE: &str = "head-v3.json";
 const DRAFT_DIRECTORY_HISTORY_FILE: &str = "history-v3.ndjson";
 const DRAFT_DIRECTORY_HISTORY_ENTRY_HASH_DOMAIN: &[u8] =
     b"the-verse/cell-directory-history-entry/v3\0";
+const MIGRATION_ASSIGNMENT_ROOT_DOMAIN: &[u8] =
+    b"the-verse/protocol-19-directory-genesis-assignments/v1\0";
+const MIGRATION_PLACEMENT_ROOT_DOMAIN: &[u8] =
+    b"the-verse/protocol-19-directory-genesis-placements/v1\0";
+const MIGRATION_GENESIS_RECORD_HASH_DOMAIN: &[u8] =
+    b"the-verse/protocol-19-directory-genesis-record/v1\0";
 const MAX_DRAFT_DIRECTORY_HISTORY_BYTES: u64 = 512 * 1_024 * 1_024;
 const MAX_DRAFT_DIRECTORY_HISTORY_LINE_BYTES: usize = MAX_DRAFT_DIRECTORY_V3_BYTES + 4_096;
 const MAX_DRAFT_DIRECTORY_HISTORY_HEAD_BYTES: u64 = 16 * 1_024;
@@ -364,6 +370,134 @@ struct CellTransferRecordV3 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct MigrationPlacementFloorV1 {
+    aggregate_id: String,
+    aggregate_kind: MobileAggregateKind,
+    cell_key: CellKeyV1,
+    cell_id: String,
+    placement_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DirectoryMigrationGenesisV1 {
+    schema_version: u32,
+    source_directory_revision: u64,
+    source_directory_document_hash: String,
+    source_terminal_transfer_count: u64,
+    source_terminal_transfer_root: String,
+    source_terminal_transfer_ids: BTreeSet<String>,
+    source_assignment_root: String,
+    source_placement_root: String,
+    target_assignment_root: String,
+    target_placement_root: String,
+    identity_map_root: String,
+    production_origin_root: String,
+    normalized_gameplay_root: String,
+    placement_floors: BTreeMap<String, MigrationPlacementFloorV1>,
+    record_hash: String,
+}
+
+impl DirectoryMigrationGenesisV1 {
+    fn new(
+        transform: &crate::grid_handoff_v2::migration_transform::ValidatedProtocol19MigrationTransform<'_>,
+        assignments: &BTreeMap<String, CellAssignmentRecord>,
+        placements: &BTreeMap<String, AggregatePlacementRecord>,
+    ) -> Result<Self, CellDirectoryError> {
+        let source = transform.source();
+        let source_terminal_transfer_ids = source
+            .transfers()
+            .map(|transfer| transfer.transfer_id.clone())
+            .collect::<BTreeSet<_>>();
+        let placement_floors = placements
+            .iter()
+            .filter(|(_, placement)| placement.placement_generation > 1)
+            .map(|(aggregate_id, placement)| {
+                (
+                    aggregate_id.clone(),
+                    MigrationPlacementFloorV1 {
+                        aggregate_id: aggregate_id.clone(),
+                        aggregate_kind: placement.aggregate_kind,
+                        cell_key: placement.cell_key.clone(),
+                        cell_id: placement.cell_id.clone(),
+                        placement_generation: placement.placement_generation,
+                    },
+                )
+            })
+            .collect();
+        let mut record = Self {
+            schema_version: 1,
+            source_directory_revision: source.directory_revision(),
+            source_directory_document_hash: source.directory_document_hash().to_owned(),
+            source_terminal_transfer_count: source.terminal_transfer_count(),
+            source_terminal_transfer_root: source.terminal_transfer_root().to_owned(),
+            source_terminal_transfer_ids,
+            source_assignment_root: source.assignment_root().to_owned(),
+            source_placement_root: source.placement_root().to_owned(),
+            target_assignment_root: hash_directory_genesis(
+                MIGRATION_ASSIGNMENT_ROOT_DOMAIN,
+                assignments,
+            )?,
+            target_placement_root: hash_directory_genesis(
+                MIGRATION_PLACEMENT_ROOT_DOMAIN,
+                placements,
+            )?,
+            identity_map_root: transform.identity_map_root().to_owned(),
+            production_origin_root: transform.production_origin_root().to_owned(),
+            normalized_gameplay_root: transform.normalized_gameplay_root().to_owned(),
+            placement_floors,
+            record_hash: String::new(),
+        };
+        record.record_hash = record.calculate_hash()?;
+        record.validate()?;
+        Ok(record)
+    }
+
+    fn calculate_hash(&self) -> Result<String, CellDirectoryError> {
+        let mut material = self.clone();
+        material.record_hash.clear();
+        hash_directory_genesis(MIGRATION_GENESIS_RECORD_HASH_DOMAIN, &material)
+    }
+
+    fn validate(&self) -> Result<(), CellDirectoryError> {
+        if self.schema_version != 1
+            || self.source_directory_revision == 0
+            || ![
+                &self.source_directory_document_hash,
+                &self.source_terminal_transfer_root,
+                &self.source_assignment_root,
+                &self.source_placement_root,
+                &self.target_assignment_root,
+                &self.target_placement_root,
+                &self.identity_map_root,
+                &self.production_origin_root,
+                &self.normalized_gameplay_root,
+                &self.record_hash,
+            ]
+            .into_iter()
+            .all(|hash| valid_blake3_hex(hash))
+            || self.record_hash != self.calculate_hash()?
+            || usize::try_from(self.source_terminal_transfer_count).ok()
+                != Some(self.source_terminal_transfer_ids.len())
+            || self
+                .source_terminal_transfer_ids
+                .iter()
+                .any(|transfer_id| validate_stable_id(transfer_id, "transfer").is_err())
+            || self.placement_floors.iter().any(|(aggregate_id, floor)| {
+                floor.aggregate_id != *aggregate_id
+                    || floor.placement_generation <= 1
+                    || floor.cell_id.is_empty()
+                    || floor.cell_key.universe_id.is_empty()
+            })
+        {
+            return Err(invalid("directory-v3 migration genesis record is invalid"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CellDirectoryDocumentV3 {
     schema_version: u32,
     universe_id: String,
@@ -372,6 +506,8 @@ struct CellDirectoryDocumentV3 {
     assignments: BTreeMap<String, CellAssignmentRecord>,
     placements: BTreeMap<String, AggregatePlacementRecord>,
     transfers: BTreeMap<String, CellTransferRecordV3>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    migration_genesis: Option<DirectoryMigrationGenesisV1>,
     document_hash: String,
 }
 
@@ -550,6 +686,193 @@ struct DraftDirectoryHistoryLocationV3 {
     entry_hash: String,
 }
 
+/// Non-Serde proof of the exact directory-v3 genesis derived from the frozen
+/// protocol-18 directory and its validated world-21 transform.
+#[derive(Debug)]
+pub(crate) struct ValidatedProtocol19DirectoryGenesis<'migration, 'source> {
+    transform: &'migration crate::grid_handoff_v2::migration_transform::ValidatedProtocol19MigrationTransform<'source>,
+    document: CellDirectoryDocumentV3,
+    history_entry: DraftDirectoryHistoryEntryV3,
+    document_bytes: Vec<u8>,
+    history_entry_bytes: Vec<u8>,
+    assignment_root: String,
+    placement_root: String,
+}
+
+impl<'migration, 'source> ValidatedProtocol19DirectoryGenesis<'migration, 'source> {
+    pub(crate) fn derive(
+        transform: &'migration crate::grid_handoff_v2::migration_transform::ValidatedProtocol19MigrationTransform<'source>,
+    ) -> Result<Self, CellDirectoryError> {
+        let source = transform.source();
+        let assignments = source
+            .assignments()
+            .cloned()
+            .map(|assignment| (assignment.cell_id.clone(), assignment))
+            .collect::<BTreeMap<_, _>>();
+        let mut placements = BTreeMap::new();
+        for source_placement in source.placements() {
+            if source_placement.state != AggregatePlacementState::Resident
+                || source_placement.active_transfer_id.is_some()
+            {
+                return Err(invalid(
+                    "frozen source placement is not terminal and resident",
+                ));
+            }
+            let aggregate_id = transform
+                .target_aggregate_id(
+                    source_placement.aggregate_kind,
+                    &source_placement.cell_id,
+                    &source_placement.aggregate_id,
+                )
+                .to_owned();
+            let target_cell = transform
+                .cells()
+                .binary_search_by(|cell| cell.cell_id().cmp(&source_placement.cell_id))
+                .ok()
+                .and_then(|index| transform.cells().get(index))
+                .ok_or_else(|| invalid("source placement references an absent target cell"))?;
+            if !target_cell.contains_aggregate(source_placement.aggregate_kind, &aggregate_id) {
+                return Err(invalid(
+                    "target placement is absent from its transformed cell",
+                ));
+            }
+            let target_placement = AggregatePlacementRecord {
+                aggregate_id: aggregate_id.clone(),
+                aggregate_kind: source_placement.aggregate_kind,
+                cell_key: source_placement.cell_key.clone(),
+                cell_id: source_placement.cell_id.clone(),
+                placement_generation: source_placement.placement_generation,
+                state: AggregatePlacementState::Resident,
+                active_transfer_id: None,
+            };
+            if placements.insert(aggregate_id, target_placement).is_some() {
+                return Err(invalid(
+                    "two frozen placements map to one target aggregate identity",
+                ));
+            }
+        }
+        for cell in transform.cells() {
+            for (aggregate_kind, aggregate_id) in cell.resident_aggregates() {
+                if let Some(existing) = placements.get(&aggregate_id) {
+                    if existing.aggregate_kind != aggregate_kind
+                        || existing.cell_key != *cell.cell_key()
+                        || existing.cell_id != cell.cell_id()
+                    {
+                        return Err(invalid(
+                            "target aggregate has a conflicting directory placement",
+                        ));
+                    }
+                    continue;
+                }
+                let placement = AggregatePlacementRecord {
+                    aggregate_id: aggregate_id.clone(),
+                    aggregate_kind,
+                    cell_key: cell.cell_key().clone(),
+                    cell_id: cell.cell_id().to_owned(),
+                    placement_generation: 1,
+                    state: AggregatePlacementState::Resident,
+                    active_transfer_id: None,
+                };
+                placements.insert(aggregate_id, placement);
+            }
+        }
+        let migration_genesis =
+            DirectoryMigrationGenesisV1::new(transform, &assignments, &placements)?;
+        let mut document = CellDirectoryDocumentV3 {
+            schema_version: DRAFT_CELL_DIRECTORY_V3_SCHEMA_VERSION,
+            universe_id: source.universe_id().to_owned(),
+            universe_manifest_hash: transform.target_manifest_hash().to_owned(),
+            directory_revision: 1,
+            assignments,
+            placements,
+            transfers: BTreeMap::new(),
+            migration_genesis: Some(migration_genesis),
+            document_hash: String::new(),
+        };
+        document.seal()?;
+        let history_entry = DraftDirectoryHistoryEntryV3::new(String::new(), document.clone())?;
+        let document_bytes = serde_json::to_vec(&document)
+            .map_err(|source| invalid(format!("directory genesis cannot encode: {source}")))?;
+        if document_bytes.len() > MAX_DRAFT_DIRECTORY_V3_BYTES {
+            return Err(invalid("directory genesis exceeds its byte bound"));
+        }
+        let history_entry_bytes = history_entry.encode_canonical()?;
+        let assignment_root =
+            hash_directory_genesis(MIGRATION_ASSIGNMENT_ROOT_DOMAIN, &document.assignments)?;
+        let placement_root =
+            hash_directory_genesis(MIGRATION_PLACEMENT_ROOT_DOMAIN, &document.placements)?;
+        Ok(Self {
+            transform,
+            document,
+            history_entry,
+            document_bytes,
+            history_entry_bytes,
+            assignment_root,
+            placement_root,
+        })
+    }
+
+    pub(crate) const fn directory_revision(&self) -> u64 {
+        self.document.directory_revision
+    }
+
+    pub(crate) fn document_hash(&self) -> &str {
+        &self.document.document_hash
+    }
+
+    pub(crate) fn history_entry_hash(&self) -> &str {
+        &self.history_entry.entry_hash
+    }
+
+    pub(crate) fn assignment_root(&self) -> &str {
+        &self.assignment_root
+    }
+
+    pub(crate) fn placement_root(&self) -> &str {
+        &self.placement_root
+    }
+
+    pub(crate) fn document_bytes(&self) -> &[u8] {
+        &self.document_bytes
+    }
+
+    pub(crate) fn history_entry_bytes(&self) -> &[u8] {
+        &self.history_entry_bytes
+    }
+
+    pub(crate) fn validate_for_transform(
+        &self,
+        transform: &'migration crate::grid_handoff_v2::migration_transform::ValidatedProtocol19MigrationTransform<'source>,
+    ) -> Result<(), CellDirectoryError> {
+        let expected = Self::derive(transform)?;
+        if !std::ptr::eq(self.transform, transform)
+            || self.document != expected.document
+            || self.history_entry != expected.history_entry
+            || self.document_bytes != expected.document_bytes
+            || self.history_entry_bytes != expected.history_entry_bytes
+            || self.assignment_root != expected.assignment_root
+            || self.placement_root != expected.placement_root
+        {
+            return Err(invalid(
+                "directory-v3 genesis belongs to another migration transform",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn hash_directory_genesis<T: Serialize>(
+    domain: &[u8],
+    value: &T,
+) -> Result<String, CellDirectoryError> {
+    let bytes = serde_json::to_vec(value)
+        .map_err(|source| invalid(format!("directory genesis root cannot encode: {source}")))?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(domain);
+    hasher.update(&bytes);
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DraftDirectoryHistoryFailpointV3 {
@@ -607,7 +930,6 @@ pub(super) struct DraftCellDirectoryHistoryStoreV3 {
 }
 
 impl DraftCellDirectoryHistoryStoreV3 {
-    #[cfg(test)]
     fn open_or_initialize(
         base_root: impl AsRef<Path>,
         initial: CellDirectoryDocumentV3,
@@ -620,7 +942,7 @@ impl DraftCellDirectoryHistoryStoreV3 {
         File::open(base_root)
             .and_then(|directory| directory.sync_all())
             .map_err(|source| io_error_v3(base_root, source))?;
-        let lock_file = lock_history_writer_v3(&root)?;
+        let lock_file = lock_history_writer_v3(&root, true)?;
         let head_path = root.join(DRAFT_DIRECTORY_HISTORY_HEAD_FILE);
         let history_path = root.join(DRAFT_DIRECTORY_HISTORY_FILE);
         let history_file = match OpenOptions::new()
@@ -692,7 +1014,6 @@ impl DraftCellDirectoryHistoryStoreV3 {
         Ok(store)
     }
 
-    #[cfg(test)]
     fn open(
         base_root: impl AsRef<Path>,
         expected_universe_id: &str,
@@ -704,7 +1025,7 @@ impl DraftCellDirectoryHistoryStoreV3 {
         if !root.is_dir() {
             return Err(invalid("v3 directory history does not exist"));
         }
-        let lock_file = lock_history_writer_v3(&root)?;
+        let lock_file = lock_history_writer_v3(&root, false)?;
         let head_path = root.join(DRAFT_DIRECTORY_HISTORY_HEAD_FILE);
         let history_path = root.join(DRAFT_DIRECTORY_HISTORY_FILE);
         let head = read_history_head_v3(&head_path)?;
@@ -734,6 +1055,133 @@ impl DraftCellDirectoryHistoryStoreV3 {
         self.current
             .as_ref()
             .ok_or_else(|| invalid("v3 directory history has no genesis document"))
+    }
+
+    pub(crate) fn stage_genesis(
+        base_root: impl AsRef<Path>,
+        genesis: &ValidatedProtocol19DirectoryGenesis<'_, '_>,
+    ) -> Result<Self, CellDirectoryError> {
+        Self::open_or_initialize(base_root, genesis.document.clone())
+    }
+
+    pub(crate) fn open_genesis(
+        base_root: impl AsRef<Path>,
+        genesis: &ValidatedProtocol19DirectoryGenesis<'_, '_>,
+    ) -> Result<Self, CellDirectoryError> {
+        let root = base_root
+            .as_ref()
+            .join(DRAFT_DIRECTORY_HISTORY_SUBDIRECTORY);
+        let metadata = fs::symlink_metadata(&root).map_err(|source| io_error_v3(&root, source))?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(invalid("v3 directory namespace is not a real directory"));
+        }
+        let lock_file = lock_history_writer_v3(&root, false)?;
+        let head_path = root.join(DRAFT_DIRECTORY_HISTORY_HEAD_FILE);
+        let history_path = root.join(DRAFT_DIRECTORY_HISTORY_FILE);
+        let head = read_history_head_v3(&head_path)?;
+        head.validate_identity(
+            &genesis.document.universe_id,
+            &genesis.document.universe_manifest_hash,
+        )?;
+        let mut expected_history = genesis.history_entry_bytes.clone();
+        expected_history.push(b'\n');
+        let history_length = fs::metadata(&history_path)
+            .map_err(|source| io_error_v3(&history_path, source))?
+            .len();
+        if history_length
+            != u64::try_from(expected_history.len())
+                .map_err(|_| invalid("v3 directory genesis length overflowed"))?
+            || history_length > MAX_DRAFT_DIRECTORY_HISTORY_BYTES
+            || fs::read(&history_path).map_err(|source| io_error_v3(&history_path, source))?
+                != expected_history
+        {
+            return Err(invalid(
+                "persisted directory-v3 genesis differs from the migration commitment",
+            ));
+        }
+        let expected_head = DraftDirectoryHistoryHeadV3::from_tip(
+            &DraftDirectoryHistoryHeadV3::empty(&genesis.document),
+            &genesis.history_entry,
+            history_length,
+        )?;
+        if head != expected_head {
+            return Err(invalid(
+                "persisted directory-v3 head differs from the migration commitment",
+            ));
+        }
+        let history_file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&history_path)
+            .map_err(|source| io_error_v3(&history_path, source))?;
+        let index = BTreeMap::from([(
+            genesis.document.directory_revision,
+            DraftDirectoryHistoryLocationV3 {
+                offset: 0,
+                line_length: genesis.history_entry_bytes.len(),
+                document_hash: genesis.document.document_hash.clone(),
+                entry_hash: genesis.history_entry.entry_hash.clone(),
+            },
+        )]);
+        Ok(Self {
+            root,
+            lock_file,
+            history_file,
+            head,
+            current: Some(genesis.document.clone()),
+            index,
+            poisoned: false,
+            #[cfg(test)]
+            failpoint: None,
+        })
+    }
+
+    pub(crate) fn validate_genesis_file_set(&self) -> Result<(), CellDirectoryError> {
+        let expected = BTreeSet::from([
+            DRAFT_DIRECTORY_HISTORY_LOCK_FILE,
+            DRAFT_DIRECTORY_HISTORY_HEAD_FILE,
+            DRAFT_DIRECTORY_HISTORY_FILE,
+        ]);
+        for entry in fs::read_dir(&self.root).map_err(|source| io_error_v3(&self.root, source))? {
+            let entry = entry.map_err(|source| io_error_v3(&self.root, source))?;
+            let name = entry.file_name();
+            let name = name
+                .to_str()
+                .ok_or_else(|| invalid("v3 directory contains a non-UTF-8 artifact"))?;
+            if !entry
+                .file_type()
+                .map_err(|source| io_error_v3(entry.path(), source))?
+                .is_file()
+                || !expected.contains(name)
+            {
+                return Err(invalid(
+                    "v3 directory genesis contains an unexpected artifact",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn discard_uncommitted_genesis(
+        base_root: impl AsRef<Path>,
+    ) -> Result<(), CellDirectoryError> {
+        let root = base_root
+            .as_ref()
+            .join(DRAFT_DIRECTORY_HISTORY_SUBDIRECTORY);
+        let metadata = match fs::symlink_metadata(&root) {
+            Ok(metadata) => metadata,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => return Err(io_error_v3(&root, source)),
+        };
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(invalid("v3 directory namespace is not a real directory"));
+        }
+        let lock_file = lock_history_writer_v3(&root, true)?;
+        fs::remove_dir_all(&root).map_err(|source| io_error_v3(&root, source))?;
+        drop(lock_file);
+        File::open(base_root.as_ref())
+            .and_then(|directory| directory.sync_all())
+            .map_err(|source| io_error_v3(base_root.as_ref(), source))
     }
 
     fn commit(
@@ -864,6 +1312,7 @@ impl DraftCellDirectoryHistoryStoreV3 {
                         .ok_or(CellDirectoryError::DirectoryRevisionExhausted)?
                     || next.universe_id != current.universe_id
                     || next.universe_manifest_hash != current.universe_manifest_hash
+                    || next.migration_genesis != current.migration_genesis
                 {
                     return Err(invalid(
                         "v3 directory history successor revision or identity is invalid",
@@ -1015,6 +1464,7 @@ impl DraftCellDirectoryHistoryStoreV3 {
         let mut index = BTreeMap::new();
         let mut current = None;
         let mut head_matched = self.head.entry_count == 0 && self.head.journal_byte_length == 0;
+        let mut pinned_migration_genesis = None;
 
         loop {
             let start = offset;
@@ -1050,6 +1500,9 @@ impl DraftCellDirectoryHistoryStoreV3 {
             if entry.previous_entry_hash != prior_entry_hash
                 || entry.document.universe_id != self.head.universe_id
                 || entry.document.universe_manifest_hash != self.head.universe_manifest_hash
+                || (prior_revision.is_none()
+                    && entry.document.migration_genesis.is_some()
+                    && entry.document.directory_revision != 1)
                 || prior_revision.is_some_and(|revision| {
                     revision.checked_add(1) != Some(entry.document.directory_revision)
                 })
@@ -1057,6 +1510,15 @@ impl DraftCellDirectoryHistoryStoreV3 {
                 return Err(invalid(
                     "v3 directory history chain, revision, or identity is invalid",
                 ));
+            }
+            if let Some(genesis) = &pinned_migration_genesis {
+                if genesis != &entry.document.migration_genesis {
+                    return Err(invalid(
+                        "v3 directory history changed its migration genesis",
+                    ));
+                }
+            } else {
+                pinned_migration_genesis = Some(entry.document.migration_genesis.clone());
             }
             offset = start
                 .checked_add(
@@ -1292,6 +1754,7 @@ impl DraftDirectoryV3AuthorityHarness {
             ]),
             placements,
             transfers: BTreeMap::new(),
+            migration_genesis: None,
             document_hash: String::new(),
         };
         document.seal()?;
@@ -1456,10 +1919,10 @@ impl DraftDirectoryV3AuthorityHarness {
     }
 }
 
-fn lock_history_writer_v3(root: &Path) -> Result<File, CellDirectoryError> {
+fn lock_history_writer_v3(root: &Path, create: bool) -> Result<File, CellDirectoryError> {
     let lock_path = root.join(DRAFT_DIRECTORY_HISTORY_LOCK_FILE);
     let lock_file = OpenOptions::new()
-        .create(true)
+        .create(create)
         .read(true)
         .write(true)
         .truncate(false)
@@ -1475,7 +1938,6 @@ fn lock_history_writer_v3(root: &Path) -> Result<File, CellDirectoryError> {
     Ok(lock_file)
 }
 
-#[cfg(test)]
 fn read_history_head_v3(path: &Path) -> Result<DraftDirectoryHistoryHeadV3, CellDirectoryError> {
     let length = fs::metadata(path)
         .map_err(|source| io_error_v3(path, source))?
@@ -2846,8 +3308,72 @@ impl CellDirectoryDocumentV3 {
             ));
         }
         self.validate_assignments()?;
+        self.validate_migration_genesis()?;
         self.validate_placements()?;
         self.validate_transfers()?;
+        Ok(())
+    }
+
+    fn validate_migration_genesis(&self) -> Result<(), CellDirectoryError> {
+        let Some(genesis) = &self.migration_genesis else {
+            return Ok(());
+        };
+        genesis.validate()?;
+        if self.directory_revision == 1 {
+            if genesis.target_assignment_root
+                != hash_directory_genesis(MIGRATION_ASSIGNMENT_ROOT_DOMAIN, &self.assignments)?
+                || genesis.target_placement_root
+                    != hash_directory_genesis(MIGRATION_PLACEMENT_ROOT_DOMAIN, &self.placements)?
+            {
+                return Err(invalid(
+                    "directory-v3 migration genesis roots differ from revision one",
+                ));
+            }
+            let expected_floors = self
+                .placements
+                .iter()
+                .filter(|(_, placement)| placement.placement_generation > 1)
+                .map(|(aggregate_id, placement)| {
+                    (
+                        aggregate_id.clone(),
+                        MigrationPlacementFloorV1 {
+                            aggregate_id: aggregate_id.clone(),
+                            aggregate_kind: placement.aggregate_kind,
+                            cell_key: placement.cell_key.clone(),
+                            cell_id: placement.cell_id.clone(),
+                            placement_generation: placement.placement_generation,
+                        },
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            if genesis.placement_floors != expected_floors {
+                return Err(invalid(
+                    "directory-v3 migration placement floors are incomplete",
+                ));
+            }
+        }
+        for (aggregate_id, floor) in &genesis.placement_floors {
+            let placement = self.placements.get(aggregate_id).ok_or_else(|| {
+                invalid(format!(
+                    "directory-v3 migration floor {aggregate_id} has no current placement"
+                ))
+            })?;
+            let assignment = self.assignments.get(&floor.cell_id).ok_or_else(|| {
+                invalid(format!(
+                    "directory-v3 migration floor {aggregate_id} has no genesis cell"
+                ))
+            })?;
+            if floor.cell_key != assignment.cell_key
+                || floor.aggregate_kind != placement.aggregate_kind
+                || placement.placement_generation < floor.placement_generation
+                || (placement.placement_generation == floor.placement_generation
+                    && (placement.cell_id != floor.cell_id || placement.cell_key != floor.cell_key))
+            {
+                return Err(invalid(format!(
+                    "directory-v3 migration floor {aggregate_id} disagrees with placement history"
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -2960,7 +3486,31 @@ impl CellDirectoryDocumentV3 {
         let mut plans = BTreeMap::new();
         let mut advance_index = BTreeMap::new();
         for (transfer_id, transfer) in &self.transfers {
+            if self
+                .migration_genesis
+                .as_ref()
+                .is_some_and(|genesis| genesis.source_terminal_transfer_ids.contains(transfer_id))
+            {
+                return Err(invalid(format!(
+                    "v3 transfer {transfer_id} reuses a frozen source transfer identity"
+                )));
+            }
             let plan = transfer.validate_identity(transfer_id)?;
+            if let Some(genesis) = &self.migration_genesis {
+                for member in &plan.members {
+                    if genesis
+                        .placement_floors
+                        .get(&member.aggregate_id)
+                        .is_some_and(|floor| {
+                            member.prior_placement_generation < floor.placement_generation
+                        })
+                    {
+                        return Err(invalid(format!(
+                            "v3 transfer {transfer_id} precedes a receipt-bound migration floor"
+                        )));
+                    }
+                }
+            }
             total_memberships = total_memberships
                 .checked_add(plan.members.len())
                 .ok_or_else(|| invalid("v3 transfer membership count overflowed"))?;
@@ -3096,28 +3646,43 @@ impl CellDirectoryDocumentV3 {
 
         for (aggregate_id, placement) in &self.placements {
             if placement.placement_generation > 1 {
-                let mut origins = advance_index
-                    .keys()
-                    .filter(|(candidate_id, generation, _)| {
-                        candidate_id == aggregate_id && *generation == 1
-                    });
-                let (_, _, origin_cell_id) = origins.next().ok_or_else(|| {
-                    invalid(format!(
-                        "v3 placement {aggregate_id} has no durable generation-one origin"
-                    ))
-                })?;
-                if origins.next().is_some() {
-                    return Err(invalid(format!(
-                        "v3 placement {aggregate_id} has ambiguous generation-one history"
-                    )));
+                if let Some(floor) = self
+                    .migration_genesis
+                    .as_ref()
+                    .and_then(|genesis| genesis.placement_floors.get(aggregate_id))
+                {
+                    Self::validate_later_member_history(
+                        aggregate_id,
+                        floor.placement_generation,
+                        &floor.cell_id,
+                        placement,
+                        &advance_index,
+                    )?;
+                } else {
+                    let mut origins =
+                        advance_index
+                            .keys()
+                            .filter(|(candidate_id, generation, _)| {
+                                candidate_id == aggregate_id && *generation == 1
+                            });
+                    let (_, _, origin_cell_id) = origins.next().ok_or_else(|| {
+                        invalid(format!(
+                            "v3 placement {aggregate_id} has no durable generation-one origin"
+                        ))
+                    })?;
+                    if origins.next().is_some() {
+                        return Err(invalid(format!(
+                            "v3 placement {aggregate_id} has ambiguous generation-one history"
+                        )));
+                    }
+                    Self::validate_later_member_history(
+                        aggregate_id,
+                        1,
+                        origin_cell_id,
+                        placement,
+                        &advance_index,
+                    )?;
                 }
-                Self::validate_later_member_history(
-                    aggregate_id,
-                    1,
-                    origin_cell_id,
-                    placement,
-                    &advance_index,
-                )?;
             }
             if let Some(transfer_id) = &placement.active_transfer_id {
                 let transfer = self.transfers.get(transfer_id).ok_or_else(|| {
@@ -4322,6 +4887,7 @@ mod tests {
             assignments,
             placements,
             transfers: BTreeMap::from([(transfer_id.into(), transfer)]),
+            migration_genesis: None,
             document_hash: String::new(),
         };
         document.seal().expect("draft v3 document seals");
@@ -4340,6 +4906,60 @@ mod tests {
         }
         initial.seal().expect("initial v3 document seals");
         (initial, requested)
+    }
+
+    fn migrated_floor_document() -> (CellDirectoryDocumentV3, CellTransferRecordV3) {
+        let (mut document, requested) = initial_document_and_request();
+        document.directory_revision = 1;
+        for placement in document.placements.values_mut() {
+            placement.placement_generation = 2;
+        }
+        let placement_floors = document
+            .placements
+            .iter()
+            .map(|(aggregate_id, placement)| {
+                (
+                    aggregate_id.clone(),
+                    MigrationPlacementFloorV1 {
+                        aggregate_id: aggregate_id.clone(),
+                        aggregate_kind: placement.aggregate_kind,
+                        cell_key: placement.cell_key.clone(),
+                        cell_id: placement.cell_id.clone(),
+                        placement_generation: placement.placement_generation,
+                    },
+                )
+            })
+            .collect();
+        let target_assignment_root =
+            hash_directory_genesis(MIGRATION_ASSIGNMENT_ROOT_DOMAIN, &document.assignments)
+                .expect("assignment root derives");
+        let target_placement_root =
+            hash_directory_genesis(MIGRATION_PLACEMENT_ROOT_DOMAIN, &document.placements)
+                .expect("placement root derives");
+        let hash = blake3::hash(b"migration-floor-fixture")
+            .to_hex()
+            .to_string();
+        let mut genesis = DirectoryMigrationGenesisV1 {
+            schema_version: 1,
+            source_directory_revision: 9,
+            source_directory_document_hash: hash.clone(),
+            source_terminal_transfer_count: 0,
+            source_terminal_transfer_root: hash.clone(),
+            source_terminal_transfer_ids: BTreeSet::new(),
+            source_assignment_root: hash.clone(),
+            source_placement_root: hash.clone(),
+            target_assignment_root,
+            target_placement_root,
+            identity_map_root: hash.clone(),
+            production_origin_root: hash.clone(),
+            normalized_gameplay_root: hash,
+            placement_floors,
+            record_hash: String::new(),
+        };
+        genesis.record_hash = genesis.calculate_hash().expect("genesis hash derives");
+        document.migration_genesis = Some(genesis);
+        document.seal().expect("migrated floor document seals");
+        (document, requested)
     }
 
     fn phase_proof(
@@ -6521,6 +7141,90 @@ mod tests {
                 .expect("history reopens");
         assert_eq!(reopened.current().expect("tip exists"), &tip);
         assert_eq!(reopened.head.entry_count, documents.len() as u64);
+    }
+
+    #[test]
+    fn migration_floor_rejects_pre_genesis_transfer_history() {
+        let (mut document, requested) = migrated_floor_document();
+        document
+            .transfers
+            .insert(requested.transfer_id.clone(), requested);
+        document.document_hash.clear();
+        document.document_hash = document.calculate_hash().expect("document hash derives");
+        let error = document
+            .validate()
+            .expect_err("pre-migration transfer history must reject");
+        assert!(
+            error
+                .to_string()
+                .contains("precedes a receipt-bound migration floor")
+        );
+    }
+
+    #[test]
+    fn history_recovery_cannot_reseal_or_replace_migration_genesis() {
+        let root = tempdir().expect("temporary directory");
+        let (initial, _) = migrated_floor_document();
+        let mut successor = initial.clone();
+        successor.directory_revision = 2;
+        successor.seal().expect("successor seals");
+        let mut store =
+            DraftCellDirectoryHistoryStoreV3::open_or_initialize(root.path(), initial.clone())
+                .expect("history initializes");
+        store
+            .commit(
+                initial.directory_revision,
+                &initial.document_hash,
+                successor.clone(),
+            )
+            .expect("valid successor commits");
+        drop(store);
+
+        let mut malicious = successor;
+        let genesis = malicious
+            .migration_genesis
+            .as_mut()
+            .expect("migration genesis exists");
+        genesis.source_directory_document_hash = blake3::hash(b"resealed source directory")
+            .to_hex()
+            .to_string();
+        genesis.record_hash = genesis.calculate_hash().expect("record hash reseals");
+        malicious.seal().expect("malicious successor self-seals");
+
+        let first = DraftDirectoryHistoryEntryV3::new(String::new(), initial.clone())
+            .expect("first history entry derives");
+        let second = DraftDirectoryHistoryEntryV3::new(first.entry_hash.clone(), malicious)
+            .expect("second history entry derives");
+        let mut history = first.encode_canonical().expect("first history encodes");
+        history.push(b'\n');
+        let first_length = u64::try_from(history.len()).expect("first length fits");
+        history.extend(second.encode_canonical().expect("second history encodes"));
+        history.push(b'\n');
+        let mut head = DraftDirectoryHistoryHeadV3::empty(&initial);
+        head = DraftDirectoryHistoryHeadV3::from_tip(&head, &first, first_length)
+            .expect("first head derives");
+        head = DraftDirectoryHistoryHeadV3::from_tip(
+            &head,
+            &second,
+            u64::try_from(history.len()).expect("history length fits"),
+        )
+        .expect("second head derives");
+        let isolated = root.path().join(DRAFT_DIRECTORY_HISTORY_SUBDIRECTORY);
+        fs::write(isolated.join(DRAFT_DIRECTORY_HISTORY_FILE), history)
+            .expect("resealed history writes");
+        fs::write(
+            isolated.join(DRAFT_DIRECTORY_HISTORY_HEAD_FILE),
+            serde_json::to_vec_pretty(&head).expect("head encodes"),
+        )
+        .expect("resealed head writes");
+
+        let error = DraftCellDirectoryHistoryStoreV3::open(
+            root.path(),
+            &initial.universe_id,
+            &initial.universe_manifest_hash,
+        )
+        .expect_err("history must reject replaced migration genesis");
+        assert!(error.to_string().contains("changed its migration genesis"));
     }
 
     #[test]

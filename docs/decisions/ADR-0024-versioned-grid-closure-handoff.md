@@ -189,10 +189,14 @@ time. A second non-Serde capability now borrows that source and performs the
 write-free identity and production-origin transform. Creation provenance comes
 from event replay, every typed live reference is rewritten, each target is
 validated under manifest 5, and canonical mapping blobs plus independently
-equal conservation and inverse-normalized gameplay roots are derived. A
-source-bound anchor, receipt binding, durable archive copying, a universe-wide
-install commit, the runtime scheduler/wake path, and coordinated protocol-19
-activation remain required.
+equal conservation and inverse-normalized gameplay roots are derived. The
+source-bound receipt and prepared installer now copy the frozen directory and
+canonical mapping artifacts, derive directory-v3 genesis, stage or strictly
+reopen the complete world-21 cell set, and write one universe commit head last.
+Without that head, partial target files grant no installed authority. With it,
+foreign, hybrid, swapped, missing, extra, or source-mismatched material fails
+closed. The runtime scheduler/wake path, signatures, and coordinated
+protocol-19 activation remain required.
 
 Rollback removes the entire unactivated protocol-19 namespace or restores it
 as one matching compatibility set. Copying individual identity, manifest,

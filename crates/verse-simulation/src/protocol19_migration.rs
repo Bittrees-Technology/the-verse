@@ -2,17 +2,20 @@
 
 //! Dormant canonical protocol-18 to protocol-19 migration receipt.
 //!
-//! This codec is not an install authority. It commits an offline, terminal
+//! The source-bound capability in this module commits an offline, terminal
 //! protocol-18 universe and its world-21 genesis without rewriting event-16
-//! history. A future installer must additionally prove live locks, archives,
-//! signatures, and every referenced root before it can mint an activation
-//! permit.
+//! history. It authorizes only dormant staging. Signatures and coordinated
+//! activation remain separate future gates.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use verse_protocol::CellKeyV1;
 use verse_protocol::protocol_v19::Protocol19CompatibilityTuple;
 
+use crate::cell_directory_v3::ValidatedProtocol19DirectoryGenesis;
+use crate::grid_handoff_v2::migration_transform::{
+    Protocol19TransformedCell, ValidatedProtocol19MigrationTransform,
+};
 use crate::{celestial, content};
 
 const MIGRATION_SCHEMA_VERSION: u32 = 1;
@@ -23,6 +26,7 @@ const MIGRATION_RECEIPT_HASH_DOMAIN: &[u8] = b"the-verse/protocol-18-to-19-migra
 const SOURCE_CELL_SET_HASH_DOMAIN: &[u8] = b"the-verse/protocol-18-terminal-cell-set/v1\0";
 const TARGET_CELL_SET_HASH_DOMAIN: &[u8] = b"the-verse/protocol-19-genesis-cell-set/v1\0";
 const TARGET_LIFECYCLE_HASH_DOMAIN: &[u8] = b"the-verse/protocol-19-target-lifecycle-genesis/v2\0";
+const SOURCE_DIRECTORY_ARCHIVE_HASH_DOMAIN: &[u8] = b"the-verse/protocol-18-directory-archive/v1\0";
 const MAX_MIGRATION_RECEIPT_BYTES: usize = 16 * 1_024 * 1_024;
 pub(crate) const MAX_TARGET_LIFECYCLE_BYTES: usize = 64 * 1_024;
 const MAX_MIGRATION_CELLS: usize = 4_096;
@@ -358,6 +362,10 @@ impl Protocol19TargetLifecycleGenesisV2 {
         self.authority_fencing_token
     }
 
+    pub(crate) const fn assignment_generation(&self) -> u64 {
+        self.assignment_generation
+    }
+
     pub(crate) const fn legacy_event_sequence(&self) -> u64 {
         self.legacy_event_sequence
     }
@@ -402,6 +410,255 @@ struct CanonicalProtocol18To19MigrationReceipt {
 impl CanonicalProtocol18To19MigrationReceipt {
     fn document(&self) -> &Protocol18To19MigrationReceiptV1 {
         &self.document
+    }
+}
+
+/// Non-Serde source-bound receipt capability. It can only be derived while the
+/// frozen source locks are held by the validated transform, and it borrows the
+/// exact directory-v3 genesis used to construct the receipt.
+#[derive(Debug)]
+pub(crate) struct ValidatedProtocol19MigrationReceipt<'migration, 'source> {
+    transform: &'migration ValidatedProtocol19MigrationTransform<'source>,
+    receipt: CanonicalProtocol18To19MigrationReceipt,
+    bytes: Vec<u8>,
+}
+
+impl<'migration, 'source> ValidatedProtocol19MigrationReceipt<'migration, 'source> {
+    pub(crate) fn derive(
+        transform: &'migration ValidatedProtocol19MigrationTransform<'source>,
+        directory: &ValidatedProtocol19DirectoryGenesis<'migration, 'source>,
+    ) -> Result<Self, MigrationReceiptError> {
+        let source = transform.source();
+        directory
+            .validate_for_transform(transform)
+            .map_err(|source| MigrationReceiptError::Invalid(source.to_string()))?;
+        if directory.directory_revision() != 1
+            || transform.target_manifest_hash().is_empty()
+            || transform.cells().len() != source.cells().len()
+        {
+            return Err(MigrationReceiptError::Invalid(
+                "migration capabilities do not form one complete target universe".into(),
+            ));
+        }
+        let source_cells = source
+            .cells()
+            .iter()
+            .map(|cell| TerminalCellV18Commitment {
+                cell_key: cell.cell_key().clone(),
+                cell_id: cell.cell_id().to_owned(),
+                assignment_generation: cell.assignment_generation(),
+                authority_fencing_token: cell.authority_fencing_token(),
+                fencing_history_root: cell.fencing_history_root().to_owned(),
+                source_world_state_hash: cell.world_state_hash().to_owned(),
+                source_snapshot_document_hash: cell.snapshot_document_hash().to_owned(),
+                source_event_schema_version: crate::event::EVENT_SCHEMA_VERSION,
+                source_event_sequence: cell.event_sequence(),
+                source_event_head_hash: cell.event_head_hash().to_owned(),
+                source_event_archive_entry_count: cell.event_archive_entry_count(),
+                source_event_archive_root: cell.event_archive_root().to_owned(),
+                source_lifecycle_revision: cell.lifecycle_revision(),
+                source_lifecycle_record_hash: cell.lifecycle_record_hash().to_owned(),
+                source_transfer_boundary_entry_count: cell.transfer_boundary_entry_count(),
+                source_transfer_boundary_head_hash: cell.transfer_boundary_head_hash().to_owned(),
+                source_transfer_boundary_archive_root: cell
+                    .transfer_boundary_archive_root()
+                    .to_owned(),
+                acknowledged_production_sequence: cell.acknowledged_production_sequence(),
+                next_production_occurrence_root: cell.next_production_occurrence_root().to_owned(),
+                last_trusted_unix_ms: cell.last_trusted_unix_ms(),
+            })
+            .collect::<Vec<_>>();
+        if source_cells
+            .iter()
+            .zip(transform.cells())
+            .any(|(source, target)| {
+                source.cell_id != target.cell_id() || source.cell_key != *target.cell_key()
+            })
+        {
+            return Err(MigrationReceiptError::Invalid(
+                "source and transformed target cell order differs".into(),
+            ));
+        }
+        let trusted_cutoff_unix_ms = source_cells
+            .iter()
+            .map(|cell| cell.last_trusted_unix_ms)
+            .max()
+            .ok_or_else(|| {
+                MigrationReceiptError::Invalid("migration has no source cells".into())
+            })?;
+        let source_cells_root = hash_source_cells(&source_cells)?;
+        let mut anchor = Protocol18To19MigrationAnchorV1 {
+            schema_version: MIGRATION_SCHEMA_VERSION,
+            migration_kind: MIGRATION_KIND.into(),
+            source_compatibility: Protocol18CompatibilityTuple::canonical(),
+            target_compatibility: Protocol19CompatibilityTuple::canonical(),
+            universe_id: source.universe_id().to_owned(),
+            world_seed: source.world_seed().to_string(),
+            trusted_cutoff_unix_ms,
+            source_manifest_hash: source.source_manifest_hash().to_owned(),
+            target_manifest_hash: transform.target_manifest_hash().to_owned(),
+            source_directory_revision: source.directory_revision(),
+            source_directory_document_hash: source.directory_document_hash().to_owned(),
+            source_terminal_transfer_count: source.terminal_transfer_count(),
+            source_terminal_transfer_root: source.terminal_transfer_root().to_owned(),
+            source_assignment_root: source.assignment_root().to_owned(),
+            source_placement_root: source.placement_root().to_owned(),
+            source_cells_root,
+            source_cell_count: u64::try_from(source_cells.len()).map_err(|_| {
+                MigrationReceiptError::Invalid("migration cell count overflowed".into())
+            })?,
+            identity_map_entry_count: transform.identity_map_entry_count(),
+            identity_map_root: transform.identity_map_root().to_owned(),
+            production_origin_count: transform.production_origin_count(),
+            production_origin_root: transform.production_origin_root().to_owned(),
+            source_global_conservation_root: transform.global_conservation_root().to_owned(),
+            normalized_gameplay_root: transform.normalized_gameplay_root().to_owned(),
+            anchor_hash: String::new(),
+        };
+        anchor.anchor_hash = calculate_anchor_hash(&anchor)?;
+        let mut target_cells = transform
+            .cells()
+            .iter()
+            .map(|cell| {
+                Ok(World21GenesisCommitment {
+                    cell_key: cell.cell_key().clone(),
+                    cell_id: cell.cell_id().to_owned(),
+                    migration_anchor_hash: anchor.anchor_hash.clone(),
+                    target_world_state_hash: cell.world_state_hash().to_owned(),
+                    target_active_world_hash: cell.active_world_hash()?,
+                    target_lifecycle_record_hash: String::new(),
+                    legacy_event_schema_version: crate::event::EVENT_SCHEMA_VERSION,
+                    legacy_event_sequence: cell.event_sequence(),
+                    legacy_event_head_hash: cell.event_head_hash().to_owned(),
+                    event17_genesis_sequence: cell.event_sequence(),
+                    event17_predecessor_hash: cell.event_head_hash().to_owned(),
+                    event17_journal_entry_count: 0,
+                    event17_journal_head_hash: String::new(),
+                    production_origin_root: cell.production_origin_root().to_owned(),
+                    identity_subset_root: cell.identity_subset_root().to_owned(),
+                })
+            })
+            .collect::<Result<
+                Vec<_>,
+                crate::grid_handoff_v2::migration_transform::Protocol19MigrationTransformError,
+            >>()
+            .map_err(|source| MigrationReceiptError::Invalid(source.to_string()))?;
+        for (index, source_cell) in source_cells.iter().enumerate() {
+            let lifecycle = Protocol19TargetLifecycleGenesisV2::new(
+                &anchor,
+                directory.directory_revision(),
+                directory.document_hash(),
+                source_cell,
+                &target_cells[index],
+            )?;
+            lifecycle
+                .record_hash()
+                .clone_into(&mut target_cells[index].target_lifecycle_record_hash);
+        }
+        let mut document = Protocol18To19MigrationReceiptV1 {
+            schema_version: MIGRATION_SCHEMA_VERSION,
+            anchor,
+            source_directory_archive_hash: hash_bytes(
+                SOURCE_DIRECTORY_ARCHIVE_HASH_DOMAIN,
+                source.directory_document_bytes(),
+            ),
+            source_cells,
+            identity_map_blob_hash: transform.identity_map_root().to_owned(),
+            production_origin_blob_hash: transform.production_origin_root().to_owned(),
+            target_directory_revision: directory.directory_revision(),
+            target_directory_document_hash: directory.document_hash().to_owned(),
+            target_directory_history_entry_hash: directory.history_entry_hash().to_owned(),
+            target_assignment_root: directory.assignment_root().to_owned(),
+            target_placement_root: directory.placement_root().to_owned(),
+            target_cells_root: hash_target_cells(&target_cells)?,
+            target_cells,
+            target_global_conservation_root: transform.global_conservation_root().to_owned(),
+            target_normalized_gameplay_root: transform.normalized_gameplay_root().to_owned(),
+            receipt_hash: String::new(),
+        };
+        document.receipt_hash = calculate_receipt_hash(&document)?;
+        let receipt = CanonicalProtocol18To19MigrationReceipt { document };
+        let bytes = encode_canonical(&receipt)?;
+        let decoded = decode_canonical(&bytes)?;
+        if decoded.document() != receipt.document() {
+            return Err(MigrationReceiptError::Invalid(
+                "canonical migration receipt failed deterministic self-validation".into(),
+            ));
+        }
+        Ok(Self {
+            transform,
+            receipt,
+            bytes,
+        })
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub(crate) fn anchor_hash(&self) -> &str {
+        &self.receipt.document.anchor.anchor_hash
+    }
+
+    pub(crate) fn receipt_hash(&self) -> &str {
+        &self.receipt.document.receipt_hash
+    }
+
+    pub(crate) fn source_directory_archive_hash(&self) -> &str {
+        &self.receipt.document.source_directory_archive_hash
+    }
+
+    pub(crate) fn transform(&self) -> &ValidatedProtocol19MigrationTransform<'source> {
+        self.transform
+    }
+
+    pub(crate) fn bind_cell(
+        &self,
+        cell: &Protocol19TransformedCell,
+    ) -> Result<Protocol19World21StagingCommitment, MigrationReceiptError> {
+        if !self
+            .transform
+            .cells()
+            .iter()
+            .any(|candidate| std::ptr::eq(candidate, cell))
+        {
+            return Err(MigrationReceiptError::Invalid(
+                "transformed cell belongs to another migration capability".into(),
+            ));
+        }
+        let source = self.transform.source();
+        let active_world_hash = cell
+            .active_world_hash()
+            .map_err(|source| MigrationReceiptError::Invalid(source.to_string()))?;
+        let source_cell = source
+            .cells()
+            .iter()
+            .find(|source_cell| source_cell.cell_id() == cell.cell_id())
+            .ok_or_else(|| {
+                MigrationReceiptError::Invalid("target cell has no frozen source".into())
+            })?;
+        let evidence = Protocol19World21StagingEvidence {
+            manifest_hash: self.transform.target_manifest_hash(),
+            universe_id: source.universe_id(),
+            world_seed: source.world_seed(),
+            cell_key: cell.cell_key(),
+            cell_id: cell.cell_id(),
+            authority_fencing_token: cell.authority_fencing_token(),
+            snapshot_state_hash: cell.world_state_hash(),
+            active_world_hash: &active_world_hash,
+            legacy_event_sequence: cell.event_sequence(),
+            legacy_event_head_hash: cell.event_head_hash(),
+        };
+        let commitment = bind_world21_staging_target(&self.bytes, &evidence)?;
+        if commitment.lifecycle().assignment_generation() != source_cell.assignment_generation()
+            || commitment.production_origin_root() != cell.production_origin_root()
+            || commitment.identity_subset_root() != cell.identity_subset_root()
+        {
+            return Err(MigrationReceiptError::Invalid(
+                "migration receipt does not bind the exact source and transform cell".into(),
+            ));
+        }
+        Ok(commitment)
     }
 }
 
@@ -1023,6 +1280,13 @@ fn hash_json<T: Serialize>(domain: &[u8], value: &T) -> Result<String, Migration
     hasher.update(domain);
     hasher.update(&bytes);
     Ok(hasher.finalize().to_hex().to_string())
+}
+
+fn hash_bytes(domain: &[u8], bytes: &[u8]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(domain);
+    hasher.update(bytes);
+    hasher.finalize().to_hex().to_string()
 }
 
 fn valid_hash(value: &str) -> bool {

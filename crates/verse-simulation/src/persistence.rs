@@ -2563,6 +2563,18 @@ fn validate_frozen_event_archive(
         {
             allowed_initial_states.push(surface_profile);
         }
+        #[cfg(test)]
+        {
+            let mut migration_boundary = allowed_initial_states[0].clone();
+            migration_boundary
+                .configure_migration_boundary_test_profile()
+                .map_err(|source| {
+                    PersistenceError::InvalidMigrationSource(format!(
+                        "migration boundary test profile cannot be derived: {source}"
+                    ))
+                })?;
+            allowed_initial_states.push(migration_boundary);
+        }
     }
 
     let mut matching_initial_states = Vec::new();

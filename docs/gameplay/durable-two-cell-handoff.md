@@ -838,10 +838,15 @@ Player and carried-inventory identities, event-zero subjects, event-16
 frontiers, operation histories, simulation, voxel, ledger, ownership, and pose
 state remain exact.
 
-Source-bound anchor issuance, receipt/source binding, archive copying, target
-directory validation, universe-wide install head, active event-17 runtime
-adapter, scheduler, durable wake-up path, and whole-world process-crash
-integration remain to be implemented before activation. All drafts are
+The source-bound receipt and prepared-install transaction now derive the exact
+directory-v3 genesis, copy the frozen directory and canonical transform blobs,
+strictly stage or reopen every world-21 cell, and commit one universe head last.
+Before that head, target debris grants no installed authority and exact retry
+rebuilds it while the install lock is held. After that head, recovery verifies
+the complete artifact, directory, lifecycle, route, frontier, and cell set and
+never substitutes or reseals foreign material. Active event-17 runtime
+adaptation, signatures, scheduler, durable wake-up, and coordinated activation
+remain to be implemented. All drafts are
 intentionally unreachable from the production directory-v2/package-v1 paths
 until every version in the table above moves in one coordinated activation.
 The dormant proof harness retains bounded predecessor projections for replay;

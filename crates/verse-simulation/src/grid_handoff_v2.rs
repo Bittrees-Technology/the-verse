@@ -17,7 +17,7 @@ mod production;
 #[allow(dead_code)]
 pub(crate) mod state;
 #[allow(dead_code)]
-mod store_v21;
+pub(crate) mod store_v21;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 

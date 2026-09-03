@@ -512,6 +512,7 @@ pub struct LocalCellDirectory {
 #[derive(Debug)]
 pub(crate) struct FrozenProtocol18Directory {
     root: PathBuf,
+    document_bytes: Vec<u8>,
     document: CellDirectoryDocument,
     document_hash: String,
     assignment_root: String,
@@ -526,7 +527,9 @@ impl FrozenProtocol18Directory {
         universe_manifest: &UniverseManifestSnapshot,
         proof_cells: impl IntoIterator<Item = CellKeyV1>,
     ) -> Result<Self, CellDirectoryError> {
-        let root = root.as_ref().to_path_buf();
+        let requested_root = root.as_ref();
+        let root =
+            fs::canonicalize(requested_root).map_err(|source| io_error(requested_root, source))?;
         if !root.is_dir() {
             return Err(CellDirectoryError::InvalidDirectory(
                 "frozen protocol-18 source directory does not exist".into(),
@@ -610,6 +613,7 @@ impl FrozenProtocol18Directory {
             hash_frozen_json(FROZEN_DIRECTORY_TRANSFER_ROOT_DOMAIN, &document.transfers)?;
         Ok(Self {
             root,
+            document_bytes: bytes,
             document,
             document_hash,
             assignment_root,
@@ -625,6 +629,10 @@ impl FrozenProtocol18Directory {
 
     pub(crate) fn document_hash(&self) -> &str {
         &self.document_hash
+    }
+
+    pub(crate) fn document_bytes(&self) -> &[u8] {
+        &self.document_bytes
     }
 
     pub(crate) fn assignment_root(&self) -> &str {
@@ -645,6 +653,10 @@ impl FrozenProtocol18Directory {
 
     pub(crate) fn assignments(&self) -> impl Iterator<Item = &CellAssignmentRecord> {
         self.document.assignments.values()
+    }
+
+    pub(crate) fn placements(&self) -> impl Iterator<Item = &AggregatePlacementRecord> {
+        self.document.placements.values()
     }
 
     pub(crate) fn transfers(&self) -> impl Iterator<Item = &CellTransferRecord> {
@@ -669,6 +681,10 @@ impl FrozenProtocol18Directory {
 
     pub(crate) fn cell_store_root(&self, assignment: &CellAssignmentRecord) -> PathBuf {
         self.root.join("cells").join(&assignment.cell_id)
+    }
+
+    pub(crate) fn universe_root(&self) -> &Path {
+        &self.root
     }
 }
 

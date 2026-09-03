@@ -942,6 +942,18 @@ impl Runtime {
         Ok(true)
     }
 
+    #[cfg(test)]
+    pub(crate) fn configure_migration_boundary_fixture(&mut self) -> Result<(), RuntimeError> {
+        if self.halted {
+            return Err(RuntimeError::Halted);
+        }
+        let mut next_state = self.state.clone();
+        next_state.configure_migration_boundary_test_profile()?;
+        self.store.save_snapshot(&next_state)?;
+        self.state = next_state;
+        Ok(())
+    }
+
     pub fn next_production_occurrence(&self) -> Option<&ProductionScheduleOccurrence> {
         self.store.next_production_occurrence()
     }
@@ -2020,6 +2032,42 @@ impl Runtime {
 }
 
 impl WorldState {
+    #[cfg(test)]
+    pub(crate) fn configure_migration_boundary_test_profile(&mut self) -> Result<(), IntentError> {
+        if self.event_sequence != 0
+            || !celestial::cell_key_from_address(&self.cell_address)
+                .is_ok_and(|cell_key| cell_key == celestial::cell_origin_key())
+        {
+            return Err(IntentError::rejected(
+                "migration_boundary_fixture_requires_origin",
+                "the migration boundary fixture requires a fresh origin cell",
+            ));
+        }
+        let boundary_address = celestial::address_from_origin_offset_um(
+            &self.cell_address,
+            [i128::from(celestial::CELL_EDGE_UM / 2), 0, 0],
+        )
+        .map_err(|source| {
+            IntentError::rejected("migration_boundary_fixture_invalid", source.to_string())
+        })?;
+        let boundary_position =
+            celestial::local_position_from_address(&self.cell_address, &boundary_address).map_err(
+                |source| {
+                    IntentError::rejected("migration_boundary_fixture_invalid", source.to_string())
+                },
+            )?;
+        let player = self.player.primary_mut();
+        player.address = boundary_address;
+        player.position = boundary_position;
+        player.linear_velocity = Vec3::ZERO;
+        player.angular_velocity = Vec3::ZERO;
+        player.surface_contact = false;
+        player.locomotion.kind = LocomotionKind::Eva;
+        player.locomotion.support = None;
+        player.locomotion.magnetic_boots_enabled = false;
+        Ok(())
+    }
+
     /// Applies the one canonical event-zero surface profile without touching
     /// persistence or runtime authority. Keeping this transformation pure lets
     /// offline migration validation reconstruct the exact same allowed origin.
@@ -5423,21 +5471,25 @@ impl WorldState {
                 package,
                 directory_transfer,
             } => {
-                *self = stage_prepared_eva_lock(self, package, directory_transfer).map_err(
+                let mut fenced = self.clone();
+                fenced.fencing_token = event.authority_fencing_token;
+                *self = stage_prepared_eva_lock(&fenced, package, directory_transfer).map_err(
                     |source| {
                         IntentError::rejected("replay_transfer_prepare_invalid", source.to_string())
                     },
                 )?;
             }
             EventPayload::PlayerTransferQuarantined { package, receipt } => {
-                let (staged, expected_receipt) =
-                    stage_eva_player_quarantine(self, receipt.destination_fencing_token, package)
-                        .map_err(|source| {
-                        IntentError::rejected(
-                            "replay_transfer_quarantine_invalid",
-                            source.to_string(),
-                        )
-                    })?;
+                let mut fenced = self.clone();
+                fenced.fencing_token = event.authority_fencing_token;
+                let (staged, expected_receipt) = stage_eva_player_quarantine(
+                    &fenced,
+                    receipt.destination_fencing_token,
+                    package,
+                )
+                .map_err(|source| {
+                    IntentError::rejected("replay_transfer_quarantine_invalid", source.to_string())
+                })?;
                 if &expected_receipt != receipt {
                     return Err(IntentError::rejected(
                         "replay_transfer_quarantine_invalid",
@@ -5450,7 +5502,9 @@ impl WorldState {
                 package,
                 directory_transfer,
             } => {
-                *self = stage_aborted_eva_unlock(self, package, directory_transfer).map_err(
+                let mut fenced = self.clone();
+                fenced.fencing_token = event.authority_fencing_token;
+                *self = stage_aborted_eva_unlock(&fenced, package, directory_transfer).map_err(
                     |source| {
                         IntentError::rejected("replay_transfer_abort_invalid", source.to_string())
                     },
@@ -5460,7 +5514,9 @@ impl WorldState {
                 package,
                 directory_transfer,
             } => {
-                *self = stage_committed_eva_export(self, package, directory_transfer).map_err(
+                let mut fenced = self.clone();
+                fenced.fencing_token = event.authority_fencing_token;
+                *self = stage_committed_eva_export(&fenced, package, directory_transfer).map_err(
                     |source| {
                         IntentError::rejected("replay_transfer_export_invalid", source.to_string())
                     },
@@ -5471,10 +5527,12 @@ impl WorldState {
                 receipt,
                 directory_transfer,
             } => {
-                *self = stage_committed_eva_import(self, package, receipt, directory_transfer)
+                let mut fenced = self.clone();
+                fenced.fencing_token = event.authority_fencing_token;
+                *self = stage_committed_eva_import(&fenced, package, receipt, directory_transfer)
                     .map_err(|source| {
-                        IntentError::rejected("replay_transfer_import_invalid", source.to_string())
-                    })?;
+                    IntentError::rejected("replay_transfer_import_invalid", source.to_string())
+                })?;
             }
         }
 

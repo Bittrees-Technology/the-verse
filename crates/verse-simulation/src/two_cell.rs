@@ -251,6 +251,25 @@ impl LocalTwoCellRuntime {
         result
     }
 
+    #[cfg(test)]
+    pub(crate) fn release_all_for_frozen_fixture(mut self) -> Result<(), TwoCellRuntimeError> {
+        for index in 0..self.cells.len() {
+            let cell_key = self.cells[index].key.clone();
+            self.cells[index]
+                .runtime
+                .drain_to_background_or_sleeping()?;
+            let assignment = self.directory.assignment(&cell_key)?.clone();
+            let holder_id = assignment.holder_id.clone().ok_or_else(|| {
+                TwoCellRuntimeError::Invalid(
+                    "fixture cell has no holder before its frozen release".into(),
+                )
+            })?;
+            self.directory
+                .release(&cell_key, assignment.assignment_generation, &holder_id)?;
+        }
+        Ok(())
+    }
+
     pub fn renew_leases(&mut self) -> Result<(), TwoCellRuntimeError> {
         let result = self
             .cells

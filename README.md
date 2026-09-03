@@ -228,15 +228,16 @@ persistence failpoint crash matrix remain disabled until their atomic paths
 are implemented. The dormant proof harness also remains bounded and
 snapshot-heavy; activation must place occurrence durability in the canonical
 event journal and reserve evidence capacity before accepting an import.
-The receipt-bound world-21 staging seam now persists a canonical
-`staged_unactivated` lifecycle-v2 genesis beside each target snapshot and binds
-its hash, the migration receipt, active-world root, and per-cell production and
-identity roots into the Store initialization head. It rejects route, manifest,
-fence, frontier, lifecycle, or authority-file substitution and is compiled
-without being reachable from the protocol-18 worker. Source archive validators,
-target directory document/root validation, the universe-wide prepared-install
-head, and explicit offline worker mode remain required before this becomes an
-installer.
+The source-bound prepared-install bridge now derives a canonical receipt and
+directory-v3 genesis while every legacy lock remains held. It copies the exact
+frozen directory and canonical mapping artifacts, persists a
+`staged_unactivated` lifecycle-v2 genesis beside each target snapshot, strictly
+stages or reopens the complete cell set, and writes one universe commit head
+last. Missing, extra, swapped, hybrid, or independently valid material from
+another frozen frontier fails closed; without the global head, partial target
+files grant no installed authority. The bridge remains dormant and unreachable
+from the protocol-18 worker. Explicit offline worker mode, signatures,
+coordinated activation, and the event-17 scheduler/wake path remain required.
 Production remains
 pinned to protocol 18/directory 2/package 1 until the complete protocol-19
 tuple activates together. Production active-player load, the

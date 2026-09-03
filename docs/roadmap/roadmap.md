@@ -195,8 +195,16 @@ production-origin transformation is now a second write-free capability that
 borrows those locks. It derives subject creation from replay, validates the
 manifest-5/world-21 targets, emits canonical bounded mapping blobs, and proves
 independently equal conservation plus inverse-normalized gameplay roots.
-Source-bound anchor and receipt issuance, archive copying, target-directory
-validation, the universe install head, and activation remain later P1.8 gates.
+The source-bound anchor and receipt issuer now consumes that locked transform
+plus a deterministically derived directory-v3 genesis. The dormant prepared
+installer copies the exact directory archive and canonical mapping artifacts,
+stages or strictly reopens both world-21 cells, and writes one universe head
+last. Absence of that head grants no installed authority; presence requires the
+exact receipt, directory, artifact set, cell set, immutable lifecycle records,
+and retained event-16 frontiers. Process-failure tests cover every universe
+boundary, and foreign, missing, extra, swapped, or independently valid but
+source-mismatched material fails closed. Coordinated activation, signatures,
+and the runtime scheduler/wake path remain later P1.8 gates.
 
 P1.5 acceptance requires:
 
