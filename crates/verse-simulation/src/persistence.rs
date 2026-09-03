@@ -4,7 +4,9 @@ use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -42,6 +44,10 @@ pub const LEASE_DURATION_MILLIS: u64 = 15_000;
 pub const LEASE_RENEWAL_INTERVAL_MILLIS: u64 = 5_000;
 pub const LEASE_WRITE_SAFETY_MARGIN_MILLIS: u64 = 5_000;
 pub const TRUSTED_CLOCK_ROLLBACK_TOLERANCE_MILLIS: u64 = 1_000;
+#[cfg(not(test))]
+const LOAD_LEASE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+#[cfg(test)]
+const LOAD_LEASE_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(2);
 
 pub trait TrustedClock: std::fmt::Debug + Send + Sync {
     fn now_unix_ms(&self) -> Result<u64, PersistenceError>;
@@ -138,6 +144,8 @@ pub enum PersistenceError {
     },
     #[error("trusted time is unavailable or cannot be represented")]
     TrustedClockUnavailable,
+    #[error("writer lease maintenance during world load is unavailable: {0}")]
+    LoadLeaseMaintenanceUnavailable(String),
     #[error("live fencing token {live} is not newer than recovered token {recovered}")]
     LiveFenceNotNewer { live: u64, recovered: u64 },
     #[error("durable lifecycle world frontier does not match recovered canonical state")]
@@ -359,6 +367,119 @@ pub struct Store {
     recovered_observed_mode: Option<LifecycleMode>,
     #[cfg(test)]
     append_failpoint: Option<AppendFailpoint>,
+    #[cfg(test)]
+    load_world_delay: Option<Duration>,
+}
+
+#[derive(Debug)]
+struct LoadLeaseOutcome {
+    lifecycle: CellLifecycleRecord,
+    last_trusted_unix_ms: u64,
+}
+
+struct LoadLeaseMaintainer {
+    stop: Arc<(Mutex<bool>, Condvar)>,
+    handle: Option<JoinHandle<Result<LoadLeaseOutcome, PersistenceError>>>,
+}
+
+impl LoadLeaseMaintainer {
+    fn start(store: &Store) -> Result<Self, PersistenceError> {
+        let root = store.root.clone();
+        let clock = Arc::clone(&store.clock);
+        let fencing_token = store.fencing_token;
+        let mut lifecycle = store.lifecycle.clone();
+        let mut last_trusted_unix_ms = store.last_trusted_unix_ms;
+        let stop = Arc::new((Mutex::new(false), Condvar::new()));
+        let thread_stop = Arc::clone(&stop);
+        let handle = thread::Builder::new()
+            .name("verse-world-load-lease".into())
+            .spawn(move || {
+                loop {
+                    let (stop_lock, stop_signal) = &*thread_stop;
+                    let stopped = stop_lock.lock().map_err(|_| {
+                        PersistenceError::LoadLeaseMaintenanceUnavailable(
+                            "stop signal lock was poisoned".into(),
+                        )
+                    })?;
+                    let (stopped, _) = stop_signal
+                        .wait_timeout(stopped, LOAD_LEASE_HEARTBEAT_INTERVAL)
+                        .map_err(|_| {
+                            PersistenceError::LoadLeaseMaintenanceUnavailable(
+                                "stop signal wait was poisoned".into(),
+                            )
+                        })?;
+                    if *stopped {
+                        return Ok(LoadLeaseOutcome {
+                            lifecycle,
+                            last_trusted_unix_ms,
+                        });
+                    }
+                    drop(stopped);
+                    maintain_live_lease(
+                        &root,
+                        clock.as_ref(),
+                        fencing_token,
+                        &mut lifecycle,
+                        &mut last_trusted_unix_ms,
+                    )?;
+                }
+            })
+            .map_err(|source| {
+                PersistenceError::LoadLeaseMaintenanceUnavailable(source.to_string())
+            })?;
+        Ok(Self {
+            stop,
+            handle: Some(handle),
+        })
+    }
+
+    fn finish(mut self, store: &mut Store) -> Result<(), PersistenceError> {
+        let outcome = self.stop_and_join()?;
+        store.lifecycle = outcome.lifecycle;
+        store.last_trusted_unix_ms = outcome.last_trusted_unix_ms;
+        store.renew_lease()
+    }
+
+    fn stop_and_join(&mut self) -> Result<LoadLeaseOutcome, PersistenceError> {
+        let (stop_lock, stop_signal) = &*self.stop;
+        let mut stopped = stop_lock.lock().map_err(|_| {
+            PersistenceError::LoadLeaseMaintenanceUnavailable(
+                "stop signal lock was poisoned".into(),
+            )
+        })?;
+        *stopped = true;
+        stop_signal.notify_one();
+        drop(stopped);
+        self.handle
+            .take()
+            .ok_or_else(|| {
+                PersistenceError::LoadLeaseMaintenanceUnavailable(
+                    "maintenance task was already joined".into(),
+                )
+            })?
+            .join()
+            .map_err(|_| {
+                PersistenceError::LoadLeaseMaintenanceUnavailable(
+                    "maintenance task panicked".into(),
+                )
+            })?
+    }
+}
+
+impl Drop for LoadLeaseMaintainer {
+    fn drop(&mut self) {
+        if self.handle.is_none() {
+            return;
+        }
+        let (stop_lock, stop_signal) = &*self.stop;
+        if let Ok(mut stopped) = stop_lock.lock() {
+            *stopped = true;
+            stop_signal.notify_one();
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 /// Non-serializable proof that one existing protocol-18 cell store was locked
@@ -906,6 +1027,8 @@ impl Store {
             recovered_observed_mode,
             #[cfg(test)]
             append_failpoint: None,
+            #[cfg(test)]
+            load_world_delay: None,
         })
     }
 
@@ -968,41 +1091,31 @@ impl Store {
     }
 
     pub fn renew_lease(&mut self) -> Result<(), PersistenceError> {
-        let found = self.read_current_lease()?;
-        let now_unix_ms = self.trusted_unix_millis()?;
-        self.validate_live_lease(&found, now_unix_ms)?;
-        let renewed_at_unix_ms = self
-            .lifecycle
-            .renewed_at_unix_ms
-            .ok_or(PersistenceError::LeaseOwnershipChanged)?;
-        let expires_at_unix_ms = self
-            .lifecycle
-            .expires_at_unix_ms
-            .ok_or(PersistenceError::LeaseOwnershipChanged)?;
-        let renewal_due =
-            now_unix_ms.saturating_sub(renewed_at_unix_ms) >= LEASE_RENEWAL_INTERVAL_MILLIS;
-        let write_margin_low =
-            expires_at_unix_ms.saturating_sub(now_unix_ms) < LEASE_WRITE_SAFETY_MARGIN_MILLIS;
-        if !renewal_due && !write_margin_low {
-            return Ok(());
-        }
-        let expires_at_unix_ms = now_unix_ms
-            .checked_add(LEASE_DURATION_MILLIS)
-            .ok_or(PersistenceError::TrustedClockUnavailable)?;
-        let renewed = CellLifecycleRecord {
-            renewed_at_unix_ms: Some(now_unix_ms),
-            expires_at_unix_ms: Some(expires_at_unix_ms),
-            last_trusted_unix_ms: now_unix_ms,
-            updated_at_unix_ms: now_unix_ms,
-            ..found
-        };
-        write_json_atomic(&self.root.join(LIFECYCLE_FILE), &renewed)?;
-        self.lifecycle = renewed;
-        self.last_trusted_unix_ms = now_unix_ms;
-        Ok(())
+        maintain_live_lease(
+            &self.root,
+            self.clock.as_ref(),
+            self.fencing_token,
+            &mut self.lifecycle,
+            &mut self.last_trusted_unix_ms,
+        )
     }
 
     pub fn load_world(&mut self) -> Result<WorldState, PersistenceError> {
+        let lease_maintainer = LoadLeaseMaintainer::start(self)?;
+        #[cfg(test)]
+        if let Some(delay) = self.load_world_delay.take() {
+            thread::sleep(delay);
+        }
+        let load_result = self.load_world_before_lifecycle_reconciliation();
+        lease_maintainer.finish(self)?;
+        let state = load_result?;
+        self.reconcile_lifecycle_with_world(&state)?;
+        Ok(state)
+    }
+
+    fn load_world_before_lifecycle_reconciliation(
+        &mut self,
+    ) -> Result<WorldState, PersistenceError> {
         let snapshot_path = self.root.join(SNAPSHOT_FILE);
         let mut state = if snapshot_path.exists() {
             let header: SnapshotHeader = read_json(&snapshot_path)?;
@@ -1150,7 +1263,6 @@ impl Store {
                 recovered: recovered_fence,
             });
         }
-        self.reconcile_lifecycle_with_world(&state)?;
         Ok(state)
     }
 
@@ -1591,25 +1703,7 @@ impl Store {
         found: &CellLifecycleRecord,
         now_unix_ms: u64,
     ) -> Result<(), PersistenceError> {
-        if found.fencing_token != self.fencing_token {
-            return Err(PersistenceError::FencingTokenChanged {
-                expected: self.fencing_token,
-                found: found.fencing_token,
-            });
-        }
-        if found.schema_version != LIFECYCLE_CONTROL_SCHEMA_VERSION || found != &self.lifecycle {
-            return Err(PersistenceError::LeaseOwnershipChanged);
-        }
-        let expires_at_unix_ms = found
-            .expires_at_unix_ms
-            .ok_or(PersistenceError::LeaseOwnershipChanged)?;
-        if now_unix_ms >= expires_at_unix_ms {
-            return Err(PersistenceError::LeaseExpired {
-                expires_at_unix_ms,
-                now_unix_ms,
-            });
-        }
-        Ok(())
+        validate_live_lease_record(&self.lifecycle, self.fencing_token, found, now_unix_ms)
     }
 
     fn trusted_unix_millis(&mut self) -> Result<u64, PersistenceError> {
@@ -1733,6 +1827,11 @@ impl Store {
     }
 
     #[cfg(test)]
+    fn set_load_world_delay(&mut self, delay: Duration) {
+        self.load_world_delay = Some(delay);
+    }
+
+    #[cfg(test)]
     pub(crate) fn install_next_production_occurrence_for_test(
         &mut self,
         occurrence: ProductionScheduleOccurrence,
@@ -1774,6 +1873,72 @@ impl Drop for Store {
             let _ = FileExt::unlock(&self.lock_file);
         }
     }
+}
+
+fn maintain_live_lease(
+    root: &Path,
+    clock: &dyn TrustedClock,
+    fencing_token: u64,
+    lifecycle: &mut CellLifecycleRecord,
+    last_trusted_unix_ms: &mut u64,
+) -> Result<(), PersistenceError> {
+    let lifecycle_path = root.join(LIFECYCLE_FILE);
+    let found = read_json::<CellLifecycleRecord>(&lifecycle_path)?;
+    let now_unix_ms = accept_trusted_time(clock.now_unix_ms()?, *last_trusted_unix_ms)?;
+    validate_live_lease_record(lifecycle, fencing_token, &found, now_unix_ms)?;
+    let renewed_at_unix_ms = lifecycle
+        .renewed_at_unix_ms
+        .ok_or(PersistenceError::LeaseOwnershipChanged)?;
+    let expires_at_unix_ms = lifecycle
+        .expires_at_unix_ms
+        .ok_or(PersistenceError::LeaseOwnershipChanged)?;
+    let renewal_due =
+        now_unix_ms.saturating_sub(renewed_at_unix_ms) >= LEASE_RENEWAL_INTERVAL_MILLIS;
+    let write_margin_low =
+        expires_at_unix_ms.saturating_sub(now_unix_ms) < LEASE_WRITE_SAFETY_MARGIN_MILLIS;
+    if renewal_due || write_margin_low {
+        let expires_at_unix_ms = now_unix_ms
+            .checked_add(LEASE_DURATION_MILLIS)
+            .ok_or(PersistenceError::TrustedClockUnavailable)?;
+        let renewed = CellLifecycleRecord {
+            renewed_at_unix_ms: Some(now_unix_ms),
+            expires_at_unix_ms: Some(expires_at_unix_ms),
+            last_trusted_unix_ms: now_unix_ms,
+            updated_at_unix_ms: now_unix_ms,
+            ..found
+        };
+        write_json_atomic(&lifecycle_path, &renewed)?;
+        *lifecycle = renewed;
+    }
+    *last_trusted_unix_ms = now_unix_ms;
+    Ok(())
+}
+
+fn validate_live_lease_record(
+    expected: &CellLifecycleRecord,
+    fencing_token: u64,
+    found: &CellLifecycleRecord,
+    now_unix_ms: u64,
+) -> Result<(), PersistenceError> {
+    if found.fencing_token != fencing_token {
+        return Err(PersistenceError::FencingTokenChanged {
+            expected: fencing_token,
+            found: found.fencing_token,
+        });
+    }
+    if found.schema_version != LIFECYCLE_CONTROL_SCHEMA_VERSION || found != expected {
+        return Err(PersistenceError::LeaseOwnershipChanged);
+    }
+    let expires_at_unix_ms = found
+        .expires_at_unix_ms
+        .ok_or(PersistenceError::LeaseOwnershipChanged)?;
+    if now_unix_ms >= expires_at_unix_ms {
+        return Err(PersistenceError::LeaseExpired {
+            expires_at_unix_ms,
+            now_unix_ms,
+        });
+    }
+    Ok(())
 }
 
 fn valid_lifecycle_transition(from: LifecycleMode, to: LifecycleMode) -> bool {
@@ -2829,6 +2994,7 @@ fn unix_millis() -> Result<u64, PersistenceError> {
 mod tests {
     use std::io::Write as _;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
 
     use tempfile::tempdir;
     use verse_protocol::{BlockKind, ClientMessage, IVec3, Vec3};
@@ -2859,6 +3025,65 @@ mod tests {
         fn now_unix_ms(&self) -> Result<u64, PersistenceError> {
             Ok(self.now_unix_ms.load(Ordering::SeqCst))
         }
+    }
+
+    #[derive(Debug)]
+    struct AcceleratedTrustedClock {
+        base_unix_ms: u64,
+        started_at: Instant,
+        multiplier: u64,
+    }
+
+    impl AcceleratedTrustedClock {
+        fn new(base_unix_ms: u64, multiplier: u64) -> Self {
+            Self {
+                base_unix_ms,
+                started_at: Instant::now(),
+                multiplier,
+            }
+        }
+    }
+
+    impl TrustedClock for AcceleratedTrustedClock {
+        fn now_unix_ms(&self) -> Result<u64, PersistenceError> {
+            let elapsed_millis = u64::try_from(self.started_at.elapsed().as_millis())
+                .map_err(|_| PersistenceError::TrustedClockUnavailable)?;
+            self.base_unix_ms
+                .checked_add(
+                    elapsed_millis
+                        .checked_mul(self.multiplier)
+                        .ok_or(PersistenceError::TrustedClockUnavailable)?,
+                )
+                .ok_or(PersistenceError::TrustedClockUnavailable)
+        }
+    }
+
+    fn persist_long_history_fixture(root: &Path, world_seed: u64, event_count: u64) -> String {
+        let clock = Arc::new(ManualTrustedClock::new(1_000_000));
+        let mut store =
+            Store::open_with_clock(root, world_seed, clock).expect("fixture store opens");
+        let mut world = WorldState::genesis(world_seed);
+        world.fencing_token = store.fencing_token();
+        let mut journal = Vec::new();
+        for index in 0..event_count {
+            let event = world
+                .prepare_client_event(&ClientMessage::SetSuitMode {
+                    operation_sequence: index + 1,
+                    operation_id: format!("long-history-{index}"),
+                    helmet_closed: !world.player.helmet_closed,
+                    jetpack_enabled: world.player.jetpack_enabled,
+                    magnetic_boots_enabled: world.player.locomotion.magnetic_boots_enabled,
+                })
+                .expect("fixture event prepares");
+            world.apply_event(&event).expect("fixture event applies");
+            serde_json::to_writer(&mut journal, &event).expect("fixture event serializes");
+            journal.push(b'\n');
+        }
+        fs::write(root.join(JOURNAL_FILE), journal).expect("fixture journal persists");
+        store
+            .save_snapshot(&world)
+            .expect("fixture snapshot persists");
+        world.state_hash()
     }
 
     #[test]
@@ -2952,6 +3177,78 @@ mod tests {
         assert!(matches!(
             store.renew_lease(),
             Err(PersistenceError::LeaseExpired { .. })
+        ));
+    }
+
+    #[test]
+    fn long_history_load_renews_before_expired_reconciliation() {
+        let directory = tempdir().expect("tempdir");
+        let expected_hash = persist_long_history_fixture(directory.path(), 1_515, 4_096);
+        let clock = Arc::new(AcceleratedTrustedClock::new(1_000_000, 20));
+        let mut store = Store::open_with_clock(directory.path(), 1_515, clock.clone())
+            .expect("replacement store opens");
+        let acquired_at_unix_ms = store
+            .lifecycle
+            .acquired_at_unix_ms
+            .expect("replacement acquisition is durable");
+        store.set_load_world_delay(Duration::from_millis(800));
+
+        let recovered = store
+            .load_world()
+            .expect("long history load maintains its exact writer lease");
+        let completed_at_unix_ms = clock.now_unix_ms().expect("trusted time remains available");
+        assert!(
+            completed_at_unix_ms >= acquired_at_unix_ms.saturating_add(LEASE_DURATION_MILLIS),
+            "test load must outlive the originally acquired lease"
+        );
+        assert_eq!(recovered.event_sequence, 4_096);
+        assert_eq!(recovered.state_hash(), expected_hash);
+        assert!(
+            store
+                .lifecycle
+                .renewed_at_unix_ms
+                .is_some_and(|renewed| renewed > acquired_at_unix_ms)
+        );
+        assert!(
+            store
+                .lifecycle
+                .expires_at_unix_ms
+                .is_some_and(|expires| expires > completed_at_unix_ms)
+        );
+    }
+
+    #[test]
+    fn long_history_load_rejects_replaced_holder_without_reconciliation() {
+        let directory = tempdir().expect("tempdir");
+        let initial_clock = Arc::new(ManualTrustedClock::new(2_000_000));
+        let mut initial = Store::open_with_clock(directory.path(), 1_516, initial_clock)
+            .expect("fixture store opens");
+        let mut world = WorldState::genesis(1_516);
+        world.fencing_token = initial.fencing_token();
+        initial
+            .save_snapshot(&world)
+            .expect("fixture snapshot persists");
+        drop(initial);
+
+        let clock = Arc::new(ManualTrustedClock::new(2_000_000));
+        let mut replacement = Store::open_with_clock(directory.path(), 1_516, clock)
+            .expect("replacement store opens");
+        replacement.set_load_world_delay(Duration::from_millis(100));
+        let lifecycle_path = directory.path().join(LIFECYCLE_FILE);
+        let tamper_path = lifecycle_path.clone();
+        let tamper = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            let mut lifecycle: CellLifecycleRecord =
+                read_json(&tamper_path).expect("live lifecycle reads");
+            lifecycle.holder_id = Some("foreign-holder".into());
+            write_json_atomic(&tamper_path, &lifecycle).expect("foreign holder persists");
+        });
+
+        let result = replacement.load_world();
+        tamper.join().expect("tamper task completes");
+        assert!(matches!(
+            result,
+            Err(PersistenceError::LeaseOwnershipChanged)
         ));
     }
 

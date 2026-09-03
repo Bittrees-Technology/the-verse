@@ -225,6 +225,15 @@ to a 15-second duration and renewal no later than every 5 seconds. Every write
 also checks the current holder, token, and expiry. Failure or uncertainty before
 expiry stops new work; reaching expiry self-fences the worker.
 
+Snapshot verification and journal replay run while the cell is Activating and
+may outlive one lease interval for a mature world. A dedicated startup
+maintainer therefore samples the same trusted clock and durably renews only the
+exact lifecycle record, holder, and fencing token acquired by the loading
+store. Startup joins that maintainer and revalidates its final durable record
+before lifecycle reconciliation. Expiry, clock failure, record replacement,
+renewal failure, or a maintainer failure rejects the load; no stale in-memory
+result can be reconciled, published, or admitted for gameplay.
+
 Expiry alone never authorizes another local process to steal a lease while the
 exclusive file lock remains held. A crashed process releases the operating-
 system lock; a successor then allocates a checked token strictly greater than
@@ -533,9 +542,12 @@ escrow, or quantities.
     overflow fail closed with actionable status.
 18. Snapshot plus journal replay restores the exact lifecycle generation,
     occurrence frontier, queue, escrow, event frontier, and world hash.
-19. Existing mining, manufacturing, inventory, multiplayer, independent-
+19. A valid long-history load may span multiple lease intervals only while its
+    exact holder renews durably; replacing that holder during load rejects
+    reconciliation and startup.
+20. Existing mining, manufacturing, inventory, multiplayer, independent-
     verifier, native, browser, packaging, and conservation suites remain green.
-20. Evidence and release notes state that the proof covers one fixed cell and
+21. Evidence and release notes state that the proof covers one fixed cell and
     does not establish multi-cell, multi-host, or public-scale readiness.
 
 ## Test and evidence strategy
@@ -558,7 +570,8 @@ escrow, or quantities.
 - **Concurrency:** Race two local workers, resume a stale worker, and coalesce
   repeated wake requests.
 - **Budget/load:** Publish the 256-machine quantum and 60-quantum catch-up
-  distributions, deadline margins, journal sizes, and eventual completion.
+  distributions, deadline margins, journal sizes, eventual completion, and a
+  long-history restart that exceeds its originally acquired lease.
 - **Client:** Fresh verified baseline after activation, stale pre-drain message
   rejection, non-waking spectator behavior, and explicit unavailable status.
 - **Release:** Hosted Linux plus Apple Silicon package and cross-process gates
