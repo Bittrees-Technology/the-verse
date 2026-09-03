@@ -3571,6 +3571,12 @@ mod tests {
             .expect("structural world change commits");
         let after = state.snapshot().event_sequence;
         assert!(after > before);
+        state
+            .public_world_cache
+            .lock()
+            .as_mut()
+            .expect("cache exists")
+            .generated_at = Instant::now();
         let rate_limited = state
             .bounded_public_world_json()
             .expect("fresh cache is served during the refresh floor");
