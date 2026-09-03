@@ -5,13 +5,14 @@
 //! a migration receipt, stage target state, or grant activation authority.
 
 use std::collections::BTreeMap;
+use std::fs;
 use std::path::Path;
 
 use thiserror::Error;
 use verse_protocol::CellKeyV1;
 
 use crate::cell_directory::{
-    CellAssignmentRecord, CellDirectoryError, CellTransferAbortProof,
+    AggregatePlacementRecord, CellAssignmentRecord, CellDirectoryError, CellTransferAbortProof,
     CellTransferFinalizationProof, CellTransferImportProof, CellTransferPrepareProof,
     CellTransferQuarantineProof, FrozenProtocol18Directory, TransferAbortRole,
 };
@@ -150,6 +151,7 @@ impl ValidatedFrozenProtocol18Source {
         let proof_cells = crate::cell_directory::proof_cell_keys()?;
         let directory =
             FrozenProtocol18Directory::lock_existing(root, &manifest, proof_cells.clone())?;
+        validate_real_contained_cell_routes(&directory)?;
         let assignments = directory.assignments().cloned().collect::<Vec<_>>();
         if assignments.len() != proof_cells.len()
             || assignments
@@ -207,6 +209,10 @@ impl ValidatedFrozenProtocol18Source {
         self.directory.document_hash()
     }
 
+    pub(crate) fn directory_document_bytes(&self) -> &[u8] {
+        self.directory.document_bytes()
+    }
+
     pub(crate) fn terminal_transfer_count(&self) -> u64 {
         self.directory.terminal_transfer_count()
     }
@@ -226,6 +232,67 @@ impl ValidatedFrozenProtocol18Source {
     pub(crate) fn cells(&self) -> &[FrozenProtocol18CellEvidence] {
         &self.cells
     }
+
+    pub(crate) fn assignments(&self) -> impl Iterator<Item = &CellAssignmentRecord> {
+        self.directory.assignments()
+    }
+
+    pub(crate) fn placements(&self) -> impl Iterator<Item = &AggregatePlacementRecord> {
+        self.directory.placements()
+    }
+
+    pub(crate) fn transfers(&self) -> impl Iterator<Item = &crate::CellTransferRecord> {
+        self.directory.transfers()
+    }
+
+    pub(crate) fn universe_root(&self) -> &Path {
+        self.directory.universe_root()
+    }
+}
+
+fn validate_real_contained_cell_routes(
+    directory: &FrozenProtocol18Directory,
+) -> Result<(), FrozenProtocol18SourceError> {
+    let universe_root = directory.universe_root();
+    let cell_container = universe_root.join("cells");
+    require_real_directory(&cell_container, "protocol-18 cells root")?;
+    let canonical_container = fs::canonicalize(&cell_container).map_err(|source| {
+        FrozenProtocol18SourceError::Invalid(format!(
+            "protocol-18 cells root cannot be canonicalized: {source}"
+        ))
+    })?;
+    if canonical_container != cell_container {
+        return Err(FrozenProtocol18SourceError::Invalid(
+            "protocol-18 cells root escapes its frozen universe".into(),
+        ));
+    }
+    for assignment in directory.assignments() {
+        let route = directory.cell_store_root(assignment);
+        require_real_directory(&route, "protocol-18 cell route")?;
+        let canonical_route = fs::canonicalize(&route).map_err(|source| {
+            FrozenProtocol18SourceError::Invalid(format!(
+                "protocol-18 cell route cannot be canonicalized: {source}"
+            ))
+        })?;
+        if canonical_route.parent() != Some(cell_container.as_path()) || canonical_route != route {
+            return Err(FrozenProtocol18SourceError::Invalid(
+                "protocol-18 cell route escapes its frozen universe".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn require_real_directory(path: &Path, label: &str) -> Result<(), FrozenProtocol18SourceError> {
+    let metadata = fs::symlink_metadata(path).map_err(|source| {
+        FrozenProtocol18SourceError::Invalid(format!("{label} is unavailable: {source}"))
+    })?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(FrozenProtocol18SourceError::Invalid(format!(
+            "{label} is not a real directory"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_cell_fences(

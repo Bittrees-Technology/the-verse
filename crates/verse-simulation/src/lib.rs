@@ -19,6 +19,8 @@ mod model;
 mod persistence;
 mod projection;
 #[allow(dead_code)]
+mod protocol19_install;
+#[allow(dead_code)]
 mod protocol19_migration;
 #[allow(dead_code)]
 mod protocol19_source;

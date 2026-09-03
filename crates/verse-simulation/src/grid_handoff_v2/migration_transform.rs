@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use verse_protocol::{ConservationSnapshot, InventoryDomain, PlayerLifeState};
+use verse_protocol::{CellKeyV1, ConservationSnapshot, InventoryDomain, PlayerLifeState};
 
 use super::production::DraftProductionJobOriginV2;
 use super::state::{DraftGridTransferCellStateV2, ValidatedDraftGridTransferCellStateV21};
@@ -192,6 +192,7 @@ impl TypedIdentityMaps {
 
 #[derive(Debug)]
 pub(crate) struct Protocol19TransformedCell {
+    cell_key: CellKeyV1,
     cell_id: String,
     state: DraftGridTransferCellStateV2,
     identity_subset_root: String,
@@ -199,6 +200,10 @@ pub(crate) struct Protocol19TransformedCell {
 }
 
 impl Protocol19TransformedCell {
+    pub(crate) fn cell_key(&self) -> &CellKeyV1 {
+        &self.cell_key
+    }
+
     pub(crate) fn cell_id(&self) -> &str {
         &self.cell_id
     }
@@ -244,6 +249,45 @@ impl Protocol19TransformedCell {
     pub(crate) fn production_origin_root(&self) -> &str {
         &self.production_origin_root
     }
+
+    pub(crate) fn contains_aggregate(
+        &self,
+        kind: crate::cell_directory::MobileAggregateKind,
+        id: &str,
+    ) -> bool {
+        match kind {
+            crate::cell_directory::MobileAggregateKind::Player => {
+                self.state.base().player.by_id.contains_key(id)
+            }
+            crate::cell_directory::MobileAggregateKind::Grid => {
+                self.state.base().grids.contains_key(id)
+            }
+        }
+    }
+
+    pub(crate) fn resident_aggregates(
+        &self,
+    ) -> Vec<(crate::cell_directory::MobileAggregateKind, String)> {
+        self.state
+            .base()
+            .player
+            .by_id
+            .keys()
+            .map(|id| {
+                (
+                    crate::cell_directory::MobileAggregateKind::Player,
+                    id.clone(),
+                )
+            })
+            .chain(
+                self.state
+                    .base()
+                    .grids
+                    .keys()
+                    .map(|id| (crate::cell_directory::MobileAggregateKind::Grid, id.clone())),
+            )
+            .collect()
+    }
 }
 
 /// Non-Serde proof of a deterministic, write-free transformation. Borrowing
@@ -262,6 +306,7 @@ pub(crate) struct ValidatedProtocol19MigrationTransform<'source> {
     production_origin_count: u64,
     global_conservation_root: String,
     normalized_gameplay_root: String,
+    grid_identity_map: BTreeMap<(String, String), String>,
 }
 
 impl<'source> ValidatedProtocol19MigrationTransform<'source> {
@@ -444,6 +489,7 @@ impl<'source> ValidatedProtocol19MigrationTransform<'source> {
             });
             identity_entries.extend(entries);
             cells.push(Protocol19TransformedCell {
+                cell_key: cell.cell_key().clone(),
                 cell_id: cell.cell_id().to_owned(),
                 state,
                 identity_subset_root,
@@ -474,6 +520,20 @@ impl<'source> ValidatedProtocol19MigrationTransform<'source> {
             universe_id: source.universe_id().to_owned(),
             entries: production_entries,
         };
+        let grid_identity_map = identity_blob
+            .entries
+            .iter()
+            .filter(|entry| entry.entity_kind == "grid")
+            .map(|entry| {
+                (
+                    (
+                        entry.terminal_cell_id.clone(),
+                        entry.legacy_subject_id.clone(),
+                    ),
+                    entry.canonical_subject_id.clone(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
         let identity_map_bytes = canonical_blob_bytes(&identity_blob)?;
         let production_origin_bytes = canonical_blob_bytes(&production_blob)?;
         let decoded_identity =
@@ -509,6 +569,7 @@ impl<'source> ValidatedProtocol19MigrationTransform<'source> {
             production_origin_root,
             global_conservation_root,
             normalized_gameplay_root,
+            grid_identity_map,
         })
     }
 
@@ -554,6 +615,21 @@ impl<'source> ValidatedProtocol19MigrationTransform<'source> {
 
     pub(crate) fn normalized_gameplay_root(&self) -> &str {
         &self.normalized_gameplay_root
+    }
+
+    pub(crate) fn target_aggregate_id<'id>(
+        &'id self,
+        kind: crate::cell_directory::MobileAggregateKind,
+        terminal_cell_id: &str,
+        legacy_id: &'id str,
+    ) -> &'id str {
+        match kind {
+            crate::cell_directory::MobileAggregateKind::Player => legacy_id,
+            crate::cell_directory::MobileAggregateKind::Grid => self
+                .grid_identity_map
+                .get(&(terminal_cell_id.to_owned(), legacy_id.to_owned()))
+                .map_or(legacy_id, String::as_str),
+        }
     }
 }
 

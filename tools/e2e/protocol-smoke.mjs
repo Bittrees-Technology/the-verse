@@ -1153,24 +1153,36 @@ async function run() {
   );
 
   const tickBeforeMotion = world.simulation_tick;
-  const gridZBeforeMotion = world.grids.find(
+  const gridBeforeMotion = world.grids.find(
     (grid) => grid.grid_id === "grid-starter",
-  ).position.z;
+  );
+  const gridPositionBeforeMotion = gridBeforeMotion.position;
+  const commandedWorldDirection = rotateVector(gridBeforeMotion.orientation, {
+    x: 0.0,
+    y: 0.0,
+    z: 1.0,
+  });
   world = await intent("set_grid_control", {
     grid_id: "grid-starter",
     linear_input: { x: 0.0, y: 0.0, z: 0.5 },
     angular_input: { x: 0.0, y: 0.1, z: 0.0 },
     dampeners: true,
   });
-  while (world.simulation_tick < tickBeforeMotion + 6) {
-    world = await waitForMotionAfter(
-      world.simulation_tick,
-      "integrated grid motion",
-    );
-  }
-  assert.ok(
-    world.grids.find((grid) => grid.grid_id === "grid-starter").position.z >
-      gridZBeforeMotion,
+  world = await waitForWorld(
+    (state) => {
+      const grid = state.grids.find(
+        (candidate) => candidate.grid_id === "grid-starter",
+      );
+      return (
+        state.simulation_tick >= tickBeforeMotion + 6 &&
+        dotVector(
+          subtractVector(grid.position, gridPositionBeforeMotion),
+          commandedWorldDirection,
+        ) > 0
+      );
+    },
+    "integrated grid motion along the commanded direction",
+    20_000,
   );
   world = await intent("set_grid_control", {
     grid_id: "grid-starter",

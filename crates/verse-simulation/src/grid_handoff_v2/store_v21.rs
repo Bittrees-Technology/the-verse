@@ -3,9 +3,9 @@
 //! Dormant staged/recovery slice of the isolated world-21 Store.
 //!
 //! The active Store never reads this namespace. The production-compiled staging
-//! seam requires a receipt-bound non-Serde target capability but has no worker
-//! entry point. Test-only constructors remain separate until source-evidence
-//! validation, the universe install head, and coordinated activation exist.
+//! seam requires a source-bound, receipt-derived non-Serde target capability
+//! and participates in the universe-wide prepared-install transaction, but has
+//! no worker or activation entry point.
 
 mod event_journal;
 
@@ -19,10 +19,14 @@ use thiserror::Error;
 use uuid::Uuid;
 use verse_protocol::{CellKeyV1, protocol_v19::Protocol19CompatibilityTuple};
 
-use super::state::{DraftGridTransferCellStateV2, ValidatedDraftGridTransferCellStateV21};
+use super::state::DraftGridTransferCellStateV2;
+#[cfg(test)]
+use super::state::ValidatedDraftGridTransferCellStateV21;
+#[cfg(test)]
+use crate::protocol19_migration::Protocol19World21StagingEvidence;
 use crate::protocol19_migration::{
     Protocol19TargetLifecycleGenesisV2, Protocol19World21StagingCommitment,
-    Protocol19World21StagingEvidence,
+    ValidatedProtocol19MigrationReceipt,
 };
 
 const STORE_DIRECTORY: &str = "protocol-19-world-v21";
@@ -296,6 +300,25 @@ pub(crate) struct ValidatedWorld21StagingTarget<'state, 'manifest> {
 }
 
 impl<'state, 'manifest> ValidatedWorld21StagingTarget<'state, 'manifest> {
+    pub(crate) fn from_migration_receipt(
+        receipt: &ValidatedProtocol19MigrationReceipt<'_, '_>,
+        cell: &'state super::migration_transform::Protocol19TransformedCell,
+        manifest: &'manifest crate::manifest_v5::ValidatedUniverseManifestV5,
+    ) -> Result<Self, DraftWorld21StoreError> {
+        let state = cell
+            .validate(manifest)
+            .map_err(|source| DraftWorld21StoreError::Invalid(source.to_string()))?;
+        let commitment = receipt
+            .bind_cell(cell)
+            .map_err(|source| DraftWorld21StoreError::Invalid(source.to_string()))?;
+        Ok(Self {
+            state: state.state(),
+            manifest: state.manifest(),
+            commitment,
+        })
+    }
+
+    #[cfg(test)]
     pub(crate) fn from_receipt(
         receipt_bytes: &[u8],
         state: &ValidatedDraftGridTransferCellStateV21<'state, 'manifest>,
@@ -382,12 +405,59 @@ pub(crate) struct DraftWorld21Store {
     _writer_lock: File,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PreparedWorld21CellEvidence {
+    pub(crate) cell_key: CellKeyV1,
+    pub(crate) cell_id: String,
+    pub(crate) initialization_head_hash: String,
+    pub(crate) identity_hash: String,
+    pub(crate) lifecycle_record_hash: String,
+    pub(crate) snapshot_state_hash: String,
+    pub(crate) active_world_hash: String,
+    pub(crate) migration_receipt_hash: String,
+}
+
 impl DraftWorld21Store {
     pub(crate) fn stage_from_migration(
         root: impl AsRef<Path>,
         target: &ValidatedWorld21StagingTarget<'_, '_>,
     ) -> Result<Self, DraftWorld21StoreError> {
         Self::stage_from_migration_with_failpoint(root, target, None)
+    }
+
+    pub(crate) fn open_from_migration(
+        base_root: impl AsRef<Path>,
+        target: &ValidatedWorld21StagingTarget<'_, '_>,
+    ) -> Result<Self, DraftWorld21StoreError> {
+        let base_root = base_root.as_ref();
+        validate_real_cell_root(base_root)?;
+        let root = base_root.join(STORE_DIRECTORY);
+        let metadata = fs::symlink_metadata(&root).map_err(|source| io_error(&root, source))?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(DraftWorld21StoreError::Invalid(
+                "committed world-21 namespace is not a real directory".into(),
+            ));
+        }
+        let writer_lock = acquire_existing_writer_lock(&root)?;
+        let initialization_head = root.join(INITIALIZATION_HEAD_FILE);
+        if !initialization_head
+            .try_exists()
+            .map_err(|source| io_error(&initialization_head, source))?
+        {
+            return Err(DraftWorld21StoreError::Invalid(
+                "committed world-21 Store has no initialization head".into(),
+            ));
+        }
+        let lifecycle = target.commitment.lifecycle();
+        Self::recover_locked(
+            root,
+            writer_lock,
+            target.manifest,
+            lifecycle.cell_key(),
+            lifecycle.migration_anchor_hash(),
+            Some(&target.commitment),
+            None,
+        )
     }
 
     #[cfg(test)]
@@ -432,13 +502,7 @@ impl DraftWorld21Store {
         let expected_cell_key = lifecycle.cell_key();
         let migration_anchor_hash = lifecycle.migration_anchor_hash();
         let base_root = root.as_ref();
-        let base_metadata =
-            fs::metadata(base_root).map_err(|source| io_error(base_root, source))?;
-        if !base_metadata.is_dir() {
-            return Err(DraftWorld21StoreError::Invalid(
-                "world-21 Store requires an existing per-cell root directory".into(),
-            ));
-        }
+        validate_real_cell_root(base_root)?;
         let root = base_root.join(STORE_DIRECTORY);
         fs::create_dir_all(&root).map_err(|source| io_error(&root, source))?;
         sync_directory(base_root)?;
@@ -452,9 +516,15 @@ impl DraftWorld21Store {
             .try_exists()
             .map_err(|source| io_error(&initialization_head_path, source))?
         {
-            return Err(DraftWorld21StoreError::Invalid(
-                "world-21 Store initialization head already exists".into(),
-            ));
+            return Self::recover_locked(
+                root,
+                writer_lock,
+                manifest,
+                expected_cell_key,
+                migration_anchor_hash,
+                Some(&target.commitment),
+                None,
+            );
         }
         reset_incomplete_initialization(&root)?;
         let identity =
@@ -523,6 +593,7 @@ impl DraftWorld21Store {
             manifest,
             expected_cell_key,
             migration_anchor_hash,
+            Some(&target.commitment),
             None,
         )
     }
@@ -542,6 +613,7 @@ impl DraftWorld21Store {
             expected_cell_key,
             migration_anchor_hash,
             None,
+            None,
         )
     }
 
@@ -560,6 +632,7 @@ impl DraftWorld21Store {
             manifest,
             expected_cell_key,
             migration_anchor_hash,
+            None,
             Some(directory_history),
         )
     }
@@ -570,6 +643,7 @@ impl DraftWorld21Store {
         manifest: &crate::manifest_v5::ValidatedUniverseManifestV5,
         expected_cell_key: &CellKeyV1,
         migration_anchor_hash: &str,
+        expected_staging: Option<&Protocol19World21StagingCommitment>,
         directory_history: Option<&crate::cell_directory_v3::DraftCellDirectoryHistoryStoreV3>,
     ) -> Result<Self, DraftWorld21StoreError> {
         if !valid_hash(migration_anchor_hash) {
@@ -633,6 +707,16 @@ impl DraftWorld21Store {
         }
         identity.validate(&state, &reopened_manifest, expected_cell_key, &lifecycle)?;
         initialization_head.validate(&identity, 0)?;
+        if let Some(expected) = expected_staging
+            && (lifecycle != *expected.lifecycle()
+                || identity.migration_receipt_hash != expected.migration_receipt_hash()
+                || identity.production_origin_root != expected.production_origin_root()
+                || identity.identity_subset_root != expected.identity_subset_root())
+        {
+            return Err(DraftWorld21StoreError::Invalid(
+                "existing world-21 Store belongs to another migration target".into(),
+            ));
+        }
         let (events, state) = match directory_history {
             Some(directory_history) => {
                 event_journal::DraftWorld21EventJournal::recover_with_history(
@@ -704,6 +788,97 @@ impl DraftWorld21Store {
     fn root(&self) -> &Path {
         &self.root
     }
+
+    pub(crate) fn prepared_install_evidence(&self) -> PreparedWorld21CellEvidence {
+        PreparedWorld21CellEvidence {
+            cell_key: self.identity.cell_key.clone(),
+            cell_id: self.identity.cell_id.clone(),
+            initialization_head_hash: self.initialization_head.head_hash.clone(),
+            identity_hash: self.identity.identity_hash.clone(),
+            lifecycle_record_hash: self.lifecycle.record_hash().to_owned(),
+            snapshot_state_hash: self.identity.snapshot_state_hash.clone(),
+            active_world_hash: self.identity.active_world_hash.clone(),
+            migration_receipt_hash: self.identity.migration_receipt_hash.clone(),
+        }
+    }
+
+    pub(crate) fn validate_prepared_file_set(&self) -> Result<(), DraftWorld21StoreError> {
+        let expected = [
+            INITIALIZATION_HEAD_FILE,
+            IDENTITY_FILE,
+            MANIFEST_FILE,
+            LIFECYCLE_GENESIS_FILE,
+            SNAPSHOT_FILE,
+            EVENT_JOURNAL_FILE,
+            event_journal::EVENT_BOUNDARY_FILE,
+            event_journal::EVENT_HEAD_FILE,
+            WRITER_LOCK_FILE,
+        ];
+        for entry in fs::read_dir(&self.root).map_err(|source| io_error(&self.root, source))? {
+            let entry = entry.map_err(|source| io_error(&self.root, source))?;
+            let name = entry.file_name();
+            let name = name.to_str().ok_or_else(|| {
+                DraftWorld21StoreError::Invalid(
+                    "world-21 Store contains a non-UTF-8 artifact".into(),
+                )
+            })?;
+            if !entry
+                .file_type()
+                .map_err(|source| io_error(entry.path(), source))?
+                .is_file()
+                || !expected.contains(&name)
+            {
+                return Err(DraftWorld21StoreError::Invalid(
+                    "world-21 Store contains an unexpected artifact".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn discard_uncommitted_namespace(
+        base_root: impl AsRef<Path>,
+    ) -> Result<(), DraftWorld21StoreError> {
+        let root = base_root.as_ref().join(STORE_DIRECTORY);
+        let metadata = match fs::symlink_metadata(&root) {
+            Ok(metadata) => metadata,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => return Err(io_error(&root, source)),
+        };
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(DraftWorld21StoreError::Invalid(
+                "world-21 namespace is not a real directory".into(),
+            ));
+        }
+        let writer_lock = acquire_writer_lock(&root)?;
+        fs::remove_dir_all(&root).map_err(|source| io_error(&root, source))?;
+        drop(writer_lock);
+        sync_directory(base_root.as_ref())
+    }
+
+    pub(crate) fn namespace_exists(
+        base_root: impl AsRef<Path>,
+    ) -> Result<bool, DraftWorld21StoreError> {
+        let root = base_root.as_ref().join(STORE_DIRECTORY);
+        match fs::symlink_metadata(&root) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => Ok(true),
+            Ok(_) => Err(DraftWorld21StoreError::Invalid(
+                "world-21 namespace is not a real directory".into(),
+            )),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(source) => Err(io_error(&root, source)),
+        }
+    }
+}
+
+fn validate_real_cell_root(path: &Path) -> Result<(), DraftWorld21StoreError> {
+    let metadata = fs::symlink_metadata(path).map_err(|source| io_error(path, source))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(DraftWorld21StoreError::Invalid(
+            "world-21 Store requires an existing real per-cell root directory".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn reset_incomplete_initialization(root: &Path) -> Result<(), DraftWorld21StoreError> {
@@ -807,6 +982,23 @@ fn acquire_writer_lock(root: &Path) -> Result<File, DraftWorld21StoreError> {
     let file = OpenOptions::new()
         .create(true)
         .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(|source| io_error(&path, source))?;
+    match file.try_lock_exclusive() {
+        Ok(()) => {}
+        Err(source) if source.kind() == std::io::ErrorKind::WouldBlock => {
+            return Err(DraftWorld21StoreError::WriterConflict);
+        }
+        Err(source) => return Err(io_error(&path, source)),
+    }
+    Ok(file)
+}
+
+fn acquire_existing_writer_lock(root: &Path) -> Result<File, DraftWorld21StoreError> {
+    let path = root.join(WRITER_LOCK_FILE);
+    let file = OpenOptions::new()
         .read(true)
         .write(true)
         .open(&path)
