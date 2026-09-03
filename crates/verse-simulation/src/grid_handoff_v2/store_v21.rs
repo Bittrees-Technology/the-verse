@@ -460,6 +460,49 @@ impl DraftWorld21Store {
         )
     }
 
+    pub(crate) fn open_from_active_head(
+        base_root: impl AsRef<Path>,
+        manifest: &crate::manifest_v5::ValidatedUniverseManifestV5,
+        migration_anchor_hash: &str,
+        expected: &PreparedWorld21CellEvidence,
+        expected_production_origin_root: &str,
+        expected_identity_subset_root: &str,
+    ) -> Result<Self, DraftWorld21StoreError> {
+        let base_root = base_root.as_ref();
+        validate_real_cell_root(base_root)?;
+        let root = base_root.join(STORE_DIRECTORY);
+        let metadata = fs::symlink_metadata(&root).map_err(|source| io_error(&root, source))?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(DraftWorld21StoreError::Invalid(
+                "activated world-21 namespace is not a real directory".into(),
+            ));
+        }
+        let writer_lock = acquire_existing_writer_lock(&root)?;
+        let store = Self::recover_locked(
+            root,
+            writer_lock,
+            manifest,
+            &expected.cell_key,
+            migration_anchor_hash,
+            None,
+            None,
+        )?;
+        if store.prepared_install_evidence() != *expected {
+            return Err(DraftWorld21StoreError::Invalid(
+                "world-21 Store differs from the cell selected by the active head".into(),
+            ));
+        }
+        if store.identity.production_origin_root != expected_production_origin_root
+            || store.identity.identity_subset_root != expected_identity_subset_root
+        {
+            return Err(DraftWorld21StoreError::Invalid(
+                "world-21 Store identity differs from its canonical migration receipt".into(),
+            ));
+        }
+        store.validate_prepared_file_set()?;
+        Ok(store)
+    }
+
     #[cfg(test)]
     fn create_for_test(
         root: impl AsRef<Path>,

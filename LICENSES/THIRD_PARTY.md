@@ -30,6 +30,7 @@ The macOS and Linux CI scripts pin and verify Godot release archive checksums. T
 | axum | MIT |
 | blake3 | CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception |
 | clap | MIT OR Apache-2.0 |
+| ed25519-dalek 2.2.0 | BSD-3-Clause |
 | futures-util | MIT OR Apache-2.0 |
 | fs2 | MIT OR Apache-2.0 |
 | godot and godot-rust support crates 0.5.4 | MPL-2.0 |

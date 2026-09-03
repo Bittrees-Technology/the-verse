@@ -6,6 +6,7 @@
 //! prepared-install head is written last and is the sole all-cell commit
 //! marker. This module deliberately exposes no activation or runtime path.
 
+use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::marker::PhantomData;
@@ -19,15 +20,23 @@ use verse_protocol::protocol_v19::Protocol19CompatibilityTuple;
 
 use crate::cell_directory::CellDirectoryError;
 use crate::cell_directory_v3::{
-    DraftCellDirectoryHistoryStoreV3, ValidatedProtocol19DirectoryGenesis,
+    ActiveDirectoryV3Expectation, DraftCellDirectoryHistoryStoreV3,
+    ValidatedProtocol19DirectoryGenesis,
 };
 use crate::grid_handoff_v2::migration_transform::ValidatedProtocol19MigrationTransform;
+use crate::grid_handoff_v2::migration_transform::{
+    recover_identity_map_root, recover_production_origin_root,
+};
 use crate::grid_handoff_v2::store_v21::{
     DraftWorld21Store, DraftWorld21StoreError, PreparedWorld21CellEvidence,
     ValidatedWorld21StagingTarget,
 };
 use crate::manifest_v5::ValidatedUniverseManifestV5;
-use crate::protocol19_migration::{MigrationReceiptError, ValidatedProtocol19MigrationReceipt};
+use crate::protocol19_migration::{
+    CanonicalProtocol19MigrationReceiptEvidence, MigrationReceiptError,
+    ValidatedProtocol19MigrationReceipt, hash_source_directory_archive,
+    recover_canonical_migration_receipt,
+};
 
 const INSTALL_DIRECTORY: &str = "protocol-19-prepared-install-v1";
 const INSTALL_LOCK_FILE: &str = "writer.lock";
@@ -78,6 +87,26 @@ struct Protocol19PreparedInstallHeadV1 {
     cell_set_root: String,
     cells: Vec<PreparedWorld21CellEvidence>,
     head_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Protocol19PreparedInstallSummary {
+    pub(crate) compatibility: Protocol19CompatibilityTuple,
+    pub(crate) universe_id: String,
+    pub(crate) world_seed: u64,
+    pub(crate) target_manifest_hash: String,
+    pub(crate) migration_anchor_hash: String,
+    pub(crate) migration_receipt_hash: String,
+    pub(crate) target_directory_document_hash: String,
+    pub(crate) target_assignment_root: String,
+    pub(crate) target_placement_root: String,
+    pub(crate) identity_map_root: String,
+    pub(crate) production_origin_root: String,
+    pub(crate) global_conservation_root: String,
+    pub(crate) normalized_gameplay_root: String,
+    pub(crate) cell_count: u64,
+    pub(crate) cell_set_root: String,
+    pub(crate) prepared_install_head_hash: String,
 }
 
 impl Protocol19PreparedInstallHeadV1 {
@@ -218,6 +247,30 @@ impl Protocol19PreparedInstallHeadV1 {
         }
         Ok(head)
     }
+
+    fn summary(&self) -> Result<Protocol19PreparedInstallSummary, Protocol19InstallError> {
+        let world_seed = self.world_seed.parse::<u64>().map_err(|_| {
+            Protocol19InstallError::Invalid("prepared world seed is not canonical".into())
+        })?;
+        Ok(Protocol19PreparedInstallSummary {
+            compatibility: self.compatibility.clone(),
+            universe_id: self.universe_id.clone(),
+            world_seed,
+            target_manifest_hash: self.target_manifest_hash.clone(),
+            migration_anchor_hash: self.migration_anchor_hash.clone(),
+            migration_receipt_hash: self.migration_receipt_hash.clone(),
+            target_directory_document_hash: self.target_directory_document_hash.clone(),
+            target_assignment_root: self.target_assignment_root.clone(),
+            target_placement_root: self.target_placement_root.clone(),
+            identity_map_root: self.identity_map_root.clone(),
+            production_origin_root: self.production_origin_root.clone(),
+            global_conservation_root: self.global_conservation_root.clone(),
+            normalized_gameplay_root: self.normalized_gameplay_root.clone(),
+            cell_count: self.cell_count,
+            cell_set_root: self.cell_set_root.clone(),
+            prepared_install_head_hash: self.head_hash.clone(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -262,6 +315,7 @@ pub(crate) enum Protocol19InstallError {
 #[derive(Debug)]
 pub(crate) struct PreparedProtocol19World<'migration, 'source> {
     head: Protocol19PreparedInstallHeadV1,
+    universe_root: PathBuf,
     _directory: DraftCellDirectoryHistoryStoreV3,
     _cells: Vec<DraftWorld21Store>,
     _install_lock: File,
@@ -280,6 +334,35 @@ impl PreparedProtocol19World<'_, '_> {
     pub(crate) const fn cell_count(&self) -> u64 {
         self.head.cell_count
     }
+
+    pub(crate) fn summary(
+        &self,
+    ) -> Result<Protocol19PreparedInstallSummary, Protocol19InstallError> {
+        self.head.summary()
+    }
+
+    pub(crate) fn universe_root(&self) -> &Path {
+        &self.universe_root
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct OpenedProtocol19PreparedInstall {
+    summary: Protocol19PreparedInstallSummary,
+    receipt: CanonicalProtocol19MigrationReceiptEvidence,
+    _directory: DraftCellDirectoryHistoryStoreV3,
+    _cells: Vec<DraftWorld21Store>,
+    _install_lock: File,
+}
+
+impl OpenedProtocol19PreparedInstall {
+    pub(crate) fn summary(&self) -> &Protocol19PreparedInstallSummary {
+        &self.summary
+    }
+
+    pub(crate) fn receipt(&self) -> &CanonicalProtocol19MigrationReceiptEvidence {
+        &self.receipt
+    }
 }
 
 pub(crate) fn prepare_or_recover<'migration, 'source>(
@@ -287,6 +370,178 @@ pub(crate) fn prepare_or_recover<'migration, 'source>(
     manifest: &ValidatedUniverseManifestV5,
 ) -> Result<PreparedProtocol19World<'migration, 'source>, Protocol19InstallError> {
     prepare_or_recover_with_failpoint(transform, manifest, None)
+}
+
+pub(crate) fn open_from_active_head(
+    universe_root: impl AsRef<Path>,
+    expected_prepared_head_hash: &str,
+) -> Result<OpenedProtocol19PreparedInstall, Protocol19InstallError> {
+    let universe_root = universe_root.as_ref();
+    let install_root = universe_root.join(INSTALL_DIRECTORY);
+    let metadata =
+        fs::symlink_metadata(&install_root).map_err(|source| io_error(&install_root, source))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(Protocol19InstallError::Invalid(
+            "active head selects a non-directory prepared-install namespace".into(),
+        ));
+    }
+    let install_lock = acquire_install_lock(&install_root, false)?;
+    validate_install_file_set(&install_root)?;
+    let head = Protocol19PreparedInstallHeadV1::decode_canonical(&read_bounded(
+        &install_root.join(INSTALL_HEAD_FILE),
+        MAX_INSTALL_HEAD_BYTES,
+    )?)?;
+    if head.head_hash != expected_prepared_head_hash {
+        return Err(Protocol19InstallError::Invalid(
+            "prepared-install head differs from the active global head".into(),
+        ));
+    }
+    let summary = head.summary()?;
+    let receipt_bytes = read_bounded(&install_root.join(RECEIPT_FILE), MAX_INSTALL_ARTIFACT_BYTES)?;
+    let receipt = recover_canonical_migration_receipt(&receipt_bytes)?;
+    validate_receipt_against_head(&receipt, &head)?;
+
+    let source_archive = read_bounded(
+        &install_root.join(SOURCE_DIRECTORY_ARCHIVE_FILE),
+        MAX_INSTALL_ARTIFACT_BYTES,
+    )?;
+    if hash_source_directory_archive(&source_archive) != receipt.source_directory_archive_hash {
+        return Err(Protocol19InstallError::Invalid(
+            "source directory archive differs from the active receipt".into(),
+        ));
+    }
+
+    let cell_ids = head
+        .cells
+        .iter()
+        .map(|cell| cell.cell_id.clone())
+        .collect::<BTreeSet<_>>();
+    let identity_bytes = read_bounded(
+        &install_root.join(IDENTITY_MAP_FILE),
+        MAX_INSTALL_ARTIFACT_BYTES,
+    )?;
+    let identity_root = recover_identity_map_root(&identity_bytes, &head.universe_id, &cell_ids)
+        .map_err(|source| Protocol19InstallError::Invalid(source.to_string()))?;
+    let production_bytes = read_bounded(
+        &install_root.join(PRODUCTION_ORIGIN_FILE),
+        MAX_INSTALL_ARTIFACT_BYTES,
+    )?;
+    let production_root =
+        recover_production_origin_root(&production_bytes, &head.universe_id, &cell_ids)
+            .map_err(|source| Protocol19InstallError::Invalid(source.to_string()))?;
+    if identity_root != head.identity_map_root || production_root != head.production_origin_root {
+        return Err(Protocol19InstallError::Invalid(
+            "identity or production artifact differs from the active head".into(),
+        ));
+    }
+
+    let manifest_bytes = read_bounded(
+        &install_root.join(TARGET_MANIFEST_FILE),
+        MAX_INSTALL_ARTIFACT_BYTES,
+    )?;
+    let manifest = crate::manifest_v5::decode_manifest_v5(&manifest_bytes, summary.world_seed)
+        .map_err(|source| Protocol19InstallError::Invalid(source.to_string()))?;
+    if manifest.universe_id() != head.universe_id
+        || manifest.manifest_hash() != head.target_manifest_hash
+    {
+        return Err(Protocol19InstallError::Invalid(
+            "manifest artifact differs from the active head".into(),
+        ));
+    }
+
+    let directory_document_bytes = read_bounded(
+        &install_root.join(TARGET_DIRECTORY_FILE),
+        MAX_INSTALL_ARTIFACT_BYTES,
+    )?;
+    let directory_history_bytes = read_bounded(
+        &install_root.join(TARGET_DIRECTORY_HISTORY_FILE),
+        MAX_INSTALL_ARTIFACT_BYTES,
+    )?;
+    let directory = DraftCellDirectoryHistoryStoreV3::open_from_active_head(
+        universe_root,
+        ActiveDirectoryV3Expectation {
+            universe_id: &head.universe_id,
+            manifest_hash: &head.target_manifest_hash,
+            revision: head.target_directory_revision,
+            document_hash: &head.target_directory_document_hash,
+            history_entry_hash: &head.target_directory_history_entry_hash,
+            assignment_root: &head.target_assignment_root,
+            placement_root: &head.target_placement_root,
+            document_bytes: &directory_document_bytes,
+            history_entry_bytes: &directory_history_bytes,
+        },
+    )?;
+
+    let mut cells = Vec::with_capacity(head.cells.len());
+    for (expected, receipt_cell) in head.cells.iter().zip(&receipt.target_cells) {
+        cells.push(DraftWorld21Store::open_from_active_head(
+            universe_root.join("cells").join(&expected.cell_id),
+            &manifest,
+            &head.migration_anchor_hash,
+            expected,
+            &receipt_cell.production_origin_root,
+            &receipt_cell.identity_subset_root,
+        )?);
+    }
+    validate_exact_cell_namespace_ids(universe_root, &cell_ids)?;
+    Ok(OpenedProtocol19PreparedInstall {
+        summary,
+        receipt,
+        _directory: directory,
+        _cells: cells,
+        _install_lock: install_lock,
+    })
+}
+
+fn validate_receipt_against_head(
+    receipt: &CanonicalProtocol19MigrationReceiptEvidence,
+    head: &Protocol19PreparedInstallHeadV1,
+) -> Result<(), Protocol19InstallError> {
+    if receipt.universe_id != head.universe_id
+        || receipt.world_seed.to_string() != head.world_seed
+        || receipt.target_manifest_hash != head.target_manifest_hash
+        || receipt.migration_anchor_hash != head.migration_anchor_hash
+        || receipt.migration_receipt_hash != head.migration_receipt_hash
+        || receipt.source_directory_archive_hash != head.source_directory_archive_hash
+        || receipt.identity_map_root != head.identity_map_root
+        || receipt.production_origin_root != head.production_origin_root
+        || receipt.target_directory_revision != head.target_directory_revision
+        || receipt.target_directory_document_hash != head.target_directory_document_hash
+        || receipt.target_directory_history_entry_hash != head.target_directory_history_entry_hash
+        || receipt.target_assignment_root != head.target_assignment_root
+        || receipt.target_placement_root != head.target_placement_root
+        || receipt.global_conservation_root != head.global_conservation_root
+        || receipt.normalized_gameplay_root != head.normalized_gameplay_root
+        || receipt.cell_count != head.cell_count
+    {
+        return Err(Protocol19InstallError::Invalid(
+            "migration receipt differs from the prepared-install head".into(),
+        ));
+    }
+    if receipt.target_cells.len() != head.cells.len()
+        || receipt
+            .target_cells
+            .iter()
+            .zip(&head.cells)
+            .any(|(receipt_cell, prepared_cell)| {
+                receipt_cell.cell_key != prepared_cell.cell_key
+                    || receipt_cell.cell_id != prepared_cell.cell_id
+                    || receipt_cell.migration_anchor_hash != head.migration_anchor_hash
+                    || receipt_cell.snapshot_state_hash != prepared_cell.snapshot_state_hash
+                    || receipt_cell.active_world_hash != prepared_cell.active_world_hash
+                    || receipt_cell.lifecycle_record_hash != prepared_cell.lifecycle_record_hash
+                    || receipt_cell.event17_genesis_sequence != receipt_cell.legacy_event_sequence
+                    || receipt_cell.event17_predecessor_hash != receipt_cell.legacy_event_head_hash
+                    || receipt_cell.event17_journal_entry_count != 0
+                    || !receipt_cell.event17_journal_head_hash.is_empty()
+                    || prepared_cell.migration_receipt_hash != receipt.migration_receipt_hash
+            })
+    {
+        return Err(Protocol19InstallError::Invalid(
+            "migration receipt cell commitments differ from the prepared-install head".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn prepare_or_recover_with_failpoint<'migration, 'source>(
@@ -393,6 +648,7 @@ fn prepare_or_recover_with_failpoint<'migration, 'source>(
     };
     Ok(PreparedProtocol19World {
         head,
+        universe_root: universe_root.to_owned(),
         _directory: directory,
         _cells: stores,
         _install_lock: install_lock,
@@ -598,6 +854,37 @@ fn validate_exact_cell_namespaces(
     Ok(())
 }
 
+fn validate_exact_cell_namespace_ids(
+    universe_root: &Path,
+    expected: &BTreeSet<String>,
+) -> Result<(), Protocol19InstallError> {
+    let cells_root = universe_root.join("cells");
+    let mut observed = BTreeSet::new();
+    for entry in fs::read_dir(&cells_root).map_err(|source| io_error(&cells_root, source))? {
+        let entry = entry.map_err(|source| io_error(&cells_root, source))?;
+        if !entry
+            .file_type()
+            .map_err(|source| io_error(entry.path(), source))?
+            .is_dir()
+        {
+            continue;
+        }
+        if DraftWorld21Store::namespace_exists(entry.path())? {
+            observed.insert(entry.file_name().into_string().map_err(|_| {
+                Protocol19InstallError::Invalid(
+                    "world-21 cell namespace has a non-UTF-8 route".into(),
+                )
+            })?);
+        }
+    }
+    if &observed != expected {
+        return Err(Protocol19InstallError::Invalid(
+            "world-21 namespaces are not the exact active-head cell set".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn persist_head(
     root: &Path,
     bytes: &[u8],
@@ -760,6 +1047,60 @@ fn io_error(path: impl AsRef<Path>, source: std::io::Error) -> Protocol19Install
 }
 
 #[cfg(test)]
+pub(crate) fn initialize_frozen_protocol18_fixture_for_test(root: &Path, with_event: bool) {
+    let manifest = crate::celestial::universe_manifest(
+        8_119,
+        crate::WORLD_SCHEMA_VERSION,
+        crate::EVENT_SCHEMA_VERSION,
+    )
+    .expect("source manifest builds");
+    let cell_keys = crate::proof_cell_keys().expect("proof cells derive");
+    let mut directory = crate::LocalCellDirectory::open(root, &manifest, cell_keys.clone())
+        .expect("source directory initializes");
+    for (index, cell_key) in cell_keys.into_iter().enumerate() {
+        let prior = directory
+            .assignment(&cell_key)
+            .expect("source assignment exists")
+            .clone();
+        let holder = format!("prepared-install-fixture-{index}");
+        let cell_root = directory
+            .cell_store_root(&cell_key)
+            .expect("source cell route derives");
+        let mut runtime =
+            crate::Runtime::open_directory_managed_for_cell(cell_root, 8_119, cell_key.clone(), 1)
+                .expect("source cell initializes");
+        let assignment = directory
+            .claim(
+                &cell_key,
+                prior.assignment_generation,
+                &holder,
+                runtime.state().fencing_token,
+            )
+            .expect("source cell claims");
+        if with_event && index == 0 {
+            runtime
+                .execute_next_for_fixture(&verse_protocol::ClientMessage::SetSuitMode {
+                    operation_sequence: 0,
+                    operation_id: "prepared-install-source-event".into(),
+                    helmet_closed: false,
+                    jetpack_enabled: true,
+                    magnetic_boots_enabled: false,
+                })
+                .expect("source event commits");
+        }
+        assert_eq!(
+            runtime
+                .drain_to_background_or_sleeping()
+                .expect("source cell drains"),
+            crate::LifecycleMode::Sleeping
+        );
+        directory
+            .release(&cell_key, assignment.assignment_generation, &holder)
+            .expect("source cell releases");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
     use std::fs;
@@ -768,7 +1109,7 @@ mod tests {
     use std::process::Command;
 
     use tempfile::{TempDir, tempdir};
-    use verse_protocol::{CellCoordinate, CellKeyV1, ClientMessage, SectorCoordinate};
+    use verse_protocol::{CellCoordinate, CellKeyV1, SectorCoordinate};
 
     use super::*;
     use crate::grid_handoff_v2::migration_transform::ValidatedProtocol19MigrationTransform;
@@ -789,57 +1130,7 @@ mod tests {
     }
 
     fn initialize_frozen_fixture(root: &Path, with_event: bool) {
-        let manifest = crate::celestial::universe_manifest(
-            TEST_SEED,
-            crate::WORLD_SCHEMA_VERSION,
-            crate::EVENT_SCHEMA_VERSION,
-        )
-        .expect("source manifest builds");
-        let cell_keys = crate::proof_cell_keys().expect("proof cells derive");
-        let mut directory = LocalCellDirectory::open(root, &manifest, cell_keys.clone())
-            .expect("source directory initializes");
-        for (index, cell_key) in cell_keys.into_iter().enumerate() {
-            let prior = directory
-                .assignment(&cell_key)
-                .expect("source assignment exists")
-                .clone();
-            let holder = format!("prepared-install-fixture-{index}");
-            let cell_root = directory
-                .cell_store_root(&cell_key)
-                .expect("source cell route derives");
-            let mut runtime =
-                Runtime::open_directory_managed_for_cell(cell_root, TEST_SEED, cell_key.clone(), 1)
-                    .expect("source cell initializes");
-            let assignment = directory
-                .claim(
-                    &cell_key,
-                    prior.assignment_generation,
-                    &holder,
-                    runtime.state().fencing_token,
-                )
-                .expect("source cell claims");
-            if with_event && index == 0 {
-                runtime
-                    .execute_next_for_fixture(&ClientMessage::SetSuitMode {
-                        operation_sequence: 0,
-                        operation_id: "prepared-install-source-event".into(),
-                        helmet_closed: false,
-                        jetpack_enabled: true,
-                        magnetic_boots_enabled: false,
-                    })
-                    .expect("source event commits");
-            }
-            assert_eq!(
-                runtime
-                    .drain_to_background_or_sleeping()
-                    .expect("source cell drains"),
-                LifecycleMode::Sleeping
-            );
-            directory
-                .release(&cell_key, assignment.assignment_generation, &holder)
-                .expect("source cell releases");
-        }
-        drop(directory);
+        initialize_frozen_protocol18_fixture_for_test(root, with_event);
     }
 
     fn finalized_transfer_fixture() -> TempDir {
@@ -1125,6 +1416,36 @@ mod tests {
             Protocol19PreparedInstallHeadV1::decode_canonical(&bytes).expect("head decodes"),
             head
         );
+    }
+
+    #[test]
+    fn prepared_cell_commitments_must_match_the_canonical_receipt() {
+        let root = frozen_fixture(true);
+        let source = ValidatedFrozenProtocol18Source::acquire_existing(root.path(), TEST_SEED)
+            .expect("source freezes");
+        let manifest = crate::manifest_v5::build_validated_manifest_v5(TEST_SEED)
+            .expect("target manifest builds");
+        let transform = ValidatedProtocol19MigrationTransform::derive(&source, &manifest)
+            .expect("target transform derives");
+        drop(prepare_or_recover(&transform, &manifest).expect("world prepares"));
+        let install_root = root.path().join(INSTALL_DIRECTORY);
+        let receipt = recover_canonical_migration_receipt(
+            &fs::read(install_root.join(RECEIPT_FILE)).expect("receipt reads"),
+        )
+        .expect("receipt recovers");
+        let mut head = Protocol19PreparedInstallHeadV1::decode_canonical(
+            &fs::read(install_root.join(INSTALL_HEAD_FILE)).expect("head reads"),
+        )
+        .expect("head decodes");
+        validate_receipt_against_head(&receipt, &head).expect("original bindings match");
+
+        head.cells[0].snapshot_state_hash = "b".repeat(64);
+        head.cell_set_root =
+            hash_json(INSTALL_CELL_SET_HASH_DOMAIN, &head.cells).expect("cell set reseals");
+        head.head_hash = head.calculate_hash().expect("head reseals");
+        head.validate()
+            .expect("mutated head remains internally valid");
+        assert!(validate_receipt_against_head(&receipt, &head).is_err());
     }
 
     #[test]

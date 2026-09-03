@@ -694,6 +694,8 @@ impl LocalCellDirectory {
         universe_manifest: &UniverseManifestSnapshot,
         proof_cells: impl IntoIterator<Item = CellKeyV1>,
     ) -> Result<Self, CellDirectoryError> {
+        crate::protocol19_activation::ensure_legacy_protocol_not_activated(root.as_ref())
+            .map_err(CellDirectoryError::InvalidDirectory)?;
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root).map_err(|source| io_error(&root, source))?;
         let lock_path = root.join(DIRECTORY_LOCK_FILE);
@@ -711,6 +713,8 @@ impl LocalCellDirectory {
                 io_error(&lock_path, source)
             }
         })?;
+        crate::protocol19_activation::ensure_legacy_protocol_not_activated(&root)
+            .map_err(CellDirectoryError::InvalidDirectory)?;
 
         let expected_assignments = canonical_assignments(universe_manifest, proof_cells)?;
         let directory_path = root.join(DIRECTORY_FILE);

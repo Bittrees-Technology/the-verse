@@ -698,6 +698,8 @@ impl Store {
         cell_key: CellKeyV1,
         clock: Arc<dyn TrustedClock>,
     ) -> Result<Self, PersistenceError> {
+        crate::protocol19_activation::ensure_legacy_protocol_not_activated(root.as_ref())
+            .map_err(PersistenceError::InvalidRuntimeUniverseManifest)?;
         celestial::validate_cell_key(&cell_key)
             .map_err(|source| PersistenceError::InvalidCellIdentity(source.to_string()))?;
         let cell_id = celestial::cell_id(&cell_key)
@@ -720,6 +722,8 @@ impl Store {
                 io_error(&lock_path, source)
             }
         })?;
+        crate::protocol19_activation::ensure_legacy_protocol_not_activated(&root)
+            .map_err(PersistenceError::InvalidRuntimeUniverseManifest)?;
 
         let manifest_path = root.join(MANIFEST_FILE);
         let runtime_manifest = celestial::universe_manifest(
