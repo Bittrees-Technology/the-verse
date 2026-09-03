@@ -1691,6 +1691,49 @@ func _test_render_interpolation_and_grounded_pitch_prediction() -> void:
 		"grounded view pitch interpolates fixed steps"
 	)
 
+	var replay_client := _new_client()
+	var forward_control := {
+		"linear_input": Vector3(0.0, 0.0, -1.0),
+		"angular_input": Vector3.ZERO,
+		"boost": false,
+		"jump": false,
+		"dampeners": true,
+	}
+	replay_client.set("current_prediction_input_sequence", 1)
+	replay_client.call("_capture_prediction_presentation_step")
+	replay_client.call("_predict_player_step", forward_control, FIXED_DELTA, true)
+	var first_replayed_position: Vector3 = replay_client.get("predicted_position")
+	replay_client.call("_capture_prediction_presentation_step")
+	replay_client.call("_predict_player_step", forward_control, FIXED_DELTA, true)
+	var second_replayed_position: Vector3 = replay_client.get("predicted_position")
+	var replay_fraction := clampf(Engine.get_physics_interpolation_fraction(), 0.0, 1.0)
+	var rendered_position := first_replayed_position.lerp(
+		second_replayed_position, replay_fraction
+	)
+	var replay_camera: Camera3D = replay_client.get("camera")
+	var eye_offset: Vector3 = replay_client.call(
+		"_prediction_camera_eye_offset", Quaternion.IDENTITY
+	)
+	replay_camera.position = rendered_position + eye_offset
+	var replay_authority := _player_from_motion({}, 1, 0)
+	replay_client.call(
+		"_apply_authoritative_player", replay_authority, 0, 1, "irregular", "motion_state"
+	)
+	_check(
+		(replay_client.get("previous_predicted_position") as Vector3).is_equal_approx(
+			first_replayed_position
+		)
+		and (replay_client.get("predicted_position") as Vector3).is_equal_approx(
+			second_replayed_position
+		),
+		"irregular authority preserves the final replay interpolation span",
+	)
+	_check(
+		(replay_client.get("presentation_position_offset") as Vector3).length() < 0.0001,
+		"ordinary fixed-step interpolation is not accumulated as reconciliation error",
+	)
+	replay_client.free()
+
 	var grounded := _base_player()
 	grounded["jetpack_enabled"] = false
 	grounded["locomotion"] = {

@@ -3402,7 +3402,7 @@ func _apply_authoritative_player(
 		or incoming_epoch != movement_epoch
 		or source == "reconnect"
 	)
-	var old_present_position := camera.position - last_presented_eye_offset
+	var old_present_camera_position := camera.position
 	var old_present_orientation := camera.quaternion
 	var old_history := prediction_history.duplicate(true)
 	var old_predicted_simulation_tick := predicted_simulation_tick
@@ -3440,6 +3440,7 @@ func _apply_authoritative_player(
 		) > incoming_ack:
 			remaining_controls.append(pending)
 	pending_controls = remaining_controls
+	var replayed_prediction_span := false
 	if lifecycle_reset:
 		prediction_history.clear()
 		pending_controls.clear()
@@ -3481,16 +3482,28 @@ func _apply_authoritative_player(
 		while replay_frames.size() > PREDICTION_HISTORY_LIMIT:
 			replay_frames.pop_front()
 		for frame in replay_frames:
+			_capture_prediction_presentation_step()
 			current_prediction_input_sequence = int(frame.get("input_sequence", incoming_ack))
 			_predict_player_step(frame.get("control", _neutral_player_control()), CHARACTER_FIXED_DELTA, true)
+			replayed_prediction_span = true
 		if pending_controls.is_empty():
 			desired_dampeners = bool(player.get("dampeners", true))
 		desired_magnetic_boots = bool(incoming_locomotion.get("magnetic_boots_enabled", false))
 
-	var correction_distance := old_present_position.distance_to(predicted_position)
-	var target_view_orientation := _predicted_player_view_orientation(
-		predicted_orientation, incoming_locomotion
+	if not replayed_prediction_span:
+		_reset_prediction_presentation_baseline()
+	var interpolation_fraction := clampf(
+		Engine.get_physics_interpolation_fraction(), 0.0, 1.0
 	)
+	var target_render_position := _interpolated_prediction_position(interpolation_fraction)
+	var target_render_orientation := _interpolated_prediction_orientation(interpolation_fraction)
+	var target_render_pitch := _interpolated_prediction_view_pitch(interpolation_fraction)
+	var target_view_orientation := _view_orientation(
+		target_render_orientation, incoming_locomotion, target_render_pitch
+	)
+	var target_eye_offset := _prediction_camera_eye_offset(target_render_orientation)
+	var target_camera_position := target_render_position + target_eye_offset
+	var correction_distance := old_present_camera_position.distance_to(target_camera_position)
 	var correction_angle := _quaternion_angular_distance(
 		old_present_orientation, target_view_orientation
 	)
@@ -3499,15 +3512,18 @@ func _apply_authoritative_player(
 	):
 		presentation_position_offset = Vector3.ZERO
 		presentation_orientation_offset = Quaternion.IDENTITY
-		last_presented_eye_offset = _prediction_camera_eye_offset(predicted_orientation)
-		camera.position = predicted_position + last_presented_eye_offset
+		last_presented_eye_offset = target_eye_offset
+		camera.position = target_camera_position
 		camera.quaternion = target_view_orientation
 	else:
-		presentation_position_offset = old_present_position - predicted_position
+		# Preserve the exact rendered camera pose across reconciliation. Comparing
+		# against the interpolated replay span avoids turning the ordinary one-tick
+		# render delay into a correction every time an irregular update arrives.
+		presentation_position_offset = old_present_camera_position - target_camera_position
 		presentation_orientation_offset = (
 			old_present_orientation * target_view_orientation.inverse()
 		).normalized()
-	_reset_prediction_presentation_baseline()
+		last_presented_eye_offset = target_eye_offset
 
 	authoritative_player_ready = true
 	awaiting_reconnect_baseline = false
