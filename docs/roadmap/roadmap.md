@@ -203,8 +203,14 @@ last. Absence of that head grants no installed authority; presence requires the
 exact receipt, directory, artifact set, cell set, immutable lifecycle records,
 and retained event-16 frontiers. Process-failure tests cover every universe
 boundary, and foreign, missing, extra, swapped, or independently valid but
-source-mismatched material fails closed. Coordinated activation, signatures,
-and the runtime scheduler/wake path remain later P1.8 gates.
+source-mismatched material fails closed. The signed activation gate now
+requires two of three externally anchored Ed25519 signers to bind the exact
+prepared receipt and roots, commits one global head last, fences updated legacy
+startup, and reopens only the head-selected directory and cells. The offline
+operator tool and worker readiness mode exercise the same verified boot while
+keeping gameplay admission closed. Directory-v3 lease transitions,
+lifecycle-v2 scheduling, ordinary event-17 gameplay, and the coordinated
+projection/verifier/client cutover remain subsequent P1.8 gates.
 
 P1.5 acceptance requires:
 

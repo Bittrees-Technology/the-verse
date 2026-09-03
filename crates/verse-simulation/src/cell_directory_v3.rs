@@ -929,6 +929,19 @@ pub(super) struct DraftCellDirectoryHistoryStoreV3 {
     failpoint: Option<DraftDirectoryHistoryFailpointV3>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ActiveDirectoryV3Expectation<'a> {
+    pub(crate) universe_id: &'a str,
+    pub(crate) manifest_hash: &'a str,
+    pub(crate) revision: u64,
+    pub(crate) document_hash: &'a str,
+    pub(crate) history_entry_hash: &'a str,
+    pub(crate) assignment_root: &'a str,
+    pub(crate) placement_root: &'a str,
+    pub(crate) document_bytes: &'a [u8],
+    pub(crate) history_entry_bytes: &'a [u8],
+}
+
 impl DraftCellDirectoryHistoryStoreV3 {
     fn open_or_initialize(
         base_root: impl AsRef<Path>,
@@ -1134,6 +1147,104 @@ impl DraftCellDirectoryHistoryStoreV3 {
             #[cfg(test)]
             failpoint: None,
         })
+    }
+
+    pub(crate) fn open_from_active_head(
+        base_root: impl AsRef<Path>,
+        expected: ActiveDirectoryV3Expectation<'_>,
+    ) -> Result<Self, CellDirectoryError> {
+        let base_root = base_root.as_ref();
+        let root = base_root.join(DRAFT_DIRECTORY_HISTORY_SUBDIRECTORY);
+        let metadata = fs::symlink_metadata(&root).map_err(|source| io_error_v3(&root, source))?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(invalid(
+                "active head selects a non-directory directory-v3 namespace",
+            ));
+        }
+        let lock_file = lock_history_writer_v3(&root, false)?;
+        let head_path = root.join(DRAFT_DIRECTORY_HISTORY_HEAD_FILE);
+        let history_path = root.join(DRAFT_DIRECTORY_HISTORY_FILE);
+        let head = read_history_head_v3(&head_path)?;
+        head.validate_identity(expected.universe_id, expected.manifest_hash)?;
+        let history_entry =
+            DraftDirectoryHistoryEntryV3::decode_canonical(expected.history_entry_bytes)?;
+        let current = history_entry.document.clone();
+        current.validate()?;
+        let canonical_document = serde_json::to_vec(&current)
+            .map_err(|source| invalid(format!("directory-v3 document cannot encode: {source}")))?;
+        let mut expected_history = expected.history_entry_bytes.to_vec();
+        expected_history.push(b'\n');
+        let read_file =
+            File::open(&history_path).map_err(|source| io_error_v3(&history_path, source))?;
+        let reported_length = read_file
+            .metadata()
+            .map_err(|source| io_error_v3(&history_path, source))?
+            .len();
+        if reported_length > MAX_DRAFT_DIRECTORY_HISTORY_BYTES {
+            return Err(invalid("v3 directory history exceeds its byte bound"));
+        }
+        let mut history_bytes = Vec::with_capacity(usize::try_from(reported_length).unwrap_or(0));
+        read_file
+            .take(MAX_DRAFT_DIRECTORY_HISTORY_BYTES + 1)
+            .read_to_end(&mut history_bytes)
+            .map_err(|source| io_error_v3(&history_path, source))?;
+        let history_length = u64::try_from(history_bytes.len())
+            .map_err(|_| invalid("directory-v3 history length overflowed"))?;
+        if history_bytes != expected_history || history_length > MAX_DRAFT_DIRECTORY_HISTORY_BYTES {
+            return Err(invalid(
+                "directory-v3 history differs from the exact active-head commitment",
+            ));
+        }
+        let expected_head = DraftDirectoryHistoryHeadV3::from_tip(
+            &DraftDirectoryHistoryHeadV3::empty(&current),
+            &history_entry,
+            history_length,
+        )?;
+        let assignment_root =
+            hash_directory_genesis(MIGRATION_ASSIGNMENT_ROOT_DOMAIN, &current.assignments)?;
+        let placement_root =
+            hash_directory_genesis(MIGRATION_PLACEMENT_ROOT_DOMAIN, &current.placements)?;
+        if head != expected_head
+            || !history_entry.previous_entry_hash.is_empty()
+            || current.directory_revision != expected.revision
+            || current.document_hash != expected.document_hash
+            || assignment_root != expected.assignment_root
+            || placement_root != expected.placement_root
+            || canonical_document != expected.document_bytes
+            || history_entry.document != current
+            || history_entry.entry_hash != expected.history_entry_hash
+        {
+            return Err(invalid(
+                "directory-v3 state differs from the exact active-head commitment",
+            ));
+        }
+        let history_file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&history_path)
+            .map_err(|source| io_error_v3(&history_path, source))?;
+        let index = BTreeMap::from([(
+            current.directory_revision,
+            DraftDirectoryHistoryLocationV3 {
+                offset: 0,
+                line_length: expected.history_entry_bytes.len(),
+                document_hash: current.document_hash.clone(),
+                entry_hash: history_entry.entry_hash.clone(),
+            },
+        )]);
+        let store = Self {
+            root,
+            lock_file,
+            history_file,
+            head,
+            current: Some(current),
+            index,
+            poisoned: false,
+            #[cfg(test)]
+            failpoint: None,
+        };
+        store.validate_genesis_file_set()?;
+        Ok(store)
     }
 
     pub(crate) fn validate_genesis_file_set(&self) -> Result<(), CellDirectoryError> {

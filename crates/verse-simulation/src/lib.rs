@@ -18,6 +18,7 @@ mod manifest_v5;
 mod model;
 mod persistence;
 mod projection;
+mod protocol19_activation;
 #[allow(dead_code)]
 mod protocol19_install;
 #[allow(dead_code)]
@@ -65,6 +66,14 @@ pub use persistence::{CellLifecycleStatus, LifecycleMode, PersistenceError, Stor
 pub use projection::{
     InterestEntityIdentity, InterestObserver, InterestProjectionState, ProjectedInterestFrame,
     ProjectionError, ProjectionSource,
+};
+pub use protocol19_activation::{
+    ACTIVE_PROTOCOL_HEAD_FILE, ActivatedProtocol19World, Protocol19ActivatedWorldSummary,
+    Protocol19ActivationAuthorizationV1, Protocol19ActivationError, Protocol19ActivationFailpoint,
+    Protocol19ActivationSignatureV1, Protocol19ActivationTrustPolicy,
+    Protocol19PreparedActivationSummary, SignedProtocol19ActivationAuthorizationV1,
+    activate_protocol19_world, open_activated_protocol19_world, prepare_protocol19_for_activation,
+    protocol19_activation_signer_id, protocol19_is_activated,
 };
 pub use two_cell::{
     CompletedPlayerHandoff, LocalTwoCellRuntime, ResidentPlayerRoute, TwoCellAdvanceOutcome,

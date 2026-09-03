@@ -31,6 +31,50 @@ Each simulation worker exposes:
 
 A cell may be drained and replaced without losing canonical state.
 
+### Protocol-19 activation and verified boot
+
+Protocol-19 activation is an offline, two-of-three signing ceremony. First
+drain every protocol-18 proof cell to Sleeping, finish or abort all transfers,
+stop old workers, and run `verse-world-activation prepare` to emit the exact
+prepared-world summary. Each signer must independently compare its universe
+ID, seed, complete compatibility tuple, receipt, prepared head, manifest,
+directory, cell set, conservation, gameplay, identity, and production roots
+before signing the canonical bounded authorization. Private keys never enter
+the universe directory or ordinary worker configuration.
+
+The signed envelope includes the signers' authorized activation timestamp
+inside its validity window. The tool also requires the host's current trusted
+time to be inside that window, but local mutable storage cannot prove the
+selector was first written then. Until a one-use nonce or timestamp is
+externally anchored, protect every prepared copy, destroy unused signed
+envelopes after the ceremony, and treat an envelope plus its exact prepared
+world as a durable capability.
+
+`verse-world-activation activate` receives canonical policy bytes, an expected
+policy hash from separate operator configuration, and the signed authorization.
+It samples trusted time once, verifies exactly two distinct signatures and every
+prepared binding, persists content-addressed authorization and head records,
+and writes `active-protocol-head-v1.json` last. A process failure before that
+final rename leaves the old world authoritative and permits cleanup of only
+known activation debris. A failure after rename is a committed activation and
+must recover forward.
+
+An activated universe is inspected with `--protocol19-verified-boot`,
+`--protocol19-activation-policy`, and
+`--protocol19-activation-policy-hash`. The worker opens every route from the
+global head, holds all writers, and exposes `/healthz` plus the bounded
+`/api/v1/protocol19/activation` evidence. The response deliberately reports
+`gameplay_session_admission: false` until the complete protocol-19 runtime and
+client tuple ships. Do not route gameplay traffic to this readiness service.
+
+`verse-world-activation verify` performs the same exact-head verification
+without starting a readiness listener. If verified boot fails after
+activation, preserve all files and capture the exact error. Do not delete a
+head, copy a per-cell file, edit JSON, or start a protocol-18 worker. Roll back
+only to a protocol-19-compatible binary that verifies the same global head.
+Returning to protocol 18 requires a separately authorized reverse migration;
+no such path exists in this checkpoint.
+
 ### P1.7 two-cell directory and handoff proof
 
 For a fresh local proof universe, run the worker with

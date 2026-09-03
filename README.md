@@ -235,9 +235,13 @@ frozen directory and canonical mapping artifacts, persists a
 stages or reopens the complete cell set, and writes one universe commit head
 last. Missing, extra, swapped, hybrid, or independently valid material from
 another frozen frontier fails closed; without the global head, partial target
-files grant no installed authority. The bridge remains dormant and unreachable
-from the protocol-18 worker. Explicit offline worker mode, signatures,
-coordinated activation, and the event-17 scheduler/wake path remain required.
+files grant no installed authority. The signed activation checkpoint now adds
+a canonical 2-of-3 authorization, a universe-root head written last,
+forward-only verified restart, protocol-18 startup fencing, an offline
+activation/verification tool, and a fail-closed worker readiness boot that
+derives the complete target only from that head. Interactive protocol-19
+service still requires the directory-v3 lease, lifecycle-v2 scheduler,
+ordinary event-17, projection-5, verifier, and client cutover.
 Production remains
 pinned to protocol 18/directory 2/package 1 until the complete protocol-19
 tuple activates together. Production active-player load, the

@@ -21,6 +21,7 @@ anyhow = "1.0"
 axum = { version = "0.8", features = ["ws"] }
 blake3 = "1.8"
 clap = { version = "4.5", features = ["derive", "env"] }
+ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["std", "fast"] }
 futures-util = "0.3"
 fs2 = "0.4"
 godot = { version = "=0.5.4", features = ["api-4-7"] }

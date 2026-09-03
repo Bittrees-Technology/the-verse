@@ -230,6 +230,35 @@ partial, externally connected, stale, conflicting, or oversized closure fails
 before prepare, and all member placements advance in one directory
 compare-and-swap.
 
+## P1.8 activation incident controls
+
+- One signer cannot activate a universe. Activation requires exactly two
+  distinct strict Ed25519 signatures from the externally anchored three-signer
+  policy; a surplus third signature is noncanonical to prevent removable-
+  signature resealing.
+- The signed payload binds the exact protocol tuple, prepared head, migration
+  receipt and anchor, all global target roots, policy generation, activation
+  generation, nonce, signer-chosen activation timestamp, and bounded validity
+  window.
+- The global active head is the sole commit point and is persisted last. A
+  crash before it leaves no authority; a crash after it recovers forward from
+  the exact content-addressed records.
+- Runtime boot begins from the global head and fails closed on missing,
+  noncanonical, unknown-signer, hybrid, swapped, extra, or altered material.
+  The activation tool rejects a trusted current time outside the signed window;
+  verified restart proves the signer-authorized time was inside that window.
+  It never scans for a plausible cell and never falls back to protocol 18.
+- Production private keys are forbidden in the repository and universe data.
+  Compromise of one signer or one copied world directory is insufficient to
+  authorize changed material.
+- Local mutable storage cannot prove when a selector was first persisted. An
+  attacker holding both an unused signed envelope and its exact prepared world
+  can replay that exact authorization after the window by bypassing the
+  cooperative tool or falsifying the host clock. Until a one-use nonce or
+  timestamp is externally anchored, operators must protect staged copies and
+  destroy unused envelopes; this residual risk does not authorize any changed
+  world material.
+
 ## Security gates
 
 Before public alpha:

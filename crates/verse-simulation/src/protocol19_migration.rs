@@ -413,6 +413,103 @@ impl CanonicalProtocol18To19MigrationReceipt {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CanonicalProtocol19TargetCellEvidence {
+    pub(crate) cell_key: CellKeyV1,
+    pub(crate) cell_id: String,
+    pub(crate) migration_anchor_hash: String,
+    pub(crate) snapshot_state_hash: String,
+    pub(crate) active_world_hash: String,
+    pub(crate) lifecycle_record_hash: String,
+    pub(crate) production_origin_root: String,
+    pub(crate) identity_subset_root: String,
+    pub(crate) legacy_event_sequence: u64,
+    pub(crate) legacy_event_head_hash: String,
+    pub(crate) event17_genesis_sequence: u64,
+    pub(crate) event17_predecessor_hash: String,
+    pub(crate) event17_journal_entry_count: u64,
+    pub(crate) event17_journal_head_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CanonicalProtocol19MigrationReceiptEvidence {
+    pub(crate) universe_id: String,
+    pub(crate) world_seed: u64,
+    pub(crate) trusted_cutoff_unix_ms: u64,
+    pub(crate) target_manifest_hash: String,
+    pub(crate) migration_anchor_hash: String,
+    pub(crate) migration_receipt_hash: String,
+    pub(crate) source_directory_archive_hash: String,
+    pub(crate) identity_map_root: String,
+    pub(crate) production_origin_root: String,
+    pub(crate) target_directory_revision: u64,
+    pub(crate) target_directory_document_hash: String,
+    pub(crate) target_directory_history_entry_hash: String,
+    pub(crate) target_assignment_root: String,
+    pub(crate) target_placement_root: String,
+    pub(crate) target_cells_root: String,
+    pub(crate) global_conservation_root: String,
+    pub(crate) normalized_gameplay_root: String,
+    pub(crate) cell_count: u64,
+    pub(crate) target_cells: Vec<CanonicalProtocol19TargetCellEvidence>,
+}
+
+pub(crate) fn recover_canonical_migration_receipt(
+    bytes: &[u8],
+) -> Result<CanonicalProtocol19MigrationReceiptEvidence, MigrationReceiptError> {
+    let receipt = decode_canonical(bytes)?;
+    let document = receipt.document();
+    let world_seed = document.anchor.world_seed.parse::<u64>().map_err(|_| {
+        MigrationReceiptError::Invalid("migration receipt seed is not canonical".into())
+    })?;
+    Ok(CanonicalProtocol19MigrationReceiptEvidence {
+        universe_id: document.anchor.universe_id.clone(),
+        world_seed,
+        trusted_cutoff_unix_ms: document.anchor.trusted_cutoff_unix_ms,
+        target_manifest_hash: document.anchor.target_manifest_hash.clone(),
+        migration_anchor_hash: document.anchor.anchor_hash.clone(),
+        migration_receipt_hash: document.receipt_hash.clone(),
+        source_directory_archive_hash: document.source_directory_archive_hash.clone(),
+        identity_map_root: document.identity_map_blob_hash.clone(),
+        production_origin_root: document.production_origin_blob_hash.clone(),
+        target_directory_revision: document.target_directory_revision,
+        target_directory_document_hash: document.target_directory_document_hash.clone(),
+        target_directory_history_entry_hash: document.target_directory_history_entry_hash.clone(),
+        target_assignment_root: document.target_assignment_root.clone(),
+        target_placement_root: document.target_placement_root.clone(),
+        target_cells_root: document.target_cells_root.clone(),
+        global_conservation_root: document.target_global_conservation_root.clone(),
+        normalized_gameplay_root: document.target_normalized_gameplay_root.clone(),
+        cell_count: u64::try_from(document.target_cells.len()).map_err(|_| {
+            MigrationReceiptError::Invalid("migration receipt cell count overflowed".into())
+        })?,
+        target_cells: document
+            .target_cells
+            .iter()
+            .map(|cell| CanonicalProtocol19TargetCellEvidence {
+                cell_key: cell.cell_key.clone(),
+                cell_id: cell.cell_id.clone(),
+                migration_anchor_hash: cell.migration_anchor_hash.clone(),
+                snapshot_state_hash: cell.target_world_state_hash.clone(),
+                active_world_hash: cell.target_active_world_hash.clone(),
+                lifecycle_record_hash: cell.target_lifecycle_record_hash.clone(),
+                production_origin_root: cell.production_origin_root.clone(),
+                identity_subset_root: cell.identity_subset_root.clone(),
+                legacy_event_sequence: cell.legacy_event_sequence,
+                legacy_event_head_hash: cell.legacy_event_head_hash.clone(),
+                event17_genesis_sequence: cell.event17_genesis_sequence,
+                event17_predecessor_hash: cell.event17_predecessor_hash.clone(),
+                event17_journal_entry_count: cell.event17_journal_entry_count,
+                event17_journal_head_hash: cell.event17_journal_head_hash.clone(),
+            })
+            .collect(),
+    })
+}
+
+pub(crate) fn hash_source_directory_archive(bytes: &[u8]) -> String {
+    hash_bytes(SOURCE_DIRECTORY_ARCHIVE_HASH_DOMAIN, bytes)
+}
+
 /// Non-Serde source-bound receipt capability. It can only be derived while the
 /// frozen source locks are held by the validated transform, and it borrows the
 /// exact directory-v3 genesis used to construct the receipt.

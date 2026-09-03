@@ -10,6 +10,7 @@ repository.workspace = true
 
 [dependencies]
 blake3.workspace = true
+ed25519-dalek.workspace = true
 fs2.workspace = true
 serde.workspace = true
 serde_json.workspace = true

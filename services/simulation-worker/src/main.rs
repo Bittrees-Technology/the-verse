@@ -1,17 +1,24 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+use std::io::Read;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use axum::{Json, Router, extract::State, routing::get};
 use clap::{Parser, ValueEnum};
+use serde::Serialize;
 use tokio::net::TcpListener;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 use verse_protocol::CellKeyV1;
-use verse_simulation::{LifecycleMode, LocalTwoCellRuntime, Runtime, cell_origin_key};
+use verse_simulation::{
+    ActivatedProtocol19World, LifecycleMode, LocalTwoCellRuntime, Protocol19ActivatedWorldSummary,
+    Protocol19ActivationTrustPolicy, Runtime, cell_origin_key, open_activated_protocol19_world,
+    protocol19_is_activated,
+};
 use verse_simulation_worker::{AppState, router};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -76,6 +83,29 @@ struct Arguments {
     /// sessions through its reconciled coordinator.
     #[arg(long, env = "VERSE_TWO_CELL_UNIVERSE", default_value_t = false)]
     two_cell_universe: bool,
+
+    /// Boot the activated protocol-19 world as a verified readiness service.
+    /// Gameplay admission remains disabled until the protocol-19 runtime tuple
+    /// is implemented.
+    #[arg(long, env = "VERSE_PROTOCOL19_VERIFIED_BOOT", default_value_t = false)]
+    protocol19_verified_boot: bool,
+
+    /// Canonical activation trust-policy JSON. The file is not trusted without
+    /// the separately configured expected hash.
+    #[arg(long, env = "VERSE_PROTOCOL19_ACTIVATION_POLICY")]
+    protocol19_activation_policy: Option<PathBuf>,
+
+    /// Externally anchored BLAKE3 hash of the activation trust policy.
+    #[arg(long, env = "VERSE_PROTOCOL19_ACTIVATION_POLICY_HASH")]
+    protocol19_activation_policy_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct VerifiedProtocol19BootStatus {
+    service: &'static str,
+    status: &'static str,
+    gameplay_session_admission: bool,
+    activation: Protocol19ActivatedWorldSummary,
 }
 
 #[tokio::main]
@@ -93,6 +123,16 @@ async fn main() -> Result<()> {
     if !arguments.bind.ip().is_loopback() {
         bail!(
             "protocol 11 local-development player authentication is restricted to a loopback bind; use 127.0.0.1 or wait for the configured session authority"
+        );
+    }
+    if arguments.protocol19_verified_boot {
+        return run_verified_protocol19_boot(&arguments).await;
+    }
+    if protocol19_is_activated(&arguments.data_directory)
+        .context("failed to determine the active universe protocol")?
+    {
+        bail!(
+            "the universe has an active protocol-19 head; legacy protocol-18 startup is fenced (use --protocol19-verified-boot with the externally anchored policy until interactive protocol-19 service is released)"
         );
     }
     let state = if arguments.two_cell_universe {
@@ -243,6 +283,92 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+async fn run_verified_protocol19_boot(arguments: &Arguments) -> Result<()> {
+    if arguments.pause_simulation
+        || arguments.two_cell_universe
+        || arguments.cell_key_json.is_some()
+        || arguments.genesis_profile != GenesisProfile::Orbital
+    {
+        bail!(
+            "verified protocol-19 boot derives its complete cell set from the active global head and does not accept legacy cell, fixture, player, pause, or two-cell options"
+        );
+    }
+    let policy_path = arguments
+        .protocol19_activation_policy
+        .as_ref()
+        .context("--protocol19-activation-policy is required for verified protocol-19 boot")?;
+    let expected_policy_hash = arguments
+        .protocol19_activation_policy_hash
+        .as_deref()
+        .context("--protocol19-activation-policy-hash is required for verified protocol-19 boot")?;
+    let policy_bytes = read_bounded_policy(policy_path)?;
+    let policy =
+        Protocol19ActivationTrustPolicy::from_canonical_bytes(&policy_bytes, expected_policy_hash)
+            .context("protocol-19 activation policy failed verification")?;
+    let activated = Arc::new(
+        open_activated_protocol19_world(&arguments.data_directory, arguments.world_seed, &policy)
+            .with_context(|| {
+            format!(
+                "failed to boot the active protocol-19 universe at {}",
+                arguments.data_directory.display()
+            )
+        })?,
+    );
+    let listener = TcpListener::bind(arguments.bind)
+        .await
+        .with_context(|| format!("failed to bind {}", arguments.bind))?;
+    info!(
+        address = %arguments.bind,
+        data = %arguments.data_directory.display(),
+        active_head = %activated.summary().active_head_hash,
+        cells = activated.summary().cell_count,
+        gameplay_session_admission = false,
+        "verified protocol-19 universe is ready"
+    );
+    let app = Router::new()
+        .route("/healthz", get(verified_protocol19_status))
+        .route(
+            "/api/v1/protocol19/activation",
+            get(verified_protocol19_status),
+        )
+        .with_state(activated);
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .context("verified protocol-19 readiness server failed")
+}
+
+async fn verified_protocol19_status(
+    State(world): State<Arc<ActivatedProtocol19World>>,
+) -> Json<VerifiedProtocol19BootStatus> {
+    Json(VerifiedProtocol19BootStatus {
+        service: "verse-simulation-worker",
+        status: "verified_activation_ready",
+        gameplay_session_admission: false,
+        activation: world.summary().clone(),
+    })
+}
+
+fn read_bounded_policy(path: &std::path::Path) -> Result<Vec<u8>> {
+    const MAX_POLICY_BYTES: u64 = 64 * 1_024;
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("failed to open activation policy at {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect activation policy at {}", path.display()))?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_POLICY_BYTES {
+        bail!("activation policy is not a bounded nonempty file");
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+    file.take(MAX_POLICY_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read activation policy at {}", path.display()))?;
+    if bytes.is_empty() || u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_POLICY_BYTES {
+        bail!("activation policy changed size or exceeded its bound while reading");
+    }
+    Ok(bytes)
+}
+
 async fn shutdown_signal() {
     let control_c = async {
         tokio::signal::ctrl_c()
@@ -279,6 +405,9 @@ mod tests {
         assert_eq!(arguments.development_players, ["player-remote"]);
         assert!(arguments.cell_key_json.is_none());
         assert_eq!(arguments.genesis_profile, GenesisProfile::Orbital);
+        assert!(!arguments.protocol19_verified_boot);
+        assert!(arguments.protocol19_activation_policy.is_none());
+        assert!(arguments.protocol19_activation_policy_hash.is_none());
         assert!(f64::from(arguments.tick_millis) <= 1_000.0 / 60.0);
     }
 
@@ -290,5 +419,26 @@ mod tests {
             "earth-start",
         ]);
         assert_eq!(arguments.genesis_profile, GenesisProfile::EarthStart);
+    }
+
+    #[test]
+    fn verified_protocol19_boot_requires_explicit_trust_configuration() {
+        let arguments = Arguments::parse_from([
+            "verse-simulation-worker",
+            "--protocol19-verified-boot",
+            "--protocol19-activation-policy",
+            "/operator/policy.json",
+            "--protocol19-activation-policy-hash",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ]);
+        assert!(arguments.protocol19_verified_boot);
+        assert_eq!(
+            arguments.protocol19_activation_policy,
+            Some(PathBuf::from("/operator/policy.json"))
+        );
+        assert_eq!(
+            arguments.protocol19_activation_policy_hash.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
     }
 }

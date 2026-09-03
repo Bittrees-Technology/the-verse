@@ -1100,6 +1100,15 @@ fn validate_identity_blob(
     Ok(blob)
 }
 
+pub(crate) fn recover_identity_map_root(
+    bytes: &[u8],
+    universe_id: &str,
+    cell_ids: &BTreeSet<String>,
+) -> Result<String, Protocol19MigrationTransformError> {
+    let blob = validate_identity_blob(bytes, universe_id, cell_ids)?;
+    hash_json(IDENTITY_MAP_ROOT_DOMAIN, &blob)
+}
+
 fn validate_production_blob(
     bytes: &[u8],
     universe_id: &str,
@@ -1155,6 +1164,15 @@ fn validate_production_blob(
         ));
     }
     Ok(blob)
+}
+
+pub(crate) fn recover_production_origin_root(
+    bytes: &[u8],
+    universe_id: &str,
+    cell_ids: &BTreeSet<String>,
+) -> Result<String, Protocol19MigrationTransformError> {
+    let blob = validate_production_blob(bytes, universe_id, cell_ids)?;
+    hash_json(PRODUCTION_ORIGIN_ROOT_DOMAIN, &blob)
 }
 
 fn validate_blob_projection(

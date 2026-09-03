@@ -162,6 +162,25 @@ These invariants are higher priority than convenience or performance.
   aggregate remains source-authoritative and is never silently split, deleted,
   capped, or assigned two writers.
 
+## P1.8 activation authority
+
+- A prepared protocol-19 world is dormant until two distinct trusted signers
+  authorize its exact receipt, prepared head, compatibility tuple, roots,
+  generation, nonce, and bounded time window under an externally anchored
+  policy hash.
+- The universe-root active-protocol head is written and synchronized last. It
+  is the sole activation commit point; per-cell heads and staged authorization
+  files grant no authority.
+- Protocol-19 restart derives every manifest, directory, cell, and receipt from
+  that global head. Namespace discovery, scalar substitution, hybrid tuples,
+  and silent repair or fallback are forbidden.
+- Before the global head exists, recovery may delete only known activation
+  debris and must preserve the prepared target and frozen source byte for byte.
+  After it exists, recovery is forward-only under protocol 19.
+- An active protocol-19 selector fences protocol-18 startup. Returning to
+  protocol 18 requires a separately authorized reverse migration proving that
+  no protocol-19 work is discarded.
+
 ## Assets
 
 - Every live canonical asset has exactly one owner and one location domain.
