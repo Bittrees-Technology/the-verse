@@ -17,6 +17,7 @@ use thiserror::Error;
 use uuid::Uuid;
 use verse_protocol::protocol_v19::Protocol19CompatibilityTuple;
 
+use crate::cell_directory::{CellAssignmentRecord, CellDirectoryError};
 use crate::grid_handoff_v2::migration_transform::ValidatedProtocol19MigrationTransform;
 use crate::persistence::{SystemTrustedClock, TrustedClock};
 use crate::protocol19_install::{
@@ -68,6 +69,8 @@ pub enum Protocol19ActivationError {
     Injected(Protocol19ActivationFailpoint),
     #[error("protocol-19 prepared installation failed: {0}")]
     Install(String),
+    #[error(transparent)]
+    Directory(#[from] CellDirectoryError),
 }
 
 impl From<Protocol19InstallError> for Protocol19ActivationError {
@@ -391,13 +394,64 @@ pub struct Protocol19ActivatedWorldSummary {
 #[derive(Debug)]
 pub struct ActivatedProtocol19World {
     summary: Protocol19ActivatedWorldSummary,
-    _prepared: OpenedProtocol19PreparedInstall,
+    #[allow(dead_code)] // consumed by the next lifecycle-v2 integration slice
+    prepared: OpenedProtocol19PreparedInstall,
     _activation_lock: File,
 }
 
+#[allow(dead_code)] // authority mutation stays crate-private until lifecycle-v2 coordinates it
 impl ActivatedProtocol19World {
     pub fn summary(&self) -> &Protocol19ActivatedWorldSummary {
         &self.summary
+    }
+
+    /// Returns the exact directory-v3 assignment held under this activated
+    /// universe capability. The active signed head remains the immutable root
+    /// of the directory history.
+    pub(crate) fn cell_assignment(
+        &self,
+        cell_key: &verse_protocol::CellKeyV1,
+    ) -> Result<&CellAssignmentRecord, Protocol19ActivationError> {
+        self.prepared.cell_assignment(cell_key).map_err(Into::into)
+    }
+
+    /// Claims one sleeping cell. The directory derives the successor
+    /// generation and fencing token; the caller supplies neither value.
+    pub(crate) fn claim_cell_authority(
+        &mut self,
+        cell_key: &verse_protocol::CellKeyV1,
+        expected_generation: u64,
+        holder_id: &str,
+    ) -> Result<CellAssignmentRecord, Protocol19ActivationError> {
+        self.prepared
+            .claim_cell_authority(cell_key, expected_generation, holder_id)
+            .map_err(Into::into)
+    }
+
+    /// Replaces the holder of an assigned cell after this process has acquired
+    /// the activated universe's exclusive writer set.
+    pub(crate) fn recover_cell_authority(
+        &mut self,
+        cell_key: &verse_protocol::CellKeyV1,
+        expected_generation: u64,
+        holder_id: &str,
+    ) -> Result<CellAssignmentRecord, Protocol19ActivationError> {
+        self.prepared
+            .recover_cell_authority(cell_key, expected_generation, holder_id)
+            .map_err(Into::into)
+    }
+
+    /// Releases an assigned cell only when the exact generation and holder
+    /// still match and no nonterminal transfer pins the cell.
+    pub(crate) fn release_cell_authority(
+        &mut self,
+        cell_key: &verse_protocol::CellKeyV1,
+        expected_generation: u64,
+        holder_id: &str,
+    ) -> Result<CellAssignmentRecord, Protocol19ActivationError> {
+        self.prepared
+            .release_cell_authority(cell_key, expected_generation, holder_id)
+            .map_err(Into::into)
     }
 }
 
@@ -650,7 +704,7 @@ pub fn open_activated_protocol19_world(
             "active head differs from the configured universe or seed".into(),
         ));
     }
-    let prepared = crate::protocol19_install::open_from_active_head(
+    let validated_prepared = crate::protocol19_install::validate_from_active_head(
         universe_root,
         &head.prepared_install_head_hash,
     )?;
@@ -674,16 +728,16 @@ pub fn open_activated_protocol19_world(
     }
     verify_authorization(
         &signed,
-        prepared.summary(),
+        validated_prepared.summary(),
         policy,
         head.authorized_activation_unix_ms,
     )?;
-    if prepared.receipt().trusted_cutoff_unix_ms > head.authorized_activation_unix_ms {
+    if validated_prepared.receipt().trusted_cutoff_unix_ms > head.authorized_activation_unix_ms {
         return Err(Protocol19ActivationError::Invalid(
             "active head predates the trusted migration cut-off".into(),
         ));
     }
-    validate_head_bindings(&head, prepared.summary(), &signed.authorization)?;
+    validate_head_bindings(&head, validated_prepared.summary(), &signed.authorization)?;
     let history_bytes = read_bounded(
         &activation_root.join(active_head_file_name(&head.head_hash)),
         MAX_ACTIVE_HEAD_BYTES,
@@ -694,10 +748,11 @@ pub fn open_activated_protocol19_world(
         ));
     }
     validate_activation_file_set(&activation_root, &head)?;
+    let prepared = validated_prepared.open()?;
     let summary = active_summary(&head, prepared.summary())?;
     Ok(ActivatedProtocol19World {
         summary,
-        _prepared: prepared,
+        prepared,
         _activation_lock: activation_lock,
     })
 }
@@ -2085,7 +2140,7 @@ mod tests {
     }
 
     #[test]
-    fn committed_authorization_tamper_fails_without_repair() {
+    fn authorization_tamper_blocks_directory_recovery_without_repair() {
         let (root, prepared, policy, keys) = fixture();
         let signed = signed_authorization(
             &prepared,
@@ -2110,15 +2165,31 @@ mod tests {
         let mut changed = fs::read(&authorization_path).expect("authorization reads");
         changed.push(b'\n');
         fs::write(&authorization_path, &changed).expect("test tamper writes");
+        let directory_root = root.path().join("protocol-19-directory-v3");
+        let history_path = directory_root.join("history-v3.ndjson");
+        let head_path = directory_root.join("head-v3.json");
+        let mut changed_history = fs::read(&history_path).expect("directory history reads");
+        changed_history.extend_from_slice(b"{\"torn\":");
+        fs::write(&history_path, &changed_history).expect("torn history suffix writes");
+        let unchanged_head = fs::read(&head_path).expect("directory head reads");
+
         assert!(open_activated_protocol19_world(root.path(), TEST_SEED, &policy).is_err());
         assert_eq!(
             fs::read(&authorization_path).expect("tampered authorization rereads"),
             changed
         );
+        assert_eq!(
+            fs::read(&history_path).expect("rejected directory history rereads"),
+            changed_history
+        );
+        assert_eq!(
+            fs::read(&head_path).expect("rejected directory head rereads"),
+            unchanged_head
+        );
     }
 
     #[test]
-    fn active_directory_torn_suffix_fails_without_repair() {
+    fn active_directory_torn_suffix_recovers_after_signed_prefix_validation() {
         let (root, prepared, policy, keys) = fixture();
         let signed = signed_authorization(
             &prepared,
@@ -2140,14 +2211,17 @@ mod tests {
             .path()
             .join("protocol-19-directory-v3")
             .join("history-v3.ndjson");
-        let mut changed = fs::read(&history_path).expect("directory history reads");
+        let expected = fs::read(&history_path).expect("directory history reads");
+        let mut changed = expected.clone();
         changed.extend_from_slice(b"{\"torn\":");
         fs::write(&history_path, &changed).expect("test tamper writes");
 
-        assert!(open_activated_protocol19_world(root.path(), TEST_SEED, &policy).is_err());
+        let world = open_activated_protocol19_world(root.path(), TEST_SEED, &policy)
+            .expect("a torn suffix outside the signed and headed prefix is recoverable");
+        drop(world);
         assert_eq!(
-            fs::read(&history_path).expect("tampered directory history rereads"),
-            changed
+            fs::read(&history_path).expect("recovered directory history rereads"),
+            expected
         );
     }
 
@@ -2324,5 +2398,136 @@ mod tests {
         drop(held);
         open_activated_protocol19_world(root.path(), TEST_SEED, &policy)
             .expect("released activated world reopens");
+    }
+
+    #[test]
+    fn activated_directory_authority_claim_recovery_and_release_survive_restart() {
+        let (root, prepared, policy, keys) = fixture();
+        let signed = signed_authorization(
+            &prepared,
+            &policy,
+            &keys,
+            &[0, 1],
+            TRUSTED_NOW - 1_000,
+            TRUSTED_NOW + 10_000,
+        );
+        activate_protocol19_world_with_clock(
+            root.path(),
+            TEST_SEED,
+            &policy,
+            &signed,
+            &ManualClock(TRUSTED_NOW),
+        )
+        .expect("world activates");
+
+        let cell_key = crate::cell_origin_key();
+        let mut world = open_activated_protocol19_world(root.path(), TEST_SEED, &policy)
+            .expect("activated world opens");
+        let genesis = world
+            .cell_assignment(&cell_key)
+            .expect("genesis assignment resolves")
+            .clone();
+        assert_eq!(genesis.state, crate::CellAssignmentState::Sleeping);
+        assert!(genesis.holder_id.is_none());
+
+        let claimed = world
+            .claim_cell_authority(&cell_key, genesis.assignment_generation, "worker-v19-a")
+            .expect("sleeping cell claims");
+        assert_eq!(
+            claimed.assignment_generation,
+            genesis.assignment_generation + 1
+        );
+        assert_eq!(
+            claimed.authority_fencing_token,
+            genesis.authority_fencing_token + 1
+        );
+        assert_eq!(claimed.state, crate::CellAssignmentState::Assigned);
+        assert_eq!(claimed.holder_id.as_deref(), Some("worker-v19-a"));
+        assert!(
+            world
+                .recover_cell_authority(&cell_key, genesis.assignment_generation, "worker-v19-a",)
+                .is_err(),
+            "a claim cannot alias a recovery retry"
+        );
+        assert_eq!(
+            world
+                .claim_cell_authority(&cell_key, genesis.assignment_generation, "worker-v19-a")
+                .expect("uncertain claim redelivery is exact"),
+            claimed
+        );
+        assert!(
+            world
+                .claim_cell_authority(&cell_key, genesis.assignment_generation, "worker-v19-b")
+                .is_err(),
+            "another holder cannot alias the committed successor"
+        );
+
+        let recovered = world
+            .recover_cell_authority(&cell_key, claimed.assignment_generation, "worker-v19-b")
+            .expect("successor holder recovers assigned cell");
+        assert_eq!(
+            recovered.assignment_generation,
+            claimed.assignment_generation + 1
+        );
+        assert_eq!(
+            recovered.authority_fencing_token,
+            claimed.authority_fencing_token + 1
+        );
+        assert_eq!(recovered.holder_id.as_deref(), Some("worker-v19-b"));
+        assert!(
+            world
+                .claim_cell_authority(&cell_key, claimed.assignment_generation, "worker-v19-b",)
+                .is_err(),
+            "a recovery cannot alias a claim retry"
+        );
+        assert!(
+            world
+                .release_cell_authority(&cell_key, claimed.assignment_generation, "worker-v19-a",)
+                .is_err(),
+            "the fenced predecessor cannot release its successor"
+        );
+
+        let released = world
+            .release_cell_authority(&cell_key, recovered.assignment_generation, "worker-v19-b")
+            .expect("current holder releases to sleeping");
+        assert_eq!(released.state, crate::CellAssignmentState::Sleeping);
+        assert!(released.holder_id.is_none());
+        assert!(
+            world
+                .release_cell_authority(
+                    &cell_key,
+                    recovered.assignment_generation,
+                    "worker-v19-impostor",
+                )
+                .is_err(),
+            "another holder cannot alias the release retry"
+        );
+        assert_eq!(
+            world
+                .release_cell_authority(&cell_key, recovered.assignment_generation, "worker-v19-b",)
+                .expect("release redelivery is exact"),
+            released
+        );
+        drop(world);
+
+        let mut reopened = open_activated_protocol19_world(root.path(), TEST_SEED, &policy)
+            .expect("active head accepts its validated successor history");
+        assert_eq!(
+            reopened
+                .cell_assignment(&cell_key)
+                .expect("released assignment reopens"),
+            &released
+        );
+        let reclaimed = reopened
+            .claim_cell_authority(&cell_key, released.assignment_generation, "worker-v19-c")
+            .expect("restarted authority advances again");
+        assert_eq!(
+            reclaimed.assignment_generation,
+            released.assignment_generation + 1
+        );
+        assert_eq!(
+            reclaimed.authority_fencing_token,
+            released.authority_fencing_token + 1
+        );
     }
 }

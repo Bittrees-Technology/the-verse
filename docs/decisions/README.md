@@ -28,5 +28,7 @@ ADRs capture durable choices and their consequences.
 | [0022](ADR-0022-durable-single-cell-lifecycle.md) | Fenced durable single-cell lifecycle and background production | Accepted |
 | [0023](ADR-0023-durable-two-cell-handoff.md) | Durable two-cell assignment and atomic mobile-aggregate handoff | Accepted |
 | [0024](ADR-0024-versioned-grid-closure-handoff.md) | Versioned atomic grid-closure handoff | Accepted |
+| [0025](ADR-0025-signed-universe-activation.md) | Signed universe activation and forward-only verified boot | Accepted |
+| [0026](ADR-0026-active-directory-v3-authority.md) | Active directory-v3 cell authority transitions | Accepted |
 
 Status values: Proposed, Accepted, Superseded, Rejected.

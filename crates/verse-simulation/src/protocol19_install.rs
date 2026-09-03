@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Dormant, universe-wide protocol-19 prepared installation.
+//! Universe-wide protocol-19 prepared installation and verified-open bridge.
 //!
 //! Per-cell and directory heads are staging evidence only. The canonical
 //! prepared-install head is written last and is the sole all-cell commit
-//! marker. This module deliberately exposes no activation or runtime path.
+//! marker. Active boot first obtains a read-only validated capability, then
+//! consumes it to open recovery-capable stores only after authorization.
 
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
@@ -16,9 +17,9 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
-use verse_protocol::protocol_v19::Protocol19CompatibilityTuple;
+use verse_protocol::{CellKeyV1, protocol_v19::Protocol19CompatibilityTuple};
 
-use crate::cell_directory::CellDirectoryError;
+use crate::cell_directory::{CellAssignmentRecord, CellDirectoryError};
 use crate::cell_directory_v3::{
     ActiveDirectoryV3Expectation, DraftCellDirectoryHistoryStoreV3,
     ValidatedProtocol19DirectoryGenesis,
@@ -347,10 +348,70 @@ impl PreparedProtocol19World<'_, '_> {
 }
 
 #[derive(Debug)]
+pub(crate) struct ValidatedProtocol19PreparedInstall {
+    universe_root: PathBuf,
+    install_lock: File,
+    head: Protocol19PreparedInstallHeadV1,
+    summary: Protocol19PreparedInstallSummary,
+    receipt: CanonicalProtocol19MigrationReceiptEvidence,
+    manifest: ValidatedUniverseManifestV5,
+    directory_document_bytes: Vec<u8>,
+    directory_history_bytes: Vec<u8>,
+    cell_ids: BTreeSet<String>,
+}
+
+impl ValidatedProtocol19PreparedInstall {
+    pub(crate) fn summary(&self) -> &Protocol19PreparedInstallSummary {
+        &self.summary
+    }
+
+    pub(crate) fn receipt(&self) -> &CanonicalProtocol19MigrationReceiptEvidence {
+        &self.receipt
+    }
+
+    pub(crate) fn open(self) -> Result<OpenedProtocol19PreparedInstall, Protocol19InstallError> {
+        let directory = DraftCellDirectoryHistoryStoreV3::open_from_active_head(
+            &self.universe_root,
+            ActiveDirectoryV3Expectation {
+                universe_id: &self.head.universe_id,
+                manifest_hash: &self.head.target_manifest_hash,
+                revision: self.head.target_directory_revision,
+                document_hash: &self.head.target_directory_document_hash,
+                history_entry_hash: &self.head.target_directory_history_entry_hash,
+                assignment_root: &self.head.target_assignment_root,
+                placement_root: &self.head.target_placement_root,
+                document_bytes: &self.directory_document_bytes,
+                history_entry_bytes: &self.directory_history_bytes,
+            },
+        )?;
+
+        let mut cells = Vec::with_capacity(self.head.cells.len());
+        for (expected, receipt_cell) in self.head.cells.iter().zip(&self.receipt.target_cells) {
+            cells.push(DraftWorld21Store::open_from_active_head(
+                self.universe_root.join("cells").join(&expected.cell_id),
+                &self.manifest,
+                &self.head.migration_anchor_hash,
+                expected,
+                &receipt_cell.production_origin_root,
+                &receipt_cell.identity_subset_root,
+            )?);
+        }
+        validate_exact_cell_namespace_ids(&self.universe_root, &self.cell_ids)?;
+        Ok(OpenedProtocol19PreparedInstall {
+            summary: self.summary,
+            receipt: self.receipt,
+            directory,
+            _cells: cells,
+            _install_lock: self.install_lock,
+        })
+    }
+}
+
+#[derive(Debug)]
 pub(crate) struct OpenedProtocol19PreparedInstall {
     summary: Protocol19PreparedInstallSummary,
     receipt: CanonicalProtocol19MigrationReceiptEvidence,
-    _directory: DraftCellDirectoryHistoryStoreV3,
+    directory: DraftCellDirectoryHistoryStoreV3,
     _cells: Vec<DraftWorld21Store>,
     _install_lock: File,
 }
@@ -363,6 +424,43 @@ impl OpenedProtocol19PreparedInstall {
     pub(crate) fn receipt(&self) -> &CanonicalProtocol19MigrationReceiptEvidence {
         &self.receipt
     }
+
+    pub(crate) fn cell_assignment(
+        &self,
+        cell_key: &CellKeyV1,
+    ) -> Result<&CellAssignmentRecord, CellDirectoryError> {
+        self.directory.assignment(cell_key)
+    }
+
+    pub(crate) fn claim_cell_authority(
+        &mut self,
+        cell_key: &CellKeyV1,
+        expected_generation: u64,
+        holder_id: &str,
+    ) -> Result<CellAssignmentRecord, CellDirectoryError> {
+        self.directory
+            .claim_cell(cell_key, expected_generation, holder_id)
+    }
+
+    pub(crate) fn recover_cell_authority(
+        &mut self,
+        cell_key: &CellKeyV1,
+        expected_generation: u64,
+        holder_id: &str,
+    ) -> Result<CellAssignmentRecord, CellDirectoryError> {
+        self.directory
+            .recover_cell(cell_key, expected_generation, holder_id)
+    }
+
+    pub(crate) fn release_cell_authority(
+        &mut self,
+        cell_key: &CellKeyV1,
+        expected_generation: u64,
+        holder_id: &str,
+    ) -> Result<CellAssignmentRecord, CellDirectoryError> {
+        self.directory
+            .release_cell(cell_key, expected_generation, holder_id)
+    }
 }
 
 pub(crate) fn prepare_or_recover<'migration, 'source>(
@@ -372,10 +470,10 @@ pub(crate) fn prepare_or_recover<'migration, 'source>(
     prepare_or_recover_with_failpoint(transform, manifest, None)
 }
 
-pub(crate) fn open_from_active_head(
+pub(crate) fn validate_from_active_head(
     universe_root: impl AsRef<Path>,
     expected_prepared_head_hash: &str,
-) -> Result<OpenedProtocol19PreparedInstall, Protocol19InstallError> {
+) -> Result<ValidatedProtocol19PreparedInstall, Protocol19InstallError> {
     let universe_root = universe_root.as_ref();
     let install_root = universe_root.join(INSTALL_DIRECTORY);
     let metadata =
@@ -457,39 +555,17 @@ pub(crate) fn open_from_active_head(
         &install_root.join(TARGET_DIRECTORY_HISTORY_FILE),
         MAX_INSTALL_ARTIFACT_BYTES,
     )?;
-    let directory = DraftCellDirectoryHistoryStoreV3::open_from_active_head(
-        universe_root,
-        ActiveDirectoryV3Expectation {
-            universe_id: &head.universe_id,
-            manifest_hash: &head.target_manifest_hash,
-            revision: head.target_directory_revision,
-            document_hash: &head.target_directory_document_hash,
-            history_entry_hash: &head.target_directory_history_entry_hash,
-            assignment_root: &head.target_assignment_root,
-            placement_root: &head.target_placement_root,
-            document_bytes: &directory_document_bytes,
-            history_entry_bytes: &directory_history_bytes,
-        },
-    )?;
-
-    let mut cells = Vec::with_capacity(head.cells.len());
-    for (expected, receipt_cell) in head.cells.iter().zip(&receipt.target_cells) {
-        cells.push(DraftWorld21Store::open_from_active_head(
-            universe_root.join("cells").join(&expected.cell_id),
-            &manifest,
-            &head.migration_anchor_hash,
-            expected,
-            &receipt_cell.production_origin_root,
-            &receipt_cell.identity_subset_root,
-        )?);
-    }
     validate_exact_cell_namespace_ids(universe_root, &cell_ids)?;
-    Ok(OpenedProtocol19PreparedInstall {
+    Ok(ValidatedProtocol19PreparedInstall {
+        universe_root: universe_root.to_path_buf(),
+        install_lock,
+        head,
         summary,
         receipt,
-        _directory: directory,
-        _cells: cells,
-        _install_lock: install_lock,
+        manifest,
+        directory_document_bytes,
+        directory_history_bytes,
+        cell_ids,
     })
 }
 

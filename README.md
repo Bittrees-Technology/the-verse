@@ -240,8 +240,12 @@ a canonical 2-of-3 authorization, a universe-root head written last,
 forward-only verified restart, protocol-18 startup fencing, an offline
 activation/verification tool, and a fail-closed worker readiness boot that
 derives the complete target only from that head. Interactive protocol-19
-service still requires the directory-v3 lease, lifecycle-v2 scheduler,
-ordinary event-17, projection-5, verifier, and client cutover.
+directory history now treats the signed genesis as an immutable prefix while
+accepting only validated hash-chained successors. Crate-private claim,
+recovery, and release transitions derive every new assignment generation and
+fence from the durable tip, reject transition-kind retry aliases, and preserve
+transfer pins. Worker admission still requires coordinated lifecycle-v2
+scheduling, ordinary event-17, projection-5, verifier, and client cutover.
 Production remains
 pinned to protocol 18/directory 2/package 1 until the complete protocol-19
 tuple activates together. Production active-player load, the
