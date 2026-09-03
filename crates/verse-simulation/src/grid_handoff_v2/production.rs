@@ -41,7 +41,6 @@ pub(super) struct DraftProductionJobOriginV2 {
 }
 
 impl DraftProductionJobOriginV2 {
-    #[cfg(test)]
     pub(super) fn new(
         universe_id: &str,
         creator_cell_id: &str,

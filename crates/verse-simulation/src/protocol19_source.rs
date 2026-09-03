@@ -38,8 +38,16 @@ pub(crate) struct FrozenProtocol18CellEvidence {
 }
 
 impl FrozenProtocol18CellEvidence {
+    pub(crate) fn event_zero_state(&self) -> &crate::WorldState {
+        self.cell.event_zero_state()
+    }
+
     pub(crate) fn state(&self) -> &crate::WorldState {
         self.cell.state()
+    }
+
+    pub(crate) fn events(&self) -> &[crate::CanonicalEvent] {
+        self.cell.events()
     }
 
     pub(crate) fn cell_key(&self) -> &CellKeyV1 {
@@ -417,7 +425,7 @@ mod tests {
     use fs2::FileExt;
     use serde_json::Value;
     use tempfile::{TempDir, tempdir};
-    use verse_protocol::ClientMessage;
+    use verse_protocol::{ClientMessage, PlayerLifeState};
 
     use super::*;
     use crate::{LifecycleMode, LocalCellDirectory, Runtime};
@@ -493,6 +501,71 @@ mod tests {
 
     fn frozen_fixture(with_event: bool) -> TempDir {
         frozen_fixture_with_profile(with_event, false)
+    }
+
+    fn frozen_fixture_with_death_drop() -> TempDir {
+        let root = frozen_fixture(false);
+        let manifest = celestial::universe_manifest(
+            TEST_SEED,
+            crate::WORLD_SCHEMA_VERSION,
+            crate::EVENT_SCHEMA_VERSION,
+        )
+        .expect("manifest builds");
+        let cell_key = crate::proof_cell_keys().expect("proof cells build")[0].clone();
+        let mut directory = LocalCellDirectory::open(
+            root.path(),
+            &manifest,
+            crate::proof_cell_keys().expect("proof cells build"),
+        )
+        .expect("directory reopens");
+        let prior = directory
+            .assignment(&cell_key)
+            .expect("origin assignment exists")
+            .clone();
+        let cell_root = directory
+            .cell_store_root(&cell_key)
+            .expect("origin root derives");
+        let mut runtime =
+            Runtime::open_directory_managed_for_cell(cell_root, TEST_SEED, cell_key.clone(), 1)
+                .expect("origin runtime reopens");
+        let holder_id = "freeze-death-drop";
+        let assigned = directory
+            .claim(
+                &cell_key,
+                prior.assignment_generation,
+                holder_id,
+                runtime.state().fencing_token,
+            )
+            .expect("origin assignment claims");
+        runtime
+            .execute_next_for_fixture(&ClientMessage::SetSuitMode {
+                operation_sequence: 0,
+                operation_id: "frozen-source-open-vacuum".into(),
+                helmet_closed: false,
+                jetpack_enabled: true,
+                magnetic_boots_enabled: false,
+            })
+            .expect("open-vacuum mode commits");
+        for _ in 0..100 {
+            runtime.advance(250).expect("life support advances");
+        }
+        assert!(matches!(
+            runtime.state().player.life_state,
+            PlayerLifeState::Incapacitated { .. }
+        ));
+        assert_eq!(runtime.state().death_drops.len(), 1);
+        assert_eq!(
+            runtime
+                .drain_to_background_or_sleeping()
+                .expect("origin runtime drains"),
+            LifecycleMode::Sleeping
+        );
+        directory
+            .release(&cell_key, assigned.assignment_generation, holder_id)
+            .expect("origin assignment releases");
+        drop(runtime);
+        drop(directory);
+        root
     }
 
     fn stale_mid_journal_fixture() -> TempDir {
@@ -751,6 +824,142 @@ mod tests {
         let second = ValidatedFrozenProtocol18Source::acquire_existing(root.path(), TEST_SEED)
             .expect("frozen source reacquires");
         assert_eq!(summary(&second), first_summary);
+        assert_eq!(collect_files(root.path()), before);
+    }
+
+    #[test]
+    fn frozen_source_derives_a_write_free_valid_world21_transform() {
+        let root = frozen_fixture(true);
+        let before = collect_files(root.path());
+        let source = ValidatedFrozenProtocol18Source::acquire_existing(root.path(), TEST_SEED)
+            .expect("frozen source validates");
+        let manifest = crate::manifest_v5::build_validated_manifest_v5(TEST_SEED)
+            .expect("target manifest validates");
+        let transform = crate::grid_handoff_v2::migration_transform::ValidatedProtocol19MigrationTransform::derive(
+            &source,
+            &manifest,
+        )
+        .expect("world-21 transform derives");
+        let repeated = crate::grid_handoff_v2::migration_transform::ValidatedProtocol19MigrationTransform::derive(
+            &source,
+            &manifest,
+        )
+        .expect("world-21 transform repeats deterministically");
+
+        assert_eq!(transform.source().world_seed(), TEST_SEED);
+        assert_eq!(transform.target_manifest_hash(), manifest.manifest_hash());
+        assert_eq!(transform.cells().len(), source.cells().len());
+        assert_eq!(transform.identity_map_entry_count(), 0);
+        assert_eq!(transform.production_origin_count(), 0);
+        assert_eq!(transform.identity_map_root(), repeated.identity_map_root());
+        assert_eq!(
+            transform.production_origin_root(),
+            repeated.production_origin_root()
+        );
+        assert_eq!(
+            transform.global_conservation_root(),
+            repeated.global_conservation_root()
+        );
+        assert_eq!(
+            transform.normalized_gameplay_root(),
+            repeated.normalized_gameplay_root()
+        );
+        assert!(!transform.identity_map_bytes().is_empty());
+        assert!(!transform.production_origin_bytes().is_empty());
+        assert_eq!(collect_files(root.path()), before);
+        for (cell, repeated_cell) in transform.cells().iter().zip(repeated.cells()) {
+            cell.validate(&manifest).expect("target cell validates");
+            let source_cell = source
+                .cells()
+                .iter()
+                .find(|source_cell| source_cell.cell_id() == cell.cell_id())
+                .expect("source cell matches");
+            assert_eq!(cell.event_sequence(), source_cell.event_sequence());
+            assert_eq!(cell.event_head_hash(), source_cell.event_head_hash());
+            assert_eq!(
+                cell.authority_fencing_token(),
+                source_cell.authority_fencing_token()
+            );
+            assert_eq!(cell.world_state_hash(), repeated_cell.world_state_hash());
+            assert_eq!(
+                cell.active_world_hash().expect("active root derives").len(),
+                64
+            );
+            assert_eq!(cell.identity_subset_root().len(), 64);
+            assert_eq!(cell.production_origin_root().len(), 64);
+        }
+        assert_ne!(
+            transform.cells()[0].identity_subset_root(),
+            transform.cells()[1].identity_subset_root()
+        );
+        assert_ne!(
+            transform.cells()[0].production_origin_root(),
+            transform.cells()[1].production_origin_root()
+        );
+        assert_eq!(transform.identity_map_root().len(), 64);
+        assert_eq!(transform.production_origin_root().len(), 64);
+        assert_eq!(transform.global_conservation_root().len(), 64);
+        assert_eq!(transform.normalized_gameplay_root().len(), 64);
+    }
+
+    #[test]
+    fn frozen_nonempty_identity_frontier_transforms_death_drop_and_inventory() {
+        let root = frozen_fixture_with_death_drop();
+        let before = collect_files(root.path());
+        let source = ValidatedFrozenProtocol18Source::acquire_existing(root.path(), TEST_SEED)
+            .expect("nonempty frozen source validates");
+        let manifest = crate::manifest_v5::build_validated_manifest_v5(TEST_SEED)
+            .expect("target manifest validates");
+        let transform = crate::grid_handoff_v2::migration_transform::ValidatedProtocol19MigrationTransform::derive(
+            &source,
+            &manifest,
+        )
+        .expect("nonempty world-21 transform derives");
+        let repeated = crate::grid_handoff_v2::migration_transform::ValidatedProtocol19MigrationTransform::derive(
+            &source,
+            &manifest,
+        )
+        .expect("nonempty world-21 transform repeats deterministically");
+
+        assert_eq!(transform.identity_map_entry_count(), 3);
+        assert_eq!(transform.production_origin_count(), 0);
+        assert_eq!(
+            transform.identity_map_bytes(),
+            repeated.identity_map_bytes()
+        );
+        assert_eq!(
+            transform.production_origin_bytes(),
+            repeated.production_origin_bytes()
+        );
+        assert_eq!(transform.identity_map_root(), repeated.identity_map_root());
+        assert_eq!(
+            transform.production_origin_root(),
+            repeated.production_origin_root()
+        );
+        let blob: Value = serde_json::from_slice(transform.identity_map_bytes())
+            .expect("identity blob parses for assertions");
+        let kinds = blob["entries"]
+            .as_array()
+            .expect("identity entries are an array")
+            .iter()
+            .map(|entry| entry["entity_kind"].as_str().expect("entity kind is text"))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            kinds,
+            std::collections::BTreeSet::from(["death", "death-drop", "inventory"])
+        );
+        for (cell, repeated_cell) in transform.cells().iter().zip(repeated.cells()) {
+            cell.validate(&manifest).expect("target cell validates");
+            assert_eq!(cell.world_state_hash(), repeated_cell.world_state_hash());
+            assert_eq!(
+                cell.identity_subset_root(),
+                repeated_cell.identity_subset_root()
+            );
+            assert_eq!(
+                cell.production_origin_root(),
+                repeated_cell.production_origin_root()
+            );
+        }
         assert_eq!(collect_files(root.path()), before);
     }
 

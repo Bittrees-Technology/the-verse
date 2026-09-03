@@ -241,6 +241,7 @@ pub(crate) struct DurableTransferBoundary {
 type TransferBoundaryIndex = BTreeMap<(String, TransferBoundaryKind), DurableTransferBoundary>;
 type LoadedTransferBoundaries = (TransferBoundaryIndex, String);
 type FrozenEventArchiveValidation = (
+    WorldState,
     Vec<CanonicalEvent>,
     WorldState,
     BTreeMap<(String, TransferBoundaryKind), String>,
@@ -365,6 +366,7 @@ pub struct Store {
 /// boundary, advancing a fence, or sampling trusted time.
 #[derive(Debug)]
 pub(crate) struct FrozenProtocol18Cell {
+    event_zero_state: WorldState,
     state: WorldState,
     events: Vec<CanonicalEvent>,
     transfer_boundaries: Vec<DurableTransferBoundary>,
@@ -489,13 +491,14 @@ impl FrozenProtocol18Cell {
 
         let journal_path = root.join(JOURNAL_FILE);
         let journal_bytes = read_frozen_bytes(&journal_path, MAX_FROZEN_EVENT_ARCHIVE_BYTES)?;
-        let (events, state, replayed_transfer_world_hashes) = validate_frozen_event_archive(
-            &journal_path,
-            &journal_bytes,
-            &snapshot.state,
-            &manifest,
-            &cell_id,
-        )?;
+        let (event_zero_state, events, state, replayed_transfer_world_hashes) =
+            validate_frozen_event_archive(
+                &journal_path,
+                &journal_bytes,
+                &snapshot.state,
+                &manifest,
+                &cell_id,
+            )?;
         state
             .validate_player_roster()
             .map_err(PersistenceError::InvalidPlayerRoster)?;
@@ -552,6 +555,7 @@ impl FrozenProtocol18Cell {
         let event_head_hash = state.last_event_hash.clone();
 
         Ok(Self {
+            event_zero_state,
             state,
             events,
             transfer_boundaries,
@@ -588,6 +592,10 @@ impl FrozenProtocol18Cell {
 
     pub(crate) fn state(&self) -> &WorldState {
         &self.state
+    }
+
+    pub(crate) fn event_zero_state(&self) -> &WorldState {
+        &self.event_zero_state
     }
 
     pub(crate) fn events(&self) -> &[CanonicalEvent] {
@@ -2584,9 +2592,10 @@ fn validate_frozen_event_archive(
         ));
     }
 
-    let mut replay = matching_initial_states
+    let event_zero_state = matching_initial_states
         .pop()
         .expect("one matching initial state was established");
+    let mut replay = event_zero_state.clone();
     if snapshot_sequence == 0 {
         replay.fencing_token = snapshot_fence;
         debug_assert_eq!(&replay, snapshot_state);
@@ -2619,7 +2628,12 @@ fn validate_frozen_event_archive(
             }
         }
     }
-    Ok((events, replay, replayed_transfer_world_hashes))
+    Ok((
+        event_zero_state,
+        events,
+        replay,
+        replayed_transfer_world_hashes,
+    ))
 }
 
 pub(crate) fn validate_frozen_transfer_archive(

@@ -3813,7 +3813,27 @@ impl DraftGridTransferCellStateV2 {
         base: WorldState,
         production_job_origins: BTreeMap<String, DraftProductionJobOriginV2>,
     ) -> Result<Self, DraftGridClosureError> {
-        let mut state = Self {
+        let mut state = Self::unsealed_with_production_origins(base, production_job_origins);
+        state.seal()?;
+        Ok(state)
+    }
+
+    pub(super) fn new_world_v21_with_production_origins(
+        base: WorldState,
+        production_job_origins: BTreeMap<String, DraftProductionJobOriginV2>,
+        manifest: &crate::manifest_v5::ValidatedUniverseManifestV5,
+    ) -> Result<Self, DraftGridClosureError> {
+        let mut state = Self::unsealed_with_production_origins(base, production_job_origins);
+        state.state_hash = state.calculate_hash()?;
+        state.validate_world_v21(manifest)?;
+        Ok(state)
+    }
+
+    fn unsealed_with_production_origins(
+        base: WorldState,
+        production_job_origins: BTreeMap<String, DraftProductionJobOriginV2>,
+    ) -> Self {
+        Self {
             schema_version: DRAFT_GRID_CELL_STATE_SCHEMA_VERSION,
             base,
             production_job_origins,
@@ -3833,9 +3853,7 @@ impl DraftGridTransferCellStateV2 {
             production_occurrence_history_head: String::new(),
             abort_witnesses: BTreeMap::new(),
             state_hash: String::new(),
-        };
-        state.seal()?;
-        Ok(state)
+        }
     }
 
     fn calculate_hash(&self) -> Result<String, DraftGridClosureError> {

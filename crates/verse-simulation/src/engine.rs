@@ -2675,7 +2675,7 @@ impl WorldState {
     }
 
     #[cfg(test)]
-    fn oxygen_incapacitation_payload(&self) -> Result<EventPayload, IntentError> {
+    pub(crate) fn oxygen_incapacitation_payload(&self) -> Result<EventPayload, IntentError> {
         self.oxygen_incapacitation_payload_for(&self.player.player_id)
     }
 
