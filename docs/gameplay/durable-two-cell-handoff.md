@@ -316,7 +316,9 @@ finalization reconciles without a second mutation.
 
 Canonical subject IDs are universe-unique. New ID derivation includes the
 universe ID, creator cell key, canonical event identity or sequence, entity
-kind, and ordinal. Moving an entity never changes its ID.
+kind, and ordinal. Creation ordinals are zero-based within each entity kind,
+sorted by legacy ID, and assigned before later terminal-state filtering. Moving
+an entity never changes its ID, and a disappeared legacy ID cannot be reused.
 
 ## Atomic handoff flow
 
@@ -822,8 +824,21 @@ encodings, missing boundaries, and changed frontiers fail without truncation,
 backfill, recovery, fence advancement, or trusted-time sampling. Dropping the
 non-Serde capability releases every lock.
 
-The identity-map and production-origin transforms, global conservation and
-normalized-gameplay roots, receipt/source binding, archive copying, target
+The first write-free migration transform now borrows that frozen capability,
+retains its uniquely selected event-zero state, and replays the complete event
+archive to derive creation provenance rather than interpreting legacy names.
+It rejects nonterminal player-transfer locks or reservations, then remaps
+terminal live event-created grids, blocks, non-player inventories,
+production jobs, deaths, and death drops; rewrites their typed references;
+derives production origins; and validates each result as an otherwise-empty
+world-21 envelope under manifest 5. Canonical bounded identity and production
+blobs, per-cell roots, an independently equal global conservation root, and an
+inverse-normalized exact gameplay root are produced without filesystem writes.
+Player and carried-inventory identities, event-zero subjects, event-16
+frontiers, operation histories, simulation, voxel, ledger, ownership, and pose
+state remain exact.
+
+Source-bound anchor issuance, receipt/source binding, archive copying, target
 directory validation, universe-wide install head, active event-17 runtime
 adapter, scheduler, durable wake-up path, and whole-world process-crash
 integration remain to be implemented before activation. All drafts are

@@ -191,9 +191,12 @@ their directory assignments to be released sleeping, all transfers terminal,
 and every event-16 and transfer-boundary record to be exact, canonical, fully
 replayable, and backed by issued fencing history. It never creates, truncates,
 backfills, recovers, advances, or rewrites a source artifact. Identity and
-production-origin transforms, global conservation/gameplay roots, receipt
-issuance, archive copying, target validation, the universe install head, and
-activation remain later P1.8 gates.
+production-origin transformation is now a second write-free capability that
+borrows those locks. It derives subject creation from replay, validates the
+manifest-5/world-21 targets, emits canonical bounded mapping blobs, and proves
+independently equal conservation plus inverse-normalized gameplay roots.
+Source-bound anchor and receipt issuance, archive copying, target-directory
+validation, the universe install head, and activation remain later P1.8 gates.
 
 P1.5 acceptance requires:
 

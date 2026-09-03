@@ -84,8 +84,11 @@ its existing schedule.
 
 New block, cargo, production-job, split-grid, and transfer-member identities
 bind at least universe ID, creator cell ID, canonical event sequence, entity
-kind, and ordinal. Equal local event sequences in different cells cannot create
-the same subject ID. Transfer never renames an existing subject.
+kind, and ordinal. The ordinal is assigned independently within each entity
+kind, in sorted legacy-ID order, across every creation of that kind in the
+event before terminal-state filtering. Equal local event sequences in different
+cells cannot create the same subject ID. Transfer never renames an existing
+subject, and a disappeared legacy identity cannot be reused.
 
 ### Containment and rejection
 
@@ -182,10 +185,14 @@ lifecycles, terminal transfers, exact full event replay, canonical bounded
 archives, matching lifecycle/snapshot/production frontiers, issued historical
 fences, and exact directory-to-cell transfer proofs. Validation is read-only:
 it does not create, truncate, backfill, heal, advance a fence, or sample trusted
-time. Identity and production-origin transforms, global conservation and
-normalized-gameplay roots, receipt binding, durable archive copying, a
-universe-wide install commit, the runtime scheduler/wake path, and coordinated
-protocol-19 activation remain required.
+time. A second non-Serde capability now borrows that source and performs the
+write-free identity and production-origin transform. Creation provenance comes
+from event replay, every typed live reference is rewritten, each target is
+validated under manifest 5, and canonical mapping blobs plus independently
+equal conservation and inverse-normalized gameplay roots are derived. A
+source-bound anchor, receipt binding, durable archive copying, a universe-wide
+install commit, the runtime scheduler/wake path, and coordinated protocol-19
+activation remain required.
 
 Rollback removes the entire unactivated protocol-19 namespace or restores it
 as one matching compatibility set. Copying individual identity, manifest,
