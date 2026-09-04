@@ -211,9 +211,14 @@ operator tool and worker readiness mode exercise the same verified boot while
 keeping gameplay admission closed. The activated directory-v3 store now
 anchors recovery to the signed genesis prefix and durably supports
 directory-issued claim, recovery, and transfer-safe release transitions with
-exact retry semantics. Lifecycle-v2 scheduling, ordinary event-17 gameplay,
-and the coordinated projection/verifier/client cutover remain subsequent P1.8
-gates.
+exact retry semantics. The next dependency is now implemented as a
+production-only lifecycle-v2 coordinator: per-cell runtime history binds the
+signed activation head, current directory authority, world frontier, and one
+exact production cursor; bounded dispatch uses the canonical event-17 Store
+path and recovers split directory, lifecycle, and event commits without
+duplicating work. Quiescent migrated cells remain Sleeping without polling.
+Ordinary event-17 gameplay and the coordinated projection/verifier/client
+cutover remain subsequent P1.8 gates.
 
 P1.5 acceptance requires:
 

@@ -847,10 +847,16 @@ strictly stage or reopen every world-21 cell, and commit one universe head last.
 Before that head, target debris grants no installed authority and exact retry
 rebuilds it while the install lock is held. After that head, recovery verifies
 the complete artifact, directory, lifecycle, route, frontier, and cell set and
-never substitutes or reseals foreign material. Signed activation and active
-directory-v3 authority transitions are now implemented. Active event-17
-runtime adaptation, lifecycle-v2 scheduling, durable wake-up, and coordinated
-client activation remain to be implemented. All remaining drafts are
+never substitutes or reseals foreign material. Signed activation, active
+directory-v3 authority transitions, and the production-only lifecycle-v2
+coordinator are now implemented. The coordinator opens only from the signed
+global head, owns an append-only per-cell lifecycle history, obtains authority
+through directory v3, and commits due production through the existing event-17
+Store transaction before acknowledging it. Idle cells release to Sleeping
+without polling; bounded exact retry handles uncertain lifecycle writes and
+split directory/lifecycle commits. Ordinary event-17 gameplay, durable
+external wake-source integration, projection and verification schema cutover,
+and coordinated client activation remain to be implemented. All remaining drafts are
 intentionally unreachable from the production directory-v2/package-v1 paths
 until every version in the table above moves in one coordinated activation.
 The dormant proof harness retains bounded predecessor projections for replay;

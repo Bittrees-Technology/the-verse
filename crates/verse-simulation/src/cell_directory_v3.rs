@@ -1670,6 +1670,50 @@ impl DraftCellDirectoryHistoryStoreV3 {
         })
     }
 
+    /// Borrows any current assignment, including Sleeping, at the exact
+    /// locked directory tip. This is lifecycle evidence, not write authority.
+    pub(super) fn current_cell_assignment(
+        &self,
+        cell_id: &str,
+    ) -> Result<ValidatedCurrentCellAssignmentV3<'_>, CellDirectoryError> {
+        let current = self.current()?;
+        self.assignment_from_document(current, cell_id)
+    }
+
+    /// Resolves one exact historical assignment, including Sleeping, from the
+    /// already validated append-only directory history. Lifecycle replay uses
+    /// this to authenticate every record against the directory revision and
+    /// document hash it persisted.
+    pub(super) fn historical_cell_assignment(
+        &self,
+        directory_revision: u64,
+        document_hash: &str,
+        cell_id: &str,
+    ) -> Result<ValidatedCurrentCellAssignmentV3<'_>, CellDirectoryError> {
+        let document = self.resolve_document(directory_revision, document_hash)?;
+        self.assignment_from_document(&document, cell_id)
+    }
+
+    #[allow(clippy::unused_self)] // self's borrow is the non-Serde history guard
+    fn assignment_from_document(
+        &self,
+        document: &CellDirectoryDocumentV3,
+        cell_id: &str,
+    ) -> Result<ValidatedCurrentCellAssignmentV3<'_>, CellDirectoryError> {
+        let assignment = document
+            .assignments
+            .get(cell_id)
+            .ok_or_else(|| CellDirectoryError::UnknownCell(cell_id.to_owned()))?;
+        Ok(ValidatedCurrentCellAssignmentV3 {
+            directory_revision: document.directory_revision,
+            directory_document_hash: document.document_hash.clone(),
+            universe_id: document.universe_id.clone(),
+            universe_manifest_hash: document.universe_manifest_hash.clone(),
+            assignment: assignment.clone(),
+            _store_guard: PhantomData,
+        })
+    }
+
     fn append_document(
         &mut self,
         expected_revision: Option<u64>,
@@ -2591,6 +2635,42 @@ impl ValidatedCurrentGridAuthorityV3<'_> {
 pub(super) struct ValidatedCurrentCellAuthorityV3<'store> {
     authority: ValidatedCellAuthorityV3,
     _store_guard: PhantomData<&'store DraftCellDirectoryHistoryStoreV3>,
+}
+
+/// Non-serializable view of one assignment at the exact locked directory tip.
+/// Unlike `ValidatedCurrentCellAuthorityV3`, this also represents Sleeping so
+/// lifecycle recovery can prove release completion without manufacturing live
+/// mutation authority.
+#[derive(Debug)]
+pub(super) struct ValidatedCurrentCellAssignmentV3<'store> {
+    directory_revision: u64,
+    directory_document_hash: String,
+    universe_id: String,
+    universe_manifest_hash: String,
+    assignment: CellAssignmentRecord,
+    _store_guard: PhantomData<&'store DraftCellDirectoryHistoryStoreV3>,
+}
+
+impl ValidatedCurrentCellAssignmentV3<'_> {
+    pub(super) fn directory_revision(&self) -> u64 {
+        self.directory_revision
+    }
+
+    pub(super) fn directory_document_hash(&self) -> &str {
+        &self.directory_document_hash
+    }
+
+    pub(super) fn universe_id(&self) -> &str {
+        &self.universe_id
+    }
+
+    pub(super) fn universe_manifest_hash(&self) -> &str {
+        &self.universe_manifest_hash
+    }
+
+    pub(super) fn assignment(&self) -> &CellAssignmentRecord {
+        &self.assignment
+    }
 }
 
 impl ValidatedCurrentCellAuthorityV3<'_> {

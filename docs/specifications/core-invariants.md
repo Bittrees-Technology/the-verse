@@ -180,6 +180,24 @@ These invariants are higher priority than convenience or performance.
 - An active protocol-19 selector fences protocol-18 startup. Returning to
   protocol 18 requires a separately authorized reverse migration proving that
   no protocol-19 work is discarded.
+- Mutable lifecycle-v2 history is a separate append-only successor of the
+  immutable per-cell migration genesis. It binds the signed active head,
+  directory-v3 authority, trusted-time frontier, exact world frontier, and
+  production cursor; it cannot rewrite or reseal prepared receipt material.
+- An activation-lock-owned universe lifecycle head authorizes each exact child
+  successor before cell materialization. Missing, rolled-back, or unauthorized
+  child lifecycle state never becomes a new local genesis.
+- Directory v3 is the only issuer of cell generations and fencing tokens. A
+  lifecycle claim, recovery, or release records its exact request before the
+  directory transition and accepts only that request's predecessor or one
+  exact successor during recovery.
+- A production occurrence is pending in lifecycle history before event-17
+  append and acknowledged only after the event journal proves its exact world
+  successor. Quiescent cells have no occurrence and receive no periodic poll.
+- Protocol-19 background dispatch starts at most 60 sequential one-second
+  occurrences and starts no new quantum after 250 milliseconds. Hitting either
+  bound preserves
+  the next exact cursor and never skips or coalesces conserved work.
 
 ## Assets
 

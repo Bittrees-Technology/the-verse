@@ -212,6 +212,17 @@ and the source writes an active audit tombstone plus restart-verifiable history.
 This model is not production-reachable until event schema 17, directory schema
 3, package schema 2, and the rest of the protocol-19 tuple activate together.
 
+The verified protocol-19 runtime now has a production-only lifecycle-v2
+coordinator behind that activation boundary. It preflights every selected cell
+without repair before creating mutable runtime state, commits every exact
+per-cell lifecycle successor first in an activation-lock-owned universe head,
+records cell intent in an append-only hash chain, obtains or replaces authority
+only through directory v3, and
+passes each due production occurrence through the canonical event-17 Store
+append. The event journal is authoritative after append-before-ack failure.
+Interactive sessions remain closed until ordinary gameplay events, private
+projection, independent verification, and the client tuple move together.
+
 Abort is a two-cell cleanup saga: the directory first enters `Aborting`, pins
 both assignments, collects canonical source and destination cleanup proofs,
 and only then restores source residency as terminal `Aborted`.

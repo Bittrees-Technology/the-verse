@@ -223,9 +223,16 @@ source event without changing gameplay or economy state, and commits both a
 compact active tombstone and a full historical proof chain. It rejects
 pre-activation, backdated, substituted, missing-local-event, and stale-fence
 attempts; exact cell-first and directory-first retries survive restart. The
-event-17 runtime/store adapter, durable scheduler wake-up wiring, and the
-persistence failpoint crash matrix remain disabled until their atomic paths
-are implemented. The dormant proof harness also remains bounded and
+event-17 Store adapter and protocol-19 lifecycle-v2 coordinator now form a
+production-only runtime path. The coordinator durably claims or recovers
+directory-v3 authority, records one-second production occurrences, appends
+them through the canonical event-17 journal, acknowledges the resulting world
+frontier, and releases idle cells without polling. Its recovery tests cover
+uncertain lifecycle writes, split directory/lifecycle commits, partial journal
+tails, stale logical authority, deleted child history, a universe-level
+write-ahead commitment, and read-only all-cell preflight before any cell
+recovery write. Ordinary event-17 gameplay admission and external scheduler wake-source
+wiring remain disabled. The dormant proof harness also remains bounded and
 snapshot-heavy; activation must place occurrence durability in the canonical
 event journal and reserve evidence capacity before accepting an import.
 The source-bound prepared-install bridge now derives a canonical receipt and
@@ -244,11 +251,10 @@ directory history now treats the signed genesis as an immutable prefix while
 accepting only validated hash-chained successors. Crate-private claim,
 recovery, and release transitions derive every new assignment generation and
 fence from the durable tip, reject transition-kind retry aliases, and preserve
-transfer pins. Worker admission still requires coordinated lifecycle-v2
-scheduling, ordinary event-17, projection-5, verifier, and client cutover.
-Production remains
-pinned to protocol 18/directory 2/package 1 until the complete protocol-19
-tuple activates together. Production active-player load, the
+transfer pins. Worker gameplay admission still requires ordinary event-17,
+projection-5, verifier, and client cutover. Production remains pinned to
+protocol 18/directory 2/package 1 until that complete protocol-19 tuple
+activates together. Production active-player load, the
 production binary codec, general multi-cell execution, safe zones, accounts,
 AMMs, and blockchain settlement remain in the
 [delivery roadmap](docs/roadmap/roadmap.md). See [Celestial registry and

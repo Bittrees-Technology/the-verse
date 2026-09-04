@@ -11,6 +11,23 @@ operations maintainers
 The durable architecture choices are recorded in
 [ADR-0022](../decisions/ADR-0022-durable-single-cell-lifecycle.md).
 
+## Protocol-19 lifecycle-v2 checkpoint
+
+[ADR-0027](../decisions/ADR-0027-protocol-19-lifecycle-v2-scheduling.md)
+extends this production-only contract across the signed protocol-19 migration
+boundary. Runtime lifecycle state does not mutate the immutable migration
+genesis. Instead, each activated cell owns a bounded, canonical append-only
+history and atomic head tied to the signed universe head, directory-v3
+assignment, trusted time, exact world frontier, and production cursor.
+
+The universe coordinator records claim, recovery, and release intent before
+directory mutation and completes only the exact matching successor after a
+crash. A due occurrence is persisted before the canonical event-17 append and
+acknowledged afterward; event replay decides an uncertain append. Empty or
+paused cells release to Sleeping with no one-second poll. This checkpoint
+keeps interactive gameplay admission closed until the ordinary event-17,
+projection, verification, and client cutover is complete.
+
 Implementation revision `0664130` passed the complete local release gate and
 [hosted CI run 33137371577](https://github.com/Bittrees-Technology/the-verse/actions/runs/33137371577).
 The hosted run includes the isolated Linux-container verifier and both native

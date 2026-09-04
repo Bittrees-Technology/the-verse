@@ -17,7 +17,9 @@ use thiserror::Error;
 use uuid::Uuid;
 use verse_protocol::protocol_v19::Protocol19CompatibilityTuple;
 
-use crate::cell_directory::{CellAssignmentRecord, CellDirectoryError};
+#[cfg(test)]
+use crate::cell_directory::CellAssignmentRecord;
+use crate::cell_directory::CellDirectoryError;
 use crate::grid_handoff_v2::migration_transform::ValidatedProtocol19MigrationTransform;
 use crate::persistence::{SystemTrustedClock, TrustedClock};
 use crate::protocol19_install::{
@@ -29,6 +31,7 @@ use crate::protocol19_source::ValidatedFrozenProtocol18Source;
 pub const ACTIVE_PROTOCOL_HEAD_FILE: &str = "active-protocol-head-v1.json";
 const ACTIVATION_DIRECTORY: &str = "protocol-19-activation-v1";
 const ACTIVATION_LOCK_FILE: &str = "writer.lock";
+const UNIVERSE_LIFECYCLE_HEAD_FILE: &str = "universe-lifecycle-v1.head.json";
 const POLICY_SCHEMA_VERSION: u32 = 1;
 const AUTHORIZATION_SCHEMA_VERSION: u32 = 1;
 const ACTIVE_HEAD_SCHEMA_VERSION: u32 = 1;
@@ -408,6 +411,7 @@ impl ActivatedProtocol19World {
     /// Returns the exact directory-v3 assignment held under this activated
     /// universe capability. The active signed head remains the immutable root
     /// of the directory history.
+    #[cfg(test)]
     pub(crate) fn cell_assignment(
         &self,
         cell_key: &verse_protocol::CellKeyV1,
@@ -417,6 +421,7 @@ impl ActivatedProtocol19World {
 
     /// Claims one sleeping cell. The directory derives the successor
     /// generation and fencing token; the caller supplies neither value.
+    #[cfg(test)]
     pub(crate) fn claim_cell_authority(
         &mut self,
         cell_key: &verse_protocol::CellKeyV1,
@@ -430,6 +435,7 @@ impl ActivatedProtocol19World {
 
     /// Replaces the holder of an assigned cell after this process has acquired
     /// the activated universe's exclusive writer set.
+    #[cfg(test)]
     pub(crate) fn recover_cell_authority(
         &mut self,
         cell_key: &verse_protocol::CellKeyV1,
@@ -443,6 +449,7 @@ impl ActivatedProtocol19World {
 
     /// Releases an assigned cell only when the exact generation and holder
     /// still match and no nonterminal transfer pins the cell.
+    #[cfg(test)]
     pub(crate) fn release_cell_authority(
         &mut self,
         cell_key: &verse_protocol::CellKeyV1,
@@ -451,6 +458,51 @@ impl ActivatedProtocol19World {
     ) -> Result<CellAssignmentRecord, Protocol19ActivationError> {
         self.prepared
             .release_cell_authority(cell_key, expected_generation, holder_id)
+            .map_err(Into::into)
+    }
+
+    /// Runs one bounded production-only lifecycle dispatch. Gameplay
+    /// admission remains closed until ordinary event-17 integration.
+    pub(crate) fn dispatch_background_production_with_clock(
+        &mut self,
+        cell_key: &verse_protocol::CellKeyV1,
+        holder_id: &str,
+        clock: &dyn TrustedClock,
+    ) -> Result<
+        crate::protocol19_install::Protocol19BackgroundDispatchOutcome,
+        Protocol19ActivationError,
+    > {
+        self.prepared
+            .dispatch_background_production(cell_key, holder_id, clock)
+            .map_err(Into::into)
+    }
+
+    #[cfg(test)]
+    fn set_lifecycle_failpoint_for_test(
+        &mut self,
+        cell_key: &verse_protocol::CellKeyV1,
+        failpoint: crate::grid_handoff_v2::lifecycle_v2::LifecycleAppendFailpointV2,
+    ) -> Result<(), Protocol19ActivationError> {
+        self.prepared
+            .set_lifecycle_failpoint_for_test(cell_key, failpoint)
+            .map_err(Into::into)
+    }
+
+    #[cfg(test)]
+    fn set_lifecycle_coordinator_failpoint_for_test(
+        &mut self,
+        failpoint: crate::protocol19_install::Protocol19LifecycleCoordinatorFailpoint,
+    ) {
+        self.prepared
+            .set_lifecycle_coordinator_failpoint_for_test(failpoint);
+    }
+
+    #[cfg(test)]
+    fn reseal_pending_lifecycle_outside_state_machine_for_test(
+        &mut self,
+    ) -> Result<(), Protocol19ActivationError> {
+        self.prepared
+            .reseal_pending_lifecycle_outside_state_machine_for_test()
             .map_err(Into::into)
     }
 }
@@ -688,7 +740,32 @@ pub fn open_activated_protocol19_world(
     expected_world_seed: u64,
     policy: &Protocol19ActivationTrustPolicy,
 ) -> Result<ActivatedProtocol19World, Protocol19ActivationError> {
-    let universe_root = universe_root.as_ref();
+    open_activated_protocol19_world_inner(universe_root.as_ref(), expected_world_seed, policy, None)
+}
+
+#[cfg(test)]
+fn open_activated_protocol19_world_with_lifecycle_initialization_failpoint(
+    universe_root: impl AsRef<Path>,
+    expected_world_seed: u64,
+    policy: &Protocol19ActivationTrustPolicy,
+    failpoint: crate::grid_handoff_v2::lifecycle_v2::LifecycleInitializationFailpointV2,
+) -> Result<ActivatedProtocol19World, Protocol19ActivationError> {
+    open_activated_protocol19_world_inner(
+        universe_root.as_ref(),
+        expected_world_seed,
+        policy,
+        Some(failpoint),
+    )
+}
+
+fn open_activated_protocol19_world_inner(
+    universe_root: &Path,
+    expected_world_seed: u64,
+    policy: &Protocol19ActivationTrustPolicy,
+    initialization_failpoint: Option<
+        crate::grid_handoff_v2::lifecycle_v2::LifecycleInitializationFailpointV2,
+    >,
+) -> Result<ActivatedProtocol19World, Protocol19ActivationError> {
     if !protocol19_is_activated(universe_root)? {
         return Err(Protocol19ActivationError::Invalid(
             "universe has no active protocol-19 global head".into(),
@@ -748,7 +825,8 @@ pub fn open_activated_protocol19_world(
         ));
     }
     validate_activation_file_set(&activation_root, &head)?;
-    let prepared = validated_prepared.open()?;
+    let prepared = validated_prepared
+        .open_with_lifecycle_initialization_failpoint(&head.head_hash, initialization_failpoint)?;
     let summary = active_summary(&head, prepared.summary())?;
     Ok(ActivatedProtocol19World {
         summary,
@@ -1349,7 +1427,15 @@ fn validate_activation_file_set(
         authorization_file_name(&head.authorization_hash),
         active_head_file_name(&head.head_hash),
     ];
+    let lifecycle_head = root.join(UNIVERSE_LIFECYCLE_HEAD_FILE);
+    if lifecycle_head
+        .try_exists()
+        .map_err(|source| io_error(&lifecycle_head, source))?
+    {
+        expected.push(UNIVERSE_LIFECYCLE_HEAD_FILE.to_owned());
+    }
     let mut observed = Vec::new();
+    let mut lifecycle_temp_count = 0usize;
     for entry in fs::read_dir(root).map_err(|source| io_error(root, source))? {
         let entry = entry.map_err(|source| io_error(root, source))?;
         if !entry
@@ -1361,11 +1447,26 @@ fn validate_activation_file_set(
                 "activation namespace contains a non-file artifact".into(),
             ));
         }
-        observed.push(entry.file_name().into_string().map_err(|_| {
+        let name = entry.file_name().into_string().map_err(|_| {
             Protocol19ActivationError::Invalid(
                 "activation namespace contains a non-UTF-8 artifact".into(),
             )
-        })?);
+        })?;
+        if let Some(uuid) = name.strip_prefix(&format!(".{UNIVERSE_LIFECYCLE_HEAD_FILE}.tmp-")) {
+            if Uuid::parse_str(uuid).is_err() {
+                return Err(Protocol19ActivationError::Invalid(
+                    "activation namespace contains malformed lifecycle staging debris".into(),
+                ));
+            }
+            lifecycle_temp_count += 1;
+            if lifecycle_temp_count > 64 {
+                return Err(Protocol19ActivationError::Invalid(
+                    "activation namespace contains too much lifecycle staging debris".into(),
+                ));
+            }
+            continue;
+        }
+        observed.push(name);
     }
     expected.sort_unstable();
     observed.sort_unstable();
@@ -1496,6 +1597,8 @@ fn io_error(path: impl AsRef<Path>, source: std::io::Error) -> Protocol19Activat
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::fs;
     use std::sync::Arc;
     use std::{path::PathBuf, process::Command};
 
@@ -2401,7 +2504,7 @@ mod tests {
     }
 
     #[test]
-    fn activated_directory_authority_claim_recovery_and_release_survive_restart() {
+    fn uncoordinated_directory_authority_changes_cannot_bypass_lifecycle() {
         let (root, prepared, policy, keys) = fixture();
         let signed = signed_authorization(
             &prepared,
@@ -2510,24 +2613,978 @@ mod tests {
         );
         drop(world);
 
+        assert!(
+            open_activated_protocol19_world(root.path(), TEST_SEED, &policy).is_err(),
+            "test-only raw directory history cannot reopen as a healthy lifecycle"
+        );
+    }
+
+    #[test]
+    fn lifecycle_v2_no_work_dispatch_claims_and_releases_without_polling() {
+        let (root, prepared, policy, keys) = fixture();
+        let signed = signed_authorization(
+            &prepared,
+            &policy,
+            &keys,
+            &[0, 1],
+            TRUSTED_NOW - 1_000,
+            TRUSTED_NOW + 10_000,
+        );
+        activate_protocol19_world_with_clock(
+            root.path(),
+            TEST_SEED,
+            &policy,
+            &signed,
+            &ManualClock(TRUSTED_NOW),
+        )
+        .expect("world activates");
+
+        let cell_key = crate::cell_origin_key();
+        let mut world = open_activated_protocol19_world(root.path(), TEST_SEED, &policy)
+            .expect("activated lifecycle opens");
+        let before = world
+            .cell_assignment(&cell_key)
+            .expect("sleeping assignment resolves")
+            .clone();
+        let outcome = world
+            .dispatch_background_production_with_clock(
+                &cell_key,
+                "lifecycle-worker-a",
+                &ManualClock(TRUSTED_NOW + 1_000),
+            )
+            .expect("empty cell dispatches");
+        assert_eq!(outcome.mode, "sleeping");
+        assert_eq!(outcome.committed_quanta, 0);
+        assert_eq!(outcome.acknowledged_production_sequence, 0);
+        assert_eq!(outcome.next_scheduled_for_unix_ms, None);
+        let after = world
+            .cell_assignment(&cell_key)
+            .expect("released assignment resolves")
+            .clone();
+        assert_eq!(after.state, crate::CellAssignmentState::Sleeping);
+        assert_eq!(
+            after.assignment_generation,
+            before.assignment_generation + 1
+        );
+        assert_eq!(
+            after.authority_fencing_token,
+            before.authority_fencing_token + 1
+        );
+        drop(world);
+
+        let cell_root = root
+            .path()
+            .join("cells")
+            .join(&after.cell_id)
+            .join("protocol-19-world-v21");
+        assert!(cell_root.join("lifecycle-v2.genesis.json").is_file());
+        assert!(cell_root.join("lifecycle-v2.ndjson").is_file());
+        assert!(cell_root.join("lifecycle-v2.head.json").is_file());
+
         let mut reopened = open_activated_protocol19_world(root.path(), TEST_SEED, &policy)
-            .expect("active head accepts its validated successor history");
+            .expect("completed lifecycle history reopens");
+        let second = reopened
+            .dispatch_background_production_with_clock(
+                &cell_key,
+                "lifecycle-worker-b",
+                &ManualClock(TRUSTED_NOW + 2_000),
+            )
+            .expect("restarted empty cell dispatches");
+        assert_eq!(second.mode, "sleeping");
+        assert_eq!(second.committed_quanta, 0);
         assert_eq!(
             reopened
                 .cell_assignment(&cell_key)
-                .expect("released assignment reopens"),
+                .expect("second release resolves")
+                .assignment_generation,
+            after.assignment_generation + 1
+        );
+    }
+
+    #[test]
+    fn lifecycle_v2_rejects_clock_rollback_and_incomplete_runtime_artifacts() {
+        let (root, prepared, policy, keys) = fixture();
+        let signed = signed_authorization(
+            &prepared,
+            &policy,
+            &keys,
+            &[0, 1],
+            TRUSTED_NOW - 1_000,
+            TRUSTED_NOW + 10_000,
+        );
+        activate_protocol19_world_with_clock(
+            root.path(),
+            TEST_SEED,
+            &policy,
+            &signed,
+            &ManualClock(TRUSTED_NOW),
+        )
+        .expect("world activates");
+        let cell_key = crate::cell_origin_key();
+        let mut world = open_activated_protocol19_world(root.path(), TEST_SEED, &policy)
+            .expect("activated lifecycle opens");
+        world
+            .dispatch_background_production_with_clock(
+                &cell_key,
+                "lifecycle-worker-clock",
+                &ManualClock(TRUSTED_NOW + 1_000),
+            )
+            .expect("first dispatch establishes trusted time");
+        assert!(
+            world
+                .dispatch_background_production_with_clock(
+                    &cell_key,
+                    "lifecycle-worker-clock-next",
+                    &ManualClock(TRUSTED_NOW),
+                )
+                .is_err(),
+            "trusted time may not move backwards"
+        );
+        let cell_id = world
+            .cell_assignment(&cell_key)
+            .expect("cell resolves")
+            .cell_id
+            .clone();
+        drop(world);
+
+        let lifecycle_head = root
+            .path()
+            .join("cells")
+            .join(cell_id)
+            .join("protocol-19-world-v21")
+            .join("lifecycle-v2.head.json");
+        fs::remove_file(&lifecycle_head).expect("test removes one runtime artifact");
+        assert!(
+            open_activated_protocol19_world(root.path(), TEST_SEED, &policy).is_err(),
+            "an incomplete lifecycle runtime set fails closed"
+        );
+    }
+
+    #[test]
+    fn lifecycle_v2_universe_commitment_rejects_deleted_cell_history() {
+        let (root, prepared, policy, keys) = fixture();
+        let signed = signed_authorization(
+            &prepared,
+            &policy,
+            &keys,
+            &[0, 1],
+            TRUSTED_NOW - 1_000,
+            TRUSTED_NOW + 10_000,
+        );
+        activate_protocol19_world_with_clock(
+            root.path(),
+            TEST_SEED,
+            &policy,
+            &signed,
+            &ManualClock(TRUSTED_NOW),
+        )
+        .expect("world activates");
+        let cell_key = crate::cell_origin_key();
+        let world = open_activated_protocol19_world(root.path(), TEST_SEED, &policy)
+            .expect("universe lifecycle bootstraps");
+        let cell_id = world
+            .cell_assignment(&cell_key)
+            .expect("cell resolves")
+            .cell_id
+            .clone();
+        drop(world);
+
+        let lifecycle_root = root
+            .path()
+            .join("cells")
+            .join(cell_id)
+            .join("protocol-19-world-v21");
+        fs::remove_file(lifecycle_root.join("lifecycle-v2.ndjson"))
+            .expect("test removes lifecycle history");
+        fs::remove_file(lifecycle_root.join("lifecycle-v2.head.json"))
+            .expect("test removes lifecycle head");
+        assert!(
+            open_activated_protocol19_world(root.path(), TEST_SEED, &policy).is_err(),
+            "a universe-committed lifecycle cannot be recreated after deletion"
+        );
+    }
+
+    #[test]
+    fn lifecycle_v2_rejects_children_without_the_universe_head() {
+        let (root, prepared, policy, keys) = fixture();
+        let signed = signed_authorization(
+            &prepared,
+            &policy,
+            &keys,
+            &[0, 1],
+            TRUSTED_NOW - 1_000,
+            TRUSTED_NOW + 10_000,
+        );
+        activate_protocol19_world_with_clock(
+            root.path(),
+            TEST_SEED,
+            &policy,
+            &signed,
+            &ManualClock(TRUSTED_NOW),
+        )
+        .expect("world activates");
+        drop(
+            open_activated_protocol19_world(root.path(), TEST_SEED, &policy)
+                .expect("universe lifecycle bootstraps"),
+        );
+        fs::remove_file(
+            root.path()
+                .join("protocol-19-activation-v1")
+                .join("universe-lifecycle-v1.head.json"),
+        )
+        .expect("test removes universe lifecycle head");
+        assert!(
+            open_activated_protocol19_world(root.path(), TEST_SEED, &policy).is_err(),
+            "existing child histories cannot be blessed by a replacement universe head"
+        );
+    }
+
+    #[test]
+    fn lifecycle_v2_universe_commitment_rejects_child_head_rollback() {
+        let (root, prepared, policy, keys) = fixture();
+        let signed = signed_authorization(
+            &prepared,
+            &policy,
+            &keys,
+            &[0, 1],
+            TRUSTED_NOW - 1_000,
+            TRUSTED_NOW + 10_000,
+        );
+        activate_protocol19_world_with_clock(
+            root.path(),
+            TEST_SEED,
+            &policy,
+            &signed,
+            &ManualClock(TRUSTED_NOW),
+        )
+        .expect("world activates");
+        let cell_key = crate::cell_origin_key();
+        let mut world = open_activated_protocol19_world(root.path(), TEST_SEED, &policy)
+            .expect("universe lifecycle bootstraps");
+        let cell_id = world
+            .cell_assignment(&cell_key)
+            .expect("cell resolves")
+            .cell_id
+            .clone();
+        let lifecycle_root = root
+            .path()
+            .join("cells")
+            .join(cell_id)
+            .join("protocol-19-world-v21");
+        let initial_history = fs::read(lifecycle_root.join("lifecycle-v2.ndjson"))
+            .expect("initial lifecycle history reads");
+        let initial_head = fs::read(lifecycle_root.join("lifecycle-v2.head.json"))
+            .expect("initial lifecycle head reads");
+        world
+            .dispatch_background_production_with_clock(
+                &cell_key,
+                "lifecycle-rollback-worker",
+                &ManualClock(TRUSTED_NOW + 1_000),
+            )
+            .expect("lifecycle advances");
+        drop(world);
+
+        fs::write(lifecycle_root.join("lifecycle-v2.ndjson"), initial_history)
+            .expect("test rolls child history back");
+        fs::write(lifecycle_root.join("lifecycle-v2.head.json"), initial_head)
+            .expect("test rolls child head back");
+        assert!(
+            open_activated_protocol19_world(root.path(), TEST_SEED, &policy).is_err(),
+            "a child valid-prefix rollback cannot satisfy the universe commitment"
+        );
+    }
+
+    #[test]
+    fn lifecycle_v2_append_failures_recover_one_exact_authority_transaction() {
+        use crate::grid_handoff_v2::lifecycle_v2::LifecycleAppendFailpointV2;
+
+        for (index, failpoint) in [
+            LifecycleAppendFailpointV2::JournalSyncedBeforeHead,
+            LifecycleAppendFailpointV2::HeadRenamedBeforeMemory,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (root, prepared, policy, keys) = fixture();
+            let signed = signed_authorization(
+                &prepared,
+                &policy,
+                &keys,
+                &[0, 1],
+                TRUSTED_NOW - 1_000,
+                TRUSTED_NOW + 10_000,
+            );
+            activate_protocol19_world_with_clock(
+                root.path(),
+                TEST_SEED,
+                &policy,
+                &signed,
+                &ManualClock(TRUSTED_NOW),
+            )
+            .expect("world activates");
+            let cell_key = crate::cell_origin_key();
+            let mut world = open_activated_protocol19_world(root.path(), TEST_SEED, &policy)
+                .expect("activated lifecycle opens");
+            let before = world
+                .cell_assignment(&cell_key)
+                .expect("sleeping assignment resolves")
+                .clone();
+            world
+                .set_lifecycle_failpoint_for_test(&cell_key, failpoint)
+                .expect("lifecycle failpoint installs");
+            let holder = format!("lifecycle-retry-{index}");
+            assert!(
+                world
+                    .dispatch_background_production_with_clock(
+                        &cell_key,
+                        &holder,
+                        &ManualClock(TRUSTED_NOW + 1_000),
+                    )
+                    .is_err(),
+                "injected lifecycle append must surface"
+            );
+            assert_eq!(
+                world
+                    .cell_assignment(&cell_key)
+                    .expect("directory remains at a defined frontier"),
+                &before,
+                "the first request append fails before directory mutation"
+            );
+            drop(world);
+
+            let mut recovered = open_activated_protocol19_world(root.path(), TEST_SEED, &policy)
+                .expect("lifecycle journal recovers its exact successor");
+            let outcome = recovered
+                .dispatch_background_production_with_clock(
+                    &cell_key,
+                    &holder,
+                    &ManualClock(TRUSTED_NOW + 1_000),
+                )
+                .expect("exact retry completes and releases");
+            assert_eq!(outcome.mode, "sleeping");
+            let after = recovered
+                .cell_assignment(&cell_key)
+                .expect("recovered release resolves");
+            assert_eq!(
+                after.assignment_generation,
+                before.assignment_generation + 1
+            );
+            assert_eq!(
+                after.authority_fencing_token,
+                before.authority_fencing_token + 1
+            );
+        }
+    }
+
+    #[test]
+    fn lifecycle_v2_recovers_write_ahead_commit_before_child_materialization() {
+        let (root, prepared, policy, keys) = fixture();
+        let signed = signed_authorization(
+            &prepared,
+            &policy,
+            &keys,
+            &[0, 1],
+            TRUSTED_NOW - 1_000,
+            TRUSTED_NOW + 10_000,
+        );
+        activate_protocol19_world_with_clock(
+            root.path(),
+            TEST_SEED,
+            &policy,
+            &signed,
+            &ManualClock(TRUSTED_NOW),
+        )
+        .expect("world activates");
+        let cell_key = crate::cell_origin_key();
+        let mut world = open_activated_protocol19_world(root.path(), TEST_SEED, &policy)
+            .expect("universe lifecycle bootstraps");
+        let before = world
+            .cell_assignment(&cell_key)
+            .expect("sleeping assignment resolves")
+            .clone();
+        world.set_lifecycle_coordinator_failpoint_for_test(
+            crate::protocol19_install::Protocol19LifecycleCoordinatorFailpoint::UniverseLifecycleWriteAheadCommitted,
+        );
+        assert!(
+            world
+                .dispatch_background_production_with_clock(
+                    &cell_key,
+                    "lifecycle-write-ahead-recovery",
+                    &ManualClock(TRUSTED_NOW + 1_000),
+                )
+                .is_err(),
+            "injected gap after write-ahead commit must surface"
+        );
+        assert_eq!(
+            world
+                .cell_assignment(&cell_key)
+                .expect("directory remains unchanged"),
+            &before
+        );
+        drop(world);
+
+        let mut recovered = open_activated_protocol19_world(root.path(), TEST_SEED, &policy)
+            .expect("authorized child append materializes on restart");
+        let outcome = recovered
+            .dispatch_background_production_with_clock(
+                &cell_key,
+                "lifecycle-write-ahead-recovery",
+                &ManualClock(TRUSTED_NOW + 1_000),
+            )
+            .expect("exact retry claims and releases once");
+        assert_eq!(outcome.mode, "sleeping");
+        let after = recovered
+            .cell_assignment(&cell_key)
+            .expect("released assignment resolves");
+        assert_eq!(
+            after.assignment_generation,
+            before.assignment_generation + 1
+        );
+        assert_eq!(
+            after.authority_fencing_token,
+            before.authority_fencing_token + 1
+        );
+    }
+
+    #[test]
+    fn lifecycle_v2_first_bootstrap_crash_boundaries_recover_exact_genesis() {
+        use crate::grid_handoff_v2::lifecycle_v2::LifecycleInitializationFailpointV2;
+
+        for failpoint in [
+            LifecycleInitializationFailpointV2::EmptyHistoryCreated,
+            LifecycleInitializationFailpointV2::EmptyHeadCommitted,
+            LifecycleInitializationFailpointV2::InitialJournalSyncedBeforeHead,
+            LifecycleInitializationFailpointV2::InitialHeadRenamedBeforeMemory,
+        ] {
+            let (root, prepared, policy, keys) = fixture();
+            let signed = signed_authorization(
+                &prepared,
+                &policy,
+                &keys,
+                &[0, 1],
+                TRUSTED_NOW - 1_000,
+                TRUSTED_NOW + 10_000,
+            );
+            activate_protocol19_world_with_clock(
+                root.path(),
+                TEST_SEED,
+                &policy,
+                &signed,
+                &ManualClock(TRUSTED_NOW),
+            )
+            .expect("world activates");
+            assert!(
+                open_activated_protocol19_world_with_lifecycle_initialization_failpoint(
+                    root.path(),
+                    TEST_SEED,
+                    &policy,
+                    failpoint,
+                )
+                .is_err(),
+                "injected {failpoint:?} bootstrap boundary must surface"
+            );
+            if failpoint == LifecycleInitializationFailpointV2::EmptyHeadCommitted {
+                let interrupted_root = fs::read_dir(root.path().join("cells"))
+                    .expect("cell roots read")
+                    .map(|entry| {
+                        entry
+                            .expect("cell root reads")
+                            .path()
+                            .join("protocol-19-world-v21")
+                    })
+                    .find(|cell_root| cell_root.join("lifecycle-v2.head.json").exists())
+                    .expect("interrupted bootstrap cell exists");
+                OpenOptions::new()
+                    .append(true)
+                    .open(interrupted_root.join("lifecycle-v2.ndjson"))
+                    .and_then(|mut file| file.write_all(b"{\"unterminated\":"))
+                    .expect("test appends an unterminated initial record fragment");
+            }
+
+            let mut recovered = open_activated_protocol19_world(root.path(), TEST_SEED, &policy)
+                .unwrap_or_else(|error| panic!("{failpoint:?} must recover: {error}"));
+            let cell_key = crate::cell_origin_key();
+            let outcome = recovered
+                .dispatch_background_production_with_clock(
+                    &cell_key,
+                    "initial-lifecycle-recovery",
+                    &ManualClock(TRUSTED_NOW + 1_000),
+                )
+                .expect("recovered immutable genesis claims and releases once");
+            assert_eq!(outcome.mode, "sleeping");
+            assert_eq!(outcome.committed_quanta, 0);
+        }
+    }
+
+    #[test]
+    fn lifecycle_v2_rejects_resealed_pending_successor_before_child_mutation() {
+        let (root, prepared, policy, keys) = fixture();
+        let signed = signed_authorization(
+            &prepared,
+            &policy,
+            &keys,
+            &[0, 1],
+            TRUSTED_NOW - 1_000,
+            TRUSTED_NOW + 10_000,
+        );
+        activate_protocol19_world_with_clock(
+            root.path(),
+            TEST_SEED,
+            &policy,
+            &signed,
+            &ManualClock(TRUSTED_NOW),
+        )
+        .expect("world activates");
+        let cell_key = crate::cell_origin_key();
+        let mut world = open_activated_protocol19_world(root.path(), TEST_SEED, &policy)
+            .expect("universe lifecycle bootstraps");
+        let cell_id = world
+            .cell_assignment(&cell_key)
+            .expect("cell resolves")
+            .cell_id
+            .clone();
+        world.set_lifecycle_coordinator_failpoint_for_test(
+            crate::protocol19_install::Protocol19LifecycleCoordinatorFailpoint::UniverseLifecycleWriteAheadCommitted,
+        );
+        assert!(
+            world
+                .dispatch_background_production_with_clock(
+                    &cell_key,
+                    "resealed-pending-rejection",
+                    &ManualClock(TRUSTED_NOW + 1_000),
+                )
+                .is_err()
+        );
+        let lifecycle_root = root
+            .path()
+            .join("cells")
+            .join(cell_id)
+            .join("protocol-19-world-v21");
+        let history_path = lifecycle_root.join("lifecycle-v2.ndjson");
+        let head_path = lifecycle_root.join("lifecycle-v2.head.json");
+        let history_before = fs::read(&history_path).expect("child history reads");
+        let head_before = fs::read(&head_path).expect("child head reads");
+        world
+            .reseal_pending_lifecycle_outside_state_machine_for_test()
+            .expect("test reseals a structurally valid invalid successor");
+        drop(world);
+
+        assert!(
+            open_activated_protocol19_world(root.path(), TEST_SEED, &policy).is_err(),
+            "a resealed pending record outside the state machine must fail closed"
+        );
+        assert_eq!(
+            fs::read(history_path).expect("rejected child history reads"),
+            history_before
+        );
+        assert_eq!(
+            fs::read(head_path).expect("rejected child head reads"),
+            head_before
+        );
+    }
+
+    #[test]
+    fn lifecycle_v2_universe_head_atomic_boundaries_recover_exactly() {
+        use crate::protocol19_install::Protocol19LifecycleCoordinatorFailpoint;
+
+        for failpoint in [
+            Protocol19LifecycleCoordinatorFailpoint::UniverseLifecycleBeginSyncedBeforeRename,
+            Protocol19LifecycleCoordinatorFailpoint::UniverseLifecycleBeginRenamedBeforeMemory,
+            Protocol19LifecycleCoordinatorFailpoint::UniverseLifecycleFinishSyncedBeforeRename,
+            Protocol19LifecycleCoordinatorFailpoint::UniverseLifecycleFinishRenamedBeforeMemory,
+        ] {
+            let (root, prepared, policy, keys) = fixture();
+            let signed = signed_authorization(
+                &prepared,
+                &policy,
+                &keys,
+                &[0, 1],
+                TRUSTED_NOW - 1_000,
+                TRUSTED_NOW + 10_000,
+            );
+            activate_protocol19_world_with_clock(
+                root.path(),
+                TEST_SEED,
+                &policy,
+                &signed,
+                &ManualClock(TRUSTED_NOW),
+            )
+            .expect("world activates");
+            let cell_key = crate::cell_origin_key();
+            let mut world = open_activated_protocol19_world(root.path(), TEST_SEED, &policy)
+                .expect("universe lifecycle bootstraps");
+            let before = world
+                .cell_assignment(&cell_key)
+                .expect("sleeping assignment resolves")
+                .clone();
+            world.set_lifecycle_coordinator_failpoint_for_test(failpoint);
+            assert!(
+                world
+                    .dispatch_background_production_with_clock(
+                        &cell_key,
+                        "universe-head-atomic-recovery",
+                        &ManualClock(TRUSTED_NOW + 1_000),
+                    )
+                    .is_err(),
+                "injected {failpoint:?} boundary must surface"
+            );
+            drop(world);
+
+            let mut recovered = open_activated_protocol19_world(root.path(), TEST_SEED, &policy)
+                .unwrap_or_else(|error| panic!("{failpoint:?} must recover: {error}"));
+            let outcome = recovered
+                .dispatch_background_production_with_clock(
+                    &cell_key,
+                    "universe-head-atomic-recovery",
+                    &ManualClock(TRUSTED_NOW + 1_000),
+                )
+                .expect("recovered universe head completes exactly once");
+            assert_eq!(outcome.mode, "sleeping");
+            assert_eq!(outcome.committed_quanta, 0);
+            let after = recovered
+                .cell_assignment(&cell_key)
+                .expect("recovered release resolves");
+            assert_eq!(
+                after.assignment_generation,
+                before.assignment_generation + 1
+            );
+            assert_eq!(
+                after.authority_fencing_token,
+                before.authority_fencing_token + 1
+            );
+        }
+    }
+
+    #[test]
+    fn lifecycle_v2_recovery_truncates_partial_tail_and_removes_bounded_stale_temp() {
+        let (root, prepared, policy, keys) = fixture();
+        let signed = signed_authorization(
+            &prepared,
+            &policy,
+            &keys,
+            &[0, 1],
+            TRUSTED_NOW - 1_000,
+            TRUSTED_NOW + 10_000,
+        );
+        activate_protocol19_world_with_clock(
+            root.path(),
+            TEST_SEED,
+            &policy,
+            &signed,
+            &ManualClock(TRUSTED_NOW),
+        )
+        .expect("world activates");
+        let cell_key = crate::cell_origin_key();
+        let mut world = open_activated_protocol19_world(root.path(), TEST_SEED, &policy)
+            .expect("activated lifecycle opens");
+        world
+            .dispatch_background_production_with_clock(
+                &cell_key,
+                "lifecycle-tail-recovery",
+                &ManualClock(TRUSTED_NOW + 1_000),
+            )
+            .expect("empty cell dispatch establishes a complete lifecycle history");
+        let cell_id = world
+            .cell_assignment(&cell_key)
+            .expect("cell resolves")
+            .cell_id
+            .clone();
+        drop(world);
+
+        let lifecycle_root = root
+            .path()
+            .join("cells")
+            .join(cell_id)
+            .join("protocol-19-world-v21");
+        let history = lifecycle_root.join("lifecycle-v2.ndjson");
+        let committed_len = fs::metadata(&history)
+            .expect("history metadata reads")
+            .len();
+        OpenOptions::new()
+            .append(true)
+            .open(&history)
+            .and_then(|mut file| file.write_all(b"{\"partial\":"))
+            .expect("test appends an unterminated lifecycle fragment");
+        let stale_temp =
+            lifecycle_root.join(".lifecycle-v2.head.json.00000000-0000-4000-8000-000000000000.tmp");
+        fs::write(&stale_temp, b"stale").expect("test creates a bounded stale head temporary");
+
+        drop(
+            open_activated_protocol19_world(root.path(), TEST_SEED, &policy)
+                .expect("bounded recovery restores the committed lifecycle frontier"),
+        );
+        assert_eq!(
+            fs::metadata(history)
+                .expect("recovered history metadata reads")
+                .len(),
+            committed_len
+        );
+        assert!(!stale_temp.exists());
+    }
+
+    #[test]
+    fn lifecycle_v2_recovers_directory_commit_before_lifecycle_finalization() {
+        let (root, prepared, policy, keys) = fixture();
+        let signed = signed_authorization(
+            &prepared,
+            &policy,
+            &keys,
+            &[0, 1],
+            TRUSTED_NOW - 1_000,
+            TRUSTED_NOW + 10_000,
+        );
+        activate_protocol19_world_with_clock(
+            root.path(),
+            TEST_SEED,
+            &policy,
+            &signed,
+            &ManualClock(TRUSTED_NOW),
+        )
+        .expect("world activates");
+        let cell_key = crate::cell_origin_key();
+        let mut world = open_activated_protocol19_world(root.path(), TEST_SEED, &policy)
+            .expect("activated lifecycle opens");
+        let before = world
+            .cell_assignment(&cell_key)
+            .expect("sleeping assignment resolves")
+            .clone();
+        world.set_lifecycle_coordinator_failpoint_for_test(
+            crate::protocol19_install::Protocol19LifecycleCoordinatorFailpoint::DirectoryAuthorityCommitted,
+        );
+        assert!(
+            world
+                .dispatch_background_production_with_clock(
+                    &cell_key,
+                    "lifecycle-directory-gap",
+                    &ManualClock(TRUSTED_NOW + 1_000),
+                )
+                .is_err()
+        );
+        let assigned = world
+            .cell_assignment(&cell_key)
+            .expect("directory successor committed")
+            .clone();
+        assert_eq!(assigned.state, crate::CellAssignmentState::Assigned);
+        assert_eq!(
+            assigned.assignment_generation,
+            before.assignment_generation + 1
+        );
+        drop(world);
+
+        let mut recovered = open_activated_protocol19_world(root.path(), TEST_SEED, &policy)
+            .expect("split authority transaction reopens");
+        let outcome = recovered
+            .dispatch_background_production_with_clock(
+                &cell_key,
+                "lifecycle-directory-gap",
+                &ManualClock(TRUSTED_NOW + 1_000),
+            )
+            .expect("exact pending claim finalizes without another generation");
+        assert_eq!(outcome.mode, "sleeping");
+        let released = recovered
+            .cell_assignment(&cell_key)
+            .expect("cell releases after recovery");
+        assert_eq!(
+            released.assignment_generation,
+            assigned.assignment_generation
+        );
+        assert_eq!(
+            released.authority_fencing_token,
+            assigned.authority_fencing_token
+        );
+    }
+
+    #[test]
+    fn lifecycle_v2_recovers_release_commit_before_sleeping_finalization() {
+        let (root, prepared, policy, keys) = fixture();
+        let signed = signed_authorization(
+            &prepared,
+            &policy,
+            &keys,
+            &[0, 1],
+            TRUSTED_NOW - 1_000,
+            TRUSTED_NOW + 10_000,
+        );
+        activate_protocol19_world_with_clock(
+            root.path(),
+            TEST_SEED,
+            &policy,
+            &signed,
+            &ManualClock(TRUSTED_NOW),
+        )
+        .expect("world activates");
+        let cell_key = crate::cell_origin_key();
+        let mut world = open_activated_protocol19_world(root.path(), TEST_SEED, &policy)
+            .expect("activated lifecycle opens");
+        let before = world
+            .cell_assignment(&cell_key)
+            .expect("sleeping assignment resolves")
+            .clone();
+        world.set_lifecycle_coordinator_failpoint_for_test(
+            crate::protocol19_install::Protocol19LifecycleCoordinatorFailpoint::DirectoryReleaseCommitted,
+        );
+        assert!(
+            world
+                .dispatch_background_production_with_clock(
+                    &cell_key,
+                    "lifecycle-release-gap",
+                    &ManualClock(TRUSTED_NOW + 1_000),
+                )
+                .is_err()
+        );
+        let released = world
+            .cell_assignment(&cell_key)
+            .expect("directory release committed")
+            .clone();
+        assert_eq!(released.state, crate::CellAssignmentState::Sleeping);
+        assert_eq!(
+            released.assignment_generation,
+            before.assignment_generation + 1
+        );
+        drop(world);
+
+        let mut recovered = open_activated_protocol19_world(root.path(), TEST_SEED, &policy)
+            .expect("split release transaction reopens");
+        let outcome = recovered
+            .dispatch_background_production_with_clock(
+                &cell_key,
+                "lifecycle-release-gap",
+                &ManualClock(TRUSTED_NOW + 1_000),
+            )
+            .expect("exact pending release finalizes without reacquiring the cell");
+        assert_eq!(outcome.mode, "sleeping");
+        assert_eq!(
+            recovered
+                .cell_assignment(&cell_key)
+                .expect("release remains the directory tip"),
             &released
         );
-        let reclaimed = reopened
-            .claim_cell_authority(&cell_key, released.assignment_generation, "worker-v19-c")
-            .expect("restarted authority advances again");
+    }
+
+    #[test]
+    fn lifecycle_v2_expired_same_holder_recovery_advances_fence_once() {
+        let (root, prepared, policy, keys) = fixture();
+        let signed = signed_authorization(
+            &prepared,
+            &policy,
+            &keys,
+            &[0, 1],
+            TRUSTED_NOW - 1_000,
+            TRUSTED_NOW + 10_000,
+        );
+        activate_protocol19_world_with_clock(
+            root.path(),
+            TEST_SEED,
+            &policy,
+            &signed,
+            &ManualClock(TRUSTED_NOW),
+        )
+        .expect("world activates");
+        let cell_key = crate::cell_origin_key();
+        let mut world = open_activated_protocol19_world(root.path(), TEST_SEED, &policy)
+            .expect("activated lifecycle opens");
+        world.set_lifecycle_coordinator_failpoint_for_test(
+            crate::protocol19_install::Protocol19LifecycleCoordinatorFailpoint::AuthorityFinalized,
+        );
+        assert!(
+            world
+                .dispatch_background_production_with_clock(
+                    &cell_key,
+                    "lifecycle-restarted-holder",
+                    &ManualClock(TRUSTED_NOW + 1_000),
+                )
+                .is_err()
+        );
+        let assigned = world
+            .cell_assignment(&cell_key)
+            .expect("initial authority committed")
+            .clone();
+        assert_eq!(assigned.state, crate::CellAssignmentState::Assigned);
+        drop(world);
+
+        let mut recovered = open_activated_protocol19_world(root.path(), TEST_SEED, &policy)
+            .expect("assigned lifecycle reopens under the exclusive writer lock");
+        let outcome = recovered
+            .dispatch_background_production_with_clock(
+                &cell_key,
+                "lifecycle-restarted-holder",
+                &ManualClock(TRUSTED_NOW + 16_001),
+            )
+            .expect("expired logical authority is recovered even with the same stable holder id");
+        assert_eq!(outcome.mode, "sleeping");
+        let released = recovered
+            .cell_assignment(&cell_key)
+            .expect("recovered empty cell releases");
         assert_eq!(
-            reclaimed.assignment_generation,
-            released.assignment_generation + 1
+            released.assignment_generation,
+            assigned.assignment_generation + 1
         );
         assert_eq!(
-            reclaimed.authority_fencing_token,
-            released.authority_fencing_token + 1
+            released.authority_fencing_token,
+            assigned.authority_fencing_token + 1
         );
+    }
+
+    #[test]
+    fn lifecycle_v2_all_cell_preflight_precedes_any_runtime_write() {
+        let (root, prepared, policy, keys) = fixture();
+        let signed = signed_authorization(
+            &prepared,
+            &policy,
+            &keys,
+            &[0, 1],
+            TRUSTED_NOW - 1_000,
+            TRUSTED_NOW + 10_000,
+        );
+        activate_protocol19_world_with_clock(
+            root.path(),
+            TEST_SEED,
+            &policy,
+            &signed,
+            &ManualClock(TRUSTED_NOW),
+        )
+        .expect("world activates");
+        let cell_roots = crate::proof_cell_keys()
+            .expect("proof cells derive")
+            .iter()
+            .map(|cell_key| {
+                root.path()
+                    .join("cells")
+                    .join(crate::cell_id(cell_key).expect("cell identity derives"))
+                    .join("protocol-19-world-v21")
+            })
+            .collect::<Vec<_>>();
+        let first_before = fs::read_dir(&cell_roots[0])
+            .expect("first cell reads")
+            .map(|entry| {
+                let path = entry.expect("first cell entry reads").path();
+                let name = path
+                    .file_name()
+                    .expect("first cell file has a name")
+                    .to_owned();
+                (name, fs::read(path).expect("first cell file reads"))
+            })
+            .collect::<BTreeMap<_, _>>();
+        fs::write(cell_roots[1].join("snapshot-v21.json"), b"{}")
+            .expect("test corrupts a canonical-named second-cell artifact");
+
+        assert!(
+            open_activated_protocol19_world(root.path(), TEST_SEED, &policy).is_err(),
+            "a later invalid cell blocks activated recovery"
+        );
+        let first_after = fs::read_dir(&cell_roots[0])
+            .expect("first cell rereads")
+            .map(|entry| {
+                let path = entry.expect("first cell entry rereads").path();
+                let name = path
+                    .file_name()
+                    .expect("first cell file has a name")
+                    .to_owned();
+                (name, fs::read(path).expect("first cell file rereads"))
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(first_after, first_before);
+        assert!(!cell_roots[0].join("lifecycle-v2.ndjson").exists());
+        assert!(!cell_roots[0].join("lifecycle-v2.head.json").exists());
     }
 }

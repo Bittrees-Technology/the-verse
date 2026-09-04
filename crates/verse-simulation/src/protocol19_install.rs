@@ -7,11 +7,12 @@
 //! marker. Active boot first obtains a read-only validated capability, then
 //! consumes it to open recovery-capable stores only after authorization.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -19,10 +20,18 @@ use thiserror::Error;
 use uuid::Uuid;
 use verse_protocol::{CellKeyV1, protocol_v19::Protocol19CompatibilityTuple};
 
-use crate::cell_directory::{CellAssignmentRecord, CellDirectoryError};
+#[cfg(test)]
+use crate::cell_directory::CellAssignmentRecord;
+use crate::cell_directory::{CellAssignmentState, CellDirectoryError};
 use crate::cell_directory_v3::{
     ActiveDirectoryV3Expectation, DraftCellDirectoryHistoryStoreV3,
     ValidatedProtocol19DirectoryGenesis,
+};
+use crate::grid_handoff_v2::lifecycle_v2::{
+    LifecycleAuthorityOperationKindV2, LifecycleHeadCommitmentV2,
+    LifecycleInitializationFailpointV2, LifecycleModeV2, LifecycleRecordV2,
+    LifecycleRuntimePreflightV2, LifecycleV2Error, PRODUCTION_QUANTUM_MILLIS,
+    PreparedLifecycleAppendV2,
 };
 use crate::grid_handoff_v2::migration_transform::ValidatedProtocol19MigrationTransform;
 use crate::grid_handoff_v2::migration_transform::{
@@ -33,11 +42,634 @@ use crate::grid_handoff_v2::store_v21::{
     ValidatedWorld21StagingTarget,
 };
 use crate::manifest_v5::ValidatedUniverseManifestV5;
+use crate::persistence::TrustedClock;
 use crate::protocol19_migration::{
     CanonicalProtocol19MigrationReceiptEvidence, MigrationReceiptError,
     ValidatedProtocol19MigrationReceipt, hash_source_directory_archive,
     recover_canonical_migration_receipt,
 };
+
+const MAX_BACKGROUND_QUANTA_PER_DISPATCH: u64 = 60;
+const MAX_BACKGROUND_DISPATCH_TIME: Duration = Duration::from_millis(250);
+const ACTIVATION_DIRECTORY: &str = "protocol-19-activation-v1";
+const UNIVERSE_LIFECYCLE_HEAD_FILE: &str = "universe-lifecycle-v1.head.json";
+const UNIVERSE_LIFECYCLE_HEAD_SCHEMA_VERSION: u32 = 1;
+const UNIVERSE_LIFECYCLE_HEAD_HASH_DOMAIN: &[u8] = b"the-verse/universe-lifecycle-head/v1\0";
+const UNIVERSE_LIFECYCLE_GENESIS_ROOT_DOMAIN: &[u8] =
+    b"the-verse/universe-lifecycle-genesis-root/v1\0";
+const MAX_UNIVERSE_LIFECYCLE_HEAD_BYTES: usize = 16 * 1_024 * 1_024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Protocol19BackgroundDispatchOutcome {
+    pub(crate) mode: &'static str,
+    pub(crate) committed_quanta: u64,
+    pub(crate) acknowledged_production_sequence: u64,
+    pub(crate) next_scheduled_for_unix_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UniverseLifecycleGenesisBindingV1 {
+    cell_id: String,
+    lifecycle_genesis_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PendingUniverseLifecycleAppendV1 {
+    cell_id: String,
+    prior: Option<LifecycleHeadCommitmentV2>,
+    record: LifecycleRecordV2,
+    next: LifecycleHeadCommitmentV2,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UniverseLifecycleHeadV1 {
+    schema_version: u32,
+    compatibility: Protocol19CompatibilityTuple,
+    universe_id: String,
+    manifest_hash: String,
+    active_head_hash: String,
+    prepared_install_head_hash: String,
+    cell_set_root: String,
+    lifecycle_genesis_root: String,
+    universe_lifecycle_revision: u64,
+    cells: BTreeMap<String, LifecycleHeadCommitmentV2>,
+    pending_append: Option<PendingUniverseLifecycleAppendV1>,
+    previous_head_hash: String,
+    head_hash: String,
+}
+
+impl UniverseLifecycleHeadV1 {
+    fn initial(
+        prepared: &Protocol19PreparedInstallHeadV1,
+        active_head_hash: &str,
+    ) -> Result<Self, Protocol19InstallError> {
+        let mut head = Self {
+            schema_version: UNIVERSE_LIFECYCLE_HEAD_SCHEMA_VERSION,
+            compatibility: Protocol19CompatibilityTuple::canonical(),
+            universe_id: prepared.universe_id.clone(),
+            manifest_hash: prepared.target_manifest_hash.clone(),
+            active_head_hash: active_head_hash.to_owned(),
+            prepared_install_head_hash: prepared.head_hash.clone(),
+            cell_set_root: prepared.cell_set_root.clone(),
+            lifecycle_genesis_root: lifecycle_genesis_root(prepared)?,
+            universe_lifecycle_revision: 1,
+            cells: BTreeMap::new(),
+            pending_append: None,
+            previous_head_hash: String::new(),
+            head_hash: String::new(),
+        };
+        head.seal()?;
+        Ok(head)
+    }
+
+    fn validate_identity(
+        &self,
+        prepared: &Protocol19PreparedInstallHeadV1,
+        active_head_hash: &str,
+    ) -> Result<(), Protocol19InstallError> {
+        let cells_known = self
+            .cells
+            .keys()
+            .all(|cell_id| prepared.cells.iter().any(|cell| &cell.cell_id == cell_id));
+        let pending_known = self.pending_append.as_ref().is_none_or(|pending| {
+            prepared
+                .cells
+                .iter()
+                .any(|cell| cell.cell_id == pending.cell_id)
+                && self.cells.get(&pending.cell_id) == pending.prior.as_ref()
+                && pending.next.last_record_hash() == pending.record.record_hash()
+                && pending
+                    .prior
+                    .as_ref()
+                    .map_or(pending.next.entry_count() == 1, |prior| {
+                        pending.next.is_direct_successor_of(prior)
+                    })
+        });
+        if self.schema_version != UNIVERSE_LIFECYCLE_HEAD_SCHEMA_VERSION
+            || self.compatibility != Protocol19CompatibilityTuple::canonical()
+            || self.universe_id != prepared.universe_id
+            || self.manifest_hash != prepared.target_manifest_hash
+            || self.active_head_hash != active_head_hash
+            || self.prepared_install_head_hash != prepared.head_hash
+            || self.cell_set_root != prepared.cell_set_root
+            || self.lifecycle_genesis_root != lifecycle_genesis_root(prepared)?
+            || self.universe_lifecycle_revision == 0
+            || (self.universe_lifecycle_revision == 1) != self.previous_head_hash.is_empty()
+            || !cells_known
+            || !pending_known
+            || !valid_hash(&self.head_hash)
+            || (!self.previous_head_hash.is_empty() && !valid_hash(&self.previous_head_hash))
+            || self.head_hash != self.calculate_hash()?
+        {
+            return Err(Protocol19InstallError::Invalid(
+                "universe lifecycle head is invalid or belongs to another activation".into(),
+            ));
+        }
+        for (cell_id, commitment) in &self.cells {
+            let genesis = prepared
+                .cells
+                .iter()
+                .find(|cell| &cell.cell_id == cell_id)
+                .expect("known lifecycle cell has prepared evidence");
+            commitment
+                .validate_identity(&genesis.lifecycle_record_hash, active_head_hash)
+                .map_err(Protocol19InstallError::from)?;
+        }
+        if let Some(pending) = &self.pending_append {
+            let genesis = prepared
+                .cells
+                .iter()
+                .find(|cell| cell.cell_id == pending.cell_id)
+                .expect("known pending lifecycle cell has prepared evidence");
+            pending
+                .next
+                .validate_identity(&genesis.lifecycle_record_hash, active_head_hash)?;
+            pending.record.validate_universe_identity(
+                &pending.cell_id,
+                &genesis.lifecycle_record_hash,
+                active_head_hash,
+            )?;
+            if let Some(prior) = &pending.prior {
+                prior.validate_identity(&genesis.lifecycle_record_hash, active_head_hash)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn begin_append(
+        &self,
+        cell_id: &str,
+        prepared: &PreparedLifecycleAppendV2,
+    ) -> Result<Self, Protocol19InstallError> {
+        if self.pending_append.is_some() {
+            return Err(Protocol19InstallError::Invalid(
+                "universe lifecycle already has a pending materialization".into(),
+            ));
+        }
+        let prior = self.cells.get(cell_id).cloned();
+        let next = prepared.next_commitment();
+        if prior.as_ref().map_or(next.entry_count() != 1, |prior| {
+            !next.is_direct_successor_of(prior)
+        }) {
+            return Err(Protocol19InstallError::Invalid(
+                "universe lifecycle append is not one exact child successor".into(),
+            ));
+        }
+        let mut head = self.successor()?;
+        head.pending_append = Some(PendingUniverseLifecycleAppendV1 {
+            cell_id: cell_id.to_owned(),
+            prior,
+            record: prepared.record().clone(),
+            next,
+        });
+        head.seal()?;
+        Ok(head)
+    }
+
+    fn finish_append(&self) -> Result<Self, Protocol19InstallError> {
+        let pending = self.pending_append.as_ref().ok_or_else(|| {
+            Protocol19InstallError::Invalid(
+                "universe lifecycle has no pending materialization".into(),
+            )
+        })?;
+        let mut head = self.successor()?;
+        head.cells
+            .insert(pending.cell_id.clone(), pending.next.clone());
+        head.pending_append = None;
+        head.seal()?;
+        Ok(head)
+    }
+
+    fn successor(&self) -> Result<Self, Protocol19InstallError> {
+        let mut head = self.clone();
+        head.universe_lifecycle_revision = self
+            .universe_lifecycle_revision
+            .checked_add(1)
+            .ok_or_else(|| {
+                Protocol19InstallError::Invalid("universe lifecycle revision is exhausted".into())
+            })?;
+        head.previous_head_hash.clone_from(&self.head_hash);
+        head.head_hash.clear();
+        Ok(head)
+    }
+
+    fn seal(&mut self) -> Result<(), Protocol19InstallError> {
+        self.head_hash.clear();
+        self.head_hash = self.calculate_hash()?;
+        Ok(())
+    }
+
+    fn calculate_hash(&self) -> Result<String, Protocol19InstallError> {
+        let mut material = self.clone();
+        material.head_hash.clear();
+        hash_json(UNIVERSE_LIFECYCLE_HEAD_HASH_DOMAIN, &material)
+    }
+}
+
+#[derive(Debug)]
+struct UniverseLifecycleStoreV1 {
+    path: PathBuf,
+    head: UniverseLifecycleHeadV1,
+    poisoned: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UniverseLifecyclePersistFailpointV1 {
+    HeadSyncedBeforeRename,
+    HeadRenamedBeforeMemory,
+}
+
+impl UniverseLifecycleStoreV1 {
+    fn read_if_present(
+        universe_root: &Path,
+        prepared: &Protocol19PreparedInstallHeadV1,
+        active_head_hash: &str,
+    ) -> Result<Option<UniverseLifecycleHeadV1>, Protocol19InstallError> {
+        let path = universe_root
+            .join(ACTIVATION_DIRECTORY)
+            .join(UNIVERSE_LIFECYCLE_HEAD_FILE);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => return Err(io_error(&path, source)),
+        };
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(Protocol19InstallError::Invalid(
+                "universe lifecycle head is not a regular file".into(),
+            ));
+        }
+        let bytes = read_bounded(&path, MAX_UNIVERSE_LIFECYCLE_HEAD_BYTES)?;
+        let head: UniverseLifecycleHeadV1 = serde_json::from_slice(&bytes)
+            .map_err(|source| Protocol19InstallError::Json(source.to_string()))?;
+        if serde_json::to_vec(&head)
+            .map_err(|source| Protocol19InstallError::Json(source.to_string()))?
+            != bytes
+        {
+            return Err(Protocol19InstallError::Invalid(
+                "universe lifecycle head bytes are not canonical".into(),
+            ));
+        }
+        head.validate_identity(prepared, active_head_hash)?;
+        Ok(Some(head))
+    }
+
+    fn open_or_bootstrap(
+        universe_root: &Path,
+        prepared: &Protocol19PreparedInstallHeadV1,
+        active_head_hash: &str,
+    ) -> Result<Self, Protocol19InstallError> {
+        let activation_root = universe_root.join(ACTIVATION_DIRECTORY);
+        cleanup_universe_lifecycle_temps(&activation_root)?;
+        let path = activation_root.join(UNIVERSE_LIFECYCLE_HEAD_FILE);
+        let head =
+            if let Some(head) = Self::read_if_present(universe_root, prepared, active_head_hash)? {
+                head
+            } else {
+                let head = UniverseLifecycleHeadV1::initial(prepared, active_head_hash)?;
+                atomic_write(
+                    &path,
+                    &serde_json::to_vec(&head)
+                        .map_err(|source| Protocol19InstallError::Json(source.to_string()))?,
+                )?;
+                head
+            };
+        Ok(Self {
+            path,
+            head,
+            poisoned: false,
+        })
+    }
+
+    fn persist(
+        &mut self,
+        next: UniverseLifecycleHeadV1,
+        failpoint: Option<UniverseLifecyclePersistFailpointV1>,
+    ) -> Result<(), Protocol19InstallError> {
+        if self.poisoned {
+            return Err(Protocol19InstallError::Invalid(
+                "universe lifecycle write outcome is uncertain; reopen before retry".into(),
+            ));
+        }
+        let persisted = read_bounded(&self.path, MAX_UNIVERSE_LIFECYCLE_HEAD_BYTES)?;
+        let expected = serde_json::to_vec(&self.head)
+            .map_err(|source| Protocol19InstallError::Json(source.to_string()))?;
+        if persisted != expected {
+            self.poisoned = true;
+            return Err(Protocol19InstallError::Invalid(
+                "persisted universe lifecycle head diverged from the locked in-memory tip".into(),
+            ));
+        }
+        let bytes = serde_json::to_vec(&next)
+            .map_err(|source| Protocol19InstallError::Json(source.to_string()))?;
+        if bytes.len() > MAX_UNIVERSE_LIFECYCLE_HEAD_BYTES {
+            return Err(Protocol19InstallError::TooLarge(self.path.clone()));
+        }
+        if let Err(error) = atomic_write_universe_lifecycle_head(&self.path, &bytes, failpoint) {
+            self.poisoned = true;
+            return Err(error);
+        }
+        self.head = next;
+        Ok(())
+    }
+
+    fn begin_append(
+        &mut self,
+        cell_id: &str,
+        prepared: &PreparedLifecycleAppendV2,
+        failpoint: Option<UniverseLifecyclePersistFailpointV1>,
+    ) -> Result<(), Protocol19InstallError> {
+        let next = self.head.begin_append(cell_id, prepared)?;
+        self.persist(next, failpoint)
+    }
+
+    fn finish_append(
+        &mut self,
+        failpoint: Option<UniverseLifecyclePersistFailpointV1>,
+    ) -> Result<(), Protocol19InstallError> {
+        let next = self.head.finish_append()?;
+        self.persist(next, failpoint)
+    }
+}
+
+fn cleanup_universe_lifecycle_temps(root: &Path) -> Result<(), Protocol19InstallError> {
+    let prefix = format!(".{UNIVERSE_LIFECYCLE_HEAD_FILE}.tmp-");
+    let mut paths = Vec::new();
+    for entry in fs::read_dir(root).map_err(|source| io_error(root, source))? {
+        let entry = entry.map_err(|source| io_error(root, source))?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(uuid) = name.strip_prefix(&prefix) else {
+            continue;
+        };
+        if Uuid::parse_str(uuid).is_err()
+            || !entry
+                .file_type()
+                .map_err(|source| io_error(entry.path(), source))?
+                .is_file()
+        {
+            return Err(Protocol19InstallError::Invalid(
+                "universe lifecycle staging debris is malformed".into(),
+            ));
+        }
+        paths.push(entry.path());
+    }
+    if paths.len() > 64 {
+        return Err(Protocol19InstallError::Invalid(
+            "universe lifecycle staging debris exceeds its bound".into(),
+        ));
+    }
+    for path in paths {
+        fs::remove_file(&path).map_err(|source| io_error(&path, source))?;
+    }
+    sync_directory(root)
+}
+
+fn lifecycle_genesis_root(
+    prepared: &Protocol19PreparedInstallHeadV1,
+) -> Result<String, Protocol19InstallError> {
+    let bindings: Vec<_> = prepared
+        .cells
+        .iter()
+        .map(|cell| UniverseLifecycleGenesisBindingV1 {
+            cell_id: cell.cell_id.clone(),
+            lifecycle_genesis_hash: cell.lifecycle_record_hash.clone(),
+        })
+        .collect();
+    hash_json(UNIVERSE_LIFECYCLE_GENESIS_ROOT_DOMAIN, &bindings)
+}
+
+fn reconcile_universe_lifecycle(
+    universe: &mut UniverseLifecycleStoreV1,
+    cells: &mut BTreeMap<String, DraftWorld21Store>,
+    lifecycle_states: &mut BTreeMap<String, LifecycleRuntimePreflightV2>,
+    directory: &DraftCellDirectoryHistoryStoreV3,
+    active_head_hash: &str,
+    initialization_failpoint: &mut Option<LifecycleInitializationFailpointV2>,
+) -> Result<(), Protocol19InstallError> {
+    if let Some(pending) = universe.head.pending_append.clone() {
+        let state = lifecycle_states.get(&pending.cell_id).ok_or_else(|| {
+            Protocol19InstallError::Invalid(
+                "universe lifecycle pending append names an unknown cell".into(),
+            )
+        })?;
+        let assignment = directory.current_cell_assignment(&pending.cell_id)?;
+        let cell = cells
+            .get_mut(&pending.cell_id)
+            .expect("preflighted cell exists");
+        let materialized = if let Some(preflight_commitment) = state.committed() {
+            let current =
+                cell.open_or_initialize_lifecycle(active_head_hash, &assignment, directory)?;
+            if &current != preflight_commitment {
+                return Err(Protocol19InstallError::Invalid(
+                    "mutable lifecycle open differs from its preflight commitment".into(),
+                ));
+            }
+            if current == pending.next {
+                current
+            } else if pending.prior.as_ref() == Some(&current) {
+                let prepared = cell.prepare_lifecycle_append(pending.record.clone(), directory)?;
+                if prepared.next_commitment() != pending.next {
+                    return Err(Protocol19InstallError::Invalid(
+                        "pending universe lifecycle successor is not deterministic".into(),
+                    ));
+                }
+                cell.materialize_lifecycle_append(prepared, directory)?;
+                cell.lifecycle_commitment()?
+            } else {
+                return Err(Protocol19InstallError::Invalid(
+                    "cell lifecycle tip differs from the universe pending append".into(),
+                ));
+            }
+        } else {
+            if pending.prior.is_some() || !state.is_uncommitted_bootstrap() {
+                return Err(Protocol19InstallError::Invalid(
+                    "committed cell lifecycle history is missing".into(),
+                ));
+            }
+            let prepared = cell.prepare_initial_lifecycle_append(active_head_hash, &assignment)?;
+            if prepared.record() != &pending.record || prepared.next_commitment() != pending.next {
+                return Err(Protocol19InstallError::Invalid(
+                    "pending initial lifecycle append differs from immutable genesis".into(),
+                ));
+            }
+            if let Some(failpoint) = initialization_failpoint.take() {
+                cell.initialize_prepared_lifecycle_with_failpoint(
+                    active_head_hash,
+                    prepared,
+                    directory,
+                    failpoint,
+                )?
+            } else {
+                cell.initialize_prepared_lifecycle(active_head_hash, prepared, directory)?
+            }
+        };
+        if materialized != pending.next {
+            return Err(Protocol19InstallError::Invalid(
+                "cell lifecycle did not materialize the universe commitment".into(),
+            ));
+        }
+        universe.finish_append(None)?;
+        lifecycle_states.insert(
+            pending.cell_id,
+            LifecycleRuntimePreflightV2::Committed(materialized),
+        );
+    }
+
+    let cell_ids: Vec<_> = cells.keys().cloned().collect();
+    for cell_id in cell_ids {
+        let state = lifecycle_states
+            .get(&cell_id)
+            .expect("preflight recorded every activated cell");
+        let committed = universe.head.cells.get(&cell_id).cloned();
+        match (committed, state) {
+            (Some(expected), LifecycleRuntimePreflightV2::Committed(preflight_commitment)) => {
+                let assignment = directory.current_cell_assignment(&cell_id)?;
+                let actual = cells
+                    .get_mut(&cell_id)
+                    .expect("preflighted cell exists")
+                    .open_or_initialize_lifecycle(active_head_hash, &assignment, directory)?;
+                if actual != expected || actual != *preflight_commitment {
+                    return Err(Protocol19InstallError::Invalid(
+                        "cell lifecycle tip differs from the universe commitment".into(),
+                    ));
+                }
+            }
+            (Some(_), _) => {
+                return Err(Protocol19InstallError::Invalid(
+                    "universe-committed cell lifecycle artifacts are missing".into(),
+                ));
+            }
+            (None, LifecycleRuntimePreflightV2::Committed(_)) => {
+                return Err(Protocol19InstallError::Invalid(
+                    "cell lifecycle exists without universe authorization".into(),
+                ));
+            }
+            (None, LifecycleRuntimePreflightV2::Absent) => {
+                let assignment = directory.current_cell_assignment(&cell_id)?;
+                let prepared = cells
+                    .get(&cell_id)
+                    .expect("preflighted cell exists")
+                    .prepare_initial_lifecycle_append(active_head_hash, &assignment)?;
+                universe.begin_append(&cell_id, &prepared, None)?;
+                let cell = cells.get_mut(&cell_id).expect("preflighted cell exists");
+                let actual = if let Some(failpoint) = initialization_failpoint.take() {
+                    cell.initialize_prepared_lifecycle_with_failpoint(
+                        active_head_hash,
+                        prepared,
+                        directory,
+                        failpoint,
+                    )?
+                } else {
+                    cell.initialize_prepared_lifecycle(active_head_hash, prepared, directory)?
+                };
+                let expected = universe
+                    .head
+                    .pending_append
+                    .as_ref()
+                    .expect("begin append persisted pending state")
+                    .next
+                    .clone();
+                if actual != expected {
+                    return Err(Protocol19InstallError::Invalid(
+                        "initial lifecycle materialization differs from authorization".into(),
+                    ));
+                }
+                universe.finish_append(None)?;
+                lifecycle_states.insert(cell_id, LifecycleRuntimePreflightV2::Committed(actual));
+            }
+            (
+                None,
+                LifecycleRuntimePreflightV2::EmptyHistoryOnly
+                | LifecycleRuntimePreflightV2::EmptyPair,
+            ) => {
+                return Err(Protocol19InstallError::Invalid(
+                    "interrupted lifecycle bootstrap lacks a pending universe authorization".into(),
+                ));
+            }
+        }
+    }
+    if universe.head.pending_append.is_some() || universe.head.cells.len() != cells.len() {
+        return Err(Protocol19InstallError::Invalid(
+            "universe lifecycle bootstrap is incomplete".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_preflight_lifecycle_commitments(
+    universe: Option<&UniverseLifecycleHeadV1>,
+    cells: &BTreeMap<String, LifecycleRuntimePreflightV2>,
+) -> Result<(), Protocol19InstallError> {
+    let Some(universe) = universe else {
+        if cells.values().any(|state| !state.is_absent()) {
+            return Err(Protocol19InstallError::Invalid(
+                "cell lifecycle artifacts exist without a universe lifecycle commitment".into(),
+            ));
+        }
+        return Ok(());
+    };
+    for (cell_id, actual) in cells {
+        let committed = universe.cells.get(cell_id);
+        let accepted = if universe
+            .pending_append
+            .as_ref()
+            .is_some_and(|pending| pending.cell_id == *cell_id)
+        {
+            let pending = universe
+                .pending_append
+                .as_ref()
+                .expect("pending was checked");
+            match (pending.prior.as_ref(), actual) {
+                (None, state) if state.is_uncommitted_bootstrap() => true,
+                (prior, LifecycleRuntimePreflightV2::Committed(actual)) => {
+                    Some(actual) == prior || actual == &pending.next
+                }
+                _ => false,
+            }
+        } else {
+            match (committed, actual) {
+                (None, LifecycleRuntimePreflightV2::Absent) => true,
+                (Some(expected), LifecycleRuntimePreflightV2::Committed(actual)) => {
+                    actual == expected
+                }
+                _ => false,
+            }
+        };
+        if !accepted {
+            return Err(Protocol19InstallError::Invalid(
+                "cell lifecycle materialization differs from the universe write-ahead head".into(),
+            ));
+        }
+    }
+    if universe
+        .cells
+        .keys()
+        .any(|cell_id| !cells.contains_key(cell_id))
+    {
+        return Err(Protocol19InstallError::Invalid(
+            "universe lifecycle commitment names an unknown cell".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Protocol19LifecycleCoordinatorFailpoint {
+    UniverseLifecycleWriteAheadCommitted,
+    UniverseLifecycleBeginSyncedBeforeRename,
+    UniverseLifecycleBeginRenamedBeforeMemory,
+    UniverseLifecycleFinishSyncedBeforeRename,
+    UniverseLifecycleFinishRenamedBeforeMemory,
+    DirectoryAuthorityCommitted,
+    AuthorityFinalized,
+    DirectoryReleaseCommitted,
+}
 
 const INSTALL_DIRECTORY: &str = "protocol-19-prepared-install-v1";
 const INSTALL_LOCK_FILE: &str = "writer.lock";
@@ -309,6 +941,8 @@ pub(crate) enum Protocol19InstallError {
     Migration(#[from] MigrationReceiptError),
     #[error(transparent)]
     Cell(#[from] DraftWorld21StoreError),
+    #[error(transparent)]
+    Lifecycle(#[from] LifecycleV2Error),
 }
 
 /// Held proof that the complete target set is durably prepared. The borrow
@@ -369,7 +1003,23 @@ impl ValidatedProtocol19PreparedInstall {
         &self.receipt
     }
 
-    pub(crate) fn open(self) -> Result<OpenedProtocol19PreparedInstall, Protocol19InstallError> {
+    pub(crate) fn open(
+        self,
+        active_head_hash: &str,
+    ) -> Result<OpenedProtocol19PreparedInstall, Protocol19InstallError> {
+        self.open_with_lifecycle_initialization_failpoint(active_head_hash, None)
+    }
+
+    pub(crate) fn open_with_lifecycle_initialization_failpoint(
+        self,
+        active_head_hash: &str,
+        mut initialization_failpoint: Option<LifecycleInitializationFailpointV2>,
+    ) -> Result<OpenedProtocol19PreparedInstall, Protocol19InstallError> {
+        for expected in &self.head.cells {
+            DraftWorld21Store::preflight_active_file_set(
+                self.universe_root.join("cells").join(&expected.cell_id),
+            )?;
+        }
         let directory = DraftCellDirectoryHistoryStoreV3::open_from_active_head(
             &self.universe_root,
             ActiveDirectoryV3Expectation {
@@ -385,23 +1035,75 @@ impl ValidatedProtocol19PreparedInstall {
             },
         )?;
 
-        let mut cells = Vec::with_capacity(self.head.cells.len());
+        // Parse and replay every selected cell without repairing any cell
+        // artifact. A corrupt canonical-named artifact in a later cell must
+        // fail before an earlier cell can initialize or recover lifecycle
+        // state.
+        let mut lifecycle_commitments = BTreeMap::new();
         for (expected, receipt_cell) in self.head.cells.iter().zip(&self.receipt.target_cells) {
-            cells.push(DraftWorld21Store::open_from_active_head(
+            let commitment = DraftWorld21Store::preflight_active_contents(
                 self.universe_root.join("cells").join(&expected.cell_id),
                 &self.manifest,
                 &self.head.migration_anchor_hash,
+                active_head_hash,
                 expected,
                 &receipt_cell.production_origin_root,
                 &receipt_cell.identity_subset_root,
-            )?);
+                &directory,
+            )?;
+            lifecycle_commitments.insert(expected.cell_id.clone(), commitment);
         }
+        let preflight_universe_lifecycle = UniverseLifecycleStoreV1::read_if_present(
+            &self.universe_root,
+            &self.head,
+            active_head_hash,
+        )?;
+        validate_preflight_lifecycle_commitments(
+            preflight_universe_lifecycle.as_ref(),
+            &lifecycle_commitments,
+        )?;
+        let mut lifecycle_states = lifecycle_commitments;
+
+        let mut cells = BTreeMap::new();
+        for (expected, receipt_cell) in self.head.cells.iter().zip(&self.receipt.target_cells) {
+            let cell = DraftWorld21Store::open_from_active_head(
+                self.universe_root.join("cells").join(&expected.cell_id),
+                &self.manifest,
+                &self.head.migration_anchor_hash,
+                active_head_hash,
+                expected,
+                &receipt_cell.production_origin_root,
+                &receipt_cell.identity_subset_root,
+                &directory,
+            )?;
+            if cells.insert(expected.cell_id.clone(), cell).is_some() {
+                return Err(Protocol19InstallError::Invalid(
+                    "activated prepared install contains duplicate cell identity".into(),
+                ));
+            }
+        }
+        let mut universe_lifecycle = UniverseLifecycleStoreV1::open_or_bootstrap(
+            &self.universe_root,
+            &self.head,
+            active_head_hash,
+        )?;
+        reconcile_universe_lifecycle(
+            &mut universe_lifecycle,
+            &mut cells,
+            &mut lifecycle_states,
+            &directory,
+            active_head_hash,
+            &mut initialization_failpoint,
+        )?;
         validate_exact_cell_namespace_ids(&self.universe_root, &self.cell_ids)?;
         Ok(OpenedProtocol19PreparedInstall {
             summary: self.summary,
             receipt: self.receipt,
             directory,
-            _cells: cells,
+            cells,
+            universe_lifecycle,
+            #[cfg(test)]
+            lifecycle_failpoint: None,
             _install_lock: self.install_lock,
         })
     }
@@ -412,11 +1114,155 @@ pub(crate) struct OpenedProtocol19PreparedInstall {
     summary: Protocol19PreparedInstallSummary,
     receipt: CanonicalProtocol19MigrationReceiptEvidence,
     directory: DraftCellDirectoryHistoryStoreV3,
-    _cells: Vec<DraftWorld21Store>,
+    cells: BTreeMap<String, DraftWorld21Store>,
+    universe_lifecycle: UniverseLifecycleStoreV1,
+    #[cfg(test)]
+    lifecycle_failpoint: Option<Protocol19LifecycleCoordinatorFailpoint>,
     _install_lock: File,
 }
 
 impl OpenedProtocol19PreparedInstall {
+    fn append_committed_lifecycle(
+        &mut self,
+        cell_id: &str,
+        record: LifecycleRecordV2,
+    ) -> Result<(), Protocol19InstallError> {
+        if self.universe_lifecycle.head.pending_append.is_some() {
+            return Err(Protocol19InstallError::Invalid(
+                "universe lifecycle has an unfinished materialization; reopen before retry".into(),
+            ));
+        }
+        let prior = self
+            .cells
+            .get(cell_id)
+            .ok_or_else(|| {
+                Protocol19InstallError::Invalid(
+                    "lifecycle append selected a cell outside the activated set".into(),
+                )
+            })?
+            .lifecycle_commitment()?;
+        if self.universe_lifecycle.head.cells.get(cell_id) != Some(&prior) {
+            return Err(Protocol19InstallError::Invalid(
+                "cell lifecycle tip differs from its universe commitment".into(),
+            ));
+        }
+        let prepared = self
+            .cells
+            .get_mut(cell_id)
+            .expect("activated lifecycle cell exists")
+            .prepare_lifecycle_append(record, &self.directory)?;
+        #[cfg(test)]
+        let begin_failpoint = match self.lifecycle_failpoint {
+            Some(
+                Protocol19LifecycleCoordinatorFailpoint::UniverseLifecycleBeginSyncedBeforeRename,
+            ) => {
+                self.lifecycle_failpoint = None;
+                Some(UniverseLifecyclePersistFailpointV1::HeadSyncedBeforeRename)
+            }
+            Some(
+                Protocol19LifecycleCoordinatorFailpoint::UniverseLifecycleBeginRenamedBeforeMemory,
+            ) => {
+                self.lifecycle_failpoint = None;
+                Some(UniverseLifecyclePersistFailpointV1::HeadRenamedBeforeMemory)
+            }
+            _ => None,
+        };
+        #[cfg(not(test))]
+        let begin_failpoint = None;
+        self.universe_lifecycle
+            .begin_append(cell_id, &prepared, begin_failpoint)?;
+        #[cfg(test)]
+        if self.lifecycle_failpoint
+            == Some(Protocol19LifecycleCoordinatorFailpoint::UniverseLifecycleWriteAheadCommitted)
+        {
+            self.lifecycle_failpoint = None;
+            return Err(Protocol19InstallError::Invalid(
+                "injected failure after universe lifecycle write-ahead commit".into(),
+            ));
+        }
+        self.cells
+            .get_mut(cell_id)
+            .expect("activated lifecycle cell exists")
+            .materialize_lifecycle_append(prepared, &self.directory)?;
+        let materialized = self
+            .cells
+            .get(cell_id)
+            .expect("activated lifecycle cell exists")
+            .lifecycle_commitment()?;
+        let expected = self
+            .universe_lifecycle
+            .head
+            .pending_append
+            .as_ref()
+            .expect("write-ahead lifecycle append remains pending")
+            .next
+            .clone();
+        if materialized != expected {
+            return Err(Protocol19InstallError::Invalid(
+                "cell lifecycle materialization differs from its write-ahead commitment".into(),
+            ));
+        }
+        #[cfg(test)]
+        let finish_failpoint = match self.lifecycle_failpoint {
+            Some(
+                Protocol19LifecycleCoordinatorFailpoint::UniverseLifecycleFinishSyncedBeforeRename,
+            ) => {
+                self.lifecycle_failpoint = None;
+                Some(UniverseLifecyclePersistFailpointV1::HeadSyncedBeforeRename)
+            }
+            Some(
+                Protocol19LifecycleCoordinatorFailpoint::UniverseLifecycleFinishRenamedBeforeMemory,
+            ) => {
+                self.lifecycle_failpoint = None;
+                Some(UniverseLifecyclePersistFailpointV1::HeadRenamedBeforeMemory)
+            }
+            _ => None,
+        };
+        #[cfg(not(test))]
+        let finish_failpoint = None;
+        self.universe_lifecycle.finish_append(finish_failpoint)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reseal_pending_lifecycle_outside_state_machine_for_test(
+        &mut self,
+    ) -> Result<(), Protocol19InstallError> {
+        let pending = self
+            .universe_lifecycle
+            .head
+            .pending_append
+            .clone()
+            .ok_or_else(|| {
+                Protocol19InstallError::Invalid(
+                    "test requires a pending universe lifecycle append".into(),
+                )
+            })?;
+        let prepared = self
+            .cells
+            .get(&pending.cell_id)
+            .ok_or_else(|| {
+                Protocol19InstallError::Invalid(
+                    "test pending lifecycle cell is outside the activated set".into(),
+                )
+            })?
+            .prepare_resealed_non_state_machine_lifecycle_successor_for_test(pending.record)?;
+        let mut replacement = self.universe_lifecycle.head.clone();
+        let replacement_pending = replacement
+            .pending_append
+            .as_mut()
+            .expect("test pending lifecycle append was checked");
+        replacement_pending.record = prepared.record().clone();
+        replacement_pending.next = prepared.next_commitment();
+        replacement.seal()?;
+        atomic_write(
+            &self.universe_lifecycle.path,
+            &serde_json::to_vec(&replacement)
+                .map_err(|source| Protocol19InstallError::Json(source.to_string()))?,
+        )?;
+        self.universe_lifecycle.head = replacement;
+        Ok(())
+    }
+
     pub(crate) fn summary(&self) -> &Protocol19PreparedInstallSummary {
         &self.summary
     }
@@ -425,6 +1271,7 @@ impl OpenedProtocol19PreparedInstall {
         &self.receipt
     }
 
+    #[cfg(test)]
     pub(crate) fn cell_assignment(
         &self,
         cell_key: &CellKeyV1,
@@ -432,6 +1279,7 @@ impl OpenedProtocol19PreparedInstall {
         self.directory.assignment(cell_key)
     }
 
+    #[cfg(test)]
     pub(crate) fn claim_cell_authority(
         &mut self,
         cell_key: &CellKeyV1,
@@ -442,6 +1290,7 @@ impl OpenedProtocol19PreparedInstall {
             .claim_cell(cell_key, expected_generation, holder_id)
     }
 
+    #[cfg(test)]
     pub(crate) fn recover_cell_authority(
         &mut self,
         cell_key: &CellKeyV1,
@@ -452,6 +1301,7 @@ impl OpenedProtocol19PreparedInstall {
             .recover_cell(cell_key, expected_generation, holder_id)
     }
 
+    #[cfg(test)]
     pub(crate) fn release_cell_authority(
         &mut self,
         cell_key: &CellKeyV1,
@@ -461,6 +1311,501 @@ impl OpenedProtocol19PreparedInstall {
         self.directory
             .release_cell(cell_key, expected_generation, holder_id)
     }
+
+    pub(crate) fn dispatch_background_production(
+        &mut self,
+        cell_key: &CellKeyV1,
+        holder_id: &str,
+        clock: &dyn TrustedClock,
+    ) -> Result<Protocol19BackgroundDispatchOutcome, Protocol19InstallError> {
+        let started = Instant::now();
+        let mut committed_quanta = 0u64;
+        let cell_id = crate::celestial::cell_id(cell_key)
+            .map_err(|source| Protocol19InstallError::Invalid(source.to_string()))?;
+        if !self.cells.contains_key(&cell_id) {
+            return Err(Protocol19InstallError::Invalid(
+                "background dispatch selected a cell outside the activated set".into(),
+            ));
+        }
+
+        let trusted_now = clock
+            .now_unix_ms()
+            .map_err(|source| Protocol19InstallError::Invalid(source.to_string()))?;
+        self.reconcile_or_acquire_background_authority(cell_key, &cell_id, holder_id, trusted_now)?;
+        #[cfg(test)]
+        if self.lifecycle_failpoint
+            == Some(Protocol19LifecycleCoordinatorFailpoint::AuthorityFinalized)
+        {
+            self.lifecycle_failpoint = None;
+            return Err(Protocol19InstallError::Invalid(
+                "injected failure after lifecycle authority finalization".into(),
+            ));
+        }
+        if self
+            .cells
+            .get(&cell_id)
+            .expect("activated cell was checked")
+            .lifecycle_record()?
+            .observed_mode()
+            == LifecycleModeV2::Sleeping
+        {
+            return Ok(Protocol19BackgroundDispatchOutcome {
+                mode: "sleeping",
+                committed_quanta: 0,
+                acknowledged_production_sequence: self
+                    .cells
+                    .get(&cell_id)
+                    .expect("activated cell was checked")
+                    .lifecycle_record()?
+                    .acknowledged_sequence(),
+                next_scheduled_for_unix_ms: None,
+            });
+        }
+
+        loop {
+            committed_quanta = committed_quanta
+                .checked_add(self.reconcile_pending_production(&cell_id, clock)?)
+                .ok_or_else(|| {
+                    Protocol19InstallError::Invalid("dispatch count exhausted".into())
+                })?;
+            let trusted_now = clock
+                .now_unix_ms()
+                .map_err(|source| Protocol19InstallError::Invalid(source.to_string()))?;
+
+            let next_occurrence = self
+                .cells
+                .get(&cell_id)
+                .expect("activated cell was checked")
+                .lifecycle_record()?
+                .next_occurrence()
+                .cloned();
+            let next_occurrence = if let Some(occurrence) = next_occurrence {
+                Some(occurrence)
+            } else {
+                let cell = self
+                    .cells
+                    .get(&cell_id)
+                    .expect("activated cell was checked");
+                if cell.background_production_is_runnable()? {
+                    let scheduled = trusted_now
+                        .checked_add(PRODUCTION_QUANTUM_MILLIS)
+                        .ok_or_else(|| {
+                            Protocol19InstallError::Invalid(
+                                "production schedule time is exhausted".into(),
+                            )
+                        })?;
+                    let occurrence = cell.next_production_occurrence_at(scheduled)?;
+                    let assignment = self.directory.current_cell_assignment(&cell_id)?;
+                    let frontier = cell.lifecycle_world_frontier()?;
+                    let next = cell.lifecycle_record()?.renew_and_set_schedule(
+                        &assignment,
+                        trusted_now,
+                        &frontier,
+                        Some(occurrence.clone()),
+                    )?;
+                    self.append_committed_lifecycle(&cell_id, next)?;
+                    Some(occurrence)
+                } else {
+                    None
+                }
+            };
+
+            let Some(occurrence) = next_occurrence else {
+                self.release_background_authority(cell_key, &cell_id, holder_id, trusted_now)?;
+                break;
+            };
+            if occurrence.scheduled_for_unix_ms > trusted_now
+                || committed_quanta >= MAX_BACKGROUND_QUANTA_PER_DISPATCH
+                || started.elapsed() >= MAX_BACKGROUND_DISPATCH_TIME
+            {
+                break;
+            }
+
+            let assignment = self.directory.current_cell_assignment(&cell_id)?;
+            let frontier = self
+                .cells
+                .get(&cell_id)
+                .expect("activated cell was checked")
+                .lifecycle_world_frontier()?;
+            let pending = self
+                .cells
+                .get(&cell_id)
+                .expect("activated cell was checked")
+                .lifecycle_record()?
+                .begin_world_commit(&assignment, trusted_now, &frontier)?;
+            self.append_committed_lifecycle(&cell_id, pending)?;
+
+            if started.elapsed() >= MAX_BACKGROUND_DISPATCH_TIME {
+                break;
+            }
+
+            // The lifecycle fsync above may have taken arbitrarily long. Take
+            // a new trusted-time sample and revalidate the lease at the exact
+            // world-write boundary rather than reusing the earlier sample.
+            let append_trusted_now = clock
+                .now_unix_ms()
+                .map_err(|source| Protocol19InstallError::Invalid(source.to_string()))?;
+            let assignment = self.directory.current_cell_assignment(&cell_id)?;
+            let frontier = self
+                .cells
+                .get(&cell_id)
+                .expect("activated cell was checked")
+                .lifecycle_world_frontier()?;
+            self.cells
+                .get(&cell_id)
+                .expect("activated cell was checked")
+                .lifecycle_record()?
+                .require_event_append_authority(&assignment, append_trusted_now, &frontier)?;
+
+            let authority = self.directory.current_cell_authority(&cell_id)?;
+            self.cells
+                .get_mut(&cell_id)
+                .expect("activated cell was checked")
+                .append_production_occurrence(occurrence, append_trusted_now, &authority)?;
+            committed_quanta = committed_quanta.checked_add(1).ok_or_else(|| {
+                Protocol19InstallError::Invalid("dispatch count exhausted".into())
+            })?;
+        }
+
+        let lifecycle = self
+            .cells
+            .get(&cell_id)
+            .expect("activated cell was checked")
+            .lifecycle_record()?;
+        Ok(Protocol19BackgroundDispatchOutcome {
+            mode: match lifecycle.observed_mode() {
+                LifecycleModeV2::Sleeping => "sleeping",
+                LifecycleModeV2::Activating => "activating",
+                LifecycleModeV2::Background => "background",
+                LifecycleModeV2::Draining => "draining",
+            },
+            committed_quanta,
+            acknowledged_production_sequence: lifecycle.acknowledged_sequence(),
+            next_scheduled_for_unix_ms: lifecycle
+                .next_occurrence()
+                .map(|occurrence| occurrence.scheduled_for_unix_ms),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_lifecycle_failpoint_for_test(
+        &mut self,
+        cell_key: &CellKeyV1,
+        failpoint: crate::grid_handoff_v2::lifecycle_v2::LifecycleAppendFailpointV2,
+    ) -> Result<(), Protocol19InstallError> {
+        let cell_id = crate::celestial::cell_id(cell_key)
+            .map_err(|source| Protocol19InstallError::Invalid(source.to_string()))?;
+        self.cells
+            .get_mut(&cell_id)
+            .ok_or_else(|| {
+                Protocol19InstallError::Invalid(
+                    "lifecycle failpoint selected a cell outside the activated set".into(),
+                )
+            })?
+            .set_lifecycle_failpoint_for_test(failpoint)?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_lifecycle_coordinator_failpoint_for_test(
+        &mut self,
+        failpoint: Protocol19LifecycleCoordinatorFailpoint,
+    ) {
+        self.lifecycle_failpoint = Some(failpoint);
+    }
+
+    fn reconcile_or_acquire_background_authority(
+        &mut self,
+        cell_key: &CellKeyV1,
+        cell_id: &str,
+        holder_id: &str,
+        trusted_now: u64,
+    ) -> Result<(), Protocol19InstallError> {
+        if let Some(operation) = self
+            .cells
+            .get(cell_id)
+            .expect("activated cell was checked")
+            .lifecycle_record()?
+            .authority_operation()
+            .cloned()
+        {
+            self.finish_authority_operation(cell_key, cell_id, &operation, trusted_now)?;
+            if operation.holder_id() != holder_id {
+                // Crash recovery completes the exact persisted transaction,
+                // but this dispatch may never continue under another caller's
+                // holder. Acquire or recover the requested holder explicitly.
+                return self.reconcile_or_acquire_background_authority(
+                    cell_key,
+                    cell_id,
+                    holder_id,
+                    trusted_now,
+                );
+            }
+            return Ok(());
+        }
+
+        let current = self.directory.current_cell_assignment(cell_id)?;
+        let lifecycle = self
+            .cells
+            .get(cell_id)
+            .expect("activated cell was checked")
+            .lifecycle_record()?
+            .clone();
+        let frontier = self
+            .cells
+            .get(cell_id)
+            .expect("activated cell was checked")
+            .lifecycle_world_frontier()?;
+        let kind = match current.assignment().state {
+            CellAssignmentState::Sleeping => LifecycleAuthorityOperationKindV2::Claim,
+            CellAssignmentState::Assigned
+                if lifecycle.holder_id() == current.assignment().holder_id.as_deref()
+                    && lifecycle.holder_id() == Some(holder_id)
+                    && lifecycle
+                        .authority_expires_at_unix_ms()
+                        .is_some_and(|expiry| trusted_now < expiry) =>
+            {
+                if lifecycle.pending_world_commit().is_some() {
+                    return Ok(());
+                }
+                let next_occurrence = lifecycle.next_occurrence().cloned();
+                let renewed = lifecycle.renew_and_set_schedule(
+                    &current,
+                    trusted_now,
+                    &frontier,
+                    next_occurrence,
+                )?;
+                self.append_committed_lifecycle(cell_id, renewed)?;
+                return Ok(());
+            }
+            CellAssignmentState::Assigned => LifecycleAuthorityOperationKindV2::Recovery,
+            _ => {
+                return Err(Protocol19InstallError::Invalid(
+                    "cell directory is in a nonterminal authority mode".into(),
+                ));
+            }
+        };
+        let request =
+            lifecycle.request_authority(&current, kind, holder_id, trusted_now, &frontier)?;
+        self.append_committed_lifecycle(cell_id, request.clone())?;
+        let operation = request
+            .authority_operation()
+            .expect("authority request contains its operation")
+            .clone();
+        self.finish_authority_operation(cell_key, cell_id, &operation, trusted_now)
+    }
+
+    fn finish_authority_operation(
+        &mut self,
+        cell_key: &CellKeyV1,
+        cell_id: &str,
+        operation: &crate::grid_handoff_v2::lifecycle_v2::LifecycleAuthorityOperationV2,
+        trusted_now: u64,
+    ) -> Result<(), Protocol19InstallError> {
+        self.cells
+            .get(cell_id)
+            .expect("activated cell was checked")
+            .lifecycle_record()?
+            .preflight_authority_finalization(trusted_now)?;
+        match operation.kind() {
+            LifecycleAuthorityOperationKindV2::Claim => {
+                self.directory.claim_cell(
+                    cell_key,
+                    operation.expected_assignment_generation(),
+                    operation.holder_id(),
+                )?;
+            }
+            LifecycleAuthorityOperationKindV2::Recovery => {
+                self.directory.recover_cell(
+                    cell_key,
+                    operation.expected_assignment_generation(),
+                    operation.holder_id(),
+                )?;
+            }
+            LifecycleAuthorityOperationKindV2::Release => {
+                self.directory.release_cell(
+                    cell_key,
+                    operation.expected_assignment_generation(),
+                    operation.holder_id(),
+                )?;
+                #[cfg(test)]
+                if self.lifecycle_failpoint
+                    == Some(Protocol19LifecycleCoordinatorFailpoint::DirectoryReleaseCommitted)
+                {
+                    self.lifecycle_failpoint = None;
+                    return Err(Protocol19InstallError::Invalid(
+                        "injected failure after directory release commit".into(),
+                    ));
+                }
+                let sleeping = self.directory.current_cell_assignment(cell_id)?;
+                let cell = self.cells.get(cell_id).expect("activated cell was checked");
+                let frontier = cell.lifecycle_world_frontier()?;
+                let next = cell.lifecycle_record()?.finalize_sleeping(
+                    &sleeping,
+                    trusted_now,
+                    &frontier,
+                )?;
+                self.append_committed_lifecycle(cell_id, next)?;
+                return Ok(());
+            }
+        }
+        #[cfg(test)]
+        if self.lifecycle_failpoint
+            == Some(Protocol19LifecycleCoordinatorFailpoint::DirectoryAuthorityCommitted)
+        {
+            self.lifecycle_failpoint = None;
+            return Err(Protocol19InstallError::Invalid(
+                "injected failure after directory authority commit".into(),
+            ));
+        }
+        let assigned = self.directory.current_cell_assignment(cell_id)?;
+        let cell = self.cells.get(cell_id).expect("activated cell was checked");
+        let frontier = cell.lifecycle_world_frontier()?;
+        let finalized =
+            cell.lifecycle_record()?
+                .finalize_assigned(&assigned, trusted_now, &frontier)?;
+        self.append_committed_lifecycle(cell_id, finalized)?;
+        Ok(())
+    }
+
+    fn reconcile_pending_production(
+        &mut self,
+        cell_id: &str,
+        clock: &dyn TrustedClock,
+    ) -> Result<u64, Protocol19InstallError> {
+        let pending = self
+            .cells
+            .get(cell_id)
+            .expect("activated cell was checked")
+            .lifecycle_record()?
+            .pending_world_commit()
+            .cloned();
+        let Some(pending) = pending else {
+            return Ok(0);
+        };
+        let frontier = self
+            .cells
+            .get(cell_id)
+            .expect("activated cell was checked")
+            .lifecycle_world_frontier()?;
+        let prior = frontier.event_sequence == pending.prior_event_sequence()
+            && frontier.event_hash == pending.prior_event_hash()
+            && frontier.state_hash == pending.prior_state_hash();
+        let committed = frontier.event_sequence
+            == pending.prior_event_sequence().checked_add(1).unwrap_or(0)
+            && frontier.committed_production_sequence
+                == pending.occurrence().production_quantum_sequence
+            && frontier.last_scheduled_for_unix_ms == pending.occurrence().scheduled_for_unix_ms;
+        if prior {
+            let append_trusted_now = clock
+                .now_unix_ms()
+                .map_err(|source| Protocol19InstallError::Invalid(source.to_string()))?;
+            let assignment = self.directory.current_cell_assignment(cell_id)?;
+            self.cells
+                .get(cell_id)
+                .expect("activated cell was checked")
+                .lifecycle_record()?
+                .require_event_append_authority(&assignment, append_trusted_now, &frontier)?;
+            let authority = self.directory.current_cell_authority(cell_id)?;
+            self.cells
+                .get_mut(cell_id)
+                .expect("activated cell was checked")
+                .append_production_occurrence(
+                    pending.occurrence().clone(),
+                    append_trusted_now,
+                    &authority,
+                )?;
+        } else if !committed {
+            return Err(Protocol19InstallError::Invalid(
+                "pending production occurrence has a conflicting world result".into(),
+            ));
+        }
+        let accepted_trusted_at = self
+            .cells
+            .get(cell_id)
+            .expect("activated cell was checked")
+            .committed_production_accepted_trusted_at(pending.occurrence())?;
+        let trusted_now = clock
+            .now_unix_ms()
+            .map_err(|source| Protocol19InstallError::Invalid(source.to_string()))?;
+        require_production_ack_time(trusted_now, accepted_trusted_at)?;
+        let frontier = self
+            .cells
+            .get(cell_id)
+            .expect("activated cell was checked")
+            .lifecycle_world_frontier()?;
+        let runnable = self
+            .cells
+            .get(cell_id)
+            .expect("activated cell was checked")
+            .background_production_is_runnable()?;
+        let next_occurrence = if runnable {
+            let scheduled = pending
+                .occurrence()
+                .scheduled_for_unix_ms
+                .checked_add(PRODUCTION_QUANTUM_MILLIS)
+                .ok_or_else(|| {
+                    Protocol19InstallError::Invalid("production schedule time is exhausted".into())
+                })?;
+            Some(
+                self.cells
+                    .get(cell_id)
+                    .expect("activated cell was checked")
+                    .next_production_occurrence_at(scheduled)?,
+            )
+        } else {
+            None
+        };
+        let assignment = self.directory.current_cell_assignment(cell_id)?;
+        let acknowledged = self
+            .cells
+            .get(cell_id)
+            .expect("activated cell was checked")
+            .lifecycle_record()?
+            .acknowledge_world_commit(&assignment, trusted_now, &frontier, next_occurrence)?;
+        self.append_committed_lifecycle(cell_id, acknowledged)?;
+        Ok(u64::from(prior))
+    }
+
+    fn release_background_authority(
+        &mut self,
+        cell_key: &CellKeyV1,
+        cell_id: &str,
+        holder_id: &str,
+        trusted_now: u64,
+    ) -> Result<(), Protocol19InstallError> {
+        let assignment = self.directory.current_cell_assignment(cell_id)?;
+        let cell = self.cells.get(cell_id).expect("activated cell was checked");
+        let frontier = cell.lifecycle_world_frontier()?;
+        let request = cell.lifecycle_record()?.request_authority(
+            &assignment,
+            LifecycleAuthorityOperationKindV2::Release,
+            holder_id,
+            trusted_now,
+            &frontier,
+        )?;
+        self.append_committed_lifecycle(cell_id, request.clone())?;
+        self.finish_authority_operation(
+            cell_key,
+            cell_id,
+            request
+                .authority_operation()
+                .expect("release request contains its operation"),
+            trusted_now,
+        )
+    }
+}
+
+fn require_production_ack_time(
+    trusted_now_unix_ms: u64,
+    accepted_trusted_at_unix_ms: u64,
+) -> Result<(), Protocol19InstallError> {
+    if trusted_now_unix_ms < accepted_trusted_at_unix_ms {
+        return Err(Protocol19InstallError::Invalid(
+            "trusted time moved backward after the durable production event".into(),
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn prepare_or_recover<'migration, 'source>(
@@ -1072,6 +2417,50 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), Protocol19InstallError>
     result
 }
 
+fn atomic_write_universe_lifecycle_head(
+    path: &Path,
+    bytes: &[u8],
+    failpoint: Option<UniverseLifecyclePersistFailpointV1>,
+) -> Result<(), Protocol19InstallError> {
+    let parent = path.parent().ok_or_else(|| {
+        Protocol19InstallError::Invalid("universe lifecycle head has no parent".into())
+    })?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            Protocol19InstallError::Invalid("universe lifecycle head is not UTF-8".into())
+        })?;
+    let temporary = parent.join(format!(".{name}.tmp-{}", Uuid::new_v4()));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)
+            .map_err(|source| io_error(&temporary, source))?;
+        file.write_all(bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|source| io_error(&temporary, source))?;
+        if failpoint == Some(UniverseLifecyclePersistFailpointV1::HeadSyncedBeforeRename) {
+            return Err(Protocol19InstallError::Invalid(
+                "injected failure before universe lifecycle head replacement".into(),
+            ));
+        }
+        fs::rename(&temporary, path).map_err(|source| io_error(path, source))?;
+        sync_directory(parent)?;
+        if failpoint == Some(UniverseLifecyclePersistFailpointV1::HeadRenamedBeforeMemory) {
+            return Err(Protocol19InstallError::Invalid(
+                "injected failure after universe lifecycle head replacement".into(),
+            ));
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
 fn read_bounded(path: &Path, maximum: usize) -> Result<Vec<u8>, Protocol19InstallError> {
     let file = File::open(path).map_err(|source| io_error(path, source))?;
     let length = file
@@ -1113,6 +2502,13 @@ fn all_hashes<'a>(values: impl IntoIterator<Item = &'a String>) -> bool {
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
     })
+}
+
+fn valid_hash(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 fn io_error(path: impl AsRef<Path>, source: std::io::Error) -> Protocol19InstallError {
@@ -1198,6 +2594,12 @@ mod tests {
     const SUBPROCESS_MODE_ENV: &str = "VERSE_PROTOCOL19_INSTALL_SUBPROCESS_MODE";
     const SUBPROCESS_ROOT_ENV: &str = "VERSE_PROTOCOL19_INSTALL_SUBPROCESS_ROOT";
     const SUBPROCESS_SECOND_CWD_ENV: &str = "VERSE_PROTOCOL19_INSTALL_SECOND_CWD";
+
+    #[test]
+    fn production_ack_rejects_time_before_the_persisted_event() {
+        assert!(require_production_ack_time(8_000, 8_000).is_ok());
+        assert!(require_production_ack_time(7_999, 8_000).is_err());
+    }
 
     fn frozen_fixture(with_event: bool) -> TempDir {
         let root = tempdir().expect("temporary universe root");
