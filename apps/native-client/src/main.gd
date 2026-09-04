@@ -60,6 +60,8 @@ const PRESENTATION_MICRO_ORIENTATION_RADIANS := 0.008
 const PRESENTATION_FULL_ORIENTATION_RADIANS := 0.09
 const PRESENTATION_MICRO_CORRECTION_RATE := 2.2
 const PRESENTATION_FULL_CORRECTION_RATE := 10.0
+const REMOTE_PLAYER_PRESENTATION_RESPONSE_RATE := 20.0
+const REMOTE_PLAYER_PRESENTATION_SNAP_DISTANCE := 6.0
 const CHARACTER_COLLISION_RADIUS := 0.34
 const CHARACTER_STANDING_HEIGHT := 1.8
 const CHARACTER_EYE_HEIGHT := 1.62
@@ -211,6 +213,7 @@ var grid_lookup: Dictionary = {}
 var grid_node_lookup: Dictionary = {}
 var grid_topology_fingerprints: Dictionary = {}
 var remote_player_nodes: Dictionary = {}
+var remote_player_presentation_targets: Dictionary = {}
 var rendered_voxel_count := -1
 var selected_block_kind := "structural"
 var target_hit: Dictionary = {}
@@ -343,6 +346,7 @@ func _process(delta: float) -> void:
 	_poll_socket()
 	_advance_mutation_transport(delta)
 	_update_player_presentation(delta)
+	_update_remote_player_presentation(delta)
 	_update_environment_presentation(delta)
 	_update_target()
 	_update_tool_action(delta)
@@ -3277,19 +3281,50 @@ func _sync_remote_players(players: Array) -> void:
 			continue
 		visible_ids[player_id] = true
 		var node: Node3D = remote_player_nodes.get(player_id, null)
+		var target_position := _vec3(player.get("position", {}))
+		var target_orientation := _quat(player.get("orientation", {}))
 		if node == null:
 			node = _build_remote_player_visual(player_id)
 			remote_player_nodes[player_id] = node
 			players_root.add_child(node)
-		node.position = _vec3(player.get("position", {}))
-		node.quaternion = _quat(player.get("orientation", {}))
+			node.position = target_position
+			node.quaternion = target_orientation
+		elif node.position.distance_to(target_position) >= REMOTE_PLAYER_PRESENTATION_SNAP_DISTANCE:
+			# Large discontinuities represent teleports, recovery, or cell handoff.
+			# Do not visually sweep an avatar through intervening geometry.
+			node.position = target_position
+			node.quaternion = target_orientation
+		remote_player_presentation_targets[player_id] = {
+			"position": target_position,
+			"orientation": target_orientation,
+		}
 		node.visible = true
 	for player_id in remote_player_nodes.keys().duplicate():
 		if visible_ids.has(player_id):
 			continue
 		var stale: Node3D = remote_player_nodes[player_id]
 		remote_player_nodes.erase(player_id)
+		remote_player_presentation_targets.erase(player_id)
 		stale.queue_free()
+
+
+func _update_remote_player_presentation(delta: float) -> void:
+	var blend := 1.0 - exp(
+		-REMOTE_PLAYER_PRESENTATION_RESPONSE_RATE * maxf(delta, 0.0)
+	)
+	for player_id in remote_player_nodes:
+		var node: Node3D = remote_player_nodes.get(player_id, null)
+		var target: Dictionary = remote_player_presentation_targets.get(player_id, {})
+		if node == null or not is_instance_valid(node) or target.is_empty():
+			continue
+		var target_position: Vector3 = target.get("position", node.position)
+		var target_orientation: Quaternion = target.get("orientation", node.quaternion)
+		node.position = node.position.lerp(target_position, blend)
+		node.quaternion = _shortest_slerp(node.quaternion, target_orientation, blend)
+		if node.position.distance_squared_to(target_position) <= 0.000001:
+			node.position = target_position
+		if node.quaternion.angle_to(target_orientation) <= 0.0001:
+			node.quaternion = target_orientation
 
 
 func _remote_player_visuals_match(players: Array) -> bool:
@@ -3308,7 +3343,14 @@ func _remote_player_visuals_match(players: Array) -> bool:
 		if node == null or not is_instance_valid(node) or node.get_parent() != players_root:
 			return false
 		var player: Dictionary = expected[player_id]
-		if node.position.distance_to(_vec3(player.get("position", {}))) > 0.001:
+		var target: Dictionary = remote_player_presentation_targets.get(player_id, {})
+		if target.is_empty():
+			return false
+		if (
+			(target.get("position", Vector3.ZERO) as Vector3).distance_to(
+				_vec3(player.get("position", {}))
+			) > 0.001
+		):
 			return false
 		if node.get_node_or_null("PilotLabel") == null:
 			return false
