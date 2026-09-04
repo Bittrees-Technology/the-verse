@@ -4592,8 +4592,15 @@ func _predict_player_step(control: Dictionary, delta: float, record_history: boo
 			result["linear_velocity"] = (
 				proposed_velocity - proposed_up * proposed_velocity.dot(proposed_up)
 			)
+	# Ground contact is represented by the fixed radial support radius above,
+	# but walls and other grids still have to participate in local prediction.
+	# Skipping the sweep for grounded motion let the camera advance through an
+	# obstacle until the next authoritative packet pulled it back, producing a
+	# visible correction sawtooth while walking into or alongside structures.
 	var sweep := (
-		{"position": proposed_position, "collided": true}
+		_sweep_player_position(predicted_position, proposed_position)
+		if locomotion_kind == "grounded"
+		else {"position": proposed_position, "collided": true}
 		if supported
 		else _sweep_player_position(predicted_position, proposed_position)
 	)

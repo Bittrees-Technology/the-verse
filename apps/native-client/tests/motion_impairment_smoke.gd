@@ -46,6 +46,7 @@ func _run() -> void:
 	_test_received_vs_processed_reconciliation()
 	_test_ordering_corrections_and_motion_only_updates()
 	_test_render_interpolation_and_grounded_pitch_prediction()
+	_test_grounded_prediction_honors_grid_obstacles()
 	_test_remote_player_presentation_smoothing()
 	_test_menu_dead_disconnect_and_bounds()
 	_test_life_state_reset()
@@ -66,7 +67,7 @@ func _run() -> void:
 		quit(1)
 		return
 	print(
-		"VERSE_NATIVE_IMPAIRMENT_OK queued_ack=ordered motion=monotonic corrections=bounded presentation=interpolated remote=smooth pitch=predicted menu=neutral_prediction lifecycle=reset buffers=bounded roll_tap=durable idle=silent rebuild=none targeting=closest_hit ownership=filtered privacy=projected operations=serialized production=physical"
+		"VERSE_NATIVE_IMPAIRMENT_OK queued_ack=ordered motion=monotonic corrections=bounded presentation=interpolated grounded_obstacles=blocked remote=smooth pitch=predicted menu=neutral_prediction lifecycle=reset buffers=bounded roll_tap=durable idle=silent rebuild=none targeting=closest_hit ownership=filtered privacy=projected operations=serialized production=physical"
 	)
 	quit(0)
 
@@ -1842,6 +1843,69 @@ func _test_render_interpolation_and_grounded_pitch_prediction() -> void:
 	client.set("predicted_linear_velocity", Vector3(0.0, 0.0, -24.0))
 	client.call("_update_player_presentation", FIXED_DELTA)
 	_check(camera.fov > 74.0, "true boost retains readable field-of-view feedback")
+	client.free()
+
+
+func _test_grounded_prediction_honors_grid_obstacles() -> void:
+	var client := _new_client()
+	var start := Vector3(0.0, 1200.901, 0.0)
+	var grounded := _base_player()
+	grounded["jetpack_enabled"] = false
+	grounded["position"] = _protocol_vec3(start)
+	grounded["surface_contact"] = true
+	grounded["locomotion"] = {
+		"kind": "grounded",
+		"up": _protocol_vec3(Vector3.UP),
+		"view_pitch_radians": 0.0,
+		"jump_held": false,
+		"support": {"body_id": "planet-body-khepri-prime"},
+	}
+	client.set("actor_private_snapshot", _private_snapshot(grounded))
+	client.set("snapshot", {
+		"environment": {
+			"celestial_body_id": "planet-body-khepri-prime",
+			"planet_center": _protocol_vec3(Vector3.ZERO),
+			"surface_radius_m": 1200.0,
+			"gravity": _protocol_vec3(Vector3(0.0, -9.81, 0.0)),
+		},
+		"players": [_public_player(grounded)],
+		"grids": [],
+		"voxels": [],
+	})
+	client.set("grid_lookup", {
+		"grounded-wall": _target_grid(
+			"grounded-wall",
+			start + Vector3(0.0, 0.0, -0.9),
+			Quaternion.IDENTITY,
+			[_target_block("grounded-wall-block", Vector3i.ZERO)],
+		),
+	})
+	client.set("predicted_position", start)
+	client.set("predicted_orientation", Quaternion.IDENTITY)
+	client.set("predicted_linear_velocity", Vector3.ZERO)
+	client.set("predicted_angular_velocity", Vector3.ZERO)
+	client.set("prediction_planet_center", Vector3.ZERO)
+	client.set("prediction_surface_radius", 1200.0)
+	client.set("prediction_gravitational_parameter", 9.81 * 1200.901 * 1200.901)
+	client.set("prediction_gravity_model_ready", true)
+	var forward_control := {
+		"linear_input": Vector3(0.0, 0.0, -1.0),
+		"angular_input": Vector3.ZERO,
+		"boost": false,
+		"jump": false,
+		"dampeners": true,
+	}
+	for _step in 120:
+		client.call("_predict_player_step", forward_control, FIXED_DELTA, false)
+	var blocked_position: Vector3 = client.get("predicted_position")
+	_check(
+		blocked_position.z > -0.2,
+		"grounded prediction stops at a grid obstacle instead of reconciling through it",
+	)
+	_check(
+		bool(client.get("predicted_surface_contact")),
+		"grounded obstacle prediction preserves support contact",
+	)
 	client.free()
 
 
