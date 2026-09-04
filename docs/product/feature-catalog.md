@@ -119,6 +119,14 @@ does not complete F-013 or WORLD-008: multi-cell assignment, handoff,
 distributed control-plane availability, and background physics remain separate
 milestones.
 
+The protocol-19 lifecycle-v2 checkpoint carries F-060's production-only
+semantics across the signed migration boundary. Its per-cell runtime history
+is anchored to immutable migration genesis and the global active head;
+directory-v3 claim, recovery, and release are coordinated as recoverable
+split-store transactions; and due work uses the event-17 Store transaction.
+This checkpoint deliberately keeps gameplay admission closed and does not
+claim external wake scheduling, multi-host availability, or capacity.
+
 F-061 has an implemented independent-EVA checkpoint under protocol `18`. Its
 [accepted gameplay contract](../gameplay/durable-two-cell-handoff.md) and
 [ADR-0023](../decisions/ADR-0023-durable-two-cell-handoff.md) define two

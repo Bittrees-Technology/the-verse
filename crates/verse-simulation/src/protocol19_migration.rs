@@ -366,6 +366,22 @@ impl Protocol19TargetLifecycleGenesisV2 {
         self.assignment_generation
     }
 
+    pub(crate) const fn trusted_cutoff_unix_ms(&self) -> u64 {
+        self.trusted_cutoff_unix_ms
+    }
+
+    pub(crate) const fn target_directory_revision(&self) -> u64 {
+        self.target_directory_revision
+    }
+
+    pub(crate) fn target_directory_document_hash(&self) -> &str {
+        &self.target_directory_document_hash
+    }
+
+    pub(crate) const fn acknowledged_production_sequence(&self) -> u64 {
+        self.acknowledged_production_sequence
+    }
+
     pub(crate) const fn legacy_event_sequence(&self) -> u64 {
         self.legacy_event_sequence
     }

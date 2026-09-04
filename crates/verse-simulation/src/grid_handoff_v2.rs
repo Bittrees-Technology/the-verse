@@ -11,6 +11,8 @@ mod dispatcher_v17;
 #[allow(dead_code)]
 mod event_v17;
 #[allow(dead_code)]
+pub(crate) mod lifecycle_v2;
+#[allow(dead_code)]
 pub(crate) mod migration_transform;
 #[allow(dead_code)]
 mod production;

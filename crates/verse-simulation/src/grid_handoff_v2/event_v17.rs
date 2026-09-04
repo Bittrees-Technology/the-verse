@@ -433,7 +433,6 @@ impl DraftCanonicalGridEventV17 {
         )
     }
 
-    #[cfg(test)]
     fn new_proven_system_with_manifest(
         state: &DraftGridTransferCellStateV2,
         world_v21_manifest: Option<&crate::manifest_v5::ValidatedUniverseManifestV5>,
@@ -510,7 +509,6 @@ impl DraftCanonicalGridEventV17 {
         }
     }
 
-    #[cfg(test)]
     pub(super) fn new_live_world_v21_system_for_store(
         state: &DraftGridTransferCellStateV2,
         manifest: &crate::manifest_v5::ValidatedUniverseManifestV5,

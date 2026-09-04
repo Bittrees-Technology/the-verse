@@ -19,9 +19,19 @@ use thiserror::Error;
 use uuid::Uuid;
 use verse_protocol::{CellKeyV1, protocol_v19::Protocol19CompatibilityTuple};
 
+use super::event_v17::{
+    DraftCanonicalGridEventV17, DraftGridEventPayloadV17, DraftProductionAuthorityClaimV17,
+    ValidatedCurrentGridEventAuthorityV17,
+};
+use super::lifecycle_v2::{
+    LIFECYCLE_HEAD_FILE, LIFECYCLE_HISTORY_FILE, LifecycleInitializationFailpointV2,
+    LifecycleRecordV2, LifecycleRuntimePreflightV2, LifecycleStoreV2, LifecycleV2Error,
+    LifecycleWorldFrontierV2, MAX_STALE_LIFECYCLE_HEAD_TEMPS, is_lifecycle_head_temp,
+};
 use super::state::DraftGridTransferCellStateV2;
 #[cfg(test)]
 use super::state::ValidatedDraftGridTransferCellStateV21;
+use crate::cell_directory::CellDirectoryError;
 #[cfg(test)]
 use crate::protocol19_migration::Protocol19World21StagingEvidence;
 use crate::protocol19_migration::{
@@ -287,6 +297,10 @@ pub(crate) enum DraftWorld21StoreError {
     Injected(DraftWorld21InitializationFailpoint),
     #[error("world-21 Store injected append failure: {0}")]
     InjectedAppend(&'static str),
+    #[error(transparent)]
+    Lifecycle(#[from] LifecycleV2Error),
+    #[error(transparent)]
+    Directory(#[from] CellDirectoryError),
 }
 
 /// Non-Serde target capability that couples one validated world-21 state to
@@ -401,8 +415,18 @@ pub(crate) struct DraftWorld21Store {
     lifecycle: Protocol19TargetLifecycleGenesisV2,
     manifest: crate::manifest_v5::ValidatedUniverseManifestV5,
     state: DraftGridTransferCellStateV2,
+    lifecycle_initial_frontier: LifecycleWorldFrontierV2,
     events: event_journal::DraftWorld21EventJournal,
+    lifecycle_runtime: Option<LifecycleStoreV2>,
     _writer_lock: File,
+}
+
+struct RecoveredImmutableWorld21 {
+    initialization_head: DraftWorld21InitializationHead,
+    identity: DraftWorld21StoreIdentity,
+    lifecycle: Protocol19TargetLifecycleGenesisV2,
+    manifest: crate::manifest_v5::ValidatedUniverseManifestV5,
+    snapshot: DraftGridTransferCellStateV2,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -418,6 +442,98 @@ pub(crate) struct PreparedWorld21CellEvidence {
 }
 
 impl DraftWorld21Store {
+    pub(crate) fn preflight_active_file_set(
+        base_root: impl AsRef<Path>,
+    ) -> Result<(), DraftWorld21StoreError> {
+        let base_root = base_root.as_ref();
+        validate_real_cell_root(base_root)?;
+        let root = base_root.join(STORE_DIRECTORY);
+        let metadata = fs::symlink_metadata(&root).map_err(|source| io_error(&root, source))?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(DraftWorld21StoreError::Invalid(
+                "activated world-21 namespace is not a real directory".into(),
+            ));
+        }
+        validate_active_file_set(&root)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn preflight_active_contents(
+        base_root: impl AsRef<Path>,
+        manifest: &crate::manifest_v5::ValidatedUniverseManifestV5,
+        migration_anchor_hash: &str,
+        active_head_hash: &str,
+        expected: &PreparedWorld21CellEvidence,
+        expected_production_origin_root: &str,
+        expected_identity_subset_root: &str,
+        directory_history: &crate::cell_directory_v3::DraftCellDirectoryHistoryStoreV3,
+    ) -> Result<LifecycleRuntimePreflightV2, DraftWorld21StoreError> {
+        let base_root = base_root.as_ref();
+        validate_real_cell_root(base_root)?;
+        let root = base_root.join(STORE_DIRECTORY);
+        validate_active_file_set(&root)?;
+        let _writer_lock = acquire_existing_writer_lock(&root)?;
+        let immutable =
+            recover_immutable(&root, manifest, &expected.cell_key, migration_anchor_hash)?;
+        let state = event_journal::DraftWorld21EventJournal::preflight_with_history(
+            &root,
+            &immutable.identity,
+            &immutable.initialization_head,
+            &immutable.snapshot,
+            &immutable.manifest,
+            directory_history,
+        )?;
+        let initial_frontier = LifecycleWorldFrontierV2::from_world(
+            immutable.snapshot.base(),
+            immutable.snapshot.state_hash(),
+            immutable.identity.active_world_hash.clone(),
+        );
+        let frontier = lifecycle_world_frontier_from_state(&state)?;
+        let assignment = directory_history.current_cell_assignment(&expected.cell_id)?;
+        let lifecycle_commitment = LifecycleStoreV2::preflight_existing(
+            &root,
+            &immutable.lifecycle,
+            active_head_hash,
+            &assignment,
+            &initial_frontier,
+            &frontier,
+            directory_history,
+        )?;
+        if lifecycle_commitment.committed().is_none() {
+            if frontier != initial_frontier {
+                return Err(DraftWorld21StoreError::Invalid(
+                    "an uninitialized lifecycle is not at its immutable world genesis".into(),
+                ));
+            }
+            LifecycleStoreV2::expected_initial_record(
+                &immutable.lifecycle,
+                active_head_hash,
+                &assignment,
+                &initial_frontier,
+            )?;
+        }
+        let evidence = PreparedWorld21CellEvidence {
+            cell_key: immutable.identity.cell_key.clone(),
+            cell_id: immutable.identity.cell_id.clone(),
+            initialization_head_hash: immutable.initialization_head.head_hash.clone(),
+            identity_hash: immutable.identity.identity_hash.clone(),
+            lifecycle_record_hash: immutable.lifecycle.record_hash().to_owned(),
+            snapshot_state_hash: immutable.identity.snapshot_state_hash.clone(),
+            active_world_hash: immutable.identity.active_world_hash.clone(),
+            migration_receipt_hash: immutable.identity.migration_receipt_hash.clone(),
+        };
+        if evidence != *expected
+            || immutable.identity.production_origin_root != expected_production_origin_root
+            || immutable.identity.identity_subset_root != expected_identity_subset_root
+            || state.state_hash().is_empty()
+        {
+            return Err(DraftWorld21StoreError::Invalid(
+                "world-21 Store differs from its active-head or receipt commitment".into(),
+            ));
+        }
+        Ok(lifecycle_commitment)
+    }
+
     pub(crate) fn stage_from_migration(
         root: impl AsRef<Path>,
         target: &ValidatedWorld21StagingTarget<'_, '_>,
@@ -460,13 +576,16 @@ impl DraftWorld21Store {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn open_from_active_head(
         base_root: impl AsRef<Path>,
         manifest: &crate::manifest_v5::ValidatedUniverseManifestV5,
         migration_anchor_hash: &str,
+        active_head_hash: &str,
         expected: &PreparedWorld21CellEvidence,
         expected_production_origin_root: &str,
         expected_identity_subset_root: &str,
+        directory_history: &crate::cell_directory_v3::DraftCellDirectoryHistoryStoreV3,
     ) -> Result<Self, DraftWorld21StoreError> {
         let base_root = base_root.as_ref();
         validate_real_cell_root(base_root)?;
@@ -477,6 +596,7 @@ impl DraftWorld21Store {
                 "activated world-21 namespace is not a real directory".into(),
             ));
         }
+        validate_active_file_set(&root)?;
         let writer_lock = acquire_existing_writer_lock(&root)?;
         let store = Self::recover_locked(
             root,
@@ -485,7 +605,7 @@ impl DraftWorld21Store {
             &expected.cell_key,
             migration_anchor_hash,
             None,
-            None,
+            Some(directory_history),
         )?;
         if store.prepared_install_evidence() != *expected {
             return Err(DraftWorld21StoreError::Invalid(
@@ -499,7 +619,8 @@ impl DraftWorld21Store {
                 "world-21 Store identity differs from its canonical migration receipt".into(),
             ));
         }
-        store.validate_prepared_file_set()?;
+        let _ = active_head_hash;
+        validate_active_file_set(&store.root)?;
         Ok(store)
     }
 
@@ -760,6 +881,11 @@ impl DraftWorld21Store {
                 "existing world-21 Store belongs to another migration target".into(),
             ));
         }
+        let lifecycle_initial_frontier = LifecycleWorldFrontierV2::from_world(
+            state.base(),
+            state.state_hash(),
+            identity.active_world_hash.clone(),
+        );
         let (events, state) = match directory_history {
             Some(directory_history) => {
                 event_journal::DraftWorld21EventJournal::recover_with_history(
@@ -788,7 +914,9 @@ impl DraftWorld21Store {
             lifecycle,
             manifest: reopened_manifest,
             state,
+            lifecycle_initial_frontier,
             events,
+            lifecycle_runtime: None,
             _writer_lock: writer_lock,
         })
     }
@@ -830,6 +958,255 @@ impl DraftWorld21Store {
 
     fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub(crate) fn lifecycle_world_frontier(
+        &self,
+    ) -> Result<LifecycleWorldFrontierV2, DraftWorld21StoreError> {
+        lifecycle_world_frontier_from_state(&self.state)
+    }
+
+    pub(crate) fn expected_initial_lifecycle_record(
+        &self,
+        active_head_hash: &str,
+        assignment: &crate::cell_directory_v3::ValidatedCurrentCellAssignmentV3<'_>,
+    ) -> Result<crate::grid_handoff_v2::lifecycle_v2::LifecycleRecordV2, DraftWorld21StoreError>
+    {
+        LifecycleStoreV2::expected_initial_record(
+            &self.lifecycle,
+            active_head_hash,
+            assignment,
+            &self.lifecycle_initial_frontier,
+        )
+        .map_err(Into::into)
+    }
+
+    pub(crate) fn prepare_initial_lifecycle_append(
+        &self,
+        active_head_hash: &str,
+        assignment: &crate::cell_directory_v3::ValidatedCurrentCellAssignmentV3<'_>,
+    ) -> Result<
+        crate::grid_handoff_v2::lifecycle_v2::PreparedLifecycleAppendV2,
+        DraftWorld21StoreError,
+    > {
+        LifecycleStoreV2::prepare_initial_append(
+            &self.lifecycle,
+            active_head_hash,
+            assignment,
+            &self.lifecycle_initial_frontier,
+        )
+        .map_err(Into::into)
+    }
+
+    pub(crate) fn initialize_prepared_lifecycle(
+        &mut self,
+        active_head_hash: &str,
+        prepared: crate::grid_handoff_v2::lifecycle_v2::PreparedLifecycleAppendV2,
+        directory_history: &crate::cell_directory_v3::DraftCellDirectoryHistoryStoreV3,
+    ) -> Result<
+        crate::grid_handoff_v2::lifecycle_v2::LifecycleHeadCommitmentV2,
+        DraftWorld21StoreError,
+    > {
+        let runtime = LifecycleStoreV2::initialize_prepared(
+            &self.root,
+            &self.lifecycle,
+            active_head_hash,
+            prepared,
+            directory_history,
+        )?;
+        let commitment = runtime.commitment();
+        self.lifecycle_runtime = Some(runtime);
+        validate_active_file_set(&self.root)?;
+        Ok(commitment)
+    }
+
+    pub(crate) fn initialize_prepared_lifecycle_with_failpoint(
+        &mut self,
+        active_head_hash: &str,
+        prepared: crate::grid_handoff_v2::lifecycle_v2::PreparedLifecycleAppendV2,
+        directory_history: &crate::cell_directory_v3::DraftCellDirectoryHistoryStoreV3,
+        failpoint: LifecycleInitializationFailpointV2,
+    ) -> Result<
+        crate::grid_handoff_v2::lifecycle_v2::LifecycleHeadCommitmentV2,
+        DraftWorld21StoreError,
+    > {
+        let runtime = LifecycleStoreV2::initialize_prepared_with_failpoint(
+            &self.root,
+            &self.lifecycle,
+            active_head_hash,
+            prepared,
+            directory_history,
+            failpoint,
+        )?;
+        let commitment = runtime.commitment();
+        self.lifecycle_runtime = Some(runtime);
+        validate_active_file_set(&self.root)?;
+        Ok(commitment)
+    }
+
+    pub(crate) fn open_or_initialize_lifecycle(
+        &mut self,
+        active_head_hash: &str,
+        assignment: &crate::cell_directory_v3::ValidatedCurrentCellAssignmentV3<'_>,
+        directory_history: &crate::cell_directory_v3::DraftCellDirectoryHistoryStoreV3,
+    ) -> Result<
+        crate::grid_handoff_v2::lifecycle_v2::LifecycleHeadCommitmentV2,
+        DraftWorld21StoreError,
+    > {
+        let frontier = self.lifecycle_world_frontier()?;
+        let runtime = LifecycleStoreV2::open_or_initialize(
+            &self.root,
+            &self.lifecycle,
+            active_head_hash,
+            assignment,
+            &self.lifecycle_initial_frontier,
+            &frontier,
+            directory_history,
+        )?;
+        let commitment = runtime.commitment();
+        self.lifecycle_runtime = Some(runtime);
+        validate_active_file_set(&self.root)?;
+        Ok(commitment)
+    }
+
+    pub(crate) fn lifecycle_commitment(
+        &self,
+    ) -> Result<
+        crate::grid_handoff_v2::lifecycle_v2::LifecycleHeadCommitmentV2,
+        DraftWorld21StoreError,
+    > {
+        Ok(self
+            .lifecycle_runtime
+            .as_ref()
+            .ok_or_else(|| DraftWorld21StoreError::Invalid("lifecycle runtime is not open".into()))?
+            .commitment())
+    }
+
+    pub(crate) fn prepare_lifecycle_append(
+        &mut self,
+        record: crate::grid_handoff_v2::lifecycle_v2::LifecycleRecordV2,
+        directory_history: &crate::cell_directory_v3::DraftCellDirectoryHistoryStoreV3,
+    ) -> Result<
+        crate::grid_handoff_v2::lifecycle_v2::PreparedLifecycleAppendV2,
+        DraftWorld21StoreError,
+    > {
+        self.lifecycle_runtime
+            .as_mut()
+            .ok_or_else(|| DraftWorld21StoreError::Invalid("lifecycle runtime is not open".into()))?
+            .prepare_append(record, directory_history)
+            .map_err(Into::into)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepare_resealed_non_state_machine_lifecycle_successor_for_test(
+        &self,
+        record: crate::grid_handoff_v2::lifecycle_v2::LifecycleRecordV2,
+    ) -> Result<
+        crate::grid_handoff_v2::lifecycle_v2::PreparedLifecycleAppendV2,
+        DraftWorld21StoreError,
+    > {
+        self.lifecycle_runtime
+            .as_ref()
+            .ok_or_else(|| DraftWorld21StoreError::Invalid("lifecycle runtime is not open".into()))?
+            .prepare_resealed_non_state_machine_successor_for_test(record)
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn materialize_lifecycle_append(
+        &mut self,
+        prepared: crate::grid_handoff_v2::lifecycle_v2::PreparedLifecycleAppendV2,
+        directory_history: &crate::cell_directory_v3::DraftCellDirectoryHistoryStoreV3,
+    ) -> Result<(), DraftWorld21StoreError> {
+        self.lifecycle_runtime
+            .as_mut()
+            .ok_or_else(|| DraftWorld21StoreError::Invalid("lifecycle runtime is not open".into()))?
+            .materialize_prepared(prepared, directory_history)
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn lifecycle_record(&self) -> Result<&LifecycleRecordV2, DraftWorld21StoreError> {
+        self.lifecycle_runtime
+            .as_ref()
+            .map(LifecycleStoreV2::current)
+            .ok_or_else(|| {
+                DraftWorld21StoreError::Invalid(
+                    "world-21 Store has no activated lifecycle runtime".into(),
+                )
+            })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_lifecycle_failpoint_for_test(
+        &mut self,
+        failpoint: super::lifecycle_v2::LifecycleAppendFailpointV2,
+    ) -> Result<(), DraftWorld21StoreError> {
+        self.lifecycle_runtime
+            .as_mut()
+            .ok_or_else(|| {
+                DraftWorld21StoreError::Invalid(
+                    "world-21 Store has no activated lifecycle runtime".into(),
+                )
+            })?
+            .set_failpoint(failpoint);
+        Ok(())
+    }
+
+    pub(crate) fn background_production_is_runnable(&self) -> Result<bool, DraftWorld21StoreError> {
+        self.state
+            .base()
+            .background_production_is_runnable()
+            .map_err(|source| DraftWorld21StoreError::Invalid(source.to_string()))
+    }
+
+    pub(crate) fn next_production_occurrence_at(
+        &self,
+        scheduled_for_unix_ms: u64,
+    ) -> Result<crate::event::ProductionScheduleOccurrence, DraftWorld21StoreError> {
+        self.state
+            .base()
+            .next_production_occurrence_at(scheduled_for_unix_ms)
+            .map_err(|source| DraftWorld21StoreError::Invalid(source.to_string()))
+    }
+
+    pub(crate) fn append_production_occurrence(
+        &mut self,
+        occurrence: crate::event::ProductionScheduleOccurrence,
+        accepted_trusted_at_unix_ms: u64,
+        authority: &crate::cell_directory_v3::ValidatedCurrentCellAuthorityV3<'_>,
+    ) -> Result<(), DraftWorld21StoreError> {
+        let live_authority = ValidatedCurrentGridEventAuthorityV17::Production(authority);
+        let event = DraftCanonicalGridEventV17::new_live_world_v21_system_for_store(
+            &self.state,
+            &self.manifest,
+            format!(
+                "production-{}-{}",
+                occurrence.lifecycle_generation, occurrence.production_quantum_sequence
+            ),
+            accepted_trusted_at_unix_ms,
+            DraftGridEventPayloadV17::ProductionQuantumCommitted {
+                occurrence,
+                accepted_trusted_at_unix_ms,
+                authority: DraftProductionAuthorityClaimV17::from_validated(authority.validated()),
+            },
+            &live_authority,
+        )
+        .map_err(|source| DraftWorld21StoreError::Invalid(source.to_string()))?;
+        let application =
+            self.events
+                .append_live(&self.state, &self.manifest, &event, &live_authority)?;
+        self.state = application.next_state;
+        drop(application.proof);
+        Ok(())
+    }
+
+    pub(crate) fn committed_production_accepted_trusted_at(
+        &self,
+        occurrence: &crate::event::ProductionScheduleOccurrence,
+    ) -> Result<u64, DraftWorld21StoreError> {
+        let (_, _, proof) =
+            super::state::reconcile_imported_production_occurrence_v2(&self.state, occurrence)
+                .map_err(|source| DraftWorld21StoreError::Invalid(source.to_string()))?;
+        Ok(proof.accepted_trusted_at_unix_ms)
     }
 
     pub(crate) fn prepared_install_evidence(&self) -> PreparedWorld21CellEvidence {
@@ -912,6 +1289,159 @@ impl DraftWorld21Store {
             Err(source) => Err(io_error(&root, source)),
         }
     }
+}
+
+fn lifecycle_world_frontier_from_state(
+    state: &DraftGridTransferCellStateV2,
+) -> Result<LifecycleWorldFrontierV2, DraftWorld21StoreError> {
+    Ok(LifecycleWorldFrontierV2::from_world(
+        state.base(),
+        state.state_hash(),
+        state
+            .calculate_active_world_hash()
+            .map_err(|source| DraftWorld21StoreError::Invalid(source.to_string()))?,
+    ))
+}
+
+fn recover_immutable(
+    root: &Path,
+    manifest: &crate::manifest_v5::ValidatedUniverseManifestV5,
+    expected_cell_key: &CellKeyV1,
+    migration_anchor_hash: &str,
+) -> Result<RecoveredImmutableWorld21, DraftWorld21StoreError> {
+    if !valid_hash(migration_anchor_hash) {
+        return Err(DraftWorld21StoreError::Invalid(
+            "migration anchor hash is not canonical BLAKE3 text".into(),
+        ));
+    }
+    let initialization_head_bytes = read_bounded(
+        &root.join(INITIALIZATION_HEAD_FILE),
+        MAX_INITIALIZATION_HEAD_BYTES,
+    )?;
+    let initialization_head =
+        serde_json::from_slice::<DraftWorld21InitializationHead>(&initialization_head_bytes)
+            .map_err(|source| DraftWorld21StoreError::Invalid(source.to_string()))?;
+    if serde_json::to_vec(&initialization_head)
+        .map_err(|source| DraftWorld21StoreError::Invalid(source.to_string()))?
+        != initialization_head_bytes
+    {
+        return Err(DraftWorld21StoreError::Invalid(
+            "world-21 Store initialization head bytes are not canonical".into(),
+        ));
+    }
+    let manifest_bytes = read_bounded(&root.join(MANIFEST_FILE), MAX_MANIFEST_BYTES)?;
+    let reopened_manifest =
+        crate::manifest_v5::decode_manifest_v5(&manifest_bytes, manifest.world_seed())
+            .map_err(|source| DraftWorld21StoreError::Invalid(source.to_string()))?;
+    if reopened_manifest.document() != manifest.document() {
+        return Err(DraftWorld21StoreError::Invalid(
+            "persisted manifest 5 differs from the expected capability".into(),
+        ));
+    }
+    let lifecycle_bytes = read_bounded(
+        &root.join(LIFECYCLE_GENESIS_FILE),
+        crate::protocol19_migration::MAX_TARGET_LIFECYCLE_BYTES,
+    )?;
+    let lifecycle = crate::protocol19_migration::decode_target_lifecycle_genesis(&lifecycle_bytes)
+        .map_err(|source| DraftWorld21StoreError::Invalid(source.to_string()))?;
+    if lifecycle.migration_anchor_hash() != migration_anchor_hash
+        || lifecycle.manifest_hash() != reopened_manifest.manifest_hash()
+        || lifecycle.cell_key() != expected_cell_key
+    {
+        return Err(DraftWorld21StoreError::Invalid(
+            "persisted lifecycle genesis differs from the routed migration target".into(),
+        ));
+    }
+    let snapshot_bytes = read_bounded(&root.join(SNAPSHOT_FILE), MAX_SNAPSHOT_BYTES)?;
+    let snapshot = DraftGridTransferCellStateV2::decode_world_v21_canonical(
+        &snapshot_bytes,
+        &reopened_manifest,
+    )
+    .map_err(|source| DraftWorld21StoreError::Invalid(source.to_string()))?;
+    let identity_bytes = read_bounded(&root.join(IDENTITY_FILE), MAX_IDENTITY_BYTES)?;
+    let identity = serde_json::from_slice::<DraftWorld21StoreIdentity>(&identity_bytes)
+        .map_err(|source| DraftWorld21StoreError::Invalid(source.to_string()))?;
+    if serde_json::to_vec(&identity)
+        .map_err(|source| DraftWorld21StoreError::Invalid(source.to_string()))?
+        != identity_bytes
+    {
+        return Err(DraftWorld21StoreError::Invalid(
+            "world-21 Store identity bytes are not canonical".into(),
+        ));
+    }
+    identity.validate(&snapshot, &reopened_manifest, expected_cell_key, &lifecycle)?;
+    initialization_head.validate(&identity, 0)?;
+    Ok(RecoveredImmutableWorld21 {
+        initialization_head,
+        identity,
+        lifecycle,
+        manifest: reopened_manifest,
+        snapshot,
+    })
+}
+
+fn validate_active_file_set(root: &Path) -> Result<(), DraftWorld21StoreError> {
+    let prepared = [
+        INITIALIZATION_HEAD_FILE,
+        IDENTITY_FILE,
+        MANIFEST_FILE,
+        LIFECYCLE_GENESIS_FILE,
+        SNAPSHOT_FILE,
+        EVENT_JOURNAL_FILE,
+        event_journal::EVENT_BOUNDARY_FILE,
+        event_journal::EVENT_HEAD_FILE,
+        WRITER_LOCK_FILE,
+    ];
+    let mut lifecycle_head = false;
+    let mut lifecycle_history = false;
+    let mut lifecycle_temps = 0usize;
+    for entry in fs::read_dir(root).map_err(|source| io_error(root, source))? {
+        let entry = entry.map_err(|source| io_error(root, source))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|source| io_error(entry.path(), source))?;
+        let name = entry.file_name();
+        let name = name.to_str().ok_or_else(|| {
+            DraftWorld21StoreError::Invalid("world-21 Store contains a non-UTF-8 artifact".into())
+        })?;
+        if !file_type.is_file() {
+            return Err(DraftWorld21StoreError::Invalid(
+                "world-21 Store contains a non-regular artifact".into(),
+            ));
+        }
+        if prepared.contains(&name) {
+            continue;
+        }
+        if name == LIFECYCLE_HEAD_FILE {
+            lifecycle_head = true;
+            continue;
+        }
+        if name == LIFECYCLE_HISTORY_FILE {
+            lifecycle_history = true;
+            continue;
+        }
+        if is_lifecycle_head_temp(name) {
+            lifecycle_temps += 1;
+            continue;
+        }
+        return Err(DraftWorld21StoreError::Invalid(
+            "world-21 Store contains an unexpected active artifact".into(),
+        ));
+    }
+    if lifecycle_temps > MAX_STALE_LIFECYCLE_HEAD_TEMPS
+        || lifecycle_head && !lifecycle_history
+        || lifecycle_history
+            && !lifecycle_head
+            && fs::metadata(root.join(LIFECYCLE_HISTORY_FILE))
+                .map_err(|source| io_error(root.join(LIFECYCLE_HISTORY_FILE), source))?
+                .len()
+                != 0
+    {
+        return Err(DraftWorld21StoreError::Invalid(
+            "world-21 Store lifecycle runtime artifact set is incomplete".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_real_cell_root(path: &Path) -> Result<(), DraftWorld21StoreError> {
@@ -1703,6 +2233,7 @@ mod tests {
             &migration_anchor(),
         )
         .expect("world-21 Store creates");
+        let genesis_active_world_hash = store.identity().active_world_hash.clone();
         let event = live_prepare_event(
             store.state(),
             &manifest,
@@ -1724,6 +2255,10 @@ mod tests {
         assert!(valid_hash(event_journal::proof_hash(&proof)));
         assert_eq!(store.committed_event17_count(), 1);
         let expected_state = store.state().clone();
+        let expected_active_world_hash = expected_state
+            .calculate_active_world_hash()
+            .expect("event successor active-world hash derives");
+        assert_ne!(expected_active_world_hash, genesis_active_world_hash);
         drop(current);
         drop(store);
 
@@ -1747,6 +2282,13 @@ mod tests {
         .expect("manifest-aware event replay reopens");
         assert_eq!(reopened.state(), &expected_state);
         assert_eq!(reopened.committed_event17_count(), 1);
+        assert_eq!(
+            lifecycle_world_frontier_from_state(reopened.state())
+                .expect("replayed lifecycle frontier derives")
+                .active_world_hash,
+            expected_active_world_hash,
+            "replayed lifecycle preflight must not reuse the immutable genesis world hash"
+        );
     }
 
     #[test]

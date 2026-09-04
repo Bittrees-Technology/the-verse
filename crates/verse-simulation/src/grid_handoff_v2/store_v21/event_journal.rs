@@ -600,8 +600,31 @@ impl DraftWorld21EventJournal {
             directory_history,
             identity,
             initialization,
+            true,
         )?;
         Ok((Self::open_append(root, head)?, state))
+    }
+
+    pub(super) fn preflight_with_history(
+        root: &Path,
+        identity: &DraftWorld21StoreIdentity,
+        initialization: &DraftWorld21InitializationHead,
+        snapshot: &DraftGridTransferCellStateV2,
+        manifest: &crate::manifest_v5::ValidatedUniverseManifestV5,
+        directory_history: &DraftCellDirectoryHistoryStoreV3,
+    ) -> Result<DraftGridTransferCellStateV2, DraftWorld21StoreError> {
+        let head = read_head(root, identity, initialization)?;
+        let (_, state) = replay(
+            root,
+            head,
+            snapshot,
+            manifest,
+            directory_history,
+            identity,
+            initialization,
+            false,
+        )?;
+        Ok(state)
     }
 
     fn open_append(
@@ -916,6 +939,7 @@ fn persist_head_atomic(
     atomic_write(&root.join(EVENT_HEAD_FILE), &bytes)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn replay(
     root: &Path,
     mut head: DraftWorld21EventHeadV17,
@@ -924,6 +948,7 @@ fn replay(
     directory_history: &DraftCellDirectoryHistoryStoreV3,
     identity: &DraftWorld21StoreIdentity,
     initialization: &DraftWorld21InitializationHead,
+    repair: bool,
 ) -> Result<(DraftWorld21EventHeadV17, DraftGridTransferCellStateV2), DraftWorld21StoreError> {
     let journal_path = root.join(super::EVENT_JOURNAL_FILE);
     let file_length = fs::metadata(&journal_path)
@@ -1045,7 +1070,9 @@ fn replay(
             if head.pending_event.is_some() {
                 head = head.rollback_pending()?;
                 head.validate(identity, initialization)?;
-                persist_head_atomic(root, &head)?;
+                if repair {
+                    persist_head_atomic(root, &head)?;
+                }
             }
         }
         Some((_record, false)) => {
@@ -1070,10 +1097,14 @@ fn replay(
                     "event-17 boundary advances while its pending event is partial",
                 ));
             }
-            truncate_journal(&journal_path, head.journal_byte_length)?;
+            if repair {
+                truncate_journal(&journal_path, head.journal_byte_length)?;
+            }
             head = head.rollback_pending()?;
             head.validate(identity, initialization)?;
-            persist_head_atomic(root, &head)?;
+            if repair {
+                persist_head_atomic(root, &head)?;
+            }
         }
         Some((record, true)) => {
             let pending = head.pending_event.as_ref().ok_or_else(|| {
@@ -1125,11 +1156,15 @@ fn replay(
                 &boundary_path,
                 MAX_EVENT_BOUNDARY_RECORD_BYTES - 1,
             )? {
-                None => append_boundary_record(
-                    &boundary_path,
-                    head.boundary_byte_length,
-                    &expected_boundary_record,
-                )?,
+                None => {
+                    if repair {
+                        append_boundary_record(
+                            &boundary_path,
+                            head.boundary_byte_length,
+                            &expected_boundary_record,
+                        )?;
+                    }
+                }
                 Some((_boundary_record, false)) => {
                     if boundary_file_length <= head.boundary_byte_length
                         || boundary_file_length >= pending.boundary_end
@@ -1138,12 +1173,14 @@ fn replay(
                             "event-17 pending boundary suffix exceeds its sealed range",
                         ));
                     }
-                    truncate_journal(&boundary_path, head.boundary_byte_length)?;
-                    append_boundary_record(
-                        &boundary_path,
-                        head.boundary_byte_length,
-                        &expected_boundary_record,
-                    )?;
+                    if repair {
+                        truncate_journal(&boundary_path, head.boundary_byte_length)?;
+                        append_boundary_record(
+                            &boundary_path,
+                            head.boundary_byte_length,
+                            &expected_boundary_record,
+                        )?;
+                    }
                 }
                 Some((boundary_record, true)) => {
                     let persisted = DraftWorld21EventBoundaryV17::decode_record(&boundary_record)?;
@@ -1163,7 +1200,9 @@ fn replay(
             }
             head = head.commit_pending()?;
             head.validate(identity, initialization)?;
-            persist_head_atomic(root, &head)?;
+            if repair {
+                persist_head_atomic(root, &head)?;
+            }
             state = application.next_state;
         }
     }
