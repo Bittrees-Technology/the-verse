@@ -46,6 +46,7 @@ func _run() -> void:
 	_test_received_vs_processed_reconciliation()
 	_test_ordering_corrections_and_motion_only_updates()
 	_test_render_interpolation_and_grounded_pitch_prediction()
+	_test_remote_player_presentation_smoothing()
 	_test_menu_dead_disconnect_and_bounds()
 	_test_life_state_reset()
 	_test_bound_player_roster_selection()
@@ -65,7 +66,7 @@ func _run() -> void:
 		quit(1)
 		return
 	print(
-		"VERSE_NATIVE_IMPAIRMENT_OK queued_ack=ordered motion=monotonic corrections=bounded presentation=interpolated pitch=predicted menu=neutral_prediction lifecycle=reset buffers=bounded roll_tap=durable idle=silent rebuild=none targeting=closest_hit ownership=filtered privacy=projected operations=serialized production=physical"
+		"VERSE_NATIVE_IMPAIRMENT_OK queued_ack=ordered motion=monotonic corrections=bounded presentation=interpolated remote=smooth pitch=predicted menu=neutral_prediction lifecycle=reset buffers=bounded roll_tap=durable idle=silent rebuild=none targeting=closest_hit ownership=filtered privacy=projected operations=serialized production=physical"
 	)
 	quit(0)
 
@@ -1841,6 +1842,73 @@ func _test_render_interpolation_and_grounded_pitch_prediction() -> void:
 	client.set("predicted_linear_velocity", Vector3(0.0, 0.0, -24.0))
 	client.call("_update_player_presentation", FIXED_DELTA)
 	_check(camera.fov > 74.0, "true boost retains readable field-of-view feedback")
+	client.free()
+
+
+func _test_remote_player_presentation_smoothing() -> void:
+	var client := _new_client()
+	var players_root := Node3D.new()
+	client.add_child(players_root)
+	client.set("players_root", players_root)
+	var remote_node := Node3D.new()
+	var pilot_label := Node3D.new()
+	pilot_label.name = "PilotLabel"
+	remote_node.add_child(pilot_label)
+	players_root.add_child(remote_node)
+	client.set("remote_player_nodes", {"player-remote": remote_node})
+	var remote := _base_player()
+	remote["player_id"] = "player-remote"
+	remote["position"] = _protocol_vec3(Vector3.ZERO)
+	remote["orientation"] = _protocol_quat(Quaternion.IDENTITY)
+	client.call("_sync_remote_players", [remote])
+	var node: Node3D = (client.get("remote_player_nodes") as Dictionary).get(
+		"player-remote", null
+	)
+	_check(node != null, "remote presentation creates an avatar")
+	if node == null:
+		client.free()
+		return
+
+	var target_orientation := Quaternion(Vector3.UP, 0.5)
+	remote["position"] = _protocol_vec3(Vector3(1.0, 0.0, 0.0))
+	remote["orientation"] = _protocol_quat(target_orientation)
+	client.call("_sync_remote_players", [remote])
+	_check(node.position.is_zero_approx(), "ordinary remote motion does not snap")
+	_check(
+		node.quaternion.is_equal_approx(Quaternion.IDENTITY),
+		"ordinary remote rotation does not snap"
+	)
+	_check(
+		bool(client.call("_remote_player_visuals_match", [remote])),
+		"remote presentation tracks the newest authoritative target"
+	)
+
+	client.call("_update_remote_player_presentation", FIXED_DELTA)
+	_check(
+		node.position.x > 0.0 and node.position.x < 1.0,
+		"remote position advances smoothly between authoritative samples"
+	)
+	_check(
+		node.quaternion.get_angle() > 0.0 and node.quaternion.get_angle() < 0.5,
+		"remote orientation advances smoothly between authoritative samples"
+	)
+	for _step in 120:
+		client.call("_update_remote_player_presentation", FIXED_DELTA)
+	_check(
+		node.position.is_equal_approx(Vector3(1.0, 0.0, 0.0)),
+		"remote position converges to authority"
+	)
+	_check(
+		node.quaternion.is_equal_approx(target_orientation),
+		"remote orientation converges to authority"
+	)
+
+	remote["position"] = _protocol_vec3(Vector3(10.0, 0.0, 0.0))
+	client.call("_sync_remote_players", [remote])
+	_check(
+		node.position.is_equal_approx(Vector3(10.0, 0.0, 0.0)),
+		"remote teleport snaps without crossing intervening geometry"
+	)
 	client.free()
 
 
