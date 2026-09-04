@@ -781,8 +781,8 @@ separate event-free reconciliation transactions, so an already committed event
 is never invented again during recovery. The dormant proof-only replay
 dispatcher now resolves the exact historical directory revision and compares it
 with the event payload; serialized authority is not itself a trust root. The
-dormant directory-v3 path now retains every full sealed revision in a canonical
-NDJSON hash chain under an isolated protocol-19 namespace. An atomically replaced head
+directory-v3 path retains every full sealed revision in a canonical NDJSON hash
+chain under an isolated protocol-19 namespace. An atomically replaced head
 pins its exact entry count, record boundary, revision, document hash, and chain
 hash, so deleting a durable suffix fails closed while a valid journal record
 that reached disk before its head is safely adopted on restart. Recovery
@@ -790,10 +790,13 @@ truncates only an unterminated final record outside the pinned prefix. Exact
 historical transfer and assigned-cell capabilities resolve only by revision plus
 document hash; stale CAS attempts, revision forks, rewritten predecessors,
 complete garbage suffixes, and live directory-v2 filename collisions reject.
-The history remains dormant because its head advertises the indivisible
-protocol-19 tuple and no active runtime calls it. Its constructors are compiled
-only for tests until a validated manifest-5 capability exists; a merely
-well-formed manifest hash cannot activate the store.
+The activated-world path opens it only after proving the exact signed genesis
+prefix, then recovers and accepts validated successors. Crate-private claim,
+recovery, and release transitions derive generations and fences from the
+durable tip; exact retry also proves the predecessor transition kind, and a
+nonterminal transfer pins release. Lifecycle-v2 coordination still gates any
+worker or public gameplay caller. A merely well-formed manifest hash cannot
+activate the store.
 The dispatcher total-matches all eight event-17 operation kinds, rebinds only a
 directory-proven successor lease fence while preserving the gameplay and event
 frontiers, and calls only exact-predecessor transactions—never reconciliation.
@@ -844,9 +847,10 @@ strictly stage or reopen every world-21 cell, and commit one universe head last.
 Before that head, target debris grants no installed authority and exact retry
 rebuilds it while the install lock is held. After that head, recovery verifies
 the complete artifact, directory, lifecycle, route, frontier, and cell set and
-never substitutes or reseals foreign material. Active event-17 runtime
-adaptation, signatures, scheduler, durable wake-up, and coordinated activation
-remain to be implemented. All drafts are
+never substitutes or reseals foreign material. Signed activation and active
+directory-v3 authority transitions are now implemented. Active event-17
+runtime adaptation, lifecycle-v2 scheduling, durable wake-up, and coordinated
+client activation remain to be implemented. All remaining drafts are
 intentionally unreachable from the production directory-v2/package-v1 paths
 until every version in the table above moves in one coordinated activation.
 The dormant proof harness retains bounded predecessor projections for replay;

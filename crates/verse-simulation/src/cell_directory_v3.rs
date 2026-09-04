@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Dormant cell-directory-v3 wire model for the protocol-19 activation.
+//! Cell-directory-v3 model and active protocol-19 history store.
 //!
-//! Nothing in this module opens or writes the production directory. Keeping
-//! this codec private preserves the protocol-18/directory-v2 compatibility
-//! boundary while the complete grid-closure tuple is implemented and tested.
+//! The crate-private activated path opens only the signed-genesis history and
+//! advances authority through its single-writer journal. The protocol-18
+//! directory remains isolated while lifecycle-v2 scheduling is completed.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
@@ -45,6 +45,7 @@ const DRAFT_DIRECTORY_HISTORY_SUBDIRECTORY: &str = "protocol-19-directory-v3";
 const DRAFT_DIRECTORY_HISTORY_LOCK_FILE: &str = "writer.lock";
 const DRAFT_DIRECTORY_HISTORY_HEAD_FILE: &str = "head-v3.json";
 const DRAFT_DIRECTORY_HISTORY_FILE: &str = "history-v3.ndjson";
+const MAX_STALE_DIRECTORY_HEAD_TEMPS: usize = 64;
 const DRAFT_DIRECTORY_HISTORY_ENTRY_HASH_DOMAIN: &[u8] =
     b"the-verse/cell-directory-history-entry/v3\0";
 const MIGRATION_ASSIGNMENT_ROOT_DOMAIN: &[u8] =
@@ -686,6 +687,12 @@ struct DraftDirectoryHistoryLocationV3 {
     entry_hash: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CellAuthorityTransitionV3 {
+    ClaimSleeping,
+    RecoverAssigned,
+}
+
 /// Non-Serde proof of the exact directory-v3 genesis derived from the frozen
 /// protocol-18 directory and its validated world-21 transform.
 #[derive(Debug)]
@@ -913,9 +920,8 @@ pub(crate) struct DraftDirectoryV3AuthorityHarness {
     history: Vec<CellDirectoryDocumentV3>,
 }
 
-/// Dormant, isolated protocol-19 history store. The crate-private module has no
-/// active runtime constructor; test-only construction remains gated until a
-/// validated manifest-5 capability and the world-21 store exist.
+/// Isolated protocol-19 history store. Activated construction requires the
+/// exact signed genesis and retains its writer lock for the store lifetime.
 #[derive(Debug)]
 pub(super) struct DraftCellDirectoryHistoryStoreV3 {
     root: PathBuf,
@@ -1161,61 +1167,53 @@ impl DraftCellDirectoryHistoryStoreV3 {
                 "active head selects a non-directory directory-v3 namespace",
             ));
         }
-        let lock_file = lock_history_writer_v3(&root, false)?;
-        let head_path = root.join(DRAFT_DIRECTORY_HISTORY_HEAD_FILE);
         let history_path = root.join(DRAFT_DIRECTORY_HISTORY_FILE);
-        let head = read_history_head_v3(&head_path)?;
-        head.validate_identity(expected.universe_id, expected.manifest_hash)?;
         let history_entry =
             DraftDirectoryHistoryEntryV3::decode_canonical(expected.history_entry_bytes)?;
-        let current = history_entry.document.clone();
-        current.validate()?;
-        let canonical_document = serde_json::to_vec(&current)
+        let genesis = history_entry.document.clone();
+        genesis.validate()?;
+        let canonical_document = serde_json::to_vec(&genesis)
             .map_err(|source| invalid(format!("directory-v3 document cannot encode: {source}")))?;
-        let mut expected_history = expected.history_entry_bytes.to_vec();
-        expected_history.push(b'\n');
-        let read_file =
-            File::open(&history_path).map_err(|source| io_error_v3(&history_path, source))?;
-        let reported_length = read_file
-            .metadata()
-            .map_err(|source| io_error_v3(&history_path, source))?
-            .len();
-        if reported_length > MAX_DRAFT_DIRECTORY_HISTORY_BYTES {
-            return Err(invalid("v3 directory history exceeds its byte bound"));
-        }
-        let mut history_bytes = Vec::with_capacity(usize::try_from(reported_length).unwrap_or(0));
-        read_file
-            .take(MAX_DRAFT_DIRECTORY_HISTORY_BYTES + 1)
-            .read_to_end(&mut history_bytes)
-            .map_err(|source| io_error_v3(&history_path, source))?;
-        let history_length = u64::try_from(history_bytes.len())
-            .map_err(|_| invalid("directory-v3 history length overflowed"))?;
-        if history_bytes != expected_history || history_length > MAX_DRAFT_DIRECTORY_HISTORY_BYTES {
-            return Err(invalid(
-                "directory-v3 history differs from the exact active-head commitment",
-            ));
-        }
-        let expected_head = DraftDirectoryHistoryHeadV3::from_tip(
-            &DraftDirectoryHistoryHeadV3::empty(&current),
-            &history_entry,
-            history_length,
-        )?;
         let assignment_root =
-            hash_directory_genesis(MIGRATION_ASSIGNMENT_ROOT_DOMAIN, &current.assignments)?;
+            hash_directory_genesis(MIGRATION_ASSIGNMENT_ROOT_DOMAIN, &genesis.assignments)?;
         let placement_root =
-            hash_directory_genesis(MIGRATION_PLACEMENT_ROOT_DOMAIN, &current.placements)?;
-        if head != expected_head
-            || !history_entry.previous_entry_hash.is_empty()
-            || current.directory_revision != expected.revision
-            || current.document_hash != expected.document_hash
+            hash_directory_genesis(MIGRATION_PLACEMENT_ROOT_DOMAIN, &genesis.placements)?;
+        if !history_entry.previous_entry_hash.is_empty()
+            || genesis.directory_revision != expected.revision
+            || genesis.document_hash != expected.document_hash
             || assignment_root != expected.assignment_root
             || placement_root != expected.placement_root
             || canonical_document != expected.document_bytes
-            || history_entry.document != current
+            || history_entry.document != genesis
             || history_entry.entry_hash != expected.history_entry_hash
         {
             return Err(invalid(
-                "directory-v3 state differs from the exact active-head commitment",
+                "directory-v3 genesis differs from the exact active-head commitment",
+            ));
+        }
+
+        // The signed activation head anchors revision one, not a permanently
+        // frozen directory tip. Prove the durable prefix before recovery is
+        // allowed to truncate or advance either artifact, then recover the
+        // complete hash-chained successor history.
+        let lock_file = lock_history_writer_v3(&root, false)?;
+        let head_path = root.join(DRAFT_DIRECTORY_HISTORY_HEAD_FILE);
+        let head = read_history_head_v3(&head_path)?;
+        head.validate_identity(expected.universe_id, expected.manifest_hash)?;
+        let mut expected_prefix = expected.history_entry_bytes.to_vec();
+        expected_prefix.push(b'\n');
+        let expected_prefix_length = u64::try_from(expected_prefix.len())
+            .map_err(|_| invalid("active directory-v3 genesis length overflowed"))?;
+        let history_length = fs::metadata(&history_path)
+            .map_err(|source| io_error_v3(&history_path, source))?
+            .len();
+        if history_length > MAX_DRAFT_DIRECTORY_HISTORY_BYTES
+            || head.entry_count == 0
+            || head.journal_byte_length < expected_prefix_length
+            || history_length < head.journal_byte_length
+        {
+            return Err(invalid(
+                "active directory-v3 head does not pin the selected genesis prefix",
             ));
         }
         let history_file = OpenOptions::new()
@@ -1223,28 +1221,315 @@ impl DraftCellDirectoryHistoryStoreV3 {
             .append(true)
             .open(&history_path)
             .map_err(|source| io_error_v3(&history_path, source))?;
-        let index = BTreeMap::from([(
-            current.directory_revision,
-            DraftDirectoryHistoryLocationV3 {
-                offset: 0,
-                line_length: expected.history_entry_bytes.len(),
-                document_hash: current.document_hash.clone(),
-                entry_hash: history_entry.entry_hash.clone(),
-            },
-        )]);
-        let store = Self {
+        let mut persisted_prefix = vec![0; expected_prefix.len()];
+        File::open(&history_path)
+            .and_then(|mut file| file.read_exact(&mut persisted_prefix))
+            .map_err(|source| io_error_v3(&history_path, source))?;
+        if persisted_prefix != expected_prefix {
+            return Err(invalid(
+                "directory-v3 history does not begin with the exact active-head genesis",
+            ));
+        }
+        remove_stale_history_head_temps_v3(&root)?;
+        let mut store = Self {
             root,
             lock_file,
             history_file,
             head,
-            current: Some(current),
-            index,
+            current: None,
+            index: BTreeMap::new(),
             poisoned: false,
             #[cfg(test)]
             failpoint: None,
         };
+        store.recover()?;
+        store.current()?;
+        let location = store.index.get(&expected.revision).ok_or_else(|| {
+            invalid("active directory-v3 history has no selected genesis revision")
+        })?;
+        let first_revision = store.index.first_key_value().map(|(revision, _)| *revision);
+        let persisted_genesis =
+            store.resolve_document(expected.revision, expected.document_hash)?;
+        let mut persisted_entry = vec![0; location.line_length];
+        File::open(&history_path)
+            .and_then(|mut file| {
+                file.seek(SeekFrom::Start(location.offset))?;
+                file.read_exact(&mut persisted_entry)
+            })
+            .map_err(|source| io_error_v3(&history_path, source))?;
+        if first_revision != Some(expected.revision)
+            || location.offset != 0
+            || location.entry_hash != expected.history_entry_hash
+            || location.document_hash != expected.document_hash
+            || persisted_entry != expected.history_entry_bytes
+            || persisted_genesis != genesis
+        {
+            return Err(invalid(
+                "directory-v3 history does not descend from the exact active-head genesis",
+            ));
+        }
         store.validate_genesis_file_set()?;
         Ok(store)
+    }
+
+    pub(crate) fn assignment(
+        &self,
+        cell_key: &CellKeyV1,
+    ) -> Result<&CellAssignmentRecord, CellDirectoryError> {
+        let cell_id = celestial::cell_id(cell_key).map_err(|source| invalid(source.to_string()))?;
+        self.current()?
+            .assignments
+            .get(&cell_id)
+            .ok_or(CellDirectoryError::UnknownCell(cell_id))
+    }
+
+    /// Claims one sleeping cell under the already-held directory and cell
+    /// writer locks. The successor generation and fence are derived from the
+    /// durable tip; callers cannot choose either authority value.
+    pub(crate) fn claim_cell(
+        &mut self,
+        cell_key: &CellKeyV1,
+        expected_generation: u64,
+        holder_id: &str,
+    ) -> Result<CellAssignmentRecord, CellDirectoryError> {
+        self.transition_cell_authority(
+            cell_key,
+            expected_generation,
+            holder_id,
+            CellAuthorityTransitionV3::ClaimSleeping,
+        )
+    }
+
+    /// Replaces an assigned holder after exclusive writer-lock acquisition.
+    /// A replacement always advances both the generation and fencing token.
+    pub(crate) fn recover_cell(
+        &mut self,
+        cell_key: &CellKeyV1,
+        expected_generation: u64,
+        holder_id: &str,
+    ) -> Result<CellAssignmentRecord, CellDirectoryError> {
+        self.transition_cell_authority(
+            cell_key,
+            expected_generation,
+            holder_id,
+            CellAuthorityTransitionV3::RecoverAssigned,
+        )
+    }
+
+    pub(crate) fn release_cell(
+        &mut self,
+        cell_key: &CellKeyV1,
+        expected_generation: u64,
+        holder_id: &str,
+    ) -> Result<CellAssignmentRecord, CellDirectoryError> {
+        validate_stable_id(holder_id, "assignment holder")?;
+        let cell_id = celestial::cell_id(cell_key).map_err(|source| invalid(source.to_string()))?;
+        let current = self.current()?.clone();
+        let assignment = current
+            .assignments
+            .get(&cell_id)
+            .ok_or_else(|| CellDirectoryError::UnknownCell(cell_id.clone()))?;
+        if assignment.state == CellAssignmentState::Sleeping
+            && assignment.assignment_generation == expected_generation
+            && assignment.holder_id.is_none()
+        {
+            if self
+                .release_transition_predecessor(&cell_id, expected_generation)?
+                .is_some_and(|prior| prior.holder_id.as_deref() == Some(holder_id))
+            {
+                return Ok(assignment.clone());
+            }
+            return Err(CellDirectoryError::AssignmentConflict {
+                cell_id,
+                reason: "the sleeping generation was not released by this holder".into(),
+            });
+        }
+        if assignment.state != CellAssignmentState::Assigned
+            || assignment.assignment_generation != expected_generation
+            || assignment.holder_id.as_deref() != Some(holder_id)
+        {
+            return Err(CellDirectoryError::AssignmentConflict {
+                cell_id,
+                reason: "generation, state, or holder no longer matches".into(),
+            });
+        }
+        if current.transfers.values().any(|transfer| {
+            !matches!(
+                transfer.phase,
+                TransferPhase::Finalized | TransferPhase::Aborted
+            ) && (transfer.source_cell_id == assignment.cell_id
+                || transfer.destination_cell_id == assignment.cell_id)
+        }) {
+            return Err(CellDirectoryError::AssignmentConflict {
+                cell_id,
+                reason: "cell assignment is pinned by a nonterminal transfer".into(),
+            });
+        }
+        let mut next = current.clone();
+        let released = next
+            .assignments
+            .get_mut(&assignment.cell_id)
+            .expect("validated assignment exists in cloned directory");
+        released.state = CellAssignmentState::Sleeping;
+        released.holder_id = None;
+        let next = finish_v3_transaction(&current, next)?;
+        self.commit(current.directory_revision, &current.document_hash, next)?;
+        Ok(self
+            .current()?
+            .assignments
+            .get(&assignment.cell_id)
+            .expect("committed assignment exists")
+            .clone())
+    }
+
+    fn transition_cell_authority(
+        &mut self,
+        cell_key: &CellKeyV1,
+        expected_generation: u64,
+        holder_id: &str,
+        transition: CellAuthorityTransitionV3,
+    ) -> Result<CellAssignmentRecord, CellDirectoryError> {
+        validate_stable_id(holder_id, "assignment holder")?;
+        let cell_id = celestial::cell_id(cell_key).map_err(|source| invalid(source.to_string()))?;
+        let current = self.current()?.clone();
+        let assignment = current
+            .assignments
+            .get(&cell_id)
+            .ok_or_else(|| CellDirectoryError::UnknownCell(cell_id.clone()))?;
+        let resulting_generation = expected_generation
+            .checked_add(1)
+            .ok_or_else(|| CellDirectoryError::AssignmentGenerationExhausted(cell_id.clone()))?;
+
+        // Exact redelivery after an uncertain commit is a no-op. The history
+        // proves that this authority is precisely the one successor derived
+        // from the caller's expected generation.
+        let expected_predecessor_state = match transition {
+            CellAuthorityTransitionV3::ClaimSleeping => CellAssignmentState::Sleeping,
+            CellAuthorityTransitionV3::RecoverAssigned => CellAssignmentState::Assigned,
+        };
+        if assignment.state == CellAssignmentState::Assigned
+            && assignment.assignment_generation == resulting_generation
+            && assignment.holder_id.as_deref() == Some(holder_id)
+            && assignment
+                .fencing_history
+                .get(&expected_generation)
+                .and_then(|prior| prior.checked_add(1))
+                == Some(assignment.authority_fencing_token)
+        {
+            if self
+                .authority_transition_predecessor(
+                    &cell_id,
+                    expected_generation,
+                    resulting_generation,
+                )?
+                .map(|prior| prior.state)
+                == Some(expected_predecessor_state)
+            {
+                return Ok(assignment.clone());
+            }
+            return Err(CellDirectoryError::AssignmentConflict {
+                cell_id,
+                reason: "the committed successor belongs to another authority transition".into(),
+            });
+        }
+
+        if assignment.assignment_generation != expected_generation
+            || assignment.state != expected_predecessor_state
+            || (expected_predecessor_state == CellAssignmentState::Sleeping
+                && assignment.holder_id.is_some())
+        {
+            return Err(CellDirectoryError::AssignmentConflict {
+                cell_id,
+                reason: match transition {
+                    CellAuthorityTransitionV3::ClaimSleeping => {
+                        "expected the current sleeping generation without a holder"
+                    }
+                    CellAuthorityTransitionV3::RecoverAssigned => {
+                        "only the current assigned generation may be recovered"
+                    }
+                }
+                .into(),
+            });
+        }
+        let next_fence = assignment
+            .authority_fencing_token
+            .checked_add(1)
+            .ok_or_else(|| invalid("cell authority fencing token is exhausted"))?;
+        let mut next = current.clone();
+        let claimed = next
+            .assignments
+            .get_mut(&assignment.cell_id)
+            .expect("validated assignment exists in cloned directory");
+        claimed.assignment_generation = resulting_generation;
+        claimed.authority_fencing_token = next_fence;
+        claimed
+            .fencing_history
+            .insert(resulting_generation, next_fence);
+        claimed.state = CellAssignmentState::Assigned;
+        claimed.holder_id = Some(holder_id.to_owned());
+        let next = finish_v3_transaction(&current, next)?;
+        self.commit(current.directory_revision, &current.document_hash, next)?;
+        Ok(self
+            .current()?
+            .assignments
+            .get(&assignment.cell_id)
+            .expect("committed assignment exists")
+            .clone())
+    }
+
+    fn authority_transition_predecessor(
+        &self,
+        cell_id: &str,
+        expected_generation: u64,
+        resulting_generation: u64,
+    ) -> Result<Option<CellAssignmentRecord>, CellDirectoryError> {
+        let mut prior_assignment: Option<CellAssignmentRecord> = None;
+        for (&revision, location) in &self.index {
+            let document = self.resolve_document(revision, &location.document_hash)?;
+            let assignment = document
+                .assignments
+                .get(cell_id)
+                .ok_or_else(|| CellDirectoryError::UnknownCell(cell_id.to_owned()))?;
+            if assignment.assignment_generation == resulting_generation {
+                return Ok(prior_assignment.and_then(|prior| {
+                    (prior.assignment_generation == expected_generation).then_some(prior)
+                }));
+            }
+            if assignment.assignment_generation > resulting_generation {
+                return Ok(None);
+            }
+            prior_assignment = Some(assignment.clone());
+        }
+        Ok(None)
+    }
+
+    fn release_transition_predecessor(
+        &self,
+        cell_id: &str,
+        generation: u64,
+    ) -> Result<Option<CellAssignmentRecord>, CellDirectoryError> {
+        let mut prior_assignment: Option<CellAssignmentRecord> = None;
+        for (&revision, location) in &self.index {
+            let document = self.resolve_document(revision, &location.document_hash)?;
+            let assignment = document
+                .assignments
+                .get(cell_id)
+                .ok_or_else(|| CellDirectoryError::UnknownCell(cell_id.to_owned()))?;
+            if assignment.assignment_generation == generation
+                && assignment.state == CellAssignmentState::Sleeping
+                && prior_assignment.as_ref().is_some_and(|prior| {
+                    prior.assignment_generation == generation
+                        && prior.state == CellAssignmentState::Assigned
+                })
+            {
+                return Ok(prior_assignment);
+            }
+            if assignment.assignment_generation > generation {
+                return Ok(None);
+            }
+            prior_assignment = Some(assignment.clone());
+        }
+        Ok(None)
     }
 
     pub(crate) fn validate_genesis_file_set(&self) -> Result<(), CellDirectoryError> {
@@ -2028,6 +2313,62 @@ impl DraftDirectoryV3AuthorityHarness {
         }
         Ok(store)
     }
+}
+
+fn remove_stale_history_head_temps_v3(root: &Path) -> Result<(), CellDirectoryError> {
+    let expected = BTreeSet::from([
+        DRAFT_DIRECTORY_HISTORY_LOCK_FILE,
+        DRAFT_DIRECTORY_HISTORY_HEAD_FILE,
+        DRAFT_DIRECTORY_HISTORY_FILE,
+    ]);
+    let temp_prefix = format!(".{DRAFT_DIRECTORY_HISTORY_HEAD_FILE}.tmp-");
+    let mut stale_temps = Vec::new();
+    for entry in fs::read_dir(root).map_err(|source| io_error_v3(root, source))? {
+        let entry = entry.map_err(|source| io_error_v3(root, source))?;
+        let name = entry.file_name();
+        let name = name
+            .to_str()
+            .ok_or_else(|| invalid("v3 directory contains a non-UTF-8 artifact"))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|source| io_error_v3(entry.path(), source))?;
+        if expected.contains(name) {
+            if !file_type.is_file() {
+                return Err(invalid(
+                    "v3 directory authority artifact is not a regular file",
+                ));
+            }
+            continue;
+        }
+        let recognized_temp = name
+            .strip_prefix(&temp_prefix)
+            .and_then(|suffix| suffix.split_once('-'))
+            .is_some_and(|(pid, uuid)| {
+                pid.parse::<u32>()
+                    .is_ok_and(|value| value > 0 && value.to_string() == pid)
+                    && Uuid::parse_str(uuid).is_ok_and(|value| value.to_string() == uuid)
+            });
+        if !recognized_temp || !file_type.is_file() {
+            return Err(invalid(
+                "v3 directory contains an unexpected authority artifact",
+            ));
+        }
+        stale_temps.push(entry.path());
+    }
+    if stale_temps.len() > MAX_STALE_DIRECTORY_HEAD_TEMPS {
+        return Err(invalid(
+            "v3 directory contains too many stale head temporary files",
+        ));
+    }
+    for temp_path in &stale_temps {
+        fs::remove_file(temp_path).map_err(|source| io_error_v3(temp_path, source))?;
+    }
+    if !stale_temps.is_empty() {
+        File::open(root)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|source| io_error_v3(root, source))?;
+    }
+    Ok(())
 }
 
 fn lock_history_writer_v3(root: &Path, create: bool) -> Result<File, CellDirectoryError> {
@@ -5073,6 +5414,34 @@ mod tests {
         (document, requested)
     }
 
+    fn open_active_history(
+        root: &std::path::Path,
+        genesis: &CellDirectoryDocumentV3,
+    ) -> Result<DraftCellDirectoryHistoryStoreV3, CellDirectoryError> {
+        let history_entry = DraftDirectoryHistoryEntryV3::new(String::new(), genesis.clone())?;
+        let document_bytes = serde_json::to_vec(genesis)
+            .map_err(|source| invalid(format!("test genesis cannot encode: {source}")))?;
+        let history_entry_bytes = history_entry.encode_canonical()?;
+        let assignment_root =
+            hash_directory_genesis(MIGRATION_ASSIGNMENT_ROOT_DOMAIN, &genesis.assignments)?;
+        let placement_root =
+            hash_directory_genesis(MIGRATION_PLACEMENT_ROOT_DOMAIN, &genesis.placements)?;
+        DraftCellDirectoryHistoryStoreV3::open_from_active_head(
+            root,
+            ActiveDirectoryV3Expectation {
+                universe_id: &genesis.universe_id,
+                manifest_hash: &genesis.universe_manifest_hash,
+                revision: genesis.directory_revision,
+                document_hash: &genesis.document_hash,
+                history_entry_hash: &history_entry.entry_hash,
+                assignment_root: &assignment_root,
+                placement_root: &placement_root,
+                document_bytes: &document_bytes,
+                history_entry_bytes: &history_entry_bytes,
+            },
+        )
+    }
+
     fn phase_proof(
         transfer: &CellTransferRecordV3,
         kind: DirectoryPhaseProofKindV3,
@@ -7423,6 +7792,554 @@ mod tests {
             .expect("history reads");
             assert_eq!(history.lines().count(), 2);
         }
+    }
+
+    fn authority_failpoints() -> [(DraftDirectoryHistoryFailpointV3, bool); 7] {
+        [
+            (DraftDirectoryHistoryFailpointV3::BeforeJournalWrite, false),
+            (
+                DraftDirectoryHistoryFailpointV3::AfterPartialJournalWrite,
+                false,
+            ),
+            (
+                DraftDirectoryHistoryFailpointV3::AfterJournalLineWriteBeforeSync,
+                true,
+            ),
+            (
+                DraftDirectoryHistoryFailpointV3::AfterJournalSyncBeforeHead,
+                true,
+            ),
+            (
+                DraftDirectoryHistoryFailpointV3::AfterHeadTempSyncBeforeRename,
+                true,
+            ),
+            (
+                DraftDirectoryHistoryFailpointV3::AfterHeadRenameBeforeDirectorySync,
+                true,
+            ),
+            (
+                DraftDirectoryHistoryFailpointV3::AfterHeadDirectorySyncBeforeMemory,
+                true,
+            ),
+        ]
+    }
+
+    #[test]
+    fn active_v3_claim_failpoints_recover_prior_or_exact_successor() {
+        for (failpoint, claim_is_durable) in authority_failpoints() {
+            let root = tempdir().expect("temporary directory");
+            let (genesis, _) = migrated_floor_document();
+            let assignment = genesis
+                .assignments
+                .values()
+                .next()
+                .expect("genesis assignment exists")
+                .clone();
+            let holder = assignment
+                .holder_id
+                .as_deref()
+                .expect("genesis assignment is held");
+            let mut store =
+                DraftCellDirectoryHistoryStoreV3::open_or_initialize(root.path(), genesis.clone())
+                    .expect("history initializes");
+            store
+                .release_cell(
+                    &assignment.cell_key,
+                    assignment.assignment_generation,
+                    holder,
+                )
+                .expect("assignment releases before claim");
+            store.set_failpoint(failpoint);
+            assert!(
+                store
+                    .claim_cell(
+                        &assignment.cell_key,
+                        assignment.assignment_generation,
+                        "worker-claim-successor",
+                    )
+                    .is_err(),
+                "the injected write boundary must be observable"
+            );
+            drop(store);
+
+            let mut reopened = open_active_history(root.path(), &genesis)
+                .expect("signed genesis accepts recovered successors");
+            let observed = reopened
+                .assignment(&assignment.cell_key)
+                .expect("assignment resolves after recovery");
+            assert_eq!(
+                observed.state,
+                if claim_is_durable {
+                    CellAssignmentState::Assigned
+                } else {
+                    CellAssignmentState::Sleeping
+                }
+            );
+            let committed = reopened
+                .claim_cell(
+                    &assignment.cell_key,
+                    assignment.assignment_generation,
+                    "worker-claim-successor",
+                )
+                .expect("claim retry resolves exactly once");
+            assert_eq!(committed.state, CellAssignmentState::Assigned);
+            assert_eq!(
+                committed.assignment_generation,
+                assignment.assignment_generation + 1
+            );
+            assert_eq!(reopened.head.entry_count, 3);
+            let history = fs::read_to_string(
+                root.path()
+                    .join(DRAFT_DIRECTORY_HISTORY_SUBDIRECTORY)
+                    .join(DRAFT_DIRECTORY_HISTORY_FILE),
+            )
+            .expect("active history reads");
+            assert_eq!(history.lines().count(), 3);
+        }
+    }
+
+    #[test]
+    fn active_v3_recovery_failpoints_recover_prior_or_exact_successor() {
+        for (failpoint, recovery_is_durable) in authority_failpoints() {
+            let root = tempdir().expect("temporary directory");
+            let (genesis, _) = migrated_floor_document();
+            let assignment = genesis
+                .assignments
+                .values()
+                .next()
+                .expect("genesis assignment exists")
+                .clone();
+            let mut store =
+                DraftCellDirectoryHistoryStoreV3::open_or_initialize(root.path(), genesis.clone())
+                    .expect("history initializes");
+            store.set_failpoint(failpoint);
+            assert!(
+                store
+                    .recover_cell(
+                        &assignment.cell_key,
+                        assignment.assignment_generation,
+                        "worker-recovery-successor",
+                    )
+                    .is_err(),
+                "the injected recovery boundary must be observable"
+            );
+            drop(store);
+
+            let mut reopened = open_active_history(root.path(), &genesis)
+                .expect("signed genesis accepts recovered authority history");
+            let observed = reopened
+                .assignment(&assignment.cell_key)
+                .expect("assignment resolves after recovery");
+            assert_eq!(
+                observed.assignment_generation,
+                assignment.assignment_generation + u64::from(recovery_is_durable)
+            );
+            assert_eq!(
+                observed.holder_id.as_deref(),
+                if recovery_is_durable {
+                    Some("worker-recovery-successor")
+                } else {
+                    assignment.holder_id.as_deref()
+                }
+            );
+            let committed = reopened
+                .recover_cell(
+                    &assignment.cell_key,
+                    assignment.assignment_generation,
+                    "worker-recovery-successor",
+                )
+                .expect("recovery retry resolves exactly once");
+            assert_eq!(
+                committed.assignment_generation,
+                assignment.assignment_generation + 1
+            );
+            assert_eq!(
+                committed.authority_fencing_token,
+                assignment.authority_fencing_token + 1
+            );
+            assert_eq!(reopened.head.entry_count, 2);
+        }
+    }
+
+    #[test]
+    fn active_v3_release_failpoints_recover_prior_or_exact_successor() {
+        for (failpoint, release_is_durable) in authority_failpoints() {
+            let root = tempdir().expect("temporary directory");
+            let (genesis, _) = migrated_floor_document();
+            let assignment = genesis
+                .assignments
+                .values()
+                .next()
+                .expect("genesis assignment exists")
+                .clone();
+            let holder = assignment
+                .holder_id
+                .as_deref()
+                .expect("genesis assignment is held");
+            let mut store =
+                DraftCellDirectoryHistoryStoreV3::open_or_initialize(root.path(), genesis.clone())
+                    .expect("history initializes");
+            store.set_failpoint(failpoint);
+            assert!(
+                store
+                    .release_cell(
+                        &assignment.cell_key,
+                        assignment.assignment_generation,
+                        holder,
+                    )
+                    .is_err(),
+                "the injected release boundary must be observable"
+            );
+            drop(store);
+
+            let mut reopened = open_active_history(root.path(), &genesis)
+                .expect("signed genesis accepts recovered release history");
+            let observed = reopened
+                .assignment(&assignment.cell_key)
+                .expect("assignment resolves after recovery");
+            assert_eq!(
+                observed.state,
+                if release_is_durable {
+                    CellAssignmentState::Sleeping
+                } else {
+                    CellAssignmentState::Assigned
+                }
+            );
+            let committed = reopened
+                .release_cell(
+                    &assignment.cell_key,
+                    assignment.assignment_generation,
+                    holder,
+                )
+                .expect("release retry resolves exactly once");
+            assert_eq!(committed.state, CellAssignmentState::Sleeping);
+            assert_eq!(
+                committed.assignment_generation,
+                assignment.assignment_generation
+            );
+            assert_eq!(
+                committed.authority_fencing_token,
+                assignment.authority_fencing_token
+            );
+            assert_eq!(reopened.head.entry_count, 2);
+        }
+    }
+
+    #[test]
+    fn active_v3_recovers_a_synced_successor_with_an_orphaned_head_temp() {
+        let root = tempdir().expect("temporary directory");
+        let (genesis, _) = migrated_floor_document();
+        let assignment = genesis
+            .assignments
+            .values()
+            .next()
+            .expect("genesis assignment exists")
+            .clone();
+        let holder = assignment
+            .holder_id
+            .as_deref()
+            .expect("genesis assignment is held");
+        let mut store =
+            DraftCellDirectoryHistoryStoreV3::open_or_initialize(root.path(), genesis.clone())
+                .expect("history initializes");
+        let directory_root = root.path().join(DRAFT_DIRECTORY_HISTORY_SUBDIRECTORY);
+        let head_path = directory_root.join(DRAFT_DIRECTORY_HISTORY_HEAD_FILE);
+        let prior_head = fs::read(&head_path).expect("prior head reads");
+        let released = store
+            .release_cell(
+                &assignment.cell_key,
+                assignment.assignment_generation,
+                holder,
+            )
+            .expect("successor commits before crash simulation");
+        let successor_head = fs::read(&head_path).expect("successor head reads");
+        let orphan_path = directory_root.join(format!(
+            ".{DRAFT_DIRECTORY_HISTORY_HEAD_FILE}.tmp-4242-{}",
+            Uuid::new_v4()
+        ));
+        fs::write(&orphan_path, &successor_head).expect("synced head temp persists");
+        fs::write(&head_path, prior_head).expect("durable head remains at predecessor");
+        drop(store);
+
+        let reopened = open_active_history(root.path(), &genesis)
+            .expect("active recovery removes only the recognized temp and adopts successor");
+        assert_eq!(
+            reopened
+                .assignment(&assignment.cell_key)
+                .expect("released assignment resolves"),
+            &released
+        );
+        assert!(!orphan_path.exists());
+        assert_eq!(
+            fs::read(&head_path).expect("recovered head reads"),
+            successor_head
+        );
+    }
+
+    #[test]
+    fn active_v3_unknown_artifact_prevents_head_temp_cleanup() {
+        let root = tempdir().expect("temporary directory");
+        let (genesis, _) = migrated_floor_document();
+        let store =
+            DraftCellDirectoryHistoryStoreV3::open_or_initialize(root.path(), genesis.clone())
+                .expect("history initializes");
+        drop(store);
+        let directory_root = root.path().join(DRAFT_DIRECTORY_HISTORY_SUBDIRECTORY);
+        let orphan_path = directory_root.join(format!(
+            ".{DRAFT_DIRECTORY_HISTORY_HEAD_FILE}.tmp-4242-{}",
+            Uuid::new_v4()
+        ));
+        let unknown_path = directory_root.join("unexpected-authority-artifact");
+        fs::write(&orphan_path, b"recognized stale temp").expect("head temp writes");
+        fs::write(&unknown_path, b"unknown").expect("unknown artifact writes");
+        let head_path = directory_root.join(DRAFT_DIRECTORY_HISTORY_HEAD_FILE);
+        let history_path = directory_root.join(DRAFT_DIRECTORY_HISTORY_FILE);
+        let head_before = fs::read(&head_path).expect("head snapshots");
+        let history_before = fs::read(&history_path).expect("history snapshots");
+
+        assert!(open_active_history(root.path(), &genesis).is_err());
+        assert!(orphan_path.exists(), "tamper failure performs no cleanup");
+        assert_eq!(fs::read(&head_path).expect("head rereads"), head_before);
+        assert_eq!(
+            fs::read(&history_path).expect("history rereads"),
+            history_before
+        );
+    }
+
+    #[test]
+    fn active_v3_retries_cannot_alias_claim_and_recovery() {
+        let root = tempdir().expect("temporary directory");
+        let (genesis, _) = migrated_floor_document();
+        let assignment = genesis
+            .assignments
+            .values()
+            .next()
+            .expect("genesis assignment exists")
+            .clone();
+        let mut store = DraftCellDirectoryHistoryStoreV3::open_or_initialize(root.path(), genesis)
+            .expect("history initializes");
+        let recovered = store
+            .recover_cell(
+                &assignment.cell_key,
+                assignment.assignment_generation,
+                "worker-recovered",
+            )
+            .expect("assigned authority recovers");
+        assert_eq!(
+            store
+                .recover_cell(
+                    &assignment.cell_key,
+                    assignment.assignment_generation,
+                    "worker-recovered",
+                )
+                .expect("the exact recovery retry remains idempotent"),
+            recovered
+        );
+        assert!(
+            store
+                .recover_cell(
+                    &assignment.cell_key,
+                    assignment.assignment_generation,
+                    "worker-impostor",
+                )
+                .is_err(),
+            "another holder cannot alias a recovery retry"
+        );
+        assert!(
+            store
+                .claim_cell(
+                    &assignment.cell_key,
+                    assignment.assignment_generation,
+                    "worker-recovered",
+                )
+                .is_err(),
+            "a recovery successor cannot masquerade as a claim retry"
+        );
+        let released = store
+            .release_cell(
+                &assignment.cell_key,
+                recovered.assignment_generation,
+                "worker-recovered",
+            )
+            .expect("recovered authority releases");
+        assert_eq!(
+            store
+                .release_cell(
+                    &assignment.cell_key,
+                    recovered.assignment_generation,
+                    "worker-recovered",
+                )
+                .expect("the exact release retry remains idempotent"),
+            released
+        );
+        assert!(
+            store
+                .release_cell(
+                    &assignment.cell_key,
+                    recovered.assignment_generation,
+                    "worker-impostor",
+                )
+                .is_err(),
+            "another holder cannot alias a release retry"
+        );
+        let claimed = store
+            .claim_cell(
+                &assignment.cell_key,
+                recovered.assignment_generation,
+                "worker-claimed",
+            )
+            .expect("sleeping authority claims");
+        assert!(
+            store
+                .recover_cell(
+                    &assignment.cell_key,
+                    recovered.assignment_generation,
+                    "worker-claimed",
+                )
+                .is_err(),
+            "a claim successor cannot masquerade as a recovery retry"
+        );
+        assert_eq!(
+            store
+                .claim_cell(
+                    &assignment.cell_key,
+                    recovered.assignment_generation,
+                    "worker-claimed",
+                )
+                .expect("the exact claim retry remains idempotent"),
+            claimed
+        );
+    }
+
+    #[test]
+    fn active_v3_authority_counters_fail_closed_at_exhaustion() {
+        for exhaust_generation in [false, true] {
+            let root = tempdir().expect("temporary directory");
+            let (mut genesis, _) = initial_document_and_request();
+            let assignment = genesis
+                .assignments
+                .values_mut()
+                .next()
+                .expect("genesis assignment exists");
+            if !exhaust_generation {
+                assignment.authority_fencing_token = u64::MAX;
+                assignment.fencing_history = BTreeMap::from([(
+                    assignment.assignment_generation,
+                    assignment.authority_fencing_token,
+                )]);
+            }
+            let cell_key = assignment.cell_key.clone();
+            let generation = if exhaust_generation {
+                u64::MAX
+            } else {
+                assignment.assignment_generation
+            };
+            genesis.seal().expect("exhausted counter fixture seals");
+            let mut store =
+                DraftCellDirectoryHistoryStoreV3::open_or_initialize(root.path(), genesis.clone())
+                    .expect("history initializes");
+            let error = store
+                .recover_cell(&cell_key, generation, "worker-after-exhaustion")
+                .expect_err("an exhausted authority counter cannot advance");
+            assert!(
+                error.to_string().contains("exhausted"),
+                "the counter failure remains explicit: {error}"
+            );
+            assert_eq!(store.current().expect("tip remains"), &genesis);
+            assert_eq!(store.head.entry_count, 1);
+        }
+    }
+
+    #[test]
+    fn active_v3_release_rejects_a_nonterminal_transfer_pin() {
+        let root = tempdir().expect("temporary directory");
+        let genesis = prepared_document();
+        let transfer = &genesis.transfers["transfer-grid-v3-proof"];
+        let pinned_cell_ids = [
+            transfer.source_cell_id.clone(),
+            transfer.destination_cell_id.clone(),
+        ];
+        let mut store = DraftCellDirectoryHistoryStoreV3::open_or_initialize(root.path(), genesis)
+            .expect("history initializes");
+        let revision = store.current().expect("tip exists").directory_revision;
+        for cell_id in pinned_cell_ids {
+            let assignment = store
+                .current()
+                .expect("tip exists")
+                .assignments
+                .get(&cell_id)
+                .expect("pinned assignment exists")
+                .clone();
+            let error = store
+                .release_cell(
+                    &assignment.cell_key,
+                    assignment.assignment_generation,
+                    assignment.holder_id.as_deref().expect("assignment is held"),
+                )
+                .expect_err("nonterminal transfer pins both cells");
+            assert!(error.to_string().contains("nonterminal transfer"));
+        }
+        assert_eq!(
+            store
+                .current()
+                .expect("rejected release preserves tip")
+                .directory_revision,
+            revision
+        );
+    }
+
+    #[test]
+    fn active_v3_rejects_a_foreign_genesis_before_recovery_writes() {
+        let root = tempdir().expect("temporary directory");
+        let (genesis, _) = initial_document_and_request();
+        let store =
+            DraftCellDirectoryHistoryStoreV3::open_or_initialize(root.path(), genesis.clone())
+                .expect("history initializes");
+        drop(store);
+
+        let mut foreign = genesis.clone();
+        foreign
+            .assignments
+            .values_mut()
+            .next()
+            .expect("foreign assignment exists")
+            .holder_id = Some("worker-forged".into());
+        foreign.seal().expect("foreign genesis self-seals");
+        let foreign_entry = DraftDirectoryHistoryEntryV3::new(String::new(), foreign.clone())
+            .expect("foreign history entry derives");
+        let mut foreign_history = foreign_entry
+            .encode_canonical()
+            .expect("foreign history encodes");
+        foreign_history.push(b'\n');
+        let foreign_head = DraftDirectoryHistoryHeadV3::from_tip(
+            &DraftDirectoryHistoryHeadV3::empty(&foreign),
+            &foreign_entry,
+            u64::try_from(foreign_history.len()).expect("history length fits"),
+        )
+        .expect("foreign head derives");
+        let isolated = root.path().join(DRAFT_DIRECTORY_HISTORY_SUBDIRECTORY);
+        let history_path = isolated.join(DRAFT_DIRECTORY_HISTORY_FILE);
+        let head_path = isolated.join(DRAFT_DIRECTORY_HISTORY_HEAD_FILE);
+        fs::write(&history_path, &foreign_history).expect("foreign history installs");
+        fs::write(
+            &head_path,
+            serde_json::to_vec_pretty(&foreign_head).expect("foreign head encodes"),
+        )
+        .expect("foreign head installs");
+        let history_before = fs::read(&history_path).expect("history snapshots");
+        let head_before = fs::read(&head_path).expect("head snapshots");
+
+        let error = open_active_history(root.path(), &genesis)
+            .expect_err("signed activation rejects a self-consistent foreign root");
+        assert!(error.to_string().contains("exact active-head genesis"));
+        assert_eq!(
+            fs::read(&history_path).expect("rejected history rereads"),
+            history_before
+        );
+        assert_eq!(
+            fs::read(&head_path).expect("rejected head rereads"),
+            head_before
+        );
     }
 
     #[test]

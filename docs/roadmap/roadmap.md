@@ -208,9 +208,12 @@ requires two of three externally anchored Ed25519 signers to bind the exact
 prepared receipt and roots, commits one global head last, fences updated legacy
 startup, and reopens only the head-selected directory and cells. The offline
 operator tool and worker readiness mode exercise the same verified boot while
-keeping gameplay admission closed. Directory-v3 lease transitions,
-lifecycle-v2 scheduling, ordinary event-17 gameplay, and the coordinated
-projection/verifier/client cutover remain subsequent P1.8 gates.
+keeping gameplay admission closed. The activated directory-v3 store now
+anchors recovery to the signed genesis prefix and durably supports
+directory-issued claim, recovery, and transfer-safe release transitions with
+exact retry semantics. Lifecycle-v2 scheduling, ordinary event-17 gameplay,
+and the coordinated projection/verifier/client cutover remain subsequent P1.8
+gates.
 
 P1.5 acceptance requires:
 
