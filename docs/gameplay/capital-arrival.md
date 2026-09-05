@@ -47,3 +47,24 @@ and walking responsive. These presentation changes require no save migration.
 
 Coordinate-origin changes must preserve camera and remote-avatar continuity.
 Walking validation must measure world travel, including origin translation.
+
+## Grand capital revision
+
+New capital worlds use a 25 by 23 metre foundation and an eight-metre atrium,
+with an open entrance and skylight, colonnades and a clear central arrival route.
+Use pale stone, dark stone inlays and brass trim for the capital structure.
+Industry remains reachable on the arrival floor. Decorative lighting and planting
+must not create invisible obstacles or obscure the mining exits.
+
+The packaged grand-capital revision uses its own Grand Capital Playtest save.
+Existing Capital Playtest saves remain intact; their layout is not rewritten.
+All physical expansion uses authoritative structural blocks and exact genesis
+component accounting. Healthy architectural finishes remain instanced; damage
+and construction states must stay readable. Verify restart, walking, mouse-look,
+industrial tools and frame pacing in the larger scene.
+
+The grand-capital outcrops leave a clear apron around the larger foundation;
+legacy capital deposit coordinates remain available for older worlds. A continuous
+walk from the hall toward the deposits must remain authoritative and reopen from
+its saved journal. Render fingerprints may reuse unchanged verified block arrays,
+while changes to damage, construction or topology still invalidate the visual.

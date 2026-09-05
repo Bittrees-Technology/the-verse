@@ -5,7 +5,7 @@ It is an unsigned development build for testing, not a production release and
 not connected to a real-value economy.
 
 macOS: open "The Verse.app", then click "Enter the Verse" when ready.
-The app starts its bundled local server and uses a separate Capital Playtest save.
+The app starts its bundled local server and uses a separate Grand Capital Playtest save (older Capital Playtest saves are retained).
 Close the app to stop its server. Esc returns to the entry menu.
 
 Linux: run "./the-verse" from a terminal. The initial target is x86_64 Ubuntu.

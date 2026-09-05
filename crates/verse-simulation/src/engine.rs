@@ -986,21 +986,21 @@ impl Runtime {
             added += block.component_cost;
             outpost.blocks.insert(id, block);
         };
-        for x in -8_i32..=8 {
-            for z in -7_i32..=7 {
+        for x in -12_i32..=12 {
+            for z in -11_i32..=11 {
                 add(format!("block-capital-floor-{x}-{z}"), IVec3::new(x, 0, z));
-                // Open central skylight gives the hall a bright readable interior.
-                if x.abs() >= 5 || z <= -5 {
-                    add(format!("block-capital-roof-{x}-{z}"), IVec3::new(x, 5, z));
+                // A broad skylight and tall galleries keep the arrival route open.
+                if x.abs() >= 8 || z <= -8 || z >= 9 {
+                    add(format!("block-capital-roof-{x}-{z}"), IVec3::new(x, 8, z));
                 }
             }
         }
-        for y in 1..=4 {
-            for x in -8..=8 {
-                add(format!("block-capital-back-{x}-{y}"), IVec3::new(x, y, -7));
+        for y in 1..=7 {
+            for x in -12..=12 {
+                add(format!("block-capital-back-{x}-{y}"), IVec3::new(x, y, -11));
             }
-            for x in [-8, 8] {
-                for z in [-6, -2, 2, 6] {
+            for x in [-12, 12] {
+                for z in [-10, -5, 0, 5, 10] {
                     add(
                         format!("block-capital-column-{x}-{y}-{z}"),
                         IVec3::new(x, y, z),
@@ -1033,7 +1033,7 @@ impl Runtime {
             .map_err(RuntimeError::CanonicalInvariant)?;
         next.player.primary_mut().position = spawn;
         next.player.primary_mut().address = address;
-        let surface = crate::geology::capital_outcrops(next.world_seed);
+        let surface = crate::geology::grand_capital_outcrops(next.world_seed);
         next.voxels
             .ferrite_ore
             .extend(crate::geology::generate_deposits(next.world_seed, &surface).into_keys());
@@ -8439,6 +8439,21 @@ mod tests {
         runtime
             .admit_development_player("player-remote")
             .expect("admit");
+        let capital = &runtime.state.grids[STARTER_INDUSTRY_GRID_ID];
+        assert!(capital.blocks.contains_key("block-capital-floor-12-11"));
+        assert!(capital.blocks.contains_key("block-capital-floor--12--11"));
+        assert!(capital.blocks.contains_key("block-capital-roof-12-11"));
+        assert_eq!(capital.blocks["block-capital-roof-12-11"].coordinate.y, 8);
+        let coordinates: std::collections::BTreeSet<_> = capital
+            .blocks
+            .values()
+            .map(|block| block.coordinate)
+            .collect();
+        assert_eq!(
+            coordinates.len(),
+            capital.blocks.len(),
+            "no overlapping architecture"
+        );
         let spawn = runtime.state.capital_spawn();
         for player in runtime.state.player.by_id.values() {
             assert!((player.position - spawn).magnitude() < 3.0);
@@ -8454,7 +8469,15 @@ mod tests {
             LocomotionKind::Grounded
         );
         assert!((runtime.state.player.position.y - spawn.y).abs() < 0.25);
-        let surface = crate::geology::capital_outcrops(42);
+        let surface = crate::geology::grand_capital_outcrops(42);
+        let center = crate::model::planet_center();
+        assert!(
+            surface.iter().all(|point| {
+                (f64::from(point.x) - center.x).abs() > 14.0
+                    || (f64::from(point.z) - center.z).abs() > 13.0
+            }),
+            "ore leaves a clear apron around the foundation"
+        );
         let deposits = crate::geology::generate_deposits(42, &surface);
         let target = *deposits
             .keys()
@@ -8480,6 +8503,41 @@ mod tests {
         let recovered = Runtime::open(directory.path(), 42, 100).expect("reopen");
         assert_eq!(recovered.state.state_hash(), expected);
         assert!(!recovered.state.voxels.occupied.contains(&target));
+    }
+
+    #[test]
+    fn grand_capital_walks_from_hall_to_outcrop_without_halting() {
+        let directory = tempdir().expect("temporary world");
+        let mut runtime = Runtime::open(directory.path(), 42, 100).expect("open");
+        runtime.configure_capital_start().expect("capital");
+        for _ in 0..120 {
+            runtime.advance(16).expect("settle arrival");
+        }
+        let start = runtime.state.player.position;
+        for sequence in 1..=100 {
+            runtime
+                .execute_next_for_fixture(&ClientMessage::SetPlayerControl {
+                    operation_sequence: 0,
+                    operation_id: format!("capital-exit-{sequence}"),
+                    movement_epoch: runtime.state.player.movement_epoch,
+                    input_sequence: sequence,
+                    linear_input: Vec3::new(1.0, 0.0, 0.0),
+                    angular_input: Vec3::ZERO,
+                    boost: false,
+                    jump: false,
+                    dampeners: true,
+                })
+                .expect("walk input");
+            runtime.advance(100).expect("walk remains authoritative");
+        }
+        assert!(runtime.state.player.position.x > start.x + 15.0);
+        assert!(runtime.state.conservation().valid);
+        runtime.persist_snapshot().expect("persist explored world");
+        let expected = runtime.state.state_hash();
+        drop(runtime);
+        let recovered =
+            Runtime::open(directory.path(), 42, 100).expect("restart after exploration");
+        assert_eq!(recovered.state.state_hash(), expected);
     }
 
     #[test]

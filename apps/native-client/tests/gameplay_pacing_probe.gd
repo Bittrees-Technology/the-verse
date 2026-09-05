@@ -90,6 +90,9 @@ func _run() -> void:
 		Input.action_release("move_right")
 		frames.sort()
 		var metrics := client.timings.duplicate()
+		metrics["connected"] = client.connected
+		metrics["replication"] = client.replication_state
+		metrics["authoritative_ready"] = client.authoritative_player_ready
 		metrics["phase"] = phase
 		metrics["frames"] = frames.size()
 		metrics["frame_p50_ms"] = frames[frames.size() / 2]
@@ -98,6 +101,12 @@ func _run() -> void:
 		metrics["nodes"] = Performance.get_monitor(Performance.OBJECT_NODE_COUNT)
 		metrics["history"] = client.prediction_history.size()
 		print("VERSE_PACING ", JSON.stringify(metrics))
+		if not client.connected or not client.authoritative_player_ready or client.replication_state != "ready":
+			printerr("VERSE_PACING_FAILED lost playable connection: ", client.session_entry.last_problem)
+			client.queue_free()
+			await process_frame
+			quit(1)
+			return
 	client.queue_free()
 	await process_frame
 	quit(0)

@@ -35,9 +35,9 @@ func _ready() -> void:
 		runtime_directory = executable_directory.path_join("verse-runtime")
 	worker_script = runtime_directory.path_join("start-owned-worker.sh")
 	if OS.get_name() == "macOS":
-		data_directory = OS.get_environment("HOME").path_join("Library/Application Support/The Verse Capital Playtest/universe")
+		data_directory = OS.get_environment("HOME").path_join("Library/Application Support/The Verse Grand Capital Playtest/universe")
 	else:
-		data_directory = OS.get_environment("HOME").path_join(".local/share/the-verse-capital/universe")
+		data_directory = OS.get_environment("HOME").path_join(".local/share/the-verse-grand-capital/universe")
 	if not OS.get_environment("VERSE_DATA_DIR").is_empty():
 		data_directory = OS.get_environment("VERSE_DATA_DIR")
 	_build_panel()

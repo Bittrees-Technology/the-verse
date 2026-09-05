@@ -32,3 +32,16 @@ projection replacement, topology order, damage exclusions and instanced parts.
 Run graphically to validate instance transforms: the headless dummy renderer
 cannot read MultiMesh transforms back. The motion impairment and interest-stream
 suites cover reconciliation, targeting and renderer lifecycle regression.
+
+## Grand capital follow-up
+
+The expanded 25 by 23 metre hall was measured separately with the same probe.
+Connected median/p95 frame times were 23.6/24.5 ms idle, 12.0/26.5 ms walking,
+and 11.1/24.4 ms mouse-look on the same M4 Pro. All three phases retained a
+verified, ready gameplay connection. The probe now fails when that connection
+is lost, so disconnected rendering cannot be mistaken for a performance gain.
+
+A longer authoritative test walks toward the relocated outcrops for ten seconds
+and reopens the saved world. The deposits leave an apron around the expanded
+foundation. Local smoke checks also cover the new architectural batches and
+keep non-colliding ornamental meshes above the player corridor.
