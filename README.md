@@ -9,7 +9,9 @@ The repository now contains the **playable P1 development proof**, including aut
 The [engineering starter kit](docs/gameplay/starter-tool-kit.md) adds selectable
 drill, grinder, welder, and short-range block-pulse tools. In a packaged build,
 open **Launch Engineering Workshop.command** for an orbital start beside the
-asteroid and powered industry. It uses a separate save from the surface playtest.
+asteroid and powered industry. Its separate Ore Workshop save contains
+[seeded ferrite, cuprite, and cobaltite deposits](docs/gameplay/seeded-ore-deposits.md).
+These currently share ore feedstock for refining and component production.
 
 Requirements: Apple Silicon macOS, Rust, Node.js, `curl`, and `jq`.
 

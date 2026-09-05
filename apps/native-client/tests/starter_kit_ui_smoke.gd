@@ -58,6 +58,14 @@ func _run() -> void:
 		printerr("VERSE_STARTER_KIT_UI_FAILED no verified baseline")
 		quit(1)
 		return
+	var assays: Dictionary = client.get("ore_assays")
+	var seen: Dictionary = {}
+	for key in client.get("voxel_lookup"):
+		var voxel: Dictionary = client.get("voxel_lookup")[key]
+		if voxel.get("material", "rock") == "ferrite_ore":
+			seen[String(assays.get(key, "missing"))] = true
+	_check(seen.has("ferrite") and seen.has("cuprite") and seen.has("cobaltite"), "three verified rich ore varieties")
+	_check(not seen.has("missing"), "every rich workshop voxel has a seeded assay")
 	client.call("_set_inventory_open", true)
 	await process_frame
 	await _click(client.get("inventory_tab_buttons")["tools"])

@@ -1,6 +1,6 @@
 # The Verse — current progress
 
-**Reviewed:** 2026-09-05 against main revision `18670fe`.
+**Reviewed:** 2026-09-05; documentation, rendering, and starter tools merged in PRs #20–#22.
 
 The Verse is in **P1: multiplayer vertical slice**. A playable local engineering
 prototype and substantial persistence infrastructure exist. The public,
@@ -34,8 +34,13 @@ passed on 2026-09-04 for main `18670fe`, including the verification job and
 Linux x86_64 / Apple Silicon native package jobs. The verification job includes
 the repository check script and isolated Linux container probe.
 
-The latest feature merge is [PR #19](https://github.com/Bittrees-Technology/the-verse/pull/19),
-protocol-19 lifecycle-v2 scheduling. Recent merged fixes address local movement
+The latest playable feature merge is [PR #22](https://github.com/Bittrees-Technology/the-verse/pull/22),
+with selectable drill, grinder, welder, and block-pulse tools and an engineering
+workshop launcher. [PR #21](https://github.com/Bittrees-Technology/the-verse/pull/21)
+improves asteroid relief and texture stability. Their verification and native
+Mac/Linux package checks passed. The ore workshop adds three seeded geological
+varieties while retaining shared ore/refining/component inventory; separate
+metals remain a future economy migration. Recent merged fixes address local movement
 reconciliation, remote-player interpolation, grounded obstacle presentation,
 and lease renewal during long world loads. These fixes support ongoing quality
 work; they do not independently close F-063.

@@ -23,7 +23,7 @@ cargo build --locked --release -p verse-simulation-worker
 tools/ci/build-native-verifier.sh release
 target/release/verse-simulation-worker \
   --data-directory "${verse_test_directory}/universe" \
-  --snapshot-every 600 --bind "127.0.0.1:${verse_port}" \
+  --genesis-profile ore-workshop --snapshot-every 600 --bind "127.0.0.1:${verse_port}" \
   >"${verse_test_directory}/server.log" 2>&1 &
 verse_server_pid="$!"
 ready=0

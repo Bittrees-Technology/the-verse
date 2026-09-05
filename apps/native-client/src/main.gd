@@ -142,6 +142,7 @@ var replication_detail := "WAITING FOR PROTOCOL HANDSHAKE"
 var stream_family := ""
 var registry_snapshot: Dictionary = {}
 var universe_manifest: Dictionary = {}
+var ore_assays: Dictionary = {}
 var interest_entities: Dictionary = {}
 var interest_session_epoch := ""
 var interest_epoch := -1
@@ -2810,6 +2811,13 @@ func _install_registry(message: Dictionary) -> bool:
 			cursor = String(parents.get(cursor, ""))
 	registry_snapshot = registry.duplicate(true)
 	universe_manifest = manifest.duplicate(true)
+	ore_assays.clear()
+	if interest_verifier != null:
+		var catalog: Variant = JSON.parse_string(interest_verifier.ore_catalog_v1(str(manifest.get("world_seed", "20260826"))))
+		if catalog is Array:
+			for entry in catalog:
+				var c: Dictionary = entry[0]
+				ore_assays[_coord_key(Vector3i(int(c.x), int(c.y), int(c.z)))] = String(entry[1])
 	return true
 
 
@@ -4107,16 +4115,20 @@ func _add_surface_triangle(
 
 func _voxel_surface_color(point: Vector3, material_samples: Array[Vector3]) -> Color:
 	var variation := _position_variation(point * 1.37)
-	var ferrite := false
+	var mineral := ""
 	for sample in material_samples:
 		var coordinate := Vector3i(roundi(sample.x), roundi(sample.y), roundi(sample.z))
 		var voxel: Dictionary = voxel_lookup.get(_coord_key(coordinate), {})
 		if voxel.get("material", "rock") == "ferrite_ore":
-			ferrite = true
-	if ferrite:
+			mineral = String(ore_assays.get(_coord_key(coordinate), "ferrite"))
+	if mineral == "cuprite":
+		return Color(0.16, 0.58 + variation * 0.12, 0.36, 1.0)
+	if mineral == "cobaltite":
+		return Color(0.28, 0.32, 0.76 + variation * 0.12, 1.0)
+	if not mineral.is_empty():
 		return Color(0.68 + variation * 0.14, 0.19, 0.055, 1.0)
 	var shade := 0.27 + variation * 0.11
-	return Color(shade * 0.84, shade * 0.94, shade, 1.0)
+	return Color(shade * 0.84, shade * 0.94, shade, 0.0)
 
 
 func _position_variation(position: Vector3) -> float:
@@ -7276,7 +7288,7 @@ func _update_interface() -> void:
 	if target_voxel != null:
 		var voxel: Dictionary = voxel_lookup.get(_coord_key(target_voxel), {})
 		var deposit := (
-			"FERRITE DEPOSIT // HIGH YIELD"
+			"%s DEPOSIT // 3 ORE" % String(ore_assays.get(_coord_key(target_voxel), "ferrite")).to_upper()
 			if voxel.get("material", "rock") == "ferrite_ore"
 			else "CARBONACEOUS ROCK // LOW YIELD"
 		)

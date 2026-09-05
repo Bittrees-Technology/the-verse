@@ -9,6 +9,7 @@ mod cell_directory_v3;
 mod content;
 mod engine;
 mod event;
+pub mod geology;
 #[allow(dead_code)]
 mod grid_handoff_v2;
 mod handoff;

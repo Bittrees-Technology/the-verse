@@ -150,7 +150,7 @@ fn deterministic_material_hash(seed: u64, coordinate: IVec3) -> u64 {
     value ^ (value >> 31)
 }
 
-fn fixed_value_noise(seed: u64, coordinate: IVec3) -> i64 {
+pub(crate) fn fixed_value_noise(seed: u64, coordinate: IVec3) -> i64 {
     const CELL_SIZE: i32 = 4;
     let cell = IVec3::new(
         coordinate.x.div_euclid(CELL_SIZE),

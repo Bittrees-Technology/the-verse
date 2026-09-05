@@ -83,7 +83,7 @@ The existing survival clock and recovery rules remain in force.
 No network, world, content, event, or verifier version changes. Existing saves
 retain their exact ledger. Reverting removes local tool selection and guidance
 without migrating inventory. A dedicated engineering launcher uses a separate
-orbital playtest save; the existing Earthlike surface launcher remains available.
+orbital ore-workshop save with seeded ferrite, cuprite, and cobaltite deposits; the existing Earthlike surface launcher remains available.
 
 ## Verification checkpoint — 2026-09-05
 

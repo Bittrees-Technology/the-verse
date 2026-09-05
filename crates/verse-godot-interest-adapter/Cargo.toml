@@ -15,6 +15,8 @@ crate-type = ["cdylib", "rlib"]
 godot.workspace = true
 serde_json.workspace = true
 verse-interest-verifier = { path = "../verse-interest-verifier" }
+# Internal AGPL-3.0-or-later geology catalog; source: crates/verse-simulation.
+verse-simulation = { path = "../verse-simulation" }
 verse-protocol = { path = "../verse-protocol" }
 
 [lints.rust]
