@@ -93,6 +93,22 @@ const TOOL_DDA_MAX_STEPS := 512
 const MINE_DURATION := 0.72
 const WELD_DURATION := 0.52
 const DAMAGE_DURATION := 0.46
+const PULSE_COOLDOWN := 0.46
+const TOOL_ORDER := ["drill", "grinder", "welder", "pulse"]
+const TOOL_NAMES := {
+	"drill": "MINING DRILL", "grinder": "SALVAGE GRINDER",
+	"welder": "WELDING TORCH", "pulse": "PULSE TOOL",
+}
+const TOOL_DESCRIPTIONS := {
+	"drill": "Hold primary on rock to collect ore. Deposit ore in cargo before refining.",
+	"grinder": "Hold primary on a block to grind it down and recover salvage.",
+	"welder": "Hold primary on an owned frame to weld, or a damaged block to repair. B opens construction.",
+	"pulse": "Click primary to shoot a block within 9 m. Short-range energy pulse; no player damage or ammunition.",
+}
+const BUILD_KINDS := [
+	"structural", "anchor", "cargo", "power_source", "damage_test",
+	"conveyor", "refinery", "assembler",
+]
 const RENDER_DISTANCE_LIMIT_M := 12_000.0
 const VOXEL_CHUNK_SIZE := 8
 const ISO_LEVEL := 0.5
@@ -237,6 +253,13 @@ var action_charge := 0.0
 var action_target_key := ""
 var action_cooldown := 0.0
 var tool_kick := 0.0
+var equipped_tool := "drill"
+var tool_viewmodels: Dictionary = {}
+var tool_equip_buttons: Dictionary = {}
+var tools_content_root: Control
+var primary_needs_release := true
+var pulse_time := 0.0
+var pulse_endpoint := Vector3.ZERO
 var elapsed_time := 0.0
 var build_mode := false
 var build_rotation_quarters := 0
@@ -381,6 +404,8 @@ func _physics_process(delta: float) -> void:
 
 
 func _input(event: InputEvent) -> void:
+	if event is InputEventMouseButton and event.button_index == MOUSE_BUTTON_LEFT and not event.pressed:
+		primary_needs_release = false
 	if event is InputEventKey and _reconnect_shortcut(event):
 		_connect_to_server(true)
 		get_viewport().set_input_as_handled()
@@ -437,6 +462,7 @@ func _input(event: InputEvent) -> void:
 						else Input.MOUSE_MODE_CAPTURED
 					)
 					_clear_transient_character_input()
+					_cancel_tool_charge()
 			KEY_I:
 				_set_inventory_open(not inventory_open)
 			KEY_J:
@@ -445,33 +471,12 @@ func _input(event: InputEvent) -> void:
 				_toggle_magnetic_boots()
 			KEY_H:
 				_toggle_helmet()
-			KEY_1:
-				selected_block_kind = "structural"
-				build_mode = true
-			KEY_2:
-				selected_block_kind = "anchor"
-				build_mode = true
-			KEY_3:
-				selected_block_kind = "cargo"
-				build_mode = true
-			KEY_4:
-				selected_block_kind = "power_source"
-				build_mode = true
-			KEY_5:
-				selected_block_kind = "damage_test"
-				build_mode = true
-			KEY_6:
-				selected_block_kind = "conveyor"
-				build_mode = true
-			KEY_7:
-				selected_block_kind = "refinery"
-				build_mode = true
-			KEY_8:
-				selected_block_kind = "assembler"
-				build_mode = true
+			KEY_1, KEY_2, KEY_3, KEY_4, KEY_5, KEY_6, KEY_7, KEY_8:
+				_select_number_slot(int(event.keycode) - int(KEY_1))
 			KEY_B:
-				build_mode = not build_mode
-				action_charge = 0.0
+				var entering := not build_mode
+				_equip_tool("welder")
+				build_mode = entering
 			KEY_BRACKETLEFT:
 				if build_mode:
 					build_rotation_quarters = posmod(build_rotation_quarters - 1, 4)
@@ -502,12 +507,17 @@ func _input(event: InputEvent) -> void:
 				suit_light.visible = suit_light_enabled
 				_set_message("Helmet light %s" % ("online" if suit_light_enabled else "offline"))
 	if event is InputEventMouseButton and event.pressed:
+		if inventory_open:
+			return
 		if Input.mouse_mode != Input.MOUSE_MODE_CAPTURED:
 			Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
+			primary_needs_release = true
 			return
 		if event.button_index == MOUSE_BUTTON_RIGHT:
 			build_mode = false
-			action_charge = 0.0
+			_cancel_tool_charge()
+		elif event.button_index == MOUSE_BUTTON_LEFT and equipped_tool == "pulse":
+			_fire_pulse()
 
 
 func _inventory_close_shortcut(event: InputEventKey, text_entry_focused: bool) -> bool:
@@ -1334,41 +1344,125 @@ func _build_target_highlight() -> void:
 
 
 func _build_viewmodel() -> void:
-	tool_root = Node3D.new()
-	tool_root.name = "SalvageToolViewmodel"
-	tool_root.position = Vector3(0.42, -0.34, -0.74)
-	tool_root.rotation_degrees = Vector3(-7.0, -10.0, 2.0)
-	camera.add_child(tool_root)
+	var equipment_fill := OmniLight3D.new()
+	equipment_fill.name = "EquipmentFill"
+	equipment_fill.position = Vector3(-0.25, 0.25, -0.15)
+	equipment_fill.light_color = Color(0.78, 0.86, 1.0)
+	equipment_fill.light_energy = 0.8
+	equipment_fill.omni_range = 2.5
+	equipment_fill.light_cull_mask = 2
+	camera.add_child(equipment_fill)
+	var tool_materials := {
+		"dark": _material(Color(0.20, 0.24, 0.28), 0.78, 0.10),
+		"steel": _material(Color(0.38, 0.43, 0.47), 0.62, 0.22),
+		"amber": _material(Color(0.65, 0.31, 0.06), 0.72, 0.10),
+		"cyan": _emissive_material(Color(0.08, 0.52, 0.72), 0.6),
+	}
+	for tool_id in TOOL_ORDER:
+		var model := Node3D.new()
+		model.name = "%sViewmodel" % TOOL_NAMES[tool_id].replace(" ", "")
+		model.scale = Vector3.ONE * 0.70
+		camera.add_child(model)
+		var body := _box_visual(Vector3(0.23, 0.20, 0.44), tool_materials["dark"])
+		model.add_child(body)
+		var grip := _box_visual(Vector3(0.11, 0.28, 0.13), tool_materials["steel"])
+		grip.position = Vector3(0.0, -0.19, 0.10)
+		grip.rotation_degrees.x = -12.0
+		model.add_child(grip)
+		var tip := Node3D.new()
+		tip.position = Vector3(0.0, 0.025, -0.36)
+		model.add_child(tip)
+		if tool_id == "drill":
+			var cone := MeshInstance3D.new()
+			var mesh := CylinderMesh.new()
+			mesh.top_radius = 0.0
+			mesh.bottom_radius = 0.12
+			mesh.height = 0.36
+			mesh.material = tool_materials["steel"]
+			cone.mesh = mesh
+			cone.rotation_degrees.x = -90.0
+			cone.position.z = -0.14
+			tip.add_child(cone)
+			for offset in [-0.085, 0.085]:
+				var tooth := _box_visual(Vector3(0.035, 0.035, 0.22), tool_materials["amber"])
+				tooth.position = Vector3(offset, 0.0, -0.08)
+				tip.add_child(tooth)
+		elif tool_id == "grinder":
+			var disc := _cylinder_visual(0.19, 0.035, tool_materials["steel"])
+			disc.rotation_degrees.x = 90.0
+			tip.add_child(disc)
+			for index in range(8):
+				var tooth := _box_visual(Vector3(0.05, 0.07, 0.045), tool_materials["amber"])
+				var angle := float(index) * TAU / 8.0
+				tooth.position = Vector3(sin(angle), cos(angle), 0.0) * 0.18
+				tooth.rotation.z = -angle
+				tip.add_child(tooth)
+		elif tool_id == "welder":
+			for offset in [-0.075, 0.075]:
+				var nozzle := _cylinder_visual(0.028, 0.28, tool_materials["steel"])
+				nozzle.rotation_degrees.x = 90.0
+				nozzle.position = Vector3(offset, 0.0, -0.10)
+				tip.add_child(nozzle)
+			var emitter := _box_visual(Vector3(0.09, 0.06, 0.08), tool_materials["amber"])
+			emitter.position.z = -0.19
+			tip.add_child(emitter)
+		else:
+			var barrel := _box_visual(Vector3(0.12, 0.12, 0.40), tool_materials["steel"])
+			barrel.position.z = -0.10
+			tip.add_child(barrel)
+			var emitter := _cylinder_visual(0.045, 0.03, tool_materials["cyan"])
+			emitter.rotation_degrees.x = 90.0
+			emitter.position.z = -0.32
+			tip.add_child(emitter)
+			var sight := _box_visual(Vector3(0.08, 0.08, 0.16), tool_materials["cyan"])
+			sight.position = Vector3(0.0, 0.15, -0.04)
+			model.add_child(sight)
+		var light := OmniLight3D.new()
+		light.light_color = Color(1.0, 0.62, 0.18) if tool_id in ["grinder", "welder"] else Color(0.14, 0.72, 1.0)
+		light.light_energy = 0.0
+		light.omni_range = 4.0
+		tip.add_child(light)
+		for geometry in model.find_children("*", "MeshInstance3D", true, false):
+			geometry.layers = 2
+			geometry.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+		tool_viewmodels[tool_id] = {"root": model, "tip": tip, "light": light}
+	_equip_tool(equipped_tool)
 
-	var body := _box_visual(Vector3(0.24, 0.22, 0.54), detail_materials["dark"])
-	body.position = Vector3(0.0, 0.0, -0.02)
-	tool_root.add_child(body)
-	var housing := _box_visual(Vector3(0.29, 0.16, 0.28), detail_materials["steel"])
-	housing.position = Vector3(0.0, 0.035, -0.27)
-	tool_root.add_child(housing)
-	var grip := _box_visual(Vector3(0.12, 0.29, 0.13), detail_materials["dark"])
-	grip.position = Vector3(0.0, -0.21, 0.08)
-	grip.rotation_degrees.x = -12.0
-	tool_root.add_child(grip)
 
-	tool_tip = Node3D.new()
-	tool_tip.position = Vector3(0.0, 0.035, -0.50)
-	tool_root.add_child(tool_tip)
-	for offset in [-0.095, 0.095]:
-		var rail := _cylinder_visual(0.034, 0.26, detail_materials["steel"])
-		rail.rotation_degrees.x = 90.0
-		rail.position = Vector3(offset, 0.0, -0.08)
-		tool_tip.add_child(rail)
-	var emitter := _cylinder_visual(0.074, 0.12, detail_materials["cyan"])
-	emitter.rotation_degrees.x = 90.0
-	emitter.position.z = -0.19
-	tool_tip.add_child(emitter)
-	tool_light = OmniLight3D.new()
-	tool_light.light_color = Color(0.14, 0.72, 1.0)
-	tool_light.light_energy = 0.0
-	tool_light.omni_range = 4.0
-	tool_light.position.z = -0.28
-	tool_tip.add_child(tool_light)
+func _cancel_tool_charge() -> void:
+	action_charge = 0.0
+	action_target_key = ""
+	primary_needs_release = true
+	pulse_time = 0.0
+	if is_instance_valid(action_progress):
+		action_progress.value = 0.0
+
+
+func _equip_tool(tool_id: String) -> void:
+	if not tool_id in TOOL_ORDER:
+		return
+	equipped_tool = tool_id
+	build_mode = false
+	_cancel_tool_charge()
+	for id in tool_viewmodels:
+		var entry: Dictionary = tool_viewmodels[id]
+		entry["root"].visible = id == tool_id
+		entry["light"].light_energy = 0.0
+	if tool_viewmodels.has(tool_id):
+		tool_root = tool_viewmodels[tool_id]["root"]
+		tool_tip = tool_viewmodels[tool_id]["tip"]
+		tool_light = tool_viewmodels[tool_id]["light"]
+	for id in tool_equip_buttons:
+		tool_equip_buttons[id].text = "EQUIPPED" if id == tool_id else "EQUIP"
+	_set_message("%s equipped // %s" % [TOOL_NAMES[tool_id], TOOL_DESCRIPTIONS[tool_id]])
+
+
+func _select_number_slot(index: int) -> void:
+	if build_mode and index >= 0 and index < BUILD_KINDS.size():
+		selected_block_kind = BUILD_KINDS[index]
+		_cancel_tool_charge()
+	elif index >= 0 and index < TOOL_ORDER.size():
+		_equip_tool(TOOL_ORDER[index])
 
 
 func _box_visual(size: Vector3, material: Material) -> MeshInstance3D:
@@ -1696,16 +1790,19 @@ func _build_inventory_terminal(canvas: CanvasLayer) -> void:
 	accent.offset_bottom = 2.0
 	terminal.add_child(accent)
 
-	var tabs := ["INVENTORY", "CONTROL PANEL", "PRODUCTION", "INFO"]
+	var tabs := ["INVENTORY", "TOOLS", "PRODUCTION"]
 	for tab_index in tabs.size():
 		var tab := Button.new()
 		tab.text = tabs[tab_index]
 		tab.position = Vector2(20.0 + float(tab_index) * 142.0, 12.0)
 		tab.size = Vector2(136.0, 34.0)
-		tab.disabled = not tab_index in [0, 2]
+		tab.disabled = false
 		if tab_index == 0:
 			tab.pressed.connect(_set_inventory_tab.bind("inventory"))
 			inventory_tab_buttons["inventory"] = tab
+		elif tab_index == 1:
+			tab.pressed.connect(_set_inventory_tab.bind("tools"))
+			inventory_tab_buttons["tools"] = tab
 		elif tab_index == 2:
 			tab.pressed.connect(_set_inventory_tab.bind("production"))
 			inventory_tab_buttons["production"] = tab
@@ -1720,7 +1817,7 @@ func _build_inventory_terminal(canvas: CanvasLayer) -> void:
 	heading.add_theme_color_override("font_color", Color(0.78, 0.90, 0.94))
 	terminal.add_child(heading)
 	var subheading := _hud_label(
-		"CONNECTED INVENTORIES  //  TWO-PANE LOGISTICS  //  SERVER AUTHORITATIVE",
+		"SUIT KIT  //  CARGO LOGISTICS  //  PHYSICAL PRODUCTION",
 		Vector2(160.0, 66.0),
 		11
 	)
@@ -1737,7 +1834,7 @@ func _build_inventory_terminal(canvas: CanvasLayer) -> void:
 
 	inventory_content_root = Control.new()
 	inventory_content_root.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
-	inventory_content_root.mouse_filter = Control.MOUSE_FILTER_PASS
+	inventory_content_root.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	terminal.add_child(inventory_content_root)
 
 	var suit_panel := _inventory_column(
@@ -1773,15 +1870,58 @@ func _build_inventory_terminal(canvas: CanvasLayer) -> void:
 	hint.add_theme_color_override("font_color", Color(0.45, 0.66, 0.73))
 	inventory_content_root.add_child(hint)
 
+	_build_tools_terminal(terminal)
 	_build_production_terminal(terminal)
 	_set_inventory_tab("inventory")
+
+
+func _build_tools_terminal(terminal: Control) -> void:
+	tools_content_root = Control.new()
+	tools_content_root.name = "SuitTools"
+	tools_content_root.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	tools_content_root.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	terminal.add_child(tools_content_root)
+	var panel := VBoxContainer.new()
+	panel.anchor_left = 0.04
+	panel.anchor_top = 0.14
+	panel.anchor_right = 0.96
+	panel.anchor_bottom = 0.90
+	panel.add_theme_constant_override("separation", 12)
+	tools_content_root.add_child(panel)
+	var title := Label.new()
+	title.text = "SUIT EQUIPMENT // PERMANENT STARTER KIT"
+	title.add_theme_font_size_override("font_size", 20)
+	panel.add_child(title)
+	for index in TOOL_ORDER.size():
+		var tool_id: String = TOOL_ORDER[index]
+		var row := HBoxContainer.new()
+		row.custom_minimum_size.y = 72.0
+		row.add_theme_constant_override("separation", 22)
+		panel.add_child(row)
+		var text := Label.new()
+		text.text = "[%d] %s\n%s" % [index + 1, TOOL_NAMES[tool_id], TOOL_DESCRIPTIONS[tool_id]]
+		text.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+		text.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		row.add_child(text)
+		var equip := Button.new()
+		equip.text = "EQUIPPED" if tool_id == equipped_tool else "EQUIP"
+		equip.custom_minimum_size = Vector2(140, 48)
+		equip.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+		equip.pressed.connect(_equip_tool.bind(tool_id))
+		row.add_child(equip)
+		tool_equip_buttons[tool_id] = equip
+	var note := Label.new()
+	note.text = "Included with your suit; cannot be traded or dropped.\nB opens block construction with the welder. I closes inventory.\nAll tools reach 9 m. Pulse shots affect blocks only."
+	note.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	note.add_theme_color_override("font_color", Color(0.53, 0.76, 0.80))
+	panel.add_child(note)
 
 
 func _build_production_terminal(terminal: Control) -> void:
 	production_content_root = Control.new()
 	production_content_root.name = "ProductionTerminal"
 	production_content_root.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
-	production_content_root.mouse_filter = Control.MOUSE_FILTER_PASS
+	production_content_root.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	terminal.add_child(production_content_root)
 
 	var panel := ColorRect.new()
@@ -1829,16 +1969,21 @@ func _build_production_terminal(terminal: Control) -> void:
 
 
 func _set_inventory_tab(tab_name: String) -> void:
-	if not tab_name in ["inventory", "production"]:
+	if not tab_name in ["inventory", "tools", "production"]:
 		return
 	active_inventory_tab = tab_name
+	if is_instance_valid(tools_content_root):
+		tools_content_root.visible = tab_name == "tools"
 	if is_instance_valid(inventory_content_root):
 		inventory_content_root.visible = tab_name == "inventory"
 	if is_instance_valid(production_content_root):
 		production_content_root.visible = tab_name == "production"
 	for name in inventory_tab_buttons:
 		var button: Button = inventory_tab_buttons[name]
-		button.button_pressed = String(name) == tab_name
+		var selected := String(name) == tab_name
+		button.add_theme_stylebox_override("normal", _terminal_style(
+			Color(0.10, 0.22, 0.27) if selected else Color(0.055, 0.065, 0.072),
+			Color(0.31, 0.70, 0.82) if selected else Color(0.10, 0.14, 0.17), 1))
 	if tab_name == "production":
 		_update_production_terminal()
 
@@ -5913,75 +6058,113 @@ func _voxel_coordinate_less(first: Vector3i, second: Vector3i) -> bool:
 	return first.z < second.z
 
 
+func _tool_pointer_captured() -> bool:
+	return Input.mouse_mode == Input.MOUSE_MODE_CAPTURED
+
+
+func _tool_controls_ready() -> bool:
+	return (
+		connected and authoritative_player_ready and operation_frontier_ready
+		and not mutation_resync_required and session_role_kind == "player"
+		and not bound_player_id.is_empty() and handoff_phase == "live"
+		and not inventory_open and not _local_player_incapacitated()
+		and _tool_pointer_captured()
+	)
+
+
+func _tool_submission_ready() -> bool:
+	return in_flight_mutation.is_empty() and mutation_queue.is_empty()
+
+
+func _tool_action_plan() -> Dictionary:
+	if build_mode and equipped_tool == "welder" and not target_block.is_empty() and _target_grid_owned_by_local():
+		var block: Dictionary = target_block["block"]
+		if _block_needs_weld(block):
+			return {"kind": "weld", "key": "weld:%s" % block.get("block_id", ""),
+				"duration": WELD_DURATION, "label": _weld_action_name(block)}
+		return {"kind": "build", "key": "build:%s:%s:%s:%d" % [
+			target_block.get("grid_id", ""), str(_build_coordinate()),
+			selected_block_kind, build_rotation_quarters],
+			"duration": WELD_DURATION, "label": "PLACING %s FRAME" % selected_block_kind.to_upper()}
+	if build_mode:
+		return {}
+	if equipped_tool == "drill" and target_voxel != null:
+		return {"kind": "mine", "key": "mine:%s" % _coord_key(target_voxel),
+			"duration": MINE_DURATION, "label": "EXTRACTING ORE"}
+	if target_block.is_empty():
+		return {}
+	var block: Dictionary = target_block["block"]
+	if equipped_tool == "grinder":
+		return {"kind": "damage", "key": "cut:%s" % block.get("block_id", ""),
+			"duration": DAMAGE_DURATION, "label": "GRINDING BLOCK"}
+	if equipped_tool == "welder" and _target_grid_owned_by_local() and _block_needs_weld(block):
+		return {"kind": "weld", "key": "weld:%s" % block.get("block_id", ""),
+			"duration": WELD_DURATION, "label": _weld_action_name(block)}
+	return {}
+
+
 func _update_tool_action(delta: float) -> void:
-	if inventory_open or _local_player_incapacitated():
+	_advance_tool_action(delta, Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT))
+
+
+func _advance_tool_action(delta: float, holding_primary: bool) -> void:
+	action_cooldown = maxf(0.0, action_cooldown - delta)
+	pulse_time = maxf(0.0, pulse_time - delta)
+	if not _tool_controls_ready():
+		_cancel_tool_charge()
+		return
+	if not holding_primary:
+		primary_needs_release = false
 		action_charge = 0.0
 		action_target_key = ""
 		action_progress.value = 0.0
 		return
-	action_cooldown = maxf(0.0, action_cooldown - delta)
-	var holding_primary := Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT)
-	var holding_secondary := Input.is_mouse_button_pressed(MOUSE_BUTTON_RIGHT)
-	var action_key := ""
-	var duration := MINE_DURATION
-	var action_name := ""
-
-	if holding_secondary and not target_block.is_empty():
-		action_key = "damage:%s" % target_block["block"].get("block_id", "")
-		duration = DAMAGE_DURATION
-		action_name = "CUTTING ARMOR"
-	elif (
-		holding_primary
-		and build_mode
-		and not target_block.is_empty()
-		and _target_grid_owned_by_local()
-	):
-		var construction_target: Dictionary = target_block["block"]
-		if _block_needs_weld(construction_target):
-			action_key = "weld:%s" % construction_target.get("block_id", "")
-			duration = WELD_DURATION
-			action_name = _weld_action_name(construction_target)
-		else:
-			action_key = "build:%s:%s:%d" % [
-				target_block.get("grid_id", ""),
-				str(_build_coordinate()),
-				build_rotation_quarters,
-			]
-			duration = WELD_DURATION
-			action_name = "PLACING %s FRAME" % selected_block_kind.to_upper()
-	elif holding_primary and not build_mode and target_voxel != null:
-		action_key = "mine:%s" % _coord_key(target_voxel)
-		duration = MINE_DURATION
-		action_name = "EXTRACTING ORE"
-
-	if action_key.is_empty() or action_cooldown > 0.0:
-		action_charge = maxf(0.0, action_charge - delta * 3.5)
-		action_target_key = ""
-		action_progress.value = action_charge
+	if primary_needs_release or equipped_tool == "pulse":
 		return
-	if action_key != action_target_key:
-		action_target_key = action_key
+	var plan := _tool_action_plan()
+	if plan.is_empty() or action_cooldown > 0.0:
 		action_charge = 0.0
-	action_charge += delta / duration
-	action_progress.value = clampf(action_charge, 0.0, 1.0)
-	mode_label.text = action_name
-	tool_kick = maxf(tool_kick, minf(action_charge, 0.62))
-	if action_charge < 1.0:
+		action_target_key = ""
+		action_progress.value = 0.0
 		return
-
-	var completed_action := action_target_key
+	if String(plan["key"]) != action_target_key:
+		action_target_key = String(plan["key"])
+		action_charge = 0.0
+	action_charge = minf(1.0, action_charge + delta / float(plan["duration"]))
+	action_progress.value = action_charge
+	mode_label.text = String(plan["label"])
+	tool_kick = maxf(tool_kick, minf(action_charge, 0.62))
+	if action_charge < 1.0 or not _tool_submission_ready():
+		return
 	action_charge = 0.0
 	action_target_key = ""
 	action_cooldown = 0.42
 	tool_kick = 1.0
-	if holding_secondary:
-		_damage_target_block()
-	elif completed_action.begins_with("weld:"):
-		_weld_target_block()
-	elif build_mode:
-		_build_selected_block()
-	else:
-		_mine_target_voxel()
+	match String(plan["kind"]):
+		"damage": _damage_target_block()
+		"weld": _weld_target_block()
+		"build": _build_selected_block()
+		"mine": _mine_target_voxel()
+
+
+func _fire_pulse() -> bool:
+	if equipped_tool != "pulse" or not _tool_controls_ready() or primary_needs_release or action_cooldown > 0.0:
+		return false
+	primary_needs_release = true
+	if not _tool_submission_ready():
+		_set_message("Waiting for the previous action. Release, then fire again.")
+		return false
+	if not target_block.is_empty() and not _damage_target_block("pulse"):
+		return false
+	pulse_endpoint = (
+		target_hit.get("hit_position", camera.global_position - camera.global_basis.z * TARGET_RANGE)
+		if not target_hit.is_empty()
+		else camera.global_position - camera.global_basis.z * TARGET_RANGE
+	)
+	pulse_time = 0.10
+	action_cooldown = PULSE_COOLDOWN
+	tool_kick = 1.0
+	return true
 
 
 func _update_viewmodel(delta: float) -> void:
@@ -5998,10 +6181,11 @@ func _update_viewmodel(delta: float) -> void:
 		-10.0,
 		2.0 + sin(elapsed_time * 3.2) * motion
 	)
-	tool_tip.rotation.z += delta * (18.0 if action_charge > 0.0 else 1.2)
+	if equipped_tool in ["drill", "grinder"]:
+		tool_tip.rotation.z += delta * (18.0 if action_charge > 0.0 else 0.0)
 	tool_light.light_energy = lerpf(
 		tool_light.light_energy,
-		5.0 if action_charge > 0.0 else 0.0,
+		5.0 if action_charge > 0.0 or pulse_time > 0.0 else 0.0,
 		minf(delta * 14.0, 1.0)
 	)
 	if build_preview.visible:
@@ -6010,13 +6194,13 @@ func _update_viewmodel(delta: float) -> void:
 
 
 func _update_action_feedback() -> void:
-	var active := action_charge > 0.0 and not action_target_key.is_empty()
+	var active := (action_charge > 0.0 and not action_target_key.is_empty()) or pulse_time > 0.0
 	action_beam.visible = active
-	action_flare.visible = active
-	action_sparks.emitting = active
+	action_flare.visible = active and pulse_time <= 0.0
+	action_sparks.emitting = active and pulse_time <= 0.0
 	if not active:
 		return
-	var target_position := _active_action_position()
+	var target_position := pulse_endpoint if pulse_time > 0.0 else _active_action_position()
 	var beam_origin := tool_tip.global_position
 	var beam_vector := target_position - beam_origin
 	if beam_vector.length_squared() < 0.001:
@@ -6052,14 +6236,14 @@ func _mine_target_voxel() -> void:
 	})
 
 
-func _damage_target_block() -> void:
+func _damage_target_block(operation_prefix := "damage") -> bool:
 	if target_block.is_empty():
-		_set_message("Aim at a grid block to apply test damage", true)
-		return
+		_set_message("Aim at a block within 9 m", true)
+		return false
 	var block: Dictionary = target_block["block"]
-	_queue_mutation({
+	return _queue_mutation({
 		"type": "damage_block",
-		"operation_id": _operation_id("damage"),
+		"operation_id": _operation_id(operation_prefix),
 		"grid_id": target_block["grid_id"],
 		"block_id": block.get("block_id", ""),
 	})
@@ -6277,7 +6461,7 @@ func _set_inventory_open(open: bool) -> void:
 	inventory_open = open
 	inventory_overlay.visible = open
 	build_mode = false if open else build_mode
-	action_charge = 0.0
+	_cancel_tool_charge()
 	_clear_transient_character_input()
 	Input.mouse_mode = Input.MOUSE_MODE_VISIBLE if open else Input.MOUSE_MODE_CAPTURED
 	_set_message(
@@ -7088,7 +7272,7 @@ func _update_interface() -> void:
 			"     ".join(hotbar_parts), build_rotation_quarters * 90
 		]
 	else:
-		hotbar_label.text = "HAND DRILL     [J] JETPACK     [K] MAG BOOTS     [B] CONSTRUCTION     [R] REFINE     [T] FABRICATE     [V] CARGO"
+		hotbar_label.text = "[1] DRILL   [2] GRINDER   [3] WELDER   [4] PULSE\n[B] CONSTRUCT   [I] INVENTORY / TOOLS / PRODUCTION"
 	if target_voxel != null:
 		var voxel: Dictionary = voxel_lookup.get(_coord_key(target_voxel), {})
 		var deposit := (
@@ -7096,7 +7280,7 @@ func _update_interface() -> void:
 			if voxel.get("material", "rock") == "ferrite_ore"
 			else "CARBONACEOUS ROCK // LOW YIELD"
 		)
-		target_label.text = "%s\nHOLD LMB  //  EXTRACT" % deposit
+		target_label.text = "%s\n%s" % [deposit, "HOLD LMB // EXTRACT" if equipped_tool == "drill" and not build_mode else "[1] EQUIP DRILL TO MINE" if not build_mode else "[B] LEAVE CONSTRUCTION TO MINE"]
 	elif not target_block.is_empty():
 		var block: Dictionary = target_block["block"]
 		var health := int(block.get("health", 0))
@@ -7109,7 +7293,7 @@ func _update_interface() -> void:
 			if owner.is_empty():
 				owner = "UNREGISTERED"
 			target_label.text = (
-				"%s // INTEGRITY %d%%\nACCESS LOCKED // PROPERTY OF %s\nHOLD RMB  //  CUT AND SALVAGE"
+				"%s // INTEGRITY %d%%\nPROPERTY OF %s // WELD / BUILD LOCKED"
 				% [String(block.get("kind", "block")).to_upper(), integrity, owner]
 			)
 		elif build_mode:
@@ -7130,7 +7314,7 @@ func _update_interface() -> void:
 		else:
 			var condition := _block_condition_label(block)
 			var target_state := "" if condition.is_empty() else " " + condition
-			target_label.text = "%s%s // INTEGRITY %d%%\nHOLD RMB  //  CUT AND SALVAGE" % [
+			target_label.text = ("%s%s // INTEGRITY %d%%\n" + _tool_target_hint(block)) % [
 				String(block.get("kind", "block")).to_upper(), target_state, integrity
 			]
 	else:
@@ -7149,7 +7333,7 @@ func _update_interface() -> void:
 				selected_block_kind.to_upper(), build_rotation_quarters * 90
 			]
 			if build_mode
-			else "INDUSTRIAL HAND DRILL // READY"
+			else "%s // %s // 9 m" % [TOOL_NAMES[equipped_tool], "CLICK TO FIRE" if equipped_tool == "pulse" else "HOLD PRIMARY"]
 			)
 	if _player_is_incapacitated(player):
 		hotbar_label.text = "EVA CONTROL OFFLINE     [ENTER] REQUEST RECOVERY"
@@ -7158,6 +7342,14 @@ func _update_interface() -> void:
 	action_progress.visible = action_charge > 0.0
 	message_label.text = recent_message
 	message_label.add_theme_color_override("font_color", recent_message_color)
+
+
+func _tool_target_hint(block: Dictionary) -> String:
+	match equipped_tool:
+		"grinder": return "HOLD LMB // GRIND AND SALVAGE"
+		"pulse": return "CLICK LMB // FIRE BLOCK PULSE"
+		"welder": return "HOLD LMB // WELD / REPAIR" if _block_needs_weld(block) else "FULL INTEGRITY // B TO CONSTRUCT"
+	return "[2] GRIND  [3] WELD  [4] PULSE  [B] CONSTRUCT"
 
 
 func _update_inventory_terminal() -> void:
@@ -7339,47 +7531,15 @@ func _mission_text(career: Dictionary) -> String:
 	var refined := int(career.get("refining_batches", 0))
 	var crafted := int(career.get("components_crafted", 0))
 	var built := int(career.get("blocks_built", 0))
-	var anchored := int(career.get("anchors_engaged", 0))
 	if mined < 3:
-		return (
-			"01 // CUT A PATH\n"
-			+ "The relay rig is awake, but its stores are dry.\n\n"
-			+ "Extract asteroid voxels  %d / 3\n"
-			+ "Hold LMB on highlighted rock."
-		) % mined
+		return "01 // MINE ORE  %d / 3\n\n[1] Equip drill. Fly toward the nearby asteroid; hold LMB on rock within 9 m.\nKeep your helmet sealed in vacuum [H]." % mined
 	if refined < 1:
-		return (
-			"02 // SMELT FEEDSTOCK\n"
-			+ "Turn raw ore into registered alloy.\n\n"
-			+ "Refining batches  0 / 1\n"
-			+ "Press R when carrying at least 2 ore."
-		)
+		return "02 // REFINE IN A MACHINE\n\n[I] Inventory: select Ferrite Ore in your suit, select the industrial cargo, then transfer at least 2 ore with the arrows.\nProduction tab: queue 1 refining batch. Wait for alloy."
 	if crafted < 1:
-		return (
-			"03 // FABRICATE A PART\n"
-			+ "Prove the production chain can sustain the rig.\n\n"
-			+ "Components fabricated  0 / 1\n"
-			+ "Press T with refined alloy."
-		)
-	if built < 2:
-		return (
-			"04 // EXPAND THE RELAY\n"
-			+ "Add a frame, then an anchor toward the rock.\n\n"
-			+ "Blocks constructed  %d / 2\n"
-			+ "Press B, select 1 or 2, rotate with [ or ], then hold LMB to place and weld."
-		) % built
-	if anchored < 1:
-		return (
-			"05 // LOCK THE RIG\n"
-			+ "Seat an anchor against the asteroid and energize it.\n\n"
-			+ "Anchor engagements  0 / 1\n"
-			+ "Press F while targeting the rig."
-		)
-	return (
-		"CONTRACT COMPLETE // RELAY ONLINE\n"
-		+ "Khepri Station recognizes your salvage license.\n\n"
-		+ "Continue mining, design a larger grid, or cut the test frame apart."
-	)
+		return "03 // MAKE A COMPONENT\n\nLeave the alloy in industrial cargo.\n[I] Production: queue 1 component batch. The powered assembler turns alloy into a construction part. Wait for completion."
+	if built < 1:
+		return "04 // BUILD A BLOCK\n\n[I] Inventory: select Construction Part in cargo and transfer it to your suit.\nClose inventory. [B], then [1]: aim at an owned block face and hold LMB to place a frame. Keep welding until complete."
+	return "ENGINEERING LOOP COMPLETE\n\nYou mined, refined, manufactured and built.\n[2] Grind a spare block. [3] Repair it. [4] Fire a short-range pulse at a spare block.\n[I] Tools lists your suit kit."
 
 
 func _inventory(inventory_id: String) -> Dictionary:
