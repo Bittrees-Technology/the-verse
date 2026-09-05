@@ -24,6 +24,7 @@ fi
 mkdir -p "${universe_directory}"
 "${package_directory}/verse-simulation-worker" \
   --data-directory "${universe_directory}" \
+  --genesis-profile "${VERSE_GENESIS_PROFILE:-orbital}" \
   --snapshot-every "${snapshot_every}" \
   --bind 127.0.0.1:7777 \
   >"${universe_directory}/server.log" 2>&1 &

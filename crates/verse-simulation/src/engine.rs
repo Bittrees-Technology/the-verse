@@ -917,6 +917,31 @@ impl Runtime {
         self.physics.is_some()
     }
 
+    /// Selects balanced ore positions only in an untouched development world.
+    pub fn configure_ore_workshop(&mut self) -> Result<bool, RuntimeError> {
+        if self.halted {
+            return Err(RuntimeError::Halted);
+        }
+        if self.state.event_sequence != 0 {
+            return Err(IntentError::rejected(
+                "ore_workshop_requires_fresh_world",
+                "ore placement requires a fresh world",
+            )
+            .into());
+        }
+        let deposits =
+            crate::geology::generate_deposits(self.state.world_seed, &self.state.voxels.occupied);
+        let rich = deposits.into_keys().collect();
+        if self.state.voxels.ferrite_ore == rich {
+            return Ok(false);
+        }
+        let mut next = self.state.clone();
+        next.voxels.ferrite_ore = rich;
+        self.store.save_snapshot(&next)?;
+        self.state = next;
+        Ok(true)
+    }
+
     /// Replaces only the event-zero development fixture with a canonical
     /// surface outpost. The profile is opt-in so ordinary genesis, established
     /// universes, and the orbital proof remain unchanged.
@@ -8275,6 +8300,48 @@ mod tests {
                 .expect("production journal contains an event"),
         )
         .expect("production event parses")
+    }
+
+    #[test]
+    fn ore_workshop_mines_each_variety_and_recovers_without_regeneration() {
+        use crate::geology::{OreKind, generate_deposits};
+        for kind in [OreKind::Ferrite, OreKind::Cuprite, OreKind::Cobaltite] {
+            let directory = tempdir().expect("temporary world");
+            let mut runtime = Runtime::open(directory.path(), 42, 100).expect("open");
+            assert!(runtime.configure_ore_workshop().expect("configure"));
+            assert!(!runtime.configure_ore_workshop().expect("idempotent"));
+            let deposits = generate_deposits(42, &runtime.state.voxels.occupied);
+            let target = *deposits
+                .iter()
+                .find(|(point, value)| {
+                    **value == kind
+                        && point
+                            .neighbors()
+                            .iter()
+                            .any(|p| !runtime.state.voxels.occupied.contains(p))
+                })
+                .expect("exposed sample")
+                .0;
+            aim_player_at_voxel(&mut runtime, "player-local", target);
+            runtime.persist_snapshot().expect("persist aimed fixture");
+            let before = runtime.state.ledger.mined_ore;
+            runtime
+                .execute_next_for_fixture(&ClientMessage::MineVoxel {
+                    operation_sequence: 0,
+                    operation_id: "mine-assay".into(),
+                    coordinate: target,
+                })
+                .expect("mine exposed mineral");
+            assert_eq!(runtime.state.ledger.mined_ore, before + 3);
+            assert!(runtime.state.conservation().valid);
+            assert!(!runtime.state.voxels.occupied.contains(&target));
+            assert!(runtime.configure_ore_workshop().is_err());
+            let expected = runtime.state.state_hash();
+            drop(runtime);
+            let recovered = Runtime::open(directory.path(), 42, 100).expect("replay mining");
+            assert_eq!(recovered.state.state_hash(), expected);
+            assert!(!recovered.state.voxels.occupied.contains(&target));
+        }
     }
 
     #[test]

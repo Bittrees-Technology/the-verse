@@ -260,6 +260,20 @@ impl IRefCounted for VerseInterestVerifier {
 
 #[godot_api]
 impl VerseInterestVerifier {
+    /// Display-only geology catalog; the verified voxel grade owns extraction.
+    #[func]
+    #[allow(clippy::needless_pass_by_value)] // Godot ABI owns string arguments.
+    #[allow(clippy::unused_self)] // Instance method exposed on the native bridge.
+    fn ore_catalog_v1(&self, seed: GString) -> GString {
+        let Ok(seed) = seed.to_string().parse::<u64>() else {
+            return "[]".into();
+        };
+        serde_json::to_string(&verse_simulation::geology::starter_deposit_catalog(seed))
+            .unwrap_or_else(|_| "[]".to_owned())
+            .as_str()
+            .into()
+    }
+
     #[func]
     #[allow(clippy::needless_pass_by_value)] // Godot's ABI owns argument values.
     #[allow(clippy::too_many_arguments)] // Complete pinned connection contract crosses this boundary.

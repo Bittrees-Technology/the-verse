@@ -25,6 +25,7 @@ use verse_simulation_worker::{AppState, router};
 enum GenesisProfile {
     Orbital,
     EarthStart,
+    OreWorkshop,
 }
 
 #[derive(Debug, Parser)]
@@ -191,6 +192,16 @@ async fn main() -> Result<()> {
                 arguments.data_directory.display()
             )
         })?;
+        if arguments.genesis_profile == GenesisProfile::OreWorkshop {
+            if !is_origin_cell {
+                bail!("ore workshop requires the origin cell");
+            }
+            if runtime.state().event_sequence == 0 {
+                runtime
+                    .configure_ore_workshop()
+                    .context("failed to configure ore workshop")?;
+            }
+        }
         if arguments.genesis_profile == GenesisProfile::EarthStart {
             if !is_origin_cell {
                 bail!(

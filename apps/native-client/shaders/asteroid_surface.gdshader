@@ -83,7 +83,7 @@ void fragment() {
 	float broad = fractal_noise(surface_position * 0.42, footprint * 0.42);
 	float grain_visibility = 1.0 - smoothstep(0.35, 1.0, footprint * 5.8);
 	float grain = mix(0.5, value_noise(surface_position * 5.8), grain_visibility);
-	float ore_mask = smoothstep(0.12, 0.34, COLOR.r - COLOR.b);
+	float ore_mask = smoothstep(0.2, 0.8, COLOR.a);
 	vec3 scanned_rock = triplanar_albedo(surface_position, normalize(surface_normal));
 	float scanned_luma = dot(scanned_rock, vec3(0.2126, 0.7152, 0.0722));
 	// Geological scans are deliberately restrained so generated source-map
@@ -91,7 +91,7 @@ void fragment() {
 	scanned_rock = mix(vec3(scanned_luma), scanned_rock, 0.14) * vec3(0.80, 0.75, 0.68);
 	vec3 rock = mix(scanned_rock, COLOR.rgb, 0.26) * mix(0.72, 1.12, broad);
 	rock *= mix(0.88, 1.08, grain);
-	vec3 ferrite = scanned_rock * vec3(0.74, 0.46, 0.25) * mix(0.72, 1.20, broad);
+	vec3 ferrite = mix(scanned_rock * COLOR.rgb, COLOR.rgb, 0.55) * mix(0.72, 1.20, broad);
 	ALBEDO = mix(rock, ferrite, ore_mask);
 	ROUGHNESS = mix(0.98, 0.72, ore_mask) - grain * 0.045;
 	METALLIC = ore_mask * 0.26;
