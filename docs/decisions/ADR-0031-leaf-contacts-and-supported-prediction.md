@@ -23,6 +23,13 @@ Voxel queries, highlights, and fragments use the same body-to-render translation
 as their meshes. Storage coordinates remain unchanged in mining intents. Cache
 sorted targeting blocks with the existing immutable projection identity cache.
 
+On macOS, select Godot's Forward Mobile renderer using the native Metal driver
+instead of OpenGL Compatibility. The same fresh-world and copied-save probes
+eliminated the observed 90–528 ms rendering stalls in these short runs. Keep the
+existing Compatibility default on other platforms and allow the CLI diagnostic
+fallback `--rendering-method gl_compatibility --rendering-driver opengl3`.
+Capital/tool visuals and graphical structure checks must also pass with Metal.
+
 No protocol or save schema changes are required. Existing events replay with the
 same validation. Reverting the server setting can reproduce the wall halt;
 reverting client changes restores the earlier presentation only. No saves are

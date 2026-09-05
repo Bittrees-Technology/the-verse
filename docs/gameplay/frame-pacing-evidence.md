@@ -63,8 +63,23 @@ walking, and 9.2/23.8 ms mouse-look. Mouse-look's maximum camera translation was
 0.12 m and maximum turn 1.05 degrees per frame. Targeting CPU cost was about
 1.94 ms per mouse-look frame, versus 4.02 ms before caching in this session.
 
-This is improved, not a claim of hitch-free rendering: walking still exhibited
+With the Compatibility renderer, this was improved but not hitch-free: walking still exhibited
 an occasional 90–103 ms frame stall and up to 0.58 m camera steps. Instrumented
 movement/network/presentation handlers did not show a matching >40 ms individual
 stall. Driver/render synchronization remains a possible cause, not established
 by these measurements. Long sessions and other hardware still need testing.
+
+### Native Metal follow-up
+
+The remaining stalls were absent in the same short probe with Metal Forward
+Mobile. The fresh capital's maximum idle/walking/mouse frame times were
+22.5/24.6/21.2 ms. A fresh copy of the actual failed save measured maxima of
+22.3/22.8/21.6 ms, compared with 32.2/100.8/528.7 ms on Compatibility during
+that copied-save scenario. Copied-save walking/mouse camera steps stayed below
+0.122/0.087 m, with no explicit camera snaps. Both runs remained entered,
+connected, authoritative-ready, and replication-ready throughout.
+
+macOS now selects the Metal Mobile renderer by feature override; other platforms
+retain Compatibility. The Metal entry/tool UI test passed and its capital image
+was inspected. These are short same-machine observations; they establish a
+useful rendering improvement, not universal hitch-free performance.

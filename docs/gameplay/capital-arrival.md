@@ -84,3 +84,5 @@ Voxel collision prediction, tool rays, and highlighting must use the same body-t
 Client movement prediction permits a 1 cm contact skin so ordinary resting solver penetration does not block tangential floor movement. Deeper overlaps and walls still block prediction; authoritative physics and replay validation remain unchanged.
 
 On grid supports, project predicted walking displacement onto the actual deck normal, not the radial gravity tangent. A bounded prediction-history reset must preserve the rendered camera pose and converge smoothly; respawn, reconnect, and large corrections retain explicit snaps.
+
+The macOS client uses the native Metal Forward Mobile renderer. Keep the Compatibility renderer for other platforms. Validate capital materials, tool UI, saved-world movement, and exported startup with Metal; retain an explicit Compatibility CLI fallback for diagnostics.
