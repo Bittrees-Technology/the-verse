@@ -11,6 +11,10 @@ target/release/verse-simulation-worker --data-directory "${verse_probe_directory
   > "${verse_probe_directory}/server.log" 2>&1 &
 verse_probe_pid=$!
 cleanup() {
+  verse_probe_status=$?
+  if [[ "${verse_probe_status}" != "0" ]]; then
+    cat "${verse_probe_directory}/server.log" >&2
+  fi
   kill -TERM "${verse_probe_pid}" 2>/dev/null || true
   wait "${verse_probe_pid}" || true
   rm -rf "${verse_probe_directory}"

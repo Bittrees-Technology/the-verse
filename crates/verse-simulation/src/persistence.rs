@@ -1816,6 +1816,20 @@ impl Store {
         &mut self,
         lifecycle: CellLifecycleRecord,
     ) -> Result<(), PersistenceError> {
+        // Serialization or suspension can consume the lease after the operation's
+        // initial write check. Never publish a post-expiry trusted timestamp into
+        // a live record: it would make a later fenced reopen reject the save.
+        let now_unix_ms = self.trusted_unix_millis()?;
+        let expires_at_unix_ms = self
+            .lifecycle
+            .expires_at_unix_ms
+            .ok_or(PersistenceError::LeaseOwnershipChanged)?;
+        if now_unix_ms >= expires_at_unix_ms {
+            return Err(PersistenceError::LeaseExpired {
+                expires_at_unix_ms,
+                now_unix_ms,
+            });
+        }
         write_json_atomic(&self.root.join(LIFECYCLE_FILE), &lifecycle)?;
         self.lifecycle = lifecycle;
         Ok(())
@@ -3140,6 +3154,33 @@ mod tests {
             Store::open(directory.path(), 14),
             Err(PersistenceError::FencingTokenExhausted)
         ));
+    }
+
+    #[test]
+    fn suspension_before_lifecycle_publish_preserves_a_reopenable_record() {
+        let directory = tempdir().expect("tempdir");
+        let clock = Arc::new(ManualTrustedClock::new(100_000));
+        let mut store = Store::open_with_clock(directory.path(), 15, clock.clone()).expect("open");
+        store
+            .verify_live_lease_for_write()
+            .expect("operation begins within lease");
+        let path = directory.path().join(LIFECYCLE_FILE);
+        let before = fs::read(&path).expect("durable record");
+        let fence = store.fencing_token();
+        let expires = store.lifecycle.expires_at_unix_ms.expect("expiry");
+        clock.set(expires + 1);
+        let mut candidate = store.lifecycle.clone();
+        candidate.last_trusted_unix_ms = expires + 1;
+        candidate.updated_at_unix_ms = expires + 1;
+        assert!(matches!(
+            store.persist_lifecycle(candidate),
+            Err(PersistenceError::LeaseExpired { .. })
+        ));
+        assert_eq!(fs::read(&path).expect("unchanged record"), before);
+        drop(store);
+        let reopened = Store::open_with_clock(directory.path(), 15, clock)
+            .expect("fresh process may acquire expired lease");
+        assert!(reopened.fencing_token() > fence);
     }
 
     #[test]

@@ -4213,8 +4213,9 @@ func _rebuild_grids(grids: Array) -> void:
 		var grid_id := String(grid.get("grid_id", ""))
 		if grid_id.is_empty():
 			continue
-		var topology_fingerprint := _grid_topology_fingerprint(grid)
 		var grid_node: Node3D = grid_node_lookup.get(grid_id, null)
+		var unchanged_blocks: bool = grid_node != null and grid_node.get_meta("verse_render_blocks", null) == grid.get("blocks", [])
+		var topology_fingerprint: String = String(grid_topology_fingerprints.get(grid_id, "")) if unchanged_blocks else _grid_topology_fingerprint(grid)
 		if (
 			grid_node == null
 			or String(grid_topology_fingerprints.get(grid_id, "")) != topology_fingerprint
@@ -4229,6 +4230,7 @@ func _rebuild_grids(grids: Array) -> void:
 			grid_node.position = _vec3(grid.get("position", {}))
 			grid_node.quaternion = _grid_quaternion(grid)
 			_sync_grid_power_visual(grid_node, bool(grid.get("power", {}).get("online", false)))
+		grid_node.set_meta("verse_render_blocks", grid.get("blocks", []))
 		next_lookup[grid_id] = grid
 		next_nodes[grid_id] = grid_node
 		next_fingerprints[grid_id] = topology_fingerprint
@@ -4254,6 +4256,7 @@ func _create_grid_node(grid: Dictionary) -> Node3D:
 	grid_node.name = String(grid.get("grid_id", "grid"))
 	grid_node.position = _vec3(grid.get("position", {}))
 	grid_node.quaternion = _grid_quaternion(grid)
+	var grand_capital: bool = grid.get("blocks", []).any(func(block): return String(block.get("block_id", "")) == "block-capital-floor-12-11")
 	var structural_instances: Array[Dictionary] = []
 	for block_value in grid.get("blocks", []):
 		if not block_value is Dictionary:
@@ -4278,15 +4281,17 @@ func _create_grid_node(grid: Dictionary) -> Node3D:
 			sign_label.text = "KHEPRI CAPITAL\nARRIVAL HALL"
 			sign_label.font_size = 96
 			sign_label.pixel_size = 0.006
-			sign_label.position = Vector3(0, 3.3, -6.4)
+			sign_label.position = Vector3(0, 4.8, -10.4) if grand_capital else Vector3(0, 3.3, -6.4)
 			sign_label.modulate = Color(0.75, 0.87, 0.88)
 			grid_node.add_child(sign_label)
 			var directions := Label3D.new()
 			directions.text = "INDUSTRY  •  CARGO / REFINERY / ASSEMBLER\nORE OUTCROPS OUTSIDE  →"
 			directions.font_size = 48
 			directions.pixel_size = 0.005
-			directions.position = Vector3(0, 2.2, -6.3)
+			directions.position = Vector3(0, 3.3, -10.3) if grand_capital else Vector3(0, 2.2, -6.3)
 			grid_node.add_child(directions)
+			if grand_capital:
+				_add_capital_luxury(grid_node)
 			break
 	_sync_grid_power_visual(grid_node, bool(grid.get("power", {}).get("online", false)))
 	return grid_node
@@ -4299,16 +4304,26 @@ func _can_instance_structure(block: Dictionary) -> bool:
 
 
 func _add_instanced_structures(grid_node: Node3D, blocks: Array[Dictionary]) -> void:
-	if blocks.is_empty():
-		return
-	# Build the exact existing healthy block once, then instance each mesh part.
-	# The verified block records still own all hits, collision and damage.
-	var prototype := _build_block_visual(blocks[0])
+	var groups: Dictionary = {}
+	for block in blocks:
+		var style := "standard"
+		if String(block.get("block_id", "")).begins_with("block-capital-"):
+			var coordinate := _coord_vector(block.get("coordinate", {}))
+			style = "inlay" if coordinate.y == 0 and absf(coordinate.x) <= 2 else "stone"
+		if not groups.has(style):
+			groups[style] = []
+		groups[style].append(block)
+	for style in groups:
+		_instance_structure_group(grid_node, groups[style], style)
+
+
+func _instance_structure_group(grid_node: Node3D, blocks: Array, style: String) -> void:
+	var prototype := _build_block_visual(blocks[0]) if style == "standard" else _capital_structure_visual(style)
 	for part in prototype.get_children():
 		if not part is MeshInstance3D:
 			continue
 		var batch := MultiMeshInstance3D.new()
-		batch.name = "StructureBatch_%d" % part.get_index()
+		batch.name = ("StructureBatch_%d" % part.get_index()) if style == "standard" else ("Capital_%s_%d" % [style, part.get_index()])
 		var instances := MultiMesh.new()
 		instances.transform_format = MultiMesh.TRANSFORM_3D
 		instances.mesh = part.mesh
@@ -4325,6 +4340,74 @@ func _add_instanced_structures(grid_node: Node3D, blocks: Array[Dictionary]) -> 
 		batch.cast_shadow = part.cast_shadow
 		grid_node.add_child(batch)
 	prototype.free()
+
+
+func _capital_structure_visual(style: String) -> Node3D:
+	var visual := Node3D.new()
+	var stone := ShaderMaterial.new()
+	stone.shader = preload("res://shaders/capital_stone.gdshader")
+	stone.set_shader_parameter("stone_color", Color(0.35, 0.34, 0.30) if style == "stone" else Color(0.035, 0.065, 0.08))
+	var brass := _material(Color(0.67, 0.43, 0.16), 0.25, 0.78)
+	visual.add_child(_box_visual(Vector3.ONE, stone))
+	for x in [-0.487, 0.487]:
+		var seam := _box_visual(Vector3(0.018, 0.006, 0.99), brass)
+		seam.position = Vector3(x, 0.503, 0)
+		visual.add_child(seam)
+	var band := _box_visual(Vector3(0.99, 0.035, 0.008), brass)
+	band.position = Vector3(0, 0.43, -0.504)
+	visual.add_child(band)
+	return visual
+
+
+func _add_capital_luxury(grid_node: Node3D) -> void:
+	var decor := Node3D.new()
+	decor.name = "GrandCapitalDecor"
+	grid_node.add_child(decor)
+	var brass := _material(Color(0.67, 0.43, 0.16), 0.22, 0.8)
+	var warm := _emissive_material(Color(1.0, 0.80, 0.46), 1.3)
+	var green := _material(Color(0.075, 0.23, 0.13), 0.85, 0.0)
+	# All suspended ornament is above the playable capsule: no invisible colliders.
+	for z in [-4.0, 5.0]:
+		for x in [-3.0, 3.0]:
+			var pendant := _box_visual(Vector3(0.07, 1.1, 0.07), brass)
+			pendant.position = Vector3(x, 6.9, z)
+			decor.add_child(pendant)
+			var lamp := _box_visual(Vector3(0.28, 0.8, 0.28), warm)
+			lamp.position = Vector3(x, 6.1, z)
+			decor.add_child(lamp)
+		var frame := _box_visual(Vector3(6.3, 0.10, 0.12), brass)
+		frame.position = Vector3(0, 7.5, z)
+		decor.add_child(frame)
+	for x in [-10.0, 10.0]:
+		for z in [-5.0, 5.0]:
+			var planter := _box_visual(Vector3(1.5, 0.28, 1.1), brass)
+			planter.position = Vector3(x, 5.2, z)
+			decor.add_child(planter)
+			for offset in [-0.48, 0.0, 0.48]:
+				var foliage := MeshInstance3D.new()
+				var crown := SphereMesh.new()
+				crown.radius = 0.34
+				crown.height = 0.85 + absf(offset)
+				crown.radial_segments = 12
+				crown.rings = 6
+				foliage.mesh = crown
+				foliage.material_override = green
+				foliage.position = Vector3(x + offset, 5.65, z)
+				decor.add_child(foliage)
+	var welcome := Label3D.new()
+	welcome.text = "C A P I T A L   C O N C O U R S E"
+	welcome.font_size = 64
+	welcome.pixel_size = 0.007
+	welcome.position = Vector3(0, 6.2, -10.35)
+	welcome.modulate = Color(0.94, 0.76, 0.43)
+	decor.add_child(welcome)
+	var light := OmniLight3D.new()
+	light.position = Vector3(0, 5.4, -2)
+	light.light_color = Color(1.0, 0.85, 0.65)
+	light.light_energy = 1.5
+	light.omni_range = 20.0
+	light.shadow_enabled = false
+	decor.add_child(light)
 
 
 func _sync_grid_power_visual(grid_node: Node3D, online: bool) -> void:

@@ -87,10 +87,20 @@ pub fn generate_deposits(seed: u64, occupied: &BTreeSet<IVec3>) -> BTreeMap<IVec
 #[must_use]
 #[allow(clippy::cast_possible_truncation)] // Pinned local body coordinates fit i32.
 pub fn capital_outcrops(seed: u64) -> BTreeSet<IVec3> {
+    capital_outcrops_at(seed, &[(18, 2), (-19, -6), (10, -23)])
+}
+
+/// Grand-capital deposits leave a clear apron around the expanded foundation.
+#[must_use]
+pub fn grand_capital_outcrops(seed: u64) -> BTreeSet<IVec3> {
+    capital_outcrops_at(seed, &[(28, 2), (-29, -6), (10, -27)])
+}
+
+fn capital_outcrops_at(seed: u64, centers: &[(i32, i32)]) -> BTreeSet<IVec3> {
     let center = crate::model::planet_center();
     let surface = center.y + crate::model::planet_surface_radius_m();
     let mut occupied = BTreeSet::new();
-    for (index, (dx, dz)) in [(18, 2), (-19, -6), (10, -23)].into_iter().enumerate() {
+    for (index, (dx, dz)) in centers.iter().copied().enumerate() {
         for x in -6_i32..=6 {
             for z in -5_i32..=5 {
                 for y in 0_i32..=5 {
@@ -120,6 +130,7 @@ pub fn starter_deposit_catalog(seed: u64) -> Vec<(IVec3, OreKind)> {
     .into_iter()
     .collect::<Vec<_>>();
     catalog.extend(generate_deposits(seed, &capital_outcrops(seed)));
+    catalog.extend(generate_deposits(seed, &grand_capital_outcrops(seed)));
     catalog
 }
 

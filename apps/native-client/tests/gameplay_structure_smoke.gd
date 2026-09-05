@@ -61,6 +61,20 @@ func _initialize() -> void:
 		check(client._player_position_is_clear(position) == expected_clear, "spatial collision matches exhaustive capsule test")
 	client.grid_lookup = {"test": {"blocks": []}}
 	check(client._player_position_is_clear(Vector3.ZERO), "replaced projection invalidates collision cache")
+	var grand_blocks := []
+	for coordinate in [Vector3i.ZERO, Vector3i(12, 0, 11), Vector3i(12, 8, 11)]:
+		var block := blocks[0].duplicate(true)
+		block["coordinate"] = {"x": coordinate.x, "y": coordinate.y, "z": coordinate.z}
+		block["block_id"] = "block-capital-%s-%d-%d" % ["floor" if coordinate.y == 0 else "roof", coordinate.x, coordinate.z]
+		grand_blocks.append(block)
+	var grand: Node3D = client._create_grid_node({"grid_id": "grand", "blocks": grand_blocks})
+	check(grand.get_node_or_null("GrandCapitalDecor") != null, "expanded capital has concourse ornament")
+	check(grand.get_node("Capital_inlay_0").multimesh.instance_count == 1, "central arrival inlay stays instanced")
+	check(grand.get_node("Capital_stone_0").multimesh.instance_count == 2, "stone architecture stays instanced")
+	for ornament in grand.get_node("GrandCapitalDecor").get_children():
+		if ornament is MeshInstance3D:
+			check(ornament.position.y >= 5.0, "non-colliding decoration stays overhead")
+	grand.free()
 	batched.free()
 	prototype.free()
 	client.free()
