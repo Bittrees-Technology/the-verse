@@ -68,3 +68,8 @@ legacy capital deposit coordinates remain available for older worlds. A continuo
 walk from the hall toward the deposits must remain authoritative and reopen from
 its saved journal. Render fingerprints may reuse unchanged verified block arrays,
 while changes to damage, construction or topology still invalidate the visual.
+
+If suspension expires a writer lease between an operation's initial check and
+its lifecycle publication, reject that publication without writing a post-expiry
+live timestamp. Keep the prior durable record valid for a fresh fenced reopen;
+never extend an already expired lease in place.
