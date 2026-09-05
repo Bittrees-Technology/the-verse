@@ -3841,7 +3841,7 @@ func _rebuild_voxel_chunk(chunk: Vector3i) -> void:
 					_polygonize_tetrahedron(surface, tetra_points, tetra_values)
 	surface.index()
 	# SurfaceTool's indexed normal generation keeps tetrahedron winding and the
-	# displacement shader consistent at chunk boundaries. Supplying only radial
+	# surface shading consistent at chunk boundaries. Supplying only radial
 	# normals caused near-camera chunks to shade as disconnected black shards.
 	surface.generate_normals()
 	var mesh := surface.commit()
