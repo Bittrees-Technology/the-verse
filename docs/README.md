@@ -1,6 +1,7 @@
 # Documentation map
 
-These documents form the initial specification baseline.
+These documents contain the product baseline, accepted designs, and implementation evidence.
+Start with [current progress and next gates](roadmap/current-progress.md) for the delivery status.
 
 - [Glossary](glossary.md)
 
