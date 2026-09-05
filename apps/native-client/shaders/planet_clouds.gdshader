@@ -7,6 +7,7 @@ uniform float opacity = 0.50;
 uniform vec3 noise_offset = vec3(5.4, 11.7, 2.9);
 
 varying vec3 cloud_direction;
+varying vec3 weather_samples;
 
 float hash31(vec3 point) {
 	point = fract(point * 0.1031);
@@ -38,13 +39,20 @@ float cloud_noise(vec3 point) {
 
 void vertex() {
 	cloud_direction = normalize(VERTEX);
+	// Sample the smooth weather field on the dense cloud shell once per vertex.
+	// Interpolation avoids repeating fifteen noise octaves for every lit pixel.
+	weather_samples = vec3(
+		cloud_noise(cloud_direction * cloud_scale + noise_offset),
+		cloud_noise(cloud_direction * cloud_scale * 2.8 + noise_offset.zxy * 1.7),
+		cloud_noise(cloud_direction * cloud_scale * 11.0 + noise_offset.yzx * 2.3)
+	);
 }
 
 void fragment() {
 	vec3 radial = normalize(cloud_direction);
-	float broad = cloud_noise(radial * cloud_scale + noise_offset);
-	float fronts = cloud_noise(radial * cloud_scale * 2.8 + noise_offset.zxy * 1.7);
-	float detail = cloud_noise(radial * cloud_scale * 11.0 + noise_offset.yzx * 2.3);
+	float broad = weather_samples.x;
+	float fronts = weather_samples.y;
+	float detail = weather_samples.z;
 	float latitude_breakup = smoothstep(0.72, 0.98, abs(radial.y));
 	float weather = broad * 0.77 + fronts * 0.23 - latitude_breakup * 0.055;
 	float cloud = smoothstep(coverage, coverage + 0.17, weather);

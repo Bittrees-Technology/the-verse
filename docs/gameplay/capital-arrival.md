@@ -31,3 +31,19 @@ live GPU test clicks Enter and the inventory controls, walks the player, checks
 floor support, and verifies all three deposit labels. The packaged owned-worker
 test suspends the real server for 18 seconds, checks that stale input is blocked,
 then resumes it and verifies lease fencing and recovery in a fresh process.
+
+## Frame pacing
+
+Complete, undamaged structural blocks may share instanced render batches per
+moving grid. Damage, construction, ownership, targeting and collision continue
+to use verified block records. Batch transforms include each block's orientation
+and move with the grid. Damaged blocks and unfinished frames retain their
+individual visuals. Verify idle, walking and mouse-look frame times in the actual
+capital scene; synthetic camera tests alone do not establish playability.
+
+Collision broad-phase queries must match the existing capsule overlap checks.
+Cloud weather may interpolate samples from the dense shell to keep mouse-look
+and walking responsive. These presentation changes require no save migration.
+
+Coordinate-origin changes must preserve camera and remote-avatar continuity.
+Walking validation must measure world travel, including origin translation.

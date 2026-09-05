@@ -25,6 +25,7 @@ fi
 if [[ -n "${godot_binary}" ]]; then
   GODOT_BIN="${godot_binary}" tools/ci/verify-native-verifier.sh
   "${godot_binary}" --headless --path apps/native-client --script res://tests/voxel_surface_normals_smoke.gd
+  "${godot_binary}" --headless --path apps/native-client --script res://tests/gameplay_structure_smoke.gd
   "${godot_binary}" \
     --headless \
     --path apps/native-client \

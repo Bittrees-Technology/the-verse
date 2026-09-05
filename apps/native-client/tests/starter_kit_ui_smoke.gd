@@ -64,15 +64,28 @@ func _run() -> void:
 	await _click(entry.enter_button)
 	_check(entry.entered, "Enter button starts gameplay")
 	if "--capital-test" in OS.get_cmdline_user_args():
+		var starting_origin: Dictionary = client.get("interest_local_origin").duplicate(true)
 		var start: Vector3 = client.get("predicted_position")
 		Input.action_press("move_right")
-		var walk_until := Time.get_ticks_msec() + 700
+		var walk_until := Time.get_ticks_msec() + 1500
 		while Time.get_ticks_msec() < walk_until:
 			await process_frame
 		Input.action_release("move_right")
 		var finish: Vector3 = client.get("predicted_position")
-		_check(finish.distance_to(start) > 0.5, "live keyboard action moves the player")
+		var origin_travel: Vector3 = client.call("_address_relative_m", client.get("interest_local_origin"), starting_origin)
+		finish += origin_travel
+		print("VERSE_WALK world_distance=", finish.distance_to(start))
+		_check(finish.distance_to(start) > 1.0, "live keyboard action moves the player")
 		_check(absf(finish.y - start.y) < 0.5, "capital floor supports walking")
+		var camera: Camera3D = client.get("camera")
+		var view_before := camera.quaternion
+		for index in range(12):
+			var look := InputEventMouseMotion.new()
+			look.relative = Vector2(3, 0)
+			Input.parse_input_event(look)
+			await process_frame
+		await create_timer(0.2).timeout
+		_check(camera.quaternion.angle_to(view_before) > 0.01, "live mouse motion turns the camera")
 		await _save("capital-arrival")
 	var assays: Dictionary = client.get("ore_assays")
 	var seen: Dictionary = {}

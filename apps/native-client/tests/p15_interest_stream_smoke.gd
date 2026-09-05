@@ -16,6 +16,7 @@ func _initialize() -> void:
 
 
 func _run() -> void:
+	_test_origin_rebase_preserves_presentation()
 	_test_exact_address_projection()
 	_test_registry_and_contiguous_interest_stream()
 	_test_handoff_presentation_freezes_and_restores_control()
@@ -214,7 +215,9 @@ func _test_registry_and_contiguous_interest_stream() -> void:
 	var rebuilt_grid: Node3D = client.get("grid_node_lookup")["grid-a"]
 	_check(
 		rebuilt_grid.get_instance_id() != reentered_grid_instance
-		and rebuilt_grid.get_node_or_null("block-a") != null,
+		and rebuilt_grid.get_node_or_null("StructureBatch_0") is MultiMeshInstance3D
+		and rebuilt_grid.get_node("StructureBatch_0").multimesh.instance_count == 1
+		and client.get("grid_lookup")["grid-a"]["blocks"][0]["block_id"] == "block-a",
 		"block topology replacement rebuilds only the changed grid renderer"
 	)
 	_check(
@@ -226,8 +229,9 @@ func _test_registry_and_contiguous_interest_stream() -> void:
 	client.call("_rebuild_registered_celestials")
 	_check(
 		(client.get("celestial_visuals")["body-test"] as Node3D).get_instance_id()
-		!= baseline_celestial_instance,
-		"a changed exact local origin deliberately rebuilds celestial relative positions"
+		== baseline_celestial_instance
+		and (client.get("celestial_visuals")["body-test"] as Node3D).position.is_equal_approx(Vector3(-1, 0, 0)),
+		"origin shift preserves celestial meshes and updates relative positions"
 	)
 
 	var committed_entities: Dictionary = client.get("interest_entities").duplicate(true)
@@ -638,3 +642,27 @@ func _vec() -> Dictionary:
 
 func _quat() -> Dictionary:
 	return {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0}
+
+
+func _test_origin_rebase_preserves_presentation() -> void:
+	var client := _new_client()
+	client.set("universe_manifest", _manifest())
+	client.set("interest_local_origin", _address("0", 500, 0))
+	client.set("predicted_position", Vector3(2, 3, 4))
+	client.set("previous_predicted_position", Vector3(1, 3, 4))
+	client.set("presentation_position_offset", Vector3(0.1, 0, 0))
+	var camera: Camera3D = client.get("camera")
+	camera.position = Vector3(2.1, 3.5, 4)
+	var remote := Node3D.new()
+	client.add_child(remote)
+	remote.position = Vector3(10, 0, 0)
+	client.set("remote_player_nodes", {"other": remote})
+	client.set("remote_player_presentation_targets", {"other": {"position": Vector3(11, 0, 0)}})
+	client.call("_rebase_presentation_origin", _address("0", 500, 500_000))
+	_check(camera.position.is_equal_approx(Vector3(1.6, 3.5, 4)), "camera follows origin translation before reconciliation")
+	_check((client.get("predicted_position") as Vector3).is_equal_approx(Vector3(1.5, 3, 4)), "predicted pose rebased")
+	_check((client.get("previous_predicted_position") as Vector3).is_equal_approx(Vector3(0.5, 3, 4)), "interpolation endpoints share origin")
+	_check((client.get("presentation_position_offset") as Vector3).is_equal_approx(Vector3(0.1, 0, 0)), "origin movement adds no correction error")
+	_check(remote.position.is_equal_approx(Vector3(9.5, 0, 0)), "remote rendered pose rebased")
+	_check(client.get("remote_player_presentation_targets")["other"]["position"].is_equal_approx(Vector3(10.5, 0, 0)), "remote target shares origin")
+	client.free()
