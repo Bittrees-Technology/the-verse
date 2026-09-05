@@ -31,6 +31,7 @@ These documents form the initial specification baseline.
 - [P1.6 Durable Single-cell Lifecycle](gameplay/durable-single-cell-lifecycle.md)
 - [P1.7 Durable Two-cell Handoff](gameplay/durable-two-cell-handoff.md)
 - [Authoritative Hand-tool Targeting](gameplay/authoritative-hand-tool-targeting.md)
+- [Asteroid surface rendering checkpoint](gameplay/asteroid-surface-rendering.md)
 
 ## Architecture
 
