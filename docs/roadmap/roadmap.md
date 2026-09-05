@@ -1,8 +1,10 @@
 # Delivery roadmap
 
-**Status:** Proposed; sequencing accepted, dates uncommitted
+**Status:** Sequencing accepted; P1 in progress; dates uncommitted
 
-The project will reconcile and specify systems before building them one by one.
+Read [current progress](current-progress.md) for the evidence-backed delivery
+assessment as of 2026-09-05. Phase lists below describe scope and exit gates;
+they are not completion checklists.
 
 ## Section 21 — Lessons for The Verse
 
@@ -155,7 +157,9 @@ P1.6 acceptance evidence covers:
   public-scale claim.
 
 [P1.7 durable two-cell assignment and mobile-aggregate handoff](../gameplay/durable-two-cell-handoff.md)
-is the accepted next correctness slice. It adds exactly one empty adjacent
+is partially implemented: independent-EVA handoff runs under protocol 18,
+while ordinary grid-and-rider closure remains gated by the protocol-19 cutover.
+Its accepted contract adds exactly one empty adjacent
 proof cell, canonical cell keys, durable directory assignment, per-cell P1.6
 lifecycle roots, a separate aggregate placement generation, and atomic handoff
 of an EVA actor or isolated ordinary unanchored grid. One directory
