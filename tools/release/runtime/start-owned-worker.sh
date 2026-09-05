@@ -9,6 +9,8 @@ if [[ ! "${local_port}" =~ ^[0-9]+$ ]] || ((local_port < 1024 || local_port > 65
   exit 1
 fi
 mkdir -p "${universe_directory}"
+printf '%s\n' "$$" >"${universe_directory}/owned-worker.pid"
+export RUST_LOG="${VERSE_SERVER_LOG_LEVEL:-verse_simulation_worker=info,tower_http=info}"
 export VERSE_BROWSER_VERIFIER_ASSET_DIR="${runtime_directory}/browser-verifier"
 exec "${runtime_directory}/verse-simulation-worker" \
   --data-directory "${universe_directory}" --genesis-profile capital-start \

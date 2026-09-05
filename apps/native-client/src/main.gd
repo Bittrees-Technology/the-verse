@@ -358,6 +358,8 @@ func _ready() -> void:
 		_client_fatal("NATIVE INTEREST VERIFIER EXTENSION UNAVAILABLE")
 		return
 	_connect_to_server()
+	if "--owned-worker-smoke" in OS.get_cmdline_user_args():
+		add_child(load("res://tests/owned_worker_smoke.gd").new())
 
 
 func _exit_tree() -> void:
