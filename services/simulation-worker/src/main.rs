@@ -26,6 +26,7 @@ enum GenesisProfile {
     Orbital,
     EarthStart,
     OreWorkshop,
+    CapitalStart,
 }
 
 #[derive(Debug, Parser)]
@@ -192,6 +193,16 @@ async fn main() -> Result<()> {
                 arguments.data_directory.display()
             )
         })?;
+        if arguments.genesis_profile == GenesisProfile::CapitalStart {
+            if !is_origin_cell {
+                bail!("capital start requires the origin cell");
+            }
+            if runtime.state().event_sequence == 0 {
+                runtime
+                    .configure_capital_start()
+                    .context("configure capital start")?;
+            }
+        }
         if arguments.genesis_profile == GenesisProfile::OreWorkshop {
             if !is_origin_cell {
                 bail!("ore workshop requires the origin cell");
@@ -232,6 +243,7 @@ async fn main() -> Result<()> {
         }
         AppState::new(runtime)
     };
+    let (failure_tx, mut failure_rx) = tokio::sync::watch::channel(false);
     let lifecycle_task = if arguments.pause_simulation {
         let lease_state = Arc::clone(&state);
         Some(tokio::spawn(async move {
@@ -241,6 +253,7 @@ async fn main() -> Result<()> {
                 interval.tick().await;
                 if let Err(source) = lease_state.renew_lease() {
                     error!(%source, "authoritative lease renewal failed; worker is fenced");
+                    let _ = failure_tx.send(true);
                     break;
                 }
             }
@@ -255,6 +268,7 @@ async fn main() -> Result<()> {
                 .await
             {
                 error!(%source, "authoritative lifecycle supervisor failed");
+                let _ = failure_tx.send(true);
             }
         }))
     };
@@ -269,7 +283,9 @@ async fn main() -> Result<()> {
         "The Verse local universe is ready"
     );
     axum::serve(listener, router(Arc::clone(&state)))
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async move {
+            tokio::select! { () = shutdown_signal() => {}, _ = failure_rx.wait_for(|failed| *failed) => {} }
+        })
         .await
         .context("simulation HTTP server failed")?;
 

@@ -58,6 +58,22 @@ func _run() -> void:
 		printerr("VERSE_STARTER_KIT_UI_FAILED no verified baseline")
 		quit(1)
 		return
+	var entry: CanvasLayer = client.get("session_entry")
+	_check(not entry.entered, "entry waits for deliberate play action")
+	await _save("ready-to-enter")
+	await _click(entry.enter_button)
+	_check(entry.entered, "Enter button starts gameplay")
+	if "--capital-test" in OS.get_cmdline_user_args():
+		var start: Vector3 = client.get("predicted_position")
+		Input.action_press("move_right")
+		var walk_until := Time.get_ticks_msec() + 700
+		while Time.get_ticks_msec() < walk_until:
+			await process_frame
+		Input.action_release("move_right")
+		var finish: Vector3 = client.get("predicted_position")
+		_check(finish.distance_to(start) > 0.5, "live keyboard action moves the player")
+		_check(absf(finish.y - start.y) < 0.5, "capital floor supports walking")
+		await _save("capital-arrival")
 	var assays: Dictionary = client.get("ore_assays")
 	var seen: Dictionary = {}
 	for key in client.get("voxel_lookup"):

@@ -34,6 +34,9 @@ Requirement IDs are stable references for issues, pull requests, tests, and rele
 - **UX-005 — Discoverable ores:** The ore workshop shall expose three seeded,
   clustered mineral varieties, with bounded scarcity and surface samples. These
   initially share refinery feedstock; see [ore specification](../gameplay/seeded-ore-deposits.md).
+- **UX-006 — Playable arrival:** The local app shall own its default server,
+  explain connection state, and admit development pilots at a grounded capital
+  with nearby mineable resources; see [capital arrival](../gameplay/capital-arrival.md).
 - **PERF-001 — Published simulation budgets:** Each playable milestone shall
   publish and test finite budgets for server tick work, client frame time,
   replication, active grids and blocks, voxel remeshing, production,

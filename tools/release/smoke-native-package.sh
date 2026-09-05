@@ -32,16 +32,32 @@ cleanup() {
     kill -TERM "${server_pid}" 2>/dev/null || true
     wait "${server_pid}" 2>/dev/null || true
   fi
+  if [[ -f "${smoke_directory}/capital/owned-worker.pid" ]]; then
+    owned_pid="$(cat "${smoke_directory}/capital/owned-worker.pid")"
+    if [[ "${owned_pid}" =~ ^[0-9]+$ ]] && kill -0 "${owned_pid}" 2>/dev/null; then
+      kill -CONT "${owned_pid}" 2>/dev/null || true
+      kill -TERM "${owned_pid}" 2>/dev/null || true
+      for _ in {1..50}; do
+        kill -0 "${owned_pid}" 2>/dev/null || break
+        sleep 0.1
+      done
+    fi
+  fi
   rm -rf "${smoke_directory}"
 }
 trap cleanup EXIT INT TERM
 
 run_client_smoke() {
+  if [[ "${1:-external}" == "owned" ]]; then
+    VERSE_LOCAL_PORT="${owned_port}" VERSE_DATA_DIR="${smoke_directory}/capital" \
+      "${client_command[@]}" --headless --log-file "${smoke_directory}/owned-client.log" -- --owned-worker-smoke &
+  else
   "${client_command[@]}" \
     --headless \
     -- \
     "--server=ws://127.0.0.1:${smoke_port}/ws" \
     --smoke-test &
+  fi
   client_pid="$!"
   local deadline=$((SECONDS + client_timeout_seconds))
   while kill -0 "${client_pid}" 2>/dev/null; do
@@ -154,6 +170,15 @@ for _ in {1..200}; do
       sed -n '1,240p' "${smoke_directory}/server.log" >&2
       echo "The packaged native client smoke failed with status ${client_status}." >&2
       exit "${client_status}"
+    fi
+    owned_port=$((smoke_port == 65535 ? 65534 : smoke_port + 1))
+    if ! run_client_smoke owned; then
+      cat "${smoke_directory}/capital/server.log" "${smoke_directory}/owned-client.log" >&2
+      exit 1
+    fi
+    if ! grep -q "writer lease expired" "${smoke_directory}/capital/server.log"; then
+      echo "Owned-worker smoke did not exercise lease expiry." >&2
+      exit 1
     fi
     echo "VERSE_NATIVE_PACKAGE_SMOKE_OK $(basename "${staging_directory}")"
     exit 0

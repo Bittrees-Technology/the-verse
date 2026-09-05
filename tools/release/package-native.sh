@@ -113,6 +113,21 @@ else
     "${staging_directory}/the-verse"
 fi
 
+# Bundle the server beside app resources so opening the app itself is playable.
+if [[ "${release_platform}" == "macos-arm64" ]]; then
+  owned_runtime="${staging_directory}/The Verse.app/Contents/Resources/verse-runtime"
+else
+  owned_runtime="${staging_directory}/verse-runtime"
+fi
+mkdir -p "${owned_runtime}/browser-verifier"
+cp target/release/verse-simulation-worker "${owned_runtime}/verse-simulation-worker"
+cp tools/release/runtime/start-owned-worker.sh "${owned_runtime}/start-owned-worker.sh"
+cp "${staging_directory}/browser-verifier/"* "${owned_runtime}/browser-verifier/"
+chmod 755 "${owned_runtime}/verse-simulation-worker"
+if [[ "${release_platform}" == "macos-arm64" ]]; then
+  codesign --force --deep --sign - "${staging_directory}/The Verse.app"
+fi
+
 cp LICENSE "${staging_directory}/LICENSE"
 cp -R LICENSES/. "${staging_directory}/licenses/"
 cp tools/release/runtime/README.txt "${staging_directory}/README.txt"

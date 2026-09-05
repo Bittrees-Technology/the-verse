@@ -61,6 +61,7 @@ const PLAYER_BODY_ID: &str = "player-body-player-local";
 const PLAYER_COLLIDER_ID: &str = "player-collider-player-local";
 pub(crate) const PLANET_BODY_ID: &str = "planet-body-khepri-prime";
 const PLANET_COLLIDER_ID: &str = "planet-collider-khepri-prime";
+const CAPITAL_MARKER: &str = "block-capital-floor-0-0";
 const EARTH_START_PROFILE_MARKER_BLOCK_ID: &str = "block-outpost-floor-x0-z0";
 const MAX_GRID_CONTROL_INPUT: f64 = 1.0;
 const CONTROL_INPUT_EPSILON: f64 = 1.0e-9;
@@ -942,6 +943,116 @@ impl Runtime {
         Ok(true)
     }
 
+    /// Creates a durable capital fixture before any canonical event.
+    pub fn configure_capital_start(&mut self) -> Result<bool, RuntimeError> {
+        if self.halted {
+            return Err(RuntimeError::Halted);
+        }
+        if self.state.event_sequence != 0 {
+            return Err(IntentError::rejected(
+                "capital_requires_fresh_world",
+                "capital requires event zero",
+            )
+            .into());
+        }
+        if self.state.is_capital_start() {
+            return Ok(false);
+        }
+        let mut next = self.state.clone();
+        next.configure_earth_start_profile()?;
+        let floor_position =
+            next.grids[STARTER_INDUSTRY_GRID_ID].position - Vec3::new(0.0, 1.0, 0.0);
+        let floor_address = next
+            .address_for_active_position(floor_position)
+            .map_err(RuntimeError::CanonicalInvariant)?;
+        let outpost = next
+            .grids
+            .get_mut(STARTER_INDUSTRY_GRID_ID)
+            .expect("industry exists");
+        outpost.position = floor_position;
+        outpost.address = floor_address;
+        let removed: u64 = outpost
+            .blocks
+            .values()
+            .filter(|b| b.kind == BlockKind::Structural)
+            .map(|b| b.component_cost)
+            .sum();
+        outpost
+            .blocks
+            .retain(|_, b| b.kind != BlockKind::Structural);
+        let mut added = 0_u64;
+        let mut add = |id: String, c: IVec3| {
+            let block = Block::new(id.clone(), c, BlockKind::Structural);
+            added += block.component_cost;
+            outpost.blocks.insert(id, block);
+        };
+        for x in -8_i32..=8 {
+            for z in -7_i32..=7 {
+                add(format!("block-capital-floor-{x}-{z}"), IVec3::new(x, 0, z));
+                // Open central skylight gives the hall a bright readable interior.
+                if x.abs() >= 5 || z <= -5 {
+                    add(format!("block-capital-roof-{x}-{z}"), IVec3::new(x, 5, z));
+                }
+            }
+        }
+        for y in 1..=4 {
+            for x in -8..=8 {
+                add(format!("block-capital-back-{x}-{y}"), IVec3::new(x, y, -7));
+            }
+            for x in [-8, 8] {
+                for z in [-6, -2, 2, 6] {
+                    add(
+                        format!("block-capital-column-{x}-{y}-{z}"),
+                        IVec3::new(x, y, z),
+                    );
+                }
+            }
+        }
+        let anchor_coordinate = IVec3::new(-7, 0, -6);
+        let old_floor = outpost
+            .blocks
+            .remove("block-capital-floor--7--6")
+            .expect("foundation floor");
+        let anchor = Block::new(
+            "block-capital-foundation",
+            anchor_coordinate,
+            BlockKind::Anchor,
+        );
+        added = added - old_floor.component_cost + anchor.component_cost;
+        outpost.blocks.insert(anchor.block_id.clone(), anchor);
+        let foundation = outpost.world_coordinate(anchor_coordinate);
+        next.voxels
+            .occupied
+            .insert(IVec3::new(foundation.x, foundation.y - 1, foundation.z));
+        outpost.anchored = true;
+        next.ledger.genesis_installed_components =
+            next.ledger.genesis_installed_components - removed + added;
+        let spawn = next.capital_spawn();
+        let address = next
+            .address_for_active_position(spawn)
+            .map_err(RuntimeError::CanonicalInvariant)?;
+        next.player.primary_mut().position = spawn;
+        next.player.primary_mut().address = address;
+        let surface = crate::geology::capital_outcrops(next.world_seed);
+        next.voxels
+            .ferrite_ore
+            .extend(crate::geology::generate_deposits(next.world_seed, &surface).into_keys());
+        next.voxels.occupied.extend(surface);
+        if !next.conservation().valid {
+            return Err(RuntimeError::CanonicalInvariant(
+                "capital conservation".into(),
+            ));
+        }
+        next.validate_player_roster()
+            .map_err(RuntimeError::CanonicalInvariant)?;
+        let mut physics = Scene::new(physics_scene_config())?;
+        physics.rebuild(&physics_body_specs(&next))?;
+        self.store.save_snapshot(&next)?;
+        self.state = next;
+        self.physics = Some(physics);
+        Ok(true)
+    }
+
     /// Replaces only the event-zero development fixture with a canonical
     /// surface outpost. The profile is opt-in so ordinary genesis, established
     /// universes, and the orbital proof remain unchanged.
@@ -1026,7 +1137,11 @@ impl Runtime {
         // giving each suit a visibly distinct spawn. The character collision
         // layer already prevents these nearby capsules from pushing or becoming
         // locomotion support for one another.
-        player.position.y += 1.5 * roster_offset;
+        if next_state.is_capital_start() {
+            player.position = next_state.capital_spawn() + Vec3::new(roster_offset * 1.5, 0.0, 0.0);
+        } else {
+            player.position.y += 1.5 * roster_offset;
+        }
         player.address = next_state
             .address_for_active_position(player.position)
             .map_err(|message| {
@@ -2096,6 +2211,16 @@ impl WorldState {
     /// Applies the one canonical event-zero surface profile without touching
     /// persistence or runtime authority. Keeping this transformation pure lets
     /// offline migration validation reconstruct the exact same allowed origin.
+    fn is_capital_start(&self) -> bool {
+        self.grids
+            .get(STARTER_INDUSTRY_GRID_ID)
+            .is_some_and(|g| g.blocks.contains_key(CAPITAL_MARKER))
+    }
+
+    fn capital_spawn(&self) -> Vec3 {
+        self.grids[STARTER_INDUSTRY_GRID_ID].position + Vec3::new(0.0, 1.48, 4.0)
+    }
+
     pub(crate) fn configure_earth_start_profile(&mut self) -> Result<bool, IntentError> {
         if self.event_sequence != 0 {
             return Err(IntentError::rejected(
@@ -2860,10 +2985,13 @@ impl WorldState {
                 "recovery requires the carried inventory to remain in its death drop",
             ));
         }
+        let recovery_origin = if self.is_capital_start() {
+            self.capital_spawn()
+        } else {
+            survival.proof_recovery_position
+        };
         let position = (0..=2_048)
-            .map(|step| {
-                survival.proof_recovery_position + Vec3::new(0.0, f64::from(step) * 2.0, 0.0)
-            })
+            .map(|step| recovery_origin + Vec3::new(0.0, f64::from(step) * 2.0, 0.0))
             .find(|position| self.proof_recovery_position_is_clear(*position))
             .ok_or_else(|| {
                 IntentError::rejected(
@@ -2878,8 +3006,8 @@ impl WorldState {
                 .map_err(|message| IntentError::rejected("respawn_address_invalid", message))?,
             position,
             suit_oxygen_milli: survival.respawn_oxygen_milli,
-            helmet_closed: survival.respawn_helmet_closed,
-            jetpack_enabled: survival.respawn_jetpack_enabled,
+            helmet_closed: !self.is_capital_start() && survival.respawn_helmet_closed,
+            jetpack_enabled: !self.is_capital_start() && survival.respawn_jetpack_enabled,
             magnetic_boots_enabled: false,
         })
     }
@@ -8300,6 +8428,86 @@ mod tests {
                 .expect("production journal contains an event"),
         )
         .expect("production event parses")
+    }
+
+    #[test]
+    fn capital_start_supports_pilots_surface_mining_and_exact_recovery() {
+        let directory = tempdir().expect("temporary world");
+        let mut runtime = Runtime::open(directory.path(), 42, 100).expect("open");
+        assert!(runtime.configure_capital_start().expect("capital"));
+        assert!(!runtime.configure_capital_start().expect("idempotent"));
+        runtime
+            .admit_development_player("player-remote")
+            .expect("admit");
+        let spawn = runtime.state.capital_spawn();
+        for player in runtime.state.player.by_id.values() {
+            assert!((player.position - spawn).magnitude() < 3.0);
+            assert!(runtime.state.environment_at(player.position).breathable);
+            assert!(!player.jetpack_enabled);
+        }
+        assert!(runtime.state.proof_recovery_position_is_clear(spawn));
+        for _ in 0..120 {
+            runtime.advance(16).expect("grounded tick");
+        }
+        assert_eq!(
+            runtime.state.player.locomotion.kind,
+            LocomotionKind::Grounded
+        );
+        assert!((runtime.state.player.position.y - spawn.y).abs() < 0.25);
+        let surface = crate::geology::capital_outcrops(42);
+        let deposits = crate::geology::generate_deposits(42, &surface);
+        let target = *deposits
+            .keys()
+            .find(|p| {
+                f64::from(p.y) > spawn.y + 1.0 && p.neighbors().iter().any(|n| !surface.contains(n))
+            })
+            .expect("exposed surface ore");
+        aim_player_at_voxel(&mut runtime, "player-local", target);
+        runtime.persist_snapshot().expect("persist mining start");
+        let before = runtime.state.ledger.mined_ore;
+        runtime
+            .execute_next_for_fixture(&ClientMessage::MineVoxel {
+                operation_sequence: 0,
+                operation_id: "capital-mine".into(),
+                coordinate: target,
+            })
+            .expect("mine planetary outcrop");
+        assert_eq!(runtime.state.ledger.mined_ore, before + 3);
+        assert!(runtime.state.conservation().valid);
+        assert!(runtime.configure_capital_start().is_err());
+        let expected = runtime.state.state_hash();
+        drop(runtime);
+        let recovered = Runtime::open(directory.path(), 42, 100).expect("reopen");
+        assert_eq!(recovered.state.state_hash(), expected);
+        assert!(!recovered.state.voxels.occupied.contains(&target));
+    }
+
+    #[test]
+    fn capital_recovery_selects_the_arrival_hall() {
+        let mut runtime = runtime();
+        runtime.configure_capital_start().expect("capital");
+        runtime.state.player.life_state = PlayerLifeState::Incapacitated {
+            death_id: "fixture-death".into(),
+            cause: PlayerDeathCause::OxygenDepleted,
+        };
+        runtime
+            .state
+            .inventories
+            .get_mut(PLAYER_INVENTORY_ID)
+            .expect("inventory")
+            .contents = InventoryContents::default();
+        let payload = runtime.state.player_respawn_payload().expect("recovery");
+        let EventPayload::PlayerRespawned {
+            position,
+            helmet_closed,
+            jetpack_enabled,
+            ..
+        } = payload
+        else {
+            panic!("respawn");
+        };
+        assert_eq!(position, runtime.state.capital_spawn());
+        assert!(!helmet_closed && !jetpack_enabled);
     }
 
     #[test]
