@@ -229,6 +229,7 @@ var voxel_coordinate_lookup: Dictionary = {}
 var voxel_chunk_nodes: Dictionary = {}
 var rendered_voxel_chunk_fingerprints: Dictionary = {}
 var grid_lookup: Dictionary = {}
+var grid_collision_cache: Dictionary = {}
 var grid_node_lookup: Dictionary = {}
 var grid_topology_fingerprints: Dictionary = {}
 var remote_player_nodes: Dictionary = {}
@@ -1038,6 +1039,25 @@ func _rebuild_registered_celestials() -> void:
 		and interest_local_origin == rendered_celestial_origin
 	):
 		return
+	if registry_hash == rendered_celestial_registry_hash:
+		var shift: Variant = _address_relative_m(rendered_celestial_origin, interest_local_origin)
+		var visible_bodies: Dictionary = {}
+		for body in registry_snapshot.get("bodies", []):
+			if String(body.get("visual_descriptor_id", "")) == "origin-regolith-v1" and body.has("voxel_field_id"):
+				continue
+			var center: Variant = _address_relative_m(body.get("center", {}), interest_local_origin)
+			if center is Vector3 and center.length() <= RENDER_DISTANCE_LIMIT_M * 2.0 and float(body.get("surface_radius_um", 0)) > 0.0:
+				visible_bodies[String(body.get("body_id", ""))] = true
+		if shift is Vector3 and visible_bodies.size() == celestial_visuals.size() and visible_bodies.keys().all(func(id): return celestial_visuals.has(id)):
+			for child in planet_root.get_children():
+				child.position += shift
+			if asteroid_root != null:
+				var voxel_body := _registered_body(String(snapshot.get("voxel_body_id", "")))
+				var voxel_center: Variant = _address_relative_m(voxel_body.get("center", {}), interest_local_origin)
+				if voxel_center is Vector3:
+					asteroid_root.position = voxel_center
+			rendered_celestial_origin = interest_local_origin.duplicate(true)
+			return
 	for child in planet_root.get_children():
 		planet_root.remove_child(child)
 		child.queue_free()
@@ -2929,6 +2949,7 @@ func _prepare_interest_delta(authoritative: Dictionary) -> Dictionary:
 
 
 func _install_verified_interest_model(candidate: Dictionary) -> void:
+	_rebase_presentation_origin(candidate.get("origin", {}))
 	var world: Dictionary = candidate.get("world", {}).duplicate(true)
 	var private_candidate: Dictionary = world.get("actor_private", {}).duplicate(true)
 	world.erase("actor_private")
@@ -2950,6 +2971,10 @@ func _install_verified_interest_model(candidate: Dictionary) -> void:
 	interest_local_origin = candidate.get("origin", {}).duplicate(true)
 	stream_family = "interest"
 	baseline_request_pending = false
+	# Replay uses collision poses from this verified origin, never the previous frame.
+	grid_lookup = {}
+	for grid in world.get("grids", []):
+		grid_lookup[String(grid.get("grid_id", ""))] = grid
 	var player := _local_player()
 	_capture_prediction_gravity({"player": player, "environment": _local_environment()})
 	_apply_authoritative_player(
@@ -2959,6 +2984,25 @@ func _install_verified_interest_model(candidate: Dictionary) -> void:
 		String(snapshot.get("world_hash", "")),
 		"snapshot",
 	)
+
+
+func _rebase_presentation_origin(next_origin: Dictionary) -> void:
+	if interest_local_origin.is_empty() or next_origin == interest_local_origin:
+		return
+	var shift: Variant = _address_relative_m(interest_local_origin, next_origin)
+	if not shift is Vector3:
+		return
+	# This is a coordinate change, not player motion or reconciliation error.
+	predicted_position += shift
+	previous_predicted_position += shift
+	if camera != null:
+		camera.position += shift
+	for player_id in remote_player_nodes:
+		var node: Node3D = remote_player_nodes[player_id]
+		node.position += shift
+		var target: Dictionary = remote_player_presentation_targets.get(player_id, {})
+		if target.has("position"):
+			target["position"] += shift
 
 
 func _interest_outer_bindings_valid(authoritative: Dictionary, interest: Dictionary) -> bool:
@@ -4197,6 +4241,9 @@ func _rebuild_grids(grids: Array) -> void:
 		if removed.get_parent() == grids_root:
 			grids_root.remove_child(removed)
 		removed.queue_free()
+	for cached_id in grid_collision_cache.keys():
+		if not next_lookup.has(cached_id):
+			grid_collision_cache.erase(cached_id)
 	grid_lookup = next_lookup
 	grid_node_lookup = next_nodes
 	grid_topology_fingerprints = next_fingerprints
@@ -4207,10 +4254,14 @@ func _create_grid_node(grid: Dictionary) -> Node3D:
 	grid_node.name = String(grid.get("grid_id", "grid"))
 	grid_node.position = _vec3(grid.get("position", {}))
 	grid_node.quaternion = _grid_quaternion(grid)
+	var structural_instances: Array[Dictionary] = []
 	for block_value in grid.get("blocks", []):
 		if not block_value is Dictionary:
 			continue
 		var block: Dictionary = block_value
+		if _can_instance_structure(block):
+			structural_instances.append(block)
+			continue
 		var block_visual := _build_block_visual(block)
 		var coordinate: Dictionary = block.get("coordinate", {})
 		block_visual.position = Vector3(
@@ -4220,6 +4271,7 @@ func _create_grid_node(grid: Dictionary) -> Node3D:
 		)
 		block_visual.rotation.y = deg_to_rad(float(int(block.get("orientation", 0)) * 90))
 		grid_node.add_child(block_visual)
+	_add_instanced_structures(grid_node, structural_instances)
 	for block in grid.get("blocks", []):
 		if String(block.get("block_id", "")) == "block-capital-floor-0-0":
 			var sign_label := Label3D.new()
@@ -4238,6 +4290,41 @@ func _create_grid_node(grid: Dictionary) -> Node3D:
 			break
 	_sync_grid_power_visual(grid_node, bool(grid.get("power", {}).get("online", false)))
 	return grid_node
+
+
+func _can_instance_structure(block: Dictionary) -> bool:
+	var health := int(block.get("health", 1))
+	var maximum := maxi(int(block.get("max_health", health)), 1)
+	return String(block.get("kind", "")) == "structural" and health >= maximum and bool(block.get("construction_complete", health >= maximum))
+
+
+func _add_instanced_structures(grid_node: Node3D, blocks: Array[Dictionary]) -> void:
+	if blocks.is_empty():
+		return
+	# Build the exact existing healthy block once, then instance each mesh part.
+	# The verified block records still own all hits, collision and damage.
+	var prototype := _build_block_visual(blocks[0])
+	for part in prototype.get_children():
+		if not part is MeshInstance3D:
+			continue
+		var batch := MultiMeshInstance3D.new()
+		batch.name = "StructureBatch_%d" % part.get_index()
+		var instances := MultiMesh.new()
+		instances.transform_format = MultiMesh.TRANSFORM_3D
+		instances.mesh = part.mesh
+		instances.instance_count = blocks.size()
+		for index in blocks.size():
+			var block: Dictionary = blocks[index]
+			var placement := Transform3D(
+				Basis(Vector3.UP, deg_to_rad(float(int(block.get("orientation", 0)) * 90))),
+				_coord_vector(block.get("coordinate", {}))
+			)
+			instances.set_instance_transform(index, placement * part.transform)
+		batch.multimesh = instances
+		batch.material_override = part.material_override
+		batch.cast_shadow = part.cast_shadow
+		grid_node.add_child(batch)
+	prototype.free()
 
 
 func _sync_grid_power_visual(grid_node: Node3D, online: bool) -> void:
@@ -4260,11 +4347,8 @@ func _sync_grid_power_visual(grid_node: Node3D, online: bool) -> void:
 
 
 func _grid_topology_fingerprint(grid: Dictionary) -> String:
-	var blocks: Array = grid.get("blocks", []).duplicate(true)
-	blocks.sort_custom(func(first: Variant, second: Variant) -> bool:
-		return _grid_block_sort_key(first) < _grid_block_sort_key(second)
-	)
-	var topology: Array = []
+	var blocks: Array = grid.get("blocks", [])
+	var topology: Array[String] = []
 	for block_value in blocks:
 		if not block_value is Dictionary:
 			continue
@@ -4272,7 +4356,7 @@ func _grid_topology_fingerprint(grid: Dictionary) -> String:
 		var coordinate: Dictionary = block.get("coordinate", {})
 		var health := int(block.get("health", 1))
 		var max_health := maxi(int(block.get("max_health", health)), 1)
-		topology.append({
+		topology.append(JSON.stringify({
 			"block_id": String(block.get("block_id", "")),
 			"kind": String(block.get("kind", "structural")),
 			"coordinate": {
@@ -4286,21 +4370,9 @@ func _grid_topology_fingerprint(grid: Dictionary) -> String:
 			"construction_complete": bool(
 				block.get("construction_complete", health >= max_health)
 			),
-		})
+		}))
+	topology.sort()
 	return JSON.stringify(topology)
-
-
-func _grid_block_sort_key(value: Variant) -> String:
-	if not value is Dictionary:
-		return ""
-	var block: Dictionary = value
-	var coordinate: Dictionary = block.get("coordinate", {})
-	return "%s|%012d|%012d|%012d" % [
-		String(block.get("block_id", "")),
-		int(coordinate.get("x", 0)),
-		int(coordinate.get("y", 0)),
-		int(coordinate.get("z", 0)),
-	]
 
 
 func _build_block_visual(block: Dictionary) -> Node3D:
@@ -5066,18 +5138,36 @@ func _player_position_is_clear(position: Vector3) -> bool:
 		var grid: Dictionary = grid_lookup[grid_id]
 		var inverse_grid_basis := _grid_basis(grid).inverse()
 		var grid_position := _vec3(grid.get("position", {}))
+		var cells := _grid_collision_cells(String(grid_id), grid)
 		for center in capsule_centers:
 			var local_position := inverse_grid_basis * (center - grid_position)
-			for block in grid.get("blocks", []):
-				var delta := local_position - _coord_vector(block.get("coordinate", {}))
-				var closest := Vector3(
-					clampf(delta.x, -0.5, 0.5),
-					clampf(delta.y, -0.5, 0.5),
-					clampf(delta.z, -0.5, 0.5)
-				)
-				if (delta - closest).length_squared() < CHARACTER_COLLISION_RADIUS * CHARACTER_COLLISION_RADIUS:
-					return false
+			var reach := Vector3.ONE * (0.5 + CHARACTER_COLLISION_RADIUS)
+			var low := Vector3i((local_position - reach).ceil())
+			var high := Vector3i((local_position + reach).floor())
+			for x in range(low.x, high.x + 1):
+				for y in range(low.y, high.y + 1):
+					for z in range(low.z, high.z + 1):
+						var coordinate := Vector3i(x, y, z)
+						if not cells.has(coordinate):
+							continue
+						var delta := local_position - Vector3(coordinate)
+						var closest := delta.clamp(Vector3.ONE * -0.5, Vector3.ONE * 0.5)
+						if (delta - closest).length_squared() < CHARACTER_COLLISION_RADIUS * CHARACTER_COLLISION_RADIUS:
+							return false
 	return true
+
+
+func _grid_collision_cells(grid_id: String, grid: Dictionary) -> Dictionary:
+	var blocks: Array = grid.get("blocks", [])
+	var cached: Dictionary = grid_collision_cache.get(grid_id, {})
+	# Verified projections replace their block arrays. Motion only changes the grid pose.
+	if not cached.is_empty() and is_same(cached.get("blocks"), blocks):
+		return cached["cells"]
+	var cells: Dictionary = {}
+	for block in blocks:
+		cells[Vector3i(_coord_vector(block.get("coordinate", {})))] = true
+	grid_collision_cache[grid_id] = {"blocks": blocks, "cells": cells}
+	return cells
 
 
 func _update_player_presentation(delta: float) -> void:
