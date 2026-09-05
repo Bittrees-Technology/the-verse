@@ -63,6 +63,8 @@ const PRESENTATION_FULL_CORRECTION_RATE := 10.0
 const REMOTE_PLAYER_PRESENTATION_RESPONSE_RATE := 20.0
 const REMOTE_PLAYER_PRESENTATION_SNAP_DISTANCE := 6.0
 const CHARACTER_COLLISION_RADIUS := 0.34
+# Jolt resting contacts can overlap slightly; prediction must not stick to floors.
+const CHARACTER_PREDICTION_CONTACT_SKIN := 0.01
 const CHARACTER_STANDING_HEIGHT := 1.8
 const CHARACTER_EYE_HEIGHT := 1.62
 const CHARACTER_CAPSULE_HALF_HEIGHT := (CHARACTER_STANDING_HEIGHT - 2.0 * CHARACTER_COLLISION_RADIUS) * 0.5
@@ -3318,7 +3320,7 @@ func _present_verified_interest_model(authoritative: Dictionary) -> bool:
 		if pending_mine_position != null:
 			var mined_coordinate: Vector3i = pending_mine_position
 			if not voxel_lookup.has(_coord_key(mined_coordinate)):
-				_emit_mining_fragments(Vector3(mined_coordinate))
+				_emit_mining_fragments(Vector3(mined_coordinate) + _voxel_render_offset())
 				pending_mine_position = null
 	_rebuild_grids(snapshot.get("grids", []))
 	if smoke_test:
@@ -3707,7 +3709,7 @@ func _apply_authoritative_player(
 		require_neutral_baseline = incoming_life_state == "alive"
 	elif history_reset:
 		# The missing local timeline cannot be replayed safely. Preserve sequence
-		# monotonicity, snap to this canonical state, and supersede any in-flight
+		# monotonicity, reset prediction to canonical state, and supersede any in-flight
 		# control with a fresh neutral baseline on the next physics frame.
 		prediction_history.clear()
 		pending_controls.clear()
@@ -3760,7 +3762,7 @@ func _apply_authoritative_player(
 		old_present_orientation, target_view_orientation
 	)
 	if _correction_requires_snap(
-		lifecycle_reset or history_reset, correction_distance, correction_angle
+		lifecycle_reset, correction_distance, correction_angle
 	):
 		presentation_position_offset = Vector3.ZERO
 		presentation_orientation_offset = Quaternion.IDENTITY
@@ -4927,6 +4929,19 @@ func _predict_player_step(control: Dictionary, delta: float, record_history: boo
 	var supported := locomotion_kind in ["grounded", "magnetic"] and not bool(
 		prediction_control.get("jump", false)
 	)
+	if supported:
+		var support: Dictionary = locomotion.get("support", {})
+		var support_grid: Dictionary = grid_lookup.get(String(support.get("body_id", "")), {})
+		if not support_grid.is_empty():
+			var support_normal := (_grid_basis(support_grid) * _vec3(support.get("local_normal", {}))).normalized()
+			if not support_normal.is_zero_approx():
+				# Gravity-up differs from a flat deck's normal on a small planet.
+				# Project the motor step onto the deck, as the contact solver does.
+				var support_velocity := _prediction_support_velocity(locomotion)
+				var relative_step := proposed_position - predicted_position - support_velocity * delta
+				proposed_position -= support_normal * relative_step.dot(support_normal)
+				var velocity: Vector3 = result.get("linear_velocity", Vector3.ZERO)
+				result["linear_velocity"] = velocity - support_normal * (velocity - support_velocity).dot(support_normal)
 	if supported and spherical_ground_radius > 0.0:
 		var proposed_radial := proposed_position - prediction_planet_center
 		if proposed_radial.length_squared() > 0.000001:
@@ -5187,6 +5202,7 @@ func _sweep_player_position(start: Vector3, finish: Vector3) -> Dictionary:
 
 
 func _player_position_is_clear(position: Vector3) -> bool:
+	var collision_radius := CHARACTER_COLLISION_RADIUS - CHARACTER_PREDICTION_CONTACT_SKIN
 	var environment := _local_environment()
 	var capsule_up := _camera_up()
 	var surface_radius := float(environment.get("surface_radius_m", 0.0))
@@ -5194,7 +5210,7 @@ func _player_position_is_clear(position: Vector3) -> bool:
 		var planet_center := _vec3(environment.get("planet_center", {}))
 		var radial := position - planet_center
 		var radial_up := radial.normalized() if radial.length_squared() > 0.000001 else Vector3.UP
-		var radial_extent := CHARACTER_COLLISION_RADIUS + CHARACTER_CAPSULE_HALF_HEIGHT * absf(
+		var radial_extent := collision_radius + CHARACTER_CAPSULE_HALF_HEIGHT * absf(
 			capsule_up.dot(radial_up)
 		)
 		if radial.length() < surface_radius + radial_extent:
@@ -5204,16 +5220,17 @@ func _player_position_is_clear(position: Vector3) -> bool:
 		capsule_centers.append(position + capsule_up * CHARACTER_CAPSULE_HALF_HEIGHT * fraction)
 	var collision_offsets: Array[Vector3] = [
 		Vector3.ZERO,
-		Vector3(CHARACTER_COLLISION_RADIUS, 0.0, 0.0),
-		Vector3(-CHARACTER_COLLISION_RADIUS, 0.0, 0.0),
-		Vector3(0.0, CHARACTER_COLLISION_RADIUS, 0.0),
-		Vector3(0.0, -CHARACTER_COLLISION_RADIUS, 0.0),
-		Vector3(0.0, 0.0, CHARACTER_COLLISION_RADIUS),
-		Vector3(0.0, 0.0, -CHARACTER_COLLISION_RADIUS),
+		Vector3(collision_radius, 0.0, 0.0),
+		Vector3(-collision_radius, 0.0, 0.0),
+		Vector3(0.0, collision_radius, 0.0),
+		Vector3(0.0, -collision_radius, 0.0),
+		Vector3(0.0, 0.0, collision_radius),
+		Vector3(0.0, 0.0, -collision_radius),
 	]
+	var voxel_offset := _voxel_render_offset()
 	for center in capsule_centers:
 		for offset in collision_offsets:
-			var sample: Vector3 = center + offset
+			var sample: Vector3 = center + offset - voxel_offset
 			var coordinate := Vector3i(roundi(sample.x), roundi(sample.y), roundi(sample.z))
 			if voxel_lookup.has(_coord_key(coordinate)):
 				return false
@@ -5224,7 +5241,7 @@ func _player_position_is_clear(position: Vector3) -> bool:
 		var cells := _grid_collision_cells(String(grid_id), grid)
 		for center in capsule_centers:
 			var local_position := inverse_grid_basis * (center - grid_position)
-			var reach := Vector3.ONE * (0.5 + CHARACTER_COLLISION_RADIUS)
+			var reach := Vector3.ONE * (0.5 + collision_radius)
 			var low := Vector3i((local_position - reach).ceil())
 			var high := Vector3i((local_position + reach).floor())
 			for x in range(low.x, high.x + 1):
@@ -5235,7 +5252,7 @@ func _player_position_is_clear(position: Vector3) -> bool:
 							continue
 						var delta := local_position - Vector3(coordinate)
 						var closest := delta.clamp(Vector3.ONE * -0.5, Vector3.ONE * 0.5)
-						if (delta - closest).length_squared() < CHARACTER_COLLISION_RADIUS * CHARACTER_COLLISION_RADIUS:
+						if (delta - closest).length_squared() < collision_radius * collision_radius:
 							return false
 	return true
 
@@ -5251,6 +5268,18 @@ func _grid_collision_cells(grid_id: String, grid: Dictionary) -> Dictionary:
 		cells[Vector3i(_coord_vector(block.get("coordinate", {})))] = true
 	grid_collision_cache[grid_id] = {"blocks": blocks, "cells": cells}
 	return cells
+
+
+func _grid_target_blocks(grid_id: String, grid: Dictionary) -> Array:
+	_grid_collision_cells(grid_id, grid)
+	var cached: Dictionary = grid_collision_cache[grid_id]
+	if not cached.has("target_blocks"):
+		var ordered: Array = grid.get("blocks", []).duplicate()
+		ordered.sort_custom(func(first: Dictionary, second: Dictionary) -> bool:
+			return String(first.get("block_id", "")) < String(second.get("block_id", ""))
+		)
+		cached["target_blocks"] = ordered
+	return cached["target_blocks"]
 
 
 func _update_player_presentation(delta: float) -> void:
@@ -5426,7 +5455,7 @@ func _update_target() -> void:
 	elif target_voxel != null:
 		target_highlight.visible = true
 		target_highlight.global_transform = Transform3D(
-			Basis.IDENTITY, Vector3(target_voxel)
+			Basis.IDENTITY, Vector3(target_voxel) + _voxel_render_offset()
 		)
 	elif not target_block.is_empty():
 		target_highlight.visible = true
@@ -5973,11 +6002,7 @@ func _closest_tool_hit(
 		var inverse_basis := grid_basis.inverse()
 		var local_origin := inverse_basis * (origin - grid_position)
 		var local_direction := inverse_basis * ray_direction
-		var blocks: Array = grid.get("blocks", []).duplicate()
-		blocks.sort_custom(func(first: Dictionary, second: Dictionary) -> bool:
-			return String(first.get("block_id", "")) < String(second.get("block_id", ""))
-		)
-		for block in blocks:
+		for block in _grid_target_blocks(grid_id, grid):
 			var local_center := _coord_vector(block.get("coordinate", {}))
 			var intersection := _ray_unit_box_hit(
 				local_origin, local_direction, local_center, maximum_distance
@@ -6005,7 +6030,23 @@ func _closest_tool_hit(
 	return best
 
 
+func _voxel_render_offset() -> Vector3:
+	var body := _registered_body(String(snapshot.get("voxel_body_id", "")))
+	var offset: Variant = _address_relative_m(body.get("center", {}), interest_local_origin)
+	return offset if offset is Vector3 else Vector3.ZERO
+
+
 func _raymarch_voxel_hit(
+	origin: Vector3, direction: Vector3, maximum_distance: float
+) -> Dictionary:
+	var offset := _voxel_render_offset()
+	var hit := _raymarch_voxel_local_hit(origin - offset, direction, maximum_distance)
+	if not hit.is_empty():
+		hit["hit_position"] += offset
+	return hit
+
+
+func _raymarch_voxel_local_hit(
 	origin: Vector3, direction: Vector3, maximum_distance: float
 ) -> Dictionary:
 	var touching := _origin_touching_voxel_hit(origin)

@@ -163,6 +163,65 @@ fn standing_capsule_contacts_floor_with_stable_identity() {
 }
 
 #[test]
+fn adjacent_wall_contacts_belong_to_the_reported_leaf() {
+    let mut scene = Scene::new(SceneConfig::default()).expect("scene");
+    let mut blocks = Vec::new();
+    for x in -10..=-7 {
+        for y in 0..=3 {
+            blocks.push(BoxColliderSpec {
+                local_pose: pose(f64::from(x), f64::from(y), -11.0),
+                ..BoxColliderSpec::unit_cube(format!("wall-{x}-{y}"))
+            });
+        }
+    }
+    let wall = BodySpec::static_body("wall", pose(900.0, -1000.48, -3800.0), blocks.clone());
+    let mut character = BodySpec::dynamic(
+        "character",
+        pose(891.386_849, -999.080_151, -3_810.158_123),
+        Vec::new(),
+    );
+    character
+        .capsule_colliders
+        .push(CapsuleColliderSpec::new("capsule", 0.34, 0.56));
+    character.collision_class = BodyCollisionClass::Character;
+    character.allow_sleeping = false;
+    character.motion_quality = MotionQuality::LinearCast;
+    character.linear_velocity = Vec3::new(0.43, 0.0, -0.1);
+    scene.rebuild(&[wall, character]).expect("build wall");
+    let mut observed = 0;
+    for _ in 0..60 {
+        let output = scene
+            .step(&[BodyControl {
+                body_id: "character".into(),
+                force_newtons: Vec3::new(0.0, 0.0, -100.0),
+                torque_newton_meters: Vec3::ZERO,
+            }])
+            .expect("step");
+        for contact in output.contacts {
+            assert_eq!(contact.body_b_id, "wall");
+            let block = blocks
+                .iter()
+                .find(|b| b.collider_id == contact.collider_b_id)
+                .expect("leaf");
+            let local =
+                contact.point - Vec3::new(900.0, -1000.48, -3800.0) - block.local_pose.position;
+            let slack = 0.02 + contact.penetration_m * 0.5;
+            assert!(
+                local.x.abs() <= 0.5 + slack
+                    && local.y.abs() <= 0.5 + slack
+                    && local.z.abs() <= 0.5 + slack,
+                "point {:?} belongs to {} at {:?}",
+                contact.point,
+                contact.collider_b_id,
+                block.local_pose.position
+            );
+            observed += 1;
+        }
+    }
+    assert!(observed > 0, "wall must actually be contacted");
+}
+
+#[test]
 fn character_collision_class_passes_other_characters_but_still_contacts_world() {
     let mut scene = Scene::new(SceneConfig::default()).expect("scene initializes");
     let floor = BodySpec::static_body(

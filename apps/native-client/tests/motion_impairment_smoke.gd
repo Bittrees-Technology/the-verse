@@ -54,6 +54,7 @@ func _run() -> void:
 	_test_ordering_corrections_and_motion_only_updates()
 	_test_render_interpolation_and_grounded_pitch_prediction()
 	_test_grounded_prediction_honors_grid_obstacles()
+	_test_resting_floor_contact_allows_tangential_walk()
 	_test_remote_player_presentation_smoothing()
 	_test_menu_dead_disconnect_and_bounds()
 	_test_life_state_reset()
@@ -1662,7 +1663,10 @@ func _test_ordering_corrections_and_motion_only_updates() -> void:
 	(correction_client.get("pending_controls") as Array).append({
 		"movement_epoch": 2, "input_sequence": 3,
 	})
+	camera.position = Vector3(0.5, 0.72, 0)
+	var before_gap_camera := camera.position
 	correction_client.call("_apply_authoritative_player", epoch_player, 5, 5, "gap", "motion_state")
+	_check(camera.position.is_equal_approx(before_gap_camera), "bounded history reset preserves rendered camera pose")
 	_check((correction_client.get("prediction_history") as Array).is_empty(), "history gap hard reset")
 	_check((correction_client.get("pending_controls") as Array).is_empty(), "history gap cleared controls")
 
@@ -1914,6 +1918,33 @@ func _test_grounded_prediction_honors_grid_obstacles() -> void:
 		bool(client.get("predicted_surface_contact")),
 		"grounded obstacle prediction preserves support contact",
 	)
+	client.free()
+
+
+func _test_resting_floor_contact_allows_tangential_walk() -> void:
+	var client := _new_client()
+	client.set("snapshot", {"environment": {}})
+	var floor_blocks: Array = []
+	for x in range(-2, 4):
+		floor_blocks.append(_target_block("floor-%d" % x, Vector3i(x, 0, 0)))
+	client.set("grid_lookup", {"floor": _target_grid("floor", Vector3.ZERO, Quaternion.IDENTITY, floor_blocks)})
+	# Five millimetres of resting solver penetration must not freeze each step.
+	var start := Vector3(0, 1.395, 0)
+	var finish := start + Vector3(1, 0, 0)
+	var sweep: Dictionary = client.call("_sweep_player_position", start, finish)
+	_check(Vector3(sweep.get("position")).is_equal_approx(finish), "resting contact permits continuous tangential walking")
+	_check(not client.call("_player_position_is_clear", Vector3(0, 1.37, 0)), "contact skin still rejects deep floor penetration")
+	var player := _base_player()
+	player["jetpack_enabled"] = false
+	player["locomotion"] = {"kind": "grounded", "up": _protocol_vec3(Vector3(0.02, 1, 0).normalized()), "support": {"body_id": "floor", "local_normal": _protocol_vec3(Vector3.UP)}}
+	client.set("actor_private_snapshot", _private_snapshot(player))
+	client.set("predicted_position", start)
+	client.set("predicted_orientation", Quaternion.IDENTITY)
+	client.set("predicted_linear_velocity", Vector3.ZERO)
+	for _step in 60:
+		client.call("_predict_player_step", {"linear_input": Vector3.RIGHT, "angular_input": Vector3.ZERO}, FIXED_DELTA, false)
+	var walked: Vector3 = client.get("predicted_position")
+	_check(walked.x > 3.0 and absf(walked.y - start.y) < 0.001, "gravity tilt does not drive prediction into flat capital floor")
 	client.free()
 
 
