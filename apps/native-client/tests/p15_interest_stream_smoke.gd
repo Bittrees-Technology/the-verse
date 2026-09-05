@@ -18,6 +18,7 @@ func _initialize() -> void:
 func _run() -> void:
 	_test_origin_rebase_preserves_presentation()
 	_test_exact_address_projection()
+	_test_translated_voxel_interaction()
 	_test_registry_and_contiguous_interest_stream()
 	_test_handoff_presentation_freezes_and_restores_control()
 	_test_legacy_family_fails_closed()
@@ -59,6 +60,25 @@ func _new_client() -> Node3D:
 	})
 	client.set("requested_player_id", "player-local")
 	return client
+
+
+func _test_translated_voxel_interaction() -> void:
+	var client := _new_client()
+	client.set("universe_manifest", _manifest())
+	client.set("registry_snapshot", {"bodies": [{
+		"body_id": "offset-ore", "center": _address("0", 500, 100_000_000),
+	}]})
+	client.set("snapshot", {"voxel_body_id": "offset-ore"})
+	client.set("voxel_lookup", {"0,0,0": {"coordinate": {"x": 0, "y": 0, "z": 0}}})
+	for origin_um in [0, 40_000_000]:
+		client.set("interest_local_origin", _address("0", 500, origin_um))
+		var offset := Vector3(100.0 - float(origin_um) / 1_000_000.0, 0.0, 0.0)
+		_check(not client.call("_player_position_is_clear", offset), "translated ore blocks predicted movement")
+		_check(client.call("_player_position_is_clear", Vector3.ZERO), "stored voxel coordinate is not a phantom render obstacle")
+		var hit: Dictionary = client.call("_closest_tool_hit", offset + Vector3(0, 0, 3), Vector3.FORWARD, 5.0)
+		_check(hit.get("coordinate") == Vector3i.ZERO, "translated ore retains storage coordinate for mining")
+		_check(Vector3(hit.get("hit_position", Vector3.ZERO)).is_equal_approx(offset + Vector3(0, 0, 0.5)), "translated ore hit aligns with mesh after rebase")
+	client.free()
 
 
 func _test_exact_address_projection() -> void:

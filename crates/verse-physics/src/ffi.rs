@@ -698,6 +698,9 @@ impl NativeScene {
                 MotionQuality::Discrete => JPC_MOTION_QUALITY_DISCRETE,
                 MotionQuality::LinearCast => JPC_MOTION_QUALITY_LINEAR_CAST,
             },
+            // Replay validates each contact against its exact leaf collider.
+            // Reduction can merge neighboring leaves while retaining only one ID.
+            UseManifoldReduction: false,
             AllowSleeping: spec.allow_sleeping,
             Friction: spec.friction,
             Restitution: spec.restitution,

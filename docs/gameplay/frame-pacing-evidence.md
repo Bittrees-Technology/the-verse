@@ -45,3 +45,41 @@ A longer authoritative test walks toward the relocated outcrops for ten seconds
 and reopens the saved world. The deposits leave an apron around the expanded
 foundation. Local smoke checks also cover the new architectural batches and
 keep non-colliding ornamental meshes above the player corridor.
+
+## Movement contact repair
+
+A disposable copy of the failed capital save reproduced
+`replay_player_contact_spatially_invalid` at a back-wall leaf. Disabling manifold
+reduction allowed that same copy to advance 120 calls of 16 ms and persist.
+The automatic adjacent-wall test also fails under the old setting. The full
+simulation suite passed 467 tests; physics, impairment, interest, and structure
+checks passed. The graphical UI test walked 6.19 m and exercised all four tools.
+
+The revised probe records origin-adjusted camera steps, correction magnitudes,
+maximum frame times, and explicit camera snaps, and requires actual world entry.
+After the contact, deck-prediction, camera-reset, and targeting-cache fixes, one
+confirmation run measured median/p95 frame times of 23.5/24.5 ms idle, 9.6/26.1 ms
+walking, and 9.2/23.8 ms mouse-look. Mouse-look's maximum camera translation was
+0.12 m and maximum turn 1.05 degrees per frame. Targeting CPU cost was about
+1.94 ms per mouse-look frame, versus 4.02 ms before caching in this session.
+
+With the Compatibility renderer, this was improved but not hitch-free: walking still exhibited
+an occasional 90–103 ms frame stall and up to 0.58 m camera steps. Instrumented
+movement/network/presentation handlers did not show a matching >40 ms individual
+stall. Driver/render synchronization remains a possible cause, not established
+by these measurements. Long sessions and other hardware still need testing.
+
+### Native Metal follow-up
+
+The remaining stalls were absent in the same short probe with Metal Forward
+Mobile. The fresh capital's maximum idle/walking/mouse frame times were
+22.5/24.6/21.2 ms. A fresh copy of the actual failed save measured maxima of
+22.3/22.8/21.6 ms, compared with 32.2/100.8/528.7 ms on Compatibility during
+that copied-save scenario. Copied-save walking/mouse camera steps stayed below
+0.122/0.087 m, with no explicit camera snaps. Both runs remained entered,
+connected, authoritative-ready, and replication-ready throughout.
+
+macOS now selects the Metal Mobile renderer by feature override; other platforms
+retain Compatibility. The Metal entry/tool UI test passed and its capital image
+was inspected. These are short same-machine observations; they establish a
+useful rendering improvement, not universal hitch-free performance.

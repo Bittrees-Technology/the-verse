@@ -34,5 +34,6 @@ ADRs capture durable choices and their consequences.
 | [0028](ADR-0028-ore-workshop-genesis.md) | Seeded ore workshop genesis | Accepted |
 | [0029](ADR-0029-capital-start-and-owned-worker.md) | Capital start and packaged worker supervision | Accepted |
 | [0030](ADR-0030-native-frame-pacing.md) | Native capital frame pacing | Accepted |
+| [0031](ADR-0031-leaf-contacts-and-supported-prediction.md) | Exact leaf contacts and supported movement prediction | Accepted |
 
 Status values: Proposed, Accepted, Superseded, Rejected.

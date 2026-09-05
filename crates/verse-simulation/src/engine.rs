@@ -8506,6 +8506,18 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a disposable VERSE_REPRO_SAVE copy"]
+    fn copied_wall_save_continues_advancing() {
+        let path = std::env::var("VERSE_REPRO_SAVE").expect("disposable copied save path");
+        let mut runtime =
+            Runtime::open(std::path::Path::new(&path), 20_260_826, 600).expect("load copied save");
+        for _ in 0..120 {
+            runtime.advance(16).expect("saved wall contact advances");
+        }
+        runtime.persist_snapshot().expect("save recovered movement");
+    }
+
+    #[test]
     fn grand_capital_walks_from_hall_to_outcrop_without_halting() {
         let directory = tempdir().expect("temporary world");
         let mut runtime = Runtime::open(directory.path(), 42, 100).expect("open");

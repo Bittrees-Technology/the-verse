@@ -73,3 +73,16 @@ If suspension expires a writer lease between an operation's initial check and
 its lifecycle publication, reject that publication without writing a post-expiry
 live timestamp. Keep the prior durable record valid for a fresh fenced reopen;
 never extend an already expired lease in place.
+
+Player contacts must retain exact leaf-block identity. Native contact reduction
+must not merge neighboring collider manifolds into a point attributed to only
+one block. Reproduce wall traversal from a copied saved world and verify that
+contact validation stays enabled and the recovered world continues advancing.
+
+Voxel collision prediction, tool rays, and highlighting must use the same body-to-render origin translation as deposit meshes, including after a local origin rebase.
+
+Client movement prediction permits a 1 cm contact skin so ordinary resting solver penetration does not block tangential floor movement. Deeper overlaps and walls still block prediction; authoritative physics and replay validation remain unchanged.
+
+On grid supports, project predicted walking displacement onto the actual deck normal, not the radial gravity tangent. A bounded prediction-history reset must preserve the rendered camera pose and converge smoothly; respawn, reconnect, and large corrections retain explicit snaps.
+
+The macOS client uses the native Metal Forward Mobile renderer. Keep the Compatibility renderer for other platforms. Validate capital materials, tool UI, saved-world movement, and exported startup with Metal; retain an explicit Compatibility CLI fallback for diagnostics.

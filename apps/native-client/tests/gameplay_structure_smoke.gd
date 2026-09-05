@@ -41,6 +41,8 @@ func _initialize() -> void:
 		check(not client._can_instance_structure(damaged), "damage and construction retain individual visuals")
 		check(client._grid_topology_fingerprint({"blocks": [damaged]}) != client._grid_topology_fingerprint({"blocks": [blocks[0]]}), "damage changes visual fingerprint")
 	client.grid_lookup = {"test": grid}
+	var target_order: Array = client._grid_target_blocks("test", grid)
+	check(is_same(target_order, client._grid_target_blocks("test", grid)), "unchanged targeting reuses sorted blocks")
 	var rng := RandomNumberGenerator.new()
 	rng.seed = 8107
 	for sample in range(500):
@@ -56,11 +58,12 @@ func _initialize() -> void:
 			for block in blocks:
 				var delta: Vector3 = Basis(rotation).inverse() * (center - translation) - client._coord_vector(block.coordinate)
 				var closest := delta.clamp(Vector3.ONE * -0.5, Vector3.ONE * 0.5)
-				if (delta - closest).length_squared() < client.CHARACTER_COLLISION_RADIUS * client.CHARACTER_COLLISION_RADIUS:
+				if (delta - closest).length_squared() < pow(client.CHARACTER_COLLISION_RADIUS - client.CHARACTER_PREDICTION_CONTACT_SKIN, 2):
 					expected_clear = false
 		check(client._player_position_is_clear(position) == expected_clear, "spatial collision matches exhaustive capsule test")
 	client.grid_lookup = {"test": {"blocks": []}}
 	check(client._player_position_is_clear(Vector3.ZERO), "replaced projection invalidates collision cache")
+	check(client._grid_target_blocks("test", client.grid_lookup["test"]).is_empty(), "replaced projection invalidates targeting cache")
 	var grand_blocks := []
 	for coordinate in [Vector3i.ZERO, Vector3i(12, 0, 11), Vector3i(12, 8, 11)]:
 		var block := blocks[0].duplicate(true)
