@@ -130,6 +130,8 @@ const DENSITY_NEIGHBORS: Array[Vector3i] = [
 ]
 
 var socket := WebSocketPeer.new()
+var last_verified_packet_msec := 0
+var session_entry: CanvasLayer
 var server_url := DEFAULT_SERVER
 var requested_player_id := DEFAULT_PLAYER_ID
 var bound_player_id := ""
@@ -349,7 +351,9 @@ func _ready() -> void:
 	_build_environment()
 	_build_viewmodel()
 	_build_interface()
-	Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
+	session_entry = load("res://src/session_entry.gd").new()
+	add_child(session_entry)
+	Input.mouse_mode = Input.MOUSE_MODE_CAPTURED if session_entry.entered else Input.MOUSE_MODE_VISIBLE
 	if not _initialize_interest_verifier():
 		_client_fatal("NATIVE INTEREST VERIFIER EXTENSION UNAVAILABLE")
 		return
@@ -379,6 +383,8 @@ func _process(delta: float) -> void:
 
 
 func _physics_process(delta: float) -> void:
+	if session_entry != null and not session_entry.entered:
+		return
 	if (
 		not connected
 		or not authoritative_player_ready
@@ -405,6 +411,8 @@ func _physics_process(delta: float) -> void:
 
 
 func _input(event: InputEvent) -> void:
+	if session_entry != null and not session_entry.entered:
+		return
 	if event is InputEventMouseButton and event.button_index == MOUSE_BUTTON_LEFT and not event.pressed:
 		primary_needs_release = false
 	if event is InputEventKey and _reconnect_shortcut(event):
@@ -456,6 +464,8 @@ func _input(event: InputEvent) -> void:
 			KEY_ESCAPE:
 				if inventory_open:
 					_set_inventory_open(false)
+				elif session_entry != null:
+					session_entry.pause_entry()
 				else:
 					Input.mouse_mode = (
 						Input.MOUSE_MODE_VISIBLE
@@ -2439,6 +2449,7 @@ func _verify_and_handle_packet(packet: PackedByteArray) -> void:
 	if not committed is Dictionary or not bool(committed.get("ok", false)):
 		_client_fatal("INTEREST VERIFIER COMMIT FAILED")
 		return
+	last_verified_packet_msec = Time.get_ticks_msec()
 	if candidate.is_empty():
 		_handle_server_message(message)
 		return
@@ -4099,16 +4110,23 @@ func _add_surface_triangle(
 	material_samples: Array[Vector3]
 ) -> void:
 	var centroid := (first + second + third) / 3.0
+	var solid_center := Vector3.ZERO
+	for sample in material_samples:
+		solid_center += sample
+	solid_center /= float(maxi(material_samples.size(), 1))
+	var outward := centroid - solid_center
 	var face_normal := (second - first).cross(third - first).normalized()
-	if face_normal.dot(centroid) < 0.0:
+	# Godot front faces wind clockwise. Orient from this tetrahedron's solid
+	# samples, not the world origin: planetary deposits and mined cavities
+	# must have the same lighting as deposits near the asteroid origin.
+	if face_normal.dot(outward) > 0.0:
 		var swap := second
 		second = third
 		third = swap
 		face_normal = -face_normal
 	var triangle_points: Array[Vector3] = [first, second, third]
 	for point in triangle_points:
-		var radial_normal: Vector3 = point.normalized()
-		surface.set_normal(radial_normal)
+		surface.set_normal(Vector3.ZERO)
 		surface.set_color(_voxel_surface_color(point, material_samples))
 		surface.add_vertex(point)
 
@@ -4122,11 +4140,11 @@ func _voxel_surface_color(point: Vector3, material_samples: Array[Vector3]) -> C
 		if voxel.get("material", "rock") == "ferrite_ore":
 			mineral = String(ore_assays.get(_coord_key(coordinate), "ferrite"))
 	if mineral == "cuprite":
-		return Color(0.16, 0.58 + variation * 0.12, 0.36, 1.0)
+		return Color(0.40 + variation * 0.05, 0.23, 0.14, 1.0)
 	if mineral == "cobaltite":
-		return Color(0.28, 0.32, 0.76 + variation * 0.12, 1.0)
+		return Color(0.37, 0.39, 0.43 + variation * 0.04, 1.0)
 	if not mineral.is_empty():
-		return Color(0.68 + variation * 0.14, 0.19, 0.055, 1.0)
+		return Color(0.44 + variation * 0.08, 0.24, 0.15, 1.0)
 	var shade := 0.27 + variation * 0.11
 	return Color(shade * 0.84, shade * 0.94, shade, 0.0)
 
@@ -4200,6 +4218,22 @@ func _create_grid_node(grid: Dictionary) -> Node3D:
 		)
 		block_visual.rotation.y = deg_to_rad(float(int(block.get("orientation", 0)) * 90))
 		grid_node.add_child(block_visual)
+	for block in grid.get("blocks", []):
+		if String(block.get("block_id", "")) == "block-capital-floor-0-0":
+			var sign_label := Label3D.new()
+			sign_label.text = "KHEPRI CAPITAL\nARRIVAL HALL"
+			sign_label.font_size = 96
+			sign_label.pixel_size = 0.006
+			sign_label.position = Vector3(0, 3.3, -6.4)
+			sign_label.modulate = Color(0.75, 0.87, 0.88)
+			grid_node.add_child(sign_label)
+			var directions := Label3D.new()
+			directions.text = "INDUSTRY  •  CARGO / REFINERY / ASSEMBLER\nORE OUTCROPS OUTSIDE  →"
+			directions.font_size = 48
+			directions.pixel_size = 0.005
+			directions.position = Vector3(0, 2.2, -6.3)
+			grid_node.add_child(directions)
+			break
 	_sync_grid_power_visual(grid_node, bool(grid.get("power", {}).get("online", false)))
 	return grid_node
 
@@ -7140,7 +7174,7 @@ func _update_interface() -> void:
 		)
 	if contract_title_label != null:
 		contract_title_label.text = (
-			"KHEPRI OUTPOST COMMISSIONING"
+			"KHEPRI CAPITAL // FIRST ASSIGNMENT"
 			if surface_operations
 			else "WAKE THE KHEPRI RELAY"
 		)
@@ -7333,7 +7367,7 @@ func _update_interface() -> void:
 		target_label.text = (
 			"CONSTRUCTION MODE // AIM AT A GRID BLOCK"
 			if build_mode
-			else "EVA NAVIGATION // AIM AT ROCK OR MACHINERY"
+			else ("SURFACE EXPLORATION // AIM AT ROCK OR MACHINERY" if surface_operations else "EVA NAVIGATION // AIM AT ROCK OR MACHINERY")
 		)
 	if not active_grid_control_id.is_empty():
 		mode_label.text = "GRID CONTROL ACTIVE // %s // RELEASE M OR PRESS X TO DAMPEN" % active_grid_control_id
@@ -7543,6 +7577,8 @@ func _mission_text(career: Dictionary) -> String:
 	var refined := int(career.get("refining_batches", 0))
 	var crafted := int(career.get("components_crafted", 0))
 	var built := int(career.get("blocks_built", 0))
+	if mined < 3 and bool(_local_environment().get("breathable", false)):
+		return "01 // MINE ORE  %d / 3\n\nWelcome to Khepri Capital. Walk outside the hall and turn right toward the nearby rock outcrop.\n[1] Drill: aim at rock within 9 m and hold LMB. [I] opens your inventory." % mined
 	if mined < 3:
 		return "01 // MINE ORE  %d / 3\n\n[1] Equip drill. Fly toward the nearby asteroid; hold LMB on rock within 9 m.\nKeep your helmet sealed in vacuum [H]." % mined
 	if refined < 1:

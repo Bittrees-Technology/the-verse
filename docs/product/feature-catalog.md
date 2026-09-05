@@ -82,6 +82,7 @@ Priorities:
 | F-068 | Versioned blueprint, script, and automation-package sharing | P3 | F-043/044, F-046, MOD-005 |
 | F-069 | Selectable starter suit tools and short-range block pulse | P1 | F-012, F-062/063, UX-004 |
 | F-070 | Seeded scarce workshop ore varieties | P1 | F-012, UX-005 |
+| F-071 | Capital arrival, surface outcrops and reliable app entry | P1 | F-062, UX-006 |
 
 ## Current implementation readiness
 

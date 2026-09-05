@@ -31,5 +31,7 @@ ADRs capture durable choices and their consequences.
 | [0025](ADR-0025-signed-universe-activation.md) | Signed universe activation and forward-only verified boot | Accepted |
 | [0026](ADR-0026-active-directory-v3-authority.md) | Active directory-v3 cell authority transitions | Accepted |
 | [0027](ADR-0027-protocol-19-lifecycle-v2-scheduling.md) | Protocol-19 lifecycle-v2 scheduling | Accepted |
+| [0028](ADR-0028-ore-workshop-genesis.md) | Seeded ore workshop genesis | Accepted |
+| [0029](ADR-0029-capital-start-and-owned-worker.md) | Capital start and packaged worker supervision | Accepted |
 
 Status values: Proposed, Accepted, Superseded, Rejected.

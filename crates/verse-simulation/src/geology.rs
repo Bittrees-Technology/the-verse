@@ -83,15 +83,44 @@ pub fn generate_deposits(seed: u64, occupied: &BTreeSet<IVec3>) -> BTreeMap<IVec
     result
 }
 
+/// Mineable surface outcrops above the starting planet's solid base collider.
+#[must_use]
+#[allow(clippy::cast_possible_truncation)] // Pinned local body coordinates fit i32.
+pub fn capital_outcrops(seed: u64) -> BTreeSet<IVec3> {
+    let center = crate::model::planet_center();
+    let surface = center.y + crate::model::planet_surface_radius_m();
+    let mut occupied = BTreeSet::new();
+    for (index, (dx, dz)) in [(18, 2), (-19, -6), (10, -23)].into_iter().enumerate() {
+        for x in -6_i32..=6 {
+            for z in -5_i32..=5 {
+                for y in 0_i32..=5 {
+                    let local = IVec3::new(x, y, z);
+                    let noise = crate::model::fixed_value_noise(seed ^ index as u64, local);
+                    if i64::from(x * x * 25 + z * z * 36 + y * y * 36) <= 900 + noise / 3 {
+                        occupied.insert(IVec3::new(
+                            center.x.round() as i32 + dx + x,
+                            surface.floor() as i32 + y,
+                            center.z.round() as i32 + dz + z,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    occupied
+}
+
 /// Presentation catalog for the starter asteroid; mining authority remains the snapshot.
 #[must_use]
 pub fn starter_deposit_catalog(seed: u64) -> Vec<(IVec3, OreKind)> {
-    generate_deposits(
+    let mut catalog = generate_deposits(
         seed,
         &crate::model::VoxelField::procedural_asteroid(seed, 8).occupied,
     )
     .into_iter()
-    .collect()
+    .collect::<Vec<_>>();
+    catalog.extend(generate_deposits(seed, &capital_outcrops(seed)));
+    catalog
 }
 
 #[cfg(test)]

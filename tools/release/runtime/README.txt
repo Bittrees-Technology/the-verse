@@ -4,8 +4,9 @@ This archive contains the native game client and the local authoritative server.
 It is an unsigned development build for testing, not a production release and
 not connected to a real-value economy.
 
-macOS: double-click "Launch The Verse.command". Gatekeeper may require you to
-approve the unsigned development build in System Settings.
+macOS: open "The Verse.app", then click "Enter the Verse" when ready.
+The app starts its bundled local server and uses a separate Capital Playtest save.
+Close the app to stop its server. Esc returns to the entry menu.
 
 Linux: run "./the-verse" from a terminal. The initial target is x86_64 Ubuntu.
 

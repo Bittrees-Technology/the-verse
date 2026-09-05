@@ -23,7 +23,7 @@ cargo build --locked --release -p verse-simulation-worker
 tools/ci/build-native-verifier.sh release
 target/release/verse-simulation-worker \
   --data-directory "${verse_test_directory}/universe" \
-  --genesis-profile ore-workshop --snapshot-every 600 --bind "127.0.0.1:${verse_port}" \
+  --genesis-profile "${VERSE_UI_PROFILE:-ore-workshop}" --snapshot-every 600 --bind "127.0.0.1:${verse_port}" \
   >"${verse_test_directory}/server.log" 2>&1 &
 verse_server_pid="$!"
 ready=0
@@ -45,4 +45,4 @@ fi
 "${godot_binary}" --path apps/native-client \
   --script res://tests/starter_kit_ui_smoke.gd -- \
   "--server=ws://127.0.0.1:${verse_port}/ws" \
-  "--output-directory=${verse_root}/artifacts/starter-kit-review"
+  "--output-directory=${verse_root}/artifacts/starter-kit-review" "${VERSE_UI_TEST_ARGUMENT:---ui-test}"

@@ -6,12 +6,15 @@ The repository now contains the **playable P1 development proof**, including aut
 
 ## Play it on macOS
 
-The [engineering starter kit](docs/gameplay/starter-tool-kit.md) adds selectable
-drill, grinder, welder, and short-range block-pulse tools. In a packaged build,
-open **Launch Engineering Workshop.command** for an orbital start beside the
-asteroid and powered industry. Its separate Ore Workshop save contains
-[seeded ferrite, cuprite, and cobaltite deposits](docs/gameplay/seeded-ore-deposits.md).
-These currently share ore feedstock for refining and component production.
+Open **The Verse.app** in the latest packaged build. It starts its own local
+server and shows **Enter the Verse** when your player is ready. New saves begin
+in Khepri Capital on the starting planet, with an arrival hall, industrial
+machines, and nearby mineable outcrops. See [capital arrival](docs/gameplay/capital-arrival.md).
+
+WASD moves, the mouse looks, Space jumps, 1–4 selects tools, I opens inventory
+and production, B opens construction, and Esc returns to the entry menu.
+The [engineering starter kit](docs/gameplay/starter-tool-kit.md) and older
+orbital workshop launcher remain available with separate saves.
 
 Requirements: Apple Silicon macOS, Rust, Node.js, `curl`, and `jq`.
 
