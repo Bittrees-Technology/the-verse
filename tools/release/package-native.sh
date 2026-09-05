@@ -93,6 +93,8 @@ if [[ "${release_platform}" == "macos-arm64" ]]; then
   chmod 755 "${client_binary}"
   cp target/release/verse-simulation-worker "${staging_directory}/verse-simulation-worker"
   cp tools/release/runtime/launch-macos.command "${staging_directory}/Launch The Verse.command"
+  cp tools/release/runtime/launch-engineering-macos.command "${staging_directory}/Launch Engineering Workshop.command"
+  chmod 755 "${staging_directory}/Launch Engineering Workshop.command"
   chmod 755 \
     "${staging_directory}/verse-simulation-worker" \
     "${staging_directory}/Launch The Verse.command"
@@ -103,6 +105,8 @@ else
     --export-release "${export_preset}" "${staging_directory}/TheVerse.x86_64"
   cp target/release/verse-simulation-worker "${staging_directory}/verse-simulation-worker"
   cp tools/release/runtime/launch-linux.sh "${staging_directory}/the-verse"
+  cp tools/release/runtime/launch-engineering-linux.sh "${staging_directory}/the-verse-engineering"
+  chmod 755 "${staging_directory}/the-verse-engineering"
   chmod 755 \
     "${staging_directory}/TheVerse.x86_64" \
     "${staging_directory}/verse-simulation-worker" \

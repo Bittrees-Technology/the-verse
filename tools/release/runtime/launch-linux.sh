@@ -16,6 +16,11 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+if curl --fail --silent --max-time 2 http://127.0.0.1:7777/healthz >/dev/null; then
+  echo "A Verse session is already running. Close it before opening another workshop." >&2
+  exit 1
+fi
+
 mkdir -p "${universe_directory}"
 "${package_directory}/verse-simulation-worker" \
   --data-directory "${universe_directory}" \

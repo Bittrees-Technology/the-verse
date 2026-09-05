@@ -6,6 +6,11 @@ The repository now contains the **playable P1 development proof**, including aut
 
 ## Play it on macOS
 
+The [engineering starter kit](docs/gameplay/starter-tool-kit.md) adds selectable
+drill, grinder, welder, and short-range block-pulse tools. In a packaged build,
+open **Launch Engineering Workshop.command** for an orbital start beside the
+asteroid and powered industry. It uses a separate save from the surface playtest.
+
 Requirements: Apple Silicon macOS, Rust, Node.js, `curl`, and `jq`.
 
 ```bash
@@ -50,11 +55,13 @@ Native controls are shown in the client:
 | Toggle jetpack / helmet seal | `J` / `H` |
 | Arm or release magnetic boots | `K` |
 | Open engineering inventory terminal | `I` |
-| Mine highlighted voxel | Hold left mouse |
+| Select drill / grinder / welder / pulse tool | `1` / `2` / `3` / `4` outside construction |
+| Mine / grind / weld with selected tool | Hold left mouse |
+| Fire short-range block pulse | Click left mouse with pulse tool |
 | Enter construction / choose block | `B` / `1`–`8` |
 | Rotate construction hologram | `[` / `]` |
 | Weld construction hologram | Hold left mouse |
-| Cut and salvage a block | Hold right mouse |
+| Exit construction | `B` or right mouse |
 | Refine / fabricate / transfer cargo | `R` / `T` / `V` (`Shift+V` reverses transfer) |
 | Anchor / move / stop targeted grid | `F` / `M` / `X` |
 | Request recovery when incapacitated | `Enter` |

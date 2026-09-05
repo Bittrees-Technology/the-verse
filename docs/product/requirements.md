@@ -28,6 +28,9 @@ Requirement IDs are stable references for issues, pull requests, tests, and rele
   interpolation, camera presentation, correction, and reconnect behavior shall
   remain bounded and visually stable under delayed, uneven, duplicated,
   reordered, or temporarily interrupted authoritative delivery.
+- **UX-004 — Starter suit tools:** The local engineering playtest shall expose
+  distinct selectable mining, grinding, welding, and short-range shooting tools
+  in suit inventory, with all world effects validated by the server.
 - **PERF-001 — Published simulation budgets:** Each playable milestone shall
   publish and test finite budgets for server tick work, client frame time,
   replication, active grids and blocks, voxel remeshing, production,

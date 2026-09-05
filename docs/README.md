@@ -15,6 +15,8 @@ Start with [current progress and next gates](roadmap/current-progress.md) for th
 
 ## Gameplay
 
+- [Playable engineering starter kit](gameplay/starter-tool-kit.md)
+
 - [P0.2 Salvage Frontier](gameplay/salvage-frontier.md)
 - [P0.3 visual engineering checkpoint](gameplay/engineering-realism.md)
 - [P0.4 Engineering Hands](gameplay/engineering-hands.md)

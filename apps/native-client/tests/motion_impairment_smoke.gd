@@ -8,6 +8,13 @@ const HISTORY_LIMIT := 180
 var failures: Array[String] = []
 
 
+class HeadlessToolClient extends "res://src/main.gd":
+	# The headless display cannot capture a pointer. Substitute only that device
+	# input; connection, actor, life, frontier, and mutation gates remain real.
+	func _tool_pointer_captured() -> bool:
+		return true
+
+
 class OutOfRangePresentationVerifier extends RefCounted:
 	var commits := 0
 	var discards := 0
@@ -53,6 +60,7 @@ func _run() -> void:
 	_test_bound_player_roster_selection()
 	_test_short_roll_taps_and_idle_silence()
 	_test_exact_tool_targeting()
+	_test_starter_tool_kit()
 	_test_private_projection_lifecycle()
 	_test_actor_owned_industry_selection()
 	_test_physical_production_client()
@@ -77,11 +85,11 @@ func _check(condition: bool, label: String) -> void:
 		failures.append(label)
 
 
-func _new_client(add_to_tree := false) -> Node3D:
+func _new_client(add_to_tree := false, client_script: Script = CLIENT_SCRIPT) -> Node3D:
 	var client := Node3D.new()
 	if add_to_tree:
 		root.add_child(client)
-	client.set_script(CLIENT_SCRIPT)
+	client.set_script(client_script)
 	var camera := Camera3D.new()
 	client.add_child(camera)
 	client.set("camera", camera)
@@ -2151,3 +2159,101 @@ func _protocol_vec3(value: Vector3) -> Dictionary:
 
 func _protocol_quat(value: Quaternion) -> Dictionary:
 	return {"x": value.x, "y": value.y, "z": value.z, "w": value.w}
+
+
+func _test_starter_tool_kit() -> void:
+	var client := _new_client(true, HeadlessToolClient)
+	var progress := ProgressBar.new()
+	var mode := Label.new()
+	client.add_child(progress)
+	client.add_child(mode)
+	client.set("action_progress", progress)
+	client.set("mode_label", mode)
+	client.set("connected", true)
+	client.set("test_capture_transport", true)
+	client.set("handoff_phase", "live")
+	Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
+	var inventory_before: Dictionary = client.get("actor_private_snapshot").duplicate(true)
+	var block := _target_block("kit-block", Vector3i.ZERO)
+	block["health"] = 50
+	block["max_health"] = 100
+	var grid := _target_grid("kit-grid", Vector3.ZERO, Quaternion.IDENTITY, [block], "impairment-player")
+	var target := {"grid_id": "kit-grid", "grid": grid, "block": block, "local_normal": Vector3.RIGHT}
+	client.set("target_block", target)
+	client.set("target_voxel", null)
+	for pair in [["drill", ""], ["grinder", "damage"], ["welder", "weld"], ["pulse", ""]]:
+		client.call("_equip_tool", pair[0])
+		var plan: Dictionary = client.call("_tool_action_plan")
+		_check(plan.get("kind", "") == pair[1], "tool block action is isolated: %s" % pair[0])
+		_check(client.get("primary_needs_release"), "tool switch requires primary release")
+	client.set("target_block", {})
+	client.set("target_voxel", Vector3i.ZERO)
+	for id in ["drill", "grinder", "welder", "pulse"]:
+		client.call("_equip_tool", id)
+		var plan: Dictionary = client.call("_tool_action_plan")
+		_check(plan.get("kind", "") == ("mine" if id == "drill" else ""), "only drill mines: %s" % id)
+	client.set("target_voxel", null)
+	client.set("target_block", target)
+	client.call("_equip_tool", "welder")
+	block["health"] = 100
+	target["block"] = block
+	client.set("target_block", target)
+	_check(client.call("_tool_action_plan").is_empty(), "welder on completed block cannot implicitly build")
+	client.set("build_mode", true)
+	_check(client.call("_tool_action_plan").get("kind", "") == "build", "explicit construction allows frame placement")
+	client.call("_select_number_slot", 6)
+	_check(client.get("selected_block_kind") == "refinery", "construction number selects a machine")
+	_check(client.get("equipped_tool") == "welder", "construction retains welder")
+	client.set("build_mode", false)
+	client.call("_select_number_slot", 1)
+	_check(client.get("equipped_tool") == "grinder", "normal number selects tool")
+	client.set("action_charge", 0.8)
+	client.call("_equip_tool", "pulse")
+	_check(is_zero_approx(client.get("action_charge")), "switch cannot carry partial grinder charge into a shot")
+	_check(not client.call("_fire_pulse"), "equipping while held cannot fire")
+	client.call("_advance_tool_action", 0.01, false)
+	_check(client.call("_fire_pulse"), "fresh pulse press fires")
+	var sent: Dictionary = client.get("in_flight_mutation")
+	_check(sent.get("type", "") == "damage_block" and sent.get("block_id", "") == "kit-block", "pulse uses server block-damage intent")
+	_check(not sent.has("damage") and not sent.has("ray") and not sent.has("ammo"), "pulse never authors damage, ray or ammo")
+	_check(String(sent.get("operation_id", "")).begins_with("pulse-"), "pulse retains diagnostic operation identity")
+	_check(not client.call("_fire_pulse"), "held pulse does not repeat")
+	client.call("_advance_tool_action", 2.0, true)
+	_check(client.get("mutation_queue").is_empty(), "held pulse never queues automatic shots")
+	client.call("_advance_tool_action", 0.01, false)
+	_check(not client.call("_fire_pulse"), "pending receipt blocks another shot")
+	client.set("in_flight_mutation", {})
+	client.set("action_cooldown", 0.0)
+	client.call("_advance_tool_action", 0.01, false)
+	client.set("inventory_open", true)
+	_check(not client.call("_fire_pulse"), "inventory prevents discharge")
+	client.call("_advance_tool_action", 0.01, true)
+	client.set("inventory_open", false)
+	_check(not client.call("_fire_pulse"), "held menu click cannot discharge after closing")
+	client.call("_advance_tool_action", 0.01, false)
+	for flag in ["connected", "authoritative_player_ready", "operation_frontier_ready"]:
+		client.set(flag, false)
+		_check(not client.call("_fire_pulse"), "unavailable authority prevents discharge: %s" % flag)
+		client.set(flag, true)
+	client.set("handoff_phase", "importing")
+	_check(not client.call("_fire_pulse"), "handoff prevents discharge")
+	client.set("handoff_phase", "live")
+	client.set("target_block", {})
+	client.set("target_hit", {})
+	_check(client.call("_fire_pulse"), "empty-space pulse is cosmetic")
+	_check(client.get("in_flight_mutation").is_empty(), "empty-space pulse cannot mutate world")
+	_check(client.get("actor_private_snapshot") == inventory_before, "tool selection and shots do not invent inventory")
+	client.call("_equip_tool", "grinder")
+	client.set("target_block", target)
+	client.set("action_cooldown", 0.0)
+	client.call("_advance_tool_action", 0.01, false)
+	client.call("_advance_tool_action", 0.2, true)
+	_check(float(client.get("action_charge")) > 0.0, "grinder charges while held")
+	client.set("connected", false)
+	client.call("_advance_tool_action", 1.0, true)
+	_check(is_zero_approx(client.get("action_charge")), "disconnect cancels charged tool")
+	_check(client.get("in_flight_mutation").is_empty(), "disconnect never completes tool work")
+	_check(String(client.call("_mission_text", {"voxels_mined": 3})).contains("transfer at least 2 ore"), "guide teaches cargo before refining")
+	_check(String(client.call("_mission_text", {"voxels_mined": 3, "refining_batches": 1})).contains("alloy in industrial cargo"), "guide teaches machine component production")
+	client.free()
+	Input.mouse_mode = Input.MOUSE_MODE_VISIBLE

@@ -22,3 +22,27 @@ https://github.com/Bittrees-Technology/the-verse.
 
 No wallet, token, marketplace, or blockchain transaction is active in this
 development package. See VERSION.txt for the exact source and protocol versions.
+
+ENGINEERING WORKSHOP
+
+macOS: double-click "Launch Engineering Workshop.command".
+Linux: run "./the-verse-engineering".
+
+This starts beside the asteroid, salvage skiff, and powered industrial platform
+in a separate persistent save. Close other Verse sessions before launching.
+
+1 = mining drill; 2 = grinder; 3 = welder; 4 = short-range pulse tool.
+Hold primary for work tools; click primary to fire a pulse at a block within 9 m.
+I opens Inventory, Tools, and Production. Tools are permanent suit equipment,
+not tradable cargo. B opens construction; 1-8 then choose block kinds.
+B or right-click exits construction. Release primary after switching tools.
+
+Mine ore. Transfer at least two ore from suit to industrial cargo in Inventory.
+Queue refining in Production, then a component batch after the alloy appears.
+Transfer the component from cargo back into your suit. Close inventory, press B,
+select 1, aim at an owned block face, and hold primary to place and weld a frame.
+The in-game work guide tracks authoritative completion through these steps.
+
+The orbital start is vacuum: keep the helmet sealed. Survival and recovery are
+still active; this is not an unlimited-oxygen sandbox. Pulse shots affect blocks,
+not players. Ammunition, tradable tools, and long-range weapons are later work.
