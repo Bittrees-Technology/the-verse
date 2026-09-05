@@ -81,10 +81,13 @@ Priorities:
 | F-067 | Durable survey, discovery, route, and world-history records | P2 | F-014, F-036–F-038, WORLD-011 |
 | F-068 | Versioned blueprint, script, and automation-package sharing | P3 | F-043/044, F-046, MOD-005 |
 | F-069 | Selectable starter suit tools and short-range block pulse | P1 | F-012, F-062/063, UX-004 |
-
 | F-070 | Seeded scarce workshop ore varieties | P1 | F-012, UX-005 |
 
 ## Current implementation readiness
+
+See [current progress](../roadmap/current-progress.md) for the dated delivery
+assessment and latest main-branch verification. Priority labels above express
+feature priority, not completion or permission to bypass roadmap phase gates.
 
 F-023 is implemented and locally verified for the P1.4 active-cell milestone.
 Its accepted [gameplay specification](../gameplay/physical-industry.md) defines
@@ -92,11 +95,13 @@ the player outcome, state authority, trust boundary, queue and escrow lifecycle,
 failure and recovery behavior, persistence versions, observability, acceptance
 criteria, and rollout. [ADR-0018](../decisions/ADR-0018-authoritative-physical-industry.md)
 records the durable conveyor, scheduler, power, privacy, split, and destruction
-choices. Hosted CI remains the milestone evidence gate.
+choices. Subsequent [main-branch CI](https://github.com/Bittrees-Technology/the-verse/actions/runs/33838538429)
+passes the inherited verification and Linux/Mac packaging gates.
 
-Offline/background production remains dependent on dynamic cell scheduling,
-and public-scale replication remains dependent on interest management. Neither
-deferred system changes the P1.4 canonical production-event contract.
+Bounded single-cell background production is implemented in F-060; general
+dynamic scheduling remains incomplete. F-059 implements bounded interest
+management, while active-player load and public-scale replication evidence
+remain open. Both retain the P1.4 canonical production-event contract.
 
 F-014 and F-059 form the bounded P1.5 correctness slice. It introduces an
 immutable, content-addressed celestial registry and deterministic interest
